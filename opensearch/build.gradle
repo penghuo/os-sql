@@ -43,6 +43,8 @@ dependencies {
     compile group: 'com.fasterxml.jackson.dataformat', name: 'jackson-dataformat-cbor', version: '2.11.4'
     compile group: 'org.json', name: 'json', version:'20180813'
     compileOnly group: 'org.opensearch.client', name: 'opensearch-rest-high-level-client', version: "${opensearch_version}"
+    implementation platform('software.amazon.awssdk:bom:2.15.0')
+    implementation 'software.amazon.awssdk:s3'
 
     testImplementation('org.junit.jupiter:junit-jupiter:5.6.2')
     testCompile group: 'org.hamcrest', name: 'hamcrest-library', version: '2.1'

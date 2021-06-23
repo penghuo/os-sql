@@ -26,6 +26,8 @@
 
 package org.opensearch.sql.analysis;
 
+import static org.opensearch.sql.data.type.ExprCoreType.STRING;
+
 import com.google.common.collect.ImmutableSet;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -258,8 +260,7 @@ public class ExpressionAnalyzer extends AbstractNodeVisitor<Expression, Analysis
 
   private Expression visitIdentifier(String ident, AnalysisContext context) {
     TypeEnvironment typeEnv = context.peek();
-    ReferenceExpression ref = DSL.ref(ident,
-        typeEnv.resolve(new Symbol(Namespace.FIELD_NAME, ident)));
+    ReferenceExpression ref = DSL.ref(ident, STRING);
 
     // Fall back to old engine too if type is not supported semantically
     if (isTypeNotSupported(ref.type())) {

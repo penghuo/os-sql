@@ -42,6 +42,7 @@ EVAL:                               'EVAL';
 HEAD:                               'HEAD';
 TOP:                                'TOP';
 RARE:                               'RARE';
+REGEX:                              'REGEX';
 
 // COMMAND ASSIST KEYWORDS
 AS:                                 'AS';

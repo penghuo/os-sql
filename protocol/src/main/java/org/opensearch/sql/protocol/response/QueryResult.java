@@ -31,6 +31,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.data.model.ExprValue;
@@ -69,10 +70,11 @@ public class QueryResult implements Iterable<Object[]> {
    *        note that column name could be original name or its alias if any.
    */
   public Map<String, String> columnNameTypes() {
+    final Optional<ExprValue> first = exprValues.stream().findFirst();
     Map<String, String> colNameTypes = new LinkedHashMap<>();
-    schema.getColumns().forEach(column -> colNameTypes.put(
-        getColumnName(column),
-        column.getExprType().typeName().toLowerCase()));
+    Map<String, Object> firstRow = (Map<String, Object>) first.get().value();
+    firstRow.entrySet().forEach(column -> colNameTypes.put(
+        column.getKey(), "string"));
     return colNameTypes;
   }
 

@@ -29,8 +29,12 @@ package org.opensearch.sql.opensearch.storage;
 
 import static org.opensearch.search.sort.FieldSortBuilder.DOC_FIELD_NAME;
 import static org.opensearch.search.sort.SortOrder.ASC;
+import static org.opensearch.sql.data.type.ExprCoreType.STRING;
 
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import java.io.IOException;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -41,6 +45,8 @@ import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.ToString;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
@@ -57,7 +63,9 @@ import org.opensearch.sql.opensearch.request.OpenSearchQueryRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 import org.opensearch.sql.opensearch.response.agg.OpenSearchAggregationResponseParser;
+import org.opensearch.sql.opensearch.s3.S3Scan;
 import org.opensearch.sql.storage.TableScanOperator;
+import org.opensearch.sql.storage.bindingtuple.BindingTuple;
 
 /**
  * OpenSearch index scan operator.
@@ -65,6 +73,8 @@ import org.opensearch.sql.storage.TableScanOperator;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true, callSuper = false)
 @ToString(onlyExplicitlyIncluded = true)
 public class OpenSearchIndexScan extends TableScanOperator {
+
+  private static final Logger log = LogManager.getLogger(OpenSearchIndexScan.class);
 
   /** OpenSearch client. */
   private final OpenSearchClient client;
@@ -100,7 +110,27 @@ public class OpenSearchIndexScan extends TableScanOperator {
       responses.add(response);
       response = client.search(request);
     }
-    iterator = Iterables.concat(responses.toArray(new OpenSearchResponse[0])).iterator();
+    Iterator<ExprValue> logStream =
+        Iterables.concat(responses.toArray(new OpenSearchResponse[0])).iterator();
+
+    S3Scan s3Scan = new S3Scan(s3Objects(logStream));
+    s3Scan.open();
+    // Todo. Return 100 records now for testing purpose
+    iterator = Iterators.limit(s3Scan, 100);
+  }
+
+  private List<Pair<String, String>> s3Objects(Iterator<ExprValue> logStream) {
+    List<Pair<String, String>> s3Objects = new ArrayList<>();
+    logStream.forEachRemaining(value -> {
+      final BindingTuple tuple = value.bindingTuples();
+      final ExprValue bucket =
+          tuple.resolve(new ReferenceExpression("meta.bucket", STRING));
+      final ExprValue object =
+          tuple.resolve(new ReferenceExpression("meta.object", STRING));
+      log.info("bucket {}, object {}", bucket.stringValue(), object.stringValue());
+      s3Objects.add(Pair.of(bucket.stringValue(), object.stringValue()));
+    });
+    return s3Objects;
   }
 
   @Override

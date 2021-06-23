@@ -18,4 +18,7 @@ grant {
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
   permission java.lang.RuntimePermission "accessDeclaredMembers";
   permission java.lang.RuntimePermission "defineClass";
+  // For AWS SDK
+  permission java.io.FilePermission "/Users/penghuo/.aws/*", "read";
+  permission java.net.SocketPermission "*", "accept,connect,resolve";
 };

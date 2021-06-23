@@ -30,6 +30,7 @@ import static org.opensearch.sql.ast.tree.Sort.NullOrder.NULL_FIRST;
 import static org.opensearch.sql.ast.tree.Sort.NullOrder.NULL_LAST;
 import static org.opensearch.sql.ast.tree.Sort.SortOrder.ASC;
 import static org.opensearch.sql.ast.tree.Sort.SortOrder.DESC;
+import static org.opensearch.sql.data.type.ExprCoreType.STRING;
 import static org.opensearch.sql.data.type.ExprCoreType.STRUCT;
 
 import com.google.common.collect.ImmutableList;
@@ -59,6 +60,7 @@ import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
+import org.opensearch.sql.ast.tree.Regex;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.RelationSubquery;
 import org.opensearch.sql.ast.tree.Rename;
@@ -67,6 +69,7 @@ import org.opensearch.sql.ast.tree.Sort.SortOption;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.ast.tree.Values;
 import org.opensearch.sql.data.model.ExprMissingValue;
+import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.exception.SemanticCheckException;
 import org.opensearch.sql.expression.DSL;
 import org.opensearch.sql.expression.Expression;
@@ -83,6 +86,7 @@ import org.opensearch.sql.planner.logical.LogicalLimit;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalProject;
 import org.opensearch.sql.planner.logical.LogicalRareTopN;
+import org.opensearch.sql.planner.logical.LogicalRegex;
 import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.logical.LogicalRemove;
 import org.opensearch.sql.planner.logical.LogicalRename;
@@ -127,6 +131,9 @@ public class Analyzer extends AbstractNodeVisitor<LogicalPlan, AnalysisContext> 
     TypeEnvironment curEnv = context.peek();
     Table table = storageEngine.getTable(node.getTableName());
     table.getFieldTypes().forEach((k, v) -> curEnv.define(new Symbol(Namespace.FIELD_NAME, k), v));
+
+    // Todo. PoC
+    curEnv.define(new Symbol(Namespace.FIELD_NAME, "raw"), STRING);
 
     // Put index name or its alias in index namespace on type environment so qualifier
     // can be removed when analyzing qualified name. The value (expr type) here doesn't matter.
@@ -321,6 +328,18 @@ public class Analyzer extends AbstractNodeVisitor<LogicalPlan, AnalysisContext> 
       typeEnvironment.define(ref);
     }
     return new LogicalEval(child, expressionsBuilder.build());
+  }
+
+  /**
+   * Build {@link LogicalRegex}
+   */
+  @Override
+  public LogicalPlan visitRegex(Regex node, AnalysisContext context) {
+    LogicalPlan child = node.getChild().get(0).accept(this, context);
+    Expression expression = expressionAnalyzer.analyze(node.getExpression(), context);
+    String pattern = (String) node.getPattern().getValue();
+
+    return new LogicalRegex(child, expression, pattern);
   }
 
   /**

@@ -95,3 +95,47 @@ Examples
 --------
 
 For example, if you run ``source=Accounts``, it will end up with an index not found exception from our plugin because the actual index name is under lower case.
+
+Multiple Indices
+================
+
+Description
+-----------
+
+To query multiple indices, you could
+
+1. Include ``*`` in index name, this is mostly an index pattern for wildcard match.
+1. Seperated indices with ``,``
+
+
+Examples
+---------
+
+Query wildcard indices::
+
+    os> source=acc* | fields `account_number`;
+    fetched rows / total rows = 4/4
+    +------------------+
+    | account_number   |
+    |------------------|
+    | 1                |
+    | 6                |
+    | 13               |
+    | 18               |
+    +------------------+
+
+
+
+
+Query multiple indices seperated by ``,``::
+
+    os> source=accounts, account2 | fields `account_number`;
+    fetched rows / total rows = 4/4
+    +------------------+
+    | account_number   |
+    |------------------|
+    | 1                |
+    | 6                |
+    | 13               |
+    | 18               |
+    +------------------+

@@ -140,3 +140,39 @@ The second example is to show a field name qualified by index alias specified. S
     +--------+-------+--------------------+
 
 Note that in both examples above, the qualifier is removed in response. This happens only when identifiers selected is a simple field name. In other cases, expressions rather than an atom field, the column name in response is exactly the same as the text in ``SELECT``clause.
+
+Multiple Indices
+================
+
+Description
+-----------
+
+To query multiple indices, you could
+
+1. Include ``*`` in index name, this is an index pattern for wildcard match.
+2. Delimited multiple indices and seperated them by ``,``. Note: no space allowed between each index.
+
+
+Examples
+---------
+
+Query wildcard indices::
+
+    os> SELECT count() FROM acc*;
+    fetched rows / total rows = 1/1
+    +-----------+
+    | count()   |
+    |-----------|
+    | 5         |
+    +-----------+
+
+
+Query delimited multiple indices seperated by ``,``::
+
+    os> SELECT count() FROM `accounts,account2`;
+    fetched rows / total rows = 1/1
+    +-----------+
+    | count()   |
+    |-----------|
+    | 5         |
+    +-----------+

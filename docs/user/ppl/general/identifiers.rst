@@ -104,8 +104,9 @@ Description
 
 To query multiple indices, you could
 
-1. Include ``*`` in index name, this is mostly an index pattern for wildcard match.
-1. Seperated indices with ``,``
+1. Include ``*`` in index name, this is an index pattern for wildcard match.
+2. Include multiple indices and seperated them by ``,``.
+3. Delimited multiple indices and seperated them by ``,``. Note: no space allowed between each index.
 
 
 Examples
@@ -124,6 +125,16 @@ Query wildcard indices::
 Query multiple indices seperated by ``,``::
 
     os> source=accounts, account2 | stats count();
+    fetched rows / total rows = 1/1
+    +-----------+
+    | count()   |
+    |-----------|
+    | 5         |
+    +-----------+
+
+Query delimited multiple indices seperated by ``,``::
+
+    os> source=`accounts,account2` | stats count();
     fetched rows / total rows = 1/1
     +-----------+
     | count()   |

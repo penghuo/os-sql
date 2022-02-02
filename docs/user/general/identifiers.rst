@@ -38,7 +38,7 @@ Examples
 
 Here are examples for using index pattern directly without quotes::
 
-    os> SELECT * FROM *cc*nt*;
+    os> SELECT * FROM *cc*nts;
     fetched rows / total rows = 4/4
     +------------------+-------------+----------------------+-----------+----------+--------+------------+---------+-------+-----------------------+------------+
     | account_number   | firstname   | address              | balance   | gender   | city   | employer   | state   | age   | email                 | lastname   |

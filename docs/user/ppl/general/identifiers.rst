@@ -113,29 +113,21 @@ Examples
 
 Query wildcard indices::
 
-    os> source=acc* | fields `account_number`;
-    fetched rows / total rows = 4/4
-    +------------------+
-    | account_number   |
-    |------------------|
-    | 1                |
-    | 6                |
-    | 13               |
-    | 18               |
-    +------------------+
-
-
-
+    os> source=acc* | stats count();
+    fetched rows / total rows = 1/1
+    +-----------+
+    | count()   |
+    |-----------|
+    | 5         |
+    +-----------+
 
 Query multiple indices seperated by ``,``::
 
-    os> source=accounts, account2 | fields `account_number`;
-    fetched rows / total rows = 4/4
-    +------------------+
-    | account_number   |
-    |------------------|
-    | 1                |
-    | 6                |
-    | 13               |
-    | 18               |
-    +------------------+
+    os> source=accounts, account2 | stats count();
+    fetched rows / total rows = 1/1
+    +-----------+
+    | count()   |
+    |-----------|
+    | 5         |
+    +-----------+
+

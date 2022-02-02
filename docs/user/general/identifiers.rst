@@ -160,19 +160,19 @@ Query wildcard indices::
 
     os> SELECT count(*) as cnt FROM acc*;
     fetched rows / total rows = 1/1
-    +-----------+
-    | cnt       |
-    |-----------|
-    | 5         |
-    +-----------+
+    +-------+
+    | cnt   |
+    |-------|
+    | 5     |
+    +-------+
 
 
 Query delimited multiple indices seperated by ``,``::
 
     os> SELECT count(*) as cnt FROM `accounts,account2`;
     fetched rows / total rows = 1/1
-    +-----------+
-    | cnt       |
-    |-----------|
-    | 5         |
-    +-----------+
+    +-------+
+    | cnt   |
+    |-------|
+    | 5     |
+    +-------+

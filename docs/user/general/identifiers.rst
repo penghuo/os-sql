@@ -158,10 +158,10 @@ Examples
 
 Query wildcard indices::
 
-    os> SELECT count() FROM acc*;
+    os> SELECT count(*) as cnt FROM acc*;
     fetched rows / total rows = 1/1
     +-----------+
-    | count()   |
+    | cnt       |
     |-----------|
     | 5         |
     +-----------+
@@ -169,10 +169,10 @@ Query wildcard indices::
 
 Query delimited multiple indices seperated by ``,``::
 
-    os> SELECT count() FROM `accounts,account2`;
+    os> SELECT count(*) as cnt FROM `accounts,account2`;
     fetched rows / total rows = 1/1
     +-----------+
-    | count()   |
+    | cnt       |
     |-----------|
     | 5         |
     +-----------+

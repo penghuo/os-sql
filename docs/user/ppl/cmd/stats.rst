@@ -373,7 +373,7 @@ The example gets the count of age by the interval of 10 years and group by gende
 PPL query::
 
     os> source=accounts | stats count() as cnt by gender span(age, 5) as age_span
-    fetched rows / total rows = 2/2
+    fetched rows / total rows = 3/3
     +-------+------------+----------+
     | cnt   | age_span   | gender   |
     |-------+------------+----------|

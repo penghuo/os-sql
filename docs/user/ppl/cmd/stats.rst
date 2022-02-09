@@ -36,14 +36,19 @@ stats <aggregation>... [by-clause]...
 
 
 * aggregation: mandatory. A aggregation function. The argument of aggregation must be field.
+
 * by-clause: optional.
+
  * Syntax: by [field]... [span-expression].
  * Description: The by clause could be the fields and expressions like scalar functions and aggregation functions. Besides, the span clause can be used to split specific field into buckets in the same interval, the stats then does the aggregation by these span buckets.
  * Default: If no <by-clause> is specified, the stats command returns only one row, which is the aggregation over the entire result set.
+
 * span-expression: optional.
+
  * Syntax: span(field_expr, interval_expr)
  * Description: the unit of the interval expression is the natural unit by default. If the field is a date and time type field, and the interval is in date/time units, you will need to specify the unit in the interval expression. For example, to split the field ``age`` into buckets by 10 years, it looks like ``span(age, 10)``. And here is another example of time span, the span to split a ``timestamp`` field into hourly intervals, it looks like ``span(timestamp, 1h)``.
- * Available time unit:
+
+* Available time unit:
 +----------------------------+
 | Span Interval Units        |
 +============================+
@@ -367,11 +372,12 @@ The example gets the count of age by the interval of 10 years and group by gende
 
 PPL query::
 
-    os> source=accounts | stats count() as cnt by gender span(age, 10) as age_span
+    os> source=accounts | stats count() as cnt by gender span(age, 5) as age_span
     fetched rows / total rows = 2/2
-    +--------------+------------+
-    | count(age)   | age_span   |
-    |--------------+------------|
-    | 1            | 20         |
-    | 3            | 30         |
-    +--------------+------------+
+    +-------+------------+----------+
+    | cnt   | age_span   | gender   |
+    |-------+------------+----------|
+    | 1     | 25         | F        |
+    | 2     | 30         | M        |
+    | 1     | 35         | M        |
+    +-------+------------+----------+

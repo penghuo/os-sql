@@ -51,12 +51,14 @@ Examples
 Here is an example for different type of arithmetic expressions::
 
     os> source=accounts | where age > (25 + 5) | fields age ;
-    fetched rows / total rows = 1/1
-    +---------+---------------+-------------+
-    | 1 + 2   | (9 - 1) % 3   | 2 * 4 / 3   |
-    |---------+---------------+-------------|
-    | 3       | 2             | 2           |
-    +---------+---------------+-------------+
+    fetched rows / total rows = 3/3
+    +-------+
+    | age   |
+    |-------|
+    | 32    |
+    | 36    |
+    | 33    |
+    +-------+
 
 Predicate Operators
 ===================
@@ -104,11 +106,11 @@ Here is an example for comparison operators::
 
     os> source=accounts | where age > 33 | fields age ;
     fetched rows / total rows = 1/1
-    +---------+----------+---------+----------+----------+---------+
-    | 2 > 1   | 2 >= 1   | 2 < 1   | 2 != 1   | 2 <= 1   | 2 = 1   |
-    |---------+----------+---------+----------+----------+---------|
-    | True    | True     | False   | True     | False    | False   |
-    +---------+----------+---------+----------+----------+---------+
+    +-------+
+    | age   |
+    |-------|
+    | 36    |
+    +-------+
 
 
 IN
@@ -117,26 +119,28 @@ IN
 IN operator test field in value lists::
 
     os> source=accounts | where age in (32, 33) | fields age ;
-    fetched rows / total rows = 1/1
-    +----------------------+--------------------+--------------------------+------------------------+
-    | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |
-    |----------------------+--------------------+--------------------------+------------------------|
-    | True                 | True               | False                    | False                  |
-    +----------------------+--------------------+--------------------------+------------------------+
+    fetched rows / total rows = 2/2
+    +-------+
+    | age   |
+    |-------|
+    | 32    |
+    | 33    |
+    +-------+
 
 
-AND
+OR
 ---
 
-AND operator ::
+OR operator ::
 
     os> source=accounts | where age = 32 OR age = 33 | fields age ;
-    fetched rows / total rows = 1/1
-    +----------------------+--------------------+--------------------------+------------------------+
-    | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |
-    |----------------------+--------------------+--------------------------+------------------------|
-    | True                 | True               | False                    | False                  |
-    +----------------------+--------------------+--------------------------+------------------------+
+    fetched rows / total rows = 2/2
+    +-------+
+    | age   |
+    |-------|
+    | 32    |
+    | 33    |
+    +-------+
 
 
 NOT
@@ -145,10 +149,11 @@ NOT
 NOT operator ::
 
     os> source=accounts | where not age in (32, 33) | fields age ;
-    fetched rows / total rows = 1/1
-    +----------------------+--------------------+--------------------------+------------------------+
-    | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |
-    |----------------------+--------------------+--------------------------+------------------------|
-    | True                 | True               | False                    | False                  |
-    +----------------------+--------------------+--------------------------+------------------------+
+    fetched rows / total rows = 2/2
+    +-------+
+    | age   |
+    |-------|
+    | 36    |
+    | 28    |
+    +-------+
 

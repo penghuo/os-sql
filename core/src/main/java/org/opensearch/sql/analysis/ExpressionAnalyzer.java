@@ -183,7 +183,7 @@ public class ExpressionAnalyzer extends AbstractNodeVisitor<Expression, Analysis
     return visitIn(node.getField(), node.getValueList(), context);
   }
 
-  public Expression visitIn(
+  private Expression visitIn(
       UnresolvedExpression field, List<UnresolvedExpression> valueList, AnalysisContext context) {
     if (valueList.size() == 1) {
       return visitCompare(new Compare("=", field, valueList.get(0)), context);
@@ -192,7 +192,7 @@ public class ExpressionAnalyzer extends AbstractNodeVisitor<Expression, Analysis
           visitCompare(new Compare("=", field, valueList.get(0)), context),
           visitIn(field, valueList.subList(1, valueList.size()), context));
     } else {
-      throw new SemanticCheckException("In clause is empty");
+      throw new SemanticCheckException("Values in In clause should not be empty");
     }
   }
 

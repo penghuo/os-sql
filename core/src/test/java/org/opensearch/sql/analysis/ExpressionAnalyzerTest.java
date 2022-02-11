@@ -10,9 +10,12 @@ import static java.util.Collections.emptyList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.opensearch.sql.ast.dsl.AstDSL.field;
+import static org.opensearch.sql.ast.dsl.AstDSL.filter;
 import static org.opensearch.sql.ast.dsl.AstDSL.function;
+import static org.opensearch.sql.ast.dsl.AstDSL.in;
 import static org.opensearch.sql.ast.dsl.AstDSL.intLiteral;
 import static org.opensearch.sql.ast.dsl.AstDSL.qualifiedName;
+import static org.opensearch.sql.ast.dsl.AstDSL.relation;
 import static org.opensearch.sql.ast.dsl.AstDSL.stringLiteral;
 import static org.opensearch.sql.data.model.ExprValueUtils.LITERAL_TRUE;
 import static org.opensearch.sql.data.model.ExprValueUtils.integerValue;
@@ -21,6 +24,7 @@ import static org.opensearch.sql.data.type.ExprCoreType.INTEGER;
 import static org.opensearch.sql.data.type.ExprCoreType.STRING;
 import static org.opensearch.sql.data.type.ExprCoreType.STRUCT;
 
+import java.util.Collections;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.opensearch.sql.analysis.symbol.Namespace;
@@ -317,6 +321,21 @@ class ExpressionAnalyzerTest extends AnalyzerTestBase {
         DSL.span(DSL.ref("integer_value", INTEGER), DSL.literal(1), ""),
         AstDSL.span(qualifiedName("integer_value"), intLiteral(1), SpanUnit.NONE)
     );
+  }
+
+  @Test
+  void visit_in() {
+    assertAnalyzeEqual(
+        dsl.or(
+            dsl.equal(DSL.ref("integer_value", INTEGER), DSL.literal(1)),
+            dsl.or(
+                dsl.equal(DSL.ref("integer_value", INTEGER), DSL.literal(2)),
+                dsl.equal(DSL.ref("integer_value", INTEGER), DSL.literal(3)))),
+        AstDSL.in(field("integer_value"), intLiteral(1), intLiteral(2), intLiteral(3)));
+
+    assertThrows(
+        SemanticCheckException.class,
+        () -> analyze(AstDSL.in(field("integer_value"), Collections.emptyList())));
   }
 
   protected Expression analyze(UnresolvedExpression unresolvedExpression) {

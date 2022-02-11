@@ -189,15 +189,15 @@ expr REGEXP pattern. The expr is string value, pattern is supports regular expre
 IN value list test
 ------------------
 
-expr REGEXP pattern. The expr is string value, pattern is supports regular expression patterns::
+Here is an example for IN value test::
 
     os> SELECT 1 in (1, 2), 3 not in (1, 2);
     fetched rows / total rows = 1/1
-    +------------------------+------------------+
-    | 'Hello!' REGEXP '.*'   | 'a' REGEXP 'b'   |
-    |------------------------+------------------|
-    | 1                      | 0                |
-    +------------------------+------------------+
+    +---------------+-------------------+
+    | 1 in (1, 2)   | 3 not in (1, 2)   |
+    |---------------+-------------------|
+    | True          | True              |
+    +---------------+-------------------+
 
 Function Call
 =============

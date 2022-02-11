@@ -95,8 +95,11 @@ Operators
 | NOT            | NOT NULL value test                    |
 +----------------+----------------------------------------+
 
+Examples
+--------
+
 Basic Predicate Operator
-------------------------
+````````````````````````
 
 Here is an example for comparison operators::
 
@@ -110,7 +113,7 @@ Here is an example for comparison operators::
 
 
 IN
---
+``
 
 IN operator test field in value lists::
 
@@ -125,7 +128,7 @@ IN operator test field in value lists::
 
 
 OR
----
+``
 
 OR operator ::
 
@@ -140,7 +143,7 @@ OR operator ::
 
 
 NOT
----
+```
 
 NOT operator ::
 

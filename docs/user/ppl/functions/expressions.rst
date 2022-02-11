@@ -102,7 +102,7 @@ Basic Predicate Operator
 
 Here is an example for comparison operators::
 
-    os> source account | where age > 33 | fields age ;
+    os> source=account | where age > 33 | fields age ;
     fetched rows / total rows = 1/1
     +---------+----------+---------+----------+----------+---------+
     | 2 > 1   | 2 >= 1   | 2 < 1   | 2 != 1   | 2 <= 1   | 2 = 1   |
@@ -116,7 +116,7 @@ IN
 
 IN operator test field in value lists::
 
-    os> source account | where age in (32, 33) | fields age ;
+    os> source=account | where age in (32, 33) | fields age ;
     fetched rows / total rows = 1/1
     +----------------------+--------------------+--------------------------+------------------------+
     | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |
@@ -130,7 +130,7 @@ AND
 
 AND operator ::
 
-    os> source account | where age = 32 OR age = 33 | fields age ;
+    os> source=account | where age = 32 OR age = 33 | fields age ;
     fetched rows / total rows = 1/1
     +----------------------+--------------------+--------------------------+------------------------+
     | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |
@@ -144,7 +144,7 @@ NOT
 
 NOT operator ::
 
-    os> source account | where not age in (32, 33) | fields age ;
+    os> source=account | where not age in (32, 33) | fields age ;
     fetched rows / total rows = 1/1
     +----------------------+--------------------+--------------------------+------------------------+
     | 'axyzb' LIKE 'a%b'   | 'acb' LIKE 'a_b'   | 'axyzb' NOT LIKE 'a%b'   | 'acb' NOT LIKE 'a_b'   |

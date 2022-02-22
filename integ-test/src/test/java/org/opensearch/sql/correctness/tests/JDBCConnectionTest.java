@@ -92,8 +92,8 @@ public class JDBCConnectionTest {
 
     assertEquals(
         Arrays.asList(
-            "INSERT INTO test(name,age) VALUES ('John','25')",
-            "INSERT INTO test(name,age) VALUES ('Hank','30')"
+            "INSERT INTO test(`name`,`age`) VALUES ('John','25')",
+            "INSERT INTO test(`name`,`age`) VALUES ('Hank','30')"
         ), actual
     );
   }
@@ -112,9 +112,9 @@ public class JDBCConnectionTest {
 
     assertEquals(
         Arrays.asList(
-            "INSERT INTO test(name,age) VALUES ('John',NULL)",
-            "INSERT INTO test(name,age) VALUES (NULL,'25')",
-            "INSERT INTO test(name,age) VALUES ('Hank','30')"
+            "INSERT INTO test(`name`,`age`) VALUES ('John',NULL)",
+            "INSERT INTO test(`name`,`age`) VALUES (NULL,'25')",
+            "INSERT INTO test(`name`,`age`) VALUES ('Hank','30')"
         ), actual
     );
   }

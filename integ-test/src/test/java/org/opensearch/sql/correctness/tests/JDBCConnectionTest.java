@@ -67,7 +67,7 @@ public class JDBCConnectionTest {
     verify(statement).executeUpdate(argCap.capture());
     String actual = argCap.getValue();
 
-    assertEquals("CREATE TABLE test(name VARCHAR,age INT)", actual);
+    assertEquals("CREATE TABLE test(`name` VARCHAR,`age` INT)", actual);
   }
 
   @Test

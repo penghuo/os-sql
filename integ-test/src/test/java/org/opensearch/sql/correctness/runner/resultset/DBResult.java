@@ -34,6 +34,12 @@ public class DBResult {
   private static final Set<String> FLOAT_TYPES = ImmutableSet.of("FLOAT", "DOUBLE", "REAL");
 
   /**
+   * Possible types for varchar.
+   * H2 2.x use CHARACTER VARYING.
+   */
+  private static final Set<String> VARCHAR = ImmutableSet.of("CHARACTER VARYING", "VARCHAR");
+
+  /**
    * Database name for display
    */
   private final String databaseName;
@@ -81,6 +87,8 @@ public class DBResult {
     // Ignore float type by assigning all type names string to it.
     if (FLOAT_TYPES.contains(type)) {
       type = FLOAT_TYPES.toString();
+    } else if (VARCHAR.contains(type)) {
+      type = "VARCHAR";
     }
     schema.add(new Type(StringUtils.toUpper(name), type));
   }

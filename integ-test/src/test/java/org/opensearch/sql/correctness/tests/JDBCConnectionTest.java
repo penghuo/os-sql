@@ -178,7 +178,7 @@ public class JDBCConnectionTest {
     assertEquals(
         Arrays.asList(
             new Type("NAME", "VARCHAR"),
-            new Type("BALANCE", "[FLOAT, DOUBLE, REAL]")
+            new Type("BALANCE", "[FLOAT, DOUBLE, REAL, DOUBLE PRECISION]")
         ),
         result.getSchema()
     );

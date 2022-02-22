@@ -30,12 +30,14 @@ public class DBResult {
 
   /**
    * Possible types for floating point number
+   * H2 2.x use DOUBLE PRECISION instead of DOUBLE.
    */
-  private static final Set<String> FLOAT_TYPES = ImmutableSet.of("FLOAT", "DOUBLE", "REAL");
+  private static final Set<String> FLOAT_TYPES =
+      ImmutableSet.of("FLOAT", "DOUBLE", "REAL", "DOUBLE PRECISION");
 
   /**
    * Possible types for varchar.
-   * H2 2.x use CHARACTER VARYING.
+   * H2 2.x use CHARACTER VARYING instead of VARCHAR.
    */
   private static final Set<String> VARCHAR = ImmutableSet.of("CHARACTER VARYING", "VARCHAR");
 

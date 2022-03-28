@@ -91,6 +91,9 @@ DAY_SECOND:                         'DAY_SECOND';
 DAY_MINUTE:                         'DAY_MINUTE';
 DAY_HOUR:                           'DAY_HOUR';
 YEAR_MONTH:                         'YEAR_MONTH';
+CENTROIDS:                          'CENTROIDS';
+ITERATIONS:                         'ITERATIONS';
+DISTANCE_TYPE:                      'DISTANCE_TYPE';
 
 // DATASET TYPES
 DATAMODEL:                          'DATAMODEL';

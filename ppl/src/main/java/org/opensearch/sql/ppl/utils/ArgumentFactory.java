@@ -29,6 +29,7 @@ import org.opensearch.sql.ast.expression.Argument;
 import org.opensearch.sql.ast.expression.DataType;
 import org.opensearch.sql.ast.expression.Literal;
 import org.opensearch.sql.common.utils.StringUtils;
+import org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser;
 import org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.AdCommandContext;
 import org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.KmeansCommandContext;
 
@@ -143,18 +144,6 @@ public class ArgumentFactory {
   }
 
   /**
-   * Get list of {@link Argument}.
-   *
-   * @param ctx KmeansCommandContext instance
-   * @return the list of arguments fetched from the kmeans command
-   */
-  public static List<Argument> getArgumentList(KmeansCommandContext ctx) {
-    // TODO: add iterations and distanceType parameters for Kemans
-    return Collections
-            .singletonList(new Argument("k", getArgumentValue(ctx.k)));
-  }
-
-  /**
    * Get map of {@link Argument}.
    *
    * @param ctx ADCommandContext instance
@@ -175,7 +164,10 @@ public class ArgumentFactory {
     };
   }
 
-  private static Literal getArgumentValue(ParserRuleContext ctx) {
+  /**
+   * Todo.
+   */
+  public static Literal getArgumentValue(ParserRuleContext ctx) {
     return ctx instanceof IntegerLiteralContext
         ? new Literal(Integer.parseInt(ctx.getText()), DataType.INTEGER)
         : ctx instanceof BooleanLiteralContext

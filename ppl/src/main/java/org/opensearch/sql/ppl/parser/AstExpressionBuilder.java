@@ -40,6 +40,7 @@ import static org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.StatsFunct
 import static org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.StringLiteralContext;
 import static org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.TableSourceContext;
 import static org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser.WcFieldExpressionContext;
+import static org.opensearch.sql.ppl.utils.ArgumentFactory.getArgumentValue;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -75,6 +76,7 @@ import org.opensearch.sql.ast.expression.UnresolvedArgument;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.expression.Xor;
 import org.opensearch.sql.common.utils.StringUtils;
+import org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParser;
 import org.opensearch.sql.ppl.antlr.parser.OpenSearchPPLParserBaseVisitor;
 import org.opensearch.sql.ppl.utils.ArgumentFactory;
 
@@ -91,6 +93,21 @@ public class AstExpressionBuilder extends OpenSearchPPLParserBaseVisitor<Unresol
           .put("isnull", IS_NULL.getName().getFunctionName())
           .put("isnotnull", IS_NOT_NULL.getName().getFunctionName())
           .build();
+
+  @Override
+  public UnresolvedExpression visitCentroids(OpenSearchPPLParser.CentroidsContext ctx) {
+    return new Argument("c", getArgumentValue(ctx.centroids));
+  }
+
+  @Override
+  public UnresolvedExpression visitIterations(OpenSearchPPLParser.IterationsContext ctx) {
+    return new Argument("i", getArgumentValue(ctx.integerLiteral()));
+  }
+
+  @Override
+  public UnresolvedExpression visitDistance_type(OpenSearchPPLParser.Distance_typeContext ctx) {
+    return new Argument("d", getArgumentValue(ctx.distance_type));
+  }
 
   /**
    * Eval clause.

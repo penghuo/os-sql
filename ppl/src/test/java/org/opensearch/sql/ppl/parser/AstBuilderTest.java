@@ -582,8 +582,8 @@ public class AstBuilderTest {
 
   @Test
   public void testKmeansCommand() {
-    assertEqual("source=t | kmeans 3",
-            new Kmeans(relation("t"),exprList(argument("k", intLiteral(3)))));
+    assertEqual("source=t | kmeans iterations=3",
+            new Kmeans(relation("t"),exprList(argument("i", intLiteral(3)))));
   }
 
   @Test

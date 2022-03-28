@@ -20,7 +20,17 @@ pplStatement
 /** commands */
 commands
     : whereCommand | fieldsCommand | renameCommand | statsCommand | dedupCommand | sortCommand | evalCommand | headCommand
-    | topCommand | rareCommand | parseCommand | kmeansCommand | adCommand;
+    | topCommand | rareCommand | parseCommand | kmeansCommand | adCommand | kmeansCommand;
+
+kmeansCommand
+    : KMEANS (kmeansParameter)*
+    ;
+
+kmeansParameter
+    : CENTROIDS EQUAL centroids=integerLiteral                      #centroids
+    | ITERATIONS EQUAL iterations=integerLiteral                    #iterations
+    | DISTANCE_TYPE EQUAL distance_type=stringLiteral               #distance_type
+    ;
 
 searchCommand
     : (SEARCH)? fromClause                                          #searchFrom
@@ -86,11 +96,6 @@ rareCommand
 
 parseCommand
     : PARSE expression pattern
-    ;
-    
-kmeansCommand
-    : KMEANS
-    k=integerLiteral
     ;
 
 adCommand

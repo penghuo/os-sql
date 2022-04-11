@@ -126,13 +126,13 @@ subprojects {
         toolVersion "8.29"
         configProperties = [
                 "org.checkstyle.google.suppressionfilter.config": rootProject.file("config/checkstyle/suppressions.xml")]
-        ignoreFailures = false
+        ignoreFailures = true
     }
 }
 checkstyle {
     configFile file("config/checkstyle/checkstyle.xml")
 }
-checkstyleMain.ignoreFailures = false
+checkstyleMain.ignoreFailures = true
 checkstyleTest.ignoreFailures = true
 
 configurations.all {

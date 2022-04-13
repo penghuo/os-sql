@@ -12,12 +12,15 @@ import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.action.admin.indices.get.GetIndexResponse;
 import org.opensearch.action.support.IndicesOptions;
@@ -26,6 +29,9 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.GroupShardsIterator;
+import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.ImmutableOpenMap;
 import org.opensearch.common.unit.TimeValue;
@@ -148,6 +154,18 @@ public class OpenSearchNodeClient implements OpenSearchClient {
     return client;
   }
 
+  @Override
+  public DiscoveryNodes getNodes() {
+    return clusterService.state().getNodes();
+  }
+
+  public GroupShardsIterator<ShardIterator> shards(String... indexExpression) {
+    ClusterState state = clusterService.state();
+    String[] concreteIndices = resolveIndexExpression(state, indexExpression);
+    return clusterService.operationRouting()
+        .searchShards(state, concreteIndices, null, null);
+  }
+
   private String[] resolveIndexExpression(ClusterState state, String[] indices) {
     return resolver.concreteIndexNames(state, IndicesOptions.strictExpandOpen(), true, indices);
   }
@@ -171,4 +189,5 @@ public class OpenSearchNodeClient implements OpenSearchClient {
       task.run();
     };
   }
+
 }

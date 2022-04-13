@@ -20,9 +20,9 @@ import org.opensearch.client.node.NodeClient;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.sql.plugin.transport.StreamExpressionAction;
-import org.opensearch.sql.plugin.transport.StreamExpressionRequest;
-import org.opensearch.sql.plugin.transport.StreamExpressionResponse;
+import org.opensearch.sql.opensearch.operator.transport.StreamExpressionAction;
+import org.opensearch.sql.opensearch.operator.transport.StreamExpressionRequest;
+import org.opensearch.sql.opensearch.operator.transport.StreamExpressionResponse;
 
 public class RestStreamQueryAction extends BaseRestHandler {
   public static final String STREAM_API_ENDPOINT = "/_plugins/_stream";
@@ -57,7 +57,7 @@ public class RestStreamQueryAction extends BaseRestHandler {
   protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
     return channel -> client.execute(
         StreamExpressionAction.INSTANCE,
-        new StreamExpressionRequest("stream()"),
+        new StreamExpressionRequest(null, "stream()"),
         new ActionListener<StreamExpressionResponse>() {
           @Override
           public void onResponse(StreamExpressionResponse response) {

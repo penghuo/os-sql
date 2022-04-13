@@ -7,6 +7,7 @@
 package org.opensearch.sql.opensearch.storage;
 
 import com.google.common.annotations.VisibleForTesting;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -19,6 +20,8 @@ import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
+import org.opensearch.sql.opensearch.operator.stream.ParallelStream;
+import org.opensearch.sql.opensearch.operator.stream.SearchStream;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalIndexAgg;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalIndexScan;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalPlanOptimizerFactory;
@@ -36,6 +39,7 @@ import org.opensearch.sql.planner.logical.LogicalAD;
 import org.opensearch.sql.planner.logical.LogicalMLCommons;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.physical.AggregationOperator;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.Table;
 
@@ -148,27 +152,38 @@ public class OpenSearchIndex implements Table {
       return indexScan;
     }
 
-    /**
-     * Implement ElasticsearchLogicalIndexAgg.
-     */
+//    /**
+//     * Implement ElasticsearchLogicalIndexAgg.
+//     */
+//    public PhysicalPlan visitIndexAggregation(OpenSearchLogicalIndexAgg node,
+//                                              OpenSearchIndexScan context) {
+//      if (node.getFilter() != null) {
+//        FilterQueryBuilder queryBuilder = new FilterQueryBuilder(
+//            new DefaultExpressionSerializer());
+//        QueryBuilder query = queryBuilder.build(node.getFilter());
+//        context.pushDown(query);
+//      }
+//      AggregationQueryBuilder builder =
+//          new AggregationQueryBuilder(new DefaultExpressionSerializer());
+//      Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder =
+//          builder.buildAggregationBuilder(node.getAggregatorList(),
+//              node.getGroupByList(), node.getSortList());
+//      context.pushDownAggregation(aggregationBuilder);
+//      context.pushTypeMapping(
+//          builder.buildTypeMapping(node.getAggregatorList(),
+//              node.getGroupByList()));
+//      return indexScan;
+//    }
+
     public PhysicalPlan visitIndexAggregation(OpenSearchLogicalIndexAgg node,
                                               OpenSearchIndexScan context) {
-      if (node.getFilter() != null) {
-        FilterQueryBuilder queryBuilder = new FilterQueryBuilder(
-            new DefaultExpressionSerializer());
-        QueryBuilder query = queryBuilder.build(node.getFilter());
-        context.pushDown(query);
-      }
-      AggregationQueryBuilder builder =
-          new AggregationQueryBuilder(new DefaultExpressionSerializer());
-      Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder =
-          builder.buildAggregationBuilder(node.getAggregatorList(),
-              node.getGroupByList(), node.getSortList());
-      context.pushDownAggregation(aggregationBuilder);
-      context.pushTypeMapping(
-          builder.buildTypeMapping(node.getAggregatorList(),
-              node.getGroupByList()));
-      return indexScan;
+
+      return new AggregationOperator(
+          new ParallelStream(
+              client.getNodeClient(), client.shards(node.getRelationName()),
+              new SearchStream()),
+              node.getAggregatorList(), node.getGroupByList()
+      );
     }
 
     @Override

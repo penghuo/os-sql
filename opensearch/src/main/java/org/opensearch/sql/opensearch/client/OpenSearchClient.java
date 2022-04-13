@@ -9,6 +9,9 @@ package org.opensearch.sql.opensearch.client;
 import java.util.List;
 import java.util.Map;
 import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.GroupShardsIterator;
+import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
@@ -67,4 +70,12 @@ public interface OpenSearchClient {
   void schedule(Runnable task);
 
   NodeClient getNodeClient();
+
+  default DiscoveryNodes getNodes() {
+    throw new IllegalStateException("getNodes");
+  }
+
+  default GroupShardsIterator<ShardIterator> shards(String... indexExpression) {
+    throw new IllegalStateException("shards");
+  }
 }

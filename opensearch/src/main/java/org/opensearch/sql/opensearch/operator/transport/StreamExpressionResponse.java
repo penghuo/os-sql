@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.opensearch.operator.transport;
 
 import java.io.IOException;
 import org.opensearch.action.ActionResponse;

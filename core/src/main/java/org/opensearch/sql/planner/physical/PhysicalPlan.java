@@ -6,6 +6,7 @@
 
 package org.opensearch.sql.planner.physical;
 
+import java.io.Serializable;
 import java.util.Iterator;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
@@ -16,7 +17,10 @@ import org.opensearch.sql.planner.PlanNode;
  */
 public abstract class PhysicalPlan implements PlanNode<PhysicalPlan>,
     Iterator<ExprValue>,
+    Serializable,
     AutoCloseable {
+
+  private static final long serialVersionUID = 1;
   /**
    * Accept the {@link PhysicalPlanNodeVisitor}.
    *

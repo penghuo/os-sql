@@ -6,6 +6,7 @@
 
 package org.opensearch.sql.opensearch.executor.protector;
 
+import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.monitor.ResourceMonitor;
 import org.opensearch.sql.opensearch.planner.physical.ADOperator;
@@ -45,11 +46,11 @@ public class OpenSearchExecutionProtector extends ExecutionProtector {
     return new FilterOperator(visitInput(node.getInput(), context), node.getConditions());
   }
 
-  @Override
-  public PhysicalPlan visitAggregation(AggregationOperator node, Object context) {
-    return new AggregationOperator(visitInput(node.getInput(), context), node.getAggregatorList(),
-        node.getGroupByExprList());
-  }
+//  @Override
+//  public PhysicalPlan visitAggregation(AggregationOperator node, Object context) {
+//    return new AggregationOperator(visitInput(node.getInput(), context), node.getAggregatorList(),
+//        node.getGroupByExprList());
+//  }
 
   @Override
   public PhysicalPlan visitRareTopN(RareTopNOperator node, Object context) {
@@ -154,7 +155,7 @@ public class OpenSearchExecutionProtector extends ExecutionProtector {
     if (null == node) {
       return node;
     } else {
-      return node.accept(this, context);
+      return Optional.ofNullable(node.accept(this, context)).orElseGet(() -> node);
     }
   }
 

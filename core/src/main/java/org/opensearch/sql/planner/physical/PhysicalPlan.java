@@ -8,6 +8,7 @@ package org.opensearch.sql.planner.physical;
 
 import java.io.Serializable;
 import java.util.Iterator;
+import java.util.List;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.planner.PlanNode;
@@ -43,5 +44,12 @@ public abstract class PhysicalPlan implements PlanNode<PhysicalPlan>,
   public ExecutionEngine.Schema schema() {
     throw new IllegalStateException(String.format("[BUG] schema can been only applied to "
         + "ProjectOperator, instead of %s", toString()));
+  }
+
+  public void setContext(Object o) {
+    List<PhysicalPlan> child = getChild();
+    for (PhysicalPlan physicalPlan : child) {
+      physicalPlan.setContext(o);
+    }
   }
 }

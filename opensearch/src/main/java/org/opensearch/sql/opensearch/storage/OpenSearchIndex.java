@@ -7,6 +7,7 @@
 package org.opensearch.sql.opensearch.storage;
 
 import com.google.common.annotations.VisibleForTesting;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +19,9 @@ import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.data.type.ExprType;
+import org.opensearch.sql.expression.NamedExpression;
+import org.opensearch.sql.expression.ReferenceExpression;
+import org.opensearch.sql.expression.aggregation.NamedAggregator;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
 import org.opensearch.sql.opensearch.operator.stream.ParallelStream;
@@ -178,10 +182,18 @@ public class OpenSearchIndex implements Table {
     public PhysicalPlan visitIndexAggregation(OpenSearchLogicalIndexAgg node,
                                               OpenSearchIndexScan context) {
 
+      List<ReferenceExpression> expressionList = new ArrayList<>();
+      for (NamedAggregator namedAggregator : node.getAggregatorList()) {
+        expressionList.add((ReferenceExpression) namedAggregator.getArguments().get(0));
+      }
+      for (NamedExpression namedExpression : node.getGroupByList()) {
+        expressionList.add((ReferenceExpression) namedExpression.getDelegated());
+      }
+
       return new AggregationOperator(
           new ParallelStream(
               client.getNodeClient(), client.shards(node.getRelationName()),
-              new SearchStream()),
+              new SearchStream(expressionList)),
               node.getAggregatorList(), node.getGroupByList()
       );
     }

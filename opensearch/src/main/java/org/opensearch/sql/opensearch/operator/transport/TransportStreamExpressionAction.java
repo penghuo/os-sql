@@ -20,7 +20,11 @@ import org.opensearch.common.CheckedConsumer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
+import org.opensearch.index.IndexService;
+import org.opensearch.index.engine.Engine;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.sql.data.model.ExprCollectionValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.opensearch.operator.common.SerDe;
@@ -71,7 +75,8 @@ public class TransportStreamExpressionAction
               TransportChannel transportChannel,
               Task task)
               throws Exception {
-            nodeExecution(SerDe.deserialize(streamExpressionRequest.getStreamExpression()))
+            nodeExecution(SerDe.deserialize(streamExpressionRequest.getStreamExpression()),
+                streamExpressionRequest.getShardRouting())
                 .accept(transportChannel);
           }
         });
@@ -116,15 +121,34 @@ public class TransportStreamExpressionAction
         });
   }
 
-  static CheckedConsumer<TransportChannel, IOException> nodeExecution(PhysicalPlan plan) {
+  protected CheckedConsumer<TransportChannel, IOException> nodeExecution(PhysicalPlan plan, ShardRouting shardRouting) {
     List<ExprValue> result = new ArrayList<>();
-    plan.open();
 
-    while (plan.hasNext()) {
-      result.add(plan.next());
+    IndexService indexService = indicesService.indexServiceSafe(shardRouting.index());
+    IndexShard shard = indexService.getShard(shardRouting.shardId().id());
+    Engine.SearcherSupplier reader = shard.acquireSearcherSupplier();
+    final Engine.Searcher engineSearcher = reader.acquireSearcher("search");
+    try {
+      ContextIndexSearcher searcher =
+          new ContextIndexSearcher(
+              engineSearcher.getIndexReader(),
+              engineSearcher.getSimilarity(),
+              engineSearcher.getQueryCache(),
+              engineSearcher.getQueryCachingPolicy(),
+              false);
+      plan.setContext(searcher);
+      plan.open();
+
+      while (plan.hasNext()) {
+        result.add(plan.next());
+      }
+      plan.close();
+      ExprCollectionValue exprValue = new ExprCollectionValue(result);
+      return channel ->
+          channel.sendResponse(new StreamExpressionResponse(SerDe.serializeExprValue(exprValue)));
+    } catch (IOException e) {
+      throw new RuntimeException(e);
     }
-    ExprCollectionValue exprValue = new ExprCollectionValue(result);
-    return channel ->
-        channel.sendResponse(new StreamExpressionResponse(SerDe.serializeExprValue(exprValue)));
+
   }
 }

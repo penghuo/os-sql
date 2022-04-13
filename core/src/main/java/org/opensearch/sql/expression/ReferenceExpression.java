@@ -107,4 +107,8 @@ public class ReferenceExpression implements Expression {
       return resolve(value.keyValue(paths.get(0)), paths.subList(1, paths.size()));
     }
   }
+
+  public String path() {
+    return paths.get(0);
+  }
 }

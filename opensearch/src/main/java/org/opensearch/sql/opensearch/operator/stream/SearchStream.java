@@ -101,22 +101,24 @@ public class SearchStream extends PhysicalPlan {
       List<ExprValue> tuples = new ArrayList<>();
       for (Integer docId : docIds) {
         ImmutableMap.Builder<String, Object> mapBuilder = new ImmutableMap.Builder<>();
-
-        for(int i = 0; i < expressionList.size(); i++) {
-          final DocIdSetIterator iterator = docValueIterators.get(i);
-          docValueIterators.get(i).advance(docId);
-
-          if (expressionList.get(i).type() == ExprCoreType.STRING || expressionList.get(i).type() == OpenSearchDataType.OPENSEARCH_TEXT_KEYWORD) {
-            SortedDocValues stringIterator = (SortedDocValues) iterator;
-            BytesRef bytesRef = stringIterator.lookupOrd(stringIterator.ordValue());
-            mapBuilder.put(expressionList.get(i).path(), bytesRef.utf8ToString());
-          } else if (expressionList.get(i).type() == OpenSearchDataType.OPENSEARCH_IP) {
-            SortedDocValues stringIterator = (SortedDocValues) iterator;
-            BytesRef bytesRef = stringIterator.lookupOrd(stringIterator.ordValue());
-            mapBuilder.put(expressionList.get(i).path(), parseIP(bytesRef));
-          } else {
-            mapBuilder.put(expressionList.get(i).path(), ((NumericDocValues) iterator).longValue());
+        try {
+          for(int i = 0; i < expressionList.size(); i++) {
+            final DocIdSetIterator iterator = docValueIterators.get(i);
+            docValueIterators.get(i).advance(docId);
+              if (expressionList.get(i).type() == ExprCoreType.STRING || expressionList.get(i).type() == OpenSearchDataType.OPENSEARCH_TEXT_KEYWORD) {
+                SortedDocValues stringIterator = (SortedDocValues) iterator;
+                BytesRef bytesRef = stringIterator.lookupOrd(stringIterator.ordValue());
+                mapBuilder.put(expressionList.get(i).path(), bytesRef.utf8ToString());
+              } else if (expressionList.get(i).type() == OpenSearchDataType.OPENSEARCH_IP) {
+                SortedDocValues stringIterator = (SortedDocValues) iterator;
+                BytesRef bytesRef = stringIterator.lookupOrd(stringIterator.ordValue());
+                mapBuilder.put(expressionList.get(i).path(), parseIP(bytesRef));
+              } else {
+                mapBuilder.put(expressionList.get(i).path(), ((NumericDocValues) iterator).longValue());
+              }
           }
+        } catch (Exception e) {
+          continue;
         }
         tuples.add(ExprValueUtils.tupleValue(mapBuilder.build()));
       }

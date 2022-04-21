@@ -6,6 +6,7 @@
 package org.opensearch.sql.opensearch.benchmark;
 
 import com.google.common.collect.ImmutableMap;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.channels.Channels;
@@ -18,6 +19,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -44,6 +46,7 @@ import org.opensearch.sql.opensearch.operator.common.SerDe;
 @Warmup(iterations = 1)
 public class SerDeBenchmark {
   @Param({ "100", "1000", "10000"})
+//  @Param({ "100"})
   public int iterations;
 
   private Random ran = new Random();
@@ -60,18 +63,53 @@ public class SerDeBenchmark {
     allocator.close();
   }
 
+//  @org.openjdk.jmh.annotations.Benchmark
+//  public void ser_bindingTuple(SerDeBenchmark bh, Blackhole blackhole) {
+//    List<ExprValue> tuples = new ArrayList<>();
+//    for (int i = 0; i < bh.iterations; i++) {
+//      tuples.add(ExprValueUtils.tupleValue(
+//          ImmutableMap.of("integer", ran.nextInt(Integer.MAX_VALUE))));
+//    }
+//    blackhole.consume(SerDe.serializeExprValue(new ExprCollectionValue(tuples)));
+//  }
+
   @org.openjdk.jmh.annotations.Benchmark
-  public void ser_bindingTuple(SerDeBenchmark bh, Blackhole blackhole) {
+  public void serde_bindingTuple(SerDeBenchmark bh, Blackhole blackhole) {
     List<ExprValue> tuples = new ArrayList<>();
     for (int i = 0; i < bh.iterations; i++) {
       tuples.add(ExprValueUtils.tupleValue(
           ImmutableMap.of("integer", ran.nextInt(Integer.MAX_VALUE))));
     }
-    blackhole.consume(SerDe.serializeExprValue(new ExprCollectionValue(tuples)));
+    String data = SerDe.serializeExprValue(new ExprCollectionValue(tuples));
+
+    blackhole.consume(SerDe.deserializeExprValue(data));
   }
 
+//  @org.openjdk.jmh.annotations.Benchmark
+//  public void ser_arrow(SerDeBenchmark bh, Blackhole blackhole) throws IOException {
+//    int N = bh.iterations;
+//    IntVector intVector = new IntVector("integer", allocator);
+//    intVector.allocateNew(N);
+//    for (int i = 0; i < N; i++) {
+//      intVector.set(i, ran.nextInt(Integer.MAX_VALUE));
+//    }
+//    intVector.setValueCount(N);
+//
+//    List<Field> fields = Arrays.asList(intVector.getField());
+//    List<FieldVector> vectors = Arrays.asList(intVector);
+//    VectorSchemaRoot root = new VectorSchemaRoot(fields, vectors);
+//
+//    ByteArrayOutputStream out = new ByteArrayOutputStream();
+//    ArrowStreamWriter writer = new ArrowStreamWriter(root, null, Channels.newChannel(out));
+//    writer.start();
+//    writer.writeBatch();
+//    writer.end();
+//    blackhole.consume(out.toString());
+//    intVector.clear();
+//  }
+
   @org.openjdk.jmh.annotations.Benchmark
-  public void ser_arrow(SerDeBenchmark bh, Blackhole blackhole) throws IOException {
+  public void serde_arrow(SerDeBenchmark bh, Blackhole blackhole) throws IOException {
     int N = bh.iterations;
     IntVector intVector = new IntVector("integer", allocator);
     intVector.allocateNew(N);
@@ -89,7 +127,13 @@ public class SerDeBenchmark {
     writer.start();
     writer.writeBatch();
     writer.end();
-    blackhole.consume(out.toString());
+    final byte[] bytes = out.toByteArray();
     intVector.clear();
+
+    try (ArrowStreamReader reader = new ArrowStreamReader(new ByteArrayInputStream(bytes), allocator)) {
+      reader.loadNextBatch();
+      VectorSchemaRoot readRoot = reader.getVectorSchemaRoot();
+      blackhole.consume(readRoot);
+    }
   }
 }

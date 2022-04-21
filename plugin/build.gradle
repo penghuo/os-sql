@@ -63,6 +63,9 @@ configurations.all {
     resolutionStrategy.force 'com.google.guava:guava:31.0.1-jre'
     resolutionStrategy.force 'com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:2.13.2'
     resolutionStrategy.force 'com.fasterxml.jackson.core:jackson-databind:2.13.2.2'
+    resolutionStrategy.force 'org.apache.commons:commons-math3:3.6.1'
+    resolutionStrategy.force 'com.fasterxml.jackson.core:jackson-annotations:2.13.2'
+    resolutionStrategy.force 'org.slf4j:slf4j-api:1.7.30'
 }
 
 dependencies {

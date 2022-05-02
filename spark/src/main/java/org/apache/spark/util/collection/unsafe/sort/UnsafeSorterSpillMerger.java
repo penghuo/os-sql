@@ -1,0 +1,95 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.apache.spark.util.collection.unsafe.sort;
+
+import java.io.IOException;
+import java.util.Comparator;
+import java.util.PriorityQueue;
+
+final class UnsafeSorterSpillMerger {
+
+  private int numRecords = 0;
+  private final PriorityQueue<UnsafeSorterIterator> priorityQueue;
+
+  UnsafeSorterSpillMerger(
+      RecordComparator recordComparator,
+      PrefixComparator prefixComparator,
+      int numSpills) {
+    Comparator<UnsafeSorterIterator> comparator = (left, right) -> {
+      int prefixComparisonResult =
+        prefixComparator.compare(left.getKeyPrefix(), right.getKeyPrefix());
+      if (prefixComparisonResult == 0) {
+        return recordComparator.compare(
+          left.getBaseObject(), left.getBaseOffset(), left.getRecordLength(),
+          right.getBaseObject(), right.getBaseOffset(), right.getRecordLength());
+      } else {
+        return prefixComparisonResult;
+      }
+    };
+    priorityQueue = new PriorityQueue<>(numSpills, comparator);
+  }
+
+  /**
+   * Add an UnsafeSorterIterator to this merger
+   */
+  public void addSpillIfNotEmpty(UnsafeSorterIterator spillReader) throws IOException {
+    if (spillReader.hasNext()) {
+      // We only add the spillReader to the priorityQueue if it is not empty. We do this to
+      // make sure the hasNext method of UnsafeSorterIterator returned by getSortedIterator
+      // does not return wrong result because hasNext will return true
+      // at least priorityQueue.size() times. If we allow n spillReaders in the
+      // priorityQueue, we will have n extra empty records in the result of UnsafeSorterIterator.
+      spillReader.loadNext();
+      priorityQueue.add(spillReader);
+      numRecords += spillReader.getNumRecords();
+    }
+  }
+
+  public UnsafeSorterIterator getSortedIterator() throws IOException {
+    return new UnsafeSorterIterator() {
+
+      private UnsafeSorterIterator spillReader;
+
+      @Override
+      public int getNumRecords() {
+        return numRecords;
+      }
+
+      @Override
+      public long getCurrentPageNumber() {
+        throw new UnsupportedOperationException();
+      }
+
+      @Override
+      public boolean hasNext() {
+        return !priorityQueue.isEmpty() || (spillReader != null && spillReader.hasNext());
+      }
+
+      @Override
+      public void loadNext() throws IOException {
+        if (spillReader != null) {
+          if (spillReader.hasNext()) {
+            spillReader.loadNext();
+            priorityQueue.add(spillReader);
+          }
+        }
+        spillReader = priorityQueue.remove();
+      }
+
+      @Override
+      public Object getBaseObject() { return spillReader.getBaseObject(); }
+
+      @Override
+      public long getBaseOffset() { return spillReader.getBaseOffset(); }
+
+      @Override
+      public int getRecordLength() { return spillReader.getRecordLength(); }
+
+      @Override
+      public long getKeyPrefix() { return spillReader.getKeyPrefix(); }
+    };
+  }
+}

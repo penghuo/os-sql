@@ -44,6 +44,7 @@ services:
     restart: unless-stopped
     volumes:
       - spark:/usr/share/spark
+      - $HOME/.aws:/root/.aws:ro
 
   redis:
     image: redis:latest

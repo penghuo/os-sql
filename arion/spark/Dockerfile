@@ -22,23 +22,28 @@ COPY log4j.properties /opt/spark/conf/log4j.properties
 COPY jars/*.* /opt/spark/jars
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# expose port 8080 for spark UI
-EXPOSE 4040 6066 7077 8080 18080 8081 10000
+WORKDIR /opt/spark
 
-# RUN wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-oss-7.10.2-linux-x86_64.tar.gz \
-# &&  tar -xf elasticsearch-oss-7.10.2-linux-x86_64.tar.gz \
-# &&  mv elasticsearch-7.10.2 /opt/elasticsearch
+ENV SPARK_MASTER_PORT=7077 \
+SPARK_MASTER_WEBUI_PORT=8080 \
+SPARK_LOG_DIR=/opt/spark/logs \
+SPARK_MASTER_LOG=/opt/spark/logs/spark-master.out \
+SPARK_WORKER_LOG=/opt/spark/logs/spark-worker.out \
+SPARK_WORKER_WEBUI_PORT=8080 \
+SPARK_WORKER_PORT=7000 \
+SPARK_MASTER="spark://spark-master:7077" \
+SPARK_WORKLOAD="master" \
+SPARK_HOME=/opt/spark
 
+EXPOSE 4040 8080 7077 6066 10000
 
-# RUN groupadd arion
-# RUN useradd arion -g arion -p arion
-# RUN chown -R arion:arion /opt/elasticsearch
-# RUN chown -R arion:arion /opt/spark
-# RUN chown -R arion:arion /opt/elasticsearch/config/elasticsearch.keystore
-# RUN chmod o+x /opt/ /opt/elasticsearch/ /opt/spark
-# RUN chgrp arion /opt/elasticsearch/
-# RUN su - arion
+# CMD ["/usr/bin/supervisord"]
+RUN mkdir -p $SPARK_LOG_DIR && \
+touch $SPARK_MASTER_LOG && \
+touch $SPARK_WORKER_LOG && \
+ln -sf /dev/stdout $SPARK_MASTER_LOG && \
+ln -sf /dev/stdout $SPARK_WORKER_LOG
 
-#default command: this is just an option 
-# CMD ["/opt/spark/sbin/start-thriftserver.sh"]
-CMD ["/usr/bin/supervisord"]
+COPY start-spark.sh /
+
+CMD ["/bin/bash", "/start-spark.sh"]

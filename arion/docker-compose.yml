@@ -18,8 +18,8 @@ x-superset-image: &superset-image penghuo/superset:latest
 x-superset-depends-on: &superset-depends-on
   - db
   - redis
-  - spark
-  - es
+  - spark-thrift
+  - os
 x-superset-volumes: &superset-volumes
   # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
   - ./docker:/app/docker
@@ -27,16 +27,19 @@ x-superset-volumes: &superset-volumes
 
 version: "3.7"
 services:
-  es:
-    image: docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2
+  os:
+    image: opensearchproject/opensearch:2.0.0
     environment:
       - discovery.type=single-node
+      - "DISABLE_INSTALL_DEMO_CONFIG=true"
+      - "DISABLE_SECURITY_PLUGIN=true"
     ports:
-      - 9200:9200    
-    container_name: superset_es
+      - 9200:9200
+      - 9600:9600
+    container_name: superset-os
     restart: unless-stopped
     volumes:
-      - es_data:/usr/share/elasticsearch/data
+      - os_data:/usr/share/opensearch/data
 
   spark-thrift:
     image: penghuo/spark:latest
@@ -47,7 +50,7 @@ services:
     depends_on:
       - spark-master
       - spark-worker-1
-      - spark-worker-2
+      # - spark-worker-2
     volumes:
       - spark:/usr/share/spark
       - $HOME/.aws:/root/.aws:ro
@@ -102,9 +105,9 @@ services:
   #   environment:
   #     - SPARK_MASTER=spark://spark-master:7077
   #     - SPARK_WORKER_CORES=1
-  #     - SPARK_WORKER_MEMORY=1G
-  #     - SPARK_DRIVER_MEMORY=1G
-  #     - SPARK_EXECUTOR_MEMORY=1G
+  #     - SPARK_WORKER_MEMORY=2G
+  #     - SPARK_DRIVER_MEMORY=2G
+  #     - SPARK_EXECUTOR_MEMORY=2G
   #     - SPARK_WORKLOAD=worker
   #     - SPARK_LOCAL_IP=spark-worker-2
 
@@ -171,7 +174,7 @@ volumes:
     external: false
   redis:
     external: false
-  es_data:
+  os_data:
     external: false
   spark:
     external: false

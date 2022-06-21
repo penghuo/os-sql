@@ -7,12 +7,16 @@ package org.opensearch.sql.opensearch.s3.transport;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionFuture;
@@ -24,7 +28,6 @@ import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
-import org.opensearch.action.support.WriteRequest;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -49,7 +52,7 @@ public class TransportCreateViewAction
 
   private static final Logger LOG = LogManager.getLogger();
 
-  private static int BATCH = 1000;
+  private static int BATCH = 5000;
 
   public static final String ACTION_NAME = "n/view/create";
 
@@ -87,7 +90,7 @@ public class TransportCreateViewAction
               new CreateIndexRequest(request.indexName)
                   .settings(
                       Settings.builder()
-                          .put("index.number_of_shards", 1)
+                          .put("index.number_of_shards", 5)
                           .put("index.number_of_replicas", 0)
                           .put("index.routing.allocation.include._id", localNode.getId())
                           .put("index.translog.durability", "async")
@@ -96,31 +99,77 @@ public class TransportCreateViewAction
 
           ActionFuture<CreateIndexResponse> indexResponseActionFuture =
               nodeClient.admin().indices().create(createIndexRequest);
-
-          // scan partition
-          S3Scan s3Scan = new S3Scan(request.partitions);
-          s3Scan.open();
-
           // send failure response
           CreateIndexResponse createIndexResponse = indexResponseActionFuture.get();
           if (!createIndexResponse.isAcknowledged()) {
             channel.sendResponse(new CreateViewResponse(false));
           }
 
-          // bulk write
-          while (true) {
-            Optional<BulkRequest> bulkRequest = bulkRequest(s3Scan, request.indexName);
-            if (!bulkRequest.isPresent()) {
-              break;
-            }
-            ActionFuture<BulkResponse> bulkResponseActionFuture =
-                nodeClient.bulk(bulkRequest.get());
-            BulkResponse bulkResponse = bulkResponseActionFuture.get();
+          ThreadPool threadPool = nodeClient.threadPool();
+          ExecutorService executorService = threadPool.executor("sql-worker");
+//          CompletionService<Boolean> completionService =
+//              new ExecutorCompletionService<>(executorService);
 
-            LOG.info("bulk took: {}", bulkResponse.getTook());
+          List<CompletableFuture<Boolean>> futures = new ArrayList<>(request.partitions.size());
+
+          for (OSS3Object partition : request.partitions) {
+            futures.add(CompletableFuture.supplyAsync(() -> {
+              S3Scan s3Scan =
+                  new S3Scan(Collections.singletonList(partition));
+              s3Scan.open();
+
+              // bulk write
+              while (true) {
+                Optional<BulkRequest> bulkRequest = bulkRequest(s3Scan, request.indexName);
+                if (!bulkRequest.isPresent()) {
+                  break;
+                }
+                ActionFuture<BulkResponse> bulkResponseActionFuture =
+                    nodeClient.bulk(bulkRequest.get());
+                try {
+                  BulkResponse bulkResponse = bulkResponseActionFuture.get();
+                  LOG.info("bulk took: {}", bulkResponse.getTook());
+                } catch (Exception e) {
+                  throw new RuntimeException(e);
+                }
+              }
+              s3Scan.close();
+              return true;
+            }, executorService));
           }
 
-          s3Scan.close();
+//          for (int i = 0; i < request.partitions.size(); i++) {
+//            final int index = i;
+//            completionService.submit(
+//                () -> {
+//                  // scan partition
+//                  S3Scan s3Scan =
+//                      new S3Scan(Collections.singletonList(request.partitions.get(index)));
+//                  s3Scan.open();
+//
+//                  // bulk write
+//                  while (true) {
+//                    Optional<BulkRequest> bulkRequest = bulkRequest(s3Scan, request.indexName);
+//                    if (!bulkRequest.isPresent()) {
+//                      break;
+//                    }
+//                    ActionFuture<BulkResponse> bulkResponseActionFuture =
+//                        nodeClient.bulk(bulkRequest.get());
+//                    try {
+//                      BulkResponse bulkResponse = bulkResponseActionFuture.get();
+//                      LOG.info("bulk took: {}", bulkResponse.getTook());
+//                    } catch (Exception e) {
+//                      throw new RuntimeException(e);
+//                    }
+//                  }
+//                  s3Scan.close();
+//                  futures.get(index).complete(true);
+//
+//                  return true;
+//                });
+//          }
+
+          CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
           channel.sendResponse(new CreateViewResponse(true));
         });
   }

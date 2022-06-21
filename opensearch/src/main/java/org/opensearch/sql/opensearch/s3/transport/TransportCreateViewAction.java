@@ -107,8 +107,6 @@ public class TransportCreateViewAction
 
           ThreadPool threadPool = nodeClient.threadPool();
           ExecutorService executorService = threadPool.executor("sql-worker");
-//          CompletionService<Boolean> completionService =
-//              new ExecutorCompletionService<>(executorService);
 
           List<CompletableFuture<Boolean>> futures = new ArrayList<>(request.partitions.size());
 
@@ -138,37 +136,6 @@ public class TransportCreateViewAction
             }, executorService));
           }
 
-//          for (int i = 0; i < request.partitions.size(); i++) {
-//            final int index = i;
-//            completionService.submit(
-//                () -> {
-//                  // scan partition
-//                  S3Scan s3Scan =
-//                      new S3Scan(Collections.singletonList(request.partitions.get(index)));
-//                  s3Scan.open();
-//
-//                  // bulk write
-//                  while (true) {
-//                    Optional<BulkRequest> bulkRequest = bulkRequest(s3Scan, request.indexName);
-//                    if (!bulkRequest.isPresent()) {
-//                      break;
-//                    }
-//                    ActionFuture<BulkResponse> bulkResponseActionFuture =
-//                        nodeClient.bulk(bulkRequest.get());
-//                    try {
-//                      BulkResponse bulkResponse = bulkResponseActionFuture.get();
-//                      LOG.info("bulk took: {}", bulkResponse.getTook());
-//                    } catch (Exception e) {
-//                      throw new RuntimeException(e);
-//                    }
-//                  }
-//                  s3Scan.close();
-//                  futures.get(index).complete(true);
-//
-//                  return true;
-//                });
-//          }
-
           CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
           channel.sendResponse(new CreateViewResponse(true));
         });
@@ -176,18 +143,16 @@ public class TransportCreateViewAction
 
   private Map<String, Object> fieldsMapping(Map<String, Object> fieldsMapping) {
     Map<String, Object> properties = new HashMap<>();
-    fieldsMapping.entrySet().stream()
-        .map(
-            entry ->
-                properties.put(
-                    entry.getKey(),
-                    new HashMap<String, Object>() {
-                      {
-                        put("type", entry.getValue());
-                      }
-                    }));
+    fieldsMapping.forEach((key, value) -> properties.put(
+        key,
+        new HashMap<String, Object>() {
+          {
+            put("type", value);
+          }
+        }));
 
     Map<String, Object> mapping = new HashMap<>();
+    mapping.put("dynamic", false);
     mapping.put("properties", properties);
 
     return mapping;

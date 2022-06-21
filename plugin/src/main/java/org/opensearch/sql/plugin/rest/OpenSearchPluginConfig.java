@@ -20,9 +20,11 @@ import org.opensearch.sql.opensearch.monitor.OpenSearchMemoryHealthy;
 import org.opensearch.sql.opensearch.monitor.OpenSearchResourceMonitor;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
 import org.opensearch.sql.storage.StorageEngine;
+import org.opensearch.sql.thunder.ThunderService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Scope;
 
 /**
  * OpenSearch plugin config that injects cluster service and node client from plugin
@@ -42,7 +44,7 @@ public class OpenSearchPluginConfig {
 
   @Bean
   public OpenSearchClient client() {
-    return new OpenSearchNodeClient(clusterService, nodeClient);
+    return new OpenSearchNodeClient(clusterService, nodeClient, thunderService());
   }
 
   @Bean
@@ -63,5 +65,11 @@ public class OpenSearchPluginConfig {
   @Bean
   public ExecutionProtector protector() {
     return new OpenSearchExecutionProtector(resourceMonitor());
+  }
+
+  @Bean
+  @Scope("singleton")
+  public ThunderService thunderService() {
+    return new ThunderService();
   }
 }

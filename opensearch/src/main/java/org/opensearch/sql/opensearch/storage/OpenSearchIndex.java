@@ -7,13 +7,22 @@
 package org.opensearch.sql.opensearch.storage;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.opensearch.action.ActionFuture;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchRequestBuilder;
+import org.opensearch.client.node.NodeClient;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.data.type.ExprType;
@@ -27,6 +36,9 @@ import org.opensearch.sql.opensearch.planner.physical.MLCommonsOperator;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexRequest;
 import org.opensearch.sql.opensearch.response.agg.OpenSearchAggregationResponseParser;
+import org.opensearch.sql.opensearch.s3.transport.CreateViewAction;
+import org.opensearch.sql.opensearch.s3.transport.CreateViewRequest;
+import org.opensearch.sql.opensearch.s3.transport.CreateViewResponse;
 import org.opensearch.sql.opensearch.storage.script.aggregation.AggregationQueryBuilder;
 import org.opensearch.sql.opensearch.storage.script.filter.FilterQueryBuilder;
 import org.opensearch.sql.opensearch.storage.script.sort.SortQueryBuilder;
@@ -63,7 +75,41 @@ public class OpenSearchIndex implements Table {
   public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName) {
     this.client = client;
     this.settings = settings;
-    this.indexName = new OpenSearchRequest.IndexName(indexName);
+
+    if(indexName.toLowerCase(Locale.ROOT).startsWith("s3")) {
+      Optional<String> optIndexName = client.get(indexName);
+      // cached index
+      if (optIndexName.isPresent()) {
+        this.indexName = new OpenSearchRequest.IndexName(optIndexName.get());
+      } else {
+        NodeClient nodeClient = client.getNodeClient();
+        String indexPrefix = RandomStringUtils.random(10, false, true);
+        ActionFuture<CreateViewResponse> actionFuture = nodeClient.execute(CreateViewAction.INSTANCE,
+            new CreateViewRequest(
+                indexName,
+                indexPrefix,
+                new ImmutableMap.Builder<String, Object>()
+                    .put("@timestamp", "date")
+                    .put("clientip", "keyword")
+                    .put("request", "text")
+                    .put("size", "integer")
+                    .put("status", "integer")
+                    .build()
+            ));
+        try {
+          if (!actionFuture.get().isStatus()) {
+            throw new RuntimeException("create view failed");
+          }
+        } catch (Exception e) {
+          throw new RuntimeException(e);
+        }
+        String newIndexName = String.format("%s-*", indexPrefix);
+        client.put(indexName, newIndexName);
+        this.indexName = new OpenSearchRequest.IndexName(newIndexName);
+      }
+    } else {
+      this.indexName = new OpenSearchRequest.IndexName(indexName);
+    }
   }
 
   /*

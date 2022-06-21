@@ -23,10 +23,12 @@ import org.opensearch.sql.opensearch.monitor.OpenSearchMemoryHealthy;
 import org.opensearch.sql.opensearch.monitor.OpenSearchResourceMonitor;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
 import org.opensearch.sql.storage.StorageEngine;
+import org.opensearch.sql.thunder.ThunderService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Scope;
 
 /**
  * OpenSearch Plugin Config for SQL.
@@ -46,9 +48,11 @@ public class OpenSearchSQLPluginConfig {
   @Autowired
   private BuiltinFunctionRepository functionRepository;
 
+  private static ThunderService thunderService = new ThunderService();
+
   @Bean
   public OpenSearchClient client() {
-    return new OpenSearchNodeClient(clusterService, nodeClient);
+    return new OpenSearchNodeClient(clusterService, nodeClient, thunderService);
   }
 
   @Bean

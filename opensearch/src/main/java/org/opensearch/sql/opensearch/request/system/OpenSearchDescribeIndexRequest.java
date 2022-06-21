@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.opensearch.sql.data.model.ExprTupleValue;
@@ -111,12 +112,24 @@ public class OpenSearchDescribeIndexRequest implements OpenSearchSystemRequest {
    */
   public Map<String, ExprType> getFieldTypes() {
     Map<String, ExprType> fieldTypes = new HashMap<>();
-    Map<String, IndexMapping> indexMappings = client.getIndexMappings(indexName.getIndexNames());
-    for (IndexMapping indexMapping : indexMappings.values()) {
-      fieldTypes
-          .putAll(indexMapping.getAllFieldTypes(this::transformESTypeToExprType).entrySet().stream()
-              .filter(entry -> !ExprCoreType.UNKNOWN.equals(entry.getValue()))
-              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
+
+    // todo, add TABLE DML.
+    if (indexName.getIndexNames()[0].toLowerCase(Locale.ROOT).startsWith("s3")) {
+      return new ImmutableMap.Builder<String, ExprType>()
+          .put("@timestamp", ExprCoreType.TIMESTAMP)
+          .put("clientip", ExprCoreType.STRING)
+          .put("request", OpenSearchDataType.OPENSEARCH_TEXT)
+          .put("size", ExprCoreType.INTEGER)
+          .put("status", ExprCoreType.INTEGER)
+          .build();
+    } else {
+      Map<String, IndexMapping> indexMappings = client.getIndexMappings(indexName.getIndexNames());
+      for (IndexMapping indexMapping : indexMappings.values()) {
+        fieldTypes
+            .putAll(indexMapping.getAllFieldTypes(this::transformESTypeToExprType).entrySet().stream()
+                .filter(entry -> !ExprCoreType.UNKNOWN.equals(entry.getValue()))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
+      }
     }
     return fieldTypes;
   }

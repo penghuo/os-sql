@@ -24,12 +24,18 @@ public class OpenSearchStorageEngine implements StorageEngine {
 
   private final Settings settings;
 
+  private Table table = null;
+
   @Override
   public Table getTable(String name) {
-    if (isSystemIndex(name)) {
-      return new OpenSearchSystemIndex(client, name);
-    } else {
-      return new OpenSearchIndex(client, settings, name);
+    if (table != null) {
+      return table;
     }
+    if (isSystemIndex(name)) {
+      table = new OpenSearchSystemIndex(client, name);
+    } else {
+      table = new OpenSearchIndex(client, settings, name);
+    }
+    return table;
   }
 }

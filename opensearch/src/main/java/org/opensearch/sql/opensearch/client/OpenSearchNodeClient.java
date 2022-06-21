@@ -13,7 +13,9 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -32,6 +34,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
+import org.opensearch.sql.thunder.ThunderService;
 import org.opensearch.threadpool.ThreadPool;
 
 /** OpenSearch connection by node client. */
@@ -51,6 +54,8 @@ public class OpenSearchNodeClient implements OpenSearchClient {
 
   private static final String SQL_WORKER_THREAD_POOL_NAME = "sql-worker";
 
+  private final ThunderService thunderService;
+
   /**
    * Constructor of ElasticsearchNodeClient.
    */
@@ -59,6 +64,16 @@ public class OpenSearchNodeClient implements OpenSearchClient {
     this.clusterService = clusterService;
     this.client = client;
     this.resolver = new IndexNameExpressionResolver(client.threadPool().getThreadContext());
+    this.thunderService = null;
+  }
+
+  public OpenSearchNodeClient(ClusterService clusterService,
+                              NodeClient client,
+                              ThunderService thunderService) {
+    this.clusterService = clusterService;
+    this.client = client;
+    this.resolver = new IndexNameExpressionResolver(client.threadPool().getThreadContext());
+    this.thunderService = thunderService;
   }
 
   /**
@@ -170,5 +185,13 @@ public class OpenSearchNodeClient implements OpenSearchClient {
       ThreadContext.putAll(currentContext);
       task.run();
     };
+  }
+
+  public void put(String tableName, String indexName) {
+    thunderService.put(tableName, indexName);
+  }
+
+  public Optional<String> get(String tableName) {
+    return thunderService.get(tableName);
   }
 }

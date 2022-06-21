@@ -13,6 +13,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Supplier;
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.ActionResponse;
 import org.opensearch.client.Client;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -41,6 +43,8 @@ import org.opensearch.sql.legacy.executor.AsyncRestExecutor;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
+import org.opensearch.sql.opensearch.s3.transport.CreateViewAction;
+import org.opensearch.sql.opensearch.s3.transport.TransportCreateViewAction;
 import org.opensearch.sql.opensearch.setting.LegacyOpenDistroSettings;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.opensearch.storage.script.ExpressionScriptEngine;
@@ -48,6 +52,7 @@ import org.opensearch.sql.opensearch.storage.serialization.DefaultExpressionSeri
 import org.opensearch.sql.plugin.rest.RestPPLQueryAction;
 import org.opensearch.sql.plugin.rest.RestPPLStatsAction;
 import org.opensearch.sql.plugin.rest.RestQuerySettingsAction;
+import org.opensearch.sql.plugin.rest.RestS3QueryAction;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -88,7 +93,8 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin {
         new RestSqlAction(settings, clusterService, pluginSettings),
         new RestSqlStatsAction(settings, restController),
         new RestPPLStatsAction(settings, restController),
-        new RestQuerySettingsAction(settings, restController)
+        new RestQuerySettingsAction(settings, restController),
+        new RestS3QueryAction()
     );
   }
 
@@ -142,4 +148,9 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin {
     return new ExpressionScriptEngine(new DefaultExpressionSerializer());
   }
 
+  @Override
+  public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
+    return ImmutableList.of(
+        new ActionHandler<>(CreateViewAction.INSTANCE, TransportCreateViewAction.class));
+  }
 }

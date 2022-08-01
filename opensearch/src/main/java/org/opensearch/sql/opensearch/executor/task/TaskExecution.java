@@ -1,0 +1,51 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.sql.opensearch.executor.task;
+
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import lombok.RequiredArgsConstructor;
+import org.opensearch.sql.planner.physical.PhysicalPlan;
+
+@RequiredArgsConstructor
+public class TaskExecution {
+
+  public static ListenableFuture<?> NOT_BLOCKED = Futures.immediateFuture(null);
+
+  private final PhysicalPlan plan;
+
+  private final PhysicalPlan source;
+
+  private final TaskState taskState;
+
+  public ListenableFuture<?> execute() {
+    ListenableFuture<?> blocked = isBlocked();
+    if (blocked != NOT_BLOCKED) {
+      return blocked;
+    }
+    try {
+      plan.open();
+
+      while (plan.hasNext()) {
+        plan.next();
+      }
+    } finally{
+      plan.close();
+    }
+    return NOT_BLOCKED;
+  }
+
+  /**
+   * plan is blocked?
+   */
+  private ListenableFuture<?> isBlocked() {
+    return NOT_BLOCKED;
+  }
+
+  public TaskState taskState() {
+    return taskState;
+  }
+}

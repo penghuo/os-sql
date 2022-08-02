@@ -6,7 +6,7 @@
 package org.opensearch.sql.opensearch.executor.stage;
 
 public class StageState {
-  enum StageExecutionState {
+  public enum StageExecutionState {
     SCHEDULING,
     RUNNING,
     FINISH

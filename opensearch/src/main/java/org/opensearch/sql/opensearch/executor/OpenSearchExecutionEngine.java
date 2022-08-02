@@ -9,6 +9,8 @@ package org.opensearch.sql.opensearch.executor;
 import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Future;
+import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
@@ -16,6 +18,9 @@ import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.Explain;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
+import org.opensearch.sql.opensearch.executor.scheduler.ExecutionSchedule;
+import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
+import org.opensearch.sql.opensearch.executor.stage.StagePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
 
@@ -46,6 +51,24 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             listener.onFailure(e);
           } finally {
             plan.close();
+          }
+        });
+  }
+
+  public void tempexecute(StagePlan stages, ResponseListener<QueryResponse> listener) {
+    Function<List<StageScheduler>, StageScheduler> nextOne = null;
+    client.schedule(
+        () -> {
+          try {
+            ExecutionSchedule executionSchedule = new ExecutionSchedule();
+            while (!executionSchedule.isDone()) {
+              StageScheduler stageScheduler = executionSchedule.nextStage();
+              stageScheduler.schedule();
+            }
+          } catch (Exception e) {
+            // listener.onFailure(e);
+          } finally{
+            // todo
           }
         });
   }

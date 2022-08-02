@@ -12,7 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
-import org.opensearch.sql.opensearch.executor.Split;
+import org.opensearch.sql.opensearch.executor.splits.Split;
 
 /** Each node has a singleton TaskService which is started during node bootstrap. */
 @RequiredArgsConstructor

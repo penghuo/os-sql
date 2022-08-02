@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.opensearch.executor.stage;
 
+import java.util.List;
 import lombok.Data;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 
@@ -12,4 +13,5 @@ import org.opensearch.sql.planner.logical.LogicalPlan;
 public class StagePlan {
   private final StageId stageId;
   private final LogicalPlan plan;
+  private final List<StagePlan> child;
 }

@@ -8,6 +8,7 @@ package org.opensearch.sql.executor;
 
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -27,7 +28,7 @@ public interface ExecutionEngine {
    * @param plan     executable physical plan
    * @param listener response listener
    */
-  void execute(PhysicalPlan plan, ResponseListener<QueryResponse> listener);
+  void execute(Supplier<PhysicalPlan> plan, ResponseListener<QueryResponse> listener);
 
   /**
    * Explain physical plan and call back response listener. The reason why this has to
@@ -37,7 +38,7 @@ public interface ExecutionEngine {
    * @param plan     physical plan to explain
    * @param listener response listener
    */
-  void explain(PhysicalPlan plan, ResponseListener<ExplainResponse> listener);
+  void explain(Supplier<PhysicalPlan> plan, ResponseListener<ExplainResponse> listener);
 
   /**
    * Data class that encapsulates ExprValue.

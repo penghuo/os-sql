@@ -57,7 +57,7 @@ public class PPLService {
    */
   public void execute(PPLQueryRequest request, ResponseListener<QueryResponse> listener) {
     try {
-      executionEngine.execute(plan(request), listener);
+      executionEngine.execute(() -> plan(request), listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }
@@ -72,7 +72,7 @@ public class PPLService {
    */
   public void explain(PPLQueryRequest request, ResponseListener<ExplainResponse> listener) {
     try {
-      executionEngine.explain(plan(request), listener);
+      executionEngine.explain(() -> plan(request), listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }

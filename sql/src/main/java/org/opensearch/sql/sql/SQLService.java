@@ -49,7 +49,7 @@ public class SQLService {
    */
   public void execute(SQLQueryRequest request, ResponseListener<QueryResponse> listener) {
     try {
-      executionEngine.execute(
+      executionEngine.execute(() ->
                         plan(
                             analyze(
                                 parse(request.getQuery()))), listener);
@@ -65,7 +65,7 @@ public class SQLService {
    */
   public void execute(PhysicalPlan plan, ResponseListener<QueryResponse> listener) {
     try {
-      executionEngine.execute(plan, listener);
+      executionEngine.execute(() -> plan, listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }
@@ -78,7 +78,7 @@ public class SQLService {
    */
   public void explain(PhysicalPlan plan, ResponseListener<ExplainResponse> listener) {
     try {
-      executionEngine.explain(plan, listener);
+      executionEngine.explain(() -> plan, listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }

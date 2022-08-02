@@ -76,7 +76,7 @@ class OpenSearchExecutionEngineTest {
     OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
     List<ExprValue> actual = new ArrayList<>();
     executor.execute(
-        plan,
+        () -> plan,
         new ResponseListener<QueryResponse>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -104,7 +104,7 @@ class OpenSearchExecutionEngineTest {
     OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
     AtomicReference<Exception> actual = new AtomicReference<>();
     executor.execute(
-        plan,
+        () -> plan,
         new ResponseListener<QueryResponse>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -129,7 +129,7 @@ class OpenSearchExecutionEngineTest {
         settings, "test", mock(OpenSearchExprValueFactory.class));
 
     AtomicReference<ExplainResponse> result = new AtomicReference<>();
-    executor.explain(plan, new ResponseListener<ExplainResponse>() {
+    executor.explain(() -> plan, new ResponseListener<ExplainResponse>() {
       @Override
       public void onResponse(ExplainResponse response) {
         result.set(response);
@@ -151,7 +151,7 @@ class OpenSearchExecutionEngineTest {
     when(plan.accept(any(), any())).thenThrow(IllegalStateException.class);
 
     AtomicReference<Exception> result = new AtomicReference<>();
-    executor.explain(plan, new ResponseListener<ExplainResponse>() {
+    executor.explain(() -> plan, new ResponseListener<ExplainResponse>() {
       @Override
       public void onResponse(ExplainResponse response) {
         fail("Should fail as expected");

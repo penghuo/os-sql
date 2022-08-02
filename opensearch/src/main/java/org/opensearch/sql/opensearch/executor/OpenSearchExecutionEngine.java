@@ -9,6 +9,7 @@ package org.opensearch.sql.opensearch.executor;
 import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
@@ -28,10 +29,12 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   private final ExecutionProtector executionProtector;
 
   @Override
-  public void execute(PhysicalPlan physicalPlan, ResponseListener<QueryResponse> listener) {
-    PhysicalPlan plan = executionProtector.protect(physicalPlan);
+  public void execute(Supplier<PhysicalPlan> physicalPlanSupplier,
+                      ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
+          PhysicalPlan physicalPlan = physicalPlanSupplier.get();
+          PhysicalPlan plan = executionProtector.protect(physicalPlan);
           try {
             List<ExprValue> result = new ArrayList<>();
             plan.open();
@@ -51,9 +54,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   @Override
-  public void explain(PhysicalPlan plan, ResponseListener<ExplainResponse> listener) {
+  public void explain(Supplier<PhysicalPlan> physicalPlanSupplier, ResponseListener<ExplainResponse> listener) {
     client.schedule(() -> {
       try {
+        PhysicalPlan plan = physicalPlanSupplier.get();
         Explain openSearchExplain = new Explain() {
           @Override
           public ExplainResponseNode visitTableScan(TableScanOperator node, Object context) {
@@ -62,7 +66,6 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             });
           }
         };
-
         listener.onResponse(openSearchExplain.apply(plan));
       } catch (Exception e) {
         listener.onFailure(e);

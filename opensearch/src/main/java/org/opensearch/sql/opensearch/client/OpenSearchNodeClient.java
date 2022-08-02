@@ -9,18 +9,26 @@ package org.opensearch.sql.opensearch.client;
 import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Streams;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.logging.log4j.ThreadContext;
+import org.opensearch.action.ActionFuture;
 import org.opensearch.action.admin.indices.get.GetIndexResponse;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.support.IndicesOptions;
+import org.opensearch.client.RequestOptions;
+//import org.opensearch.client.indices.GetMappingsRequest;
+//import org.opensearch.client.indices.GetMappingsResponse;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
@@ -75,14 +83,15 @@ public class OpenSearchNodeClient implements OpenSearchClient {
   @Override
   public Map<String, IndexMapping> getIndexMappings(String... indexExpression) {
     try {
-      ClusterState state = clusterService.state();
-      String[] concreteIndices = resolveIndexExpression(state, indexExpression);
-
-      return populateIndexMappings(
-          state.metadata().findMappings(concreteIndices, ALL_FIELDS));
-    } catch (IOException e) {
-      throw new IllegalStateException(
-          "Failed to read mapping in cluster state for index pattern [" + indexExpression + "]", e);
+      GetMappingsResponse mappingsResponse = client.admin().indices()
+          .prepareGetMappings(indexExpression)
+          .setLocal(true)
+          .get();
+      return Streams.stream(mappingsResponse.mappings().iterator())
+          .collect(Collectors.toMap(cursor -> cursor.key,
+              cursor -> new IndexMapping(cursor.value)));
+    } catch (Exception e) {
+      throw new IllegalStateException("Failed to get index mappings for " + indexExpression, e);
     }
   }
 

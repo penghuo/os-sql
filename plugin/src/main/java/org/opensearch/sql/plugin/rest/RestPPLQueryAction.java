@@ -10,6 +10,7 @@ import static org.opensearch.rest.RestStatus.BAD_REQUEST;
 import static org.opensearch.rest.RestStatus.INTERNAL_SERVER_ERROR;
 import static org.opensearch.rest.RestStatus.OK;
 import static org.opensearch.rest.RestStatus.SERVICE_UNAVAILABLE;
+import static org.opensearch.sql.legacy.executor.AsyncRestExecutor.SQL_WORKER_THREAD_POOL_NAME;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
 
 import com.google.common.collect.ImmutableList;
@@ -18,12 +19,15 @@ import java.security.PrivilegedExceptionAction;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -56,6 +60,7 @@ import org.opensearch.sql.protocol.response.format.RawResponseFormatter;
 import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
+import org.opensearch.threadpool.ThreadPool;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 public class RestPPLQueryAction extends BaseRestHandler {
@@ -136,10 +141,13 @@ public class RestPPLQueryAction extends BaseRestHandler {
     PPLService pplService = createPPLService(nodeClient);
     PPLQueryRequest pplRequest = PPLQueryRequestFactory.getPPLRequest(request);
 
-    if (pplRequest.isExplainRequest()) {
-      return channel -> pplService.explain(pplRequest, createExplainResponseListener(channel));
-    }
-    return channel -> pplService.execute(pplRequest, createListener(channel, pplRequest));
+    return channel -> schedule(nodeClient, () -> {
+      if (pplRequest.isExplainRequest()) {
+        pplService.explain(pplRequest, createExplainResponseListener(channel));
+      } else {
+        pplService.execute(pplRequest, createListener(channel, pplRequest));
+      }
+    });
   }
 
   /**
@@ -255,5 +263,22 @@ public class RestPPLQueryAction extends BaseRestHandler {
         || e instanceof ExpressionEvaluationException
         || e instanceof QueryEngineException
         || e instanceof SyntaxCheckException;
+  }
+
+  private void schedule(NodeClient client, Runnable task) {
+    ThreadPool threadPool = client.threadPool();
+    threadPool.schedule(
+        withCurrentContext(task),
+        new TimeValue(0),
+        SQL_WORKER_THREAD_POOL_NAME
+    );
+  }
+
+  private static Runnable withCurrentContext(final Runnable task) {
+    final Map<String, String> currentContext = ThreadContext.getImmutableContext();
+    return () -> {
+      ThreadContext.putAll(currentContext);
+      task.run();
+    };
   }
 }

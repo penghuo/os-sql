@@ -21,6 +21,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.action.admin.indices.get.GetIndexResponse;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.ClusterState;
@@ -29,11 +30,9 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.ImmutableOpenMap;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
-import org.opensearch.threadpool.ThreadPool;
 
 /** OpenSearch connection by node client. */
 public class OpenSearchNodeClient implements OpenSearchClient {
@@ -79,12 +78,12 @@ public class OpenSearchNodeClient implements OpenSearchClient {
   @Override
   public Map<String, IndexMapping> getIndexMappings(String... indexExpression) {
     try {
-      ClusterState state = clusterService.state();
-      String[] concreteIndices = resolveIndexExpression(state, indexExpression);
-
-      return populateIndexMappings(
-          state.metadata().findMappings(concreteIndices, ALL_TYPES, ALL_FIELDS));
-    } catch (IOException e) {
+      GetMappingsResponse mappingsResponse = client.admin().indices()
+          .prepareGetMappings(indexExpression)
+          .setLocal(true)
+          .get();
+      return populateIndexMappings(mappingsResponse.getMappings());
+    } catch (Exception e) {
       throw new IllegalStateException(
           "Failed to read mapping in cluster state for index pattern [" + indexExpression + "]", e);
     }
@@ -139,12 +138,8 @@ public class OpenSearchNodeClient implements OpenSearchClient {
 
   @Override
   public void schedule(Runnable task) {
-    ThreadPool threadPool = client.threadPool();
-    threadPool.schedule(
-        withCurrentContext(task),
-        new TimeValue(0),
-        SQL_WORKER_THREAD_POOL_NAME
-    );
+    // currently, task already running the sql-worker threadpool
+    task.run();
   }
 
   @Override

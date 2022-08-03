@@ -9,6 +9,8 @@ package org.opensearch.sql.legacy.plugin;
 import static org.opensearch.rest.RestStatus.BAD_REQUEST;
 import static org.opensearch.rest.RestStatus.OK;
 import static org.opensearch.rest.RestStatus.SERVICE_UNAVAILABLE;
+import static org.opensearch.sql.legacy.executor.AsyncRestExecutor.SQL_WORKER_THREAD_POOL_NAME;
+import static org.opensearch.sql.opensearch.executor.Scheduler.schedule;
 
 import com.alibaba.druid.sql.parser.ParserException;
 import com.google.common.collect.ImmutableList;
@@ -24,10 +26,12 @@ import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.client.Client;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -63,6 +67,7 @@ import org.opensearch.sql.legacy.utils.JsonPrettyFormatter;
 import org.opensearch.sql.legacy.utils.LogUtils;
 import org.opensearch.sql.legacy.utils.QueryDataAnonymizer;
 import org.opensearch.sql.sql.domain.SQLQueryRequest;
+import org.opensearch.threadpool.ThreadPool;
 
 public class RestSqlAction extends BaseRestHandler {
 
@@ -147,19 +152,27 @@ public class RestSqlAction extends BaseRestHandler {
 
             Format format = SqlRequestParam.getFormat(request.params());
 
-            // Route request to new query engine if it's supported already
-            SQLQueryRequest newSqlRequest = new SQLQueryRequest(sqlRequest.getJsonContent(),
-                sqlRequest.getSql(), request.path(), request.params());
-            RestChannelConsumer result = newSqlQueryHandler.prepareRequest(newSqlRequest, client);
-            if (result != RestSQLQueryAction.NOT_SUPPORTED_YET) {
-                LOG.info("[{}] Request is handled by new SQL query engine", LogUtils.getRequestId());
-                return result;
-            }
-            LOG.debug("[{}] Request {} is not supported and falling back to old SQL engine",
-                LogUtils.getRequestId(), newSqlRequest);
+            return channel -> schedule(client, () -> {
+                try {
+                    // Route request to new query engine if it's supported already
+                    SQLQueryRequest newSqlRequest = new SQLQueryRequest(sqlRequest.getJsonContent(),
+                        sqlRequest.getSql(), request.path(), request.params());
+                    RestChannelConsumer result = newSqlQueryHandler.prepareRequest(newSqlRequest, client);
+                    if (result != RestSQLQueryAction.NOT_SUPPORTED_YET) {
+                        LOG.info("[{}] Request is handled by new SQL query engine", LogUtils.getRequestId());
+                        result.accept(channel);
+                    } else {
+                        LOG.debug("[{}] Request {} is not supported and falling back to old SQL engine",
+                            LogUtils.getRequestId(), newSqlRequest);
 
-            final QueryAction queryAction = explainRequest(client, sqlRequest, format);
-            return channel -> executeSqlRequest(request, queryAction, client, channel);
+                        QueryAction queryAction = explainRequest(client, sqlRequest, format);
+                        executeSqlRequest(request, queryAction, client, channel);
+                    }
+                } catch (Exception e) {
+                    logAndPublishMetrics(e);
+                    reportError(channel, e, isClientError(e) ? BAD_REQUEST : SERVICE_UNAVAILABLE);
+                }
+            });
         } catch (Exception e) {
             logAndPublishMetrics(e);
             return channel -> reportError(channel, e, isClientError(e) ? BAD_REQUEST : SERVICE_UNAVAILABLE);

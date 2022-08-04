@@ -31,7 +31,7 @@ public class ExecutionSchedule {
   public void execute() {
     try {
       StageExecution nextStage = nextStage();
-      StageScheduler stageScheduler = null;
+      StageScheduler stageScheduler = nextStage.createStageScheduler();
       stageScheduler.schedule();
     } catch (Exception e) {
       // listener.onFailure(e);

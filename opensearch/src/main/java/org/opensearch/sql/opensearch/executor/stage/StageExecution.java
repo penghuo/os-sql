@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 import lombok.Data;
+import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.sql.opensearch.executor.scheduler.OpenSearchQueryScheduler;
 import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
@@ -17,6 +18,8 @@ import org.opensearch.sql.opensearch.executor.splits.Split;
 import org.opensearch.sql.opensearch.executor.splits.SplitManager;
 import org.opensearch.sql.opensearch.executor.task.TransportTaskPlan;
 import org.opensearch.sql.opensearch.executor.task.TaskPlan;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskAction;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskRequest;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 
 @Data
@@ -31,21 +34,24 @@ public class StageExecution {
 
   private final List<Consumer<StageState>> listeners;
 
+  private final NodeClient client;
+
   public StageScheduler createStageScheduler() {
     try {
       List<Split> splits = splitManager.nextBatch().get();
       if (splits.size() == 1 && splitManager.noMoreSplits()) {
-        return OpenSearchQueryScheduler()
-      } throw {
-
+        return new OpenSearchQueryScheduler(this, splitManager);
+      } else  {
+        throw new RuntimeException("split large than 1 is not supported yet");
       }
     } catch (InterruptedException | ExecutionException e) {
-      e.printStackTrace();
+      throw new RuntimeException(e);
     }
   }
 
   public void schedule(DiscoveryNode node) {
     tasks.add(new TransportTaskPlan(plan, node));
+    client.execute(QLTaskAction.INSTANCE, new QLTaskRequest());
   }
 
   public void addListener(Consumer<StageState> listener) {

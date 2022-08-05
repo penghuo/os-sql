@@ -77,4 +77,8 @@ public abstract class LogicalPlanNodeVisitor<R, C> {
   public R visitAD(LogicalAD plan, C context) {
     return visitNode(plan, context);
   }
+
+  public R visitWrite(LogicalWrite plan, C context) {
+    return visitNode(plan, context);
+  }
 }

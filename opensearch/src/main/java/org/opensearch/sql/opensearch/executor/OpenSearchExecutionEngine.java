@@ -20,6 +20,7 @@ import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.executor.scheduler.ExecutionSchedule;
 import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
+import org.opensearch.sql.opensearch.executor.stage.StageExecution;
 import org.opensearch.sql.opensearch.executor.stage.StagePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
@@ -56,21 +57,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   public void tempexecute(StagePlan stages, ResponseListener<QueryResponse> listener) {
-    Function<List<StageScheduler>, StageScheduler> nextOne = null;
-    client.schedule(
-        () -> {
-          try {
-            ExecutionSchedule executionSchedule = new ExecutionSchedule();
-            while (!executionSchedule.isDone()) {
-              StageScheduler stageScheduler = executionSchedule.nextStage();
-              stageScheduler.schedule();
-            }
-          } catch (Exception e) {
-            // listener.onFailure(e);
-          } finally{
-            // todo
-          }
-        });
+    List<StageExecution> stageExecutions = new ArrayList<>();
+    ExecutionSchedule executionSchedule = new ExecutionSchedule();
+
+    stageExecutions.get(0).getOutput().addListener(listener);
   }
 
   @Override

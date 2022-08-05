@@ -7,7 +7,10 @@ package org.opensearch.sql.opensearch.executor.task;
 
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import java.util.ArrayList;
+import java.util.List;
 import lombok.RequiredArgsConstructor;
+import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
 @RequiredArgsConstructor
@@ -26,11 +29,12 @@ public class TaskExecution {
     if (blocked != NOT_BLOCKED) {
       return blocked;
     }
+    List<ExprValue> result = new ArrayList<>();
     try {
       plan.open();
 
       while (plan.hasNext()) {
-        plan.next();
+        result.add(plan.next());
       }
     } finally{
       plan.close();

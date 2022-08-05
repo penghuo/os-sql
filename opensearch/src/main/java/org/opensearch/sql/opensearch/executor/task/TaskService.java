@@ -37,7 +37,6 @@ public class TaskService {
   public void addTask(TaskPlan task) {
     // todo. TaskExecution is created from LogicalPlan in TaskPlan.
     TaskExecution taskExecution = null;
-    taskExecution.execute();
     tasks.put(task.getTaskId(), taskExecution);
     taskExecutionQueue.add(taskExecution);
   }

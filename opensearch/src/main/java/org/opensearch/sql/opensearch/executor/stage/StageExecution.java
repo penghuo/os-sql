@@ -36,6 +36,8 @@ public class StageExecution {
 
   private final NodeClient client;
 
+  private final StageOutput output;
+
   public StageScheduler createStageScheduler() {
     try {
       List<Split> splits = splitManager.nextBatch().get();
@@ -53,6 +55,8 @@ public class StageExecution {
     tasks.add(new TransportTaskPlan(plan, node));
     client.execute(QLTaskAction.INSTANCE, new QLTaskRequest());
   }
+
+
 
   public void addListener(Consumer<StageState> listener) {
     listeners.add(listener);

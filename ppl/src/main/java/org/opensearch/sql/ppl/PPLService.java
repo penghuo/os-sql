@@ -8,6 +8,7 @@ package org.opensearch.sql.ppl;
 
 import static org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 
+import java.util.Collections;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.apache.logging.log4j.LogManager;
@@ -23,8 +24,11 @@ import org.opensearch.sql.expression.DSL;
 import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
 import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPlan;
+import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.stage.StageId;
+import org.opensearch.sql.planner.stage.StagePlan;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.sql.ppl.parser.AstBuilder;
@@ -57,7 +61,8 @@ public class PPLService {
    */
   public void execute(PPLQueryRequest request, ResponseListener<QueryResponse> listener) {
     try {
-      executionEngine.execute(plan(request), listener);
+//      executionEngine.execute(plan(request), listener);
+      executionEngine.newExecute(stagePlan(request), listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }
@@ -94,5 +99,23 @@ public class PPLService {
     return new Planner(storageEngine, LogicalPlanOptimizer.create(new DSL(repository)))
         .plan(logicalPlan);
   }
+
+  // todo, we use single StagePlan for now, will split the logical plan into StagePlan in future PR.
+  private StagePlan stagePlan(PPLQueryRequest request) {
+    // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
+    ParseTree cst = parser.parse(request.getRequest());
+    UnresolvedPlan ast = cst.accept(
+        new AstBuilder(new AstExpressionBuilder(), request.getRequest()));
+
+    LOG.info("[{}] Incoming request {}", LogUtils.getRequestId(), anonymizer.anonymizeData(ast));
+
+    // 2.Analyze abstract syntax to generate logical plan
+    LogicalPlan logicalPlan = analyzer.analyze(UnresolvedPlanHelper.addSelectAll(ast),
+        new AnalysisContext());
+
+    // 3.Generate optimal physical plan from logical plan
+    return new StagePlan(StageId.stageId(), logicalPlan, null);
+  }
+
 
 }

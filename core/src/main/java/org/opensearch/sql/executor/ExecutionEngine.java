@@ -15,6 +15,7 @@ import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.stage.StagePlan;
 
 /**
  * Execution engine that encapsulates execution details.
@@ -28,6 +29,8 @@ public interface ExecutionEngine {
    * @param listener response listener
    */
   void execute(PhysicalPlan plan, ResponseListener<QueryResponse> listener);
+
+  void newExecute(StagePlan plan, ResponseListener<QueryResponse> listener);
 
   /**
    * Explain physical plan and call back response listener. The reason why this has to

@@ -16,7 +16,8 @@ public class ExecutionSchedule {
   private List<StageExecution> stageExecutionList = null;
   private ResponseListener<ExecutionEngine.QueryResponse> listener;
 
-  public ExecutionSchedule() {
+  public ExecutionSchedule(List<StageExecution> stageExecutionList) {
+    this.stageExecutionList = stageExecutionList;
     for (StageExecution stageExecution : stageExecutionList) {
       stageExecution.addListener(
           stageState -> {

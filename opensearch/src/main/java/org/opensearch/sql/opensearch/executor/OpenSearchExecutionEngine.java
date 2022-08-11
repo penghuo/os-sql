@@ -9,8 +9,6 @@ package org.opensearch.sql.opensearch.executor;
 import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Future;
-import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
@@ -19,9 +17,12 @@ import org.opensearch.sql.executor.Explain;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.executor.scheduler.ExecutionSchedule;
-import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
 import org.opensearch.sql.opensearch.executor.stage.StageExecution;
-import org.opensearch.sql.opensearch.executor.stage.StagePlan;
+import org.opensearch.sql.planner.logical.LogicalPlan;
+import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalWrite;
+import org.opensearch.sql.planner.splits.SplitManager;
+import org.opensearch.sql.planner.stage.StagePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
 
@@ -56,11 +57,20 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
         });
   }
 
-  public void tempexecute(StagePlan stages, ResponseListener<QueryResponse> listener) {
+  public void newExecute(StagePlan stagePlan, ResponseListener<QueryResponse> listener) {
     List<StageExecution> stageExecutions = new ArrayList<>();
-    ExecutionSchedule executionSchedule = new ExecutionSchedule();
+    StagePlan tmp = stagePlan;
+    while (tmp != null) {
+      stageExecutions.add(buildStageExecution(tmp));
+      tmp = stagePlan.getChild();
+    }
 
-    stageExecutions.get(0).getOutput().addListener(listener);
+    // todo, we assume the first stage is the final stage
+    stageExecutions.get(0).addOutputListener(listener);
+
+    // schedule the execution
+    ExecutionSchedule executionSchedule = new ExecutionSchedule(stageExecutions);
+    executionSchedule.execute();
   }
 
   @Override
@@ -83,4 +93,19 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     });
   }
 
+  private StageExecution buildStageExecution(StagePlan stagePlan) {
+    return new StageExecution(
+        stagePlan.getStageId(),
+        stagePlan.getPlan(),
+        stagePlan.getPlan().accept(new SplitManagerBuilder(), null),
+        client.getNodeClient()
+    );
+  }
+
+  private static class SplitManagerBuilder extends LogicalPlanNodeVisitor<SplitManager, Void> {
+    @Override
+    public SplitManager visitWrite(LogicalWrite plan, Void context) {
+      return plan.getTable().getSplitManager();
+    }
+  }
 }

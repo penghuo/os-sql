@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.opensearch.executor.splits;
+package org.opensearch.sql.planner.splits;
 
 public interface Split {
 

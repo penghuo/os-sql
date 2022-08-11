@@ -15,5 +15,5 @@ public class TaskState {
     FINISH
   }
 
-  private final TaskState taskState;
+  private final TaskExecutionState executionState;
 }

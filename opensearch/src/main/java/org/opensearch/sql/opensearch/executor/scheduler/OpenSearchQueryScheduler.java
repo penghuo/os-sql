@@ -7,7 +7,7 @@ package org.opensearch.sql.opensearch.executor.scheduler;
 
 import lombok.RequiredArgsConstructor;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.sql.opensearch.executor.splits.SplitManager;
+import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.opensearch.executor.stage.StageExecution;
 
 /**

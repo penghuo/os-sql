@@ -12,7 +12,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
-import org.opensearch.sql.opensearch.executor.splits.Split;
+import org.opensearch.sql.planner.logical.LogicalPlan;
+import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalWrite;
+import org.opensearch.sql.planner.splits.Split;
+import org.opensearch.sql.planner.splits.SplitManager;
+import org.opensearch.sql.storage.Table;
 
 /** Each node has a singleton TaskService which is started during node bootstrap. */
 @RequiredArgsConstructor
@@ -34,10 +39,10 @@ public class TaskService {
     }
   }
 
-  public void addTask(TaskPlan task) {
+  public void addTask(TaskPlan taskPlan) {
     // todo. TaskExecution is created from LogicalPlan in TaskPlan.
-    TaskExecution taskExecution = null;
-    tasks.put(task.getTaskId(), taskExecution);
+    TaskExecution taskExecution = createTaskExecution(taskPlan);
+    tasks.put(taskPlan.getTaskId(), taskExecution);
     taskExecutionQueue.add(taskExecution);
   }
 
@@ -62,5 +67,21 @@ public class TaskService {
 
   public TaskState taskState(TaskPlan task) {
     return tasks.get(task.getTaskId()).taskState();
+  }
+
+
+  private TaskExecution createTaskExecution(TaskPlan taskPlan) {
+    FindTable findTable = new FindTable();
+    LogicalPlan logicalPlan = taskPlan.getPlan();
+    Table table = logicalPlan.accept(findTable, null);
+    return new TaskExecution(table.implement(table.optimize(logicalPlan)));
+  }
+
+
+  private static class FindTable extends LogicalPlanNodeVisitor<Table, Void> {
+    @Override
+    public Table visitWrite(LogicalWrite plan, Void context) {
+      return plan.getTable();
+    }
   }
 }

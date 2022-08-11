@@ -37,6 +37,7 @@ import org.opensearch.sql.planner.logical.LogicalMLCommons;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.Table;
 
 /** OpenSearch table (index) implementation. */
@@ -98,6 +99,11 @@ public class OpenSearchIndex implements Table {
   @Override
   public LogicalPlan optimize(LogicalPlan plan) {
     return OpenSearchLogicalPlanOptimizerFactory.create().optimize(plan);
+  }
+
+  @Override
+  public SplitManager getSplitManager() {
+    return null;
   }
 
   @VisibleForTesting

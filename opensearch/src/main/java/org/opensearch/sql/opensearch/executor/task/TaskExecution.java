@@ -13,16 +13,20 @@ import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
-@RequiredArgsConstructor
 public class TaskExecution {
 
   public static ListenableFuture<?> NOT_BLOCKED = Futures.immediateFuture(null);
 
   private final PhysicalPlan plan;
 
-  private final PhysicalPlan source;
+//  private final PhysicalPlan source;
 
-  private final TaskState taskState;
+  private final TaskState taskState = new TaskState(TaskState.TaskExecutionState.SCHEDULING);
+
+  public TaskExecution(PhysicalPlan plan) {
+    this.plan = plan;
+  }
+
 
   public ListenableFuture<?> execute() {
     ListenableFuture<?> blocked = isBlocked();

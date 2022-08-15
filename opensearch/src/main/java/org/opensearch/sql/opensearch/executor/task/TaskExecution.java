@@ -9,7 +9,9 @@ import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 import lombok.RequiredArgsConstructor;
+import org.apache.commons.math3.analysis.function.Exp;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
@@ -19,12 +21,13 @@ public class TaskExecution {
 
   private final PhysicalPlan plan;
 
-//  private final PhysicalPlan source;
-
   private final TaskState taskState = new TaskState(TaskState.TaskExecutionState.SCHEDULING);
 
-  public TaskExecution(PhysicalPlan plan) {
+  private Consumer<List<ExprValue>> resultConsumer;
+
+  public TaskExecution(PhysicalPlan plan, Consumer<List<ExprValue>> resultConsumer) {
     this.plan = plan;
+    this.resultConsumer = resultConsumer;
   }
 
 
@@ -41,9 +44,10 @@ public class TaskExecution {
         result.add(plan.next());
       }
     } finally{
+      resultConsumer.accept(result);
       plan.close();
     }
-    return NOT_BLOCKED;
+    return null;
   }
 
   /**

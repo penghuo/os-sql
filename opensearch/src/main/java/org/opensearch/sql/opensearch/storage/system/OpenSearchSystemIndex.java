@@ -21,6 +21,7 @@ import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.Table;
 import org.opensearch.sql.utils.SystemIndexUtils;
 
@@ -46,6 +47,11 @@ public class OpenSearchSystemIndex implements Table {
   @Override
   public PhysicalPlan implement(LogicalPlan plan) {
     return plan.accept(new OpenSearchSystemIndexDefaultImplementor(), null);
+  }
+
+  @Override
+  public SplitManager getSplitManager() {
+    return null;
   }
 
   @VisibleForTesting

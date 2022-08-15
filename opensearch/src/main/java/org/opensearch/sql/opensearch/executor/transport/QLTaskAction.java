@@ -9,7 +9,7 @@ import org.opensearch.action.ActionType;
 
 public class QLTaskAction extends ActionType<QLTaskResponse> {
   public static final QLTaskAction INSTANCE = new QLTaskAction();
-  public static final String NAME = "cluster:opensearch/query/task";
+  public static final String NAME = "cluster:admin/opensearch/ql/task";
 
   private QLTaskAction() {
     super(NAME, QLTaskResponse::new);

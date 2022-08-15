@@ -6,7 +6,9 @@
 package org.opensearch.sql.opensearch.executor.scheduler;
 
 import lombok.RequiredArgsConstructor;
+import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.sql.opensearch.executor.task.TaskNode;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.opensearch.executor.stage.StageExecution;
 
@@ -21,6 +23,6 @@ public class OpenSearchQueryScheduler implements StageScheduler {
   @Override
   public void schedule() {
     // todo
-    stageExecution.schedule(DiscoveryNodes.EMPTY_NODES.getLocalNode());
+    stageExecution.schedule(TaskNode.LOCAL);
   }
 }

@@ -12,12 +12,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import org.opensearch.action.ActionListener;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.opensearch.executor.scheduler.OpenSearchQueryScheduler;
 import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
+import org.opensearch.sql.opensearch.executor.task.LocalTransportTaskPlan;
+import org.opensearch.sql.opensearch.executor.task.TaskNode;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskResponse;
 import org.opensearch.sql.opensearch.executor.transport.QLTaskType;
 import org.opensearch.sql.planner.splits.Split;
 import org.opensearch.sql.planner.splits.SplitManager;
@@ -59,7 +63,7 @@ public class StageExecution {
     this.tasks = new HashSet<>();
     this.listeners = new ArrayList<>();
     this.client = client;
-    this.output = Optional.of(stageOutput);
+    this.output = Optional.ofNullable(stageOutput);
   }
 
   public StageScheduler createStageScheduler() {
@@ -75,8 +79,13 @@ public class StageExecution {
     }
   }
 
-  public void schedule(DiscoveryNode node) {
-    TransportTaskPlan taskPlan = new TransportTaskPlan(plan, node);
+  public void schedule(TaskNode node) {
+    TransportTaskPlan taskPlan = null;
+    if (output.isPresent()) {
+      taskPlan = new LocalTransportTaskPlan(plan, node, output.get()::consume);
+    } else {
+      taskPlan = new TransportTaskPlan(plan, node);
+    }
     client.execute(QLTaskAction.INSTANCE, new QLTaskRequest(QLTaskType.CREATE, taskPlan));
     tasks.add(taskPlan);
   }

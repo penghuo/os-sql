@@ -6,6 +6,8 @@
 package org.opensearch.sql.opensearch.executor.transport;
 
 
+import static org.opensearch.sql.opensearch.client.OpenSearchNodeClient.SQL_WORKER_THREAD_POOL_NAME;
+
 import java.io.IOException;
 import java.util.Collections;
 import org.apache.logging.log4j.LogManager;
@@ -13,10 +15,16 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionListener;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.Writeable;
+import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
+import org.opensearch.sql.opensearch.executor.task.TaskNode;
 import org.opensearch.sql.opensearch.executor.task.TaskService;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportException;
@@ -35,17 +43,28 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
 
   private final TransportService transportService;
 
+//  private final ClusterState clusterState;
+
+  private final ClusterService clusterService;
+
   @Inject
   public TransportQLTaskAction(String actionName,
                                TransportService transportService,
                                ActionFilters actionFilters,
-                               Writeable.Reader<QLTaskRequest> qlTaskRequestReader,
                                String executor,
-                               TaskService taskService) {
-    super(actionName, transportService, actionFilters, qlTaskRequestReader, executor);
+                               ClusterService clusterService,
+                               NodeClient nodeClient) {
+    super(actionName, transportService, actionFilters, QLTaskRequest::new, executor);
 
-    this.taskService = taskService;
+
+    this.taskService =
+        new TaskService(
+            new OpenSearchNodeClient(clusterService, nodeClient),
+            nodeClient.threadPool().executor(SQL_WORKER_THREAD_POOL_NAME));
     this.transportService = transportService;
+    this.clusterService = clusterService;
+//    this.clusterState = clusterService.state();
+    taskService.init();
     transportService.registerRequestHandler(
         ACTION_NAME,
         EXECUTOR,
@@ -72,28 +91,32 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
   @Override
   protected void doExecute(Task task, QLTaskRequest request,
                            ActionListener<QLTaskResponse> actionListener) {
-    DiscoveryNode node = request.getTaskPlan().getNode();
-    transportService.sendRequest(node, ACTION_NAME, request,
-        new TransportResponseHandler<QLTaskResponse>() {
-          @Override
-          public void handleResponse(QLTaskResponse resp) {
-            actionListener.onResponse(resp);
-          }
+    TaskNode node = request.getTaskPlan().getNode();
 
-          @Override
-          public void handleException(TransportException e) {
-            actionListener.onFailure(e);
-          }
+    if (node == TaskNode.LOCAL) {
+      final DiscoveryNode localNode = clusterService.state().getNodes().getLocalNode();
+      transportService.sendRequest(localNode, ACTION_NAME, request,
+          new TransportResponseHandler<QLTaskResponse>() {
+            @Override
+            public void handleResponse(QLTaskResponse resp) {
+              actionListener.onResponse(resp);
+            }
 
-          @Override
-          public String executor() {
-            return EXECUTOR;
-          }
+            @Override
+            public void handleException(TransportException e) {
+              actionListener.onFailure(e);
+            }
 
-          @Override
-          public QLTaskResponse read(StreamInput in) throws IOException {
-            return new QLTaskResponse(in);
-          }
-        });
+            @Override
+            public String executor() {
+              return EXECUTOR;
+            }
+
+            @Override
+            public QLTaskResponse read(StreamInput in) throws IOException {
+              return new QLTaskResponse(in);
+            }
+          });
+    }
   }
 }

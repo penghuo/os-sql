@@ -10,18 +10,27 @@ import java.util.List;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingDeque;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.splits.Split;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.Table;
+import org.springframework.cglib.core.Local;
 
 /** Each node has a singleton TaskService which is started during node bootstrap. */
 @RequiredArgsConstructor
 public class TaskService {
+  private static final Logger LOG = LogManager.getLogger();
+
   private final static int numberOfThreads = 4;
 
   private final ConcurrentHashMap<TaskId, TaskExecution> tasks;
@@ -32,10 +41,17 @@ public class TaskService {
 
   private final ExecutorService executor;
 
+  public TaskService(OpenSearchClient client, ExecutorService executor) {
+    this.tasks = new ConcurrentHashMap<>();
+    this.taskExecutionQueue = new LinkedBlockingDeque<>();
+    this.client = client;
+    this.executor = executor;
+  }
+
   // kick off thread runner.
   public void init() {
     for (int i = 0; i < numberOfThreads; i++) {
-      executor.submit(new TaskRunner());
+      executor.execute(new TaskRunner());
     }
   }
 
@@ -43,7 +59,11 @@ public class TaskService {
     // todo. TaskExecution is created from LogicalPlan in TaskPlan.
     TaskExecution taskExecution = createTaskExecution(taskPlan);
     tasks.put(taskPlan.getTaskId(), taskExecution);
-    taskExecutionQueue.add(taskExecution);
+    try {
+      taskExecutionQueue.putLast(taskExecution);
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   public void addSplit(List<Split> splitList) {
@@ -53,15 +73,25 @@ public class TaskService {
   private class TaskRunner implements Runnable {
     @Override
     public void run() {
-      TaskExecution execution = taskExecutionQueue.pollFirst();
+      try {
+        while (true) {
+          LOG.info("TaskRunner execute");
+          TaskExecution execution = taskExecutionQueue.takeFirst();
 
-      ListenableFuture<?> blocked = execution.execute();
+          ListenableFuture<?> blocked = execution.execute();
+          if (blocked == null) continue;
+          blocked.addListener(
+              () -> {
+                taskExecutionQueue.offer(execution);
+              },
+              executor);
 
-      blocked.addListener(
-          () -> {
-            taskExecutionQueue.offer(execution);
-          },
-          executor);
+        }
+
+
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
     }
   }
 
@@ -71,17 +101,56 @@ public class TaskService {
 
 
   private TaskExecution createTaskExecution(TaskPlan taskPlan) {
-    FindTable findTable = new FindTable();
+    TableBuilder findTable = new TableBuilder();
     LogicalPlan logicalPlan = taskPlan.getPlan();
-    Table table = logicalPlan.accept(findTable, null);
-    return new TaskExecution(table.implement(table.optimize(logicalPlan)));
+    TableContext tblCtx = new TableContext();
+    logicalPlan.accept(findTable, tblCtx);
+    Table table = tblCtx.write != null ? tblCtx.getWrite() : tblCtx.getRead();
+
+    if (taskPlan instanceof LocalTransportTaskPlan) {
+      return new TaskExecution(table.implement(table.optimize(logicalPlan)),
+          ((LocalTransportTaskPlan) taskPlan).getConsumer());
+    } else {
+      return new TaskExecution(table.implement(table.optimize(logicalPlan)), v -> {});
+    }
   }
 
+//
+//  private static class FindTable extends LogicalPlanNodeVisitor<Table, Void> {
+//    @Override
+//    public Table visitWrite(LogicalWrite plan, Void context) {
+//      return plan.getTable();
+//    }
+//
+//    @Override
+//    public Table visitRelation(LogicalRelation plan, Void context) {
+//      return plan.getTable();
+//    }
+//  }
 
-  private static class FindTable extends LogicalPlanNodeVisitor<Table, Void> {
+  private static class TableBuilder extends LogicalPlanNodeVisitor<Void, TableContext> {
     @Override
-    public Table visitWrite(LogicalWrite plan, Void context) {
-      return plan.getTable();
+    public Void visitNode(LogicalPlan plan, TableContext context) {
+      plan.getChild().forEach(child -> child.accept(this, context));
+      return null;
     }
+
+    @Override
+    public Void visitWrite(LogicalWrite plan, TableContext context) {
+      context.setWrite(plan.getTable());
+      return null;
+    }
+
+    @Override
+    public Void visitRelation(LogicalRelation plan, TableContext context) {
+      context.setRead(plan.getTable());
+      return null;
+    }
+  }
+
+  @Data
+  static class TableContext {
+    Table read;
+    Table write;
   }
 }

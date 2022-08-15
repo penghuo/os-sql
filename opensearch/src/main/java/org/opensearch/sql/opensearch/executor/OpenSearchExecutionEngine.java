@@ -9,6 +9,7 @@ package org.opensearch.sql.opensearch.executor;
 import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.List;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
@@ -18,8 +19,10 @@ import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.executor.scheduler.ExecutionSchedule;
 import org.opensearch.sql.opensearch.executor.stage.StageExecution;
+import org.opensearch.sql.opensearch.executor.stage.StageOutput;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.planner.stage.StagePlan;
@@ -94,18 +97,41 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   private StageExecution buildStageExecution(StagePlan stagePlan) {
+    SplitManagerContext ctx = new SplitManagerContext();
+    stagePlan.getPlan().accept(new SplitManagerBuilder(), ctx);
+    final Schema outputSchema = stagePlan.getOutputSchema();
     return new StageExecution(
         stagePlan.getStageId(),
         stagePlan.getPlan(),
-        stagePlan.getPlan().accept(new SplitManagerBuilder(), null),
-        client.getNodeClient()
-    );
+        ctx.getWrite() != null ? ctx.getWrite() : ctx.getRead(),
+        client.getNodeClient(),
+        outputSchema == null ? null : new StageOutput(outputSchema));
   }
 
-  private static class SplitManagerBuilder extends LogicalPlanNodeVisitor<SplitManager, Void> {
+  private static class SplitManagerBuilder extends LogicalPlanNodeVisitor<Void,
+      SplitManagerContext> {
     @Override
-    public SplitManager visitWrite(LogicalWrite plan, Void context) {
-      return plan.getTable().getSplitManager();
+    public Void visitNode(LogicalPlan plan, SplitManagerContext context) {
+      plan.getChild().forEach(child -> child.accept(this, context));
+      return null;
     }
+
+    @Override
+    public Void visitWrite(LogicalWrite plan, SplitManagerContext context) {
+      context.setWrite(plan.getTable().getSplitManager());
+      return null;
+    }
+
+    @Override
+    public Void visitRelation(LogicalRelation plan, SplitManagerContext context) {
+      context.setRead(plan.getTable().getSplitManager());
+      return null;
+    }
+  }
+
+  @Data
+  static class SplitManagerContext {
+    SplitManager read;
+    SplitManager write;
   }
 }

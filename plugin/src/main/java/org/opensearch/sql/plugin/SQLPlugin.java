@@ -43,6 +43,9 @@ import org.opensearch.sql.legacy.executor.AsyncRestExecutor;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskAction;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskResponse;
+import org.opensearch.sql.opensearch.executor.transport.TransportQLTaskAction;
 import org.opensearch.sql.opensearch.setting.LegacyOpenDistroSettings;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.opensearch.storage.script.ExpressionScriptEngine;
@@ -102,7 +105,10 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin {
     return Arrays.asList(
         new ActionHandler<>(
             new ActionType<>(PPLQueryAction.NAME, TransportPPLQueryResponse::new),
-            TransportPPLQueryAction.class));
+            TransportPPLQueryAction.class),
+        new ActionHandler<>(
+            new ActionType<>(QLTaskAction.NAME, QLTaskResponse::new),
+            TransportQLTaskAction.class));
   }
 
   @Override

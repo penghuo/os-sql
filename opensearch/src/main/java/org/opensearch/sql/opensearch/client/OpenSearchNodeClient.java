@@ -49,7 +49,7 @@ public class OpenSearchNodeClient implements OpenSearchClient {
   /** Index name expression resolver to get concrete index name. */
   private final IndexNameExpressionResolver resolver;
 
-  private static final String SQL_WORKER_THREAD_POOL_NAME = "sql-worker";
+  public static final String SQL_WORKER_THREAD_POOL_NAME = "sql-worker";
 
   /**
    * Constructor of ElasticsearchNodeClient.

@@ -9,11 +9,13 @@ import static org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactor
 
 import java.io.IOException;
 import java.util.List;
+import java.util.function.Consumer;
 import lombok.Getter;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.io.stream.NamedWriteable;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
+import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.planner.splits.Split;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 
@@ -26,9 +28,9 @@ public class TransportTaskPlan implements TaskPlan, NamedWriteable {
   private final LogicalPlan logicalPlan;
 
   @Getter
-  private final DiscoveryNode node;
+  private final TaskNode node;
 
-  public TransportTaskPlan(LogicalPlan logicalPlan, DiscoveryNode node) {
+  public TransportTaskPlan(LogicalPlan logicalPlan, TaskNode node) {
     this.taskId = TaskId.taskId();
     this.logicalPlan = logicalPlan;
     this.node = node;
@@ -37,14 +39,14 @@ public class TransportTaskPlan implements TaskPlan, NamedWriteable {
   public TransportTaskPlan(StreamInput in) throws IOException {
     this.taskId = in.readNamedWriteable(TaskId.class);
     this.logicalPlan = OBJECT_MAPPER.readValue(in.readString(), LogicalPlan.class);
-    this.node = new DiscoveryNode(in);
+    this.node = in.readEnum(TaskNode.class);
   }
 
   @Override
   public void writeTo(StreamOutput out) throws IOException {
     out.writeNamedWriteable(taskId);
     out.writeString(OBJECT_MAPPER.writeValueAsString(logicalPlan));
-    node.writeTo(out);
+    out.writeEnum(node);
   }
 
   public void execute(List<Split> splitList) {

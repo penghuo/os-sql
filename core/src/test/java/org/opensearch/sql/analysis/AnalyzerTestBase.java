@@ -23,6 +23,7 @@ import org.opensearch.sql.expression.env.Environment;
 import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.StorageEngine;
 import org.opensearch.sql.storage.Table;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -48,6 +49,11 @@ public class AnalyzerTestBase {
 
           @Override
           public PhysicalPlan implement(LogicalPlan plan) {
+            throw new UnsupportedOperationException();
+          }
+
+          @Override
+          public SplitManager getSplitManager() {
             throw new UnsupportedOperationException();
           }
         };

@@ -19,6 +19,7 @@ import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
+import org.opensearch.sql.opensearch.executor.splits.OpenSearchSplitManager;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalIndexAgg;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalIndexScan;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalPlanOptimizerFactory;
@@ -103,7 +104,7 @@ public class OpenSearchIndex implements Table {
 
   @Override
   public SplitManager getSplitManager() {
-    return null;
+    return new OpenSearchSplitManager();
   }
 
   @VisibleForTesting

@@ -13,8 +13,8 @@ import org.opensearch.sql.opensearch.executor.stage.StageState;
 
 public class ExecutionSchedule {
 
-  private List<StageExecution> stageExecutionList = null;
-  private ResponseListener<ExecutionEngine.QueryResponse> listener;
+  private final List<StageExecution> stageExecutionList;
+//  private ResponseListener<ExecutionEngine.QueryResponse> listener;
 
   public ExecutionSchedule(List<StageExecution> stageExecutionList) {
     this.stageExecutionList = stageExecutionList;
@@ -35,13 +35,13 @@ public class ExecutionSchedule {
       StageScheduler stageScheduler = nextStage.createStageScheduler();
       stageScheduler.schedule();
     } catch (Exception e) {
-      // listener.onFailure(e);
+      throw new RuntimeException(e);
     } finally{
       // todo
     }
   }
 
   public StageExecution nextStage() {
-    return null;
+    return stageExecutionList.get(stageExecutionList.size() - 1);
   }
 }

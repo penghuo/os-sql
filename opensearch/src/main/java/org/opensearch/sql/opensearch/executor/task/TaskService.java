@@ -20,9 +20,11 @@ import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
 import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.logical.LogicalStageState;
 import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.splits.Split;
 import org.opensearch.sql.planner.splits.SplitManager;
+import org.opensearch.sql.planner.stage.StageStateTable;
 import org.opensearch.sql.storage.Table;
 import org.springframework.cglib.core.Local;
 
@@ -55,9 +57,9 @@ public class TaskService {
     }
   }
 
-  public void addTask(TaskPlan taskPlan) {
+  public void addTask(TaskPlan taskPlan, TaskExecution.TaskExecutionListener listener) {
     // todo. TaskExecution is created from LogicalPlan in TaskPlan.
-    TaskExecution taskExecution = createTaskExecution(taskPlan);
+    TaskExecution taskExecution = createTaskExecution(taskPlan, listener);
     tasks.put(taskPlan.getTaskId(), taskExecution);
     try {
       taskExecutionQueue.putLast(taskExecution);
@@ -85,10 +87,7 @@ public class TaskService {
                 taskExecutionQueue.offer(execution);
               },
               executor);
-
         }
-
-
       } catch (InterruptedException e) {
         throw new RuntimeException(e);
       }
@@ -100,7 +99,8 @@ public class TaskService {
   }
 
 
-  private TaskExecution createTaskExecution(TaskPlan taskPlan) {
+  private TaskExecution createTaskExecution(TaskPlan taskPlan,
+                                            TaskExecution.TaskExecutionListener listener) {
     TableBuilder findTable = new TableBuilder();
     LogicalPlan logicalPlan = taskPlan.getPlan();
     TableContext tblCtx = new TableContext();
@@ -109,24 +109,11 @@ public class TaskService {
 
     if (taskPlan instanceof LocalTransportTaskPlan) {
       return new TaskExecution(table.implement(table.optimize(logicalPlan)),
-          ((LocalTransportTaskPlan) taskPlan).getConsumer());
+          ((LocalTransportTaskPlan) taskPlan).getConsumer(), listener);
     } else {
-      return new TaskExecution(table.implement(table.optimize(logicalPlan)), v -> {});
+      return new TaskExecution(table.implement(table.optimize(logicalPlan)), v -> {}, listener);
     }
   }
-
-//
-//  private static class FindTable extends LogicalPlanNodeVisitor<Table, Void> {
-//    @Override
-//    public Table visitWrite(LogicalWrite plan, Void context) {
-//      return plan.getTable();
-//    }
-//
-//    @Override
-//    public Table visitRelation(LogicalRelation plan, Void context) {
-//      return plan.getTable();
-//    }
-//  }
 
   private static class TableBuilder extends LogicalPlanNodeVisitor<Void, TableContext> {
     @Override
@@ -144,6 +131,12 @@ public class TaskService {
     @Override
     public Void visitRelation(LogicalRelation plan, TableContext context) {
       context.setRead(plan.getTable());
+      return null;
+    }
+
+    @Override
+    public Void visitStageState(LogicalStageState plan, TableContext context) {
+      context.setRead(StageStateTable.INSTANCE);
       return null;
     }
   }

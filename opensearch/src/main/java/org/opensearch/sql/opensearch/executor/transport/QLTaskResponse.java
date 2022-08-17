@@ -8,11 +8,13 @@ package org.opensearch.sql.opensearch.executor.transport;
 import static org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory.OBJECT_MAPPER;
 
 import java.io.IOException;
+import lombok.Getter;
 import org.opensearch.action.ActionResponse;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
 import org.opensearch.sql.opensearch.executor.task.TaskState;
 
+@Getter
 public class QLTaskResponse extends ActionResponse {
 
   private TaskState taskState;

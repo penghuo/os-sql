@@ -21,17 +21,23 @@ public class TaskExecution {
 
   private final PhysicalPlan plan;
 
-  private final TaskState taskState = new TaskState(TaskState.TaskExecutionState.SCHEDULING);
+  private final TaskState taskState = TaskState.SCHEDULING();
 
   private Consumer<List<ExprValue>> resultConsumer;
 
-  public TaskExecution(PhysicalPlan plan, Consumer<List<ExprValue>> resultConsumer) {
+  private TaskExecutionListener listener;
+
+  public TaskExecution(PhysicalPlan plan, Consumer<List<ExprValue>> resultConsumer,
+                       TaskExecutionListener listener) {
     this.plan = plan;
     this.resultConsumer = resultConsumer;
+    this.listener = listener;
   }
 
 
   public ListenableFuture<?> execute() {
+    int rowCount = 0;
+
     ListenableFuture<?> blocked = isBlocked();
     if (blocked != NOT_BLOCKED) {
       return blocked;
@@ -42,8 +48,12 @@ public class TaskExecution {
 
       while (plan.hasNext()) {
         result.add(plan.next());
+        rowCount++;
       }
+    } catch (Exception e) {
+      listener.onFailure(new TaskState(-1, -1, TaskState.TaskExecutionState.FINISH), e);
     } finally{
+      listener.onSuccess(new TaskState(0, rowCount, TaskState.TaskExecutionState.FINISH));
       resultConsumer.accept(result);
       plan.close();
     }
@@ -59,5 +69,13 @@ public class TaskExecution {
 
   public TaskState taskState() {
     return taskState;
+  }
+
+
+  public interface TaskExecutionListener {
+
+    void onSuccess(TaskState taskState);
+
+    void onFailure(TaskState taskState, Exception e);
   }
 }

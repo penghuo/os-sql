@@ -6,22 +6,24 @@
 package org.opensearch.sql.opensearch.executor.scheduler;
 
 import java.util.List;
-import org.opensearch.sql.common.response.ResponseListener;
-import org.opensearch.sql.executor.ExecutionEngine;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.opensearch.executor.stage.StageExecution;
-import org.opensearch.sql.opensearch.executor.stage.StageState;
 
 public class ExecutionSchedule {
 
+  private static final Logger LOG = LogManager.getLogger();
+
   private final List<StageExecution> stageExecutionList;
-//  private ResponseListener<ExecutionEngine.QueryResponse> listener;
 
   public ExecutionSchedule(List<StageExecution> stageExecutionList) {
     this.stageExecutionList = stageExecutionList;
+
+    // add listener for each stage.
     for (StageExecution stageExecution : stageExecutionList) {
       stageExecution.addListener(
           stageState -> {
-            if (stageState.stageExecutionState() == StageState.StageExecutionState.FINISH) {
+            if (stageState.isFinish()) {
               execute();
             }
           }
@@ -31,17 +33,29 @@ public class ExecutionSchedule {
 
   public void execute() {
     try {
-      StageExecution nextStage = nextStage();
+      StageExecution nextStage = nextStage(stageExecutionList.size());
+      if (nextStage == null) {
+        LOG.info("Done. no stage execution pending schedule");
+      }
       StageScheduler stageScheduler = nextStage.createStageScheduler();
       stageScheduler.schedule();
     } catch (Exception e) {
+      LOG.error("stage execution", e);
       throw new RuntimeException(e);
     } finally{
       // todo
     }
   }
 
-  public StageExecution nextStage() {
-    return stageExecutionList.get(stageExecutionList.size() - 1);
+  public StageExecution nextStage(int index) {
+    if (index < 0) {
+      return null;
+    }
+    StageExecution stageExecution = stageExecutionList.get(index);
+    if (stageExecution.getStageState().isFinish()) {
+      return nextStage(index - 1);
+    } else {
+      return stageExecution;
+    }
   }
 }

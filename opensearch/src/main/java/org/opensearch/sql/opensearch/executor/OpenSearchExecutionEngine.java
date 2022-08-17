@@ -23,10 +23,12 @@ import org.opensearch.sql.opensearch.executor.stage.StageOutput;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
 import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.logical.LogicalStageState;
 import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.planner.stage.StagePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.stage.StageStateTable;
 import org.opensearch.sql.storage.TableScanOperator;
 
 /** OpenSearch execution engine implementation. */
@@ -125,6 +127,12 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     @Override
     public Void visitRelation(LogicalRelation plan, SplitManagerContext context) {
       context.setRead(plan.getTable().getSplitManager());
+      return null;
+    }
+
+    @Override
+    public Void visitStageState(LogicalStageState plan, SplitManagerContext context) {
+      context.setRead(StageStateTable.INSTANCE.getSplitManager());
       return null;
     }
   }

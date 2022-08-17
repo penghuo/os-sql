@@ -25,10 +25,13 @@ import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
 import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.logical.LogicalStageState;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.planner.stage.StageId;
 import org.opensearch.sql.planner.stage.StagePlan;
+import org.opensearch.sql.planner.stage.StageState;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.sql.ppl.parser.AstBuilder;
@@ -113,9 +116,11 @@ public class PPLService {
     LogicalPlan logicalPlan = analyzer.analyze(UnresolvedPlanHelper.addSelectAll(ast),
         new AnalysisContext());
 
+    // todo, add StageStateScan operator as a new stage for DML query. currently for everything.
+    StageId childStageId = StageId.stageId();
+    StagePlan child = new StagePlan(childStageId, logicalPlan, null);
+
     // 3.Generate optimal physical plan from logical plan
-    return new StagePlan(StageId.stageId(), logicalPlan, null);
+    return new StagePlan(StageId.stageId(), new LogicalStageState(childStageId), child);
   }
-
-
 }

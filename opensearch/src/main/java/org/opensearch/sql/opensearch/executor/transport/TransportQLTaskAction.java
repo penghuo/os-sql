@@ -24,8 +24,10 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.Writeable;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
+import org.opensearch.sql.opensearch.executor.task.TaskExecution;
 import org.opensearch.sql.opensearch.executor.task.TaskNode;
 import org.opensearch.sql.opensearch.executor.task.TaskService;
+import org.opensearch.sql.opensearch.executor.task.TaskState;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportResponseHandler;
@@ -70,10 +72,27 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
         EXECUTOR,
         QLTaskRequest::new,
         (req, channel, task) -> {
-          try {
             switch (req.getTaskType()) {
               case CREATE:
-                taskService.addTask(req.getTaskPlan());
+                taskService.addTask(req.getTaskPlan(), new TaskExecution.TaskExecutionListener() {
+                  @Override
+                  public void onSuccess(TaskState taskState) {
+                    try {
+                      channel.sendResponse(new QLTaskResponse(taskState));
+                    } catch (IOException e) {
+                      LOG.error("transport IO exception");
+                    }
+                  }
+
+                  @Override
+                  public void onFailure(TaskState taskState, Exception e) {
+                    try {
+                      channel.sendResponse(e);
+                    } catch (IOException ioException) {
+                      LOG.error("transport IO exception");
+                    }
+                  }
+                });
                 break;
               case UPDATE:
                 taskService.addSplit(Collections.emptyList());
@@ -81,10 +100,7 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
               default:
                 break;
             }
-            channel.sendResponse(new QLTaskResponse(taskService.taskState(req.getTaskPlan())));
-          } catch (Exception e) {
-            channel.sendResponse(e);
-          }
+
         });
   }
 

@@ -67,7 +67,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     StagePlan tmp = stagePlan;
     while (tmp != null) {
       stageExecutions.add(buildStageExecution(tmp));
-      tmp = stagePlan.getChild();
+      tmp = tmp.getChild();
     }
 
     // todo, we assume the first stage is the final stage

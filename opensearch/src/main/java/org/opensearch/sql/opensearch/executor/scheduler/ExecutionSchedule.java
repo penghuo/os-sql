@@ -33,9 +33,10 @@ public class ExecutionSchedule {
 
   public void execute() {
     try {
-      StageExecution nextStage = nextStage(stageExecutionList.size());
+      StageExecution nextStage = nextStage(stageExecutionList.size() - 1);
       if (nextStage == null) {
         LOG.info("Done. no stage execution pending schedule");
+        return;
       }
       StageScheduler stageScheduler = nextStage.createStageScheduler();
       stageScheduler.schedule();

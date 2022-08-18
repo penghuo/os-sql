@@ -15,13 +15,16 @@ import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
+import org.opensearch.sql.opensearch.s3.split.S3SplitManager;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndexScan;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalPlan;
+import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.Table;
 
+@RequiredArgsConstructor
 public class S3Table implements Table {
   static Map<String, String> S3_DATA_MAPPING = new ImmutableMap.Builder<String, String>()
       .put("@timestamp", "date")
@@ -54,6 +57,10 @@ public class S3Table implements Table {
           .put("binary", OpenSearchDataType.OPENSEARCH_BINARY)
           .build();
 
+
+  private final String tableName;
+
+
   @Override
   public Map<String, ExprType> getFieldTypes() {
     Map<String, ExprType> fieldTypes = new HashMap<>();
@@ -66,18 +73,21 @@ public class S3Table implements Table {
 
   @Override
   public PhysicalPlan implement(LogicalPlan plan) {
-    return null;
+    return plan.accept(new S3PlanImplementor(), null);
   }
 
   @Override
   public SplitManager getSplitManager() {
-    return null;
+    return new S3SplitManager(tableName);
   }
 
   @VisibleForTesting
   @RequiredArgsConstructor
   public static class S3PlanImplementor
-      extends DefaultImplementor<OpenSearchIndexScan> {
-
+      extends DefaultImplementor<Void> {
+    @Override
+    public PhysicalPlan visitRelation(LogicalRelation node, Void context) {
+      return new S3ScanOperator();
+    }
   }
 }

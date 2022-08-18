@@ -10,7 +10,7 @@ import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.List;
 import lombok.Data;
-import lombok.RequiredArgsConstructor;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
@@ -32,12 +32,28 @@ import org.opensearch.sql.planner.stage.StageStateTable;
 import org.opensearch.sql.storage.TableScanOperator;
 
 /** OpenSearch execution engine implementation. */
-@RequiredArgsConstructor
 public class OpenSearchExecutionEngine implements ExecutionEngine {
 
   private final OpenSearchClient client;
 
   private final ExecutionProtector executionProtector;
+
+  private final ClusterService clusterService;
+
+  public OpenSearchExecutionEngine(OpenSearchClient client,
+                                   ExecutionProtector executionProtector) {
+    this.client = client;
+    this.executionProtector = executionProtector;
+    this.clusterService = null;
+  }
+
+  public OpenSearchExecutionEngine(OpenSearchClient client,
+                                   ExecutionProtector executionProtector,
+                                   ClusterService clusterService) {
+    this.client = client;
+    this.executionProtector = executionProtector;
+    this.clusterService = clusterService;
+  }
 
   @Override
   public void execute(PhysicalPlan physicalPlan, ResponseListener<QueryResponse> listener) {
@@ -74,7 +90,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     stageExecutions.get(0).addOutputListener(listener);
 
     // schedule the execution
-    ExecutionSchedule executionSchedule = new ExecutionSchedule(stageExecutions);
+    ExecutionSchedule executionSchedule = new ExecutionSchedule(stageExecutions, clusterService);
     executionSchedule.execute();
   }
 

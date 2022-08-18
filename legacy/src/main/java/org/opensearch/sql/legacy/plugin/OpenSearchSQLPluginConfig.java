@@ -59,7 +59,7 @@ public class OpenSearchSQLPluginConfig {
   @Bean
   public ExecutionEngine executionEngine() {
     OpenSearchFunctions.register(functionRepository);
-    return new OpenSearchExecutionEngine(client(), protector());
+    return new OpenSearchExecutionEngine(client(), protector(), clusterService);
   }
 
   @Bean

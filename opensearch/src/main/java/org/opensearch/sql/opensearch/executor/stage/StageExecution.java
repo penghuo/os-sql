@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.opensearch.action.ActionListener;
 import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.opensearch.executor.scheduler.OpenSearchQueryScheduler;
@@ -81,8 +83,11 @@ public class StageExecution {
     this.stageStateTable = StageStateTable.INSTANCE;
   }
 
-  public StageScheduler createStageScheduler() {
+  public StageScheduler createStageScheduler(ClusterService clusterService) {
     try {
+      DiscoveryNodes nodes = clusterService.state().getNodes();
+
+
       List<Split> splits = splitManager.nextBatch().get();
       if (splits.size() == 1 && splitManager.noMoreSplits()) {
         return new OpenSearchQueryScheduler(this, splitManager);

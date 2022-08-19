@@ -12,14 +12,19 @@ import com.google.common.collect.ImmutableMap;
 import java.util.HashMap;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
+import org.opensearch.client.node.NodeClient;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
+import org.opensearch.sql.opensearch.s3.OpenSearchWriteOperator;
 import org.opensearch.sql.opensearch.s3.split.S3SplitManager;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndexScan;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalPlan;
+import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
+import org.opensearch.sql.planner.logical.LogicalProject;
 import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.planner.splits.SplitManager;
 import org.opensearch.sql.storage.Table;
@@ -57,9 +62,11 @@ public class S3Table implements Table {
           .put("binary", OpenSearchDataType.OPENSEARCH_BINARY)
           .build();
 
+  private final NodeClient nodeClient;
 
   private final String tableName;
 
+  private static final String indexName = "maximus-test-00001";
 
   @Override
   public Map<String, ExprType> getFieldTypes() {
@@ -83,11 +90,16 @@ public class S3Table implements Table {
 
   @VisibleForTesting
   @RequiredArgsConstructor
-  public static class S3PlanImplementor
+  public  class S3PlanImplementor
       extends DefaultImplementor<Void> {
     @Override
     public PhysicalPlan visitRelation(LogicalRelation node, Void context) {
       return new S3ScanOperator();
+    }
+
+    @Override
+    public PhysicalPlan visitWrite(LogicalWrite plan, Void context) {
+      return new OpenSearchWriteOperator(visitChild(plan, context), nodeClient, plan.getRelationName());
     }
   }
 }

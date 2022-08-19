@@ -10,6 +10,7 @@ import java.util.Iterator;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.planner.PlanNode;
+import org.opensearch.sql.planner.splits.Split;
 
 /**
  * Physical plan.
@@ -27,6 +28,10 @@ public abstract class PhysicalPlan implements PlanNode<PhysicalPlan>,
    * @return returned object.
    */
   public abstract <R, C> R accept(PhysicalPlanNodeVisitor<R, C> visitor, C context);
+
+  public void addSplits(Split split) {
+    getChild().forEach(c -> c.addSplits(split));
+  }
 
   public void open() {
     getChild().forEach(PhysicalPlan::open);

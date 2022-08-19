@@ -42,7 +42,7 @@ public class ExecutionSchedule {
         LOG.info("Done. no stage execution pending schedule");
         return;
       }
-      StageScheduler stageScheduler = nextStage.createStageScheduler();
+      StageScheduler stageScheduler = nextStage.createStageScheduler(clusterService);
       stageScheduler.schedule();
     } catch (Exception e) {
       LOG.error("stage execution", e);

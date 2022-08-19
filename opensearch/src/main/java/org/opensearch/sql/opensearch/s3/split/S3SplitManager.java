@@ -21,13 +21,13 @@ public class S3SplitManager implements SplitManager {
 
   private final String tableName;
 
-  static private int N = 5;
+  static private int PARTITION = 1;
 
   @Override
   public CompletableFuture<List<Split>> nextBatch() {
     try {
       S3Lister s3Lister = new S3Lister(new URI(tableName));
-      Iterable<List<OSS3Object>> partition = s3Lister.partition(N);
+      Iterable<List<OSS3Object>> partition = s3Lister.partition(PARTITION);
       List<Split> result = new ArrayList<>();
       for (List<OSS3Object> oss3Objects : partition) {
         final S3Split s3Split = new S3Split(oss3Objects);

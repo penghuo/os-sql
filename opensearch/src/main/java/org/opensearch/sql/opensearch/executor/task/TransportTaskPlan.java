@@ -40,14 +40,14 @@ public class TransportTaskPlan implements TaskPlan, NamedWriteable {
   public TransportTaskPlan(StreamInput in) throws IOException {
     this.taskId = in.readNamedWriteable(TaskId.class);
     this.logicalPlan = OBJECT_MAPPER.readValue(in.readString(), LogicalPlan.class);
-    this.node = in.readEnum(TaskNode.class);
+    this.node = OBJECT_MAPPER.readValue(in.readString(), TaskNode.class);
   }
 
   @Override
   public void writeTo(StreamOutput out) throws IOException {
     out.writeNamedWriteable(taskId);
     out.writeString(OBJECT_MAPPER.writeValueAsString(logicalPlan));
-    out.writeEnum(node);
+    out.writeString(OBJECT_MAPPER.writeValueAsString(node));
   }
 
   public void execute(List<Split> splitList) {

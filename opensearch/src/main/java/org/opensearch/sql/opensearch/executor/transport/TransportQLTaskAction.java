@@ -109,9 +109,9 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
                            ActionListener<QLTaskResponse> actionListener) {
     TaskNode node = request.getTaskPlan().getNode();
 
-    if (node == TaskNode.LOCAL) {
-      final DiscoveryNode localNode = clusterService.state().getNodes().getLocalNode();
-      transportService.sendRequest(localNode, ACTION_NAME, request,
+
+//      final DiscoveryNode localNode = clusterService.state().getNodes().getLocalNode();
+      transportService.sendRequest(node.getNode(), ACTION_NAME, request,
           new TransportResponseHandler<QLTaskResponse>() {
             @Override
             public void handleResponse(QLTaskResponse resp) {
@@ -133,6 +133,5 @@ public class TransportQLTaskAction extends HandledTransportAction<QLTaskRequest,
               return new QLTaskResponse(in);
             }
           });
-    }
   }
 }

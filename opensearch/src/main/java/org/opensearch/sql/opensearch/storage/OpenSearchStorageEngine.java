@@ -11,6 +11,7 @@ import static org.opensearch.sql.utils.SystemIndexUtils.isSystemIndex;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.s3.connector.S3Table;
 import org.opensearch.sql.opensearch.storage.system.OpenSearchSystemIndex;
 import org.opensearch.sql.storage.StorageEngine;
 import org.opensearch.sql.storage.Table;
@@ -29,7 +30,9 @@ public class OpenSearchStorageEngine implements StorageEngine {
     if (isSystemIndex(name)) {
       return new OpenSearchSystemIndex(client, name);
     } else {
-      return new OpenSearchIndex(client, settings, name);
+      // todo, with catalog PR
+//      return new OpenSearchIndex(client, settings, name);
+      return new S3Table(client.getNodeClient(), name);
     }
   }
 }

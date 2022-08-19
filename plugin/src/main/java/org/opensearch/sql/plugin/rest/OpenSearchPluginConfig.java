@@ -52,7 +52,7 @@ public class OpenSearchPluginConfig {
 
   @Bean
   public ExecutionEngine executionEngine() {
-    return new OpenSearchExecutionEngine(client(), protector());
+    return new OpenSearchExecutionEngine(client(), protector(), clusterService);
   }
 
   @Bean

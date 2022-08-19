@@ -11,13 +11,14 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.data.model.ExprValue;
+import org.opensearch.sql.opensearch.s3.split.S3Split;
+import org.opensearch.sql.planner.splits.Split;
 import org.opensearch.sql.storage.TableScanOperator;
 
 @EqualsAndHashCode(onlyExplicitlyIncluded = true, callSuper = false)
@@ -66,8 +67,12 @@ public class S3ScanOperator extends TableScanOperator {
     }
   }
 
-  public void open(List<OSS3Object> partitions) {
-    this.partitions = partitions.iterator();
+  @Override
+  public void addSplits(Split split) {
+    this.partitions = ((S3Split) split).getObjects().iterator();
+  }
+
+  public void open() {
     OSS3Object next = this.partitions.next();
 
     log.info("next file {}", next);

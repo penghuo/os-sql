@@ -27,6 +27,7 @@ import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanNodeVisitor;
 import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.logical.LogicalStageState;
+import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.planner.stage.StageId;
@@ -113,8 +114,11 @@ public class PPLService {
     LOG.info("[{}] Incoming request {}", LogUtils.getRequestId(), anonymizer.anonymizeData(ast));
 
     // 2.Analyze abstract syntax to generate logical plan
-    LogicalPlan logicalPlan = analyzer.analyze(UnresolvedPlanHelper.addSelectAll(ast),
+    LogicalPlan subPlan = analyzer.analyze(UnresolvedPlanHelper.addSelectAll(ast),
         new AnalysisContext());
+
+    // todo, Table is not
+    LogicalPlan logicalPlan = new LogicalWrite(subPlan, "maximus-test-00001", null);
 
     // todo, add StageStateScan operator as a new stage for DML query. currently for everything.
     StageId childStageId = StageId.stageId();

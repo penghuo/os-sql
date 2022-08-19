@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import org.apache.commons.math3.analysis.function.Exp;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.planner.splits.Split;
 
 public class TaskExecution {
 
@@ -27,11 +28,14 @@ public class TaskExecution {
 
   private TaskExecutionListener listener;
 
+  private final Split split;
+
   public TaskExecution(PhysicalPlan plan, Consumer<List<ExprValue>> resultConsumer,
-                       TaskExecutionListener listener) {
+                       TaskExecutionListener listener, Split split) {
     this.plan = plan;
     this.resultConsumer = resultConsumer;
     this.listener = listener;
+    this.split = split;
   }
 
 
@@ -44,6 +48,7 @@ public class TaskExecution {
     }
     List<ExprValue> result = new ArrayList<>();
     try {
+      plan.addSplits(split);
       plan.open();
 
       while (plan.hasNext()) {

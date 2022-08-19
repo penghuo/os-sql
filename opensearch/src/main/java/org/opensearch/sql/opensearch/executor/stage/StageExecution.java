@@ -18,11 +18,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.opensearch.action.ActionListener;
 import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.opensearch.executor.scheduler.OpenSearchQueryScheduler;
+import org.opensearch.sql.opensearch.executor.scheduler.ScaleWriterScheduler;
 import org.opensearch.sql.opensearch.executor.scheduler.StageScheduler;
 import org.opensearch.sql.opensearch.executor.task.LocalTransportTaskPlan;
 import org.opensearch.sql.opensearch.executor.task.TaskId;
@@ -90,9 +92,10 @@ public class StageExecution {
 
       List<Split> splits = splitManager.nextBatch().get();
       if (splits.size() == 1 && splitManager.noMoreSplits()) {
-        return new OpenSearchQueryScheduler(this, splitManager);
+        return new OpenSearchQueryScheduler(this, splitManager, nodes.getLocalNode(),
+            splits.get(0));
       } else  {
-        throw new RuntimeException("split large than 1 is not supported yet");
+        return new ScaleWriterScheduler(this, splits, nodes);
       }
     } catch (InterruptedException | ExecutionException e) {
       throw new RuntimeException(e);
@@ -101,7 +104,7 @@ public class StageExecution {
 
   public void schedule(TaskNode node) {
     TransportTaskPlan tempTaskPlan = null;
-    if (node == TaskNode.LOCAL) {
+    if (node.isLocalNode()) {
       if (output.isPresent()) {
         tempTaskPlan = new LocalTransportTaskPlan(plan, node, output.get()::consume);
       } else {

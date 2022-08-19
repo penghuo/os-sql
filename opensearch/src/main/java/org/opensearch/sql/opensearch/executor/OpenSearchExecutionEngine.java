@@ -134,11 +134,11 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       return null;
     }
 
-    @Override
-    public Void visitWrite(LogicalWrite plan, SplitManagerContext context) {
-      context.setWrite(plan.getTable().getSplitManager());
-      return null;
-    }
+//    @Override
+//    public Void visitWrite(LogicalWrite plan, SplitManagerContext context) {
+//      context.setWrite(plan.getTable().getSplitManager());
+//      return null;
+//    }
 
     @Override
     public Void visitRelation(LogicalRelation plan, SplitManagerContext context) {

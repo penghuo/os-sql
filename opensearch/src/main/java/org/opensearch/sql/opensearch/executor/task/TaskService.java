@@ -107,11 +107,14 @@ public class TaskService {
     logicalPlan.accept(findTable, tblCtx);
     Table table = tblCtx.write != null ? tblCtx.getWrite() : tblCtx.getRead();
 
+
     if (taskPlan instanceof LocalTransportTaskPlan) {
       return new TaskExecution(table.implement(table.optimize(logicalPlan)),
-          ((LocalTransportTaskPlan) taskPlan).getConsumer(), listener);
+          ((LocalTransportTaskPlan) taskPlan).getConsumer(), listener,
+          ((LocalTransportTaskPlan) taskPlan).getNode().getSplit());
     } else {
-      return new TaskExecution(table.implement(table.optimize(logicalPlan)), v -> {}, listener);
+      return new TaskExecution(table.implement(table.optimize(logicalPlan)), v -> {}, listener,
+          ((TransportTaskPlan) taskPlan).getNode().getSplit());
     }
   }
 
@@ -121,12 +124,12 @@ public class TaskService {
       plan.getChild().forEach(child -> child.accept(this, context));
       return null;
     }
-
-    @Override
-    public Void visitWrite(LogicalWrite plan, TableContext context) {
-      context.setWrite(plan.getTable());
-      return null;
-    }
+//
+//    @Override
+//    public Void visitWrite(LogicalWrite plan, TableContext context) {
+//      context.setWrite(plan.getTable());
+//      return null;
+//    }
 
     @Override
     public Void visitRelation(LogicalRelation plan, TableContext context) {

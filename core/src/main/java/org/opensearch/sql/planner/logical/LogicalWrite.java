@@ -26,8 +26,8 @@ public class LogicalWrite extends LogicalPlan {
   /**
    * Constructor of LogicalRelation.
    */
-  public LogicalWrite(String relationName, Table table) {
-    super(ImmutableList.of());
+  public LogicalWrite(LogicalPlan child, String relationName, Table table) {
+    super(ImmutableList.of(child));
     this.relationName = relationName;
     this.table = table;
   }

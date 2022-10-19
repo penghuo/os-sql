@@ -74,7 +74,7 @@ class OpenSearchExecutionEngineTest {
     FakePhysicalPlan plan = new FakePhysicalPlan(expected.iterator());
     when(protector.protect(plan)).thenReturn(plan);
 
-    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
+    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, null, protector);
     List<ExprValue> actual = new ArrayList<>();
     executor.execute(
         plan,
@@ -102,7 +102,7 @@ class OpenSearchExecutionEngineTest {
     when(plan.hasNext()).thenThrow(expected);
     when(protector.protect(plan)).thenReturn(plan);
 
-    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
+    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, null, protector);
     AtomicReference<Exception> actual = new AtomicReference<>();
     executor.execute(
         plan,
@@ -123,7 +123,7 @@ class OpenSearchExecutionEngineTest {
 
   @Test
   void explainSuccessfully() {
-    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
+    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, null, protector);
     Settings settings = mock(Settings.class);
     when(settings.getSettingValue(QUERY_SIZE_LIMIT)).thenReturn(100);
     PhysicalPlan plan = new OpenSearchIndexScan(mock(OpenSearchClient.class),
@@ -147,7 +147,7 @@ class OpenSearchExecutionEngineTest {
 
   @Test
   void explainWithFailure() {
-    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, protector);
+    OpenSearchExecutionEngine executor = new OpenSearchExecutionEngine(client, null, protector);
     PhysicalPlan plan = mock(PhysicalPlan.class);
     when(plan.accept(any(), any())).thenThrow(IllegalStateException.class);
 

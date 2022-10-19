@@ -48,6 +48,10 @@ import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskAction;
+import org.opensearch.sql.opensearch.executor.transport.QLTaskResponse;
+import org.opensearch.sql.opensearch.executor.transport.TransportQLTaskAction;
+import org.opensearch.sql.opensearch.executor.transport.dataplane.QLDataService;
 import org.opensearch.sql.opensearch.security.SecurityAccess;
 import org.opensearch.sql.opensearch.setting.LegacyOpenDistroSettings;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
@@ -124,7 +128,10 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
     return Arrays.asList(
         new ActionHandler<>(
             new ActionType<>(PPLQueryAction.NAME, TransportPPLQueryResponse::new),
-            TransportPPLQueryAction.class));
+            TransportPPLQueryAction.class),
+        new ActionHandler<>(
+            new ActionType<>(QLTaskAction.NAME, QLTaskResponse::new),
+            TransportQLTaskAction.class));
   }
 
   @Override
@@ -172,7 +179,7 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
                 SecurityAccess.doPrivileged(() -> applicationContext.getBean(QueryService.class))));
     // return objects used by Guice to inject dependencies for e.g.,
     // transport action handler constructors
-    return ImmutableList.of(applicationContext);
+    return ImmutableList.of(applicationContext, new QLDataService());
   }
 
   @Override

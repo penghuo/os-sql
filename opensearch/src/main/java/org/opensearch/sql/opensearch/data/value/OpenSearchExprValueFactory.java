@@ -90,7 +90,7 @@ public class OpenSearchExprValueFactory {
 
   private static final String TOP_PATH = "";
 
-  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+  public static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
   private final Map<ExprType, Function<Content, ExprValue>> typeActionMap =
       new ImmutableMap.Builder<ExprType, Function<Content, ExprValue>>()

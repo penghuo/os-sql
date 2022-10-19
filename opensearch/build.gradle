@@ -95,3 +95,6 @@ jacocoTestCoverageVerification {
 }
 check.dependsOn jacocoTestCoverageVerification
 jacocoTestCoverageVerification.dependsOn jacocoTestReport
+
+checkstyleMain.ignoreFailures = true
+checkstyleTest.ignoreFailures = true

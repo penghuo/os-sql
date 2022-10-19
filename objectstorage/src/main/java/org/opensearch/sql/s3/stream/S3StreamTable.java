@@ -19,6 +19,8 @@ import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.s3.storage.OSS3Object;
 import org.opensearch.sql.s3.storage.S3ScanOperator;
 import org.opensearch.sql.s3.storage.S3Table;
+import org.opensearch.sql.s3.storage.splits.S3SplitManager;
+import org.opensearch.sql.storage.splits.SplitManager;
 
 /**
  * s3 stream table.
@@ -48,5 +50,10 @@ public class S3StreamTable extends S3Table {
     public PhysicalPlan visitRelation(LogicalRelation node, Void context) {
       return new S3ScanOperator(location, files);
     }
+  }
+
+  @Override
+  public SplitManager getSplitManager() {
+    return new S3SplitManager(files);
   }
 }

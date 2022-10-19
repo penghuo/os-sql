@@ -10,6 +10,7 @@ import java.util.Iterator;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.planner.PlanNode;
+import org.opensearch.sql.storage.splits.Split;
 
 /**
  * Physical plan.
@@ -40,4 +41,10 @@ public abstract class PhysicalPlan implements PlanNode<PhysicalPlan>,
     throw new IllegalStateException(String.format("[BUG] schema can been only applied to "
         + "ProjectOperator, instead of %s", toString()));
   }
+
+  // todo, add split to execution plan
+  public void addSplit(Split split) {
+    getChild().forEach(plan -> plan.addSplit(split));
+  }
+
 }

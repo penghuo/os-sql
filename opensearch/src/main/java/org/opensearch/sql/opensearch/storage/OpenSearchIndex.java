@@ -6,6 +6,8 @@
 
 package org.opensearch.sql.opensearch.storage;
 
+import static org.opensearch.sql.planner.logical.LogicalRemote.RemoteType.SOURCE;
+
 import com.google.common.annotations.VisibleForTesting;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +26,8 @@ import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalIndexScan;
 import org.opensearch.sql.opensearch.planner.logical.OpenSearchLogicalPlanOptimizerFactory;
 import org.opensearch.sql.opensearch.planner.physical.ADOperator;
 import org.opensearch.sql.opensearch.planner.physical.MLCommonsOperator;
+import org.opensearch.sql.opensearch.planner.physical.RemoteSinkOperator;
+import org.opensearch.sql.opensearch.planner.physical.RemoteSourceOperator;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexRequest;
 import org.opensearch.sql.opensearch.response.agg.OpenSearchAggregationResponseParser;
@@ -31,15 +35,18 @@ import org.opensearch.sql.opensearch.storage.script.aggregation.AggregationQuery
 import org.opensearch.sql.opensearch.storage.script.filter.FilterQueryBuilder;
 import org.opensearch.sql.opensearch.storage.script.sort.SortQueryBuilder;
 import org.opensearch.sql.opensearch.storage.serialization.DefaultExpressionSerializer;
+import org.opensearch.sql.opensearch.storage.splits.OSSplitManager;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalAD;
 import org.opensearch.sql.planner.logical.LogicalHighlight;
 import org.opensearch.sql.planner.logical.LogicalMLCommons;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalRelation;
+import org.opensearch.sql.planner.logical.LogicalRemote;
 import org.opensearch.sql.planner.logical.LogicalWrite;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.Table;
+import org.opensearch.sql.storage.splits.SplitManager;
 
 /** OpenSearch table (index) implementation. */
 public class OpenSearchIndex implements Table {
@@ -124,6 +131,11 @@ public class OpenSearchIndex implements Table {
   @Override
   public LogicalPlan optimize(LogicalPlan plan) {
     return OpenSearchLogicalPlanOptimizerFactory.create().optimize(plan);
+  }
+
+  @Override
+  public SplitManager getSplitManager() {
+    return new OSSplitManager();
   }
 
   @VisibleForTesting

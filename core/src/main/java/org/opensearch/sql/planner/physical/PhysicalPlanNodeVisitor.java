@@ -16,7 +16,7 @@ import org.opensearch.sql.storage.TableScanOperator;
  */
 public abstract class PhysicalPlanNodeVisitor<R, C> {
 
-  protected R visitNode(PhysicalPlan node, C context) {
+  public R visitNode(PhysicalPlan node, C context) {
     return null;
   }
 
@@ -81,6 +81,10 @@ public abstract class PhysicalPlanNodeVisitor<R, C> {
   }
 
   public R visitAD(PhysicalPlan node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitOutput(OutputOperator node, C context) {
     return visitNode(node, context);
   }
 }

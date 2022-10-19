@@ -14,6 +14,8 @@ import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.type.ExprType;
+import org.opensearch.sql.executor.stage.StageExecution;
+import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
 /**
@@ -35,6 +37,14 @@ public interface ExecutionEngine {
    * @param listener response listener
    */
   void execute(PhysicalPlan plan, ResponseListener<QueryResponse> listener);
+
+  void newExecute(LogicalPlan plan, ResponseListener<QueryResponse> listener);
+
+  List<StageExecution> plan(LogicalPlan plan);
+
+  default PhysicalPlan implement(LogicalPlan plan, List<Object> context) {
+    throw new UnsupportedOperationException("ExecutionEngine implement");
+  }
 
   /**
    * Explain physical plan and call back response listener. The reason why this has to

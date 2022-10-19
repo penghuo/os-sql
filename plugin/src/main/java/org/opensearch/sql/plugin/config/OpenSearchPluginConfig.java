@@ -10,6 +10,7 @@
 package org.opensearch.sql.plugin.config;
 
 import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.analysis.ExpressionAnalyzer;
 import org.opensearch.sql.catalog.CatalogService;
@@ -62,6 +63,9 @@ public class OpenSearchPluginConfig {
   @Autowired
   private CatalogService catalogService;
 
+  @Autowired
+  private ClusterService clusterService;
+
   @Bean
   @Scope(value = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
   public OpenSearchClient client() {
@@ -78,7 +82,7 @@ public class OpenSearchPluginConfig {
   @Scope(value = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
   public ExecutionEngine executionEngine() {
     OpenSearchFunctions.register(functionRepository);
-    return new OpenSearchExecutionEngine(client(), protector());
+    return new OpenSearchExecutionEngine(client(), clusterService, protector());
   }
 
   @Bean

@@ -10,6 +10,7 @@ import java.util.Map;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.storage.splits.SplitManager;
 
 /**
  * Table.
@@ -29,6 +30,10 @@ public interface Table {
    */
   PhysicalPlan implement(LogicalPlan plan);
 
+  default PhysicalPlan implement(LogicalPlan plan, Void context) {
+    return implement(plan);
+  }
+
   // todo. need improve
   default PhysicalPlan implement(LogicalPlan plan, PhysicalPlan child) {
     return child;
@@ -45,4 +50,8 @@ public interface Table {
     return plan;
   }
 
+  // todo. add docs
+  default SplitManager getSplitManager() {
+    throw new UnsupportedOperationException();
+  }
 }

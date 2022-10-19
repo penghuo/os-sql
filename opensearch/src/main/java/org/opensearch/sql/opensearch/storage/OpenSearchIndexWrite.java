@@ -5,10 +5,6 @@
 
 package org.opensearch.sql.opensearch.storage;
 
-import static org.opensearch.sql.data.model.ExprValueUtils.stringValue;
-import static org.opensearch.sql.data.model.ExprValueUtils.tupleValue;
-
-import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -16,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.opensearch.sql.data.model.ExprValue;
+import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
@@ -76,11 +73,14 @@ public class OpenSearchIndexWrite extends WriteOperator {
     return (count > 0);
   }
 
+  /**
+   * Return total count writeTo index.
+   */
   @Override
   public ExprValue next() {
-    ExprValue result = tupleValue(
-        ImmutableMap.of("message", stringValue(count + " row(s) impacted")));
+    Map<String, Object> result = new HashMap<>();
+    result.put("count", count);
     count = 0;
-    return result;
+    return ExprValueUtils.tupleValue(result);
   }
 }

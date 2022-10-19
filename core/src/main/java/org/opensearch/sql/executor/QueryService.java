@@ -52,7 +52,6 @@ public class QueryService {
     }
   }
 
-
   /**
    * Execute the {@link UnresolvedPlan}, using {@link ResponseListener} to get response.
    *
@@ -62,7 +61,7 @@ public class QueryService {
   public void execute(UnresolvedPlan plan,
                       ResponseListener<ExecutionEngine.QueryResponse> listener) {
     try {
-      executionEngine.execute(plan(analyze(plan)), listener);
+      executionEngine.newExecute(analyze(plan), listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }
@@ -71,7 +70,7 @@ public class QueryService {
   public void executePlan(LogicalPlan plan,
                           ResponseListener<ExecutionEngine.QueryResponse> listener) {
     try {
-      executionEngine.execute(plan(plan), listener);
+      executionEngine.newExecute(plan, listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }

@@ -77,7 +77,7 @@ public class MicroBatchTask {
 
         @Override
         public void onFailure(Exception e) {
-          log.error("");
+          log.error(e);
         }
       });
     }

@@ -21,9 +21,11 @@ import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalRelation;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.sql.s3.storage.splits.S3SplitManager;
 import org.opensearch.sql.s3.stream.S3StreamSource;
 import org.opensearch.sql.storage.StreamTable;
 import org.opensearch.sql.storage.Table;
+import org.opensearch.sql.storage.splits.SplitManager;
 
 @Getter
 @RequiredArgsConstructor

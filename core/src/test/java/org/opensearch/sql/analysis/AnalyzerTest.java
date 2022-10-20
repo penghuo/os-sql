@@ -35,6 +35,7 @@ import static org.opensearch.sql.data.type.ExprCoreType.INTEGER;
 import static org.opensearch.sql.data.type.ExprCoreType.LONG;
 import static org.opensearch.sql.data.type.ExprCoreType.STRING;
 import static org.opensearch.sql.data.type.ExprCoreType.STRUCT;
+import static org.opensearch.sql.data.type.ExprCoreType.TIMESTAMP;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -998,5 +999,20 @@ class AnalyzerTest extends AnalyzerTestBase {
     assertEquals("unsupported function name: queryrange", exception.getMessage());
   }
 
-
+  @Test
+  public void pr_919() {
+    Map<String, Literal> argumentMap =
+        new HashMap<>() {
+          {
+            put("anomaly_grade", AstDSL.doubleLiteral(1.0));
+            put("time_field", AstDSL.stringLiteral("timestamp_value"));
+          }
+        };
+    assertAnalyzeEqual(
+        LogicalPlanDSL.project(
+            new LogicalAD(LogicalPlanDSL.relation("schema", table), argumentMap),
+            DSL.named("timestamp_value", DSL.ref("timestamp_value", TIMESTAMP))),
+        AstDSL.project(
+            new AD(AstDSL.relation("schema"), argumentMap), AstDSL.field("timestamp_value")));
+  }
 }

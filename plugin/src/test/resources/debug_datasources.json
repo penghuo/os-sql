@@ -1,0 +1,11 @@
+[
+  {
+    "name" : "my_s3",
+    "connector": "filesystem",
+    "properties" : {
+      "fs.s3a.aws.credentials.provider": "com.amazonaws.auth.profile.ProfileCredentialsProvider",
+      "fs.s3a.endpoint.region": "us-west-2",
+      "fs.s3a.path.style.access": "true"
+    }
+  }
+]

@@ -21,6 +21,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import org.opensearch.gradle.test.RestIntegTestTask
 
 plugins {
     id 'java'
@@ -30,6 +31,7 @@ plugins {
 }
 
 apply plugin: 'opensearch.pluginzip'
+apply plugin: 'opensearch.rest-test'
 
 ext {
     projectSubstitutions = [:]
@@ -225,4 +227,25 @@ afterEvaluate {
             doLast { delete file("$buildDir/distributions/$archiveName") }
         }
     }
+}
+
+task debugTest(type: RestIntegTestTask) {
+    description = "Run tests against a cluster"
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+}
+
+testClusters.debugTest {
+    testDistribution = "INTEG_TEST"
+    plugin(project.tasks.bundlePlugin.archiveFile)
+
+    // run with ./gradlew opensearch-sql:run -DdebugTest=true
+    if (System.getProperty("debugTest") != null) {
+        jvmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005'
+    }
+    keystore 'plugins.query.federation.datasources.config', new File("$projectDir/src/test/resources/", 'debug_datasources.json')
+}
+
+run {
+    useCluster testClusters.debugTest
 }

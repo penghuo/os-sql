@@ -64,7 +64,7 @@ buildscript {
 plugins {
     id 'nebula.ospackage' version "8.3.0"
     id 'java-library'
-    id 'checkstyle'
+    id "com.diffplug.spotless" version "6.4.2" apply false
     id "io.freefair.lombok" version "6.4.0"
     id 'jacoco'
 }
@@ -88,6 +88,38 @@ allprojects {
 
     plugins.withId('java') {
         sourceCompatibility = targetCompatibility = "11"
+    }
+}
+
+subprojects {
+    if (!it.name.startsWith('legacy')) {
+        project.apply plugin: "com.diffplug.spotless"
+
+        spotless {
+            java {
+                // Normally this isn't necessary, but we have Java sources in
+                // non-standard places
+                target 'src/*/java/**/*.java'
+
+                removeUnusedImports()
+                googleJavaFormat('1.15.0').reflowLongStrings().groupArtifact('com.google.googlejavaformat:google-java-format')
+                trimTrailingWhitespace()
+
+                custom 'Refuse wildcard imports', {
+                    // Wildcard imports can't be resolved; fail the build
+                    if (it =~ /\s+import .*\*;/) {
+                        throw new AssertionError("Do not use wildcard imports.  'spotlessApply' cannot resolve this issue.")
+                    }
+                }
+
+                // See DEVELOPER_GUIDE.md for details of when to enable this.
+                if (System.getProperty('spotless.paddedcell') != null) {
+                    paddedCell()
+                }
+            }
+        }
+
+        build.dependsOn 'spotlessJavaCheck'
     }
 }
 
@@ -153,23 +185,6 @@ jacocoTestCoverageVerification {
     }
 }
 check.dependsOn jacocoTestCoverageVerification
-
-// TODO: fix code style in main and test source code
-allprojects {
-    apply plugin: 'checkstyle'
-    checkstyle {
-        configFile rootProject.file("config/checkstyle/google_checks.xml")
-        toolVersion "10.3.2"
-        configProperties = [
-                "org.checkstyle.google.suppressionfilter.config": rootProject.file("config/checkstyle/suppressions.xml")]
-        ignoreFailures = false
-    }
-}
-checkstyle {
-    configFile file("config/checkstyle/checkstyle.xml")
-}
-checkstyleMain.ignoreFailures = false
-checkstyleTest.ignoreFailures = true
 
 configurations.all {
     resolutionStrategy.force 'junit:junit:4.13.2'

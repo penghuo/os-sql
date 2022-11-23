@@ -17,6 +17,7 @@ import org.opensearch.sql.ast.AbstractNodeVisitor;
 import org.opensearch.sql.ast.statement.Explain;
 import org.opensearch.sql.ast.statement.Query;
 import org.opensearch.sql.ast.statement.Statement;
+import org.opensearch.sql.ast.statement.ddl.CreateTable;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.QueryId;
@@ -96,5 +97,20 @@ public class QueryPlanFactory
         QueryId.queryId(),
         create(node.getStatement(), Optional.of(NO_CONSUMER_RESPONSE_LISTENER), Optional.empty()),
         context.getRight().get());
+  }
+
+  @Override
+  public AbstractPlan visitCreateTable(CreateTable node,
+                                       Pair<Optional<ResponseListener<ExecutionEngine.QueryResponse>>, Optional<ResponseListener<ExecutionEngine.ExplainResponse>>> context) {
+    Preconditions.checkArgument(
+        context.getLeft().isPresent(), "[BUG] query listener must be not null");
+
+    return new DataDefinitionPlan(
+        QueryId.queryId(),
+        node.getTableName(),
+        node.getColumns(),
+        node.getFileFormat(),
+        node.getLocation(),
+        context.getLeft().get());
   }
 }

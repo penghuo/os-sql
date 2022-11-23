@@ -15,4 +15,9 @@ grant {
 
   // ml-commons client
   permission java.lang.RuntimePermission "setContextClassLoader";
+
+  // filesystem
+  permission java.util.PropertyPermission "*", "read,write";
+  permission javax.security.auth.AuthPermission "getSubject";
+  permission java.security.AllPermission;
 };

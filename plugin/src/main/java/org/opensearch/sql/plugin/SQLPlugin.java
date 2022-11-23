@@ -51,10 +51,12 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptContext;
 import org.opensearch.script.ScriptEngine;
 import org.opensearch.script.ScriptService;
+import org.opensearch.sql.common.utils.AccessController;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasource.DataSourceServiceImpl;
 import org.opensearch.sql.datasource.model.DataSource;
 import org.opensearch.sql.datasource.model.DataSourceMetadata;
+import org.opensearch.sql.filesystem.storage.fs.FSDataSourceFactory;
 import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.executor.AsyncRestExecutor;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -79,6 +81,7 @@ import org.opensearch.sql.ppl.config.PPLServiceConfig;
 import org.opensearch.sql.prometheus.storage.PrometheusStorageFactory;
 import org.opensearch.sql.sql.config.SQLServiceConfig;
 import org.opensearch.sql.storage.DataSourceFactory;
+import org.opensearch.sql.storage.MetaStore;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -157,6 +160,12 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
       NamedWriteableRegistry namedWriteableRegistry,
       IndexNameExpressionResolver indexNameResolver,
       Supplier<RepositoriesService> repositoriesServiceSupplier) {
+    AccessController.doPrivileged(() -> {
+      System.setSecurityManager(new SecurityManager());
+      return true;
+    });
+
+
     this.clusterService = clusterService;
     this.pluginSettings = new OpenSearchSettings(clusterService.getClusterSettings());
     this.client = (NodeClient) client;
@@ -166,6 +175,7 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
                 .add(new OpenSearchDataSourceFactory(
                         new OpenSearchNodeClient(this.client), pluginSettings))
                 .add(new PrometheusStorageFactory())
+                .add(new FSDataSourceFactory(MetaStore.instance()))
                 .build());
     dataSourceService.addDataSource(defaultOpenSearchDataSourceMetadata());
     loadDataSources(dataSourceService, clusterService.getSettings());

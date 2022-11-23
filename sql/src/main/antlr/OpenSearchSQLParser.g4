@@ -44,13 +44,16 @@ root
 
 //    Only SELECT
 sqlStatement
-    : dmlStatement | adminStatement
+    : dmlStatement | adminStatement | ddlStatement
     ;
 
 dmlStatement
     : selectStatement
     ;
 
+ddlStatement
+    : createTable
+    ;
 
 // Data Manipulation Language
 
@@ -89,8 +92,29 @@ compatibleID
     : (MODULE | ID)+?
     ;
 
-//    Select Statement's Details
+createTable
+    : CREATE EXTERNAL? TABLE
+        tableName createDefinitions
+        STORED AS fileFormat=stringLiteral
+        LOCATION location=stringLiteral
+    ;
 
+createDefinitions
+    : LR_BRACKET createDefinition (COMMA createDefinition)* RR_BRACKET
+    ;
+
+createDefinition
+    : columnName dataType
+    ;
+
+dataType
+    : typeName=STRING
+    | typeName=INTEGER
+    | typeName=DOUBLE
+    | typeName=DATE
+    ;
+
+//    Select Statement's Details
 querySpecification
     : selectClause
       fromClause?

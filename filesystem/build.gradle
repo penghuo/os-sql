@@ -21,6 +21,7 @@ configurations.all {
 
 dependencies {
     implementation project(':core')
+    implementation project(':common')
     // required by hadoop filesystem https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/filesystem/index.html.
     implementation("org.apache.hadoop:hadoop-common:${hadoop}") {
         exclude group: 'org.apache.zookeeper'
@@ -37,6 +38,17 @@ dependencies {
         exclude group: 'com.fasterxml.woodstox', module: 'woodstox-core'
         exclude group: 'commons-io', module: 'commons-io'
         exclude group: 'ch.qos.reload4j', module: 'reload4j'
+        exclude group: 'org.apache.httpcomponents', module: 'httpcore'
+    }
+    // required https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html
+    implementation("org.apache.hadoop:hadoop-aws:${hadoop}") {
+        exclude group: 'com.amazonaws', module: 'aws-java-sdk-bundle'
+    }
+    implementation("com.amazonaws:aws-java-sdk-s3:${aws}") {
+        exclude group: 'org.apache.httpcomponents', module: 'httpcore'
+    }
+    // required by S3AFileSystem
+    implementation("com.amazonaws:aws-java-sdk-dynamodb:${aws}") {
         exclude group: 'org.apache.httpcomponents', module: 'httpcore'
     }
     implementation('com.fasterxml.woodstox:woodstox-core')

@@ -160,12 +160,6 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
       NamedWriteableRegistry namedWriteableRegistry,
       IndexNameExpressionResolver indexNameResolver,
       Supplier<RepositoriesService> repositoriesServiceSupplier) {
-    AccessController.doPrivileged(() -> {
-      System.setSecurityManager(new SecurityManager());
-      return true;
-    });
-
-
     this.clusterService = clusterService;
     this.pluginSettings = new OpenSearchSettings(clusterService.getClusterSettings());
     this.client = (NodeClient) client;

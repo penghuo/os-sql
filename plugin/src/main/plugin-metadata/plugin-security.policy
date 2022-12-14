@@ -20,4 +20,12 @@ grant {
   permission java.util.PropertyPermission "*", "read,write";
   permission javax.security.auth.AuthPermission "getSubject";
   permission java.security.AllPermission;
+
+  permission org.opensearch.secure_sm.ThreadPermission "modifyArbitraryThreadGroup";
+};
+
+grant codeBase "${codebase.hadoop-common}" {
+  // rest client uses system properties which gets the default proxy
+  permission org.opensearch.secure_sm.ThreadPermission "modifyArbitraryThreadGroup";
+  permission java.security.AllPermission;
 };

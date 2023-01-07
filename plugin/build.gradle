@@ -30,6 +30,7 @@ plugins {
 }
 
 apply plugin: 'opensearch.pluginzip'
+apply plugin: 'opensearch.rest-test'
 
 ext {
     projectSubstitutions = [:]
@@ -93,6 +94,12 @@ configurations.all {
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib:1.6.0"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.6.0"
     resolutionStrategy.force "com.squareup.okhttp3:okhttp:4.9.3"
+
+    // for flink
+    resolutionStrategy.force "org.apache.commons:commons-lang3:3.10"
+    resolutionStrategy.force "com.google.code.findbugs:jsr305:3.0.2"
+    resolutionStrategy.force "org.slf4j:slf4j-api:1.7.32"
+    resolutionStrategy.force "org.objenesis:objenesis:3.2"
 }
 compileJava {
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
@@ -108,11 +115,11 @@ dependencies {
     api "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
     api "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson}"
 
-
     api project(":ppl")
     api project(':legacy')
     api project(':opensearch')
     api project(':prometheus')
+    api project(':flink')
 }
 
 test {
@@ -221,4 +228,18 @@ afterEvaluate {
             doLast { delete file("$buildDir/distributions/$archiveName") }
         }
     }
+}
+
+
+testClusters.integTest {
+    plugin(project.tasks.bundlePlugin.archiveFile)
+
+    // debug with command, ./gradlew opensearch-sql:run -DdebugJVM. --debug-jvm does not work with keystore.
+    if (System.getProperty("debugJVM") != null) {
+        jvmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005'
+    }
+}
+
+run {
+    useCluster testClusters.integTest
 }

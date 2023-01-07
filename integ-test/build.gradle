@@ -73,6 +73,12 @@ configurations.all {
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib:1.6.0"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.6.0"
     resolutionStrategy.force "com.squareup.okhttp3:okhttp:4.9.3"
+
+    // for flink
+    resolutionStrategy.force "org.apache.commons:commons-lang3:3.10"
+    resolutionStrategy.force "com.google.code.findbugs:jsr305:3.0.2"
+    resolutionStrategy.force "org.slf4j:slf4j-api:1.7.32"
+    resolutionStrategy.force "org.objenesis:objenesis:3.2"
 }
 
 dependencies {

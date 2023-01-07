@@ -40,6 +40,9 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptContext;
 import org.opensearch.script.ScriptEngine;
 import org.opensearch.script.ScriptService;
+import org.opensearch.sql.flink.transport.FlinkAction;
+import org.opensearch.sql.flink.transport.TransportFlinkAction;
+import org.opensearch.sql.flink.transport.TransportFlinkResponse;
 import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.executor.AsyncRestExecutor;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -53,6 +56,7 @@ import org.opensearch.sql.opensearch.storage.script.ExpressionScriptEngine;
 import org.opensearch.sql.opensearch.storage.serialization.DefaultExpressionSerializer;
 import org.opensearch.sql.plugin.catalog.CatalogServiceImpl;
 import org.opensearch.sql.plugin.catalog.CatalogSettings;
+import org.opensearch.sql.plugin.rest.RestFlinkAction;
 import org.opensearch.sql.plugin.rest.RestPPLQueryAction;
 import org.opensearch.sql.plugin.rest.RestPPLStatsAction;
 import org.opensearch.sql.plugin.rest.RestQuerySettingsAction;
@@ -105,7 +109,8 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
             CatalogServiceImpl.getInstance()),
         new RestSqlStatsAction(settings, restController),
         new RestPPLStatsAction(settings, restController),
-        new RestQuerySettingsAction(settings, restController));
+        new RestQuerySettingsAction(settings, restController),
+        new RestFlinkAction());
   }
 
   /**
@@ -116,7 +121,10 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
     return Arrays.asList(
         new ActionHandler<>(
             new ActionType<>(PPLQueryAction.NAME, TransportPPLQueryResponse::new),
-            TransportPPLQueryAction.class));
+            TransportPPLQueryAction.class),
+        new ActionHandler<>(
+            new ActionType<>(FlinkAction.NAME, TransportFlinkResponse::new),
+            TransportFlinkAction.class));
   }
 
   @Override

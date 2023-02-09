@@ -1,0 +1,31 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+plugins {
+    id 'java-library'
+    id "io.freefair.lombok"
+    id 'jacoco'
+    id 'info.solidsoft.pitest' version '1.9.0'
+}
+
+dependencies {
+    api project(':core')
+
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.0'
+}
+
+pitest {
+    targetClasses = ['org.opensearch.sql.*']
+    pitestVersion = '1.9.0'
+    threads = 4
+    outputFormats = ['HTML', 'XML']
+    timestampedReports = false
+    junit5PluginVersion = '1.0.0'
+}
+
+test {
+    useJUnitPlatform()
+}

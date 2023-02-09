@@ -8,5 +8,12 @@
       "prometheus.auth.username" : "admin",
       "prometheus.auth.password" : "type"
     }
+  },
+  {
+    "name" : "myspark",
+    "connector": "jdbc",
+    "properties" : {
+      "driver" : "http://localhost:9090"
+    }
   }
 ]

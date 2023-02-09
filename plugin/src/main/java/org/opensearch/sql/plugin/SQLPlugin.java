@@ -57,6 +57,7 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasource.DataSourceServiceImpl;
 import org.opensearch.sql.datasource.model.DataSource;
 import org.opensearch.sql.datasource.model.DataSourceMetadata;
+import org.opensearch.sql.jdbc.JDBCStorageFactory;
 import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.executor.AsyncRestExecutor;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -165,6 +166,7 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
                 .add(new OpenSearchDataSourceFactory(
                         new OpenSearchNodeClient(this.client), pluginSettings))
                 .add(new PrometheusStorageFactory())
+                .add(new JDBCStorageFactory())
                 .build());
     dataSourceService.addDataSource(defaultOpenSearchDataSourceMetadata());
     loadDataSources(dataSourceService, clusterService.getSettings());
@@ -229,6 +231,11 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin, Rel
             try {
               List<DataSourceMetadata> metadataList =
                   objectMapper.readValue(inputStream, new TypeReference<>() {});
+              metadataList.forEach(
+                  meta -> {
+                    LOG.info("name = {}", meta.getName());
+                    LOG.info("connector = {}", meta.getConnector().name());
+                  });
               dataSourceService.addDataSource(metadataList.toArray(new DataSourceMetadata[0]));
             } catch (IOException e) {
               LOG.error(

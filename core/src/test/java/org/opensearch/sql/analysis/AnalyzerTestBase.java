@@ -115,24 +115,6 @@ public class AnalyzerTestBase {
                       DataSourceService dataSourceService,
                       Table table) {
     BuiltinFunctionRepository functionRepository = BuiltinFunctionRepository.getInstance();
-    functionRepository.register("prometheus", new FunctionResolver() {
-
-      @Override
-      public Pair<FunctionSignature, FunctionBuilder> resolve(
-          FunctionSignature unresolvedSignature) {
-        FunctionName functionName = FunctionName.of("query_range");
-        FunctionSignature functionSignature =
-            new FunctionSignature(functionName, List.of(STRING, LONG, LONG, LONG));
-        return Pair.of(functionSignature,
-            (functionProperties, args) -> new TestTableFunctionImplementation(functionName, args,
-                table));
-      }
-
-      @Override
-      public FunctionName getFunctionName() {
-        return FunctionName.of("query_range");
-      }
-    });
     return new Analyzer(expressionAnalyzer, dataSourceService, functionRepository);
   }
 

@@ -116,6 +116,7 @@ dependencies {
     api project(':legacy')
     api project(':opensearch')
     api project(':prometheus')
+    api project(':jdbc')
 }
 
 test {

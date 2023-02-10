@@ -5,9 +5,12 @@
 
 package org.opensearch.sql.jdbc.functions;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.function.Supplier;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
@@ -27,13 +30,12 @@ import org.opensearch.sql.storage.read.TableScanBuilder;
 
 public class JDBCFunction extends FunctionExpression implements TableFunctionImplementation {
 
-  private final String queryString;
+  private final Supplier<TableScanOperator> tableScanOperatorSupplier;
 
-  private static final Table jdbcTable = new JDBCTable();
-
-  public JDBCFunction(FunctionName functionName, String queryString) {
+  public JDBCFunction(
+      FunctionName functionName, String url, String sqlQuery, Properties properties) {
     super(functionName, List.of());
-    this.queryString = queryString;
+    tableScanOperatorSupplier = () -> new JDBCQueryOperator(url, sqlQuery, properties);
   }
 
   @Override
@@ -48,10 +50,14 @@ public class JDBCFunction extends FunctionExpression implements TableFunctionImp
 
   @Override
   public Table applyArguments() {
-    return jdbcTable;
+    return new JDBCTable();
   }
 
-  static class JDBCTable implements Table {
+  @VisibleForTesting
+  protected class JDBCTable implements Table {
+    /**
+     * return empty map at query analysis stage.
+     */
     @Override
     public Map<String, ExprType> getFieldTypes() {
       return ImmutableMap.of();
@@ -69,13 +75,17 @@ public class JDBCFunction extends FunctionExpression implements TableFunctionImp
     }
   }
 
-  static class JDBCTableScanBuilder extends TableScanBuilder {
+  @VisibleForTesting
+  protected class JDBCTableScanBuilder extends TableScanBuilder {
 
     @Override
     public TableScanOperator build() {
-      return new JDBCQueryOperator();
+      return tableScanOperatorSupplier.get();
     }
 
+    /**
+     * ignore project operator.
+     */
     @Override
     public boolean pushDownProject(LogicalProject project) {
       return true;

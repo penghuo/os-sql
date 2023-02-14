@@ -98,6 +98,8 @@ configurations.all {
     resolutionStrategy.force "com.squareup.okhttp3:okhttp:4.9.3"
     resolutionStrategy.force "joda-time:joda-time:2.10.12"
     resolutionStrategy.force "org.slf4j:slf4j-api:1.7.36"
+
+    resolutionStrategy.force "org.apache.commons:commons-lang3:3.10"
 }
 compileJava {
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
@@ -116,7 +118,7 @@ dependencies {
     api project(':legacy')
     api project(':opensearch')
     api project(':prometheus')
-    api project(':jdbc')
+    implementation project(':jdbc')
 }
 
 test {

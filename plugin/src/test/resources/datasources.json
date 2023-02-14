@@ -13,7 +13,7 @@
     "name" : "myspark",
     "connector": "jdbc",
     "properties" : {
-      "driver" : "http://localhost:9090"
+      "url" : "jdbc:hive2://localhost:10000/default"
     }
   }
 ]

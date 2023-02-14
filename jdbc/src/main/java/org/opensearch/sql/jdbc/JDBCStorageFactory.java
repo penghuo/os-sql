@@ -18,6 +18,6 @@ public class JDBCStorageFactory implements DataSourceFactory {
 
   @Override
   public DataSource createDataSource(DataSourceMetadata metadata) {
-    return new DataSource(metadata.getName(), DataSourceType.JDBC, new JDBCStorageEngine());
+    return new DataSource(metadata.getName(), DataSourceType.JDBC, new JDBCStorageEngine(metadata));
   }
 }

@@ -5,40 +5,80 @@
 
 package org.opensearch.sql.jdbc;
 
-import static org.opensearch.sql.data.model.ExprValueUtils.LITERAL_TRUE;
-
-import java.util.List;
-import java.util.Map;
-import org.opensearch.sql.data.model.ExprTupleValue;
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.Locale;
+import java.util.Properties;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import org.opensearch.sql.data.model.ExprValue;
-import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.storage.TableScanOperator;
 
+@RequiredArgsConstructor
 public class JDBCQueryOperator extends TableScanOperator {
 
-  private String jdbcQuery = "jdbcQuery";
+  private final String url;
 
-  private boolean flag = true;
+  private final String sqlQuery;
+
+  private final Properties properties;
+
+  private Connection connection;
+
+  private Statement statement;
+
+  private ResultSet resultSet;
+
+  private JDBCResponseHandle jdbcResponse;
 
   @Override
   public String explain() {
-    return jdbcQuery;
+    return String.format(Locale.ROOT, "jdbc(%s)", sqlQuery);
   }
 
+  @SneakyThrows
+  @Override
+  public void open() {
+    doPrivileged(
+        () -> {
+          Class.forName("org.apache.hive.jdbc.HiveDriver");
+          connection = DriverManager.getConnection(url, properties);
+          statement = connection.createStatement();
+          resultSet = statement.executeQuery(sqlQuery);
+          jdbcResponse = new JDBCResponseHandle(resultSet.getMetaData());
+          return null;
+        });
+  }
+
+  @SneakyThrows
+  @Override
+  public void close() {
+    if (resultSet != null) {
+      resultSet.close();
+    }
+    if (statement != null) {
+      statement.close();
+    }
+    if (connection != null) {
+      connection.close();
+    }
+  }
+
+  @SneakyThrows
   @Override
   public boolean hasNext() {
-    if (flag) {
-      flag = false;
-      return true;
-    } else {
-      return false;
-    }
+    return resultSet.next();
   }
 
   @Override
   public ExprValue next() {
-    return ExprTupleValue.fromExprValueMap(Map.of("field", LITERAL_TRUE));
+    return jdbcResponse.parse(resultSet);
   }
 
   /**
@@ -46,7 +86,18 @@ public class JDBCQueryOperator extends TableScanOperator {
    */
   @Override
   public ExecutionEngine.Schema schema() {
-    return new ExecutionEngine.Schema(
-        List.of(new ExecutionEngine.Schema.Column("field", "field", ExprCoreType.BOOLEAN)));
+    return jdbcResponse.schema();
+  }
+
+
+  /**
+   * Execute the operation in privileged mode.
+   */
+  public static <T> T doPrivileged(final PrivilegedExceptionAction<T> operation) {
+    try {
+      return AccessController.doPrivileged(operation);
+    } catch (final PrivilegedActionException e) {
+      throw new IllegalStateException("Failed to perform privileged action", e);
+    }
   }
 }

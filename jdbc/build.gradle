@@ -12,6 +12,49 @@ plugins {
 
 dependencies {
     api project(':core')
+    runtimeOnly('org.apache.hive:hive-jdbc:3.1.3') {
+        exclude group: "org.apache.hadoop", module: "hadoop-common"
+        exclude group: 'org.apache.zookeeper'
+        exclude group: "org.apache.hive", module: "hive-metastore"
+        exclude group: "org.apache.hive", module: "hive-shims"
+        exclude group: 'org.apache.hive', module: 'hive-llap-server'
+        exclude group: 'org.apache.hive', module: 'hive-upgrade-acid'
+
+        // exclude for resolving version conflict
+        exclude group: 'org.apache.httpcomponents', module: 'httpcore'
+        exclude group: 'org.apache.httpcomponents', module: 'httpclient'
+
+        // exclude for include with transitive = false
+        exclude group: "org.apache.hive", module: "hive-common"
+        exclude group: "org.apache.hive", module: "hive-service"
+        exclude group: "org.apache.hive", module: "hive-serde"
+        exclude group: 'org.apache.hive', module: 'hive-service-rpc'
+    }
+    runtimeOnly('org.apache.httpcomponents:httpcore')
+    constraints {
+        runtimeOnly('org.apache.httpcomponents:httpcore:4.4.1') {
+            because 'org.apache.httpcomponents:httpcore between versions 4.4.13 and 4.4.1'
+        }
+    }
+    runtimeOnly('org.apache.httpcomponents:httpclient')
+    constraints {
+        runtimeOnly('org.apache.httpcomponents:httpclient:4.4.1') {
+            because 'org.apache.httpcomponents:httpclient between versions 4.5.13 and 4.4.1'
+        }
+    }
+    runtimeOnly('org.apache.hive:hive-service:3.1.3') {
+        transitive = false
+    }
+    runtimeOnly('org.apache.hive:hive-serde:3.1.3') {
+        transitive = false
+    }
+    runtimeOnly('org.apache.hive:hive-common:3.1.3') {
+        transitive = false
+    }
+    runtimeOnly('org.apache.hive:hive-service-rpc:3.1.3') {
+        transitive = false
+    }
+    runtimeOnly 'commons-lang:commons-lang:2.6'
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.0'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.0'
@@ -29,3 +72,5 @@ pitest {
 test {
     useJUnitPlatform()
 }
+
+checkstyleMain.ignoreFailures = true

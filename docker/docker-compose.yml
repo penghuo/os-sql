@@ -52,7 +52,6 @@ services:
     ports:
       - "8080:8080"
       - "7077:7077"
-      - "4040:4040"
     volumes: *spark-volumes
     environment:
       - SPARK_LOCAL_IP=spark-master
@@ -62,6 +61,7 @@ services:
     image: *spark-image
     container_name: spark-thrift
     ports:
+      - "4000:4000"
       - "10000:10000"
     depends_on:
       - spark-master
@@ -78,7 +78,6 @@ services:
     container_name: spark-worker-1
     ports:
       - "8081:8080"
-      - "7001:7077"
     depends_on:
       - spark-master
     volumes: *spark-volumes
@@ -96,7 +95,6 @@ services:
     container_name: spark-worker-2
     ports:
       - "8082:8080"
-      - "7002:7077"
     depends_on:
       - spark-master
     volumes: *spark-volumes

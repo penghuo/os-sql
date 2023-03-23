@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import org.opensearch.common.Strings;
-import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.sql.legacy.query.planner.core.ExecuteParams;
 import org.opensearch.sql.legacy.query.planner.physical.PhysicalOperator;
@@ -98,7 +97,7 @@ public class BlockHashJoin<T> extends JoinAlgorithm<T> {
             );
 
             if (LOG.isTraceEnabled()) {
-                LOG.trace("Terms filter optimization: {}", Strings.toString(XContentType.JSON, andQuery));
+                LOG.trace("Terms filter optimization: {}", Strings.toString(andQuery));
             }
             orQuery.should(andQuery);
         }

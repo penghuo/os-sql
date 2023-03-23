@@ -61,7 +61,7 @@ services:
     image: *spark-image
     container_name: spark-thrift
     ports:
-      - "4000:4000"
+      - "4040:4040"
       - "10000:10000"
     depends_on:
       - spark-master

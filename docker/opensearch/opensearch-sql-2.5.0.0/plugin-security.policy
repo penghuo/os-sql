@@ -16,7 +16,7 @@ grant {
   // ml-commons client
   permission java.lang.RuntimePermission "setContextClassLoader";
 
-  // todo
+  // hive2 jdbc required
   permission java.io.FilePermission "*", "read, write";
   permission java.security.SecurityPermission "*";
 };

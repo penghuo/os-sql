@@ -3,6 +3,7 @@
     "name" : "myspark",
     "connector": "jdbc",
     "properties" : {
+      "driver": "org.apache.hive.jdbc.HiveDriver",
       "url" : "jdbc:hive2://spark-thrift:10000/default"
     }
   }

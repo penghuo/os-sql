@@ -68,7 +68,8 @@ public class OpenSearchReader {
    * Return each hit doc.
    */
   public String next() {
-    return iterator.next().getSourceAsString();
+    String val = iterator.next().getSourceAsString();
+    return val;
   }
 
   public void close() {

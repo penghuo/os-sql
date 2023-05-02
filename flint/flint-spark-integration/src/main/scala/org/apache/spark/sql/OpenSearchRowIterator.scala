@@ -5,7 +5,7 @@
 
 package org.apache.spark.sql
 
-import com.fasterxml.jackson.core.JsonFactory
+import com.fasterxml.jackson.core.{JsonFactory, JsonParser}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.json.{CreateJacksonParser, JSONOptionsInRead, JacksonParser}
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, FailureSafeParser}
@@ -22,9 +22,7 @@ private[spark] class OpenSearchRowIterator(
   lazy val parser = new JacksonParser(schema,
     new JSONOptionsInRead(CaseInsensitiveMap(Map.empty[String, String]), TimeZone.getDefault.getID, ""),
     allowArrayAsStructs = true)
-  lazy val stringParser = parser.options.encoding
-    .map(enc => CreateJacksonParser.string(_: JsonFactory, _: String))
-    .getOrElse(CreateJacksonParser.string(_: JsonFactory, _: String))
+  lazy val stringParser: (JsonFactory, String) => JsonParser = CreateJacksonParser.string(_: JsonFactory, _: String)
   lazy val safeParser = new FailureSafeParser[String](
     input => parser.parse(input, stringParser, UTF8String.fromString),
     parser.options.parseMode,

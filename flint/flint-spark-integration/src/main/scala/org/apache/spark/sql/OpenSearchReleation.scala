@@ -6,7 +6,6 @@
 package org.apache.spark.sql
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types.StructType
 
@@ -24,7 +23,11 @@ case class OpenSearchRelation(
   }
 
   def buildScan(requiredColumns: Array[String], filters: Array[Filter]) = {
-    new OpenSearchRDD(sparkSession.sparkContext, userSchema.get, options).asInstanceOf[RDD[Row]]
+    val iteratorInternalRow = new OpenSearchRDD(sparkSession.sparkContext, userSchema.get, options)
+
+    iteratorInternalRow.map { internalRow =>
+      Row.fromSeq(schema.fields.indices.map(i => internalRow.get(i, schema.fields(i).dataType)))
+    }
   }
 
   /**

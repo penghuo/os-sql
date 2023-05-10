@@ -66,6 +66,7 @@ lazy val flintSparkIntegration = (project in file("flint-spark-integration"))
     libraryDependencies ++= Seq(
       "org.opensearch.client" % "opensearch-rest-client" % opensearchVersion,
       "org.opensearch.client" % "opensearch-rest-high-level-client" % opensearchVersion,
+      "org.json4s" %% "json4s-jackson" % "3.7.0-M11" % "provided",
       "org.testcontainers" % "testcontainers" % "1.18.0" % "test",
       "org.scalactic" %% "scalactic" % "3.2.15",
       "org.scalatest" %% "scalatest" % "3.2.15" % "test",

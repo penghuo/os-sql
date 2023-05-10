@@ -3,9 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.apache.spark.sql.v2
+package org.apache.spark.sql.flint
 
 import java.util
+
+import scala.collection.JavaConverters._
+
+import org.opensearch.flint.storage.FlintOptions
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.{Table, TableProvider}
@@ -14,24 +18,29 @@ import org.apache.spark.sql.sources.DataSourceRegister
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-class OpenSearchJsonDataSourceV2 extends TableProvider with DataSourceRegister {
+class FlintDataSourceV2 extends TableProvider with DataSourceRegister {
 
-  /**
-   * Todo. add inferSchema for read path
-   */
+  private var table: FlintTable = null
+
   override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
-    throw new UnsupportedOperationException("inferSchema is not supported")
+    if (table == null) {
+      table = getFlintTable(Option.empty, new FlintOptions(options.asScala.toMap))
+    }
+    table.schema
   }
 
   override def getTable(
       schema: StructType,
       partitioning: Array[Transform],
       properties: util.Map[String, String]): Table = {
-    OpenSearchTable(
-      getTableName(properties),
-      SparkSession.active,
-      new CaseInsensitiveStringMap(properties),
-      Some(schema))
+    if (table == null) {
+      table = getFlintTable(Some(schema), new FlintOptions(properties.asScala.toMap))
+    }
+    table
+  }
+
+  protected def getFlintTable(schema: Option[StructType], option: FlintOptions): FlintTable = {
+    FlintTable(option.getIndexName, SparkSession.active, option, schema)
   }
 
   /**
@@ -40,11 +49,4 @@ class OpenSearchJsonDataSourceV2 extends TableProvider with DataSourceRegister {
   override def shortName(): String = "flint"
 
   override def supportsExternalMetadata(): Boolean = true
-
-  /**
-   * get from paths property.
-   */
-  private def getTableName(properties: util.Map[String, String]): String = {
-    properties.get("path")
-  }
 }

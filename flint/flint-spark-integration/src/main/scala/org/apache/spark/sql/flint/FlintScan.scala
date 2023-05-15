@@ -26,7 +26,7 @@ case class FLintScan(
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    FlintReaderFactory(tableName, schema, options, pushedPredicates)
+    FlintPartitionReaderFactory(tableName, schema, options, pushedPredicates)
   }
 
   override def toBatch: Batch = this

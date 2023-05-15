@@ -5,7 +5,7 @@
 
 package org.apache.spark.sql.flint
 
-import org.opensearch.flint.storage.FlintOptions
+import org.opensearch.flint.core.FlintOptions
 
 import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.read.{Batch, InputPartition, PartitionReaderFactory, Scan}

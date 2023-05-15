@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.apache.spark.sql.flint
+package org.apache.spark.sql.flint.mapping
 
 import org.apache.spark.sql.connector.expressions.{Expression, FieldReference, LiteralValue}
 import org.apache.spark.sql.connector.expressions.filter.Predicate
@@ -11,7 +11,7 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate
 /**
  * Todo. find the right package.
  */
-object FlintQueryBuilder {
+object FlintQueryCompiler {
 
   /**
    * Using AND to concat predicates.

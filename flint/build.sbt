@@ -54,7 +54,14 @@ lazy val root = (project in file("."))
 
 lazy val flintCore = (project in file("flint-core"))
   .disablePlugins(AssemblyPlugin)
-  .settings(name := "flint-core", scalaVersion := scala212)
+  .settings(
+    name := "flint-core",
+    scalaVersion := scala212,
+    // todo, does it required?
+    javacOptions ++= Seq("-source", "11", "-target", "11"),
+    libraryDependencies ++= Seq(
+      "org.opensearch.client" % "opensearch-rest-client" % opensearchVersion,
+      "org.opensearch.client" % "opensearch-rest-high-level-client" % opensearchVersion))
 
 lazy val flintSparkIntegration = (project in file("flint-spark-integration"))
   .dependsOn(flintCore)

@@ -7,9 +7,7 @@ package org.apache.spark.sql.flint
 
 import java.util
 
-import scala.collection.JavaConverters._
-
-import org.opensearch.flint.storage.FlintOptions
+import org.opensearch.flint.core.FlintOptions
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.{Table, TableProvider}
@@ -24,7 +22,7 @@ class FlintDataSourceV2 extends TableProvider with DataSourceRegister {
 
   override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
     if (table == null) {
-      table = getFlintTable(Option.empty, new FlintOptions(options.asScala.toMap))
+      table = getFlintTable(Option.empty, new FlintOptions(options.asCaseSensitiveMap()))
     }
     table.schema
   }
@@ -34,7 +32,7 @@ class FlintDataSourceV2 extends TableProvider with DataSourceRegister {
       partitioning: Array[Transform],
       properties: util.Map[String, String]): Table = {
     if (table == null) {
-      table = getFlintTable(Some(schema), new FlintOptions(properties.asScala.toMap))
+      table = getFlintTable(Some(schema), new FlintOptions(properties))
     }
     table
   }

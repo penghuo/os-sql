@@ -7,7 +7,7 @@ package org.apache.spark.sql.flint.mapping
 
 import org.json4s.{JField, JString, _}
 import org.json4s.jackson._
-import org.opensearch.flint.storage.{FlintClient, FlintOptions}
+import org.opensearch.flint.core.{FlintClient, FlintOptions}
 
 import org.apache.spark.sql.flint.mapping.FlintMapping.compile
 import org.apache.spark.sql.types.{DataTypes, IntegerType, LongType, MetadataBuilder, StringType, StructType}

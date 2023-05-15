@@ -1,0 +1,52 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.flint.core;
+
+import java.io.Serializable;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+
+public class FlintOptions implements Serializable {
+  private Map<String, String> options;
+
+  public static final String INDEX_NAME = "index";
+  public static final String HOST = "host";
+  public static final String PORT = "port";
+  public static final String ARRAY_FIELDS = "array_fields";
+
+  public FlintOptions(Map<String, String> options) {
+    this.options = options;
+  }
+
+  public String getIndexName() {
+    if(options.containsKey("path")) {
+      return options.get("path");
+    } else if(options.containsKey(INDEX_NAME)) {
+      return options.get(INDEX_NAME);
+    } else {
+      throw new NoSuchElementException("index or path not found");
+    }
+  }
+
+  public String getHost() {
+    return options.getOrDefault(HOST, "localhost");
+  }
+
+  public int getPort() {
+    return Integer.parseInt(options.getOrDefault(PORT, "9200"));
+  }
+
+  public Set<String> arrayFields() {
+    String[] fields = options.getOrDefault(ARRAY_FIELDS, "").split(",");
+    Set<String> fieldsSet = new HashSet<>();
+    for(String field : fields) {
+      fieldsSet.add(field.trim());
+    }
+    return fieldsSet;
+  }
+}

@@ -7,9 +7,7 @@ package org.apache.spark.sql.flint
 
 import java.util
 
-import scala.collection.JavaConverters._
-
-import org.opensearch.flint.storage.{FlintClient, FlintOptions}
+import org.opensearch.flint.core.{FlintClient, FlintOptions}
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.{SupportsRead, Table, TableCapability}
@@ -53,6 +51,6 @@ case class FlintTable(
     util.EnumSet.of(BATCH_READ)
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
-    FlintScanBuilder(name, sparkSession, schema, new FlintOptions(options.asScala.toMap))
+    FlintScanBuilder(name, sparkSession, schema, new FlintOptions(options.asCaseSensitiveMap()))
   }
 }

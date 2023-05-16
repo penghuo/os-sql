@@ -10,8 +10,6 @@ import org.opensearch.client.RestClient;
 import org.opensearch.client.RestHighLevelClient;
 import org.opensearch.flint.core.storage.FlintReader;
 
-import java.util.Optional;
-
 public interface FlintClient {
 
   static FlintClient create(FlintOptions options) {
@@ -33,5 +31,5 @@ public interface FlintClient {
    * @param query DSL query. DSL query is null means match_all
    * @return {@link FlintReader}.
    */
-  FlintReader createReader(String indexName, String query);
+  FlintReader createReader(String indexName, String query, FlintOptions option);
 }

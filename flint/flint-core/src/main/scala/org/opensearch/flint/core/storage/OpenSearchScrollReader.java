@@ -13,6 +13,8 @@ import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestHighLevelClient;
 import org.opensearch.common.Strings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.flint.core.FlintOptions;
+import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.io.IOException;
 
@@ -24,10 +26,13 @@ public class OpenSearchScrollReader extends OpenSearchReader {
   /** Default scroll context timeout in minutes. */
   public static final TimeValue DEFAULT_SCROLL_TIMEOUT = TimeValue.timeValueMinutes(1L);
 
+  private final FlintOptions options;
+
   private String scrollId = null;
 
-  public OpenSearchScrollReader(RestHighLevelClient client, SearchRequest searchRequest) {
-    super(client, searchRequest);
+  public OpenSearchScrollReader(RestHighLevelClient client, String indexName, SearchSourceBuilder searchSourceBuilder, FlintOptions options) {
+    super(client, new SearchRequest().indices(indexName).source(searchSourceBuilder.size(options.getScrollSize())));
+    this.options = options;
   }
 
   /**
@@ -46,7 +51,7 @@ public class OpenSearchScrollReader extends OpenSearchReader {
   }
 
   /**
-   * clean.
+   * clean the scroll context.
    */
   void clean() throws IOException {
     if (Strings.isNullOrEmpty(scrollId)) {

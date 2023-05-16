@@ -17,6 +17,11 @@ public class FlintOptions implements Serializable {
   public static final String INDEX_NAME = "index";
   public static final String HOST = "host";
   public static final String PORT = "port";
+  /**
+   * Used by {@link org.opensearch.flint.core.storage.OpenSearchScrollReader}
+   */
+  public static final String SCROLL_SIZE = "scroll_size";
+  public static final int DEFAULT_SCROLL_SIZE = 100;
   public static final String ARRAY_FIELDS = "array_fields";
 
   public FlintOptions(Map<String, String> options) {
@@ -48,5 +53,9 @@ public class FlintOptions implements Serializable {
       fieldsSet.add(field.trim());
     }
     return fieldsSet;
+  }
+
+  public int getScrollSize() {
+    return Integer.parseInt(options.getOrDefault(SCROLL_SIZE, String.valueOf(DEFAULT_SCROLL_SIZE)));
   }
 }

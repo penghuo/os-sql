@@ -5,7 +5,6 @@
 
 package org.opensearch.flint.core;
 
-import org.opensearch.action.search.SearchRequest;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestHighLevelClient;
 import org.opensearch.client.indices.GetMappingsRequest;
@@ -30,11 +29,18 @@ import static org.opensearch.common.xcontent.DeprecationHandler.IGNORE_DEPRECATI
 
 public class OpenSearchRestHighLevelClient implements FlintClient {
 
-  private static NamedXContentRegistry
-      repository =
+  /**
+   * {@link NamedXContentRegistry} from {@link SearchModule} used for construct {@link QueryBuilder} from DSL query string.
+   */
+  private final static NamedXContentRegistry
+      xContentRegistry =
       new NamedXContentRegistry(new SearchModule(Settings.builder().build(), new ArrayList<>()).getNamedXContents());
 
-  private RestHighLevelClient client;
+  /**
+   * Todo. Migrate to https://opensearch.org/docs/latest/clients/java/ in future.
+   * The reason we use {@link RestHighLevelClient} is https://github.com/opensearch-project/opensearch-java/issues/257
+   */
+  private final RestHighLevelClient client;
 
   public OpenSearchRestHighLevelClient(RestHighLevelClient client) {
     this.client = client;
@@ -54,18 +60,17 @@ public class OpenSearchRestHighLevelClient implements FlintClient {
    * Create {@link FlintReader}.
    *
    * @param indexName index name.
-   * @param query DSL query. DSL query is null means match_all
+   * @param query DSL query. DSL query is null means match_all.
    * @return {@link FlintReader}.
    */
-  @Override public FlintReader createReader(String indexName, String query) {
+  @Override public FlintReader createReader(String indexName, String query, FlintOptions options) {
     try {
       QueryBuilder queryBuilder = new MatchAllQueryBuilder();
       if (!Strings.isNullOrEmpty(query)) {
-        XContentParser parser = XContentType.JSON.xContent().createParser(repository, IGNORE_DEPRECATIONS, query);
+        XContentParser parser = XContentType.JSON.xContent().createParser(xContentRegistry, IGNORE_DEPRECATIONS, query);
         queryBuilder = AbstractQueryBuilder.parseInnerQueryBuilder(parser);
       }
-      SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder().query(queryBuilder);
-      return new OpenSearchScrollReader(client, new SearchRequest().indices(indexName).source(searchSourceBuilder));
+      return new OpenSearchScrollReader(client, indexName, new SearchSourceBuilder().query(queryBuilder), options);
     } catch (IOException e) {
       throw new RuntimeException(e);
     }

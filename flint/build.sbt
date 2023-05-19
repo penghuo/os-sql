@@ -5,7 +5,7 @@
 import Dependencies._
 
 lazy val scala212 = "2.12.14"
-lazy val sparkVersion = "3.3.1"
+lazy val sparkVersion = "3.4.0"
 lazy val opensearchVersion = "2.6.0"
 
 ThisBuild / version := "0.1.0-SNAPSHOT"

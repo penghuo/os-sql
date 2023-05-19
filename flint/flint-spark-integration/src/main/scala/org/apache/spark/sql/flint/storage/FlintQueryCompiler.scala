@@ -6,7 +6,7 @@
 package org.apache.spark.sql.flint.storage
 
 import org.apache.spark.sql.catalyst.expressions.Literal
-import org.apache.spark.sql.connector.expressions.{Expression, FieldReference, LiteralValue}
+import org.apache.spark.sql.connector.expressions.{Expression, FieldReference, LiteralValue, UserDefinedScalarFunc}
 import org.apache.spark.sql.connector.expressions.filter.{And, Predicate}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
@@ -67,8 +67,14 @@ case class FlintQueryCompiler(schema: StructType) {
             p.children()(0))}}},{"bool":{"filter":${compile(p.children()(1))}}}]}}"""
       case "NOT" =>
         s"""{"bool":{"must_not":${compile(p.children()(0))}}}"""
-      case "=" =>
-        s"""{"term":{"${compile(p.children()(0))}":{"value":${compile(p.children()(1))}}}}"""
+      case "=" | "ARRAY_CONTAINS" =>
+        p.children().head match {
+          case udf: UserDefinedScalarFunc if udf.name() == "ARRAY_CONTAINS" =>
+            s"""{"term":{"${compile(udf.children()(0))}":{"value":${compile(
+                udf.children()(1))}}}}"""
+          case _ =>
+            s"""{"term":{"${compile(p.children()(0))}":{"value":${compile(p.children()(1))}}}}"""
+        }
       case ">" =>
         s"""{"range":{"${compile(p.children()(0))}":{"gt":${compile(p.children()(1))}}}}"""
       case ">=" =>

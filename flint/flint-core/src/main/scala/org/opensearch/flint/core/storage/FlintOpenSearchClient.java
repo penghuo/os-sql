@@ -6,6 +6,7 @@
 package org.opensearch.flint.core.storage;
 
 import java.io.IOException;
+import java.io.Writer;
 import java.util.ArrayList;
 
 import org.apache.http.HttpHost;
@@ -113,6 +114,10 @@ public class FlintOpenSearchClient implements FlintClient {
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
+  }
+
+  public Writer createWriter(String indexName) {
+    return new OpenSearchWriter(createClient(), indexName);
   }
 
   private RestHighLevelClient createClient() {

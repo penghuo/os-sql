@@ -8,6 +8,8 @@ package org.opensearch.flint.core;
 import org.opensearch.flint.core.metadata.FlintMetadata;
 import org.opensearch.flint.core.storage.FlintReader;
 
+import java.io.Writer;
+
 /**
  * Flint index client that provides API for metadata and data operations
  * on a Flint index regardless of concrete storage.
@@ -46,4 +48,6 @@ public interface FlintClient {
    * @return {@link FlintReader}.
    */
   FlintReader createReader(String indexName, String query);
+
+  Writer createWriter(String indexName);
 }

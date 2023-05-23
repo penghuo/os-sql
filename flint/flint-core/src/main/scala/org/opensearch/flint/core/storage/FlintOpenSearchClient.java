@@ -116,7 +116,7 @@ public class FlintOpenSearchClient implements FlintClient {
     }
   }
 
-  public Writer createWriter(String indexName) {
+  public FlintWriter createWriter(String indexName) {
     return new OpenSearchWriter(createClient(), indexName);
   }
 

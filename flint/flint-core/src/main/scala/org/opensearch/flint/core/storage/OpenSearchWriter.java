@@ -5,79 +5,72 @@
 
 package org.opensearch.flint.core.storage;
 
+import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
-import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestHighLevelClient;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.rest.RestStatus;
 
 import java.io.IOException;
-import java.io.Writer;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.StringWriter;
+import java.util.Arrays;
 
-public class OpenSearchWriter extends Writer {
+/**
+ * OpenSearch Bulk writer. More reading https://opensearch.org/docs/1.2/opensearch/rest-api/document-apis/bulk/.
+ */
+public class OpenSearchWriter extends FlintWriter {
 
-  private static final String LINE_SEP = "\n";
+  private final String indexName;
 
-  private final String index;
+  private final StringWriter writer;
 
-  private final RestHighLevelClient client;
+  private RestHighLevelClient client;
 
-  private final StringBuilder stringBuilder;
-
-  private final List<String> documents;
-
-  public OpenSearchWriter(RestHighLevelClient client, String index) {
+  public OpenSearchWriter(RestHighLevelClient client, String indexName) {
     this.client = client;
-    this.index = index;
-    this.stringBuilder = new StringBuilder();
-    this.documents = new ArrayList<>();
+    this.indexName = indexName;
+    this.writer = new StringWriter();
   }
 
-  @Override
-  public void write(char[] cbuf, int off, int len) {
-    stringBuilder.append(cbuf, off, len);
+  @Override public void write(char[] cbuf, int off, int len) {
+    writer.write(cbuf, off, len);
   }
 
-  @Override
-  public void flush() throws IOException {
-    String[] docs = stringBuilder.toString().split(LINE_SEP);
-
-    if (docs.length == 0) {
-      // do nothing
-      return;
-    }
-
-    // Create bulk request
-    BulkRequest request = new BulkRequest();
-    for (String doc : docs) {
-      request.add(new IndexRequest(index).source(doc, XContentType.JSON));
-    }
-
-    // Execute bulk request
+  /**
+   * Todo. StringWriter is not efficient. it will copy the cbuf when create bytes.
+   */
+  @Override public void flush() throws IOException {
     try {
-      client.bulk(request, RequestOptions.DEFAULT);
+      byte[] bytes = writer.toString().getBytes();
+      BulkRequest request = new BulkRequest(indexName).add(bytes, 0, bytes.length, XContentType.JSON);
+      BulkResponse response = client.bulk(request, RequestOptions.DEFAULT);
+      // fail entire bulk request even one doc failed.
+      if (response.hasFailures() && Arrays.stream(response.getItems()).anyMatch(itemResp -> !isCreateConflict(itemResp))) {
+        throw new RuntimeException(response.buildFailureMessage());
+      }
     } catch (IOException e) {
-      throw new IOException("Failed to execute bulk request", e);
+      throw new RuntimeException(String.format("Failed to execute bulk request on index: %s", indexName), e);
+    } finally {
+      writer.close();
     }
-
-    documents.clear();
-    stringBuilder.setLength(0);
   }
 
-  @Override
-  public void close() throws IOException {
-    if (stringBuilder.length() > 0) {
-      flush();
-    }
-    if (client != null) {
-      try {
+  @Override public void close() {
+    try {
+      if (client != null) {
         client.close();
-      } catch (IOException e) {
-        throw new RuntimeException(e);
+        client = null;
       }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
     }
+  }
+
+  private boolean isCreateConflict(BulkItemResponse itemResp) {
+    return itemResp.getOpType() == DocWriteRequest.OpType.CREATE && itemResp.getFailure().getStatus() == RestStatus.CONFLICT;
   }
 }
 

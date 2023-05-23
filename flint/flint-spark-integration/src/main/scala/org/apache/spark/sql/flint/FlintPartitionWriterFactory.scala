@@ -21,6 +21,6 @@ case class FlintPartitionWriterFactory(
   override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] = {
     val flintClient = FlintClientBuilder.build(new FlintOptions(properties))
 
-    FlintPartitionWriter(flintClient.createWriter(tableName), schema)
+    FlintPartitionWriter(flintClient.createWriter(tableName), schema, properties)
   }
 }

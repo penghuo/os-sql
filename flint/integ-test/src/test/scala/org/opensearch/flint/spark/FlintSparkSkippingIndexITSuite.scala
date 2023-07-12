@@ -259,8 +259,7 @@ class FlintSparkSkippingIndexITSuite
 
     checkAnswer(query, Row("Hello"))
     query.queryExecution.executedPlan should
-      useFlintSparkSkippingFileIndex(
-        hasIndexFilter(col("year") === 2023 && col("month") === 4))
+      useFlintSparkSkippingFileIndex(hasIndexFilter(col("year") === 2023 && col("month") === 4))
   }
 
   test("can build value set skipping index and rewrite applicable query") {
@@ -279,8 +278,7 @@ class FlintSparkSkippingIndexITSuite
 
     checkAnswer(query, Row("World"))
     query.queryExecution.executedPlan should
-      useFlintSparkSkippingFileIndex(
-        hasIndexFilter(col("address") === "Seattle"))
+      useFlintSparkSkippingFileIndex(hasIndexFilter(col("address") === "Seattle"))
   }
 
   test("can build min max skipping index and rewrite applicable query") {
@@ -331,6 +329,49 @@ class FlintSparkSkippingIndexITSuite
 
   test("should return empty if describe index not exist") {
     flint.describeIndex("non-exist") shouldBe empty
+  }
+
+  test("can build value set skipping index on varchar field and rewrite applicable query") {
+    val parquetTable = "parquet"
+    sql(s"""
+           | CREATE TABLE $parquetTable
+           | (
+           |   name STRING,
+           |   age INT,
+           |   address VARCHAR(255)
+           | )
+           | USING PARQUET
+           |""".stripMargin)
+
+    sql(s"""
+           | INSERT INTO $parquetTable
+           | VALUES ('Hello', 30, 'Seattle')
+           | """.stripMargin)
+
+    sql(s"""
+           | INSERT INTO $parquetTable
+           | VALUES ('World', 25, 'Portland')
+           | """.stripMargin)
+    val parquetIndex = getSkippingIndexName(parquetTable)
+
+    flint
+      .skippingIndex()
+      .onTable(parquetTable)
+      .addValueSet("address")
+      .create()
+    flint.refreshIndex(parquetIndex, FULL)
+
+    withIndexName(parquetIndex) {
+      val query = sql(s"""
+                         | SELECT name
+                         | FROM $parquetTable
+                         | WHERE address = 'Portland'
+                         |""".stripMargin)
+
+      checkAnswer(query, Row("World"))
+      query.queryExecution.executedPlan should
+        useFlintSparkSkippingFileIndex(hasIndexFilter(col("address") === "Seattle"))
+    }
   }
 
   // Custom matcher to check if a SparkPlan uses FlintSparkSkippingFileIndex

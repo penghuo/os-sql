@@ -5,8 +5,6 @@
 
 package org.apache.spark.sql.flint.datatype
 
-import java.time.format.DateTimeFormatterBuilder
-
 import org.json4s.{Formats, JField, JValue, NoTypeHints}
 import org.json4s.JsonAST.{JNothing, JObject, JString}
 import org.json4s.jackson.JsonMethods
@@ -123,7 +121,7 @@ object FlintDataType {
       case BooleanType => JObject("type" -> JString("boolean"))
 
       // string
-      case StringType =>
+      case CharType(_) | VarcharType(_) | StringType =>
         if (metadata.contains("osType") && metadata.getString("osType") == "text") {
           JObject("type" -> JString("text"))
         } else {
@@ -147,7 +145,9 @@ object FlintDataType {
 
       // objects
       case st: StructType => serializeJValue(st)
-      case _ => throw new IllegalStateException(s"unsupported data type")
+      case _ =>
+        throw new IllegalStateException(
+          s"unsupported field data type. field: ${structField.name}, type: ${structField.dataType}")
     }
     JField(structField.name, dataType)
   }

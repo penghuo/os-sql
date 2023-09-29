@@ -57,6 +57,7 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.auth.DataSourceUserAuthorizationHelper;
 import org.opensearch.sql.datasources.auth.DataSourceUserAuthorizationHelperImpl;
 import org.opensearch.sql.datasources.encryptor.EncryptorImpl;
+import org.opensearch.sql.datasources.glue.CWLDataSourceFactory;
 import org.opensearch.sql.datasources.glue.GlueDataSourceFactory;
 import org.opensearch.sql.datasources.model.transport.CreateDataSourceActionResponse;
 import org.opensearch.sql.datasources.model.transport.DeleteDataSourceActionResponse;
@@ -289,6 +290,7 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin {
             .add(new PrometheusStorageFactory(pluginSettings))
             .add(new SparkStorageFactory(this.client, pluginSettings))
             .add(new GlueDataSourceFactory(pluginSettings))
+            .add(new CWLDataSourceFactory())
             .build(),
         dataSourceMetadataStorage,
         dataSourceUserAuthorizationHelper);

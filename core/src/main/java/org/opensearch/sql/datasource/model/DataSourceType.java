@@ -9,7 +9,8 @@ public enum DataSourceType {
   PROMETHEUS("prometheus"),
   OPENSEARCH("opensearch"),
   SPARK("spark"),
-  S3GLUE("s3glue");
+  S3GLUE("s3glue"),
+  CLOUDWATCHLOG("cloudwatchlog");
 
   private String text;
 

@@ -10,6 +10,7 @@ package org.opensearch.sql.datasource.model;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import org.opensearch.sql.ast.AbstractNodeVisitor;
 import org.opensearch.sql.storage.StorageEngine;
 
 /** Each user configured datasource mapping to one instance of DataSource per JVM. */

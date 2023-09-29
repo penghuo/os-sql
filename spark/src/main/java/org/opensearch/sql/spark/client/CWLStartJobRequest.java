@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.spark.client;
 
+import static org.opensearch.sql.datasources.glue.CWLDataSourceFactory.P_CWL_ACCOUNT_ID;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.DRIVER_ENV_ASSUME_ROLE_ARN_KEY;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.EXECUTOR_ENV_ASSUME_ROLE_ARN_KEY;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.FLINT_INDEX_STORE_AUTH_KEY;
@@ -15,8 +16,13 @@ import static org.opensearch.sql.spark.data.constants.SparkConstants.FLINT_INDEX
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import org.opensearch.sql.datasource.AbstractDataSourceVisitor;
+import org.opensearch.sql.datasource.conf.DataSourceProperty;
+import org.opensearch.sql.datasource.model.CatalogDataSource;
+import org.opensearch.sql.datasource.model.DataSource;
 import org.opensearch.sql.datasource.model.DataSourceMetadata;
 import org.opensearch.sql.spark.asyncquery.model.CWLSparkSubmitParameters;
+import org.opensearch.sql.spark.asyncquery.model.SparkSubmitParameters;
 
 public class CWLStartJobRequest {
 
@@ -70,5 +76,34 @@ public class CWLStartJobRequest {
 
   private String getOpenSearchUri() {
     return dataSourceMetadata.getProperties().get("cloudwatchlog.indexstore.opensearch.uri");
+  }
+
+
+
+  public static SparkSubmitParameters cloudWatchLog(CatalogDataSource dataSource) {
+    SparkSubmitParameters parameters = SparkSubmitParameters.defaultParameters();
+    dataSource.accept(new AbstractDataSourceVisitor<Void, SparkSubmitParameters>() {
+      @Override
+      public Void visitGlueS3DataSource(CatalogDataSource dataSource,
+                                        SparkSubmitParameters context) {
+        return null;
+      }
+
+      @Override
+      public Void visitCloudWatchLogDataSource(CatalogDataSource dataSource,
+                                               SparkSubmitParameters context) {
+        DataSourceProperty property = dataSource.getDataSourceProperty();
+
+        parameters.add(
+            "spark.sql.catalog." + dataSource.getName(), "com.amazon.awslogscatalog.LogsCatalog");
+        parameters.add(
+            "spark.sql.catalog.accountId", property.get(P_CWL_ACCOUNT_ID));
+        parameters.add(
+            "spark.sql.catalog.accessRole", getDataSourceRoleARN());
+        parameters.add(
+            "spark.sql.catalog.region", dataSourceMetadata.getProperties().get("cloudwatchlog.region"));
+      }
+    }, parameters);
+    return parameters;
   }
 }

@@ -10,14 +10,14 @@ public class SparkConstants {
   public static final String STEP_ID_FIELD = "stepId.keyword";
   // TODO should be replaced with mvn jar.
   public static final String SPARK_SQL_APPLICATION_JAR =
-      "s3://flint-data-dp-eu-west-1-beta/code/flint/sql-job.jar";
+      "s3://flint-data-dp-eu-west-1-beta/code/flint/flint-spark-reql-0.1.0-SNAPSHOT.jar";
   public static final String SPARK_RESPONSE_BUFFER_INDEX_NAME = ".query_execution_result";
   // TODO should be replaced with mvn jar.
   public static final String FLINT_INTEGRATION_JAR =
       "s3://spark-datasource/flint-spark-integration-assembly-0.1.0-SNAPSHOT.jar";
   // TODO should be replaced with mvn jar.
   public static final String GLUE_CATALOG_HIVE_JAR =
-      "s3://flint-data-dp-eu-west-1-beta/code/flint/AWSGlueDataCatalogHiveMetaStoreAuth-1.0.jar";
+      "s3://flint-data-dp-eu-west-1-beta/code/flint/AWSGlueDataCatalogHiveMetaStoreAuth-1.0.jar" + "," + SPARK_SQL_APPLICATION_JAR;
   // TODO should be replaced with mvn jar.
   public static final String FLINT_CATALOG_JAR =
       "s3://flint-data-dp-eu-west-1-beta/code/flint/flint-catalog.jar";
@@ -26,7 +26,7 @@ public class SparkConstants {
   public static final String FLINT_DEFAULT_SCHEME = "http";
   public static final String FLINT_DEFAULT_AUTH = "-1";
   public static final String FLINT_DEFAULT_REGION = "us-west-2";
-  public static final String DEFAULT_CLASS_NAME = "org.opensearch.sql.FlintJob";
+  public static final String DEFAULT_CLASS_NAME = "org.opensearch.flint.app.FlintREPL";
   public static final String S3_AWS_CREDENTIALS_PROVIDER_KEY =
       "spark.hadoop.fs.s3.customAWSCredentialsProvider";
   public static final String DRIVER_ENV_ASSUME_ROLE_ARN_KEY =

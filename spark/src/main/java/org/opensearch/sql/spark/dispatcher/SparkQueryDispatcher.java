@@ -14,6 +14,7 @@ import static org.opensearch.sql.spark.data.constants.SparkConstants.FLINT_INDEX
 import static org.opensearch.sql.spark.data.constants.SparkConstants.FLINT_INDEX_STORE_PORT_KEY;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.FLINT_INDEX_STORE_SCHEME_KEY;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.HIVE_METASTORE_GLUE_ARN_KEY;
+import static org.opensearch.sql.spark.repl.ReplSessionManager.SESSION_ID;
 
 import com.amazonaws.services.emrserverless.model.CancelJobRunResult;
 import com.amazonaws.services.emrserverless.model.GetJobRunResult;
@@ -24,6 +25,7 @@ import java.util.HashMap;
 import java.util.Map;
 import lombok.AllArgsConstructor;
 import org.json.JSONObject;
+import org.opensearch.client.Client;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasource.model.DataSourceMetadata;
 import org.opensearch.sql.datasource.model.DataSourceType;
@@ -34,11 +36,16 @@ import org.opensearch.sql.spark.client.StartJobRequest;
 import org.opensearch.sql.spark.dispatcher.model.DispatchQueryRequest;
 import org.opensearch.sql.spark.dispatcher.model.FullyQualifiedTableName;
 import org.opensearch.sql.spark.dispatcher.model.IndexDetails;
+import org.opensearch.sql.spark.repl.ReplQueryId;
+import org.opensearch.sql.spark.repl.ReplRequest;
+import org.opensearch.sql.spark.repl.ReplSessionManager;
 import org.opensearch.sql.spark.response.JobExecutionResponseReader;
 import org.opensearch.sql.spark.rest.model.LangType;
 import org.opensearch.sql.spark.utils.SQLQueryUtils;
 
-/** This class takes care of understanding query and dispatching job query to emr serverless. */
+/**
+ * This class takes care of understanding query and dispatching job query to emr serverless.
+ */
 @AllArgsConstructor
 public class SparkQueryDispatcher {
 
@@ -48,6 +55,8 @@ public class SparkQueryDispatcher {
   public static final String TABLE_TAG_KEY = "table";
   public static final String CLUSTER_NAME_TAG_KEY = "cluster";
 
+  public static final String DATASOURCE_REPL_INDEX = "datasource_repl_index";
+
   private EMRServerlessClient EMRServerlessClient;
 
   private DataSourceService dataSourceService;
@@ -56,31 +65,56 @@ public class SparkQueryDispatcher {
 
   private JobExecutionResponseReader jobExecutionResponseReader;
 
+  private ReplSessionManager replSessionManager;
+  // OpenSearch client
+  private Client client;
+
   public String dispatch(DispatchQueryRequest dispatchQueryRequest) {
-    return EMRServerlessClient.startJobRun(getStartJobRequest(dispatchQueryRequest));
+    StartJobRequest request = getStartJobRequest(dispatchQueryRequest);
+    if (request.isSSSRequest()) {
+      return EMRServerlessClient.startJobRun(request);
+    } else {
+      if (replSessionManager.get(SESSION_ID).isEmpty()) {
+        replSessionManager.createSession(request);
+      }
+      return replSessionManager.get(SESSION_ID).get()
+          .submit(dispatchQueryRequest.getQuery()).getQueryId();
+    }
   }
 
   // TODO : Fetch from Result Index and then make call to EMR Serverless.
   public JSONObject getQueryResponse(String applicationId, String queryId) {
-    GetJobRunResult getJobRunResult = EMRServerlessClient.getJobRunResult(applicationId, queryId);
-    JSONObject result = new JSONObject();
-    if (getJobRunResult.getJobRun().getState().equals(JobRunState.SUCCESS.toString())) {
-      result = jobExecutionResponseReader.getResultFromOpensearchIndex(queryId);
+    try {
+      ReplQueryId replQueryId = ReplQueryId.from(queryId);
+      ReplRequest replRequest = new ReplRequest(DATASOURCE_REPL_INDEX, client,
+          id -> jobExecutionResponseReader.getResultFromOpensearchIndex(id));
+      return replRequest.result(replQueryId);
+    } catch (IllegalArgumentException e) {
+      GetJobRunResult getJobRunResult = EMRServerlessClient.getJobRunResult(applicationId, queryId);
+      JSONObject result = new JSONObject();
+      if (getJobRunResult.getJobRun().getState().equals(JobRunState.SUCCESS.toString())) {
+        result = jobExecutionResponseReader.getResultFromOpensearchIndex(queryId);
+      }
+      result.put("status", getJobRunResult.getJobRun().getState());
+      return result;
     }
-    result.put("status", getJobRunResult.getJobRun().getState());
-    return result;
   }
 
   public String cancelJob(String applicationId, String jobId) {
-    CancelJobRunResult cancelJobRunResult = EMRServerlessClient.cancelJobRun(applicationId, jobId);
-    return cancelJobRunResult.getJobRunId();
+    try {
+      throw new UnsupportedOperationException("REPL cancel is not supported yet");
+    } catch (IllegalArgumentException e) {
+      CancelJobRunResult cancelJobRunResult =
+          EMRServerlessClient.cancelJobRun(applicationId, jobId);
+      return cancelJobRunResult.getJobRunId();
+    }
   }
 
   private StartJobRequest getStartJobRequest(DispatchQueryRequest dispatchQueryRequest) {
     if (LangType.SQL.equals(dispatchQueryRequest.getLangType())) {
-      if (SQLQueryUtils.isIndexQuery(dispatchQueryRequest.getQuery()))
+      if (SQLQueryUtils.isIndexQuery(dispatchQueryRequest.getQuery())) {
         return getStartJobRequestForIndexRequest(dispatchQueryRequest);
-      else {
+      } else {
         return getStartJobRequestForNonIndexQueries(dispatchQueryRequest);
       }
     }
@@ -127,6 +161,9 @@ public class SparkQueryDispatcher {
     s3GlueSparkSubmitParameters.addParameter(FLINT_INDEX_STORE_AWSREGION_KEY, region);
     s3GlueSparkSubmitParameters.addParameter(
         "spark.sql.catalog." + datasourceName, FLINT_DELEGATE_CATALOG);
+
+    s3GlueSparkSubmitParameters.addSparkConf(
+        "--conf spark.dynamicAllocation.enabled=false --conf spark.executor.instances=10");
     return s3GlueSparkSubmitParameters.toString();
   }
 
@@ -154,7 +191,9 @@ public class SparkQueryDispatcher {
             dispatchQueryRequest.getApplicationId(),
             dispatchQueryRequest.getExecutionRoleARN(),
             constructSparkParameters(fullyQualifiedTableName.getDatasourceName()),
-            tags);
+            tags, false,
+            dataSourceService
+                .getRawDataSourceMetadata(fullyQualifiedTableName.getDatasourceName()), SESSION_ID);
     return startJobRequest;
   }
 
@@ -181,7 +220,10 @@ public class SparkQueryDispatcher {
             dispatchQueryRequest.getApplicationId(),
             dispatchQueryRequest.getExecutionRoleARN(),
             constructSparkParameters(fullyQualifiedTableName.getDatasourceName()),
-            tags);
+            tags, true,
+            dataSourceService
+                .getRawDataSourceMetadata(fullyQualifiedTableName.getDatasourceName()),
+            "no_session");
     return startJobRequest;
   }
 

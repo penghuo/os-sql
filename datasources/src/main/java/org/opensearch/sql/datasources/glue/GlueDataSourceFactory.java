@@ -23,6 +23,7 @@ public class GlueDataSourceFactory implements DataSourceFactory {
   public static final String FLINT_URI = "glue.indexstore.opensearch.uri";
   public static final String FLINT_AUTH = "glue.indexstore.opensearch.auth";
   public static final String FLINT_REGION = "glue.indexstore.opensearch.region";
+  public static final String FLINT_DATASOURCE_SPARK_CONFIG = "glue.datasource.spark.config";
 
   @Override
   public DataSourceType getDataSourceType() {

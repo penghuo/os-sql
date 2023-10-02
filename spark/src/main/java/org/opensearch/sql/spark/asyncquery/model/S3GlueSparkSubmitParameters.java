@@ -50,6 +50,7 @@ public class S3GlueSparkSubmitParameters {
 
   private String className;
   private Map<String, String> config;
+  private String sparkConf = "";
   public static final String SPACE = " ";
   public static final String EQUALS = "=";
 
@@ -61,8 +62,8 @@ public class S3GlueSparkSubmitParameters {
         HADOOP_CATALOG_CREDENTIALS_PROVIDER_FACTORY_KEY,
         DEFAULT_GLUE_CATALOG_CREDENTIALS_PROVIDER_FACTORY_KEY);
     this.config.put(SPARK_JARS_KEY, GLUE_CATALOG_HIVE_JAR + "," + FLINT_CATALOG_JAR);
-    this.config.put(SPARK_JAR_PACKAGES_KEY, SPARK_STANDALONE_PACKAGE);
-    this.config.put(SPARK_JAR_REPOSITORIES_KEY, AWS_SNAPSHOT_REPOSITORY);
+//    this.config.put(SPARK_JAR_PACKAGES_KEY, SPARK_STANDALONE_PACKAGE);
+//    this.config.put(SPARK_JAR_REPOSITORIES_KEY, AWS_SNAPSHOT_REPOSITORY);
     this.config.put(SPARK_DRIVER_ENV_JAVA_HOME_KEY, JAVA_HOME_LOCATION);
     this.config.put(SPARK_EXECUTOR_ENV_JAVA_HOME_KEY, JAVA_HOME_LOCATION);
     this.config.put(FLINT_INDEX_STORE_HOST_KEY, FLINT_DEFAULT_HOST);
@@ -79,6 +80,10 @@ public class S3GlueSparkSubmitParameters {
     this.config.put(key, value);
   }
 
+  public void addSparkConf(String sparkConf) {
+    this.sparkConf = sparkConf;
+  }
+
   @Override
   public String toString() {
     StringBuilder stringBuilder = new StringBuilder();
@@ -91,6 +96,10 @@ public class S3GlueSparkSubmitParameters {
       stringBuilder.append(EQUALS);
       stringBuilder.append(config.get(key));
       stringBuilder.append(SPACE);
+    }
+    if (!sparkConf.isEmpty()) {
+      stringBuilder.append(SPACE);
+      stringBuilder.append(sparkConf);
     }
     return stringBuilder.toString();
   }

@@ -7,6 +7,7 @@ package org.opensearch.sql.plugin;
 
 import static org.opensearch.sql.common.setting.Settings.Key.SPARK_EXECUTION_ENGINE_CONFIG;
 import static org.opensearch.sql.datasource.model.DataSourceMetadata.defaultOpenSearchDataSourceMetadata;
+import static org.opensearch.sql.spark.dispatcher.SparkQueryDispatcher.DATASOURCE_REPL_INDEX;
 
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.emrserverless.AWSEMRServerless;
@@ -97,6 +98,7 @@ import org.opensearch.sql.spark.client.EMRServerlessClient;
 import org.opensearch.sql.spark.client.EmrServerlessClientImplEMR;
 import org.opensearch.sql.spark.config.SparkExecutionEngineConfig;
 import org.opensearch.sql.spark.dispatcher.SparkQueryDispatcher;
+import org.opensearch.sql.spark.repl.ReplSessionManager;
 import org.opensearch.sql.spark.response.JobExecutionResponseReader;
 import org.opensearch.sql.spark.rest.RestAsyncQueryManagementAction;
 import org.opensearch.sql.spark.storage.SparkStorageFactory;
@@ -304,7 +306,9 @@ public class SQLPlugin extends Plugin implements ActionPlugin, ScriptPlugin {
             EMRServerlessClient,
             this.dataSourceService,
             new DataSourceUserAuthorizationHelperImpl(client),
-            jobExecutionResponseReader);
+            jobExecutionResponseReader,
+            new ReplSessionManager(DATASOURCE_REPL_INDEX, this.client, EMRServerlessClient),
+            this.client);
     return new AsyncQueryExecutorServiceImpl(
         asyncQueryJobMetadataStorageService, sparkQueryDispatcher, pluginSettings);
   }

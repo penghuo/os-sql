@@ -26,6 +26,7 @@ import org.opensearch.sql.spark.config.SparkExecutionEngineConfig;
 import org.opensearch.sql.spark.dispatcher.SparkQueryDispatcher;
 import org.opensearch.sql.spark.dispatcher.model.DispatchQueryRequest;
 import org.opensearch.sql.spark.functions.response.DefaultSparkSqlFunctionResponseHandle;
+import org.opensearch.sql.spark.repl.ReplQueryId;
 import org.opensearch.sql.spark.rest.model.CreateAsyncQueryRequest;
 import org.opensearch.sql.spark.rest.model.CreateAsyncQueryResponse;
 
@@ -80,7 +81,15 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
   @Override
   public AsyncQueryExecutionResponse getAsyncQueryResults(String queryId) {
     validateSparkExecutionEngineSettings();
-    Optional<AsyncQueryJobMetadata> jobMetadata =
+
+    boolean isREPL = true;
+    try {
+      ReplQueryId.from(queryId);
+    } catch (IllegalArgumentException e) {
+      isREPL = false;
+    }
+    Optional<AsyncQueryJobMetadata> jobMetadata = isREPL ?
+        Optional.of(new AsyncQueryJobMetadata(queryId, "mockAppId")) :
         asyncQueryJobMetadataStorageService.getJobMetadata(queryId);
     if (jobMetadata.isPresent()) {
       JSONObject jsonObject =

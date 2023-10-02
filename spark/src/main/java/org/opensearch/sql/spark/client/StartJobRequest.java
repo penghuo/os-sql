@@ -7,6 +7,7 @@ package org.opensearch.sql.spark.client;
 
 import java.util.Map;
 import lombok.Data;
+import org.opensearch.sql.datasource.model.DataSourceMetadata;
 
 /**
  * This POJO carries all the fields required for emr serverless job submission. Used as model in
@@ -20,4 +21,7 @@ public class StartJobRequest {
   private final String executionRoleArn;
   private final String sparkSubmitParams;
   private final Map<String, String> tags;
+  private final boolean isSSSRequest;
+  private final DataSourceMetadata datasource;
+  private final String sessionId;
 }

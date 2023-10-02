@@ -46,8 +46,13 @@ public class EmrServerlessClientImplEMR implements EMRServerlessClient {
                         new SparkSubmit()
                             .withEntryPoint(SPARK_SQL_APPLICATION_JAR)
                             .withEntryPointArguments(
-                                startJobRequest.getQuery(), SPARK_RESPONSE_BUFFER_INDEX_NAME)
+                                startJobRequest.getQuery(), SPARK_RESPONSE_BUFFER_INDEX_NAME,
+                                startJobRequest.isSSSRequest() ? "wait" : "exit",
+                                startJobRequest.getSessionId())
                             .withSparkSubmitParameters(startJobRequest.getSparkSubmitParams())));
+    if (startJobRequest.isSSSRequest()) {
+      request.setExecutionTimeoutMinutes(0L);
+    }
     StartJobRunResult startJobRunResult =
         AccessController.doPrivileged(
             (PrivilegedAction<StartJobRunResult>) () -> emrServerless.startJobRun(request));

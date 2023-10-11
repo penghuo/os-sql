@@ -26,17 +26,14 @@ import org.opensearch.action.support.WriteRequest;
 import org.opensearch.client.Client;
 import org.opensearch.index.engine.VersionConflictEngineException;
 
-/**
- * Session define the statement execution context. Each session is binding to one Spark Job.
- */
+/** Session define the statement execution context. Each session is binding to one Spark Job. */
 public class ReplSession {
 
   private static final Logger LOG = LogManager.getLogger(ReplSession.class);
 
   private static final ObjectMapper objectMapper = new ObjectMapper();
 
-  @Getter
-  private final String sessionId;
+  @Getter private final String sessionId;
 
   // session_state index name
   private final String indexName;
@@ -55,6 +52,7 @@ public class ReplSession {
     create();
     bootstrap.run();
   }
+
   public ReplQueryId submit(String query) {
     ReplQueryId queryId = ReplQueryId.generate();
     ReplRequestMeta request = ReplRequestMeta.init(sessionId, queryId.getQueryId(), query);
@@ -64,14 +62,16 @@ public class ReplSession {
       indexRequest.opType(DocWriteRequest.OpType.CREATE);
       indexRequest.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
       AccessController.doPrivileged(
-          (PrivilegedAction<IndexRequest>) () -> {
-            try {
-              return indexRequest.source(objectMapper.writeValueAsString(request), INDEX_CONTENT_TYPE);
-            } catch (JsonProcessingException e) {
-              LOG.info("objectMapper exception", e);
-              throw new RuntimeException(e);
-            }
-          });
+          (PrivilegedAction<IndexRequest>)
+              () -> {
+                try {
+                  return indexRequest.source(
+                      objectMapper.writeValueAsString(request), INDEX_CONTENT_TYPE);
+                } catch (JsonProcessingException e) {
+                  LOG.info("objectMapper exception", e);
+                  throw new RuntimeException(e);
+                }
+              });
       IndexResponse indexResponse = client.index(indexRequest).actionGet();
       if (indexResponse.getResult().equals(DocWriteResponse.Result.CREATED)) {
         LOG.info("Successfully created {}", request);
@@ -96,15 +96,18 @@ public class ReplSession {
         return Optional.empty();
       }
 
-      ReplSessionMeta metaData = AccessController.doPrivileged(
-          (PrivilegedAction<ReplSessionMeta>) () -> {
-            try {
-              return objectMapper.readValue(response.getSourceAsString(), ReplSessionMeta.class);
-            } catch (JsonProcessingException e) {
-              LOG.info("objectMapper exception", e);
-              throw new RuntimeException(e);
-            }
-          });
+      ReplSessionMeta metaData =
+          AccessController.doPrivileged(
+              (PrivilegedAction<ReplSessionMeta>)
+                  () -> {
+                    try {
+                      return objectMapper.readValue(
+                          response.getSourceAsString(), ReplSessionMeta.class);
+                    } catch (JsonProcessingException e) {
+                      LOG.info("objectMapper exception", e);
+                      throw new RuntimeException(e);
+                    }
+                  });
       return Optional.ofNullable(metaData.getState());
     } catch (Exception e) {
       LOG.error("fetch state exception", e);
@@ -121,14 +124,16 @@ public class ReplSession {
       indexRequest.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
 
       AccessController.doPrivileged(
-          (PrivilegedAction<IndexRequest>) () -> {
-            try {
-              return indexRequest.source(objectMapper.writeValueAsString(replSessionMeta), INDEX_CONTENT_TYPE);
-            } catch (JsonProcessingException e) {
-              LOG.info("objectMapper exception", e);
-              throw new RuntimeException(e);
-            }
-          });
+          (PrivilegedAction<IndexRequest>)
+              () -> {
+                try {
+                  return indexRequest.source(
+                      objectMapper.writeValueAsString(replSessionMeta), INDEX_CONTENT_TYPE);
+                } catch (JsonProcessingException e) {
+                  LOG.info("objectMapper exception", e);
+                  throw new RuntimeException(e);
+                }
+              });
       IndexResponse indexResponse = client.index(indexRequest).actionGet();
       if (indexResponse.getResult().equals(DocWriteResponse.Result.CREATED)) {
         LOG.info("Successfully created {}", replSessionMeta);

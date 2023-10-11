@@ -6,5 +6,7 @@
 package org.opensearch.sql.spark.execution.connection;
 
 public interface Connection {
+  void startJob();
 
+  void stopJob();
 }

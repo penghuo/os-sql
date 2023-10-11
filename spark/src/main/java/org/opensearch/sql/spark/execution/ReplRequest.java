@@ -36,15 +36,18 @@ public class ReplRequest {
     GetRequest getRequest = new GetRequest().index(indexName).id(queryId.getQueryId());
     try {
       GetResponse response = client.get(getRequest).actionGet();
-      ReplRequestMeta replRequestMeta = AccessController.doPrivileged(
-          (PrivilegedAction<ReplRequestMeta>) () -> {
-            try {
-              return objectMapper.readValue(response.getSourceAsString(), ReplRequestMeta.class);
-            } catch (JsonProcessingException e) {
-              LOG.info("objectMapper exception", e);
-              throw new RuntimeException(e);
-            }
-          });
+      ReplRequestMeta replRequestMeta =
+          AccessController.doPrivileged(
+              (PrivilegedAction<ReplRequestMeta>)
+                  () -> {
+                    try {
+                      return objectMapper.readValue(
+                          response.getSourceAsString(), ReplRequestMeta.class);
+                    } catch (JsonProcessingException e) {
+                      LOG.info("objectMapper exception", e);
+                      throw new RuntimeException(e);
+                    }
+                  });
       return replRequestMeta.getState();
     } catch (Exception e) {
       LOG.error("fetch state exception", e);
@@ -66,7 +69,5 @@ public class ReplRequest {
   }
 
   // todo
-  public void cancel() {
-
-  }
+  public void cancel() {}
 }

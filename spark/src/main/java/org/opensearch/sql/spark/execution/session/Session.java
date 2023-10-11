@@ -10,22 +10,17 @@ import org.opensearch.sql.spark.execution.QueryRequest;
 import org.opensearch.sql.spark.execution.statement.Statement;
 import org.opensearch.sql.spark.execution.statement.StatementId;
 
-/**
- * Session define the statement execution context. Each session is binding to one Spark Job.
- */
+/** Session define the statement execution context. Each session is binding to one Spark Job. */
 public interface Session {
-  /**
-   * open session.
-   */
+  /** open session. */
   void open();
 
-  /**
-   * close session.
-   */
+  /** close session. */
   void close();
 
   /**
    * submit {@link QueryRequest}.
+   *
    * @param request {@link QueryRequest}
    * @return {@link StatementId}
    */
@@ -33,13 +28,12 @@ public interface Session {
 
   /**
    * get {@link Statement}.
+   *
    * @param stID {@link StatementId}
    * @return {@link Statement}
    */
   Statement get(StatementId stID);
 
-  /**
-   * list {@link Statement} in session.
-   */
+  /** list {@link Statement} in session. */
   List<Statement> list();
 }

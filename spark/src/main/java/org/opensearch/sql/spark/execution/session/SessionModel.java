@@ -7,61 +7,122 @@ package org.opensearch.sql.spark.execution.session;
 
 import static org.opensearch.sql.spark.execution.session.SessionType.INTERACTIVE;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.annotations.Expose;
 import java.io.IOException;
-import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
-import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.core.xcontent.XContentParserUtils;
 import org.opensearch.index.seqno.SequenceNumbers;
-import org.opensearch.sql.spark.execution.statestore.StateModel;
-
 
 @Data
-@AllArgsConstructor
-public class SessionModel {
-  @Expose
-  private String version;
-  @Expose
-  private SessionType sessionType;
-  @Expose
-  private SessionId sessionID;
-  @Expose
-  private SessionState sessionState;
-  @Expose
-  private String datasourceName;
-  // occ
+@Builder
+public class SessionModel implements ToXContentObject {
+  public static final String VERSION = "version";
+  public static final String TYPE = "type";
+  public static final String SESSION_TYPE = "sessionType";
+  public static final String SESSION_ID = "sessionId";
+  public static final String SESSION_STATE = "state";
+  public static final String DATASOURCE_NAME = "dataSourceName";
 
-  private long seqNo;
-  private long primaryTerm;
+  public static final String SESSION_DOC_TYPE = "session";
 
-  public StateModel toStateModel() {
-    try {
-      XContentBuilder xContentBuilder = XContentFactory.jsonBuilder();
-    } catch (IOException e) {
+  private final String version;
+  private final SessionType sessionType;
+  private final SessionId sessionID;
+  private final SessionState sessionState;
+  private final String datasourceName;
 
-    }
+  private final long seqNo;
+  private final long primaryTerm;
 
-
-
-
-
-    Gson gson = new GsonBuilder().excludeFieldsWithoutExposeAnnotation().create();
-    return new StateModel(sessionID.getSessionId(), gson.toJson(this), seqNo, primaryTerm);
+  @Override
+  public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+    builder
+        .startObject()
+        .field(VERSION, version)
+        .field(TYPE, SESSION_DOC_TYPE)
+        .field(SESSION_TYPE, sessionType.getSessionType())
+        .field(SESSION_ID, sessionID.getSessionId())
+        .field(SESSION_STATE, sessionState)
+        .field(DATASOURCE_NAME, datasourceName)
+        .endObject();
+    return builder;
   }
 
-  public static SessionModel fromStateModel(XContentParser parser, final long seqNo,
-                                            long primaryTerm) {
-    return null;
+  public static SessionModel of(
+      SessionModel copy, SessionState sessionState, long seqNo, long primaryTerm) {
+    return builder()
+        .version(copy.version)
+        .sessionType(copy.sessionType)
+        .sessionID(new SessionId(copy.sessionID.getSessionId()))
+        .sessionState(sessionState)
+        .datasourceName(copy.datasourceName)
+        .seqNo(seqNo)
+        .primaryTerm(primaryTerm)
+        .build();
+  }
+
+  public static SessionModel of(SessionModel copy, long seqNo, long primaryTerm) {
+    return builder()
+        .version(copy.version)
+        .sessionType(copy.sessionType)
+        .sessionID(new SessionId(copy.sessionID.getSessionId()))
+        .sessionState(copy.sessionState)
+        .datasourceName(copy.datasourceName)
+        .seqNo(seqNo)
+        .primaryTerm(primaryTerm)
+        .build();
+  }
+
+  public static SessionModel fromXContent(XContentParser parser, long seqNo, long primaryTerm) {
+    try {
+      SessionModelBuilder builder = new SessionModelBuilder();
+      XContentParserUtils.ensureExpectedToken(
+          XContentParser.Token.START_OBJECT, parser.currentToken(), parser);
+      while (!XContentParser.Token.END_OBJECT.equals(parser.nextToken())) {
+        String fieldName = parser.currentName();
+        parser.nextToken();
+        switch (fieldName) {
+          case VERSION:
+            builder.version(parser.text());
+            break;
+          case SESSION_TYPE:
+            builder.sessionType(SessionType.fromString(parser.text()));
+            break;
+          case SESSION_ID:
+            builder.sessionID(new SessionId(parser.text()));
+            break;
+          case SESSION_STATE:
+            builder.sessionState(SessionState.fromString(parser.text()));
+            break;
+          case DATASOURCE_NAME:
+            builder.datasourceName(parser.text());
+            break;
+          case TYPE:
+            // do nothing.
+            break;
+          default:
+            throw new IllegalArgumentException("Unknown field " + fieldName);
+        }
+      }
+      builder.seqNo(seqNo);
+      builder.primaryTerm(primaryTerm);
+      return builder.build();
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   public static SessionModel initInteractiveSession() {
-    return new SessionModel("1.0", INTERACTIVE, new SessionId("0123456789012"),
+    return new SessionModel(
+        "1.0",
+        INTERACTIVE,
+        new SessionId("0123456789012"),
         SessionState.NOT_STARTED,
-        "dataSourceName", SequenceNumbers.UNASSIGNED_SEQ_NO,
+        "dataSourceName",
+        SequenceNumbers.UNASSIGNED_SEQ_NO,
         SequenceNumbers.UNASSIGNED_PRIMARY_TERM);
   }
 }

@@ -22,20 +22,15 @@ import lombok.Setter;
 @EqualsAndHashCode
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ReplSessionMeta {
-  @JsonProperty
-  private String type;
+  @JsonProperty private String type;
 
-  @JsonProperty
-  private String sessionId;
+  @JsonProperty private String sessionId;
 
-  @JsonProperty
-  private String applicationId;
+  @JsonProperty private String applicationId;
 
-  @JsonProperty
-  private String jobId;
+  @JsonProperty private String jobId;
 
-  @JsonProperty
-  private ReplSessionState state;
+  @JsonProperty private ReplSessionState state;
 
   public static ReplSessionMeta standBy(String sessionId) {
     return new ReplSessionMeta("job", sessionId, "unknown", "unknown", STANDBY);

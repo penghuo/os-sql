@@ -16,9 +16,7 @@ import org.opensearch.client.Client;
 import org.opensearch.sql.spark.client.EMRServerlessClient;
 import org.opensearch.sql.spark.client.StartJobRequest;
 
-/**
- * Singleton. Managed sessions.
- */
+/** Singleton. Managed sessions. */
 @RequiredArgsConstructor
 public class ReplSessionManager {
 

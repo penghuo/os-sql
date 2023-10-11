@@ -5,5 +5,4 @@
 
 package org.opensearch.sql.spark.execution.statement;
 
-public enum StatementState {
-}
+public enum StatementState {}

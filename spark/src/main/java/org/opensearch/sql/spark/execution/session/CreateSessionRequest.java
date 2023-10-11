@@ -8,5 +8,4 @@ package org.opensearch.sql.spark.execution.session;
 import lombok.Data;
 
 @Data
-public class CreateSessionRequest {
-}
+public class CreateSessionRequest {}

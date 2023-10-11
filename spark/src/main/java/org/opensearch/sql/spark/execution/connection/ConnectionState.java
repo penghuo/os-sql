@@ -5,5 +5,4 @@
 
 package org.opensearch.sql.spark.execution.connection;
 
-public enum ConnectionState {
-}
+public enum ConnectionState {}

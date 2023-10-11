@@ -20,26 +20,20 @@ import lombok.Setter;
 @EqualsAndHashCode
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ReplRequestMeta {
-  @JsonProperty
-  private String type;
+  @JsonProperty private String type;
 
-  @JsonProperty
-  private String sessionId;
+  @JsonProperty private String sessionId;
 
-  @JsonProperty
-  private String queryId;
+  @JsonProperty private String queryId;
 
-  @JsonProperty
-  private String query;
+  @JsonProperty private String query;
 
-  @JsonProperty
-  private ReplRequestState state;
+  @JsonProperty private ReplRequestState state;
 
-  @JsonProperty
-  private Long submitTime;
+  @JsonProperty private Long submitTime;
 
   public static ReplRequestMeta init(String sessionId, String queryId, String query) {
-    return new ReplRequestMeta("request", sessionId, queryId, query, ReplRequestState.PENDING,
-        System.currentTimeMillis());
+    return new ReplRequestMeta(
+        "request", sessionId, queryId, query, ReplRequestState.PENDING, System.currentTimeMillis());
   }
 }

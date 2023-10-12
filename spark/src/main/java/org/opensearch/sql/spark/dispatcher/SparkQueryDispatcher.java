@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -39,6 +40,11 @@ import org.opensearch.sql.spark.dispatcher.model.DispatchQueryRequest;
 import org.opensearch.sql.spark.dispatcher.model.DispatchQueryResponse;
 import org.opensearch.sql.spark.dispatcher.model.FullyQualifiedTableName;
 import org.opensearch.sql.spark.dispatcher.model.IndexDetails;
+import org.opensearch.sql.spark.execution.QueryRequest;
+import org.opensearch.sql.spark.execution.session.CreateSessionRequest;
+import org.opensearch.sql.spark.execution.session.Session;
+import org.opensearch.sql.spark.execution.session.SessionId;
+import org.opensearch.sql.spark.execution.session.SessionManager;
 import org.opensearch.sql.spark.flint.FlintIndexMetadata;
 import org.opensearch.sql.spark.flint.FlintIndexMetadataReader;
 import org.opensearch.sql.spark.response.JobExecutionResponseReader;
@@ -68,6 +74,8 @@ public class SparkQueryDispatcher {
   private FlintIndexMetadataReader flintIndexMetadataReader;
 
   private Client client;
+
+  private SessionManager sessionManager;
 
   public DispatchQueryResponse dispatch(DispatchQueryRequest dispatchQueryRequest) {
     if (LangType.SQL.equals(dispatchQueryRequest.getLangType())) {
@@ -182,6 +190,15 @@ public class SparkQueryDispatcher {
     dataSourceUserAuthorizationHelper.authorizeDataSource(dataSourceMetadata);
     String jobName = dispatchQueryRequest.getClusterName() + ":" + "non-index-query";
     Map<String, String> tags = getDefaultTagsForJobSubmission(dispatchQueryRequest);
+    if (dispatchQueryRequest.getSessionId() != null) {
+      Optional<Session> session =
+          sessionManager.getSession(new SessionId(dispatchQueryRequest.getSessionId()));
+      if (session.isEmpty()) {
+        throw new IllegalArgumentException("invalid sessionId: " + dispatchQueryRequest.getSessionId());
+      }
+      // todo, submit statement in session.
+    }
+    // todo. create session if not exist.
     StartJobRequest startJobRequest =
         new StartJobRequest(
             dispatchQueryRequest.getQuery(),

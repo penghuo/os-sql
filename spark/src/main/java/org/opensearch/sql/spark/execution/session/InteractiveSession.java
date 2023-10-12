@@ -5,41 +5,42 @@
 
 package org.opensearch.sql.spark.execution.session;
 
-import static org.opensearch.sql.spark.execution.session.SessionModel.initInteractiveSession;
-
 import java.util.List;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.sql.spark.client.EMRServerlessClient;
+import org.opensearch.sql.spark.client.StartJobRequest;
 import org.opensearch.sql.spark.execution.QueryRequest;
-import org.opensearch.sql.spark.execution.connection.Connection;
 import org.opensearch.sql.spark.execution.statement.Statement;
 import org.opensearch.sql.spark.execution.statement.StatementId;
 import org.opensearch.sql.spark.execution.statestore.SessionStateStore;
 
+@Builder
 @Getter
-@RequiredArgsConstructor
+@AllArgsConstructor
 public class InteractiveSession implements Session {
   private static final Logger LOG = LogManager.getLogger();
 
   private final SessionStateStore sessionStateStore;
-  private final Connection connection;
-
+  private final EMRServerlessClient serverlessClient;
   private SessionModel sessionModel;
+  private StartJobRequest startJobRequest;
 
   @Override
   public void open() {
-    try {
-      sessionModel = initInteractiveSession();
-      sessionModel = sessionStateStore.create(sessionModel);
-      // todo, startJob();
-    } catch (VersionConflictEngineException e) {
-      String errorMsg = "session with same sessionId already exist";
-      LOG.error(errorMsg);
-      throw new RuntimeException(errorMsg);
-    }
+    // todo, startJob();
+//    try {
+//      sessionModel = initInteractiveSession();
+//      sessionModel = sessionStateStore.create(sessionModel);
+//      // todo, startJob();
+//    } catch (VersionConflictEngineException e) {
+//      String errorMsg = "session with same sessionId already exist";
+//      LOG.error(errorMsg);
+//      throw new RuntimeException(errorMsg);
+//    }
   }
 
   @Override

@@ -115,13 +115,13 @@ public class SessionModel implements ToXContentObject {
     }
   }
 
-  public static SessionModel initInteractiveSession() {
+  public static SessionModel initInteractiveSession(SessionId sid, String datasourceName) {
     return new SessionModel(
         "1.0",
         INTERACTIVE,
-        new SessionId("0123456789012"),
+        sid,
         SessionState.NOT_STARTED,
-        "dataSourceName",
+        datasourceName,
         SequenceNumbers.UNASSIGNED_SEQ_NO,
         SequenceNumbers.UNASSIGNED_PRIMARY_TERM);
   }

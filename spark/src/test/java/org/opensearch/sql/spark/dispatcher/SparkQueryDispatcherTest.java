@@ -74,6 +74,7 @@ import org.opensearch.sql.spark.execution.session.SessionManager;
 import org.opensearch.sql.spark.execution.statement.Statement;
 import org.opensearch.sql.spark.execution.statement.StatementId;
 import org.opensearch.sql.spark.execution.statement.StatementState;
+import org.opensearch.sql.spark.execution.statestore.StateStore;
 import org.opensearch.sql.spark.flint.FlintIndexMetadata;
 import org.opensearch.sql.spark.flint.FlintIndexMetadataReader;
 import org.opensearch.sql.spark.flint.FlintIndexType;
@@ -107,6 +108,8 @@ public class SparkQueryDispatcherTest {
 
   @Captor ArgumentCaptor<StartJobRequest> startJobRequestArgumentCaptor;
 
+  @Mock private StateStore stateStore;
+
   @BeforeEach
   void setUp() {
     sparkQueryDispatcher =
@@ -117,7 +120,8 @@ public class SparkQueryDispatcherTest {
             jobExecutionResponseReader,
             flintIndexMetadataReader,
             openSearchClient,
-            sessionManager);
+            sessionManager,
+            stateStore);
   }
 
   @Test
@@ -171,7 +175,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -227,7 +230,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -281,7 +283,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -420,7 +421,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -475,7 +475,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -530,7 +529,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -589,7 +587,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -648,7 +645,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -843,7 +839,8 @@ public class SparkQueryDispatcherTest {
             jobExecutionResponseReader,
             flintIndexMetadataReader,
             openSearchClient,
-            sessionManager);
+            sessionManager,
+            stateStore);
     JSONObject queryResult = new JSONObject();
     Map<String, Object> resultMap = new HashMap<>();
     resultMap.put(STATUS_FIELD, "SUCCESS");
@@ -879,7 +876,8 @@ public class SparkQueryDispatcherTest {
             jobExecutionResponseReader,
             flintIndexMetadataReader,
             openSearchClient,
-            sessionManager);
+            sessionManager,
+            stateStore);
 
     String jobId =
         new SparkQueryDispatcher.DropIndexResult(JobRunState.SUCCESS.toString()).toJobId();
@@ -890,7 +888,6 @@ public class SparkQueryDispatcherTest {
                 AsyncQueryId.newAsyncQueryId(DS_NAME),
                 EMRS_APPLICATION_ID,
                 jobId,
-                true,
                 null,
                 null));
     verify(jobExecutionResponseReader, times(0))
@@ -912,8 +909,6 @@ public class SparkQueryDispatcherTest {
     when(flintIndexMetadataReader.getFlintIndexMetadata(indexDetails))
         .thenReturn(flintIndexMetadata);
     when(flintIndexMetadata.getJobId()).thenReturn(EMR_JOB_ID);
-    // auto_refresh == true
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(true);
 
     when(emrServerlessClient.cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID))
         .thenReturn(
@@ -1041,7 +1036,6 @@ public class SparkQueryDispatcherTest {
             .build();
     when(flintIndexMetadataReader.getFlintIndexMetadata(indexDetails))
         .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(false);
 
     DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
     when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
@@ -1084,8 +1078,6 @@ public class SparkQueryDispatcherTest {
     when(flintIndexMetadataReader.getFlintIndexMetadata(indexDetails))
         .thenReturn(flintIndexMetadata);
     when(flintIndexMetadata.getJobId()).thenReturn(EMR_JOB_ID);
-    // auto_refresh == true
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(true);
 
     when(emrServerlessClient.cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID))
         .thenReturn(
@@ -1304,6 +1296,6 @@ public class SparkQueryDispatcherTest {
   private AsyncQueryJobMetadata asyncQueryJobMetadataWithSessionId(
       String statementId, String sessionId) {
     return new AsyncQueryJobMetadata(
-        new AsyncQueryId(statementId), EMRS_APPLICATION_ID, EMR_JOB_ID, false, null, sessionId);
+        new AsyncQueryId(statementId), EMRS_APPLICATION_ID, EMR_JOB_ID, null, sessionId);
   }
 }

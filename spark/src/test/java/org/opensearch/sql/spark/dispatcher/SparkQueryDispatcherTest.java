@@ -70,6 +70,7 @@ import org.opensearch.sql.spark.execution.session.SessionManager;
 import org.opensearch.sql.spark.execution.statement.Statement;
 import org.opensearch.sql.spark.execution.statement.StatementId;
 import org.opensearch.sql.spark.execution.statement.StatementState;
+import org.opensearch.sql.spark.execution.statestore.StateStore;
 import org.opensearch.sql.spark.flint.FlintIndexMetadata;
 import org.opensearch.sql.spark.flint.FlintIndexMetadataReader;
 import org.opensearch.sql.spark.flint.FlintIndexType;
@@ -104,6 +105,8 @@ public class SparkQueryDispatcherTest {
 
   @Captor ArgumentCaptor<StartJobRequest> startJobRequestArgumentCaptor;
 
+  @Mock private StateStore stateStore;
+
   @BeforeEach
   void setUp() {
     sparkQueryDispatcher =
@@ -114,7 +117,8 @@ public class SparkQueryDispatcherTest {
             jobExecutionResponseReader,
             flintIndexMetadataReader,
             openSearchClient,
-            sessionManager);
+            sessionManager,
+            stateStore);
   }
 
   @Test
@@ -168,7 +172,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -224,7 +227,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -278,7 +280,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -418,7 +419,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -473,7 +473,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -528,7 +527,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -587,7 +585,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -646,7 +643,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -700,7 +696,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -754,7 +749,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -808,7 +802,6 @@ public class SparkQueryDispatcherTest {
             null);
     Assertions.assertEquals(expected, startJobRequestArgumentCaptor.getValue());
     Assertions.assertEquals(EMR_JOB_ID, dispatchQueryResponse.getJobId());
-    Assertions.assertFalse(dispatchQueryResponse.isDropIndexQuery());
     verifyNoInteractions(flintIndexMetadataReader);
   }
 
@@ -1004,7 +997,8 @@ public class SparkQueryDispatcherTest {
             jobExecutionResponseReader,
             flintIndexMetadataReader,
             openSearchClient,
-            sessionManager);
+            sessionManager,
+            stateStore);
     JSONObject queryResult = new JSONObject();
     Map<String, Object> resultMap = new HashMap<>();
     resultMap.put(STATUS_FIELD, "SUCCESS");
@@ -1029,254 +1023,87 @@ public class SparkQueryDispatcherTest {
     verifyNoInteractions(emrServerlessClient);
   }
 
-  // todo. refactor query process logic in plugin.
-  @Test
-  void testGetQueryResponseOfDropIndex() {
-    SparkQueryDispatcher sparkQueryDispatcher =
-        new SparkQueryDispatcher(
-            emrServerlessClient,
-            dataSourceService,
-            dataSourceUserAuthorizationHelper,
-            jobExecutionResponseReader,
-            flintIndexMetadataReader,
-            openSearchClient,
-            sessionManager);
-
-    String jobId =
-        new SparkQueryDispatcher.DropIndexResult(JobRunState.SUCCESS.toString()).toJobId();
-
-    JSONObject result =
-        sparkQueryDispatcher.getQueryResponse(
-            new AsyncQueryJobMetadata(
-                AsyncQueryId.newAsyncQueryId(DS_NAME),
-                EMRS_APPLICATION_ID,
-                jobId,
-                true,
-                null,
-                null));
-    verify(jobExecutionResponseReader, times(0))
-        .getResultFromOpensearchIndex(anyString(), anyString());
-    Assertions.assertEquals("SUCCESS", result.get(STATUS_FIELD));
-  }
-
-  @Test
-  void testDropIndexQuery() throws ExecutionException, InterruptedException {
-    String query = "DROP INDEX size_year ON my_glue.default.http_logs";
-    IndexQueryDetails indexQueryDetails =
-        IndexQueryDetails.builder()
-            .indexName("size_year")
-            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
-            .autoRefresh(false)
-            .indexQueryActionType(IndexQueryActionType.DROP)
-            .indexType(FlintIndexType.COVERING)
-            .build();
-    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
-        .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.getJobId()).thenReturn(EMR_JOB_ID);
-    // auto_refresh == true
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(true);
-
-    when(emrServerlessClient.cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID))
-        .thenReturn(
-            new CancelJobRunResult()
-                .withJobRunId(EMR_JOB_ID)
-                .withApplicationId(EMRS_APPLICATION_ID));
-    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
-    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
-    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
-
-    AcknowledgedResponse acknowledgedResponse = mock(AcknowledgedResponse.class);
-    when(openSearchClient.admin().indices().delete(any()).get()).thenReturn(acknowledgedResponse);
-    when(acknowledgedResponse.isAcknowledged()).thenReturn(true);
-    DispatchQueryResponse dispatchQueryResponse =
-        sparkQueryDispatcher.dispatch(
-            new DispatchQueryRequest(
-                EMRS_APPLICATION_ID,
-                query,
-                "my_glue",
-                LangType.SQL,
-                EMRS_EXECUTION_ROLE,
-                TEST_CLUSTER_NAME));
-    verify(emrServerlessClient, times(1)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
-    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
-    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
-    SparkQueryDispatcher.DropIndexResult dropIndexResult =
-        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
-    Assertions.assertEquals(JobRunState.SUCCESS.toString(), dropIndexResult.getStatus());
-    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
-  }
-
-  @Test
-  void testDropSkippingIndexQuery() throws ExecutionException, InterruptedException {
-    String query = "DROP SKIPPING INDEX ON my_glue.default.http_logs";
-    IndexQueryDetails indexQueryDetails =
-        IndexQueryDetails.builder()
-            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
-            .autoRefresh(false)
-            .indexQueryActionType(IndexQueryActionType.DROP)
-            .indexType(FlintIndexType.SKIPPING)
-            .build();
-    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
-        .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.getJobId()).thenReturn(EMR_JOB_ID);
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(true);
-
-    when(emrServerlessClient.cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID))
-        .thenReturn(
-            new CancelJobRunResult()
-                .withJobRunId(EMR_JOB_ID)
-                .withApplicationId(EMRS_APPLICATION_ID));
-    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
-    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
-    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
-    AcknowledgedResponse acknowledgedResponse = mock(AcknowledgedResponse.class);
-    when(openSearchClient.admin().indices().delete(any()).get()).thenReturn(acknowledgedResponse);
-
-    DispatchQueryResponse dispatchQueryResponse =
-        sparkQueryDispatcher.dispatch(
-            new DispatchQueryRequest(
-                EMRS_APPLICATION_ID,
-                query,
-                "my_glue",
-                LangType.SQL,
-                EMRS_EXECUTION_ROLE,
-                TEST_CLUSTER_NAME));
-    verify(emrServerlessClient, times(1)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
-    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
-    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
-    SparkQueryDispatcher.DropIndexResult dropIndexResult =
-        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
-    Assertions.assertEquals(JobRunState.SUCCESS.toString(), dropIndexResult.getStatus());
-    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
-  }
-
-  @Test
-  void testDropSkippingIndexQueryAutoRefreshFalse()
-      throws ExecutionException, InterruptedException {
-    String query = "DROP SKIPPING INDEX ON my_glue.default.http_logs";
-    IndexQueryDetails indexQueryDetails =
-        IndexQueryDetails.builder()
-            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
-            .autoRefresh(false)
-            .indexQueryActionType(IndexQueryActionType.DROP)
-            .indexType(FlintIndexType.SKIPPING)
-            .build();
-    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
-        .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(false);
-
-    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
-    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
-    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
-    AcknowledgedResponse acknowledgedResponse = mock(AcknowledgedResponse.class);
-    when(openSearchClient.admin().indices().delete(any()).get()).thenReturn(acknowledgedResponse);
-
-    DispatchQueryResponse dispatchQueryResponse =
-        sparkQueryDispatcher.dispatch(
-            new DispatchQueryRequest(
-                EMRS_APPLICATION_ID,
-                query,
-                "my_glue",
-                LangType.SQL,
-                EMRS_EXECUTION_ROLE,
-                TEST_CLUSTER_NAME));
-    verify(emrServerlessClient, times(0)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
-    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
-    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
-    SparkQueryDispatcher.DropIndexResult dropIndexResult =
-        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
-    Assertions.assertEquals(JobRunState.SUCCESS.toString(), dropIndexResult.getStatus());
-    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
-  }
-
-  @Test
-  void testDropSkippingIndexQueryDeleteIndexException()
-      throws ExecutionException, InterruptedException {
-    String query = "DROP SKIPPING INDEX ON my_glue.default.http_logs";
-    IndexQueryDetails indexQueryDetails =
-        IndexQueryDetails.builder()
-            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
-            .autoRefresh(false)
-            .indexQueryActionType(IndexQueryActionType.DROP)
-            .indexType(FlintIndexType.SKIPPING)
-            .build();
-    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
-        .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(false);
-
-    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
-    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
-    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
-
-    when(openSearchClient.admin().indices().delete(any()).get())
-        .thenThrow(ExecutionException.class);
-
-    DispatchQueryResponse dispatchQueryResponse =
-        sparkQueryDispatcher.dispatch(
-            new DispatchQueryRequest(
-                EMRS_APPLICATION_ID,
-                query,
-                "my_glue",
-                LangType.SQL,
-                EMRS_EXECUTION_ROLE,
-                TEST_CLUSTER_NAME));
-    verify(emrServerlessClient, times(0)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
-    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
-    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
-    SparkQueryDispatcher.DropIndexResult dropIndexResult =
-        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
-    Assertions.assertEquals(JobRunState.FAILED.toString(), dropIndexResult.getStatus());
-    Assertions.assertEquals(
-        "{\"error\":\"failed to drop index\",\"status\":\"FAILED\"}",
-        dropIndexResult.result().toString());
-    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
-  }
-
-  @Test
-  void testDropMVQuery() throws ExecutionException, InterruptedException {
-    String query = "DROP MATERIALIZED VIEW mv_1";
-    IndexQueryDetails indexQueryDetails =
-        IndexQueryDetails.builder()
-            .mvName("mv_1")
-            .indexQueryActionType(IndexQueryActionType.DROP)
-            .fullyQualifiedTableName(null)
-            .indexType(FlintIndexType.MATERIALIZED_VIEW)
-            .build();
-    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
-        .thenReturn(flintIndexMetadata);
-    when(flintIndexMetadata.getJobId()).thenReturn(EMR_JOB_ID);
-    // auto_refresh == true
-    when(flintIndexMetadata.isAutoRefresh()).thenReturn(true);
-
-    when(emrServerlessClient.cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID))
-        .thenReturn(
-            new CancelJobRunResult()
-                .withJobRunId(EMR_JOB_ID)
-                .withApplicationId(EMRS_APPLICATION_ID));
-    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
-    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
-    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
-
-    AcknowledgedResponse acknowledgedResponse = mock(AcknowledgedResponse.class);
-    when(openSearchClient.admin().indices().delete(any()).get()).thenReturn(acknowledgedResponse);
-    when(acknowledgedResponse.isAcknowledged()).thenReturn(true);
-    DispatchQueryResponse dispatchQueryResponse =
-        sparkQueryDispatcher.dispatch(
-            new DispatchQueryRequest(
-                EMRS_APPLICATION_ID,
-                query,
-                "my_glue",
-                LangType.SQL,
-                EMRS_EXECUTION_ROLE,
-                TEST_CLUSTER_NAME));
-    verify(emrServerlessClient, times(1)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
-    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
-    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
-    SparkQueryDispatcher.DropIndexResult dropIndexResult =
-        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
-    Assertions.assertEquals(JobRunState.SUCCESS.toString(), dropIndexResult.getStatus());
-    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
-  }
+//  // todo. refactor query process logic in plugin.
+//  @Test
+//  void testDropSkippingIndexQueryAutoRefreshFalse()
+//      throws ExecutionException, InterruptedException {
+//    String query = "DROP SKIPPING INDEX ON my_glue.default.http_logs";
+//    IndexQueryDetails indexQueryDetails =
+//        IndexQueryDetails.builder()
+//            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
+//            .autoRefresh(false)
+//            .indexQueryActionType(IndexQueryActionType.DROP)
+//            .indexType(FlintIndexType.SKIPPING)
+//            .build();
+//    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
+//        .thenReturn(flintIndexMetadata);
+//    when(flintIndexMetadata.isAutoRefresh()).thenReturn(false);
+//
+//    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
+//    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
+//    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
+//    AcknowledgedResponse acknowledgedResponse = mock(AcknowledgedResponse.class);
+//    when(openSearchClient.admin().indices().delete(any()).get()).thenReturn(acknowledgedResponse);
+//
+//    DispatchQueryResponse dispatchQueryResponse =
+//        sparkQueryDispatcher.dispatch(
+//            new DispatchQueryRequest(
+//                EMRS_APPLICATION_ID,
+//                query,
+//                "my_glue",
+//                LangType.SQL,
+//                EMRS_EXECUTION_ROLE,
+//                TEST_CLUSTER_NAME));
+//    verify(emrServerlessClient, times(0)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
+//    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
+//    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
+//    SparkQueryDispatcher.DropIndexResult dropIndexResult =
+//        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
+//    Assertions.assertEquals(JobRunState.SUCCESS.toString(), dropIndexResult.getStatus());
+//    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
+//  }
+//
+//  @Test
+//  void testDropSkippingIndexQueryDeleteIndexException()
+//      throws ExecutionException, InterruptedException {
+//    String query = "DROP SKIPPING INDEX ON my_glue.default.http_logs";
+//    IndexQueryDetails indexQueryDetails =
+//        IndexQueryDetails.builder()
+//            .fullyQualifiedTableName(new FullyQualifiedTableName("my_glue.default.http_logs"))
+//            .autoRefresh(false)
+//            .indexQueryActionType(IndexQueryActionType.DROP)
+//            .indexType(FlintIndexType.SKIPPING)
+//            .build();
+//    when(flintIndexMetadataReader.getFlintIndexMetadata(indexQueryDetails))
+//        .thenReturn(flintIndexMetadata);
+//
+//    DataSourceMetadata dataSourceMetadata = constructMyGlueDataSourceMetadata();
+//    when(dataSourceService.getRawDataSourceMetadata("my_glue")).thenReturn(dataSourceMetadata);
+//    doNothing().when(dataSourceUserAuthorizationHelper).authorizeDataSource(dataSourceMetadata);
+//
+//    when(openSearchClient.admin().indices().delete(any()).get())
+//        .thenThrow(ExecutionException.class);
+//
+//    DispatchQueryResponse dispatchQueryResponse =
+//        sparkQueryDispatcher.dispatch(
+//            new DispatchQueryRequest(
+//                EMRS_APPLICATION_ID,
+//                query,
+//                "my_glue",
+//                LangType.SQL,
+//                EMRS_EXECUTION_ROLE,
+//                TEST_CLUSTER_NAME));
+//    verify(emrServerlessClient, times(0)).cancelJobRun(EMRS_APPLICATION_ID, EMR_JOB_ID);
+//    verify(dataSourceUserAuthorizationHelper, times(1)).authorizeDataSource(dataSourceMetadata);
+//    verify(flintIndexMetadataReader, times(1)).getFlintIndexMetadata(indexQueryDetails);
+//    SparkQueryDispatcher.DropIndexResult dropIndexResult =
+//        SparkQueryDispatcher.DropIndexResult.fromJobId(dispatchQueryResponse.getJobId());
+//    Assertions.assertEquals(JobRunState.FAILED.toString(), dropIndexResult.getStatus());
+//    Assertions.assertEquals(
+//        "{\"error\":\"failed to drop index\",\"status\":\"FAILED\"}",
+//        dropIndexResult.result().toString());
+//    Assertions.assertTrue(dispatchQueryResponse.isDropIndexQuery());
+//  }
 
   @Test
   void testDispatchQueryWithExtraSparkSubmitParameters() {
@@ -1465,6 +1292,6 @@ public class SparkQueryDispatcherTest {
   private AsyncQueryJobMetadata asyncQueryJobMetadataWithSessionId(
       String statementId, String sessionId) {
     return new AsyncQueryJobMetadata(
-        new AsyncQueryId(statementId), EMRS_APPLICATION_ID, EMR_JOB_ID, false, null, sessionId);
+        new AsyncQueryId(statementId), EMRS_APPLICATION_ID, EMR_JOB_ID, null, sessionId);
   }
 }

@@ -8,6 +8,7 @@ package org.opensearch.sql.spark.dispatcher;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.DATA_FIELD;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.ERROR_FIELD;
 import static org.opensearch.sql.spark.data.constants.SparkConstants.STATUS_FIELD;
+import static org.opensearch.sql.spark.dispatcher.IndexDMLHandler.isIndexDMLQuery;
 
 import com.amazonaws.services.emrserverless.model.JobRunState;
 import org.json.JSONObject;
@@ -17,11 +18,6 @@ import org.opensearch.sql.spark.asyncquery.model.AsyncQueryJobMetadata;
 public abstract class AsyncQueryHandler {
 
   public JSONObject getQueryResponse(AsyncQueryJobMetadata asyncQueryJobMetadata) {
-    if (asyncQueryJobMetadata.isDropIndexQuery()) {
-      return SparkQueryDispatcher.DropIndexResult.fromJobId(asyncQueryJobMetadata.getJobId())
-          .result();
-    }
-
     JSONObject result = getResponseFromResultIndex(asyncQueryJobMetadata);
     if (result.has(DATA_FIELD)) {
       JSONObject items = result.getJSONObject(DATA_FIELD);

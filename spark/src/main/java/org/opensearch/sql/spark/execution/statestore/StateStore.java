@@ -45,11 +45,17 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.spark.asyncquery.model.AsyncQueryJobMetadata;
+import org.opensearch.sql.spark.dispatcher.model.IndexDMLResult;
+import org.opensearch.sql.spark.dispatcher.model.IndexDMLResult;
 import org.opensearch.sql.spark.execution.session.SessionModel;
 import org.opensearch.sql.spark.execution.session.SessionState;
 import org.opensearch.sql.spark.execution.session.SessionType;
 import org.opensearch.sql.spark.execution.statement.StatementModel;
 import org.opensearch.sql.spark.execution.statement.StatementState;
+import org.opensearch.sql.spark.flint.FlintIndexState;
+import org.opensearch.sql.spark.flint.FlintIndexStateModel;
+import org.opensearch.sql.spark.flint.FlintIndexState;
+import org.opensearch.sql.spark.flint.FlintIndexStateModel;
 
 /**
  * State Store maintain the state of Session and Statement. State State create/update/get doc on
@@ -303,5 +309,35 @@ public class StateStore {
                 .must(
                     QueryBuilders.termQuery(
                         SessionModel.SESSION_STATE, SessionState.RUNNING.getSessionState())));
+  }
+
+
+  public static BiFunction<FlintIndexStateModel, FlintIndexState, FlintIndexStateModel> updateFlintIndexState(
+      StateStore stateStore, String datasourceName) {
+    return (old, state) ->
+        stateStore.updateState(
+            old,
+            state,
+            FlintIndexStateModel::copyWithState,
+            DATASOURCE_TO_REQUEST_INDEX.apply(datasourceName));
+  }
+
+  public static Function<String, Optional<FlintIndexStateModel>> getFlintIndexState(
+      StateStore stateStore, String datasourceName) {
+    return (docId) ->
+        stateStore.get(
+            docId, FlintIndexStateModel::fromXContent, DATASOURCE_TO_REQUEST_INDEX.apply(datasourceName));
+  }
+
+  public static Function<FlintIndexStateModel, FlintIndexStateModel> createFlintIndexState(
+      StateStore stateStore, String datasourceName) {
+    return (st) ->
+        stateStore.create(
+            st, FlintIndexStateModel::copy, DATASOURCE_TO_REQUEST_INDEX.apply(datasourceName));
+  }
+
+  public static Function<IndexDMLResult, IndexDMLResult> createIndexDMLResult(
+      StateStore stateStore, String indexName) {
+    return (result) -> stateStore.create(result, IndexDMLResult::copy, indexName);
   }
 }

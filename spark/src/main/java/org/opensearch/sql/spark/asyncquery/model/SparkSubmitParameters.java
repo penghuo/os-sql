@@ -21,6 +21,8 @@ import java.util.Map;
 import java.util.function.Supplier;
 import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.datasource.model.DataSourceMetadata;
 import org.opensearch.sql.datasource.model.DataSourceType;
 import org.opensearch.sql.datasources.auth.AuthenticationType;
@@ -29,6 +31,8 @@ import org.opensearch.sql.datasources.auth.AuthenticationType;
 @AllArgsConstructor
 @RequiredArgsConstructor
 public class SparkSubmitParameters {
+  private static final Logger LOG = LogManager.getLogger();
+
   public static final String SPACE = " ";
   public static final String EQUALS = "=";
   public static final String FLINT_BASIC_AUTH = "basic";
@@ -67,7 +71,6 @@ public class SparkSubmitParameters {
       config.put(FLINT_INDEX_STORE_AUTH_KEY, FLINT_DEFAULT_AUTH);
       config.put(FLINT_CREDENTIALS_PROVIDER_KEY, EMR_ASSUME_ROLE_CREDENTIALS_PROVIDER);
       config.put(SPARK_SQL_EXTENSIONS_KEY, FLINT_SQL_EXTENSION + "," + FLINT_PPL_EXTENSION);
-      config.put(HIVE_METASTORE_CLASS_KEY, GLUE_HIVE_CATALOG_FACTORY_CLASS);
     }
 
     public static Builder builder() {
@@ -184,6 +187,8 @@ public class SparkSubmitParameters {
     if (extraParameters != null) {
       stringBuilder.append(extraParameters);
     }
-    return stringBuilder.toString();
+    String param = stringBuilder.toString();
+    LOG.info(param);
+    return param;
   }
 }

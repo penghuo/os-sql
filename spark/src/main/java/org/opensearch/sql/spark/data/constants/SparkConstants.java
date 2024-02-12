@@ -63,8 +63,6 @@ public class SparkConstants {
       "spark.datasource.flint.customAWSCredentialsProvider";
   public static final String FLINT_DATA_SOURCE_KEY = "spark.flint.datasource.name";
   public static final String SPARK_SQL_EXTENSIONS_KEY = "spark.sql.extensions";
-  public static final String HIVE_METASTORE_CLASS_KEY =
-      "spark.hadoop.hive.metastore.client.factory.class";
   public static final String DEFAULT_S3_AWS_CREDENTIALS_PROVIDER_VALUE =
       "com.amazonaws.emr.AssumeRoleAWSCredentialsProvider";
   public static final String DEFAULT_GLUE_CATALOG_CREDENTIALS_PROVIDER_FACTORY_KEY =
@@ -77,8 +75,6 @@ public class SparkConstants {
       "org.opensearch:opensearch-spark-ppl_2.12:0.1.0-SNAPSHOT";
   public static final String AWS_SNAPSHOT_REPOSITORY =
       "https://aws.oss.sonatype.org/content/repositories/snapshots";
-  public static final String GLUE_HIVE_CATALOG_FACTORY_CLASS =
-      "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory";
   public static final String FLINT_DELEGATE_CATALOG =
       "org.opensearch.sql.FlintDelegatingSessionCatalog";
   public static final String FLINT_SQL_EXTENSION =

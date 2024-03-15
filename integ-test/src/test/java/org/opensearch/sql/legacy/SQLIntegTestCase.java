@@ -235,17 +235,21 @@ public abstract class SQLIntegTestCase extends OpenSearchSQLRestTestCase {
 
   protected String executeQuery(String query, String requestType) {
     try {
-      String endpoint = "/_plugins/_sql?format=" + requestType;
+      String endpoint = "/_search";
       String requestBody = makeRequest(query);
 
       Request sqlRequest = new Request("POST", endpoint);
-      sqlRequest.setJsonEntity(requestBody);
+      sqlRequest.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+          "  \"sql\": {\n" +
+          "    \"query\": \"%s\"\n" +
+          "  }\n" +
+          "}", query));
 
       Response response = client().performRequest(sqlRequest);
       Assert.assertEquals(200, response.getStatusLine().getStatusCode());
       String responseString = getResponseBody(response, true);
 
-      return responseString;
+      return new JSONObject(responseString).getJSONObject("sql").toString();
     } catch (IOException e) {
       throw new RuntimeException(e);
     }

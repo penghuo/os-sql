@@ -94,6 +94,10 @@ public class RestPPLQueryAction extends BaseRestHandler {
 
   @Override
   protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient nodeClient) {
+    if (true) {
+      throw new RuntimeException("[Juno Test] Should not call /_plugins/_ppl endpoint");
+    }
+
     TransportPPLQueryRequest transportPPLQueryRequest =
         new TransportPPLQueryRequest(PPLQueryRequestFactory.getPPLRequest(request));
 

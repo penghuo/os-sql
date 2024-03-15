@@ -31,7 +31,7 @@ plugins {
 
 dependencies {
     api project(':core')
-    api files('.m2/repository/org/opensearch/opensearch/3.0.0-SNAPSHOT/opensearch-2.11.1-SNAPSHOT.jar')
+    api files('.m2/repository/org/opensearch/opensearch/2.13.0-SNAPSHOT/opensearch-2.13.0-SNAPSHOT.jar')
     implementation "io.github.resilience4j:resilience4j-retry:1.5.0"
     implementation group: 'com.fasterxml.jackson.core', name: 'jackson-core', version: "${versions.jackson}"
     implementation group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: "${versions.jackson_databind}"

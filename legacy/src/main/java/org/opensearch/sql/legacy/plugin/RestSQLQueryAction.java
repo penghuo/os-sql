@@ -85,6 +85,10 @@ public class RestSQLQueryAction extends BaseRestHandler {
       SQLQueryRequest request,
       BiConsumer<RestChannel, Exception> fallbackHandler,
       BiConsumer<RestChannel, Exception> executionErrorHandler) {
+    if (true) {
+      throw new RuntimeException("[Juno Test] Should not call /_plugins/_sql endpoint");
+    }
+
     if (!request.isSupported()) {
       return channel -> fallbackHandler.accept(channel, new IllegalStateException("not supported"));
     }

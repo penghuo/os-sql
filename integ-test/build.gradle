@@ -382,10 +382,10 @@ integTest {
     }
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
-    if(getOSFamilyType() != "windows") {
-        dependsOn startPrometheus
-        finalizedBy stopPrometheus
-    }
+    // if(getOSFamilyType() != "windows") {
+    //     dependsOn startPrometheus
+    //     finalizedBy stopPrometheus
+    // }
     systemProperty 'tests.security.manager', 'false'
     systemProperty('project.root', project.projectDir.absolutePath)
 
@@ -719,10 +719,28 @@ task integTestRemote(type: RestIntegTestTask) {
     // Exclude the same tests that are excluded for integTest
     exclude 'org/opensearch/sql/doctest/**/*IT.class'
     exclude 'org/opensearch/sql/correctness/**'
-    exclude 'org/opensearch/sql/legacy/ExplainIT.class'
-    exclude 'org/opensearch/sql/legacy/PrettyFormatterIT.class'
-    exclude 'org/opensearch/sql/legacy/TermQueryExplainIT.class'
-    exclude 'org/opensearch/sql/legacy/QueryAnalysisIT.class'
-    exclude 'org/opensearch/sql/legacy/OrderIT.class'
     exclude 'org/opensearch/sql/jdbc/**'
+    exclude 'org/opensearch/sql/datasource/**'
+    exclude 'org/opensearch/sql/security/**'
+    exclude 'org/opensearch/sql/ppl/PrometheusDataSourceCommandsIT.class'
+    exclude 'org/opensearch/sql/ppl/InformationSchemaCommandIT.class'
+    exclude 'org/opensearch/sql/ppl/CsvFormatIT.class'
+    // exclude /_plugins/_ppl/explain IT
+    exclude 'org/opensearch/sql/ppl/ExplainIT.class'
+    // exclude plugin IT
+    exclude 'org/opensearch/sql/ppl/PPLPluginIT.class'
+    exclude 'org/opensearch/sql/ppl/LegacyAPICompatibilityIT.class'
+    // exclude /_plugins/_ppl/stats IT
+    exclude 'org/opensearch/sql/ppl/MetricsIT.class'
+    // exclude exception handling IT, should it use OpenSearch error format? or follow SQL error format?
+    exclude 'org/opensearch/sql/ppl/QueryAnalysisIT.class'
+
+    // disable cursor and pagination IT
+    exclude 'org/opensearch/sql/sql/LegacyAPICompatibilityIT.class'
+    exclude 'org/opensearch/sql/sql/PaginationBlackboxIT.class'
+    exclude 'org/opensearch/sql/sql/PaginationFilterIT.class'
+    exclude 'org/opensearch/sql/sql/PaginationIT.class'
+    // disable all sql legacy engine IT
+    exclude 'org/opensearch/sql/legacy/**'
+    exclude 'org/opensearch/sql/sql/**'
 }

@@ -5,8 +5,13 @@
 
 package org.opensearch.sql.opensearch.data.value;
 
+import java.io.IOException;
 import java.util.Objects;
 import lombok.Data;
+import org.opensearch.core.common.io.stream.NamedWriteable;
+import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.xcontent.ToXContentObject;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.sql.data.model.AbstractExprValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.type.ExprType;
@@ -52,10 +57,30 @@ public class OpenSearchExprGeoPointValue extends AbstractExprValue {
   }
 
   @Data
-  public static class GeoPoint {
+  public static class GeoPoint implements NamedWriteable, ToXContentObject {
 
     private final Double lat;
 
     private final Double lon;
+
+    @Override
+    public String getWriteableName() {
+      return "geo";
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+      out.writeDouble(lat);
+      out.writeDouble(lon);
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+      builder.startObject();
+      builder.field("lat", lat);
+      builder.field("lon", lon);
+      builder.endObject();
+      return builder;
+    }
   }
 }

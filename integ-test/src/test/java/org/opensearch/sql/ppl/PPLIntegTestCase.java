@@ -22,12 +22,14 @@ import org.opensearch.sql.legacy.SQLIntegTestCase;
 /** OpenSearch Rest integration test base for PPL testing. */
 public abstract class PPLIntegTestCase extends SQLIntegTestCase {
 
+  public static final String SEARCH_ENDPOINT = "/_search";
+
   protected JSONObject executeQuery(String query) throws IOException {
     return jsonify(executeQueryToString(query));
   }
 
   protected String executeQueryToString(String query) throws IOException {
-    Response response = client().performRequest(buildRequest(query, QUERY_API_ENDPOINT));
+    Response response = client().performRequest(buildRequest(query, SEARCH_ENDPOINT));
     Assert.assertEquals(200, response.getStatusLine().getStatusCode());
     return getResponseBody(response, true);
   }
@@ -54,7 +56,11 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
 
   protected Request buildRequest(String query, String endpoint) {
     Request request = new Request("POST", endpoint);
-    request.setJsonEntity(String.format(Locale.ROOT, "{\n" + "  \"query\": \"%s\"\n" + "}", query));
+    request.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+        "  \"ppl\": {\n" +
+        "    \"query\": \"%s\"\n" +
+        "  }\n" +
+        "}", query));
 
     RequestOptions.Builder restOptionsBuilder = RequestOptions.DEFAULT.toBuilder();
     restOptionsBuilder.addHeader("Content-Type", "application/json");
@@ -107,7 +113,8 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
 
   private JSONObject jsonify(String text) {
     try {
-      return new JSONObject(text);
+      JSONObject jsonObject = new JSONObject(text);
+      return jsonObject.getJSONObject("ppl");
     } catch (JSONException e) {
       throw new IllegalStateException(String.format("Failed to transform %s to JSON format", text));
     }

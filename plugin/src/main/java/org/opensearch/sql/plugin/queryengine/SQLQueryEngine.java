@@ -1,5 +1,7 @@
 package org.opensearch.sql.plugin.queryengine;
 
+import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,6 +27,12 @@ import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.protocol.response.QueryResult;
+import org.opensearch.sql.protocol.response.format.CsvResponseFormatter;
+import org.opensearch.sql.protocol.response.format.Format;
+import org.opensearch.sql.protocol.response.format.JdbcResponseFormatter;
+import org.opensearch.sql.protocol.response.format.RawResponseFormatter;
+import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.sql.SQLService;
 import org.opensearch.sql.sql.domain.SQLQueryRequest;
 
@@ -33,6 +41,7 @@ public class SQLQueryEngine extends QueryEngine {
   public static final String NAME = "sql";
   private static SQLService sqlService;
   private String query;
+  private Format format;
 
   public static void initialize(SQLService sqlService) {
     SQLQueryEngine.sqlService = sqlService;
@@ -89,12 +98,19 @@ public class SQLQueryEngine extends QueryEngine {
 
     protected final ExecutionEngine.QueryResponse queryResponse;
 
+    protected final QueryResult queryResult;
+
+    protected final Format format = Format.CSV;
+
     public SQLResponseExternalBuilder(ExecutionEngine.QueryResponse queryResponse) {
       this.queryResponse = queryResponse;
+      this.queryResult = new QueryResult(queryResponse.getSchema(), queryResponse.getResults(),
+          queryResponse.getCursor());
     }
 
     public SQLResponseExternalBuilder(StreamInput in) throws IOException {
       this.queryResponse = null;
+      this.queryResult =  null;
     }
 
     @Override
@@ -123,10 +139,10 @@ public class SQLQueryEngine extends QueryEngine {
       }
       builder.endArray();
       builder.startArray("datarows");
-      for (ExprValue result : queryResponse.getResults()) {
+      for (Object[] values : queryResult) {
         builder.startArray();
-        for (String columnName : columnNames) {
-          builder.value(result.tupleValue().get(columnName).value());
+        for (Object value : values) {
+          builder.value(value);
         }
         builder.endArray();
       }

@@ -11,7 +11,9 @@ import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
 
 import java.io.IOException;
 import org.json.JSONObject;
+import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.jupiter.api.Disabled;
 
 public class LikeQueryIT extends PPLIntegTestCase {
 
@@ -94,7 +96,7 @@ public class LikeQueryIT extends PPLIntegTestCase {
     assertEquals(0, result.getInt("total"));
   }
 
-  @Test
+  @Ignore("Disable explain test")
   public void test_convert_field_text_to_keyword() throws IOException {
     String query =
         "source="

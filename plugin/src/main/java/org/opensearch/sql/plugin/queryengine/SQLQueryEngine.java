@@ -7,7 +7,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import org.apache.lucene.search.TotalHits;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -25,11 +27,11 @@ import org.opensearch.search.externalengine.QueryEngine;
 import org.opensearch.search.externalengine.QueryEngineExtBuilder;
 import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.sql.common.response.ResponseListener;
-import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.protocol.response.QueryResult;
 import org.opensearch.sql.protocol.response.format.CsvResponseFormatter;
 import org.opensearch.sql.protocol.response.format.Format;
+
 import org.opensearch.sql.protocol.response.format.JdbcResponseFormatter;
 import org.opensearch.sql.protocol.response.format.RawResponseFormatter;
 import org.opensearch.sql.protocol.response.format.ResponseFormatter;
@@ -41,7 +43,7 @@ public class SQLQueryEngine extends QueryEngine {
   public static final String NAME = "sql";
   private static SQLService sqlService;
   private String query;
-  private Format format;
+  private String format;
 
   public static void initialize(SQLService sqlService) {
     SQLQueryEngine.sqlService = sqlService;
@@ -50,7 +52,7 @@ public class SQLQueryEngine extends QueryEngine {
   @Override
   public void executeQuery(
       SearchRequest searchRequest, ActionListener<SearchResponse> actionListener) {
-    SQLQueryRequest sqlQueryRequest = new SQLQueryRequest(new JSONObject(), query, "_search", "json");
+    SQLQueryRequest sqlQueryRequest = new SQLQueryRequest(new JSONObject(), query, "_search", format);
     sqlService.execute(
         sqlQueryRequest,
         new ResponseListener<>() {
@@ -81,7 +83,7 @@ public class SQLQueryEngine extends QueryEngine {
             (Boolean) null,
             1,
             Collections.emptyList(),
-            List.of(new SQLResponseExternalBuilder(queryResponse))),
+            List.of(new SQLResponseExternalBuilder(queryResponse, format))),
         (String) null,
         0,
         0,
@@ -100,17 +102,19 @@ public class SQLQueryEngine extends QueryEngine {
 
     protected final QueryResult queryResult;
 
-    protected final Format format = Format.CSV;
+    protected final String format;
 
-    public SQLResponseExternalBuilder(ExecutionEngine.QueryResponse queryResponse) {
+    public SQLResponseExternalBuilder(ExecutionEngine.QueryResponse queryResponse, String format) {
       this.queryResponse = queryResponse;
       this.queryResult = new QueryResult(queryResponse.getSchema(), queryResponse.getResults(),
           queryResponse.getCursor());
+      this.format = format;
     }
 
     public SQLResponseExternalBuilder(StreamInput in) throws IOException {
       this.queryResponse = null;
       this.queryResult =  null;
+      this.format = null;
     }
 
     @Override
@@ -125,31 +129,107 @@ public class SQLQueryEngine extends QueryEngine {
 
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-      // Serialize the schema
+      ResponseFormatter<QueryResult> formatter;
+      if (format.equals(Format.CSV.getFormatName())) {
+        formatter = new CsvResponseFormatter(true);
+      } else if (format.equals(Format.RAW.getFormatName())) {
+        formatter = new RawResponseFormatter();
+      } else {
+        formatter = new JdbcResponseFormatter(PRETTY);
+      }
+
+      String result = formatter.format(queryResult);
+      JSONObject jsonObject = new JSONObject(result);
+
       builder.startObject(NAME);
-      ArrayList<String> columnNames = new ArrayList<>();
       builder.startArray("schema");
-      for (ExecutionEngine.Schema.Column column : queryResponse.getSchema().getColumns()) {
+      JSONArray schema = jsonObject.getJSONArray("schema");
+      for (int i = 0; i < schema.length(); i++) {
+        JSONObject column = schema.getJSONObject(i);
         builder.startObject();
-        String columnName = getColumnName(column);
-        columnNames.add(columnName);
-        builder.field("name", columnName);
-        builder.field("type", column.getExprType().typeName().toLowerCase(Locale.ROOT));
+        builder.field("name", column.getString("name"));
+        if (column.has("alias")) {
+          builder.field("alias", column.getString("alias"));
+        }
+        builder.field("type", column.getString("type"));
         builder.endObject();
       }
       builder.endArray();
+
       builder.startArray("datarows");
-      for (Object[] values : queryResult) {
-        builder.startArray();
-        for (Object value : values) {
-          builder.value(value);
-        }
-        builder.endArray();
+      JSONArray datarows = jsonObject.getJSONArray("datarows");
+      for (int i = 0; i < datarows.length(); i++) {
+        jsonArray(builder, datarows.getJSONArray(i));
       }
       builder.endArray();
-      builder.field("total", queryResponse.getResults().size());
-      builder.field("size", queryResponse.getResults().size());
+
+      builder.field("total", jsonObject.getLong("total"));
+      builder.field("size", jsonObject.getLong("size"));
       builder.endObject();
+
+
+//      // Serialize the schema
+//      builder.startObject(NAME);
+//      ArrayList<String> columnNames = new ArrayList<>();
+//      builder.startArray("schema");
+//      for (ExecutionEngine.Schema.Column column : queryResponse.getSchema().getColumns()) {
+//        builder.startObject();
+//        String columnName = getColumnName(column);
+//        columnNames.add(columnName);
+//        builder.field("name", columnName);
+//        builder.field("type", column.getExprType().typeName().toLowerCase(Locale.ROOT));
+//        builder.endObject();
+//      }
+//      builder.endArray();
+//      builder.startArray("datarows");
+//      for (Object[] values : queryResult) {
+//        builder.startArray();
+//        for (Object value : values) {
+//          builder.value(value);
+//        }
+//        builder.endArray();
+//      }
+//      builder.endArray();
+//      builder.field("total", queryResponse.getResults().size());
+//      builder.field("size", queryResponse.getResults().size());
+//      builder.endObject();
+      return builder;
+    }
+
+    public XContentBuilder jsonObject(XContentBuilder builder, JSONObject object) throws IOException {
+      Map<String, Object> objectMap = object.toMap();
+      builder.startObject();
+      for (String key : objectMap.keySet()) {
+        Object value = objectMap.get(key);
+        if (value instanceof JSONObject) {
+          jsonObject(builder, (JSONObject) value);
+        } else if (value instanceof JSONArray) {
+          jsonArray(builder, (JSONArray) value);
+        } else {
+          builder.field(key, value);
+        }
+      }
+      builder.endObject();
+      return builder;
+    }
+
+    public XContentBuilder jsonArray(XContentBuilder builder, JSONArray array) throws IOException {
+      builder.startArray();
+      for (int i = 0; i < array.length(); i++) {
+        if (array.isNull(i)) {
+          builder.nullValue();
+        } else {
+          Object value = array.get(i);
+          if (value instanceof JSONObject) {
+            jsonObject(builder, (JSONObject) value);
+          } else if (value instanceof JSONArray) {
+            jsonArray(builder, (JSONArray) value);
+          } else {
+            builder.value(value);
+          }
+        }
+      }
+      builder.endArray();
       return builder;
     }
 
@@ -177,8 +257,9 @@ public class SQLQueryEngine extends QueryEngine {
 
   }
 
-  public SQLQueryEngine(String query) {
+  public SQLQueryEngine(String query, String format) {
     this.query = query;
+    this.format = format;
   }
 
   public SQLQueryEngine(StreamInput in) {}
@@ -199,14 +280,18 @@ public class SQLQueryEngine extends QueryEngine {
   public static QueryEngine fromXContent(XContentParser parser) throws IOException {
     XContentParser.Token token;
     String query = "";
+    String format = "jdbc";
     while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
       String fieldName = parser.currentName();
       token = parser.nextToken();
       if (fieldName.equals("query")) {
         query = parser.textOrNull();
       }
+      if (fieldName.equals("format")) {
+        format = parser.textOrNull();
+      }
     }
-    return new SQLQueryEngine(query);
+    return new SQLQueryEngine(query, format);
   }
 
 

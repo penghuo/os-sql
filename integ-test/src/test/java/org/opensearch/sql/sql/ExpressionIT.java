@@ -8,10 +8,12 @@ package org.opensearch.sql.sql;
 import static org.hamcrest.Matchers.is;
 import static org.opensearch.sql.legacy.plugin.RestSqlAction.QUERY_API_ENDPOINT;
 import static org.opensearch.sql.util.MatcherUtils.featureValueOf;
+import static org.opensearch.sql.util.TestUtils.getResponseBody;
 
 import java.io.IOException;
 import java.util.Locale;
 import java.util.function.Function;
+import org.json.JSONObject;
 import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.rules.ExpectedException;
@@ -74,8 +76,12 @@ public class ExpressionIT extends RestIntegTestCase {
   }
 
   private static Response executeQuery(String query) throws IOException {
-    Request request = new Request("POST", QUERY_API_ENDPOINT);
-    request.setJsonEntity(String.format(Locale.ROOT, "{\n" + "  \"query\": \"%s\"\n" + "}", query));
+    Request request = new Request("POST", "/_search");
+    request.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+        "  \"sql\": {\n" +
+        "    \"query\": \"%s\"\n" +
+        "  }\n" +
+        "}", query));
 
     RequestOptions.Builder restOptionsBuilder = RequestOptions.DEFAULT.toBuilder();
     restOptionsBuilder.addHeader("Content-Type", "application/json");

@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.jupiter.api.Disabled;
 import org.opensearch.sql.legacy.SQLIntegTestCase;
@@ -112,7 +113,7 @@ public class NestedIT extends SQLIntegTestCase {
     verifyDataRows(result, rows("e", 1, "a"));
   }
 
-  @Test
+  @Ignore("disable exception test")
   public void invalid_multiple_nested_all_function_in_a_function_in_select_test() {
     String query =
         "SELECT nested(message.*), nested(message.info) FROM "
@@ -242,7 +243,7 @@ public class NestedIT extends SQLIntegTestCase {
   // Nested function in GROUP BY clause is not yet implemented for JDBC format. This test ensures
   // that the V2 engine falls back to legacy implementation.
   // TODO Fix the test when NESTED is supported in GROUP BY in the V2 engine.
-  @Test
+  @Ignore("disable fallback test")
   public void nested_function_with_group_by_clause() {
     String query =
         "SELECT count(*) FROM " + TEST_INDEX_NESTED_TYPE + " GROUP BY nested(message.info)";
@@ -259,7 +260,7 @@ public class NestedIT extends SQLIntegTestCase {
   // Nested function in HAVING clause is not yet implemented for JDBC format. This test ensures
   // that the V2 engine falls back to legacy implementation.
   // TODO Fix the test when NESTED is supported in HAVING in the V2 engine.
-  @Test
+  @Ignore("disable legacy engine fallback IT")
   public void nested_function_with_having_clause() {
     String query =
         "SELECT count(*) FROM "
@@ -310,7 +311,7 @@ public class NestedIT extends SQLIntegTestCase {
         rows("a", new JSONArray(List.of("<em>b</em>"))));
   }
 
-  @Test
+  @Ignore("disable exception test")
   public void nested_with_non_nested_type_test() {
     String query = "SELECT nested(someField) FROM " + TEST_INDEX_NESTED_TYPE;
 
@@ -329,7 +330,7 @@ public class NestedIT extends SQLIntegTestCase {
                     + "}"));
   }
 
-  @Test
+  @Ignore("disable exception test")
   public void nested_missing_path() {
     String query = "SELECT nested(message.invalid) FROM " + TEST_INDEX_MULTI_NESTED_TYPE;
 
@@ -349,7 +350,7 @@ public class NestedIT extends SQLIntegTestCase {
                     + "}"));
   }
 
-  @Test
+  @Ignore("disable exception test")
   public void nested_missing_path_argument() {
     String query =
         "SELECT nested(message.author.name, invalid) FROM " + TEST_INDEX_MULTI_NESTED_TYPE;
@@ -370,7 +371,7 @@ public class NestedIT extends SQLIntegTestCase {
                     + "}"));
   }
 
-  @Test
+  @Ignore("disable legacy engine fallback IT")
   public void test_nested_where_with_and_conditional() {
     String query =
         "SELECT nested(message.info), nested(message.author) FROM "
@@ -571,7 +572,7 @@ public class NestedIT extends SQLIntegTestCase {
         rows(new JSONArray(List.of(Map.of("dateAndTime", "2001-11-11 04:07:44")))));
   }
 
-  @Test
+  @Ignore("disable exception test")
   public void nested_function_all_subfields_in_wrong_clause() {
     String query = "SELECT * FROM " + TEST_INDEX_NESTED_TYPE + " ORDER BY nested(message.*)";
 

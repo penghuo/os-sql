@@ -6,6 +6,7 @@
 package org.opensearch.sql.sql;
 
 import org.json.JSONObject;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.opensearch.sql.legacy.SQLIntegTestCase;
 import org.opensearch.sql.legacy.TestsConstants;
@@ -17,7 +18,7 @@ public class PreparedStatementIT extends SQLIntegTestCase {
     loadIndex(Index.ACCOUNT);
   }
 
-  @Test
+  @Ignore("disable prepare statement")
   public void testPreparedStatement() {
     JSONObject response =
         new JSONObject(

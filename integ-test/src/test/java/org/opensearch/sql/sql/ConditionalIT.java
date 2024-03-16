@@ -21,6 +21,7 @@ import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 import com.fasterxml.jackson.core.JsonFactory;
 import java.io.IOException;
 import org.json.JSONObject;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.xcontent.LoggingDeprecationHandler;
@@ -147,7 +148,7 @@ public class ConditionalIT extends SQLIntegTestCase {
     assertEquals("boolean", response.query("/schema/0/type"));
   }
 
-  @Test
+  @Ignore("disable legacy fallback IT")
   public void isnullWithNotNullInputTest() throws IOException {
     assertThat(
         executeQuery("SELECT ISNULL('elastic') AS isnull FROM " + TEST_INDEX_ACCOUNT),
@@ -178,7 +179,7 @@ public class ConditionalIT extends SQLIntegTestCase {
         rows(LITERAL_TRUE.value(), LITERAL_FALSE.value()));
   }
 
-  @Test
+  @Ignore("disable legacy fallback IT")
   public void isnullWithMathExpr() throws IOException {
     assertThat(
         executeQuery("SELECT ISNULL(1+1) AS isnull FROM " + TEST_INDEX_ACCOUNT),

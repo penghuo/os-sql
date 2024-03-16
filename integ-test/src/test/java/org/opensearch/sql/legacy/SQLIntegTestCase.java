@@ -212,9 +212,17 @@ public abstract class SQLIntegTestCase extends OpenSearchSQLRestTestCase {
   }
 
   protected Request getSqlRequest(String request, boolean explain, String requestType) {
-    String queryEndpoint = String.format("%s?format=%s", QUERY_API_ENDPOINT, requestType);
-    Request sqlRequest = new Request("POST", explain ? EXPLAIN_API_ENDPOINT : queryEndpoint);
-    sqlRequest.setJsonEntity(request);
+//    String queryEndpoint = String.format("%s?format=%s", QUERY_API_ENDPOINT, requestType);
+//    Request sqlRequest = new Request("POST", explain ? EXPLAIN_API_ENDPOINT : queryEndpoint);
+//    sqlRequest.setJsonEntity(request);
+
+    Request sqlRequest = new Request("POST", "/_search");
+    sqlRequest.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+        "  \"sql\": {\n" +
+        "    \"query\": \"%s\"\n" +
+        "  }\n" +
+        "}", request));
+
     RequestOptions.Builder restOptionsBuilder = RequestOptions.DEFAULT.toBuilder();
     restOptionsBuilder.addHeader("Content-Type", "application/json");
     sqlRequest.setOptions(restOptionsBuilder);
@@ -317,7 +325,7 @@ public abstract class SQLIntegTestCase extends OpenSearchSQLRestTestCase {
   protected JSONObject executeQuery(final String sqlQuery) throws IOException {
 
     final String requestBody = makeRequest(sqlQuery);
-    return executeRequest(requestBody);
+    return executeRequest(sqlQuery);
   }
 
   protected String explainQuery(final String sqlQuery) throws IOException {

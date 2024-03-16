@@ -66,7 +66,14 @@ public class CsvFormatIT extends SQLIntegTestCase {
             Locale.ROOT, "SELECT firstname, lastname FROM %s", TEST_INDEX_BANK_CSV_SANITIZE);
     String requestBody = makeRequest(query);
 
-    Request sqlRequest = new Request("POST", "/_plugins/_sql?format=csv");
+//    Request sqlRequest = new Request("POST", "/_plugins/_sql?format=csv");
+    Request sqlRequest = new Request("POST", "/_search");
+    sqlRequest.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+        "  \"sql\": {\n" +
+        "    \"query\": \"%s\",\n" +
+        "    \"format\": \"csv\"\n" +
+        "  }\n" +
+        "}", query));
     sqlRequest.setJsonEntity(requestBody);
 
     Response response = client().performRequest(sqlRequest);

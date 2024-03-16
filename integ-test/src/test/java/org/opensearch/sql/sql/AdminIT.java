@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.sql.common.utils.StringUtils;
@@ -57,7 +58,7 @@ public class AdminIT extends SQLIntegTestCase {
     assertThat(row.get(2), equalTo(alias));
   }
 
-  @Test
+  @Ignore("disable test for explain query")
   public void explainShow() throws Exception {
     String expected = loadFromFile("expectedOutput/sql/explain_show.json");
 

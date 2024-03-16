@@ -742,5 +742,18 @@ task integTestRemote(type: RestIntegTestTask) {
     exclude 'org/opensearch/sql/sql/PaginationIT.class'
     // disable all sql legacy engine IT
     exclude 'org/opensearch/sql/legacy/**'
-    exclude 'org/opensearch/sql/sql/**'
+
+    // disable CSVFormatIT
+    exclude 'org/opensearch/sql/sql/CsvFormatIT.class'
+    exclude 'org/opensearch/sql/sql/RawFormatIT.class'
+    exclude 'org/opensearch/sql/sql/PaginationFallbackIT.class'
+    exclude 'org/opensearch/sql/sql/PaginationWindowIT.class'
+    exclude 'org/opensearch/sql/sql/StandalonePaginationIT.class'
+    exclude 'org/opensearch/sql/sql/QueryValidationIT.class'
+
+    // disable JDBC client based test
+    exclude 'org/opensearch/sql/sql/SQLCorrectnessIT.class'
+
+    // disable Metrcs IT
+    exclude 'org/opensearch/sql/sql/MetricsIT.class'
 }

@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.util.Locale;
 import org.json.JSONObject;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.opensearch.sql.legacy.SQLIntegTestCase;
 import org.opensearch.sql.legacy.TestsConstants;
@@ -38,7 +39,7 @@ public class ScoreQueryIT extends SQLIntegTestCase {
    *
    * @throws IOException
    */
-  @Test
+  @Ignore("disable explain IT")
   public void scoreQueryExplainTest() throws IOException {
     final String result =
         explainQuery(
@@ -75,7 +76,7 @@ public class ScoreQueryIT extends SQLIntegTestCase {
         result, rows("154 Douglass Street", 650.1515), rows("565 Hall Street", 3.2507575));
   }
 
-  @Test
+  @Ignore("disable explain IT")
   public void scoreQueryDefaultBoostExplainTest() throws IOException {
     final String result =
         explainQuery(

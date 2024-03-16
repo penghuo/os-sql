@@ -9,6 +9,7 @@ import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_BEER;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.CONTENT_TYPE;
 
 import java.io.IOException;
+import java.util.Locale;
 import org.json.JSONObject;
 import org.junit.Test;
 import org.opensearch.client.Request;
@@ -78,10 +79,13 @@ public class SimpleQueryStringIT extends SQLIntegTestCase {
         "SELECT Id FROM "
             + TEST_INDEX_BEER
             + " WHERE simple_query_string([\\\"Tags\\\" ^ 1.5, Title, 'Body' 4.2], 'taste')";
-    String requestBody = makeRequest(query);
 
-    Request sqlRequest = new Request("POST", "/_plugins/_sql");
-    sqlRequest.setJsonEntity(requestBody);
+    Request sqlRequest = new Request("POST", "/_search");
+    sqlRequest.setJsonEntity(String.format(Locale.ROOT, "{\n" +
+        "  \"sql\": {\n" +
+        "    \"query\": \"%s\"\n" +
+        "  }\n" +
+        "}", query));
 
     Response response = client().performRequest(sqlRequest);
 

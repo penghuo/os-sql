@@ -12,6 +12,7 @@ import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.analysis.ExpressionAnalyzer;
+import org.opensearch.sql.calcite.CalciteExecutionEngine;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.executor.ExecutionEngine;
@@ -60,7 +61,8 @@ public class OpenSearchPluginModule extends AbstractModule {
   @Provides
   public ExecutionEngine executionEngine(
       OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-    return new OpenSearchExecutionEngine(client, protector, planSerializer);
+    return new CalciteExecutionEngine(client);
+//    return new OpenSearchExecutionEngine(client, protector, planSerializer);
   }
 
   @Provides

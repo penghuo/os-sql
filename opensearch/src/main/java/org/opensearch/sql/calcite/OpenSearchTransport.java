@@ -31,6 +31,7 @@ import java.util.Collections;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.calcite.runtime.Hook;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
@@ -126,7 +127,7 @@ final class OpenSearchTransport {
     return scrollId -> {
       try {
         SearchResponse searchResponse =
-            nodeClient.searchScroll(new SearchScrollRequest().scroll(scrollId).scroll("1m"))
+            nodeClient.searchScroll(new SearchScrollRequest().scrollId(scrollId).scroll("1m"))
                 .actionGet();
         return mapper.readValue(searchResponse.toString(), OpenSearchJson.Result.class);
       } catch (IOException e) {
@@ -141,7 +142,8 @@ final class OpenSearchTransport {
     try {
 
       ClearScrollRequest clearScrollRequest = new ClearScrollRequest();
-      clearScrollRequest.setScrollIds(StreamSupport.stream(scrollIds.spliterator(), false).toList());
+      clearScrollRequest.setScrollIds(StreamSupport.stream(scrollIds.spliterator(), false).collect(
+          Collectors.toUnmodifiableList()));
       nodeClient.clearScroll(clearScrollRequest);
     } catch ( UncheckedIOException e) {
       LOGGER.warn("Failed to close scroll(s): {}", scrollIds, e);
@@ -166,7 +168,7 @@ final class OpenSearchTransport {
         SearchRequest searchRequest = new SearchRequest()
             .indices(indexName)
             .source(parseQuery(json))
-            .scroll(httpParams.get("scoll"));
+            .scroll(httpParams.getOrDefault("scroll", "1m"));
         searchResponse = nodeClient.search(searchRequest).actionGet();
         return mapper.readValue(searchResponse.toString(), OpenSearchJson.Result.class);
       } catch (JsonProcessingException e) {

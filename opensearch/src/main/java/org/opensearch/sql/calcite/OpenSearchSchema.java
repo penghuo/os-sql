@@ -48,7 +48,7 @@ public class OpenSearchSchema extends AbstractSchema {
 
   private final ObjectMapper mapper;
 
-  private final Map<String, Table> tableMap;
+  private  Map<String, Table> tableMap;
 
   /**
    * Default batch size to be used during scrolling.
@@ -78,17 +78,20 @@ public class OpenSearchSchema extends AbstractSchema {
     this.fetchSize = fetchSize;
 
     if (index == null) {
-      try {
-        this.tableMap = createTables(indicesFromOpenSearch());
-      } catch (IOException e) {
-        throw new UncheckedIOException("Couldn't get indices", e);
-      }
+      this.tableMap = null;
     } else {
       this.tableMap = createTables(Collections.singleton(index));
     }
   }
 
   @Override protected Map<String, Table> getTableMap() {
+    if (tableMap == null) {
+      try {
+        this.tableMap = createTables(indicesFromOpenSearch());
+      } catch (IOException e) {
+        throw new UncheckedIOException("Couldn't get indices", e);
+      }
+    }
     return tableMap;
   }
 

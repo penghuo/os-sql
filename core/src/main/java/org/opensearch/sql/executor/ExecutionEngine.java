@@ -10,6 +10,7 @@ import java.util.Map;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
+import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.type.ExprType;
@@ -31,6 +32,13 @@ public interface ExecutionEngine {
   /** Execute physical plan with {@link ExecutionContext} and call back response listener. */
   void execute(
       PhysicalPlan plan, ExecutionContext context, ResponseListener<QueryResponse> listener);
+
+
+  // FIXME
+  default void execute(UnresolvedPlan plan, ExecutionContext context,
+               ResponseListener<QueryResponse> listener) {
+    throw new UnsupportedOperationException();
+  }
 
   /**
    * Explain physical plan and call back response listener. The reason why this has to be part of

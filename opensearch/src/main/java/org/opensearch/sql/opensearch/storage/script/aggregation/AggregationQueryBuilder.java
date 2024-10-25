@@ -45,7 +45,7 @@ import org.opensearch.sql.opensearch.storage.serialization.ExpressionSerializer;
 public class AggregationQueryBuilder extends ExpressionNodeVisitor<AggregationBuilder, Object> {
 
   /** How many composite buckets should be returned. */
-  public static final int AGGREGATION_BUCKET_SIZE = 1000;
+  public  final int aggregationBucketSize;
 
   /** Bucket Aggregation builder. */
   private final BucketAggregationBuilder bucketBuilder;
@@ -54,9 +54,10 @@ public class AggregationQueryBuilder extends ExpressionNodeVisitor<AggregationBu
   private final MetricAggregationBuilder metricBuilder;
 
   /** Aggregation Query Builder Constructor. */
-  public AggregationQueryBuilder(ExpressionSerializer serializer) {
+  public AggregationQueryBuilder(ExpressionSerializer serializer, int size) {
     this.bucketBuilder = new BucketAggregationBuilder(serializer);
     this.metricBuilder = new MetricAggregationBuilder(serializer);
+    this.aggregationBucketSize = size;
   }
 
   /** Build AggregationBuilder. */
@@ -91,7 +92,7 @@ public class AggregationQueryBuilder extends ExpressionNodeVisitor<AggregationBu
                                           groupSortOrder.missingOrder(expr)))
                               .collect(Collectors.toList())))
                   .subAggregations(metrics.getLeft())
-                  .size(AGGREGATION_BUCKET_SIZE)),
+                  .size(aggregationBucketSize)),
           new CompositeAggregationParser(metrics.getRight()));
     }
   }

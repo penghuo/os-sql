@@ -29,6 +29,7 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.sql.common.antlr.SyntaxCheckException;
+import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.QueryManager;
 import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.sql.SQLService;
@@ -49,6 +50,8 @@ public class RestSQLQueryActionTest extends BaseRestHandler {
 
   @Mock private RestChannel restChannel;
 
+  @Mock private Settings settings;
+
   private Injector injector;
 
   @Before
@@ -58,7 +61,7 @@ public class RestSQLQueryActionTest extends BaseRestHandler {
     modules.add(
         b -> {
           b.bind(SQLService.class)
-              .toInstance(new SQLService(new SQLSyntaxParser(), queryManager, factory));
+              .toInstance(new SQLService(new SQLSyntaxParser(), queryManager, factory, settings));
         });
     injector = modules.createInjector();
     Mockito.lenient()

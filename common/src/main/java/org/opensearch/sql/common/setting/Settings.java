@@ -15,6 +15,9 @@ import lombok.RequiredArgsConstructor;
 
 /** Setting. */
 public abstract class Settings {
+
+  public static final int QUERY_SIZE_LIMIT_SETTING_DEFAULT = 10000;
+
   @RequiredArgsConstructor
   public enum Key {
 

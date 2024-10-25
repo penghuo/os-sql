@@ -29,6 +29,8 @@ public class SQLCorrectnessIT extends CorrectnessTestBase {
   public void runAllTests() throws Exception {
     verifyQueries(EXPR_TEST_DIR, expr -> "SELECT " + expr);
     verifyQueries(QUERY_TEST_DIR, Function.identity());
+
+    Thread.sleep(10000);
   }
 
   /**

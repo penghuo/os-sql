@@ -220,12 +220,12 @@ public class StandaloneIT extends PPLIntegTestCase {
 
     @Provides
     public PPLService pplService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
-      return new PPLService(new PPLSyntaxParser(), queryManager, queryPlanFactory);
+      return new PPLService(new PPLSyntaxParser(), queryManager, queryPlanFactory, settings);
     }
 
     @Provides
     public SQLService sqlService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
-      return new SQLService(new SQLSyntaxParser(), queryManager, queryPlanFactory);
+      return new SQLService(new SQLSyntaxParser(), queryManager, queryPlanFactory, settings);
     }
 
     @Provides

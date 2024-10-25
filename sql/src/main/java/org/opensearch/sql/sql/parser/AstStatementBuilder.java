@@ -8,12 +8,15 @@
 
 package org.opensearch.sql.sql.parser;
 
+import java.util.List;
 import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.ast.statement.Explain;
 import org.opensearch.sql.ast.statement.Query;
 import org.opensearch.sql.ast.statement.Statement;
+import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.sql.antlr.parser.OpenSearchSQLParser;
 import org.opensearch.sql.sql.antlr.parser.OpenSearchSQLParserBaseVisitor;
 
@@ -26,7 +29,7 @@ public class AstStatementBuilder extends OpenSearchSQLParserBaseVisitor<Statemen
 
   @Override
   public Statement visitSqlStatement(OpenSearchSQLParser.SqlStatementContext ctx) {
-    Query query = new Query(astBuilder.visit(ctx), context.fetchSize);
+    Query query = new Query(addQuerySizeLimit(astBuilder.visit(ctx)), context.fetchSize);
     return context.isExplain ? new Explain(query) : query;
   }
 
@@ -40,5 +43,23 @@ public class AstStatementBuilder extends OpenSearchSQLParserBaseVisitor<Statemen
   public static class StatementBuilderContext {
     private final boolean isExplain;
     private final int fetchSize;
+    private final int querySizeLimit;
+  }
+
+  /**
+   * Enforce query size limit.
+   *
+   * @param plan
+   * @return
+   */
+  private UnresolvedPlan addQuerySizeLimit(UnresolvedPlan plan) {
+    // Ignore if it is pagination query.
+    if (context.fetchSize > 0) {
+      return plan;
+    }
+    Limit limit = new Limit(context.getQuerySizeLimit(), 0);
+    limit.attach(((List<UnresolvedPlan>) plan.getChild()).get(0));;
+    plan.attach(limit);
+    return plan;
   }
 }

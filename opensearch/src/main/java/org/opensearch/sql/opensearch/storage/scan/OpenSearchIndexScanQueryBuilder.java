@@ -71,8 +71,7 @@ class OpenSearchIndexScanQueryBuilder implements PushDownQueryBuilder {
 
   @Override
   public boolean pushDownLimit(LogicalLimit limit) {
-    requestBuilder.pushDownLimit(limit.getLimit(), limit.getOffset());
-    return true;
+    return requestBuilder.pushDownLimit(limit.getLimit(), limit.getOffset());
   }
 
   @Override

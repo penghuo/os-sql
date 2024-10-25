@@ -101,6 +101,15 @@ public class OpenSearchDescribeIndexRequest implements OpenSearchSystemRequest {
         .get();
   }
 
+  public Integer getMaxBuckets() {
+    return client
+        .getIndexMaxResultWindows(getLocalIndexNames(indexName.getIndexNames()))
+        .values()
+        .stream()
+        .min(Integer::compare)
+        .get();
+  }
+
   private ExprTupleValue row(String fieldName, String fieldType, int position, String clusterName) {
     LinkedHashMap<String, ExprValue> valueMap = new LinkedHashMap<>();
     valueMap.put("TABLE_CAT", stringValue(clusterName));

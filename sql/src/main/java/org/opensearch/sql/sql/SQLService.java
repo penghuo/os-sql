@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.opensearch.sql.ast.statement.Statement;
 import org.opensearch.sql.common.response.ResponseListener;
+import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.QueryManager;
@@ -29,6 +30,11 @@ public class SQLService {
   private final QueryManager queryManager;
 
   private final QueryPlanFactory queryExecutionFactory;
+
+  /**
+   * OpenSearch Settings.
+   */
+  private final Settings settings;
 
   /**
    * Given {@link SQLQueryRequest}, execute it. Using listener to listen result.
@@ -89,6 +95,7 @@ public class SQLService {
                   AstStatementBuilder.StatementBuilderContext.builder()
                       .isExplain(isExplainRequest)
                       .fetchSize(request.getFetchSize())
+                      .querySizeLimit(settings.getSettingValue(Settings.Key.QUERY_SIZE_LIMIT))
                       .build()));
 
       return queryExecutionFactory.create(statement, queryListener, explainListener);

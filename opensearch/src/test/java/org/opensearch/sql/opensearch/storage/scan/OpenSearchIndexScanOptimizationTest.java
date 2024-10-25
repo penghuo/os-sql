@@ -650,7 +650,7 @@ class OpenSearchIndexScanOptimizationTest {
                         .missingBucket(true)))
             .subAggregation(
                 AggregationBuilders.avg(aggregation.aggregateName).field(aggregation.aggregateBy))
-            .size(AggregationQueryBuilder.AGGREGATION_BUCKET_SIZE);
+            .size(10000);
 
     List<AggregationBuilder> aggBuilders = Collections.singletonList(aggBuilder);
     OpenSearchAggregationResponseParser responseParser =

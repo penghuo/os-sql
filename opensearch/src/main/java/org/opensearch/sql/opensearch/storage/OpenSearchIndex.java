@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.opensearch.storage;
 
+import static org.opensearch.search.aggregations.MultiBucketConsumerService.MAX_BUCKET_SETTING;
+
 import com.google.common.annotations.VisibleForTesting;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -161,16 +163,17 @@ public class OpenSearchIndex implements Table {
   @Override
   public TableScanBuilder createScanBuilder() {
     final int querySizeLimit = settings.getSettingValue(Settings.Key.QUERY_SIZE_LIMIT);
+    final int maxResultWindow = getMaxResultWindow();
 
     final TimeValue cursorKeepAlive = settings.getSettingValue(Settings.Key.SQL_CURSOR_KEEP_ALIVE);
-    var builder = new OpenSearchRequestBuilder(querySizeLimit, createExprValueFactory());
+    var builder = new OpenSearchRequestBuilder(maxResultWindow, createExprValueFactory());
     Function<OpenSearchRequestBuilder, OpenSearchIndexScan> createScanOperator =
         requestBuilder ->
             new OpenSearchIndexScan(
                 client,
                 requestBuilder.getMaxResponseSize(),
                 requestBuilder.build(indexName, getMaxResultWindow(), cursorKeepAlive));
-    return new OpenSearchIndexScanBuilder(builder, createScanOperator);
+    return new OpenSearchIndexScanBuilder(builder, createScanOperator, querySizeLimit);
   }
 
   private OpenSearchExprValueFactory createExprValueFactory() {

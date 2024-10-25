@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.optimizer.rule.MergeFilterAndFilter;
+import org.opensearch.sql.planner.optimizer.rule.MergeLimits;
 import org.opensearch.sql.planner.optimizer.rule.PushFilterUnderSort;
 import org.opensearch.sql.planner.optimizer.rule.read.CreateTableScanBuilder;
 import org.opensearch.sql.planner.optimizer.rule.read.TableScanPushDown;
@@ -46,6 +47,7 @@ public class LogicalPlanOptimizer {
              */
             new MergeFilterAndFilter(),
             new PushFilterUnderSort(),
+            new MergeLimits(),
             /*
              * Phase 2: Transformations that rely on data source push down capability
              */

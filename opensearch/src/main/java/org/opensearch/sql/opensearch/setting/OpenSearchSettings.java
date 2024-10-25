@@ -91,7 +91,7 @@ public class OpenSearchSettings extends Settings {
   public static final Setting<?> QUERY_SIZE_LIMIT_SETTING =
       Setting.intSetting(
           Key.QUERY_SIZE_LIMIT.getKeyValue(),
-          IndexSettings.MAX_RESULT_WINDOW_SETTING,
+          QUERY_SIZE_LIMIT_SETTING_DEFAULT,
           0,
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);

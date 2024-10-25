@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.opensearch.storage.scan;
 
+import static org.opensearch.sql.common.setting.Settings.QUERY_SIZE_LIMIT_SETTING_DEFAULT;
+
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -22,6 +24,7 @@ import org.opensearch.sql.opensearch.storage.script.aggregation.AggregationQuery
 import org.opensearch.sql.opensearch.storage.serialization.DefaultExpressionSerializer;
 import org.opensearch.sql.planner.logical.LogicalAggregation;
 import org.opensearch.sql.planner.logical.LogicalFilter;
+import org.opensearch.sql.planner.logical.LogicalLimit;
 import org.opensearch.sql.planner.logical.LogicalSort;
 
 /** Index scan builder for aggregate query used by {@link OpenSearchIndexScanBuilder} internally. */
@@ -40,20 +43,32 @@ class OpenSearchIndexScanAggregationBuilder implements PushDownQueryBuilder {
   /** Sorting items pushed down. */
   private List<Pair<Sort.SortOption, Expression>> sortList;
 
+  /**
+   * Aggregation response size limit
+   * Configured with QUERY_MEMORY_LIMIT_SETTING
+   */
+  private int limit;
+
   OpenSearchIndexScanAggregationBuilder(
       OpenSearchRequestBuilder requestBuilder, LogicalAggregation aggregation) {
+    this(requestBuilder, aggregation, QUERY_SIZE_LIMIT_SETTING_DEFAULT);
+  }
+
+  OpenSearchIndexScanAggregationBuilder(
+      OpenSearchRequestBuilder requestBuilder, LogicalAggregation aggregation, int querySizeLimit) {
     this.requestBuilder = requestBuilder;
     aggregatorList = aggregation.getAggregatorList();
     groupByList = aggregation.getGroupByList();
+    limit = querySizeLimit;
   }
 
   @Override
   public OpenSearchRequestBuilder build() {
     AggregationQueryBuilder builder =
-        new AggregationQueryBuilder(new DefaultExpressionSerializer());
+        new AggregationQueryBuilder(new DefaultExpressionSerializer(), limit);
     Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder =
         builder.buildAggregationBuilder(aggregatorList, groupByList, sortList);
-    requestBuilder.pushDownAggregation(aggregationBuilder);
+    requestBuilder.pushDownAggregation(aggregationBuilder, limit);
     requestBuilder.pushTypeMapping(builder.buildTypeMapping(aggregatorList, groupByList));
     return requestBuilder;
   }
@@ -71,6 +86,17 @@ class OpenSearchIndexScanAggregationBuilder implements PushDownQueryBuilder {
 
     sortList = sort.getSortList();
     return true;
+  }
+
+  @Override
+  public boolean pushDownLimit(LogicalLimit limit) {
+    this.limit = limit.getLimit();
+    // keep Limit operator, OpenSearch DSL can not pushdown limit on metrics aggregation
+    if (groupByList.isEmpty()) {
+      return false;
+    } else {
+      return true;
+    }
   }
 
   private boolean hasAggregatorInSortBy(LogicalSort sort) {

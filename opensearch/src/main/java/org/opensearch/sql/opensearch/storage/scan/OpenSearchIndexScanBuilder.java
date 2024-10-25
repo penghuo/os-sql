@@ -5,7 +5,9 @@
 
 package org.opensearch.sql.opensearch.storage.scan;
 
+import static org.opensearch.index.IndexSettings.MAX_RESULT_WINDOW_SETTING;
 import static org.opensearch.sql.analysis.NestedAnalyzer.isNestedFunction;
+import static org.opensearch.sql.common.setting.Settings.QUERY_SIZE_LIMIT_SETTING_DEFAULT;
 
 import java.util.function.Function;
 import lombok.EqualsAndHashCode;
@@ -31,6 +33,8 @@ public class OpenSearchIndexScanBuilder extends TableScanBuilder {
 
   private final Function<OpenSearchRequestBuilder, OpenSearchIndexScan> scanFactory;
 
+  private final int querySizeLimit;
+
   /** Delegated index scan builder for non-aggregate or aggregate query. */
   @EqualsAndHashCode.Include private PushDownQueryBuilder delegate;
 
@@ -41,8 +45,17 @@ public class OpenSearchIndexScanBuilder extends TableScanBuilder {
   public OpenSearchIndexScanBuilder(
       OpenSearchRequestBuilder requestBuilder,
       Function<OpenSearchRequestBuilder, OpenSearchIndexScan> scanFactory) {
+    this(requestBuilder, scanFactory, QUERY_SIZE_LIMIT_SETTING_DEFAULT);
+  }
+
+  /** Constructor used during query execution. */
+  public OpenSearchIndexScanBuilder(
+      OpenSearchRequestBuilder requestBuilder,
+      Function<OpenSearchRequestBuilder, OpenSearchIndexScan> scanFactory,
+      int querySizeLimit) {
     this.delegate = new OpenSearchIndexScanQueryBuilder(requestBuilder);
     this.scanFactory = scanFactory;
+    this.querySizeLimit = querySizeLimit;
   }
 
   /** Constructor used for unit tests. */
@@ -51,6 +64,7 @@ public class OpenSearchIndexScanBuilder extends TableScanBuilder {
       Function<OpenSearchRequestBuilder, OpenSearchIndexScan> scanFactory) {
     this.delegate = translator;
     this.scanFactory = scanFactory;
+    this.querySizeLimit = QUERY_SIZE_LIMIT_SETTING_DEFAULT;
   }
 
   @Override
@@ -71,7 +85,7 @@ public class OpenSearchIndexScanBuilder extends TableScanBuilder {
 
     // Switch to builder for aggregate query which has different push down logic
     //  for later filter, sort and limit operator.
-    delegate = new OpenSearchIndexScanAggregationBuilder(delegate.build(), aggregation);
+    delegate = new OpenSearchIndexScanAggregationBuilder(delegate.build(), aggregation, querySizeLimit);
     return true;
   }
 
@@ -90,7 +104,9 @@ public class OpenSearchIndexScanBuilder extends TableScanBuilder {
 
   @Override
   public boolean pushDownLimit(LogicalLimit limit) {
-    // Assume limit push down happening on OpenSearchIndexScanQueryBuilder
+    if (limit.getOffset() != 0) {
+      return false;
+    }
     isLimitPushedDown = true;
     return delegate.pushDownLimit(limit);
   }

@@ -52,11 +52,26 @@ import org.opensearch.sql.opensearch.response.agg.OpenSearchAggregationResponseP
 @ToString
 public class OpenSearchRequestBuilder {
 
+  public static final int UNLIMITED_FETCH_SIZE = -1;
+
   /** Search request source builder. */
   private final SearchSourceBuilder sourceBuilder;
 
-  /** Query size of the request -- how many rows will be returned. */
-  private int requestedTotalSize;
+  /**
+   * Max Result windows
+   * https://opensearch.org/docs/latest/install-and-configure/configuring-opensearch/index-settings/
+   */
+  private int maxResultWindow = 0;
+
+  /**
+   * The maximum number of documents that can be fetched from an index.
+   */
+  private int fetchDocSize = UNLIMITED_FETCH_SIZE;
+
+  /**
+   * The maximum number of aggregation buckets that can be fetched from an index.
+   */
+  private int aggregationResponseSize = 0;
 
   /** Size of each page request to return. */
   private Integer pageSize = null;
@@ -69,8 +84,8 @@ public class OpenSearchRequestBuilder {
 
   /** Constructor. */
   public OpenSearchRequestBuilder(
-      int requestedTotalSize, OpenSearchExprValueFactory exprValueFactory) {
-    this.requestedTotalSize = requestedTotalSize;
+      int maxResultWindow, OpenSearchExprValueFactory exprValueFactory) {
+    this.maxResultWindow = maxResultWindow;
     this.sourceBuilder =
         new SearchSourceBuilder()
             .from(startFrom)
@@ -86,17 +101,16 @@ public class OpenSearchRequestBuilder {
    */
   public OpenSearchRequest build(
       OpenSearchRequest.IndexName indexName, int maxResultWindow, TimeValue scrollTimeout) {
-    int size = requestedTotalSize;
     FetchSourceContext fetchSource = this.sourceBuilder.fetchSource();
     List<String> includes = fetchSource != null ? Arrays.asList(fetchSource.includes()) : List.of();
     if (pageSize == null) {
-      if (startFrom + size > maxResultWindow) {
-        sourceBuilder.size(maxResultWindow - startFrom);
+      if (fetchDocSize == UNLIMITED_FETCH_SIZE) {
+        sourceBuilder.size(maxResultWindow);
         return new OpenSearchScrollRequest(
             indexName, scrollTimeout, sourceBuilder, exprValueFactory, includes);
       } else {
         sourceBuilder.from(startFrom);
-        sourceBuilder.size(requestedTotalSize);
+        sourceBuilder.size(fetchDocSize);
         return new OpenSearchQueryRequest(indexName, sourceBuilder, exprValueFactory, includes);
       }
     } else {
@@ -142,8 +156,11 @@ public class OpenSearchRequestBuilder {
    * @param aggregationBuilder pair of aggregation query and aggregation parser.
    */
   public void pushDownAggregation(
-      Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder) {
+      Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder,
+      int aggregationResponseSize) {
     aggregationBuilder.getLeft().forEach(sourceBuilder::aggregation);
+    this.aggregationResponseSize = aggregationResponseSize;
+    fetchDocSize = 0;
     sourceBuilder.size(0);
     exprValueFactory.setParser(aggregationBuilder.getRight());
   }
@@ -164,11 +181,19 @@ public class OpenSearchRequestBuilder {
     }
   }
 
-  /** Pushdown size (limit) and from (offset) to DSL request. */
-  public void pushDownLimit(Integer limit, Integer offset) {
-    requestedTotalSize = limit;
-    startFrom = offset;
-    sourceBuilder.from(offset).size(limit);
+  /**
+   * Pushdown size (limit) and from (offset) to DSL request.
+   *
+   * Return false if Limit can not been push down.
+   */
+  public boolean pushDownLimit(Integer limit, Integer offset) {
+    // from + size should less or equal to max_result_window
+    if (limit > maxResultWindow) {
+      return false;
+    }
+    fetchDocSize = limit;
+    sourceBuilder.size(limit);
+    return true;
   }
 
   public void pushDownTrackedScore(boolean trackScores) {
@@ -271,7 +296,12 @@ public class OpenSearchRequestBuilder {
   }
 
   public int getMaxResponseSize() {
-    return pageSize == null ? requestedTotalSize : pageSize;
+    if (pageSize == null) {
+      return fetchDocSize == UNLIMITED_FETCH_SIZE ? UNLIMITED_FETCH_SIZE :
+          Integer.max(fetchDocSize, aggregationResponseSize);
+    } else {
+      return pageSize;
+    }
   }
 
   /** Initialize bool query for push down. */

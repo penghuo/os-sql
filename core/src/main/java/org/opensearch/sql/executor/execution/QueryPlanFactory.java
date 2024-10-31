@@ -116,8 +116,10 @@ public class QueryPlanFactory
         throw new UnsupportedCursorRequestException();
       }
     } else {
-      return new QueryPlan(
+      QueryPlan queryPlan = new QueryPlan(
           QueryId.queryId(), node.getPlan(), queryService, context.getLeft().get());
+      queryPlan.setRawQuery(node.getRawQuery());
+      return queryPlan;
     }
   }
 

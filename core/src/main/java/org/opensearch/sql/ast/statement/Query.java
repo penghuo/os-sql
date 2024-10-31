@@ -26,9 +26,15 @@ public class Query extends Statement {
 
   protected final UnresolvedPlan plan;
   protected final int fetchSize;
+  protected String rawQuery;
 
   @Override
   public <R, C> R accept(AbstractNodeVisitor<R, C> visitor, C context) {
     return visitor.visitQuery(this, context);
+  }
+
+  @Override
+  public String rawQuery() {
+    return rawQuery;
   }
 }

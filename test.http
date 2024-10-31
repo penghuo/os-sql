@@ -1,0 +1,61 @@
+
+@baseUrl = http://localhost:9200
+
+###
+GET {{baseUrl}}/_cat/indices
+
+###
+DELETE {{baseUrl}}/opensearch_dashboards_sample_data_ecommerce
+
+
+###
+GET {{baseUrl}}/opensearch_dashboards_sample_data_flights/_mappings
+
+###
+PUT {{baseUrl}}/people
+Content-Type: application/x-ndjson
+
+{
+  "mappings" : {
+    "properties": {
+      "age": { 
+        "type" : "integer"
+      },
+      "name": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+
+
+###
+POST {{baseUrl}}/_plugins/_sql/
+Content-Type: application/x-ndjson
+
+{
+  "query": "SELECT 10, 10+10"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql/
+Content-Type: application/x-ndjson
+
+{
+  "query": "SELECT t1.address as t1a, t2.address as t2a FROM dev.default.my_index as t1 INNER JOIN dev.default.my_index as t2 ON t1.address=t2.address LIMIT 10"
+}
+
+
+###
+POST {{baseUrl}}/_plugins/_sql/
+Content-Type: application/x-ndjson
+
+{
+  "query": "SELECT Origin, Dest FROM (SELECT * FROM opensearch_dashboards_sample_data_flights WHERE AvgTicketPrice > 100 GROUP BY Origin, Dest, AvgTicketPrice) AS flights WHERE AvgTicketPrice < 1000"
+}
+
+###
+POST {{baseUrl}}/opensearch_dashboards_sample_data_flights/_search
+Content-Type: application/x-ndjson
+
+{"from":0,"size":0,"timeout":"1m","query":{"range":{"AvgTicketPrice":{"from":100,"to":null,"include_lower":false,"include_upper":true,"boost":1.0}}},"sort":[{"_doc":{"order":"asc"}}],"aggregations":{"composite_buckets":{"composite":{"size":10000,"sources":[{"Origin":{"terms":{"field":"Origin.keyword","missing_bucket":true,"missing_order":"first","order":"asc"}}},{"Dest":{"terms":{"field":"Dest.keyword","missing_bucket":true,"missing_order":"first","order":"asc"}}},{"AvgTicketPrice":{"terms":{"field":"AvgTicketPrice","missing_bucket":true,"missing_order":"first","order":"asc"}}}]}}}}

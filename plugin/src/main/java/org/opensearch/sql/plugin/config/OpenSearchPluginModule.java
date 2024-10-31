@@ -34,6 +34,7 @@ import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.ppl.PPLService;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
+import org.opensearch.sql.spark.SparkExecutionEngine;
 import org.opensearch.sql.sql.SQLService;
 import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.StorageEngine;
@@ -58,9 +59,11 @@ public class OpenSearchPluginModule extends AbstractModule {
   }
 
   @Provides
+  @Singleton
   public ExecutionEngine executionEngine(
       OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-    return new OpenSearchExecutionEngine(client, protector, planSerializer);
+    return new SparkExecutionEngine();
+//    return new OpenSearchExecutionEngine(client, protector, planSerializer);
   }
 
   @Provides

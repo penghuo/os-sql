@@ -17,4 +17,8 @@ public abstract class Statement extends Node {
   public <R, C> R accept(AbstractNodeVisitor<R, C> visitor, C context) {
     return visitor.visitStatement(this, context);
   }
+
+  public String rawQuery() {
+    throw new UnsupportedOperationException();
+  }
 }

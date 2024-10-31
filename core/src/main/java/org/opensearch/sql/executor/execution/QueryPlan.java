@@ -9,6 +9,7 @@
 package org.opensearch.sql.executor.execution;
 
 import java.util.Optional;
+import lombok.Setter;
 import org.apache.commons.lang3.NotImplementedException;
 import org.opensearch.sql.ast.tree.Paginate;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -29,6 +30,9 @@ public class QueryPlan extends AbstractPlan {
   protected final ResponseListener<ExecutionEngine.QueryResponse> listener;
 
   protected final Optional<Integer> pageSize;
+
+  @Setter
+  protected String rawQuery;
 
   /** Constructor. */
   public QueryPlan(
@@ -62,7 +66,7 @@ public class QueryPlan extends AbstractPlan {
     if (pageSize.isPresent()) {
       queryService.execute(new Paginate(pageSize.get(), plan), listener);
     } else {
-      queryService.execute(plan, listener);
+      queryService.execute(rawQuery, listener);
     }
   }
 

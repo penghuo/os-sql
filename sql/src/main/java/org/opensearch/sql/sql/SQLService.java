@@ -5,10 +5,13 @@
 
 package org.opensearch.sql.sql;
 
+import java.util.ArrayList;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
+import org.opensearch.sql.ast.statement.Query;
 import org.opensearch.sql.ast.statement.Statement;
+import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
@@ -81,16 +84,18 @@ public class SQLService {
           explainListener.orElse(null));
     } else {
       // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
-      ParseTree cst = parser.parse(request.getQuery());
-      Statement statement =
-          cst.accept(
-              new AstStatementBuilder(
-                  new AstBuilder(request.getQuery()),
-                  AstStatementBuilder.StatementBuilderContext.builder()
-                      .isExplain(isExplainRequest)
-                      .fetchSize(request.getFetchSize())
-                      .build()));
-
+//      ParseTree cst = parser.parse(request.getQuery());
+//      Statement statement =
+//          cst.accept(
+//              new AstStatementBuilder(
+//                  new AstBuilder(request.getQuery()),
+//                  AstStatementBuilder.StatementBuilderContext.builder()
+//                      .isExplain(isExplainRequest)
+//                      .fetchSize(request.getFetchSize())
+//                      .build()));
+      // FIXME, pass raw sql query.
+      Query statement = new Query(new Project(new ArrayList<>()), 0);
+      statement.setRawQuery(request.getQuery());
       return queryExecutionFactory.create(statement, queryListener, explainListener);
     }
   }

@@ -29,6 +29,20 @@ public class QueryService {
   private final Planner planner;
 
   /**
+   * Forward SQL Query to execution engine.
+   * @param query
+   * @param listener
+   */
+  public void execute(
+      String query, ResponseListener<ExecutionEngine.QueryResponse> listener) {
+    try {
+      executionEngine.execute(query, ExecutionContext.emptyExecutionContext(), listener);
+    } catch (Exception e) {
+      listener.onFailure(e);
+    }
+  }
+
+  /**
    * Execute the {@link UnresolvedPlan}, using {@link ResponseListener} to get response.<br>
    * Todo. deprecated this interface after finalize {@link PlanContext}.
    *
@@ -38,7 +52,7 @@ public class QueryService {
   public void execute(
       UnresolvedPlan plan, ResponseListener<ExecutionEngine.QueryResponse> listener) {
     try {
-      executePlan(analyze(plan), PlanContext.emptyPlanContext(), listener);
+      executePlanInternal(plan, PlanContext.emptyPlanContext(), listener);
     } catch (Exception e) {
       listener.onFailure(e);
     }
@@ -53,6 +67,22 @@ public class QueryService {
    * @param planContext {@link PlanContext}
    * @param listener {@link ResponseListener}
    */
+  public void executePlanInternal(
+      UnresolvedPlan plan,
+      PlanContext planContext,
+      ResponseListener<ExecutionEngine.QueryResponse> listener) {
+    try {
+      planContext
+          .getSplit()
+          .ifPresentOrElse(
+              split -> executionEngine.execute(plan, new ExecutionContext(split), listener),
+              () ->
+                  executionEngine.execute(plan, ExecutionContext.emptyExecutionContext(), listener));
+    } catch (Exception e) {
+      listener.onFailure(e);
+    }
+  }
+
   public void executePlan(
       LogicalPlan plan,
       PlanContext planContext,

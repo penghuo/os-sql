@@ -1,0 +1,32 @@
+@baseUrl = http://localhost:8998
+@sessionid = 0
+@statementId = 5
+###
+GET {{baseUrl}}/sessions
+
+###
+POST {{baseUrl}}/sessions
+Content-Type: application/x-ndjson
+
+{
+  "kind": "sql",
+  "conf": {
+    "spark.master": "local[*]"
+  }
+}
+###
+GET {{baseUrl}}/sessions/{{sessionid}}/state
+
+###
+DELETE {{baseUrl}}/sessions/{{sessionid}}
+
+###
+POST {{baseUrl}}/sessions/{{sessionid}}/statements
+Content-Type: application/x-ndjson
+
+{
+    "kind": "sql",
+    "code": "SELECT 10"
+}
+###
+GET {{baseUrl}}/sessions/{{sessionid}}/statements/{{statementId}}

@@ -81,19 +81,20 @@ public class SQLQueryRequest {
    * @return true if supported.
    */
   public boolean isSupported() {
-    var noCursor = !isCursor();
-    var noQuery = query == null;
-    var noUnsupportedParams =
-        params.isEmpty() || (params.size() == 1 && params.containsKey(QUERY_PARAMS_FORMAT));
-    var noContent = jsonContent == null || jsonContent.isEmpty();
-
-    return ((!noCursor
-                && noQuery
-                && noUnsupportedParams
-                && noContent) // if cursor is given, but other things
-            || (noCursor && !noQuery)) // or if cursor is not given, but query
-        && isOnlySupportedFieldInPayload() // and request has supported fields only
-        && isSupportedFormat(); // and request is in supported format
+    return true;
+//    var noCursor = !isCursor();
+//    var noQuery = query == null;
+//    var noUnsupportedParams =
+//        params.isEmpty() || (params.size() == 1 && params.containsKey(QUERY_PARAMS_FORMAT));
+//    var noContent = jsonContent == null || jsonContent.isEmpty();
+//
+//    return ((!noCursor
+//                && noQuery
+//                && noUnsupportedParams
+//                && noContent) // if cursor is given, but other things
+//            || (noCursor && !noQuery)) // or if cursor is not given, but query
+//        && isOnlySupportedFieldInPayload() // and request has supported fields only
+//        && isSupportedFormat(); // and request is in supported format
   }
 
   private boolean isCursor() {

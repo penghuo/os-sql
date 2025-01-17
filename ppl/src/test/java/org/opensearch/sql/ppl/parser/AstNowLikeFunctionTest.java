@@ -20,17 +20,13 @@ import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.mockito.Mock;
 import org.opensearch.sql.ast.Node;
-import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 
 @RunWith(Parameterized.class)
 public class AstNowLikeFunctionTest {
 
   private final PPLSyntaxParser parser = new PPLSyntaxParser();
-
-  @Mock private Settings settings;
 
   /**
    * Set parameterized values used in test.
@@ -114,7 +110,7 @@ public class AstNowLikeFunctionTest {
   }
 
   private Node plan(String query) {
-    AstBuilder astBuilder = new AstBuilder(new AstExpressionBuilder(), settings, query);
+    AstBuilder astBuilder = new AstBuilder(query);
     return astBuilder.visit(parser.parse(query));
   }
 }

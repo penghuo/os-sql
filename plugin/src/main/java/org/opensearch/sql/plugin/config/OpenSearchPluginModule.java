@@ -11,6 +11,7 @@ import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.analysis.ExpressionAnalyzer;
+import org.opensearch.sql.calcite.CalciteRelNodeVisitor;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.executor.ExecutionEngine;
@@ -103,7 +104,9 @@ public class OpenSearchPluginModule extends AbstractModule {
         new Analyzer(
             new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
     Planner planner = new Planner(LogicalPlanOptimizer.create());
-    QueryService queryService = new QueryService(analyzer, executionEngine, planner);
+    CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor();
+    QueryService queryService =
+        new QueryService(analyzer, executionEngine, planner, relNodeVisitor, dataSourceService);
     return new QueryPlanFactory(queryService);
   }
 }

@@ -14,7 +14,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.ast.statement.Statement;
 import org.opensearch.sql.common.response.ResponseListener;
-import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.QueryManager;
@@ -23,7 +22,6 @@ import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.sql.ppl.parser.AstBuilder;
-import org.opensearch.sql.ppl.parser.AstExpressionBuilder;
 import org.opensearch.sql.ppl.parser.AstStatementBuilder;
 import org.opensearch.sql.ppl.utils.PPLQueryDataAnonymizer;
 
@@ -35,8 +33,6 @@ public class PPLService {
   private final QueryManager queryManager;
 
   private final QueryPlanFactory queryExecutionFactory;
-
-  private final Settings settings;
 
   private final PPLQueryDataAnonymizer anonymizer = new PPLQueryDataAnonymizer();
 
@@ -80,7 +76,7 @@ public class PPLService {
     Statement statement =
         cst.accept(
             new AstStatementBuilder(
-                new AstBuilder(new AstExpressionBuilder(), settings, request.getRequest()),
+                new AstBuilder(request.getRequest()),
                 AstStatementBuilder.StatementBuilderContext.builder()
                     .isExplain(request.isExplainRequest())
                     .build()));

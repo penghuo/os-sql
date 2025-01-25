@@ -17,16 +17,22 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
+import org.apache.calcite.avatica.util.Casing;
 import org.apache.calcite.jdbc.CalciteConnection;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.schema.SchemaPlus;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.parser.SqlParseException;
+import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
+import org.apache.calcite.tools.Planner;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.tools.RelRunner;
 import org.opensearch.client.node.NodeClient;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.ast.expression.DataType;
+import org.opensearch.sql.ast.tree.TableFunction;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprStringValue;
@@ -35,6 +41,7 @@ import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.pagination.Cursor;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
@@ -43,7 +50,7 @@ public class CalciteExecutionEngine implements ExecutionEngine {
   private final NodeClient client;
   private final SchemaPlus rootSchema;
   private final Connection connection;
-  private final CalciteAnalyzer analyzer;
+  private final FrameworkConfig frameworkConfig;
 
   public CalciteExecutionEngine(OpenSearchClient openSearchClient) {
     this.client = openSearchClient.getNodeClient();
@@ -65,14 +72,17 @@ public class CalciteExecutionEngine implements ExecutionEngine {
       rootSchema.add("os",
           new OpenSearchSchema(client, new ObjectMapper(), null));
 
-      FrameworkConfig frameworkConfig = AccessController.doPrivileged(
+      frameworkConfig = AccessController.doPrivileged(
           (PrivilegedAction<FrameworkConfig>)
           () -> Frameworks.newConfigBuilder()
               .defaultSchema(rootSchema.getSubSchema("os"))
+              .parserConfig(SqlParser.config()
+                  .withCaseSensitive(true)  // Enables case sensitivity
+                  .withUnquotedCasing(Casing.UNCHANGED))
               .build()
       );
-      RelBuilder builder = RelBuilder.create(frameworkConfig);
-      this.analyzer = new CalciteAnalyzer(builder);
+//      RelBuilder builder = RelBuilder.create(frameworkConfig);
+//      this.analyzer = new CalciteAnalyzer(builder);
     } catch (SQLException e) {
       throw new RuntimeException(e);
     }
@@ -86,8 +96,13 @@ public class CalciteExecutionEngine implements ExecutionEngine {
           (PrivilegedAction<Void>)
           () -> {
             try {
-              analyzer.analyze(plan, new AnalysisContext());
-              RelNode relNode = analyzer.relBuilder.build();
+//              analyzer.analyze(plan, new AnalysisContext());
+//              RelNode relNode = analyzer.relBuilder.build();
+              String query = ((TableFunction) plan).getFunctionName().getParts().get(0);
+              Planner planner = Frameworks.getPlanner(frameworkConfig);
+              SqlNode parsedQuery = planner.parse(query);
+              SqlNode validatedQuery = planner.validate(parsedQuery);
+              RelNode relNode = planner.rel(validatedQuery).rel;
               RelRunner runner = connection.unwrap(RelRunner.class);
 
               List<String> result = new ArrayList<>();
@@ -99,10 +114,10 @@ public class CalciteExecutionEngine implements ExecutionEngine {
                       ExprCoreType.STRING)));
               QueryResponse queryResponse = new QueryResponse(schema,
                   result.stream().map(s -> ExprValueUtils.tupleValue(ImmutableMap.of("_MAP", s
-                      ))).collect(Collectors.toList()), null);
+                      ))).collect(Collectors.toList()), Cursor.None);
               listener.onResponse(queryResponse);
               return null;
-            } catch (SQLException e) {
+            } catch (Exception e) {
               throw new RuntimeException(e);
             }
           }

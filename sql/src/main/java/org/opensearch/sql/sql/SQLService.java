@@ -5,10 +5,16 @@
 
 package org.opensearch.sql.sql;
 
+import com.google.common.collect.ImmutableList;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
+import org.opensearch.sql.ast.expression.DataType;
+import org.opensearch.sql.ast.expression.Literal;
+import org.opensearch.sql.ast.expression.QualifiedName;
+import org.opensearch.sql.ast.statement.Query;
 import org.opensearch.sql.ast.statement.Statement;
+import org.opensearch.sql.ast.tree.TableFunction;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
@@ -62,36 +68,41 @@ public class SQLService {
       SQLQueryRequest request,
       Optional<ResponseListener<QueryResponse>> queryListener,
       Optional<ResponseListener<ExplainResponse>> explainListener) {
-    boolean isExplainRequest = request.isExplainRequest();
-    if (request.getCursor().isPresent()) {
-      // Handle v2 cursor here -- legacy cursor was handled earlier.
-      if (isExplainRequest) {
-        throw new UnsupportedOperationException(
-            "Explain of a paged query continuation "
-                + "is not supported. Use `explain` for the initial query request.");
-      }
-      if (request.isCursorCloseRequest()) {
-        return queryExecutionFactory.createCloseCursor(
-            request.getCursor().get(), queryListener.orElse(null));
-      }
-      return queryExecutionFactory.create(
-          request.getCursor().get(),
-          isExplainRequest,
-          queryListener.orElse(null),
-          explainListener.orElse(null));
-    } else {
-      // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
-      ParseTree cst = parser.parse(request.getQuery());
-      Statement statement =
-          cst.accept(
-              new AstStatementBuilder(
-                  new AstBuilder(request.getQuery()),
-                  AstStatementBuilder.StatementBuilderContext.builder()
-                      .isExplain(isExplainRequest)
-                      .fetchSize(request.getFetchSize())
-                      .build()));
 
-      return queryExecutionFactory.create(statement, queryListener, explainListener);
-    }
+    TableFunction tableFunction =
+        new TableFunction(new QualifiedName(request.getQuery()), ImmutableList.of());
+    Query statement = new Query(tableFunction, 0);
+    return queryExecutionFactory.create(statement, queryListener, explainListener);
+//    boolean isExplainRequest = request.isExplainRequest();
+//    if (request.getCursor().isPresent()) {
+//      // Handle v2 cursor here -- legacy cursor was handled earlier.
+//      if (isExplainRequest) {
+//        throw new UnsupportedOperationException(
+//            "Explain of a paged query continuation "
+//                + "is not supported. Use `explain` for the initial query request.");
+//      }
+//      if (request.isCursorCloseRequest()) {
+//        return queryExecutionFactory.createCloseCursor(
+//            request.getCursor().get(), queryListener.orElse(null));
+//      }
+//      return queryExecutionFactory.create(
+//          request.getCursor().get(),
+//          isExplainRequest,
+//          queryListener.orElse(null),
+//          explainListener.orElse(null));
+//    } else {
+//      // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
+//      ParseTree cst = parser.parse(request.getQuery());
+//      Statement statement =
+//          cst.accept(
+//              new AstStatementBuilder(
+//                  new AstBuilder(request.getQuery()),
+//                  AstStatementBuilder.StatementBuilderContext.builder()
+//                      .isExplain(isExplainRequest)
+//                      .fetchSize(request.getFetchSize())
+//                      .build()));
+//
+//      return queryExecutionFactory.create(statement, queryListener, explainListener);
+//    }
   }
 }

@@ -1,0 +1,186 @@
+
+# nexus
+#@baseUrl = http://ec2-18-237-133-156.us-west-2.compute.amazonaws.com:9200
+@baseUrl = http://localhost:9200
+
+###
+GET {{baseUrl}}/_cat/indices
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from \"logs-181998\" LIMIT 10"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from \"logs-181998\" as dim WHERE _MAP['clientip']='13.0.0.0' LIMIT 100"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "SELECT * FROM (SELECT CAST(_MAP['clientip'] AS VARCHAR(32)) AS clientip, CAST(_MAP['size'] AS int) AS size FROM \"logs-181998\") AS logs LEFT JOIN (SELECT CAST(_MAP['clientip'] AS VARCHAR(32)) AS clientip, CAST(_MAP['request'] AS VARCHAR(32)) AS request FROM \"dimension50k\") AS dim ON logs.clientip=dim.clientip WHERE logs.clientip='13.0.0.0' ORDER BY logs.size DESC LIMIT 200"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from (select cast(_MAP['clientip'] AS varchar(32)) as clientip  from \"logs-181998\") as logs LEFT JOIN (select cast(_MAP['clientip'] AS varchar(32)) as clientip, cast(_MAP['request'] AS varchar(32)) as request from \"dimension50k\") as dim ON logs.clientip=dim.clientip where logs.clientip<>'0.0.0.0' LIMIT 100"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from (select cast(_MAP['clientip'] AS varchar(32)) as clientip, cast(_MAP['request'] AS varchar(32)) as request  from \"logs-181998\" as dim) where clientip<>'0.0.0.0' LIMIT 100"
+}
+
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from dimension50k as p1 cross join dimension50k as p2 limit 10"
+}
+
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from \"logs-181998\" WHERE _MAP['clientip']='113.100.0.0' LIMIT 10"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select _MAP['clientip'] from \"logs-181998\" limit 10"
+}
+
+###
+POST {{baseUrl}}/_plugins/_sql
+Content-Type: application/x-ndjson
+
+{
+  "query": "select * from people as p1 cross join people as p2"
+}
+
+###
+PUT {{baseUrl}}/logs-181998/_settings
+Content-Type: application/x-ndjson
+
+{
+  "index": {
+    "max_result_window": 50000
+  }
+}
+
+###
+POST {{baseUrl}}/_reindex
+Content-Type: application/x-ndjson
+
+{
+  "source": {
+    "index": "logs-181998",
+    "slice": {
+        "id": 0,
+        "max": 50
+    }
+  },
+  "dest": {
+    "index": "dimension50k"
+  }
+}'
+
+###
+DELETE {{baseUrl}}/dimension50k
+
+###
+GET {{baseUrl}}/logs-181998
+
+###
+GET {{baseUrl}}/dimension50k
+
+### 
+PUT {{baseUrl}}/dimension50k
+Content-Type: application/x-ndjson
+
+{
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "@timestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||epoch_second"
+        },
+        "clientip": {
+          "type": "ip"
+        },
+        "geoip": {
+          "properties": {
+            "city_name": {
+              "type": "keyword"
+            },
+            "country_name": {
+              "type": "keyword"
+            },
+            "location": {
+              "type": "geo_point"
+            }
+          }
+        },
+        "message": {
+          "type": "keyword",
+          "index": false,
+          "doc_values": false
+        },
+        "request": {
+          "type": "text",
+          "fields": {
+            "raw": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "size": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "integer"
+        }
+      }
+    },
+    "settings": {
+      "index": {
+        "number_of_shards": "5",
+        "number_of_replicas": "0"
+      }
+    }
+  }
+
+
+###
+PUT {{baseUrl}}/_cluster/settings
+Content-Type: application/x-ndjson
+
+{
+  "persistent": {
+    "search.max_open_scroll_context": 1000
+  }
+}

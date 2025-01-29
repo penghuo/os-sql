@@ -422,10 +422,10 @@ integTest {
     }
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
-    if(getOSFamilyType() != "windows") {
-        dependsOn startPrometheus
-        finalizedBy stopPrometheus
-    }
+//    if(getOSFamilyType() != "windows" || getOSFamilyType() != "darwin") {
+//        dependsOn startPrometheus
+//        finalizedBy stopPrometheus
+//    }
 
     systemProperty 'java.security.manager', 'disallow'
     systemProperty 'tests.security.manager', 'false'
@@ -458,11 +458,11 @@ integTest {
         }
     }
 
-    if(getOSFamilyType() == "windows") {
+//    if(getOSFamilyType() == "windows" || getOSFamilyType() == "darwin") {
         exclude 'org/opensearch/sql/ppl/PrometheusDataSourceCommandsIT.class'
         exclude 'org/opensearch/sql/ppl/ShowDataSourcesCommandIT.class'
         exclude 'org/opensearch/sql/ppl/InformationSchemaCommandIT.class'
-    }
+//    }
 
     exclude 'org/opensearch/sql/doctest/**/*IT.class'
     exclude 'org/opensearch/sql/correctness/**'

@@ -11,6 +11,10 @@ package org.opensearch.sql.executor;
 import java.util.List;
 import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
+import org.apache.calcite.jdbc.CalciteConnection;
+import org.apache.calcite.jdbc.CalciteJdbc41Factory;
+import org.apache.calcite.jdbc.CalciteSchema;
+import org.apache.calcite.jdbc.Driver;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.schema.SchemaPlus;
@@ -60,8 +64,16 @@ public class QueryService {
       UnresolvedPlan plan, ResponseListener<ExecutionEngine.QueryResponse> listener) {
     try {
       try {
-        final FrameworkConfig config = buildFrameworkConfig();
-        final CalcitePlanContext context = new CalcitePlanContext(config);
+        final CalciteSchema rootSchema =  CalciteSchema.createRootSchema(true, false);
+        final CalciteSchema opensearchSchema =
+            rootSchema.add(
+                OpenSearchSchema.OPEN_SEARCH_SCHEMA_NAME, new OpenSearchSchema(dataSourceService));
+
+        CalciteJdbc41Factory factory = new CalciteJdbc41Factory();
+        CalciteConnection connection = factory.newConnection(new Driver(), factory, "",  new java.util.Properties(), rootSchema, null);
+        final FrameworkConfig config = buildFrameworkConfig(opensearchSchema.plus());
+
+        final CalcitePlanContext context = new CalcitePlanContext(config, connection);
         executePlanByCalcite(analyze(plan, context), context, listener);
       } catch (Exception e) {
         LOG.warn("Fallback to V2 query engine since got exception", e);
@@ -134,14 +146,10 @@ public class QueryService {
     return relNodeVisitor.analyze(plan, context);
   }
 
-  private FrameworkConfig buildFrameworkConfig() {
-    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
-    final SchemaPlus opensearchSchema =
-        rootSchema.add(
-            OpenSearchSchema.OPEN_SEARCH_SCHEMA_NAME, new OpenSearchSchema(dataSourceService));
+  private FrameworkConfig buildFrameworkConfig(SchemaPlus schema) {
     return Frameworks.newConfigBuilder()
         .parserConfig(SqlParser.Config.DEFAULT) // TODO check
-        .defaultSchema(opensearchSchema)
+        .defaultSchema(schema)
         .traitDefs((List<RelTraitDef>) null)
         .programs(Programs.heuristicJoinOrder(Programs.RULE_SET, true, 2))
         .build();

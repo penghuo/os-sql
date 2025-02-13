@@ -27,6 +27,9 @@ public abstract class Settings {
     PPL_ENABLED("plugins.ppl.enabled"),
     DEFAULT_PATTERN_METHOD("plugins.ppl.default.pattern.method"),
 
+    /** Enable Calcite as execution engine */
+    CALCITE_ENGINE_ENABLED("plugins.calcite.enabled"),
+
     /** Query Settings. */
     FIELD_TYPE_TOLERANCE("plugins.query.field_type_tolerance"),
 

@@ -34,7 +34,7 @@ import org.opensearch.sql.opensearch.planner.physical.OpenSearchEvalOperator;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexRequest;
-import org.opensearch.sql.opensearch.storage.scan.CalciteOpenSearchIndexScan;
+import org.opensearch.sql.opensearch.storage.scan.CalciteLogicalTableScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexEnumerator;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScanBuilder;
@@ -95,7 +95,8 @@ public class OpenSearchIndex extends OpenSearchTable {
   @Override
   public RelNode toRel(RelOptTable.ToRelContext context, RelOptTable relOptTable) {
     final RelOptCluster cluster = context.getCluster();
-    return new CalciteOpenSearchIndexScan(cluster, relOptTable, this);
+    //        return new CalciteOpenSearchIndexScan(cluster, relOptTable, this);
+    return new CalciteLogicalTableScan(cluster, relOptTable, this);
   }
 
   @Override

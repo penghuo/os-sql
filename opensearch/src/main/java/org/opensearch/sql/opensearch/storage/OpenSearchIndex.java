@@ -70,7 +70,7 @@ public class OpenSearchIndex extends OpenSearchTable {
   /** OpenSearch client connection. */
   @Getter private final OpenSearchClient client;
 
-  private final Settings settings;
+  @Getter private final Settings settings;
 
   /** {@link OpenSearchRequest.IndexName}. */
   private final OpenSearchRequest.IndexName indexName;

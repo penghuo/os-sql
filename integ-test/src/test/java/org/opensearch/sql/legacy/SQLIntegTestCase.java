@@ -23,17 +23,20 @@ import static org.opensearch.sql.legacy.TestUtils.getEmployeeNestedTypeIndexMapp
 import static org.opensearch.sql.legacy.TestUtils.getGameOfThronesIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getGeoIpIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getGeopointIndexMapping;
+import static org.opensearch.sql.legacy.TestUtils.getHobbiesIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getJoinTypeIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getJsonTestIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getLocationIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getMappingFile;
 import static org.opensearch.sql.legacy.TestUtils.getNestedSimpleIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getNestedTypeIndexMapping;
+import static org.opensearch.sql.legacy.TestUtils.getOccupationIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getOdbcIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getOrderIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getPeople2IndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getPhraseIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
+import static org.opensearch.sql.legacy.TestUtils.getStateCountryIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getStringIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getUnexpandedObjectIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getWeblogsIndexMapping;
@@ -768,6 +771,21 @@ public abstract class SQLIntegTestCase extends OpenSearchSQLRestTestCase {
         "dates",
         getGeopointIndexMapping(),
         "src/test/resources/geopoints.json"),
+    STATE_COUNTRY(
+        TestsConstants.TEST_INDEX_STATE_COUNTRY,
+        "state_country",
+        getStateCountryIndexMapping(),
+        "src/test/resources/state_country.json"),
+    OCCUPATION(
+        TestsConstants.TEST_INDEX_OCCUPATION,
+        "occupation",
+        getOccupationIndexMapping(),
+        "src/test/resources/occupation.json"),
+    HOBBIES(
+        TestsConstants.TEST_INDEX_HOBBIES,
+        "hobbies",
+        getHobbiesIndexMapping(),
+        "src/test/resources/hobbies.json"),
     JSON_TEST(
         TestsConstants.TEST_INDEX_JSON_TEST,
         "json",

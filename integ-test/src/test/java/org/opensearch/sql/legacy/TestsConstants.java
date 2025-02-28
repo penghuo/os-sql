@@ -62,6 +62,9 @@ public class TestsConstants {
   public static final String TEST_INDEX_ALIAS = TEST_INDEX + "_alias";
   public static final String TEST_INDEX_GEOIP = TEST_INDEX + "_geoip";
   public static final String DATASOURCES = ".ql-datasources";
+  public static final String TEST_INDEX_STATE_COUNTRY = TEST_INDEX + "_state_country";
+  public static final String TEST_INDEX_OCCUPATION = TEST_INDEX + "_occupation";
+  public static final String TEST_INDEX_HOBBIES = TEST_INDEX + "_hobbies";
 
   public static final String DATE_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
   public static final String TS_DATE_FORMAT = "yyyy-MM-dd HH:mm:ss.SSS";

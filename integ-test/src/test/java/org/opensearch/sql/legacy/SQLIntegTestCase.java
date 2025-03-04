@@ -40,6 +40,8 @@ import static org.opensearch.sql.legacy.TestUtils.getStateCountryIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getStringIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getUnexpandedObjectIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.getWeblogsIndexMapping;
+import static org.opensearch.sql.legacy.TestUtils.getWorkInformationIndexMapping;
+import static org.opensearch.sql.legacy.TestUtils.getWorkerIndexMapping;
 import static org.opensearch.sql.legacy.TestUtils.isIndexExist;
 import static org.opensearch.sql.legacy.TestUtils.loadDataByRestClient;
 import static org.opensearch.sql.legacy.plugin.RestSqlAction.CURSOR_CLOSE_ENDPOINT;
@@ -786,6 +788,16 @@ public abstract class SQLIntegTestCase extends OpenSearchSQLRestTestCase {
         "hobbies",
         getHobbiesIndexMapping(),
         "src/test/resources/hobbies.json"),
+    WORKER(
+        TestsConstants.TEST_INDEX_WORKER,
+        "worker",
+        getWorkerIndexMapping(),
+        "src/test/resources/worker.json"),
+    WORK_INFORMATION(
+        TestsConstants.TEST_INDEX_WORK_INFORMATION,
+        "work_information",
+        getWorkInformationIndexMapping(),
+        "src/test/resources/work_information.json"),
     JSON_TEST(
         TestsConstants.TEST_INDEX_JSON_TEST,
         "json",

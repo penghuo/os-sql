@@ -25,6 +25,10 @@ queryStatement
    : pplCommands (PIPE commands)*
    ;
 
+subSearch
+   : searchCommand (PIPE commands)*
+   ;
+
 // commands
 pplCommands
    : searchCommand
@@ -341,6 +345,12 @@ logicalExpression
 comparisonExpression
    : left = valueExpression comparisonOperator right = valueExpression  # compareExpr
    | valueExpression IN valueList                                       # inExpr
+   | valueExpressionList NOT? IN LT_SQR_PRTHS subSearch RT_SQR_PRTHS    # inSubqueryExpr
+   ;
+
+valueExpressionList
+   : valueExpression
+   | LT_PRTHS valueExpression (COMMA valueExpression)* RT_PRTHS
    ;
 
 valueExpression
@@ -1005,6 +1015,10 @@ keywordsCanBeId
    | LAST
    | LIST
    | VALUES
+   | EARLIEST
+   | EARLIEST_TIME
+   | LATEST
+   | LATEST_TIME
    | PER_DAY
    | PER_HOUR
    | PER_MINUTE
@@ -1015,4 +1029,13 @@ keywordsCanBeId
    | DC
    | patternMethod
    | patternsMethod
+   // JOIN TYPE
+   | OUTER
+   | INNER
+   | CROSS
+   | LEFT
+   | RIGHT
+   | FULL
+   | SEMI
+   | ANTI
    ;

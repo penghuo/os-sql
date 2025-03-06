@@ -209,10 +209,15 @@ mlArg
 
 // clauses
 fromClause
-   : SOURCE EQUAL tableSourceClause
-   | INDEX EQUAL tableSourceClause
+   : SOURCE EQUAL tableOrSubqueryClause
+   | INDEX EQUAL tableOrSubqueryClause
    | SOURCE EQUAL tableFunction
    | INDEX EQUAL tableFunction
+   ;
+
+tableOrSubqueryClause
+   : LT_SQR_PRTHS subSearch RT_SQR_PRTHS (AS alias = qualifiedName)?
+   | tableSourceClause
    ;
 
 tableSourceClause
@@ -221,7 +226,7 @@ tableSourceClause
 
 // join
 joinCommand
-   : (joinType) JOIN sideAlias joinHintList? joinCriteria? right = tableSourceClause
+   : (joinType) JOIN sideAlias joinHintList? joinCriteria? right = tableOrSubqueryClause
    ;
 
 joinType

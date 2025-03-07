@@ -350,7 +350,6 @@ logicalExpression
 comparisonExpression
    : left = valueExpression comparisonOperator right = valueExpression  # compareExpr
    | valueExpression IN valueList                                       # inExpr
-   | valueExpressionList NOT? IN LT_SQR_PRTHS subSearch RT_SQR_PRTHS    # inSubqueryExpr
    ;
 
 valueExpressionList
@@ -381,7 +380,9 @@ positionFunction
    ;
 
 booleanExpression
-   : booleanFunctionCall
+   : booleanFunctionCall                                                # booleanFunctionCallExpr
+   | valueExpressionList NOT? IN LT_SQR_PRTHS subSearch RT_SQR_PRTHS    # inSubqueryExpr
+   | EXISTS LT_SQR_PRTHS subSearch RT_SQR_PRTHS                         # existsSubqueryExpr
    ;
 
 relevanceExpression
@@ -962,6 +963,8 @@ keywordsCanBeId
    | ML
    | TRENDLINE
    // commands assist keywords
+   | IN
+   | EXISTS
    | SOURCE
    | INDEX
    | DESC

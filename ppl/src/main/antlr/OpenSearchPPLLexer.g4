@@ -103,6 +103,7 @@ ANOMALY_SCORE_THRESHOLD:            'ANOMALY_SCORE_THRESHOLD';
 // COMPARISON FUNCTION KEYWORDS
 CASE:                               'CASE';
 IN:                                 'IN';
+EXISTS:                             'EXISTS';
 
 // Geo IP eval function
 GEOIP:                              'GEOIP';

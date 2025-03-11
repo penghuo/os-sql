@@ -97,6 +97,10 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
   private final String query;
 
   public AstBuilder(String query) {
+    this(query, null);
+  }
+
+  public AstBuilder(String query, Settings settings) {
     this.expressionBuilder = new AstExpressionBuilder(this);
     this.query = query;
   }
@@ -305,7 +309,7 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
     Aggregation aggregation =
         new Aggregation(
             aggListBuilder.build(),
-            Collections.emptyList(),
+            groupList,
             groupList,
             span,
             ArgumentFactory.getArgumentList(ctx));
@@ -358,11 +362,23 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
 
   /** Rare command. */
   @Override
-  public UnresolvedPlan visitRareCommand(RareCommandContext ctx) {
+  public UnresolvedPlan visitRareCommand(OpenSearchPPLParser.RareCommandContext ctx) {
     List<UnresolvedExpression> groupList =
         ctx.byClause() == null ? Collections.emptyList() : getGroupByList(ctx.byClause());
     return new RareTopN(
         CommandType.RARE,
+        ArgumentFactory.getArgumentList(ctx),
+        getFieldList(ctx.fieldList()),
+        groupList);
+  }
+
+  /** Top command. */
+  @Override
+  public UnresolvedPlan visitTopCommand(OpenSearchPPLParser.TopCommandContext ctx) {
+    List<UnresolvedExpression> groupList =
+        ctx.byClause() == null ? Collections.emptyList() : getGroupByList(ctx.byClause());
+    return new RareTopN(
+        CommandType.TOP,
         ArgumentFactory.getArgumentList(ctx),
         getFieldList(ctx.fieldList()),
         groupList);
@@ -416,18 +432,6 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
                 List.of(), // ignore partition by list for now as we haven't seen such requirement
                 List.of()), // ignore sort by list for now as we haven't seen such requirement
             alias.get()));
-  }
-
-  /** Top command. */
-  @Override
-  public UnresolvedPlan visitTopCommand(TopCommandContext ctx) {
-    List<UnresolvedExpression> groupList =
-        ctx.byClause() == null ? Collections.emptyList() : getGroupByList(ctx.byClause());
-    return new RareTopN(
-        CommandType.TOP,
-        ArgumentFactory.getArgumentList(ctx),
-        getFieldList(ctx.fieldList()),
-        groupList);
   }
 
   @Override

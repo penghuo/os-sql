@@ -18,7 +18,6 @@ import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.opensearch.sql.common.response.ResponseListener;
-import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.DefaultQueryManager;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
@@ -45,8 +44,6 @@ public class PPLServiceTest {
 
   @Mock private ExecutionEngine.Schema schema;
 
-  @Mock private Settings settings;
-
   /** Setup the test context. */
   @Before
   public void setUp() {
@@ -54,7 +51,7 @@ public class PPLServiceTest {
 
     pplService =
         new PPLService(
-            new PPLSyntaxParser(), queryManager, new QueryPlanFactory(queryService), settings);
+            new PPLSyntaxParser(), queryManager, new QueryPlanFactory(queryService), null);
   }
 
   @After

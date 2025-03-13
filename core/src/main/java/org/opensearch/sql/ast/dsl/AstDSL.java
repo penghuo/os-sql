@@ -523,8 +523,7 @@ public class AstDSL {
             new WindowFunction(
                 new Function(patternMethod.name().toLowerCase(Locale.ROOT), funArgs),
                 List.of(),
-                List.of()),
-            alias),
+                List.of())),
         input);
   }
 

@@ -7,7 +7,7 @@ package org.opensearch.sql.opensearch.util;
 
 import lombok.NonNull;
 import lombok.experimental.UtilityClass;
-import org.opensearch.client.node.NodeClient;
+import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 

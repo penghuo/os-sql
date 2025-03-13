@@ -497,7 +497,7 @@ public class Analyzer extends AbstractNodeVisitor<LogicalPlan, AnalysisContext> 
     TypeEnvironment curEnv = context.peek();
     LogicalWindow window = (LogicalWindow) child;
     curEnv.define(
-        new Symbol(Namespace.FIELD_NAME, window.getWindowFunction().getNameOrAlias()),
+        new Symbol(Namespace.FIELD_NAME, window.getWindowFunction().getName()),
         window.getWindowFunction().getDelegated().type());
 
     return child;

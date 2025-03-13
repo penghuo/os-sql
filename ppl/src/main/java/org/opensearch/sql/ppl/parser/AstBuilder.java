@@ -96,6 +96,8 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
    */
   private final String query;
 
+  private final Settings settings = null;
+
   public AstBuilder(String query) {
     this(query, null);
   }
@@ -430,8 +432,7 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
                             .toLowerCase(Locale.ROOT),
                     unresolvedArguments),
                 List.of(), // ignore partition by list for now as we haven't seen such requirement
-                List.of()), // ignore sort by list for now as we haven't seen such requirement
-            alias.get()));
+                List.of())));
   }
 
   @Override

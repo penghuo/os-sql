@@ -29,11 +29,31 @@ plugins {
     id 'info.solidsoft.pitest' version '1.9.0'
     id 'java-test-fixtures'
     id 'com.diffplug.spotless' version '6.22.0'
-
+    id 'com.gradleup.shadow'
 }
 
 repositories {
     mavenCentral()
+}
+
+shadowJar {
+    dependencies {
+        include(dependency("org.apache.calcite:calcite-core:1.38.0"))
+        include(dependency('org.apache.calcite:calcite-linq4j:1.38.0'))
+        include(dependency('org.apache.calcite.avatica:avatica-core:1.25.0'))
+        include(dependency("com.google.guava:guava:${guava_version}"))
+        include(dependency("com.google.guava:failureaccess:1.0.2"))
+        include(dependency("com.google.common:google-collect:0.5"))
+    }
+    // Set archive name and destination
+    archiveClassifier.set(null)
+    destinationDirectory.set(file("$buildDir/libs"))
+    relocate 'com.google.common', 'org.opensearch.sql.repackage.com.google.common'
+    relocate 'com.google.thirdparty', 'org.opensearch.sql.repackage.com.google.thirdparty'
+}
+
+tasks.named('shadowJar') {
+    dependsOn(':common:shadowJar')
 }
 
 pitest {
@@ -46,7 +66,7 @@ pitest {
 }
 
 dependencies {
-    api group: 'com.google.guava', name: 'guava', version: "${guava_version}"
+    implementation group: 'com.google.guava', name: 'guava', version: "${guava_version}"
     api group: 'org.apache.commons', name: 'commons-lang3', version: "${commons_lang3_version}"
     api group: 'org.apache.commons', name: 'commons-text', version: "${commons_text_version}"
     api group: 'com.facebook.presto', name: 'presto-matching', version: '0.240'
@@ -58,6 +78,11 @@ dependencies {
     api group: 'com.tdunning', name: 't-digest', version: '3.3'
     api 'org.apache.calcite:calcite-core:1.38.0'
     api 'org.apache.calcite:calcite-linq4j:1.38.0'
+    implementation 'org.apache.calcite:calcite-core:1.38.0'
+    implementation 'org.apache.calcite:calcite-linq4j:1.38.0'
+    implementation 'com.jayway.jsonpath:json-path:2.9.0'
+    implementation 'org.codehaus.janino:commons-compiler:3.1.11'
+    implementation 'org.codehaus.janino:janino:3.1.11'
     api project(':common')
     implementation "com.github.seancfoley:ipaddress:5.4.2"
 

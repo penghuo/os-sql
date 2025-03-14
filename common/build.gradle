@@ -26,15 +26,26 @@ plugins {
     id 'java-library'
     id "io.freefair.lombok"
     id 'com.diffplug.spotless' version '6.22.0'
+    id 'com.gradleup.shadow'
 }
 
 repositories {
     mavenCentral()
 }
 
+shadowJar {
+    dependencies {
+        include(dependency("com.google.guava:guava:${guava_version}"))
+    }
+    // Set archive name and destination
+    archiveClassifier.set(null)
+    destinationDirectory.set(file("$buildDir/libs"))
+    relocate 'com.google', 'org.opensearch.sql.repackage.com.google'
+}
+
 dependencies {
     api "org.antlr:antlr4-runtime:4.7.1"
-    api group: 'com.google.guava', name: 'guava', version: "${guava_version}"
+    implementation group: 'com.google.guava', name: 'guava', version: "${guava_version}"
     api group: 'org.apache.logging.log4j', name: 'log4j-core', version:"${versions.log4j}"
     api group: 'org.apache.commons', name: 'commons-lang3', version: "${commons_lang3_version}"
     api group: 'org.apache.commons', name: 'commons-text', version: "${commons_text_version}"

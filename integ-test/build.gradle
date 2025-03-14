@@ -191,7 +191,12 @@ dependencies {
     testImplementation group: 'org.hamcrest', name: 'hamcrest', version: "${hamcrest_version}"
     implementation group: 'org.apache.logging.log4j', name: 'log4j-core', version:"${versions.log4j}"
     testImplementation project(':opensearch-sql-plugin')
-    testImplementation project(':legacy')
+    testImplementation(project(':legacy')) {
+        exclude group: 'org.apache.calcite', module: 'calcite-core'
+        exclude group: 'org.apache.calcite', module: 'calcite-linq4j'
+    }
+    testCompileOnly 'org.apache.calcite:calcite-core:1.38.0'
+    testCompileOnly 'org.apache.calcite:calcite-linq4j:1.38.0'
     testImplementation('org.junit.jupiter:junit-jupiter-api:5.9.3')
     testRuntimeOnly('org.junit.jupiter:junit-jupiter-engine:5.9.3')
     testRuntimeOnly('org.junit.platform:junit-platform-launcher:1.9.3')
@@ -435,10 +440,10 @@ integTest {
     }
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
-    if(getOSFamilyType() != "windows") {
-        dependsOn startPrometheus
-        finalizedBy stopPrometheus
-    }
+//    if(getOSFamilyType() != "windows") {
+//        dependsOn startPrometheus
+//        finalizedBy stopPrometheus
+//    }
 
     // enable calcite codegen in IT
     systemProperty 'calcite.debug', 'false'

@@ -98,6 +98,7 @@ public class PPLService {
                 AstStatementBuilder.StatementBuilderContext.builder()
                     .isExplain(request.isExplainRequest())
                     .format(request.getFormat())
+                    .timezone(request.getTimezone())
                     .build()));
 
     log.info(

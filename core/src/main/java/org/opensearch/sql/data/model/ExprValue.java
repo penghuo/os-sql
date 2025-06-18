@@ -10,12 +10,14 @@ import java.io.Serializable;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.temporal.TemporalAmount;
 import java.util.List;
 import java.util.Map;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.exception.ExpressionEvaluationException;
+import org.opensearch.sql.expression.function.FunctionProperties;
 import org.opensearch.sql.storage.bindingtuple.BindingTuple;
 
 /** The definition of the Expression Value. */
@@ -123,20 +125,38 @@ public interface ExprValue extends Serializable, Comparable<ExprValue> {
         "invalid to get booleanValue from value of type " + type());
   }
 
-  /** Get timestamp value. */
-  default Instant timestampValue() {
+//  /** Get timestamp value at UTC */
+//  default Instant timestampValue() {
+//    throw new ExpressionEvaluationException(
+//        "invalid to get timestampValue from value of type " + type());
+//  }
+
+  /** Get timestamp value at timeZone */
+  default Instant timestampValue(FunctionProperties funcProps) {
     throw new ExpressionEvaluationException(
         "invalid to get timestampValue from value of type " + type());
   }
 
-  /** Get time value. */
-  default LocalTime timeValue() {
+//  /** Get time value at UTC */
+//  default LocalTime timeValue() {
+//    throw new ExpressionEvaluationException(
+//        "invalid to get timeValue from value of type " + type());
+//  }
+
+  /* Get time value at timeZone */
+  default LocalTime timeValue(FunctionProperties funcProp) {
     throw new ExpressionEvaluationException(
         "invalid to get timeValue from value of type " + type());
   }
 
-  /** Get date value. */
-  default LocalDate dateValue() {
+//  /** Get date value at UTC */
+//  default LocalDate dateValue() {
+//    throw new ExpressionEvaluationException(
+//        "invalid to get dateValue from value of type " + type());
+//  }
+
+  /** Get date value at timeZone */
+  default LocalDate dateValue(FunctionProperties funcProp) {
     throw new ExpressionEvaluationException(
         "invalid to get dateValue from value of type " + type());
   }

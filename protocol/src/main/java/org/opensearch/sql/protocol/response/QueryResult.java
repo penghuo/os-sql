@@ -5,12 +5,14 @@
 
 package org.opensearch.sql.protocol.response;
 
+import java.time.ZoneId;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import lombok.Getter;
+import org.opensearch.sql.data.model.ExprTimestampValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.executor.ExecutionEngine;
@@ -33,13 +35,16 @@ public class QueryResult implements Iterable<Object[]> {
 
   private final LangSpec langSpec;
 
+  /** Session timezone for formatting timestamp values. */
+  private final ZoneId sessionTimezone;
+
   public QueryResult(ExecutionEngine.Schema schema, Collection<ExprValue> exprValues) {
-    this(schema, exprValues, Cursor.None, LangSpec.SQL_SPEC);
+    this(schema, exprValues, Cursor.None, LangSpec.SQL_SPEC, ZoneId.systemDefault());
   }
 
   public QueryResult(
       ExecutionEngine.Schema schema, Collection<ExprValue> exprValues, Cursor cursor) {
-    this(schema, exprValues, cursor, LangSpec.SQL_SPEC);
+    this(schema, exprValues, cursor, LangSpec.SQL_SPEC, ZoneId.systemDefault());
   }
 
   public QueryResult(
@@ -47,10 +52,21 @@ public class QueryResult implements Iterable<Object[]> {
       Collection<ExprValue> exprValues,
       Cursor cursor,
       LangSpec langSpec) {
+    this(schema, exprValues, cursor, langSpec, ZoneId.systemDefault());
+  }
+
+  /** Constructor with timezone support for timestamp formatting. */
+  public QueryResult(
+      ExecutionEngine.Schema schema,
+      Collection<ExprValue> exprValues,
+      Cursor cursor,
+      LangSpec langSpec,
+      ZoneId sessionTimezone) {
     this.schema = schema;
     this.exprValues = exprValues;
     this.cursor = cursor;
     this.langSpec = langSpec;
+    this.sessionTimezone = sessionTimezone != null ? sessionTimezone : ZoneId.systemDefault();
   }
 
   /**
@@ -95,6 +111,18 @@ public class QueryResult implements Iterable<Object[]> {
   }
 
   private Object[] convertExprValuesToValues(Collection<ExprValue> exprValues) {
-    return exprValues.stream().map(ExprValue::value).toArray(Object[]::new);
+    return exprValues.stream().map(this::convertExprValueToValue).toArray(Object[]::new);
+  }
+
+  /**
+   * Convert ExprValue to display value using session timezone for timestamps. This implements the
+   * pure Instant architecture where timezone is applied only at display boundary.
+   */
+  private Object convertExprValueToValue(ExprValue exprValue) {
+    if (exprValue instanceof ExprTimestampValue) {
+      // Apply session timezone for timestamp display - key part of Instant-based architecture
+      return ((ExprTimestampValue) exprValue).value(sessionTimezone);
+    }
+    return exprValue.value();
   }
 }

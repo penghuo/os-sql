@@ -9,6 +9,7 @@ import java.io.Serializable;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import org.opensearch.sql.executor.QueryType;
@@ -27,6 +28,10 @@ public class FunctionProperties implements Serializable {
 
   public FunctionProperties(QueryType queryType) {
     this(Instant.now(), ZoneId.systemDefault(), queryType);
+  }
+
+  public FunctionProperties(ZoneId timezone, QueryType queryType) {
+    this(Instant.now(), timezone, queryType);
   }
 
   public FunctionProperties(Instant nowInstant, ZoneId currentZoneId) {
@@ -49,13 +54,21 @@ public class FunctionProperties implements Serializable {
   }
 
   /**
-   * Method to get time when query began execution. Clock class combines an instant Supplier and a
-   * time zone.
+   * Get Clock in sessionTimeZone when query began execution
    *
    * @return a fixed clock that returns the time execution started at.
    */
   public Clock getQueryStartClock() {
     return Clock.fixed(nowInstant, currentZoneId);
+  }
+
+  // TODO.
+  public Instant getQueryStartInstant() {
+    return nowInstant;
+  }
+
+  public ZoneId getSessionTimeZone() {
+    return currentZoneId;
   }
 
   /** Use when compiling functions that do not rely on function properties. */

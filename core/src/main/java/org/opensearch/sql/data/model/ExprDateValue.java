@@ -11,16 +11,19 @@ import com.google.common.base.Objects;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.TimeZone;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.exception.SemanticCheckException;
+import org.opensearch.sql.expression.function.FunctionProperties;
 
-/** Expression Date Value. */
+/** Expression Date Value in session time zone. */
 @RequiredArgsConstructor
 public class ExprDateValue extends AbstractExprValue {
 
@@ -46,19 +49,22 @@ public class ExprDateValue extends AbstractExprValue {
     return ExprCoreType.DATE;
   }
 
-  @Override
   public LocalDate dateValue() {
     return date;
   }
 
   @Override
-  public LocalTime timeValue() {
+  public LocalTime timeValue(FunctionProperties funcProp) {
     return LocalTime.of(0, 0, 0);
   }
 
+  /**
+   * Return Instant at 00:00:00 at specified timeZone.
+   * @return
+   */
   @Override
-  public Instant timestampValue() {
-    return ZonedDateTime.of(date, timeValue(), ZoneOffset.UTC).toInstant();
+  public Instant timestampValue(FunctionProperties funcProp) {
+    return ZonedDateTime.of(date, timeValue(funcProp), funcProp.getSessionTimeZone()).toInstant();
   }
 
   @Override
@@ -73,12 +79,20 @@ public class ExprDateValue extends AbstractExprValue {
 
   @Override
   public int compare(ExprValue other) {
-    return date.compareTo(other.dateValue());
+    if (other instanceof ExprDateValue) {
+      return date.compareTo(((ExprDateValue) other).dateValue());
+    } else {
+      return 1;
+    }
   }
 
   @Override
   public boolean equal(ExprValue other) {
-    return date.equals(other.dateValue());
+    if (other instanceof ExprDateValue) {
+      return date.equals(((ExprDateValue) other).dateValue());
+    } else {
+      return false;
+    }
   }
 
   @Override

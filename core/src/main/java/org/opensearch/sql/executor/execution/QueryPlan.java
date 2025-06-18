@@ -8,6 +8,7 @@
 
 package org.opensearch.sql.executor.execution;
 
+import java.time.ZoneId;
 import java.util.Optional;
 import org.apache.commons.lang3.NotImplementedException;
 import org.opensearch.sql.ast.statement.Explain;
@@ -32,6 +33,8 @@ public class QueryPlan extends AbstractPlan {
 
   protected final Optional<Integer> pageSize;
 
+  protected final Optional<ZoneId> timezone;
+
   /** Constructor. */
   public QueryPlan(
       QueryId queryId,
@@ -44,6 +47,23 @@ public class QueryPlan extends AbstractPlan {
     this.queryService = queryService;
     this.listener = listener;
     this.pageSize = Optional.empty();
+    this.timezone = Optional.empty();
+  }
+
+  /** Constructor with timezone. */
+  public QueryPlan(
+      QueryId queryId,
+      QueryType queryType,
+      UnresolvedPlan plan,
+      QueryService queryService,
+      ResponseListener<ExecutionEngine.QueryResponse> listener,
+      ZoneId timezone) {
+    super(queryId, queryType);
+    this.plan = plan;
+    this.queryService = queryService;
+    this.listener = listener;
+    this.pageSize = Optional.empty();
+    this.timezone = Optional.ofNullable(timezone);
   }
 
   /** Constructor with page size. */
@@ -59,14 +79,41 @@ public class QueryPlan extends AbstractPlan {
     this.queryService = queryService;
     this.listener = listener;
     this.pageSize = Optional.of(pageSize);
+    this.timezone = Optional.empty();
+  }
+
+  /** Constructor with page size and timezone. */
+  public QueryPlan(
+      QueryId queryId,
+      QueryType queryType,
+      UnresolvedPlan plan,
+      int pageSize,
+      QueryService queryService,
+      ResponseListener<ExecutionEngine.QueryResponse> listener,
+      ZoneId timezone) {
+    super(queryId, queryType);
+    this.plan = plan;
+    this.queryService = queryService;
+    this.listener = listener;
+    this.pageSize = Optional.of(pageSize);
+    this.timezone = Optional.ofNullable(timezone);
   }
 
   @Override
   public void execute() {
     if (pageSize.isPresent()) {
-      queryService.execute(new Paginate(pageSize.get(), plan), getQueryType(), listener);
+      if (timezone.isPresent()) {
+        queryService.execute(
+            new Paginate(pageSize.get(), plan), getQueryType(), listener, timezone.get());
+      } else {
+        queryService.execute(new Paginate(pageSize.get(), plan), getQueryType(), listener);
+      }
     } else {
-      queryService.execute(plan, getQueryType(), listener);
+      if (timezone.isPresent()) {
+        queryService.execute(plan, getQueryType(), listener, timezone.get());
+      } else {
+        queryService.execute(plan, getQueryType(), listener);
+      }
     }
   }
 

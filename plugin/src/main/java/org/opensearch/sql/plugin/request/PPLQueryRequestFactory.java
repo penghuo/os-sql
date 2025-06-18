@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.plugin.request;
 
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.Map;
 import java.util.Optional;
 import org.json.JSONException;
@@ -20,6 +22,7 @@ public class PPLQueryRequestFactory {
   private static final String PPL_FIELD_NAME = "query";
   private static final String QUERY_PARAMS_FORMAT = "format";
   private static final String QUERY_PARAMS_SANITIZE = "sanitize";
+  private static final String QUERY_PARAMS_TIMEZONE = "timezone";
   private static final String DEFAULT_RESPONSE_FORMAT = "jdbc";
   private static final String DEFAULT_EXPLAIN_FORMAT = "standard";
   private static final String QUERY_PARAMS_PRETTY = "pretty";
@@ -49,7 +52,8 @@ public class PPLQueryRequestFactory {
     if (ppl == null) {
       throw new IllegalArgumentException("Cannot find ppl parameter from the URL");
     }
-    return new PPLQueryRequest(ppl, null, restRequest.path());
+    ZoneId timezone = getTimezone(restRequest.params());
+    return new PPLQueryRequest(ppl, null, restRequest.path(), "", timezone);
   }
 
   private static PPLQueryRequest parsePPLRequestFromPayload(RestRequest restRequest) {
@@ -57,6 +61,7 @@ public class PPLQueryRequestFactory {
     JSONObject jsonContent;
     Format format = getFormat(restRequest.params(), restRequest.rawPath());
     boolean pretty = getPrettyOption(restRequest.params());
+    ZoneId timezone = getTimezone(restRequest.params());
     try {
       jsonContent = new JSONObject(content);
     } catch (JSONException e) {
@@ -67,7 +72,8 @@ public class PPLQueryRequestFactory {
             jsonContent.getString(PPL_FIELD_NAME),
             jsonContent,
             restRequest.path(),
-            format.getFormatName());
+            format.getFormatName(),
+            timezone);
     // set sanitize option if csv format
     if (format.equals(Format.CSV)) {
       pplRequest.sanitize(getSanitizeOption(restRequest.params()));
@@ -114,5 +120,43 @@ public class PPLQueryRequestFactory {
       return Boolean.parseBoolean(prettyValue);
     }
     return false;
+  }
+
+  /**
+   * Parse timezone from request parameters. Supports IANA timezone names and offset formats.
+   * Defaults to UTC if not specified or invalid.
+   *
+   * @param requestParams HTTP request parameters
+   * @return ZoneId representing the timezone, defaulting to UTC
+   */
+  private static ZoneId getTimezone(Map<String, String> requestParams) {
+    if (!requestParams.containsKey(QUERY_PARAMS_TIMEZONE)) {
+      return ZoneOffset.UTC;
+    }
+
+    String timezoneValue = requestParams.get(QUERY_PARAMS_TIMEZONE);
+    if (timezoneValue == null || timezoneValue.trim().isEmpty()) {
+      return ZoneOffset.UTC;
+    }
+
+    timezoneValue = timezoneValue.trim();
+    try {
+      // Try to parse as a valid ZoneId
+      return ZoneId.of(timezoneValue);
+    } catch (Exception e) {
+      try {
+        if (timezoneValue.startsWith("+") || timezoneValue.startsWith("-")) {
+          return ZoneOffset.of(timezoneValue);
+        }
+        return ZoneId.of(timezoneValue);
+      } catch (Exception ex) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Invalid timezone '%s'. Supported formats: IANA timezone names (e.g.,"
+                    + " 'America/Los_Angeles') or offset formats (e.g., 'UTC+8', 'Z')",
+                timezoneValue),
+            e);
+      }
+    }
   }
 }

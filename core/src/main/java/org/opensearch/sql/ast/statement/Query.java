@@ -8,6 +8,8 @@
 
 package org.opensearch.sql.ast.statement;
 
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -28,6 +30,11 @@ public class Query extends Statement {
   protected final UnresolvedPlan plan;
   protected final int fetchSize;
   private final QueryType queryType;
+  private final ZoneId timezone;
+
+  public Query(UnresolvedPlan plan, int fetchSize, QueryType queryType) {
+    this(plan, fetchSize, queryType, ZoneOffset.UTC);
+  }
 
   @Override
   public <R, C> R accept(AbstractNodeVisitor<R, C> visitor, C context) {

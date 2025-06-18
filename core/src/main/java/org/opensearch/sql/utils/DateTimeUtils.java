@@ -147,9 +147,7 @@ public class DateTimeUtils {
    * `ExprTimeValue`.
    */
   public static Instant extractTimestamp(ExprValue value, FunctionProperties functionProperties) {
-    return value instanceof ExprTimeValue
-        ? ((ExprTimeValue) value).timestampValue(functionProperties)
-        : value.timestampValue();
+    return value.timestampValue(functionProperties);
   }
 
   /**

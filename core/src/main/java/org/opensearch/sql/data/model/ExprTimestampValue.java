@@ -12,6 +12,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
@@ -20,19 +21,34 @@ import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.exception.SemanticCheckException;
+import org.opensearch.sql.expression.function.FunctionProperties;
 
-/** Expression Timestamp Value. */
+/** Expression Timestamp Value in UTC timezone */
 @RequiredArgsConstructor
 public class ExprTimestampValue extends AbstractExprValue {
 
   private final Instant timestamp;
 
-  /** Constructor. */
+  /**
+   * Construct ExprTimestamp Value with default UTC timezone.
+   *
+   * @param timestamp
+   */
   public ExprTimestampValue(String timestamp) {
+    this(timestamp, ZoneOffset.UTC);
+  }
+
+  /**
+   * Construct ExprTimestamp Value with timeZone
+   *
+   * @param timestamp timestamp
+   * @param timeZone time zone
+   */
+  public ExprTimestampValue(String timestamp, ZoneId timeZone) {
     try {
       this.timestamp =
           LocalDateTime.parse(timestamp, DATE_TIME_FORMATTER_VARIABLE_NANOS)
-              .atZone(ZoneOffset.UTC)
+              .atZone(timeZone)
               .toInstant();
     } catch (DateTimeParseException e) {
       throw new SemanticCheckException(
@@ -47,13 +63,26 @@ public class ExprTimestampValue extends AbstractExprValue {
     this.timestamp = localDateTime.atZone(ZoneOffset.UTC).toInstant();
   }
 
+  /** localDateTime Constructor with timezone awareness. */
+  public ExprTimestampValue(LocalDateTime localDateTime, ZoneId timezone) {
+    this.timestamp = localDateTime.atZone(timezone).toInstant();
+  }
+
   @Override
   public String value() {
+    return value(ZoneOffset.UTC);
+  }
+
+  /**
+   * Get string representation in specified timezone. This is where timezone formatting should be
+   * applied per user's architecture suggestion.
+   */
+  public String value(ZoneId timeZone) {
     return timestamp.getNano() == 0
         ? DATE_TIME_FORMATTER_WITHOUT_NANO
-            .withZone(ZoneOffset.UTC)
+            .withZone(timeZone)
             .format(timestamp.truncatedTo(ChronoUnit.SECONDS))
-        : DATE_TIME_FORMATTER_VARIABLE_NANOS.withZone(ZoneOffset.UTC).format(timestamp);
+        : DATE_TIME_FORMATTER_VARIABLE_NANOS.withZone(timeZone).format(timestamp);
   }
 
   @Override
@@ -61,19 +90,21 @@ public class ExprTimestampValue extends AbstractExprValue {
     return ExprCoreType.TIMESTAMP;
   }
 
-  @Override
   public Instant timestampValue() {
     return timestamp;
   }
 
+  /**
+   * Get LocalData at specified timeZone.
+   */
   @Override
-  public LocalDate dateValue() {
-    return timestamp.atZone(ZoneOffset.UTC).toLocalDate();
+  public LocalDate dateValue(FunctionProperties funcProp) {
+    return timestamp.atZone(funcProp.getSessionTimeZone()).toLocalDate();
   }
 
   @Override
-  public LocalTime timeValue() {
-    return timestamp.atZone(ZoneOffset.UTC).toLocalTime();
+  public LocalTime timeValue(FunctionProperties funcProp) {
+    return timestamp.atZone(funcProp.getSessionTimeZone()).toLocalTime();
   }
 
   @Override
@@ -88,12 +119,20 @@ public class ExprTimestampValue extends AbstractExprValue {
 
   @Override
   public int compare(ExprValue other) {
-    return timestamp.compareTo(other.timestampValue().atZone(ZoneOffset.UTC).toInstant());
+    if (other instanceof ExprTimestampValue) {
+      return timestamp.compareTo(((ExprTimestampValue) other).timestampValue());
+    } else {
+      return 1;
+    }
   }
 
   @Override
   public boolean equal(ExprValue other) {
-    return timestamp.equals(other.timestampValue().atZone(ZoneOffset.UTC).toInstant());
+    if (other instanceof ExprTimestampValue) {
+      return timestamp.equals(((ExprTimestampValue) other).timestampValue());
+    } else {
+      return false;
+    }
   }
 
   @Override

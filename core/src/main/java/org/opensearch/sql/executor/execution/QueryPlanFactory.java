@@ -117,14 +117,20 @@ public class QueryPlanFactory
             node.getPlan(),
             node.getFetchSize(),
             queryService,
-            context.getLeft());
+            context.getLeft(),
+            node.getTimezone());
       } else {
         // This should be picked up by the legacy engine.
         throw new UnsupportedCursorRequestException();
       }
     } else {
       return new QueryPlan(
-          QueryId.queryId(), node.getQueryType(), node.getPlan(), queryService, context.getLeft());
+          QueryId.queryId(),
+          node.getQueryType(),
+          node.getPlan(),
+          queryService,
+          context.getLeft(),
+          node.getTimezone());
     }
   }
 

@@ -8,6 +8,7 @@ package org.opensearch.sql.calcite;
 import static org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.TYPE_FACTORY;
 
 import java.sql.Connection;
+import java.time.ZoneId;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,13 +54,26 @@ public class CalcitePlanContext {
   @Getter public Map<String, RexLambdaRef> rexLambdaRefMap;
 
   private CalcitePlanContext(FrameworkConfig config, Integer querySizeLimit, QueryType queryType) {
+    this(config, querySizeLimit, queryType, null);
+  }
+
+  private CalcitePlanContext(
+      FrameworkConfig config, Integer querySizeLimit, QueryType queryType, ZoneId timezone) {
     this.config = config;
     this.querySizeLimit = querySizeLimit;
     this.queryType = queryType;
     this.connection = CalciteToolsHelper.connect(config, TYPE_FACTORY);
     this.relBuilder = CalciteToolsHelper.create(config, TYPE_FACTORY, connection);
     this.rexBuilder = new ExtendedRexBuilder(relBuilder.getRexBuilder());
-    this.functionProperties = new FunctionProperties(QueryType.PPL);
+    this.functionProperties =
+        timezone != null
+            ? new FunctionProperties(queryType)
+                    .getQueryStartClock()
+                    .withZone(timezone)
+                    .equals(timezone)
+                ? new FunctionProperties(queryType)
+                : new FunctionProperties(java.time.Instant.now(), timezone, queryType)
+            : new FunctionProperties(QueryType.PPL);
     this.rexLambdaRefMap = new HashMap<>();
   }
 
@@ -99,6 +113,11 @@ public class CalcitePlanContext {
   public static CalcitePlanContext create(
       FrameworkConfig config, Integer querySizeLimit, QueryType queryType) {
     return new CalcitePlanContext(config, querySizeLimit, queryType);
+  }
+
+  public static CalcitePlanContext create(
+      FrameworkConfig config, Integer querySizeLimit, QueryType queryType, ZoneId timezone) {
+    return new CalcitePlanContext(config, querySizeLimit, queryType, timezone);
   }
 
   public void putRexLambdaRefMap(Map<String, RexLambdaRef> candidateMap) {

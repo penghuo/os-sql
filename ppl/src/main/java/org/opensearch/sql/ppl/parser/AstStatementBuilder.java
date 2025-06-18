@@ -11,6 +11,7 @@ package org.opensearch.sql.ppl.parser;
 import static org.opensearch.sql.executor.QueryType.PPL;
 
 import com.google.common.collect.ImmutableList;
+import java.time.ZoneId;
 import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -33,7 +34,12 @@ public class AstStatementBuilder extends OpenSearchPPLParserBaseVisitor<Statemen
 
   @Override
   public Statement visitDmlStatement(OpenSearchPPLParser.DmlStatementContext ctx) {
-    Query query = new Query(addSelectAll(astBuilder.visit(ctx)), context.getFetchSize(), PPL);
+    Query query =
+        new Query(
+            addSelectAll(astBuilder.visit(ctx)),
+            context.getFetchSize(),
+            PPL,
+            context.getTimezone());
     if (ctx.explainStatement() != null) {
       if (ctx.explainStatement().explainMode() == null) {
         return new Explain(query, PPL);
@@ -56,6 +62,7 @@ public class AstStatementBuilder extends OpenSearchPPLParserBaseVisitor<Statemen
     private final boolean isExplain;
     private final int fetchSize;
     private final String format;
+    private final ZoneId timezone;
   }
 
   private UnresolvedPlan addSelectAll(UnresolvedPlan plan) {

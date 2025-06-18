@@ -1,0 +1,3 @@
+source=opensearch_dashboards_sample_data_logs
+| where @timestamp > date_sub(now(), INTERVAL 10 DAY)
+| stats count() by span(@timestamp, 1d)

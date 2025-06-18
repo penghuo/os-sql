@@ -10,6 +10,7 @@ import static org.opensearch.sql.utils.DateTimeFormatters.DATE_TIME_FORMATTER_VA
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -47,17 +48,29 @@ public class ExprTimeValue extends AbstractExprValue {
     return ExprCoreType.TIME;
   }
 
-  @Override
   public LocalTime timeValue() {
     return time;
   }
 
-  public LocalDate dateValue(FunctionProperties functionProperties) {
-    return LocalDate.now(functionProperties.getQueryStartClock());
+  @Override
+  public LocalTime timeValue(FunctionProperties funcProp) {
+    return time;
   }
 
-  public Instant timestampValue(FunctionProperties functionProperties) {
-    return ZonedDateTime.of(dateValue(functionProperties), timeValue(), ZoneOffset.UTC).toInstant();
+  /**
+   * Time does not include date value. Use query start date instead.
+   */
+  @Override
+  public LocalDate dateValue(FunctionProperties funcProp) {
+    return LocalDate.now(funcProp.getQueryStartClock());
+  }
+
+  /**
+   * Time does not include date value. Use query start date instead.
+   */
+  @Override
+  public Instant timestampValue(FunctionProperties funcProp) {
+    return LocalDateTime.of(dateValue(funcProp), timeValue()).atZone(funcProp.getSessionTimeZone()).toInstant();
   }
 
   @Override
@@ -72,12 +85,20 @@ public class ExprTimeValue extends AbstractExprValue {
 
   @Override
   public int compare(ExprValue other) {
-    return time.compareTo(other.timeValue());
+    if (other instanceof ExprTimeValue) {
+      return time.compareTo(((ExprTimeValue) other).timeValue());
+    } else {
+      return 1;
+    }
   }
 
   @Override
   public boolean equal(ExprValue other) {
-    return time.equals(other.timeValue());
+    if (other instanceof ExprTimeValue) {
+      return time.equals(((ExprTimeValue) other).timeValue());
+    } else {
+      return false;
+    }
   }
 
   @Override

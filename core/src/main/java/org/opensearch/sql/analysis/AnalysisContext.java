@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.analysis;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -40,9 +41,16 @@ public class AnalysisContext {
   }
 
   public AnalysisContext(TypeEnvironment environment, QueryType queryType) {
+    this(environment, queryType, null);
+  }
+
+  public AnalysisContext(TypeEnvironment environment, QueryType queryType, ZoneId timezone) {
     this.environment = environment;
     this.namedParseExpressions = new ArrayList<>();
-    this.functionProperties = new FunctionProperties(queryType);
+    this.functionProperties =
+        timezone != null
+            ? new FunctionProperties(timezone, queryType)
+            : new FunctionProperties(queryType);
   }
 
   /** Push a new environment. */

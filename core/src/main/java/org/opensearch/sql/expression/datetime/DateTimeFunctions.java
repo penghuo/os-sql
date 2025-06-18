@@ -239,8 +239,7 @@ public class DateTimeFunctions {
     return define(
         functionName,
         implWithProperties(
-            functionProperties ->
-                new ExprTimestampValue(formatNow(functionProperties.getQueryStartClock())),
+            functionProperties -> new ExprTimestampValue(functionProperties.getQueryStartInstant()),
             TIMESTAMP));
   }
 
@@ -280,7 +279,7 @@ public class DateTimeFunctions {
         functionName,
         implWithProperties(
             functionProperties ->
-                new ExprTimeValue(formatNow(functionProperties.getQueryStartClock()).toLocalTime()),
+                new ExprTimeValue(LocalTime.now(functionProperties.getQueryStartClock())),
             TIME));
   }
 
@@ -297,7 +296,7 @@ public class DateTimeFunctions {
         functionName,
         implWithProperties(
             functionProperties ->
-                new ExprDateValue(formatNow(functionProperties.getQueryStartClock()).toLocalDate()),
+                new ExprDateValue(LocalDate.now(functionProperties.getQueryStartClock())),
             DATE));
   }
 
@@ -517,9 +516,9 @@ public class DateTimeFunctions {
   private DefaultFunctionResolver day() {
     return define(
         BuiltinFunctionName.DAY.getName(),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, DATE),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, TIMESTAMP),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, STRING));
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth), INTEGER, DATE),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth), INTEGER, TIMESTAMP),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth), INTEGER, STRING));
   }
 
   /**
@@ -542,11 +541,13 @@ public class DateTimeFunctions {
             nullMissingHandlingWithProperties(
                 (functionProperties, arg) ->
                     DateTimeFunctions.dayOfMonthToday(functionProperties.getQueryStartClock())),
-            INTEGER,
-            TIME),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, DATE),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, STRING),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfMonth), INTEGER, TIMESTAMP));
+            INTEGER, TIME),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth),
+            INTEGER, DATE),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth),
+            INTEGER, STRING),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfMonth),
+            INTEGER, TIMESTAMP));
   }
 
   /**
@@ -562,9 +563,9 @@ public class DateTimeFunctions {
                     DateTimeFunctions.dayOfWeekToday(functionProperties.getQueryStartClock())),
             INTEGER,
             TIME),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfWeek), INTEGER, DATE),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfWeek), INTEGER, TIMESTAMP),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfWeek), INTEGER, STRING));
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfWeek), INTEGER, DATE),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfWeek), INTEGER, TIMESTAMP),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfWeek), INTEGER, STRING));
   }
 
   /** DAYOFYEAR(STRING/DATE/TIMESTAMP). return the day of the year for date (1-366). */
@@ -577,9 +578,9 @@ public class DateTimeFunctions {
                     DateTimeFunctions.dayOfYearToday(functionProperties.getQueryStartClock())),
             INTEGER,
             TIME),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfYear), INTEGER, DATE),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfYear), INTEGER, TIMESTAMP),
-        impl(nullMissingHandling(DateTimeFunctions::exprDayOfYear), INTEGER, STRING));
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfYear), INTEGER, DATE),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfYear), INTEGER, TIMESTAMP),
+        implWithProperties(nullMissingHandlingWithProperties(DateTimeFunctions::exprDayOfYear), INTEGER, STRING));
   }
 
   private DefaultFunctionResolver extract() {
@@ -1163,9 +1164,10 @@ public class DateTimeFunctions {
       ExprValue datetime,
       TemporalAmount interval,
       Boolean isAdd) {
-    var dt =
-        extractTimestamp(datetime, functionProperties).atZone(ZoneOffset.UTC).toLocalDateTime();
-    return new ExprTimestampValue(isAdd ? dt.plus(interval) : dt.minus(interval));
+    // Pure Instant approach: work directly with UTC instants, no timezone conversion needed
+    Instant instant = extractTimestamp(datetime, functionProperties);
+    Instant result = isAdd ? instant.plus(interval) : instant.minus(interval);
+    return new ExprTimestampValue(result);
   }
 
   /**
@@ -1214,12 +1216,13 @@ public class DateTimeFunctions {
   public static ExprValue exprDateApplyDays(
       FunctionProperties functionProperties, ExprValue datetime, Long days, Boolean isAdd) {
     if (datetime.type() == DATE) {
+      ExprDateValue dt = (ExprDateValue) datetime;
       return new ExprDateValue(
-          isAdd ? datetime.dateValue().plusDays(days) : datetime.dateValue().minusDays(days));
+          isAdd ? dt.dateValue().plusDays(days) : dt.dateValue().minusDays(days));
     }
-    var dt =
-        extractTimestamp(datetime, functionProperties).atZone(ZoneOffset.UTC).toLocalDateTime();
-    return new ExprTimestampValue(isAdd ? dt.plusDays(days) : dt.minusDays(days));
+    Instant ts = datetime.timestampValue(functionProperties);
+    Instant result = isAdd ? ts.plus(Duration.ofDays(days)) : ts.minus(Duration.ofDays(days));
+    return new ExprTimestampValue(result);
   }
 
   /**
@@ -1395,8 +1398,8 @@ public class DateTimeFunctions {
    * @param date ExprValue of Date/String/Time/Timestamp type.
    * @return ExprValue.
    */
-  public static ExprValue exprDayOfMonth(ExprValue date) {
-    return new ExprIntegerValue(date.dateValue().getDayOfMonth());
+  public static ExprValue exprDayOfMonth(FunctionProperties funcProp, ExprValue date) {
+    return new ExprIntegerValue(date.dateValue(funcProp).getDayOfMonth());
   }
 
   /**
@@ -1405,8 +1408,8 @@ public class DateTimeFunctions {
    * @param date ExprValue of Date/String/Timstamp type.
    * @return ExprValue.
    */
-  public static ExprValue exprDayOfWeek(ExprValue date) {
-    return new ExprIntegerValue((date.dateValue().getDayOfWeek().getValue() % 7) + 1);
+  public static ExprValue exprDayOfWeek(FunctionProperties funcProp, ExprValue date) {
+    return new ExprIntegerValue((date.dateValue(funcProp).getDayOfWeek().getValue() % 7) + 1);
   }
 
   /**
@@ -1415,8 +1418,8 @@ public class DateTimeFunctions {
    * @param date ExprValue of Date/String type.
    * @return ExprValue.
    */
-  public static ExprValue exprDayOfYear(ExprValue date) {
-    return new ExprIntegerValue(date.dateValue().getDayOfYear());
+  public static ExprValue exprDayOfYear(FunctionProperties funcProp, ExprValue date) {
+    return new ExprIntegerValue(date.dateValue(funcProp).getDayOfYear());
   }
 
   /**

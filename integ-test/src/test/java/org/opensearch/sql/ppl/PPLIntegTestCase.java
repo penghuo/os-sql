@@ -31,8 +31,20 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
     return jsonify(executeQueryToString(query));
   }
 
+  protected JSONObject executeQueryWithTimezone(String query, String timezone) throws IOException {
+    return jsonify(executeQueryWithTimezoneToString(query, timezone));
+  }
+
   protected String executeQueryToString(String query) throws IOException {
     Response response = client().performRequest(buildRequest(query, QUERY_API_ENDPOINT));
+    Assert.assertEquals(200, response.getStatusLine().getStatusCode());
+    return getResponseBody(response, true);
+  }
+
+  protected String executeQueryWithTimezoneToString(String query, String timezone)
+      throws IOException {
+    Response response =
+        client().performRequest(buildRequestWithTimezone(query, QUERY_API_ENDPOINT, timezone));
     Assert.assertEquals(200, response.getStatusLine().getStatusCode());
     return getResponseBody(response, true);
   }
@@ -68,6 +80,18 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
 
   protected Request buildRequest(String query, String endpoint) {
     Request request = new Request("POST", endpoint);
+    request.setJsonEntity(String.format(Locale.ROOT, "{\n" + "  \"query\": \"%s\"\n" + "}", query));
+
+    RequestOptions.Builder restOptionsBuilder = RequestOptions.DEFAULT.toBuilder();
+    restOptionsBuilder.addHeader("Content-Type", "application/json");
+    request.setOptions(restOptionsBuilder);
+    return request;
+  }
+
+  protected Request buildRequestWithTimezone(String query, String endpoint, String timezone) {
+    // Replace any '+' in the timezone with '%2B' to ensure proper URL encoding
+    String encodedTimezone = timezone.replace("+", "%2B");
+    Request request = new Request("POST", endpoint + "?timezone=" + encodedTimezone);
     request.setJsonEntity(String.format(Locale.ROOT, "{\n" + "  \"query\": \"%s\"\n" + "}", query));
 
     RequestOptions.Builder restOptionsBuilder = RequestOptions.DEFAULT.toBuilder();

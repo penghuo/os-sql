@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "mcp__github-mcp__get_issue",
+      "Bash(curl -s \"https://api.github.com/repos/opensearch-project/sql/issues/3725/comments\")",
+      "Bash(find . -name \"*.java\" -exec grep -l \"\\.timezone(\" {} \\;)",
+      "Bash(find /Users/penghuo/oss/os-sql -name \"*.java\" -exec grep -l \"\\.timezone(\" {} \\;)",
+      "Bash(grep -n \"visitQuery\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/ast/AbstractNodeVisitor.java)",
+      "Bash(./gradlew :core:test --tests \"org.opensearch.sql.analysis.AnalysisContextTest\" --console=plain)",
+      "Bash(./gradlew :core:test --tests \"org.opensearch.sql.executor.QueryServiceTest\" --console=plain)",
+      "Bash(grep -n \"execute.*(\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/executor/QueryService.java)",
+      "Bash(grep -n \"analyze(\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/executor/QueryService.java)",
+      "Bash(grep -n \"formatNow\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/expression/datetime/DateTimeFunctions.java)",
+      "Bash(grep -n -A 20 -B 5 \"ZoneOffset.UTC\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/expression/datetime/DateTimeFunctions.java)",
+      "Bash(grep -n \"ZoneOffset.UTC\" /Users/penghuo/oss/os-sql/core/src/main/java/org/opensearch/sql/expression/datetime/DateTimeFunctions.java)",
+      "Bash(./gradlew compileJava -q)",
+      "WebFetch(domain:docs.splunk.com)",
+      "WebFetch(domain:www.postgresql.org)",
+      "Bash(grep -n \"executeWithLegacy\" core/src/main/java/org/opensearch/sql/executor/QueryService.java)",
+      "Bash(./gradlew :integ-test:integTest -Dtests.class=\"*TimezoneParameterIT\")",
+      "Bash(grep -n \"getDateIndexMapping\" /Users/penghuo/oss/os-sql/integ-test/src/test/java/org/opensearch/sql/legacy/TestUtils.java)",
+      "Bash(grep -n -A 10 \"getMappingFile\" /Users/penghuo/oss/os-sql/integ-test/src/test/java/org/opensearch/sql/legacy/TestUtils.java)",
+      "Bash(grep -n -A 5 -B 5 \"date_keyword\" /Users/penghuo/oss/os-sql/integ-test/src/test/java/org/opensearch/sql/ppl/DateTimeFunctionIT.java)",
+      "Bash(grep -n -A 10 -B 5 \"verifySchema.*date_keyword\" /Users/penghuo/oss/os-sql/integ-test/src/test/java/org/opensearch/sql/ppl/DateTimeFunctionIT.java)"
+    ]
+  },
+  "enableAllProjectMcpServers": false
+}

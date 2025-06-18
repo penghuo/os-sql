@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.ppl.domain;
 
+import java.time.ZoneId;
 import java.util.Locale;
 import java.util.Optional;
 import lombok.Getter;
@@ -18,12 +19,14 @@ public class PPLQueryRequest {
 
   private static final String DEFAULT_PPL_PATH = "/_plugins/_ppl";
 
-  public static final PPLQueryRequest NULL = new PPLQueryRequest("", null, DEFAULT_PPL_PATH, "");
+  public static final PPLQueryRequest NULL =
+      new PPLQueryRequest("", null, DEFAULT_PPL_PATH, "", ZoneId.systemDefault());
 
   private final String pplQuery;
   @Getter private final JSONObject jsonContent;
   @Getter private final String path;
   @Getter private String format = "";
+  @Getter private final ZoneId timezone;
 
   @Setter
   @Getter
@@ -36,15 +39,21 @@ public class PPLQueryRequest {
   private JsonResponseFormatter.Style style = JsonResponseFormatter.Style.COMPACT;
 
   public PPLQueryRequest(String pplQuery, JSONObject jsonContent, String path) {
-    this(pplQuery, jsonContent, path, "");
+    this(pplQuery, jsonContent, path, "", ZoneId.systemDefault());
   }
 
-  /** Constructor of PPLQueryRequest. */
   public PPLQueryRequest(String pplQuery, JSONObject jsonContent, String path, String format) {
+    this(pplQuery, jsonContent, path, format, ZoneId.systemDefault());
+  }
+
+  /** Constructor of PPLQueryRequest with timezone support. */
+  public PPLQueryRequest(
+      String pplQuery, JSONObject jsonContent, String path, String format, ZoneId timezone) {
     this.pplQuery = pplQuery;
     this.jsonContent = jsonContent;
     this.path = Optional.ofNullable(path).orElse(DEFAULT_PPL_PATH);
     this.format = format;
+    this.timezone = Optional.ofNullable(timezone).orElse(ZoneId.systemDefault());
   }
 
   public String getRequest() {

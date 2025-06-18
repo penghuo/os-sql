@@ -31,6 +31,7 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.analysis.Analyzer;
+import org.opensearch.sql.analysis.TypeEnvironment;
 import org.opensearch.sql.ast.statement.Explain;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
@@ -75,16 +76,38 @@ public class QueryService {
     }
   }
 
+  /** Execute the {@link UnresolvedPlan} with timezone support. */
+  public void execute(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.QueryResponse> listener,
+      java.time.ZoneId timezone) {
+    if (shouldUseCalcite(queryType)) {
+      executeWithCalcite(plan, queryType, listener, timezone);
+    } else {
+      executeWithLegacy(plan, queryType, listener, Optional.empty(), timezone);
+    }
+  }
+
   /** Explain the {@link UnresolvedPlan}, using {@link ResponseListener} to get response.<br> */
   public void explain(
       UnresolvedPlan plan,
       QueryType queryType,
       ResponseListener<ExecutionEngine.ExplainResponse> listener,
       Explain.ExplainFormat format) {
+    explain(plan, queryType, listener, format, null);
+  }
+
+  public void explain(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.ExplainResponse> listener,
+      Explain.ExplainFormat format,
+      java.time.ZoneId timezone) {
     if (shouldUseCalcite(queryType)) {
-      explainWithCalcite(plan, queryType, listener, format);
+      explainWithCalcite(plan, queryType, listener, format, timezone);
     } else {
-      explainWithLegacy(plan, queryType, listener, format, Optional.empty());
+      explainWithLegacy(plan, queryType, listener, format, Optional.empty(), timezone);
     }
   }
 
@@ -92,6 +115,14 @@ public class QueryService {
       UnresolvedPlan plan,
       QueryType queryType,
       ResponseListener<ExecutionEngine.QueryResponse> listener) {
+    executeWithCalcite(plan, queryType, listener, null);
+  }
+
+  public void executeWithCalcite(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.QueryResponse> listener,
+      java.time.ZoneId timezone) {
     try {
       AccessController.doPrivileged(
           (PrivilegedAction<Void>)
@@ -100,7 +131,8 @@ public class QueryService {
                     CalcitePlanContext.create(
                         buildFrameworkConfig(),
                         settings.getSettingValue(Key.QUERY_SIZE_LIMIT),
-                        queryType);
+                        queryType,
+                        timezone);
                 RelNode relNode = analyze(plan, context);
                 RelNode optimized = optimize(relNode);
                 RelNode calcitePlan = convertToCalcitePlan(optimized);
@@ -110,7 +142,11 @@ public class QueryService {
     } catch (Throwable t) {
       if (isCalciteFallbackAllowed() && !(t instanceof NonFallbackCalciteException)) {
         log.warn("Fallback to V2 query engine since got exception", t);
-        executeWithLegacy(plan, queryType, listener, Optional.of(t));
+        if (timezone != null) {
+          executeWithLegacy(plan, queryType, listener, Optional.of(t), timezone);
+        } else {
+          executeWithLegacy(plan, queryType, listener, Optional.of(t));
+        }
       } else {
         if (t instanceof Error) {
           // Calcite may throw AssertError during query execution.
@@ -127,13 +163,22 @@ public class QueryService {
       QueryType queryType,
       ResponseListener<ExecutionEngine.ExplainResponse> listener,
       Explain.ExplainFormat format) {
+    explainWithCalcite(plan, queryType, listener, format, null);
+  }
+
+  public void explainWithCalcite(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.ExplainResponse> listener,
+      Explain.ExplainFormat format,
+      java.time.ZoneId timezone) {
     try {
       AccessController.doPrivileged(
           (PrivilegedAction<Void>)
               () -> {
                 CalcitePlanContext context =
                     CalcitePlanContext.create(
-                        buildFrameworkConfig(), getQuerySizeLimit(), queryType);
+                        buildFrameworkConfig(), getQuerySizeLimit(), queryType, timezone);
                 RelNode relNode = analyze(plan, context);
                 RelNode optimized = optimize(relNode);
                 RelNode calcitePlan = convertToCalcitePlan(optimized);
@@ -143,7 +188,11 @@ public class QueryService {
     } catch (Throwable t) {
       if (isCalciteFallbackAllowed()) {
         log.warn("Fallback to V2 query engine since got exception", t);
-        explainWithLegacy(plan, queryType, listener, format, Optional.of(t));
+        if (timezone != null) {
+          explainWithLegacy(plan, queryType, listener, format, Optional.of(t), timezone);
+        } else {
+          explainWithLegacy(plan, queryType, listener, format, Optional.of(t));
+        }
       } else {
         if (t instanceof Error) {
           // Calcite may throw AssertError during query execution.
@@ -174,6 +223,27 @@ public class QueryService {
     }
   }
 
+  /** Execute with Legacy engine using timezone-aware analysis. */
+  public void executeWithLegacy(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.QueryResponse> listener,
+      Optional<Throwable> calciteFailure,
+      java.time.ZoneId timezone) {
+    try {
+      executePlan(analyze(plan, queryType, timezone), PlanContext.emptyPlanContext(), listener);
+    } catch (Exception e) {
+      if (shouldUseCalcite(queryType) && isCalciteFallbackAllowed()) {
+        // if there is a failure thrown from Calcite and execution after fallback V2
+        // keeps failure, we should throw the failure from Calcite.
+        calciteFailure.ifPresentOrElse(
+            t -> listener.onFailure(new RuntimeException(t)), () -> listener.onFailure(e));
+      } else {
+        listener.onFailure(e);
+      }
+    }
+  }
+
   /**
    * Explain the query in {@link UnresolvedPlan} using {@link ResponseListener} to get and format
    * explain response.
@@ -189,12 +259,26 @@ public class QueryService {
       ResponseListener<ExecutionEngine.ExplainResponse> listener,
       Explain.ExplainFormat format,
       Optional<Throwable> calciteFailure) {
+    explainWithLegacy(plan, queryType, listener, format, calciteFailure, null);
+  }
+
+  public void explainWithLegacy(
+      UnresolvedPlan plan,
+      QueryType queryType,
+      ResponseListener<ExecutionEngine.ExplainResponse> listener,
+      Explain.ExplainFormat format,
+      Optional<Throwable> calciteFailure,
+      java.time.ZoneId timezone) {
     try {
       if (format != null && format != Explain.ExplainFormat.STANDARD) {
         throw new UnsupportedOperationException(
             "Explain mode " + format.name() + " is not supported in v2 engine");
       }
-      executionEngine.explain(plan(analyze(plan, queryType)), listener);
+      if (timezone != null) {
+        executionEngine.explain(plan(analyze(plan, queryType, timezone)), listener);
+      } else {
+        executionEngine.explain(plan(analyze(plan, queryType)), listener);
+      }
     } catch (Exception e) {
       if (shouldUseCalcite(queryType) && isCalciteFallbackAllowed()) {
         // if there is a failure thrown from Calcite and execution after fallback V2
@@ -245,6 +329,12 @@ public class QueryService {
   /** Analyze {@link UnresolvedPlan}. */
   public LogicalPlan analyze(UnresolvedPlan plan, QueryType queryType) {
     return analyzer.analyze(plan, new AnalysisContext(queryType));
+  }
+
+  /** Analyze {@link UnresolvedPlan} with timezone. */
+  public LogicalPlan analyze(UnresolvedPlan plan, QueryType queryType, java.time.ZoneId timezone) {
+    return analyzer.analyze(
+        plan, new AnalysisContext(new TypeEnvironment(null), queryType, timezone));
   }
 
   /** Translate {@link LogicalPlan} to {@link PhysicalPlan}. */

@@ -87,15 +87,20 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.tools.RelRunner;
 import org.apache.calcite.util.Holder;
 import org.apache.calcite.util.Util;
+import org.apache.calcite.util.trace.CalciteTimingTracer;
+import org.apache.calcite.util.trace.CalciteTrace;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.udf.udaf.NullableSqlAvgAggFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Calcite Tools Helper. This class is used to create customized: 1. Connection 2. JavaTypeFactory
  * 3. RelBuilder 4. RelRunner 5. CalcitePreparingStmt. TODO delete it in future if possible.
  */
 public class CalciteToolsHelper {
+  private static final Logger logger = LoggerFactory.getLogger(CalciteToolsHelper.class);
 
   /** Create a RelBuilder with testing */
   public static RelBuilder create(FrameworkConfig config) {
@@ -294,6 +299,8 @@ public class CalciteToolsHelper {
           cluster,
           resultConvention,
           convertletTable);
+
+      this.timingTracer = new CalciteTimingTracer(CalciteTrace.getStatementTracer(), "TIMER");
     }
 
     @Override

@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__github-mcp__get_issue",
+      "Bash(grep -n \"MULTI_MATCH.*FunctionName\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/expression/function/BuiltinFunctionName.java)",
+      "Bash(grep -n \"visitFilter\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/calcite/CalciteRelNodeVisitor.java)",
+      "Bash(find /Users/penghuo/oss/os-ppl -name \"*.java\" -exec grep -l \"multi_match.*json_extract\\|json_extract.*multi_match\" {} \\;)",
+      "Bash(grep -n \"shouldUseCalcite\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/executor/QueryService.java)",
+      "Bash(grep -n \"visitRelevanceFieldList\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/ast/AbstractNodeVisitor.java)",
+      "Bash(grep -n \"shouldUseCalcite(\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/executor/QueryService.java)",
+      "Bash(./gradlew :core:compileJava)",
+      "Bash(grep -A5 -B1 \"defaultValue\\|aggregateResult\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/ast/AbstractNodeVisitor.java)",
+      "Bash(./gradlew :integ-test:integTest -Dtests.class=\"*MultiMatchIT\" -Dtests.method=\"test_multi_match_with_json_extract\")",
+      "Bash(./gradlew :integ-test:stopPrometheus)",
+      "Bash(./gradlew compileJava)",
+      "Bash(./gradlew spotlessCheck)",
+      "Bash(./gradlew spotlessApply)",
+      "Bash(git checkout -- core/src/main/java/org/opensearch/sql/executor/QueryService.java integ-test/src/test/java/org/opensearch/sql/ppl/MultiMatchIT.java)",
+      "Bash(grep -n -A5 -B5 \"MULTI_MATCH\\|MATCH\\|SCORE\\|QUERY\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/expression/function/BuiltinFunctionName.java)",
+      "Bash(find /Users/penghuo/oss/os-ppl -name \"*.java\" -exec grep -l \"CalciteUnsupportedException.*Relevance\" {} \\;)",
+      "Bash(grep -n \"multi_match\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/expression/function/OpenSearchFunctions.java)",
+      "Bash(grep -n -A5 -B5 \"json_extract\\|JSON_EXTRACT\" /Users/penghuo/oss/os-ppl/core/src/main/java/org/opensearch/sql/expression/function/PPLFuncImpTable.java)",
+      "Bash(find . -type d -name \"calcite\" -o -name \"pushdown\")"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,5 @@
+# Claude User Rules
+
+# Enable all grep operations for searching code and files
+grep_allowed: true
+search_allowed: true

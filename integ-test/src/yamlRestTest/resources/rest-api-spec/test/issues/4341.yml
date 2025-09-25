@@ -1,0 +1,67 @@
+setup:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : true
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : false
+
+---
+"Test _MAP field access with fields command":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      indices.create:
+        index: test
+        body:
+          mappings:
+            properties:
+              "@timestamp":
+                type: date
+              age:
+                type: integer
+              v:
+                type: keyword
+
+  - do:
+      bulk:
+        index: test
+        refresh: true
+        body:
+          - '{"index": {"_id": 1}}'
+          - '{"@timestamp":"2025-08-19T04:53:24Z", "age":10}'
+          - '{"index": {"_id": 2}}'
+          - '{"@timestamp":"2025-08-20T04:53:24Z", "v1": "v-1"}'
+
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "search source=test | fields `_MAP['v1']`"
+
+  # Basic assertions - expecting 2 total results
+  - match: { total: 2 }
+
+  # Test that the response contains datarows
+  - is_true: datarows
+  - length: { datarows: 2 }
+
+  # Test that _MAP['v1'] field access works correctly
+  # First row should have null (no v1 field)
+  - match: { datarows.0.0: null }
+
+  # Second row should have "v-1" (has v1 field)
+  - match: { datarows.1.0: "v-1" }
+
+  # Test that the response has correct structure
+  - match: { size: 2 }

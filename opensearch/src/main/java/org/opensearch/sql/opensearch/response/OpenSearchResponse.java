@@ -128,7 +128,9 @@ public class OpenSearchResponse implements Iterable<ExprValue> {
                 addParsedHitsToBuilder(builder, hit);
                 addMetaDataFieldsToBuilder(builder, hit);
                 addHighlightsToBuilder(builder, hit);
-                return (ExprValue) ExprTupleValue.fromExprValueMap(builder.build());
+                ImmutableMap.Builder<String, ExprValue> builder2 = new ImmutableMap.Builder<>();
+                builder2.put("_MAP", ExprTupleValue.fromExprValueMap(builder.build()));
+                return (ExprValue) ExprTupleValue.fromExprValueMap(builder2.build());
               })
           .iterator();
     }

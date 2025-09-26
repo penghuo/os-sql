@@ -5,11 +5,13 @@
 
 package org.opensearch.sql.calcite.plan;
 
+import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
+import org.apache.calcite.rel.type.DynamicRecordTypeImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.schema.TranslatableTable;
 import org.apache.calcite.schema.impl.AbstractTable;
-import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 
 /**
  * Abstract class to map the {@link org.opensearch.sql.storage.Table} and {@link
@@ -20,6 +22,6 @@ public abstract class AbstractOpenSearchTable extends AbstractTable
 
   @Override
   public RelDataType getRowType(RelDataTypeFactory relDataTypeFactory) {
-    return OpenSearchTypeFactory.convertSchema(this);
+    return new DynamicRecordTypeImpl(new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT));
   }
 }

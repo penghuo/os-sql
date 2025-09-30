@@ -1,0 +1,1 @@
+./gradlew ':integ-test:yamlRestTest' --tests 'org.opensearch.sql.rest.RestHandlerClientYamlTestSuiteIT.test {yaml=issues/4341_fields/Test field access with fields command}' -Dtests.seed=2405A607975CEAAD -Dtests.security.manager=false -Dtests.locale=wo-Latn-SN -Dtests.timezone=US/Central -Druntime.java=21

@@ -17,6 +17,9 @@ import lombok.RequiredArgsConstructor;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.type.DynamicRecordTypeImpl;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.sql.calcite.plan.AbstractOpenSearchTable;
 import org.opensearch.sql.common.setting.Settings;
@@ -89,11 +92,28 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   /** The cached max result window setting of index. */
   private Integer cachedMaxResultWindow = null;
 
+  private Map<String, ExprType> schema;
+
   /** Constructor. */
   public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName) {
     this.client = client;
     this.settings = settings;
     this.indexName = new OpenSearchRequest.IndexName(indexName);
+  }
+
+  public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName,
+                         Map<String, ExprType> schema) {
+    this.client = client;
+    this.settings = settings;
+    this.indexName = new OpenSearchRequest.IndexName(indexName);
+    this.schema = schema;
+  }
+
+  @Override
+  public RelDataType getRowType(RelDataTypeFactory relDataTypeFactory) {
+    DynamicRecordTypeImpl dynamicRecordType = new DynamicRecordTypeImpl(relDataTypeFactory);
+    schema.forEach((field, type) -> dynamicRecordType.getField(field, true, false));
+    return dynamicRecordType;
   }
 
   @Override

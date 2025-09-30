@@ -22,6 +22,6 @@ public abstract class AbstractOpenSearchTable extends AbstractTable
 
   @Override
   public RelDataType getRowType(RelDataTypeFactory relDataTypeFactory) {
-    return new DynamicRecordTypeImpl(new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT));
+    return new DynamicRecordTypeImpl(relDataTypeFactory);
   }
 }

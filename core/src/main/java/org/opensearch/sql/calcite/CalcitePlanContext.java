@@ -13,9 +13,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Stack;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import lombok.Getter;
 import lombok.Setter;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCorrelVariable;
 import org.apache.calcite.rex.RexLambdaRef;
 import org.apache.calcite.rex.RexNode;
@@ -35,6 +37,8 @@ public class CalcitePlanContext {
   public final FunctionProperties functionProperties;
   public final QueryType queryType;
   public final Integer querySizeLimit;
+
+  public final AtomicReference<RelDataType> relDataType = new AtomicReference<>();
 
   /** This thread local variable is only used to skip script encoding in script pushdown. */
   public static final ThreadLocal<Boolean> skipEncoding = ThreadLocal.withInitial(() -> false);
@@ -107,5 +111,13 @@ public class CalcitePlanContext {
 
   public void putRexLambdaRefMap(Map<String, RexLambdaRef> candidateMap) {
     this.rexLambdaRefMap.putAll(candidateMap);
+  }
+
+  public void setRelDataType(RelDataType type) {
+    this.relDataType.set(type);
+  }
+
+  public RelDataType getRelDataType() {
+    return this.relDataType.get();
   }
 }

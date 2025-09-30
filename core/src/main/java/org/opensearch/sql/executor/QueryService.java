@@ -8,6 +8,7 @@ package org.opensearch.sql.executor;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import javax.annotation.Nullable;
 import lombok.AllArgsConstructor;
@@ -28,6 +29,7 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.analysis.Analyzer;
+import org.opensearch.sql.analysis.symbol.Namespace;
 import org.opensearch.sql.ast.statement.Explain;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
@@ -38,6 +40,7 @@ import org.opensearch.sql.calcite.plan.LogicalSystemLimit.SystemLimitType;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.setting.Settings.Key;
+import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.NonFallbackCalciteException;
@@ -94,9 +97,15 @@ public class QueryService {
       AccessController.doPrivileged(
           (PrivilegedAction<Void>)
               () -> {
+                //
+                AnalysisContext analysisContext = new AnalysisContext(queryType);
+                analyzer.analyze(plan, analysisContext);
+                Map<String, ExprType> schema =
+                    analysisContext.peek().lookupAllFields(Namespace.FIELD_NAME);
+
                 CalcitePlanContext context =
                     CalcitePlanContext.create(
-                        buildFrameworkConfig(), getQuerySizeLimit(), queryType);
+                        buildFrameworkConfig(schema), getQuerySizeLimit(), queryType);
                 RelNode relNode = analyze(plan, context);
                 RelNode optimized = optimize(relNode, context);
                 RelNode calcitePlan = convertToCalcitePlan(optimized);
@@ -294,6 +303,22 @@ public class QueryService {
   // Calcite is not available for SQL query now. Maybe release in 3.1.0?
   private boolean shouldUseCalcite(QueryType queryType) {
     return isCalciteEnabled(settings) && queryType == QueryType.PPL;
+  }
+
+  private FrameworkConfig buildFrameworkConfig(Map<String, ExprType> schema) {
+    // Use simple calcite schema since we don't compute tables in advance of the query.
+    final SchemaPlus rootSchema = CalciteSchema.createRootSchema(true, false).plus();
+    final SchemaPlus opensearchSchema =
+        rootSchema.add(
+            OpenSearchSchema.OPEN_SEARCH_SCHEMA_NAME, new OpenSearchSchema(dataSourceService, schema));
+    Frameworks.ConfigBuilder configBuilder =
+        Frameworks.newConfigBuilder()
+            .parserConfig(SqlParser.Config.DEFAULT) // TODO check
+            .defaultSchema(opensearchSchema)
+            .traitDefs((List<RelTraitDef>) null)
+            .programs(Programs.standard())
+            .typeSystem(OpenSearchTypeSystem.INSTANCE);
+    return configBuilder.build();
   }
 
   private FrameworkConfig buildFrameworkConfig() {

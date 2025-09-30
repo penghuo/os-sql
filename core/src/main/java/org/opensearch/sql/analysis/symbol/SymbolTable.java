@@ -14,6 +14,8 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
+import org.opensearch.sql.data.model.ExprStringValue;
+import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 
 /** Symbol table for symbol definition and resolution. */
@@ -72,6 +74,8 @@ public class SymbolTable {
     Map<String, ExprType> table = tableByNamespace.get(symbol.getNamespace());
     ExprType type = null;
     if (table != null) {
+      // Add type if absent
+      table.putIfAbsent(symbol.getName(), ExprCoreType.STRING);
       type = table.get(symbol.getName());
     }
     return Optional.ofNullable(type);

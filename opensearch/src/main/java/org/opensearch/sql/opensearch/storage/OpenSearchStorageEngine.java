@@ -7,10 +7,12 @@ package org.opensearch.sql.opensearch.storage;
 
 import static org.opensearch.sql.utils.SystemIndexUtils.isSystemIndex;
 
+import java.util.Map;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.opensearch.sql.DataSourceSchemaName;
 import org.opensearch.sql.common.setting.Settings;
+import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.storage.system.OpenSearchSystemIndex;
 import org.opensearch.sql.storage.StorageEngine;
@@ -32,5 +34,11 @@ public class OpenSearchStorageEngine implements StorageEngine {
     } else {
       return new OpenSearchIndex(client, settings, name);
     }
+  }
+
+  @Override
+  public Table getTable(DataSourceSchemaName dataSourceSchemaName, String tableName,
+                        Map<String, ExprType> schema) {
+    return new OpenSearchIndex(client, settings, tableName, schema);
   }
 }

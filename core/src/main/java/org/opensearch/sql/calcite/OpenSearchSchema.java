@@ -14,10 +14,10 @@ import org.apache.calcite.schema.impl.AbstractSchema;
 import org.opensearch.sql.DataSourceSchemaName;
 import org.opensearch.sql.analysis.DataSourceSchemaIdentifierNameResolver;
 import org.opensearch.sql.ast.expression.QualifiedName;
+import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.datasource.DataSourceService;
 
 @Getter
-@AllArgsConstructor
 public class OpenSearchSchema extends AbstractSchema {
   public static final String OPEN_SEARCH_SCHEMA_NAME = "OpenSearch";
 
@@ -33,6 +33,16 @@ public class OpenSearchSchema extends AbstractSchema {
           return super.get(key);
         }
       };
+  private Map<String, ExprType> schema;
+
+  public OpenSearchSchema(DataSourceService dataSourceService) {
+    this.dataSourceService = dataSourceService;
+  }
+
+  public OpenSearchSchema(DataSourceService dataSourceService, Map<String, ExprType> schema) {
+    this.dataSourceService = dataSourceService;
+    this.schema = schema;
+  }
 
   public void registerTable(QualifiedName qualifiedName) {
     DataSourceSchemaIdentifierNameResolver nameResolver =
@@ -44,7 +54,8 @@ public class OpenSearchSchema extends AbstractSchema {
             .getTable(
                 new DataSourceSchemaName(
                     nameResolver.getDataSourceName(), nameResolver.getSchemaName()),
-                nameResolver.getIdentifierName());
+                nameResolver.getIdentifierName(),
+                schema);
     tableMap.put(qualifiedName.toString(), (org.apache.calcite.schema.Table) table);
   }
 }

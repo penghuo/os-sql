@@ -75,7 +75,7 @@ public class SymbolTable {
     ExprType type = null;
     if (table != null) {
       // Add type if absent
-      table.putIfAbsent(symbol.getName(), ExprCoreType.STRING);
+      store(symbol, ExprCoreType.STRING);
       type = table.get(symbol.getName());
     }
     return Optional.ofNullable(type);

@@ -29,6 +29,7 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.analysis.Analyzer;
+import org.opensearch.sql.analysis.TypeEnvironment;
 import org.opensearch.sql.analysis.symbol.Namespace;
 import org.opensearch.sql.ast.statement.Explain;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -100,8 +101,11 @@ public class QueryService {
                 //
                 AnalysisContext analysisContext = new AnalysisContext(queryType);
                 analyzer.analyze(plan, analysisContext);
-                Map<String, ExprType> schema =
-                    analysisContext.peek().lookupAllFields(Namespace.FIELD_NAME);
+                TypeEnvironment top = analysisContext.peek();
+                while (top.getParent() !=null && top.getParent().getParent() != null) {
+                  top = top.getParent();
+                }
+                Map<String, ExprType> schema = top.lookupAllFields(Namespace.FIELD_NAME);
 
                 CalcitePlanContext context =
                     CalcitePlanContext.create(

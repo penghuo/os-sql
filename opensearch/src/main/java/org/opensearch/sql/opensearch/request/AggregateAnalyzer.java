@@ -42,6 +42,7 @@ import java.util.Map;
 import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.Project;
@@ -330,9 +331,13 @@ public class AggregateAnalyzer {
   }
 
   private static List<RexNode> convertAggArgThroughProject(AggregateCall aggCall, Project project) {
-    return project == null
-        ? List.of()
-        : aggCall.getArgList().stream().map(project.getProjects()::get).toList();
+    if (project == null) {
+      return List.of();
+    }
+    return aggCall.getArgList().stream()
+        .map(project.getProjects()::get)
+        .map(node -> resolveProjectExpression(node, project.getInput()))
+        .toList();
   }
 
   private static Pair<AggregationBuilder, MetricParser> createAggregationBuilderAndParser(
@@ -533,7 +538,7 @@ public class AggregateAnalyzer {
 
   private static ValuesSourceAggregationBuilder<?> createBucket(
       Integer groupIndex, Project project, AggregateBuilderHelper helper) {
-    RexNode rex = project.getProjects().get(groupIndex);
+    RexNode rex = resolveProjectExpression(project, groupIndex);
     String bucketName = project.getRowType().getFieldList().get(groupIndex).getName();
     if (rex instanceof RexCall rexCall
         && rexCall.getKind() == SqlKind.OTHER_FUNCTION
@@ -554,7 +559,7 @@ public class AggregateAnalyzer {
 
   private static CompositeValuesSourceBuilder<?> createCompositeBucket(
       Integer groupIndex, Project project, AggregateAnalyzer.AggregateBuilderHelper helper) {
-    RexNode rex = project.getProjects().get(groupIndex);
+    RexNode rex = resolveProjectExpression(project, groupIndex);
     String bucketName = project.getRowType().getFieldList().get(groupIndex).getName();
     if (rex instanceof RexCall rexCall
         && rexCall.getKind() == SqlKind.OTHER_FUNCTION
@@ -577,6 +582,29 @@ public class AggregateAnalyzer {
     } else {
       return createTermsSourceBuilder(bucketName, rex, helper);
     }
+  }
+
+  private static RexNode resolveProjectExpression(Project project, int index) {
+    if (project == null) {
+      return null;
+    }
+    RexNode node = project.getProjects().get(index);
+    return resolveProjectExpression(node, project.getInput());
+  }
+
+  private static RexNode resolveProjectExpression(RexNode node, RelNode input) {
+    RexNode current = node;
+    RelNode currentInput = input;
+    while (current instanceof RexInputRef ref && currentInput instanceof Project innerProject) {
+      int refIndex = ref.getIndex();
+      List<RexNode> innerProjects = innerProject.getProjects();
+      if (refIndex < 0 || refIndex >= innerProjects.size()) {
+        break;
+      }
+      current = innerProjects.get(refIndex);
+      currentInput = innerProject.getInput();
+    }
+    return current;
   }
 
   private static CompositeValuesSourceBuilder<?> createTermsSourceBuilder(

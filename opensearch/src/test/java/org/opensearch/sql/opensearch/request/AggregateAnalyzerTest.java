@@ -574,6 +574,68 @@ class AggregateAnalyzerTest {
         .verify();
   }
 
+  @Test
+  void analyze_handlesNestedProjectWithRexExtractExpression()
+      throws ExpressionNotAnalyzableException {
+    String tableName = "test";
+    SchemaPlus root = Frameworks.createRootSchema(true);
+    root.add(
+        tableName,
+        new AbstractTable() {
+          @Override
+          public RelDataType getRowType(RelDataTypeFactory tf) {
+            return rowType;
+          }
+        });
+
+    RelBuilder relBuilder =
+        RelBuilder.create(Frameworks.newConfigBuilder().defaultSchema(root).build());
+
+    relBuilder.scan(tableName);
+
+    RexNode rexExtractCall =
+        relBuilder.call(
+            PPLBuiltinOperators.REX_EXTRACT,
+            relBuilder.field("b"),
+            relBuilder.literal("(?<HttpRequest>.+?)"),
+            relBuilder.literal(1));
+
+    relBuilder.project(
+        ImmutableList.of(
+            relBuilder.field("a"),
+            relBuilder.alias(rexExtractCall, "HttpRequest"),
+            relBuilder.field("b")),
+        ImmutableList.of("a", "HttpRequest", "b"));
+
+    // Mimic CalciteRelNodeVisitor#projectPlusOverriding introducing nested projects.
+    relBuilder.project(
+        ImmutableList.of(relBuilder.field("a"), relBuilder.field("HttpRequest")),
+        ImmutableList.of("a", "HttpRequest"));
+
+    relBuilder.aggregate(
+        relBuilder.groupKey(relBuilder.field("HttpRequest")),
+        relBuilder.count(false, "count", relBuilder.field("HttpRequest")));
+
+    RelNode rel = relBuilder.build();
+    Aggregate aggregate = (Aggregate) rel;
+    Project project = (Project) aggregate.getInput();
+
+    Hook.CURRENT_TIME.addThread((Consumer<Holder<Long>>) h -> h.set(0L));
+
+    Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> result =
+        AggregateAnalyzer.analyze(
+            aggregate,
+            project,
+            rowType,
+            fieldTypes,
+            aggregate.getRowType().getFieldNames(),
+            aggregate.getCluster());
+
+    String dsl = result.getLeft().toString();
+    assertTrue(dsl.contains("script"));
+    assertTrue(dsl.contains("HttpRequest"));
+  }
+
   private Aggregate createMockAggregate(List<AggregateCall> calls, ImmutableBitSet groups) {
     Aggregate agg = mock(Aggregate.class);
     when(agg.getGroupSet()).thenReturn(groups);

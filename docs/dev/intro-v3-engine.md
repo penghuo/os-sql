@@ -30,8 +30,6 @@ In the initial release of the V3 engine (3.0.0), the main new features focus on 
 * **[Lookup](../user/ppl/cmd/lookup.rst) Command**
 * **[Subquery](../user/ppl/cmd/subquery.rst) Command**
 
-V3 (Calcite integration) engine is enabled by default in 3.3.0.
-
 ---
 ## 3.What are Changed
 

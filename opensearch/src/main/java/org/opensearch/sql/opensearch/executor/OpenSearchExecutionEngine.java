@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
@@ -49,8 +50,10 @@ import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
+import org.opensearch.sql.opensearch.executor.protector.ResourceMonitorPlan;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
+import org.opensearch.sql.monitor.ResourceMonitor;
 import org.opensearch.sql.opensearch.util.JdbcOpenSearchDataTypeConvertor;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
@@ -63,14 +66,17 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
 
   private final ExecutionProtector executionProtector;
   private final PlanSerializer planSerializer;
+  private final ResourceMonitor resourceMonitor;
 
   public OpenSearchExecutionEngine(
       OpenSearchClient client,
       ExecutionProtector executionProtector,
-      PlanSerializer planSerializer) {
+      PlanSerializer planSerializer,
+      ResourceMonitor resourceMonitor) {
     this.client = client;
     this.executionProtector = executionProtector;
     this.planSerializer = planSerializer;
+    this.resourceMonitor = resourceMonitor;
     registerOpenSearchFunctions();
   }
 
@@ -198,25 +204,58 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   @Override
   public void execute(
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
+    try {
+      ensureMemoryHealthy(new AtomicBoolean(false));
+    } catch (IllegalStateException e) {
+      listener.onFailure(e);
+      return;
+    }
     client.schedule(
-        () ->
+        () -> {
+          try {
             AccessController.doPrivileged(
                 (PrivilegedAction<Void>)
                     () -> {
+                      AtomicBoolean memoryAbort = new AtomicBoolean(false);
+                      Thread watchdog = null;
+                      Thread executionThread = Thread.currentThread();
                       try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
-                        ResultSet result = statement.executeQuery();
-                        buildResultSet(result, rel.getRowType(), context.querySizeLimit, listener);
+                        watchdog = startCalciteWatchdog(statement, executionThread, memoryAbort);
+                        try (ResultSet result = statement.executeQuery()) {
+                          buildResultSet(
+                              result,
+                              rel.getRowType(),
+                              context.querySizeLimit,
+                              memoryAbort,
+                              listener);
+                        }
                       } catch (SQLException e) {
+                        if (memoryAbort.get()) {
+                          throw new IllegalStateException(
+                              "insufficient resources to run the query, quit.", e);
+                        }
                         throw new RuntimeException(e);
+                      } finally {
+                        if (watchdog != null) {
+                          memoryAbort.set(true);
+                          watchdog.interrupt();
+                        }
                       }
                       return null;
-                    }));
+                    });
+          } catch (IllegalStateException e) {
+            listener.onFailure(e);
+          } catch (RuntimeException e) {
+            listener.onFailure(e);
+          }
+        });
   }
 
   private void buildResultSet(
       ResultSet resultSet,
       RelDataType rowTypes,
       Integer querySizeLimit,
+      AtomicBoolean memoryAbort,
       ResponseListener<QueryResponse> listener)
       throws SQLException {
     // Get the ResultSet metadata to know about columns
@@ -225,8 +264,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     List<RelDataType> fieldTypes =
         rowTypes.getFieldList().stream().map(RelDataTypeField::getType).toList();
     List<ExprValue> values = new ArrayList<>();
+    long rowCount = 0L;
     // Iterate through the ResultSet
     while (resultSet.next() && (querySizeLimit == null || values.size() < querySizeLimit)) {
+      ensureMemoryHealthy(memoryAbort);
       Map<String, ExprValue> row = new LinkedHashMap<String, ExprValue>();
       // Loop through each column
       for (int i = 1; i <= columnCount; i++) {
@@ -239,6 +280,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
         row.put(columnName, exprValue);
       }
       values.add(ExprTupleValue.fromExprValueMap(row));
+      rowCount++;
+      if (rowCount % ResourceMonitorPlan.NUMBER_OF_NEXT_CALL_TO_CHECK == 0) {
+        ensureMemoryHealthy(memoryAbort);
+      }
     }
 
     List<Column> columns = new ArrayList<>(metaData.getColumnCount());
@@ -264,6 +309,54 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     Schema schema = new Schema(columns);
     QueryResponse response = new QueryResponse(schema, values, null);
     listener.onResponse(response);
+  }
+
+  private Thread startCalciteWatchdog(
+      PreparedStatement statement, Thread executionThread, AtomicBoolean memoryAbort) {
+    Thread watchdog =
+        new Thread(
+            () -> {
+              while (!memoryAbort.get() && !Thread.currentThread().isInterrupted()) {
+                try {
+                  ensureMemoryHealthy(memoryAbort);
+                } catch (IllegalStateException e) {
+                  logger.warn("Calcite query canceled due to memory pressure");
+                  try {
+                    statement.cancel();
+                  } catch (SQLException ex) {
+                    logger.debug("Failed to cancel statement after memory trigger", ex);
+                  }
+                  try {
+                    executionThread.stop(e);
+                  } catch (Throwable stopError) {
+                    logger.debug("Failed to stop execution thread gracefully", stopError);
+                  }
+                  break;
+                }
+                try {
+                  Thread.sleep(100);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  break;
+                }
+              }
+            },
+            "calcite-memory-watchdog");
+    watchdog.setDaemon(true);
+    watchdog.start();
+    return watchdog;
+  }
+
+  private void ensureMemoryHealthy(AtomicBoolean memoryAbort) {
+    try {
+      if (!resourceMonitor.isHealthy()) {
+        memoryAbort.set(true);
+        throw new IllegalStateException("insufficient resources to run the query, quit.");
+      }
+    } catch (RuntimeException e) {
+      memoryAbort.set(true);
+      throw new IllegalStateException("insufficient resources to run the query, quit.", e);
+    }
   }
 
   /** Registers opensearch-dependent functions */

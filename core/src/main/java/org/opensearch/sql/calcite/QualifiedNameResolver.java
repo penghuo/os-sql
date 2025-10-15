@@ -249,7 +249,7 @@ public class QualifiedNameResolver {
     if (length == parts.size() - start) {
       return field;
     } else {
-      String itemName = joinParts(parts, length + start, parts.size() - 1 - length);
+      String itemName = joinParts(parts, length + start, parts.size() - length);
       return createItemAccess(field, itemName, context);
     }
   }

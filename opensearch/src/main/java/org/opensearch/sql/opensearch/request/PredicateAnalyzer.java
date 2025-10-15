@@ -361,6 +361,7 @@ public class PredicateAnalyzer {
             case CAST -> toCastExpression(call);
             case CONTAINS -> binary(call);
             case LIKE -> like(call);
+            case ITEM -> item(call);
             default -> {
               String message = format(Locale.ROOT, "Unsupported call: [%s]", call);
               throw new PredicateAnalyzerException(message);
@@ -713,6 +714,56 @@ public class PredicateAnalyzer {
           return CompoundQueryExpression.or(queryExpressions.toArray(new QueryExpression[0]));
         }
       }
+    }
+
+    /**
+     * Handle ITEM(map, key) calls by converting them to a NamedFieldExpression of the form
+     * 'prefix.key' if the left operand resolves to a NamedFieldExpression (e.g., nested ITEM),
+     * otherwise simply 'key'. Only push down if the resulting field exists in index mapping
+     * (fieldTypes).
+     */
+    private TerminalExpression item(RexCall call) {
+      // Expect two operands: ITEM(container, key)
+      if (call.getOperands().size() != 2) {
+        String message = format(Locale.ROOT, "Unsupported ITEM call arity: [%s]", call);
+        throw new PredicateAnalyzerException(message);
+      }
+
+      // Evaluate left for possible nested ITEM chains
+      Expression left = call.getOperands().get(0).accept(this);
+
+      // Right must be a string literal key
+      RexNode rightNode = call.getOperands().get(1);
+      if (!(rightNode instanceof RexLiteral)) {
+        String message = format(Locale.ROOT, "Unsupported ITEM key (must be literal): [%s]", call);
+        throw new PredicateAnalyzerException(message);
+      }
+      RexLiteral keyLiteral = (RexLiteral) rightNode;
+      if (!SqlTypeName.CHAR_TYPES.contains(keyLiteral.getType().getSqlTypeName())) {
+        String message =
+            format(Locale.ROOT, "Unsupported ITEM key type (must be string): [%s]", call);
+        throw new PredicateAnalyzerException(message);
+      }
+      String key = RexLiteral.stringValue(keyLiteral);
+
+      String prefix = null;
+      if (left instanceof NamedFieldExpression named) {
+        String root = named.getRootName();
+        // Ignore Calcite synthetic root map field name "_MAP" if present
+        if (root != null && !"_MAP".equals(root)) {
+          prefix = root;
+        }
+      }
+
+      String fieldName = (prefix == null || prefix.isEmpty()) ? key : prefix + "." + key;
+      ExprType exprType = fieldTypes.get(fieldName);
+      if (exprType == null) {
+        // Field not in mapping; don't push down
+        String message = format(Locale.ROOT, "ITEM references unmapped field: [%s]", fieldName);
+        throw new PredicateAnalyzerException(message);
+      }
+
+      return new NamedFieldExpression(fieldName, exprType);
     }
 
     private boolean containIsEmptyFunction(RexCall call) {

@@ -51,6 +51,7 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.commons.lang3.tuple.Pair;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
@@ -151,11 +152,21 @@ public class AggregateAnalyzer {
     }
 
     <T> T build(RexNode node, Function<String, T> fieldBuilder, Function<Script, T> scriptBuilder) {
-      if (node == null) return fieldBuilder.apply(METADATA_FIELD);
-      else if (node instanceof RexInputRef ref) {
+      if (node == null) {
+        return fieldBuilder.apply(METADATA_FIELD);
+      } else if (node instanceof RexInputRef ref) {
         return fieldBuilder.apply(
             new NamedFieldExpression(ref.getIndex(), rowType.getFieldNames(), fieldTypes)
                 .getReferenceForTermQuery());
+      } else if (node instanceof RexCall call && call.getKind() == SqlKind.ITEM) {
+        String field = resolveItemFieldName(call);
+        if (field != null && fieldTypes.containsKey(field)) {
+          return fieldBuilder.apply(
+              new NamedFieldExpression(field, fieldTypes.get(field)).getReferenceForTermQuery());
+        }
+        return scriptBuilder.apply(
+            (new PredicateAnalyzer.ScriptQueryExpression(node, rowType, fieldTypes, cluster))
+                .getScript());
       } else if (node instanceof RexCall || node instanceof RexLiteral) {
         return scriptBuilder.apply(
             (new PredicateAnalyzer.ScriptQueryExpression(node, rowType, fieldTypes, cluster))
@@ -168,6 +179,11 @@ public class AggregateAnalyzer {
     NamedFieldExpression inferNamedField(RexNode node) {
       if (node instanceof RexInputRef ref) {
         return new NamedFieldExpression(ref.getIndex(), rowType.getFieldNames(), fieldTypes);
+      } else if (node instanceof RexCall call && call.getKind() == SqlKind.ITEM) {
+        String field = resolveItemFieldName(call);
+        if (field != null && fieldTypes.containsKey(field)) {
+          return new NamedFieldExpression(field, fieldTypes.get(field));
+        }
       }
       throw new IllegalStateException(
           String.format("Cannot infer field name from RexNode %s", node));
@@ -179,6 +195,47 @@ public class AggregateAnalyzer {
       }
       throw new IllegalStateException(String.format("Cannot infer value from RexNode %s", node));
     }
+  }
+
+  /** Recursively resolve ITEM(...) chains to a dotted field path. */
+  private static String resolveItemFieldName(RexCall itemCall) {
+    if (itemCall.getKind() != SqlKind.ITEM || itemCall.getOperands().size() != 2) {
+      return null;
+    }
+    RexNode left = itemCall.getOperands().get(0);
+    RexNode right = itemCall.getOperands().get(1);
+    String key;
+    if (right instanceof RexLiteral lit) {
+      if (!SqlTypeName.CHAR_TYPES.contains(lit.getType().getSqlTypeName())) {
+        return null;
+      }
+      try {
+        key = lit.getValueAs(String.class);
+      } catch (Exception e) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+
+    String prefix = null;
+    if (left instanceof RexInputRef) {
+      // In Calcite for OpenSearch, the root map column is often '_MAP'. Ignore it.
+      // We can't derive the actual root from input ref; ITEM with only one level becomes the key.
+      prefix = null;
+    } else if (left instanceof RexCall nested && nested.getKind() == SqlKind.ITEM) {
+      prefix = resolveItemFieldName(nested);
+    } else if (left instanceof RexLiteral litLeft) {
+      // not supported
+      return null;
+    } else {
+      return null;
+    }
+
+    if (prefix == null || prefix.isEmpty() || "_MAP".equals(prefix)) {
+      return key;
+    }
+    return prefix + "." + key;
   }
 
   // TODO: should we support filter aggregation? For PPL, we don't have filter in stats command

@@ -123,10 +123,9 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
       RelDataType rowType = filter.getRowType();
       CalciteLogicalIndexScan newScan = this.copyWithNewSchema(filter.getRowType());
       List<String> schema = this.getRowType().getFieldNames();
-      Map<String, ExprType> fieldTypes =
-          this.osIndex.getAllFieldTypes().entrySet().stream()
-              .filter(entry -> schema.contains(entry.getKey()))
-              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      // Use all field types to support filters referencing fields via ITEM($0, 'field')
+      // where the field may not be present in the current schema (which can be just _MAP).
+      Map<String, ExprType> fieldTypes = this.osIndex.getAllFieldTypes();
       QueryExpression queryExpression =
           PredicateAnalyzer.analyzeExpression(
               filter.getCondition(), schema, fieldTypes, rowType, getCluster());
@@ -285,24 +284,37 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
               aggregate.getRowType(),
               // Aggregation will eliminate all collations.
               pushDownContext.cloneWithoutSort());
-      List<String> schema = this.getRowType().getFieldNames();
-      Map<String, ExprType> fieldTypes =
-          this.osIndex.getAllFieldTypes().entrySet().stream()
-              .filter(entry -> schema.contains(entry.getKey()))
-              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      // Use all field types instead of restricting to current schema (which may be only _MAP)
+      // so that ITEM($0, 'v') can resolve and be pushed down for aggregations.
+      Map<String, ExprType> fieldTypes = this.osIndex.getAllFieldTypes();
       List<String> outputFields = aggregate.getRowType().getFieldNames();
       final Pair<List<AggregationBuilder>, OpenSearchAggregationResponseParser> aggregationBuilder =
           AggregateAnalyzer.analyze(
               aggregate, project, getRowType(), fieldTypes, outputFields, getCluster());
+      Map<String, OpenSearchDataType> flatMapping =
+          OpenSearchDataType.traverseAndFlatten(osIndex.getFieldOpenSearchTypes());
+      int groupCount = aggregate.getGroupSet().cardinality();
       Map<String, OpenSearchDataType> extendedTypeMapping =
-          aggregate.getRowType().getFieldList().stream()
-              .collect(
-                  Collectors.toMap(
-                      RelDataTypeField::getName,
-                      field ->
-                          OpenSearchDataType.of(
-                              OpenSearchTypeFactory.convertRelDataTypeToExprType(
-                                  field.getType()))));
+          aggregate.getRowType().getFieldList().subList(0, groupCount).stream()
+              .map(
+                  field -> {
+                    String outName = field.getName();
+                    var exprType =
+                        OpenSearchTypeFactory.convertRelDataTypeToExprType(field.getType());
+                    if (exprType == ExprCoreType.UNDEFINED) {
+                      String key = outName.startsWith("_MAP.") ? outName.substring(5) : outName;
+                      OpenSearchDataType osType = flatMapping.get(key);
+                      if (osType != null) {
+                        return Map.entry(outName, osType);
+                      }
+                      // Skip adding UNDEFINED mapping to allow parse by content
+                      return null;
+                    }
+                    // Skip non-bucket or well-typed core fields; parser can infer by content
+                    return null;
+                  })
+              .filter(Objects::nonNull)
+              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
       AggPushDownAction action =
           new AggPushDownAction(
               aggregationBuilder,

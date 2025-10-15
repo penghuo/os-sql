@@ -14,23 +14,19 @@ teardown:
             plugins.calcite.enabled : false
 
 ---
-"Test _MAP field access with fields command":
+"Test _MAP.v access, filter, and stats":
   - skip:
       features:
         - headers
-        - allowed_warnings
   - do:
       indices.create:
         index: test
         body:
           mappings:
+            dynamic: false
             properties:
-              "@timestamp":
-                type: date
-              age:
-                type: integer
               v:
-                type: keyword
+                type: integer
 
   - do:
       bulk:
@@ -38,30 +34,48 @@ teardown:
         refresh: true
         body:
           - '{"index": {"_id": 1}}'
-          - '{"@timestamp":"2025-08-19T04:53:24Z", "age":10}'
+          - '{"v": 1, "a": "1"}'
           - '{"index": {"_id": 2}}'
-          - '{"@timestamp":"2025-08-20T04:53:24Z", "v1": "v-1"}'
+          - '{"v": 2, "b": "2"}'
+          - '{"index": {"_id": 3}}'
+          - '{"v": 3, "c": "3"}'
 
+  # Test-1: fields _MAP.v
   - do:
       headers:
         Content-Type: 'application/json'
       ppl:
         body:
-          query: "search source=test | fields `_MAP['v1']`"
+          query: "source=test | sort v | fields _MAP.v"
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+  - match: { datarows.0.0: 1 }
+  - match: { datarows.1.0: 2 }
+  - match: { datarows.2.0: 3 }
 
-  # Basic assertions - expecting 2 total results
-  - match: { total: 2 }
+  # Test-2: where _MAP.v=1
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "source=test | where _MAP.v=1 | fields _MAP.v"
+  - match: { total: 1 }
+  - length: { datarows: 1 }
+  - match: { datarows.0.0: 1 }
 
-  # Test that the response contains datarows
-  - is_true: datarows
-  - length: { datarows: 2 }
-
-  # Test that _MAP['v1'] field access works correctly
-  # First row should have null (no v1 field)
-  - match: { datarows.0.0: null }
-
-  # Second row should have "v-1" (has v1 field)
-  - match: { datarows.1.0: "v-1" }
-
-  # Test that the response has correct structure
-  - match: { size: 2 }
+  # Test-3: stats count by _MAP.v
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "source=test | stats count by _MAP.v | sort _MAP.v"
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+  - match: { datarows.0.0: 1 }
+  - match: { datarows.0.1: 1 }
+  - match: { datarows.1.0: 2 }
+  - match: { datarows.1.1: 1 }
+  - match: { datarows.2.0: 3 }
+  - match: { datarows.2.1: 1 }

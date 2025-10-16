@@ -1,0 +1,70 @@
+setup:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : true
+
+  - do:
+      indices.create:
+        index: log00001
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              v:
+                type: text
+
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - '{"index": {"_index": "log00001", "_id": 1}}'
+          - '{"v": "value=1000"}'
+          - '{"index": {"_index": "log00001", "_id": 2}}'
+          - '{"v": "value=2000"}'
+          - '{"index": {"_index": "log00001", "_id": 3}}'
+          - '{"v": "value=3000"}'
+          - '{"index": {"_index": "log00001", "_id": 4}}'
+          - '{"v": "value=4000"}'
+          - '{"index": {"_index": "log00001", "_id": 5}}'
+          - '{"v": "value=string"}'
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : false
+  - do:
+      indices.delete:
+        index: log00001
+        ignore_unavailable: true
+
+---
+"Rex numeric captures participate in arithmetic":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=log00001 | rex field=v 'value=(?<digits>\\d*)' | eval multi = digits * 10 | sort multi | fields v, multi
+  - match: {"total": 5}
+  - match: {"schema": [{"name": "v", "type": "string"}, {"name": "multi", "type": "int"}]}
+  - match: {"datarows": [["value=string", null], ["value=1000", 10000], ["value=2000", 20000], ["value=3000", 30000], ["value=4000", 40000]]}
+
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=log00001 | rex field=v 'value=(?<digits>\\d*)' | stats sum(digits) as total
+  - match: {"total": 1}
+  - match: {"schema": [{"name": "total", "type": "bigint"}]}
+  - match: {"datarows": [[10000]]}

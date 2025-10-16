@@ -9,11 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.when;
 import static org.opensearch.sql.data.type.ExprCoreType.ARRAY;
+import static org.opensearch.sql.data.type.ExprCoreType.BOOLEAN;
+import static org.opensearch.sql.data.type.ExprCoreType.INTEGER;
 import static org.opensearch.sql.data.type.ExprCoreType.STRING;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.util.Collections;
+import java.util.Map;
 import org.junit.jupiter.api.DisplayNameGeneration;
 import org.junit.jupiter.api.DisplayNameGenerator;
 import org.junit.jupiter.api.Test;
@@ -65,6 +68,8 @@ class DefaultFunctionResolverTest {
     when(functionSignature.match(notMatchFS)).thenReturn(WideningTypeRule.IMPOSSIBLE_WIDENING);
     when(notMatchFS.formatTypes()).thenReturn("[INTEGER,INTEGER]");
     when(functionSignature.formatTypes()).thenReturn("[BOOLEAN,BOOLEAN]");
+    when(notMatchFS.getParamTypeList()).thenReturn(ImmutableList.of(INTEGER, INTEGER));
+    when(functionSignature.getParamTypeList()).thenReturn(ImmutableList.of(BOOLEAN, BOOLEAN));
     DefaultFunctionResolver resolver =
         new DefaultFunctionResolver(functionName, ImmutableMap.of(notMatchFS, notMatchBuilder));
 
@@ -124,5 +129,17 @@ class DefaultFunctionResolverTest {
         assertThrows(
             ExpressionEvaluationException.class, () -> resolver.resolve(functionSignature));
     assertEquals("concat function expected 1-9 arguments, but got 10", exception.getMessage());
+  }
+
+  @Test
+  void resolve_function_signature_castable_string_to_integer() {
+    FunctionSignature intSignature = new FunctionSignature(functionName, ImmutableList.of(INTEGER));
+    FunctionBuilder builder = (fp, args) -> null;
+    DefaultFunctionResolver resolver =
+        new DefaultFunctionResolver(functionName, Map.of(intSignature, builder));
+
+    FunctionSignature unresolved = new FunctionSignature(functionName, ImmutableList.of(STRING));
+
+    assertEquals(builder, resolver.resolve(unresolved).getValue());
   }
 }

@@ -6,8 +6,10 @@
 package org.opensearch.sql.expression.function;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import javax.annotation.Nullable;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
@@ -16,7 +18,20 @@ import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.data.type.WideningTypeRule;
 import org.opensearch.sql.exception.ExpressionEvaluationException;
 
-public class CoercionUtils {
+public final class CoercionUtils {
+
+  private static final EnumSet<ExprCoreType> NUMERIC_TYPES =
+      EnumSet.of(
+          ExprCoreType.BYTE,
+          ExprCoreType.SHORT,
+          ExprCoreType.INTEGER,
+          ExprCoreType.LONG,
+          ExprCoreType.FLOAT,
+          ExprCoreType.DOUBLE);
+
+  private CoercionUtils() {
+    throw new AssertionError("Utility class should not be instantiated");
+  }
 
   /**
    * Casts the arguments to the types specified in the typeChecker. Returns null if no combination
@@ -90,11 +105,29 @@ public class CoercionUtils {
     if (!argType.shouldCast(targetType)) {
       return arg;
     }
+    if (requiresSafeCast(argType, targetType)) {
+      RelDataType nullableTarget =
+          OpenSearchTypeFactory.convertExprTypeToRelDataType(targetType, true);
+      return builder.makeCast(nullableTarget, arg, true, true);
+    }
 
     if (WideningTypeRule.distance(argType, targetType) != WideningTypeRule.IMPOSSIBLE_WIDENING) {
       return builder.makeCast(OpenSearchTypeFactory.convertExprTypeToRelDataType(targetType), arg);
     }
     return null;
+  }
+
+  private static boolean requiresSafeCast(ExprType sourceType, ExprType targetType) {
+    if (!(targetType instanceof ExprCoreType targetCoreType)) {
+      return false;
+    }
+    if (!NUMERIC_TYPES.contains(targetCoreType)) {
+      return false;
+    }
+    if (sourceType instanceof ExprCoreType sourceCoreType) {
+      return sourceCoreType == ExprCoreType.STRING || sourceCoreType == ExprCoreType.UNKNOWN;
+    }
+    return false;
   }
 
   /**

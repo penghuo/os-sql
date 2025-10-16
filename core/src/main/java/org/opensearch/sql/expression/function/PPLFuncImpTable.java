@@ -273,6 +273,8 @@ import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.calcite.utils.PlanUtils;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
+import org.opensearch.sql.data.type.ExprCoreType;
+import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.exception.ExpressionEvaluationException;
 import org.opensearch.sql.executor.QueryType;
 
@@ -428,12 +430,53 @@ public class PPLFuncImpTable {
       List<RexNode> argList,
       CalcitePlanContext context) {
     var implementation = getImplementation(functionName);
+    CalciteFuncSignature signature = implementation.getKey();
+
+    RexNode coercedField = coerceAggField(signature, field, argList, context);
 
     // Validation is done based on original argument types to generate error from user perspective.
-    validateFunctionArgs(implementation, functionName, field, argList);
+    validateFunctionArgs(implementation, functionName, coercedField, argList);
 
     var handler = implementation.getValue();
-    return handler.apply(distinct, field, argList, context);
+    return handler.apply(distinct, coercedField, argList, context);
+  }
+
+  private RexNode coerceAggField(
+      CalciteFuncSignature signature,
+      RexNode field,
+      List<RexNode> argList,
+      CalcitePlanContext context) {
+    if (field == null || !argList.isEmpty() || signature.typeChecker() == null) {
+      return field;
+    }
+    if (signature.typeChecker() == null
+        || !expectsNumericInput(signature.typeChecker().getParameterTypes())) {
+      return field;
+    }
+
+    List<RexNode> casted =
+        CoercionUtils.castArguments(context.rexBuilder, signature.typeChecker(), List.of(field));
+    if (casted != null && !casted.isEmpty()) {
+      return casted.getFirst();
+    }
+
+    return field;
+  }
+
+  private boolean expectsNumericInput(List<List<ExprType>> parameterTypes) {
+    if (parameterTypes == null) {
+      return false;
+    }
+    return parameterTypes.stream()
+        .filter(types -> !types.isEmpty())
+        .anyMatch(types -> isNumericType(types.getFirst()));
+  }
+
+  private boolean isNumericType(ExprType type) {
+    if (type instanceof ExprCoreType exprCoreType) {
+      return ExprCoreType.numberTypes().contains(exprCoreType);
+    }
+    return false;
   }
 
   static void validateFunctionArgs(

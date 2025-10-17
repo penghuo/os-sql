@@ -25,16 +25,16 @@ public enum ExprCoreType implements ExprType {
    */
   UNDEFINED,
 
+  /** String. */
+  STRING(UNDEFINED),
+
   /** Numbers. */
   BYTE(UNDEFINED),
   SHORT(BYTE),
   INTEGER(SHORT),
   LONG(INTEGER),
   FLOAT(LONG),
-  DOUBLE(FLOAT),
-
-  /** String. */
-  STRING(UNDEFINED),
+  DOUBLE(FLOAT, STRING),
 
   /** Boolean. */
   BOOLEAN(STRING),

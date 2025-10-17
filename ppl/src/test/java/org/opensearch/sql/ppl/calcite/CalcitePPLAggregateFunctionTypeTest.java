@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.ppl.calcite;
 
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.test.CalciteAssert;
 import org.junit.Test;
 
@@ -16,39 +17,37 @@ public class CalcitePPLAggregateFunctionTypeTest extends CalcitePPLAbstractTest 
 
   @Test
   public void testAvgWithWrongArgType() {
-    verifyQueryThrowsException(
-        "source=EMP | stats avg(ENAME) as avg_name",
-        "Aggregation function AVG expects field type {[INTEGER]|[DOUBLE]}, but got [STRING]");
+    String ppl = "source=EMP | stats avg(ENAME) as avg_name";
+    RelNode root = getRelNode(ppl);
+    verifyResult(root, "avg_name=null\n");
   }
 
   @Test
   public void testVarsampWithWrongArgType() {
-    verifyQueryThrowsException(
-        "source=EMP | stats var_samp(ENAME) as varsamp_name",
-        "Aggregation function VARSAMP expects field type {[INTEGER]|[DOUBLE]}, but got [STRING]");
+    String ppl = "source=EMP | stats var_samp(ENAME) as varsamp_name";
+    RelNode root = getRelNode(ppl);
+    verifyResult(root, "varsamp_name=null\n");
   }
 
   @Test
   public void testVarpopWithWrongArgType() {
-    verifyQueryThrowsException(
-        "source=EMP | stats var_pop(ENAME) as varpop_name",
-        "Aggregation function VARPOP expects field type {[INTEGER]|[DOUBLE]}, but got [STRING]");
+    String ppl = "source=EMP | stats var_pop(ENAME) as varpop_name";
+    RelNode root = getRelNode(ppl);
+    verifyResult(root, "varpop_name=null\n");
   }
 
   @Test
   public void testStddevSampWithWrongArgType() {
-    verifyQueryThrowsException(
-        "source=EMP | stats stddev_samp(ENAME) as stddev_name",
-        "Aggregation function STDDEV_SAMP expects field type {[INTEGER]|[DOUBLE]}, but got"
-            + " [STRING]");
+    String ppl = "source=EMP | stats stddev_samp(ENAME) as stddev_name";
+    RelNode root = getRelNode(ppl);
+    verifyResult(root, "stddev_name=null\n");
   }
 
   @Test
   public void testStddevPopWithWrongArgType() {
-    verifyQueryThrowsException(
-        "source=EMP | stats stddev_pop(ENAME) as stddev_name",
-        "Aggregation function STDDEV_POP expects field type {[INTEGER]|[DOUBLE]}, but got"
-            + " [STRING]");
+    String ppl = "source=EMP | stats stddev_pop(ENAME) as stddev_name";
+    RelNode root = getRelNode(ppl);
+    verifyResult(root, "stddev_name=null\n");
   }
 
   @Test

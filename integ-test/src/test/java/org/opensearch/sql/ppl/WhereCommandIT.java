@@ -5,7 +5,6 @@
 
 package org.opensearch.sql.ppl;
 
-import static org.hamcrest.CoreMatchers.containsString;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_BANK_WITH_NULL_VALUES;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_DATE_TIME;
@@ -16,7 +15,6 @@ import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 
 import java.io.IOException;
 import java.util.stream.Collectors;
-import org.hamcrest.MatcherAssert;
 import org.json.JSONObject;
 import org.junit.jupiter.api.Test;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -243,17 +241,12 @@ public class WhereCommandIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void testInWithIncompatibleType() {
-    Exception e =
-        assertThrows(
-            Exception.class,
-            () -> {
-              executeQuery(
-                  String.format(
-                      "source=%s | where balance in (4180, 5686, '6077') | fields firstname",
-                      TEST_INDEX_ACCOUNT));
-            });
-    MatcherAssert.assertThat(e.getMessage(), containsString(getIncompatibleTypeErrMsg()));
+  public void testInWithIncompatibleType() throws IOException {
+    JSONObject result =
+        executeQuery(
+            String.format(
+                "source=%s | where balance in ('6077') | fields firstname", TEST_INDEX_ACCOUNT));
+    verifyDataRows(result, rows("Hughes"));
   }
 
   protected String getIncompatibleTypeErrMsg() {

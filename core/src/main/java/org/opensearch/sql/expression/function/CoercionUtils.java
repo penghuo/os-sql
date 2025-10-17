@@ -7,17 +7,19 @@ package org.opensearch.sql.expression.function;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.PriorityQueue;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
+import org.apache.commons.lang3.tuple.Pair;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.data.type.WideningTypeRule;
 import org.opensearch.sql.exception.ExpressionEvaluationException;
 
-public class CoercionUtils {
-
+public final class CoercionUtils {
   /**
    * Casts the arguments to the types specified in the typeChecker. Returns null if no combination
    * of parameter types matches the arguments or if casting fails.
@@ -31,15 +33,25 @@ public class CoercionUtils {
       RexBuilder builder, PPLTypeChecker typeChecker, List<RexNode> arguments) {
     List<List<ExprType>> paramTypeCombinations = typeChecker.getParameterTypes();
 
-    // TODO: var args?
-
+    List<ExprType> sourceTypes =
+        arguments.stream()
+            .map(node -> OpenSearchTypeFactory.convertRelDataTypeToExprType(node.getType()))
+            .collect(Collectors.toList());
+    PriorityQueue<Pair<List<ExprType>, Integer>> rankedSignatures =
+        new PriorityQueue<>((left, right) -> Integer.compare(right.getValue(), left.getValue()));
     for (List<ExprType> paramTypes : paramTypeCombinations) {
-      List<RexNode> castedArguments = castArguments(builder, paramTypes, arguments);
-      if (castedArguments != null) {
-        return castedArguments;
+      int distance = computeDistance(sourceTypes, paramTypes);
+      if (distance == 0) {
+        return castArguments(builder, paramTypes, arguments);
+      }
+      if (distance != WideningTypeRule.IMPOSSIBLE_WIDENING) {
+        rankedSignatures.add(Pair.of(paramTypes, distance));
       }
     }
-    return null;
+    if (rankedSignatures.isEmpty()) {
+      return null;
+    }
+    return castArguments(builder, rankedSignatures.peek().getKey(), arguments);
   }
 
   /**
@@ -90,9 +102,9 @@ public class CoercionUtils {
     if (!argType.shouldCast(targetType)) {
       return arg;
     }
-
     if (WideningTypeRule.distance(argType, targetType) != WideningTypeRule.IMPOSSIBLE_WIDENING) {
-      return builder.makeCast(OpenSearchTypeFactory.convertExprTypeToRelDataType(targetType), arg);
+      return builder.makeCast(
+          OpenSearchTypeFactory.convertExprTypeToRelDataType(targetType), arg, true, true);
     }
     return null;
   }
@@ -135,5 +147,24 @@ public class CoercionUtils {
   private static boolean areDateAndTime(ExprType type1, ExprType type2) {
     return (type1 == ExprCoreType.DATE && type2 == ExprCoreType.TIME)
         || (type1 == ExprCoreType.TIME && type2 == ExprCoreType.DATE);
+  }
+
+  private static int computeDistance(List<ExprType> sourceTypes, List<ExprType> targetTypes) {
+    if (sourceTypes.size() != targetTypes.size()) {
+      return WideningTypeRule.IMPOSSIBLE_WIDENING;
+    }
+
+    int totalDistance = 0;
+    for (int i = 0; i < sourceTypes.size(); i++) {
+      ExprType source = sourceTypes.get(i);
+      ExprType target = targetTypes.get(i);
+      int distance = WideningTypeRule.distance(source, target);
+      if (distance == WideningTypeRule.IMPOSSIBLE_WIDENING) {
+        return WideningTypeRule.IMPOSSIBLE_WIDENING;
+      } else {
+        totalDistance += distance;
+      }
+    }
+    return totalDistance;
   }
 }

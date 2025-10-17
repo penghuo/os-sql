@@ -129,6 +129,36 @@ public class CalcitePPLRexTest extends CalcitePPLAbstractTest {
   }
 
   @Test
+  public void testRexDigitsUsedInArithmetic() {
+    String ppl =
+        "source=EMP | rex field=ENAME '(?<digits>\\d+)' | eval mult = digits * 10 | fields ENAME,"
+            + " mult";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(ENAME=[$1], mult=[*(SAFE_CAST(REX_EXTRACT($1, '(?<digits>\\d+)', 1)),"
+            + " 10)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+
+    String expectedSparkSql =
+        "SELECT `ENAME`, SAFE_CAST(`REX_EXTRACT`(`ENAME`, '(?<digits>\\d+)', 1) AS DOUBLE) * 10"
+            + " `mult`\n"
+            + "FROM `scott`.`EMP`";
+    verifyPPLToSparkSQL(root, expectedSparkSql);
+  }
+
+  @Test
+  public void testRexDigitsUsedInStats() {
+    String ppl =
+        "source=EMP | eval v = concat('value=', cast(EMPNO as string)) | rex field=v"
+            + " 'value=(?<digits>[-+]?\\d*\\.?\\d+)' | stats sum(digits) as total";
+    RelNode root = getRelNode(ppl);
+
+    String expectedResult = "total=108172.0\n";
+    verifyResult(root, expectedResult);
+  }
+
+  @Test
   public void testRexComplexPattern() {
     String ppl =
         "source=EMP | rex field=ENAME '(?<prefix>[A-Z]{2})(?<suffix>[A-Z]+)' | fields ENAME,"

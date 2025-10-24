@@ -8,6 +8,7 @@ package org.opensearch.sql.ppl.calcite;
 import static org.apache.calcite.test.Matchers.hasTree;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -194,5 +195,14 @@ public class CalcitePPLAbstractTest {
   protected void verifyQueryThrowsException(String query, String expectedErrorMessage) {
     Exception e = Assert.assertThrows(ExpressionEvaluationException.class, () -> getRelNode(query));
     verifyErrorMessageContains(e, expectedErrorMessage);
+  }
+
+  protected void verifyQueryUnsupported(String query, String functionName) {
+    IllegalArgumentException e =
+        Assert.assertThrows(IllegalArgumentException.class, () -> getRelNode(query));
+    assertThat(
+        String.format("Unexpected message: %s", e.getMessage()),
+        e.getMessage(),
+        containsString(String.format("Unsupported function: %s", functionName)));
   }
 }

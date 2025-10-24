@@ -186,7 +186,7 @@ public class AnalyzerTestBase {
     return analyzer.analyze(unresolvedPlan, analysisContext);
   }
 
-  private class DefaultDataSourceService implements DataSourceService {
+  public class DefaultDataSourceService implements DataSourceService {
 
     private final DataSource opensearchDataSource =
         new DataSource(DEFAULT_DATASOURCE_NAME, DataSourceType.OPENSEARCH, storageEngine());

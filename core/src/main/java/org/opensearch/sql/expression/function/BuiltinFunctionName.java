@@ -297,6 +297,7 @@ public enum BuiltinFunctionName {
   CAST_TO_DATETIME(FunctionName.of("cast_to_datetime")),
   CAST_TO_IP(FunctionName.of("cast_to_ip")),
   CAST_TO_JSON(FunctionName.of("cast_to_json")),
+  CAST(FunctionName.of("cast")),
   TYPEOF(FunctionName.of("typeof")),
 
   /** Relevance Function. */

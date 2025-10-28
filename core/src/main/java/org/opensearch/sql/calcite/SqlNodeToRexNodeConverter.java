@@ -11,11 +11,16 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlBasicTypeNameSpec;
 import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlDataTypeSpec;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlTypeNameSpec;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.sql.ast.expression.QualifiedName;
 
@@ -41,6 +46,14 @@ public class SqlNodeToRexNodeConverter {
   }
 
   private RexNode convertCall(SqlCall call) {
+    if (call.getKind() == SqlKind.SAFE_CAST && call.getOperandList().size() == 2) {
+      RexNode value = convert(call.operand(0));
+      SqlNode typeOperand = call.operand(1);
+      if (typeOperand instanceof SqlDataTypeSpec dataTypeSpec) {
+        RelDataType targetType = deriveRelDataType(dataTypeSpec);
+        return context.rexBuilder.makeCast(targetType, value, true, true);
+      }
+    }
     List<RexNode> operands =
         call.getOperandList().stream().map(this::convert).collect(Collectors.toList());
     return context.rexBuilder.makeCall(call.getOperator(), operands);
@@ -82,5 +95,28 @@ public class SqlNodeToRexNodeConverter {
   private RexNode convertIdentifier(SqlIdentifier identifier) {
     QualifiedName qualifiedName = QualifiedName.of(identifier.names);
     return QualifiedNameResolver.resolve(qualifiedName, context);
+  }
+
+  private RelDataType deriveRelDataType(SqlDataTypeSpec spec) {
+    RelDataTypeFactory typeFactory = context.relBuilder.getTypeFactory();
+    SqlTypeNameSpec typeNameSpec = spec.getTypeNameSpec();
+    RelDataType relType;
+    if (typeNameSpec instanceof SqlBasicTypeNameSpec basicType) {
+      SqlTypeName typeName = SqlTypeName.get(basicType.getTypeName().getSimple());
+      int precision = basicType.getPrecision();
+      int scale = basicType.getScale();
+      if (typeName.allowsPrecScale(true, true) && precision >= 0 && scale >= 0) {
+        relType = typeFactory.createSqlType(typeName, precision, scale);
+      } else if (typeName.allowsPrec() && precision >= 0) {
+        relType = typeFactory.createSqlType(typeName, precision);
+      } else {
+        relType = typeFactory.createSqlType(typeName);
+      }
+    } else {
+      throw new UnsupportedOperationException("Unsupported SqlTypeNameSpec: " + typeNameSpec);
+    }
+    boolean nullable = spec.getNullable() == null || spec.getNullable();
+    relType = typeFactory.createTypeWithNullability(relType, nullable);
+    return relType;
   }
 }

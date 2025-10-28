@@ -22,6 +22,7 @@ import static org.opensearch.sql.expression.function.BuiltinFunctionName.ASIN;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.ATAN;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.ATAN2;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.AVG;
+import static org.opensearch.sql.expression.function.BuiltinFunctionName.CAST;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.CBRT;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.CEIL;
 import static org.opensearch.sql.expression.function.BuiltinFunctionName.CEILING;
@@ -492,6 +493,7 @@ public class PPLFuncImpTable {
 
   public RexNode resolve(
       final RexBuilder builder, final BuiltinFunctionName functionName, RexNode... args) {
+
     // Check the external function registry first. This allows the data-storage-dependent
     // function implementations to override the internal ones with the same name.
     List<Pair<CalciteFuncSignature, FunctionImp>> implementList =
@@ -1137,6 +1139,7 @@ public class PPLFuncImpTable {
                       // necessary for SQL function input
                       builder.makeLiteral("\\")),
           PPLTypeChecker.family(SqlTypeFamily.STRING, SqlTypeFamily.STRING));
+      registerOperator(CAST, SqlLibraryOperators.SAFE_CAST);
     }
   }
 

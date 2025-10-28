@@ -18,13 +18,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import javax.annotation.Nullable;
 import lombok.RequiredArgsConstructor;
-import org.apache.calcite.config.CalciteConnectionConfigImpl;
-import org.apache.calcite.prepare.Prepare;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -32,21 +29,11 @@ import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexLambdaRef;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.runtime.CalciteContextException;
-import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlIntervalQualifier;
-import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.SqlNodeList;
-import org.apache.calcite.sql.SqlOperatorTable;
-import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
-import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.ArraySqlType;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
-import org.apache.calcite.sql.util.SqlOperatorTables;
-import org.apache.calcite.sql.validate.SqlValidator;
-import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.util.DateString;
 import org.apache.calcite.util.TimeString;
 import org.apache.calcite.util.TimestampString;
@@ -394,97 +381,64 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
   }
 
   @Override
-  public RexNode visitFunction(Function node, CalcitePlanContext context) {
+  public RexNode visitFunction(Function fun, CalcitePlanContext context) {
+    Function node = fun;
+    boolean coercionRequested = CalcitePlanContext.needCoercion.get();
+    if (coercionRequested) {
+      TypeCoercion converter = new TypeCoercion();
+      try {
+        node = converter.convert(fun, context);
+      } finally {
+        CalcitePlanContext.needCoercion.set(false);
+      }
+    }
+
+    List<UnresolvedExpression> args = node.getFuncArgs();
+    List<RexNode> arguments = new ArrayList<>(args.size());
+
+    boolean isCoalesce = "coalesce".equalsIgnoreCase(node.getFuncName());
+    if (isCoalesce) {
+      context.setInCoalesceFunction(true);
+    }
+
     try {
-      return analyzeFunctionWithSqlValidator(node, context);
-    } catch (CalciteContextException ex) {
-      throw new ExpressionEvaluationException(ex.getMessage(), ex);
+      for (UnresolvedExpression arg : args) {
+        if (arg instanceof LambdaFunction) {
+          CalcitePlanContext lambdaContext =
+              prepareLambdaContext(
+                  context, (LambdaFunction) arg, arguments, node.getFuncName(), null);
+          RexNode lambdaNode = analyze(arg, lambdaContext);
+          if (node.getFuncName().equalsIgnoreCase("reduce")) {
+            lambdaContext =
+                prepareLambdaContext(
+                    context,
+                    (LambdaFunction) arg,
+                    arguments,
+                    node.getFuncName(),
+                    lambdaNode.getType());
+            lambdaNode = analyze(arg, lambdaContext);
+          }
+          arguments.add(lambdaNode);
+        } else {
+          arguments.add(analyze(arg, context));
+        }
+      }
+    } finally {
+      if (isCoalesce) {
+        context.setInCoalesceFunction(false);
+      }
+      if (coercionRequested) {
+        CalcitePlanContext.needCoercion.set(false);
+      }
     }
-  }
 
-  private RexNode analyzeFunctionWithSqlValidator(Function node, CalcitePlanContext context) {
-    SqlNodeAnalyzer analyzer = new SqlNodeAnalyzer();
-    SqlNode sqlCall = analyzer.analyze(node, context);
-    SqlOperatorTable operatorTable = createSqlOperatorTable();
-    SqlNode converted =
-        validateExprWithRowType(
-            false, operatorTable, TYPE_FACTORY, getCurrentRowType(context), sqlCall);
-
-    SqlNodeToRexNodeConverter converter = new SqlNodeToRexNodeConverter(context);
-    RexNode rexNode = converter.convert(converted);
-    validateFunctionSignature(node, rexNode, context);
-    return rexNode;
-  }
-
-  public static SqlNode validateExprWithRowType(
-      boolean caseSensitive,
-      SqlOperatorTable operatorTable,
-      RelDataTypeFactory typeFactory,
-      RelDataType rowType,
-      SqlNode expr) {
-    String tableName = "_table_";
-    SqlSelect select0 =
-        new SqlSelect(
-            SqlParserPos.ZERO,
-            (SqlNodeList) null,
-            new SqlNodeList(Collections.singletonList(expr), SqlParserPos.ZERO),
-            new SqlIdentifier("_table_", SqlParserPos.ZERO),
-            (SqlNode) null,
-            (SqlNodeList) null,
-            (SqlNode) null,
-            (SqlNodeList) null,
-            (SqlNode) null,
-            (SqlNodeList) null,
-            (SqlNode) null,
-            (SqlNode) null,
-            (SqlNodeList) null);
-    Prepare.CatalogReader catalogReader =
-        SqlValidatorUtil.createSingleTableCatalogReader(
-            caseSensitive, "_table_", typeFactory, rowType);
-
-    final SqlValidator.Config config =
-        SqlValidator.Config.DEFAULT
-            .withDefaultNullCollation(CalciteConnectionConfigImpl.DEFAULT.defaultNullCollation())
-            .withIdentifierExpansion(true);
-    SqlValidator validator =
-        SqlValidatorUtil.newValidator(operatorTable, catalogReader, typeFactory, config);
-    SqlSelect select = (SqlSelect) validator.validate(select0);
-    SqlNodeList selectList = select.getSelectList();
-
-    assert selectList.size() == 1 : "Expression " + expr + " should be atom expression";
-
-    return selectList.get(0);
-  }
-
-  private static RelDataType getCurrentRowType(CalcitePlanContext context) {
-    try {
-      return context.relBuilder.peek().getRowType();
-    } catch (IllegalArgumentException | NoSuchElementException e) {
-      return TYPE_FACTORY.builder().build();
+    RexNode resolvedNode =
+        PPLFuncImpTable.INSTANCE.resolve(
+            context.rexBuilder, node.getFuncName(), arguments.toArray(new RexNode[0]));
+    if (resolvedNode != null) {
+      return resolvedNode;
     }
-  }
-
-  private static SqlOperatorTable createSqlOperatorTable() {
-    final SqlOperatorTable opTab0 =
-        CalciteConnectionConfigImpl.DEFAULT.fun(
-            SqlOperatorTable.class, SqlStdOperatorTable.instance());
-    final List<SqlOperatorTable> list = new ArrayList<>();
-    list.add(opTab0);
-    return SqlOperatorTables.chain(list);
-  }
-
-  private void validateFunctionSignature(
-      Function node, RexNode rexNode, CalcitePlanContext context) {
-    if (!(rexNode instanceof RexCall call)) {
-      return;
-    }
-    RexNode[] operands = call.getOperands().toArray(RexNode[]::new);
-    try {
-      PPLFuncImpTable.INSTANCE.resolve(context.rexBuilder, node.getFuncName(), operands);
-    } catch (IllegalStateException e) {
-      throw new IllegalArgumentException(
-          String.format("Unsupported function: %s", node.getFuncName()), e);
-    }
+    throw new IllegalArgumentException("Unsupported operator: " + node.getFuncName());
   }
 
   //  @Override

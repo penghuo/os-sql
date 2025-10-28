@@ -37,6 +37,8 @@ public class CalcitePlanContext {
   public final QueryType queryType;
   public final SysLimit sysLimit;
 
+  public static final ThreadLocal<Boolean> needCoercion = ThreadLocal.withInitial(() -> true);
+
   /** This thread local variable is only used to skip script encoding in script pushdown. */
   public static final ThreadLocal<Boolean> skipEncoding = ThreadLocal.withInitial(() -> false);
 

@@ -23,9 +23,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
+import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.sql.ast.expression.Function;
 import org.opensearch.sql.ast.expression.LambdaFunction;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
@@ -185,6 +187,26 @@ public class CalciteRexNodeVisitorTest {
     assertEquals(
         lambdaContext.getRexLambdaRefMap().get("acc").getType().getSqlTypeName(),
         SqlTypeName.BIGINT);
+  }
+
+  @Test
+  public void visitFunctionDisablesCoercionAfterFailure() {
+    CalcitePlanContext.needCoercion.set(true);
+    Function function = new Function("abs", List.of());
+
+    try (MockedConstruction<TypeCoercion> mockedConstruction =
+        Mockito.mockConstruction(
+            TypeCoercion.class,
+            (mock, unused) ->
+                Mockito.when(mock.convert(Mockito.any(), Mockito.any()))
+                    .thenThrow(new RuntimeException("boom")))) {
+      RuntimeException exception =
+          assertThrows(RuntimeException.class, () -> visitor.visitFunction(function, context));
+      assertEquals("boom", exception.getMessage());
+      assertFalse(CalcitePlanContext.needCoercion.get());
+    } finally {
+      CalcitePlanContext.needCoercion.set(true);
+    }
   }
 
   @Test

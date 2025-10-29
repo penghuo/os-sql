@@ -32,6 +32,8 @@ import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
+import org.opensearch.sql.type.OperandTypes;
+import org.opensearch.sql.type.RexCallFamilyOperandTypeChecker;
 
 /**
  * A custom type checker interface for PPL (Piped Processing Language) functions.
@@ -431,8 +433,12 @@ public interface PPLTypeChecker {
    * @param families the expected {@link SqlTypeFamily} for each operand, in order
    * @return a {@link PPLFamilyTypeChecker} that enforces the specified type families for operands
    */
-  static PPLFamilyTypeChecker family(SqlTypeFamily... families) {
-    return new PPLFamilyTypeChecker(families);
+  //  static PPLFamilyTypeChecker family(SqlTypeFamily... families) {
+  //    return new PPLFamilyTypeChecker(families);
+  //  }
+
+  static RexCallFamilyOperandTypeChecker family(SqlTypeFamily... families) {
+    return OperandTypes.family(families);
   }
 
   /**

@@ -1,30 +1,15 @@
 {
   "bash": [
-    "user/optimization/optimization.rst",
-    "user/admin/settings.rst"
+
   ],
   "bash_calcite": [
-    "user/ppl/interfaces/endpoint.rst",
-    "user/ppl/interfaces/protocol.rst"
+
   ],
   "sql_cli": [
-    "user/dql/expressions.rst",
-    "user/general/comments.rst",
-    "user/general/datatypes.rst",
-    "user/general/identifiers.rst",
-    "user/general/values.rst",
-    "user/dql/basics.rst",
-    "user/dql/functions.rst",
-    "user/dql/window.rst",
-    "user/beyond/partiql.rst",
-    "user/dql/aggregations.rst",
-    "user/dql/complex.rst",
-    "user/dql/metadata.rst"
   ],
   "ppl_cli_calcite": [
     "user/ppl/cmd/ad.rst",
     "user/ppl/cmd/append.rst",
-    "user/ppl/cmd/bin.rst",
     "user/ppl/cmd/dedup.rst",
     "user/ppl/cmd/describe.rst",
     "user/ppl/cmd/eventstats.rst",
@@ -36,26 +21,20 @@
     "user/ppl/cmd/join.rst",
     "user/ppl/cmd/lookup.rst",
     "user/ppl/cmd/parse.rst",
-    "user/ppl/cmd/patterns.rst",
     "user/ppl/cmd/rare.rst",
     "user/ppl/cmd/regex.rst",
     "user/ppl/cmd/rename.rst",
     "user/ppl/cmd/multisearch.rst",
     "user/ppl/cmd/replace.rst",
     "user/ppl/cmd/rex.rst",
-    "user/ppl/cmd/search.rst",
-    "user/ppl/cmd/showdatasources.rst",
     "user/ppl/cmd/sort.rst",
     "user/ppl/cmd/stats.rst",
     "user/ppl/cmd/subquery.rst",
     "user/ppl/cmd/syntax.rst",
     "user/ppl/cmd/timechart.rst",
-    "user/ppl/cmd/search.rst",
-    "user/ppl/functions/statistical.rst",
     "user/ppl/cmd/top.rst",
     "user/ppl/cmd/trendline.rst",
     "user/ppl/cmd/where.rst",
-    "user/ppl/functions/collection.rst",
     "user/ppl/functions/condition.rst",
     "user/ppl/functions/datetime.rst",
     "user/ppl/functions/expressions.rst",

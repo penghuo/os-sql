@@ -28,6 +28,9 @@ public class OpenSearchSchema extends AbstractSchema {
         @Override
         public Table get(Object key) {
           if (!super.containsKey(key)) {
+            if (OPEN_SEARCH_SCHEMA_NAME.equalsIgnoreCase(key.toString())) {
+              return null;
+            }
             registerTable(new QualifiedName((String) key));
           }
           return super.get(key);

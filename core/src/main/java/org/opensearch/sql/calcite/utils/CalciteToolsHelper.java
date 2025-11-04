@@ -113,6 +113,12 @@ public class CalciteToolsHelper {
             new OpenSearchRelBuilder(config.getContext(), cluster, relOptSchema));
   }
 
+  /** Execute action using existing connection and shared OpenSearch type factory. */
+  public static <R> R withPrepare(
+      FrameworkConfig config, Connection connection, Frameworks.BasePrepareAction<R> action) {
+    return withPrepare(config, OpenSearchTypeFactory.TYPE_FACTORY, connection, action);
+  }
+
   public static Connection connect(FrameworkConfig config, JavaTypeFactory typeFactory) {
     final Properties info = new Properties();
     if (config.getTypeSystem() != RelDataTypeSystem.DEFAULT) {

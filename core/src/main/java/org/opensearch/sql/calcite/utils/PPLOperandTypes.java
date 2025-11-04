@@ -74,6 +74,12 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata NUMERIC =
       UDFOperandMetadata.wrap((FamilyOperandTypeChecker) OperandTypes.NUMERIC);
 
+  public static final UDFOperandMetadata MIN_MAX =
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.NUMERIC.or(
+                  OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC)));
+
   public static final UDFOperandMetadata NUMERIC_OPTIONAL_STRING =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -148,7 +154,7 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata OPTIONAL_DATE_OR_TIMESTAMP_OR_NUMERIC =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              OperandTypes.DATETIME.or(OperandTypes.NUMERIC).or(OperandTypes.family()));
+              OperandTypes.DATETIME.or(OperandTypes.NUMERIC).or(OperandTypes.STRING));
 
   public static final UDFOperandMetadata DATETIME_OR_STRING =
       UDFOperandMetadata.wrap(

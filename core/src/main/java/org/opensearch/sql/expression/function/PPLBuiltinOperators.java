@@ -25,7 +25,10 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
+import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeTransforms;
 import org.apache.calcite.sql.util.ReflectiveSqlOperatorTable;
 import org.apache.calcite.util.BuiltInMethod;
@@ -457,7 +460,17 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
           PercentileApproxFunction.class,
           "percentile_approx",
           ReturnTypes.ARG0_FORCE_NULLABLE,
-          PPLOperandTypes.NUMERIC_NUMERIC_OPTIONAL_NUMERIC);
+          UDFOperandMetadata.wrap(
+              (CompositeOperandTypeChecker)
+                  OperandTypes.NUMERIC_NUMERIC
+                      .or(
+                          OperandTypes.family(
+                              SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC))
+                      .or(
+                          OperandTypes.family(
+                              SqlTypeFamily.NUMERIC,
+                              SqlTypeFamily.NUMERIC,
+                              SqlTypeFamily.STRING))));
   public static final SqlAggFunction INTERNAL_PATTERN =
       createUserDefinedAggFunction(
           LogPatternAggFunction.class,

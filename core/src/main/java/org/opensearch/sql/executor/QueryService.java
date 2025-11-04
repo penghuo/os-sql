@@ -14,15 +14,36 @@ import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
+import org.apache.calcite.config.CalciteConnectionConfig;
 import org.apache.calcite.jdbc.CalciteSchema;
+import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitDef;
+import org.apache.calcite.prepare.CalciteCatalogReader;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.schema.SchemaPlus;
+import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlOperatorTable;
+import org.apache.calcite.sql.dialect.CalciteSqlDialect;
+import org.apache.calcite.sql.dialect.SparkSqlDialect;
+import org.apache.calcite.sql.fun.SqlLibrary;
+import org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.util.SqlOperatorTables;
+import org.apache.calcite.sql.util.SqlShuttle;
+import org.apache.calcite.sql.validate.SqlValidator;
+import org.apache.calcite.sql.validate.SqlValidatorUtil;
+import org.apache.calcite.sql2rel.SqlRexConvertletTable;
+import org.apache.calcite.sql2rel.SqlToRelConverter;
+import org.apache.calcite.sql2rel.StandardConvertletTable;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
@@ -36,11 +57,15 @@ import org.opensearch.sql.calcite.OpenSearchSchema;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.plan.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.LogicalSystemLimit.SystemLimitType;
+import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.NonFallbackCalciteException;
+import org.opensearch.sql.expression.function.OpenSearchBuiltinOperators;
+import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.planner.PlanContext;
 import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPaginate;
@@ -253,7 +278,12 @@ public class QueryService {
   }
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
-    return getRelNodeVisitor().analyze(plan, context);
+    RelNode relNode = getRelNodeVisitor().analyze(plan, context);
+    RelToSqlConverter relToSqlConverter = new RelToSqlConverter(CalciteSqlDialect.DEFAULT);
+    //    RelToSqlConverter relToSqlConverter = new RelToSqlConverter(SparkSqlDialect.DEFAULT);
+    SqlNode sqlNode = relToSqlConverter.visitRoot(relNode).asStatement();
+    SqlNode normalizedSqlNode = ensureCountStar(sqlNode);
+    return convertSqlNodeToRel(normalizedSqlNode, context);
   }
 
   /** Analyze {@link UnresolvedPlan}. */
@@ -315,10 +345,18 @@ public class QueryService {
     final SchemaPlus opensearchSchema =
         rootSchema.add(
             OpenSearchSchema.OPEN_SEARCH_SCHEMA_NAME, new OpenSearchSchema(dataSourceService));
+    final SqlOperatorTable operatorTable =
+        SqlOperatorTables.chain(
+            PPLBuiltinOperators.instance(),
+            OpenSearchBuiltinOperators.instance(),
+            SqlStdOperatorTable.instance(),
+            SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(
+                SqlLibrary.MYSQL, SqlLibrary.BIG_QUERY, SqlLibrary.SPARK, SqlLibrary.POSTGRESQL));
     Frameworks.ConfigBuilder configBuilder =
         Frameworks.newConfigBuilder()
             .parserConfig(SqlParser.Config.DEFAULT) // TODO check
             .defaultSchema(opensearchSchema)
+            .operatorTable(operatorTable)
             .traitDefs((List<RelTraitDef>) null)
             .programs(Programs.standard())
             .typeSystem(OpenSearchTypeSystem.INSTANCE);
@@ -345,5 +383,85 @@ public class QueryService {
       calcitePlan = LogicalSort.create(osPlan, collation, null, null);
     }
     return calcitePlan;
+  }
+
+  private static SqlNode ensureCountStar(SqlNode sqlNode) {
+    return sqlNode.accept(
+        new SqlShuttle() {
+          @Override
+          public SqlNode visit(SqlCall call) {
+            SqlNode visited = super.visit(call);
+            if (!(visited instanceof SqlCall normalizedCall)) {
+              return visited;
+            }
+            if (isCountWithoutArguments(normalizedCall)) {
+              return SqlStdOperatorTable.COUNT.createCall(
+                  normalizedCall.getParserPosition(),
+                  SqlIdentifier.star(normalizedCall.getParserPosition()));
+            }
+            return normalizedCall;
+          }
+
+          private boolean isCountWithoutArguments(SqlCall call) {
+            return call.getOperator() == SqlStdOperatorTable.COUNT
+                && call.getOperandList().isEmpty();
+          }
+        });
+  }
+
+  private RelNode convertSqlNodeToRel(SqlNode sqlNode, CalcitePlanContext context) {
+    FrameworkConfig frameworkConfig = context.config;
+
+    return CalciteToolsHelper.withPrepare(
+        frameworkConfig,
+        context.connection,
+        (cluster, relOptSchema, rootSchema, statement) -> {
+          CalciteCatalogReader catalogReader = (CalciteCatalogReader) relOptSchema;
+          CalciteConnectionConfig connectionConfig = catalogReader.getConfig();
+
+          OpenSearchTypeFactory typeFactory =
+              (OpenSearchTypeFactory) catalogReader.getTypeFactory();
+
+          SqlOperatorTable operatorTable =
+              SqlOperatorTables.chain(frameworkConfig.getOperatorTable(), catalogReader);
+
+          SqlValidator.Config validatorConfig =
+              frameworkConfig
+                  .getSqlValidatorConfig()
+                  .withDefaultNullCollation(connectionConfig.defaultNullCollation())
+                  .withLenientOperatorLookup(connectionConfig.lenientOperatorLookup())
+                  .withConformance(connectionConfig.conformance())
+                  .withIdentifierExpansion(true);
+
+          SqlValidator validator =
+              SqlValidatorUtil.newValidator(
+                  operatorTable, catalogReader, typeFactory, validatorConfig);
+          log.info(sqlNode.toSqlString(SparkSqlDialect.DEFAULT));
+          SqlNode validated = validator.validate(sqlNode);
+
+          SqlRexConvertletTable convertletTable =
+              frameworkConfig.getConvertletTable() != null
+                  ? frameworkConfig.getConvertletTable()
+                  : StandardConvertletTable.INSTANCE;
+
+          SqlToRelConverter.Config sqlToRelConfig =
+              frameworkConfig
+                  .getSqlToRelConverterConfig()
+                  .withTrimUnusedFields(false)
+                  .withRemoveSortInSubQuery(false);
+
+          RelOptTable.ViewExpander viewExpander =
+              (rowType, queryString, schemaPath, viewPath) -> {
+                throw new UnsupportedOperationException("View expansion is unsupported");
+              };
+
+          SqlToRelConverter sqlToRelConverter =
+              new SqlToRelConverter(
+                  viewExpander, validator, catalogReader, cluster, convertletTable, sqlToRelConfig);
+          log.info(validated.toSqlString(CalciteSqlDialect.DEFAULT));
+
+          RelRoot relRoot = sqlToRelConverter.convertQuery(validated, false, true);
+          return relRoot.withRel(sqlToRelConverter.flattenTypes(relRoot.rel, true)).rel;
+        });
   }
 }

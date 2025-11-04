@@ -1275,7 +1275,7 @@ public class PPLFuncImpTable {
             }
             List<RexNode> newArgList =
                 argList.stream().map(PlanUtils::derefMapCall).collect(Collectors.toList());
-            newArgList.add(ctx.rexBuilder.makeFlag(field.getType().getSqlTypeName()));
+            newArgList.add(ctx.rexBuilder.makeLiteral(field.getType().getSqlTypeName().getName()));
             return UserDefinedFunctionUtils.makeAggregateCall(
                 PPLBuiltinOperators.PERCENTILE_APPROX, List.of(field), newArgList, ctx.relBuilder);
           },
@@ -1299,7 +1299,7 @@ public class PPLFuncImpTable {
             List<RexNode> medianArgList =
                 List.of(
                     ctx.rexBuilder.makeExactLiteral(BigDecimal.valueOf(MEDIAN_PERCENTILE)),
-                    ctx.rexBuilder.makeFlag(field.getType().getSqlTypeName()));
+                    ctx.rexBuilder.makeLiteral(field.getType().getSqlTypeName().getName()));
             return UserDefinedFunctionUtils.makeAggregateCall(
                 PPLBuiltinOperators.PERCENTILE_APPROX,
                 List.of(field),

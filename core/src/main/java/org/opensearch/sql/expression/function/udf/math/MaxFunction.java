@@ -16,6 +16,7 @@ import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.data.utils.MixedTypeComparator;
 import org.opensearch.sql.expression.function.ImplementorUDF;
 import org.opensearch.sql.expression.function.UDFOperandMetadata;
@@ -37,7 +38,7 @@ public class MaxFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return PPLOperandTypes.MIN_MAX;
   }
 
   public static class MaxImplementor implements NotNullImplementor {

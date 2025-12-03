@@ -67,6 +67,11 @@ public class OpenSearchAggregateIndexScanRule
     AbstractRelNode newRelNode = scan.pushDownAggregate(aggregate, project);
     if (newRelNode != null) {
       call.transformTo(newRelNode);
+      if (project != null) {
+        call.getPlanner().prune(project);
+      }
+      call.getPlanner().prune(aggregate);
+      call.getPlanner().prune(scan);
     }
   }
 

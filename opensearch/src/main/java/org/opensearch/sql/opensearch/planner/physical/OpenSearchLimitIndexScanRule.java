@@ -44,6 +44,8 @@ public class OpenSearchLimitIndexScanRule extends RelRule<OpenSearchLimitIndexSc
       AbstractRelNode newOperator = scan.pushDownLimit(sort, limitValue, offsetValue);
       if (newOperator != null) {
         call.transformTo(newOperator);
+        call.getPlanner().prune(sort);
+        call.getPlanner().prune(scan);
       }
     }
   }

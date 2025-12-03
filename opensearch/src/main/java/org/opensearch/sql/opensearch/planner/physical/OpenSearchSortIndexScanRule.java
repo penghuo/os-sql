@@ -28,6 +28,9 @@ public class OpenSearchSortIndexScanRule extends RelRule<OpenSearchSortIndexScan
     AbstractCalciteIndexScan newScan = scan.pushDownSort(collations);
     if (newScan != null) {
       call.transformTo(newScan);
+      // preferred push down
+      call.getPlanner().prune(sort);
+      call.getPlanner().prune(scan);
     }
   }
 

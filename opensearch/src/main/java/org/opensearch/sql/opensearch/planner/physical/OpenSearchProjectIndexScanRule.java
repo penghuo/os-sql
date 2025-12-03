@@ -79,6 +79,8 @@ public class OpenSearchProjectIndexScanRule extends RelRule<OpenSearchProjectInd
         } else {
           call.transformTo(call.builder().push(newScan).project(newProjectRexNodes).build());
         }
+        call.getPlanner().prune(project);
+        call.getPlanner().prune(scan);
       }
     }
   }

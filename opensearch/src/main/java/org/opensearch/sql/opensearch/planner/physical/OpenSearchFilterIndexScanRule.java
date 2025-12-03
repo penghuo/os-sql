@@ -42,6 +42,9 @@ public class OpenSearchFilterIndexScanRule extends RelRule<OpenSearchFilterIndex
     AbstractRelNode newRel = scan.pushDownFilter(filter);
     if (newRel != null) {
       call.transformTo(newRel);
+      // preferred pushdown
+      call.getPlanner().prune(filter);
+      call.getPlanner().prune(scan);
     }
   }
 

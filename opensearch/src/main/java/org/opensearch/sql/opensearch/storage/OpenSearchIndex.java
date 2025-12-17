@@ -26,6 +26,7 @@ import org.opensearch.sql.calcite.plan.AbstractOpenSearchTable;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
+import org.opensearch.sql.executor.QueryLatencyTracker;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
@@ -304,7 +305,10 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   /** The v3 API to build an OpenSearchRequest, calling by CalciteEnumerableIndexScan */
   public OpenSearchRequest buildRequest(OpenSearchRequestBuilder requestBuilder) {
     final TimeValue cursorKeepAlive = settings.getSettingValue(Settings.Key.SQL_CURSOR_KEEP_ALIVE);
-    return requestBuilder.build(
-        indexName, cursorKeepAlive, client, cachedFieldOpenSearchTypes.isEmpty());
+    OpenSearchRequest req =
+        requestBuilder.build(
+            indexName, cursorKeepAlive, client, cachedFieldOpenSearchTypes.isEmpty());
+    req.setQueryLatencyTracker(QueryLatencyTracker.current());
+    return req;
   }
 }

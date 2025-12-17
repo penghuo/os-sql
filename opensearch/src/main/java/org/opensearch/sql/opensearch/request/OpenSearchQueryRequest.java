@@ -39,6 +39,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ShardDocSortBuilder;
 import org.opensearch.search.sort.SortBuilders;
+import org.opensearch.sql.executor.QueryLatencyTracker;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
@@ -81,6 +82,12 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
   private Object[] searchAfter;
 
   private SearchResponse searchResponse = null;
+
+  private QueryLatencyTracker queryLatencyTracker;
+
+  public void setQueryLatencyTracker(QueryLatencyTracker queryLatencyTracker) {
+    this.queryLatencyTracker = queryLatencyTracker;
+  }
 
   @ToString.Exclude private Map<String, Object> afterKey;
 
@@ -199,6 +206,8 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
 
   private OpenSearchResponse search(Function<SearchRequest, SearchResponse> searchAction) {
     OpenSearchResponse openSearchResponse;
+    LOG.debug("[{}] dsl startTime={}", "dummy", System.currentTimeMillis());
+    long dslStart = System.nanoTime();
     if (searchDone) {
       openSearchResponse =
           new OpenSearchResponse(
@@ -237,6 +246,8 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
       }
       needClean = searchDone;
     }
+    LOG.debug("[{}] dsl endTime={}", "dummy", System.currentTimeMillis());
+    queryLatencyTracker.recordDSL(System.nanoTime() - dslStart);
     return openSearchResponse;
   }
 

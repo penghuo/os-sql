@@ -23,6 +23,7 @@ public class PPLQueryRequestFactory {
   private static final String DEFAULT_RESPONSE_FORMAT = "jdbc";
   private static final String DEFAULT_EXPLAIN_FORMAT = "standard";
   private static final String QUERY_PARAMS_PRETTY = "pretty";
+  private static final String QUERY_PARAMS_PROFILE = "profile";
 
   /**
    * Build {@link PPLQueryRequest} from {@link RestRequest}.
@@ -49,7 +50,8 @@ public class PPLQueryRequestFactory {
     if (ppl == null) {
       throw new IllegalArgumentException("Cannot find ppl parameter from the URL");
     }
-    return new PPLQueryRequest(ppl, null, restRequest.path());
+    boolean profile = getProfileOption(restRequest.params());
+    return new PPLQueryRequest(ppl, null, restRequest.path(), "", profile);
   }
 
   private static PPLQueryRequest parsePPLRequestFromPayload(RestRequest restRequest) {
@@ -57,6 +59,7 @@ public class PPLQueryRequestFactory {
     JSONObject jsonContent;
     Format format = getFormat(restRequest.params(), restRequest.rawPath());
     boolean pretty = getPrettyOption(restRequest.params());
+    boolean profile = getProfileOption(restRequest.params());
     try {
       jsonContent = new JSONObject(content);
       PPLQueryRequest pplRequest =
@@ -64,7 +67,8 @@ public class PPLQueryRequestFactory {
               jsonContent.getString(PPL_FIELD_NAME),
               jsonContent,
               restRequest.path(),
-              format.getFormatName());
+              format.getFormatName(),
+              profile);
       // set sanitize option if csv format
       if (format.equals(Format.CSV)) {
         pplRequest.sanitize(getSanitizeOption(restRequest.params()));
@@ -112,6 +116,17 @@ public class PPLQueryRequestFactory {
         return true;
       }
       return Boolean.parseBoolean(prettyValue);
+    }
+    return false;
+  }
+
+  private static boolean getProfileOption(Map<String, String> requestParams) {
+    if (requestParams.containsKey(QUERY_PARAMS_PROFILE)) {
+      String profileValue = requestParams.get(QUERY_PARAMS_PROFILE);
+      if (profileValue.isEmpty()) {
+        return true;
+      }
+      return Boolean.parseBoolean(profileValue);
     }
     return false;
   }

@@ -16,6 +16,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.sql.executor.QueryLatencyTracker;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 
@@ -35,6 +36,8 @@ public interface OpenSearchRequest extends Writeable {
   OpenSearchResponse search(
       Function<SearchRequest, SearchResponse> searchAction,
       Function<SearchScrollRequest, SearchResponse> scrollAction);
+
+  default void setQueryLatencyTracker(QueryLatencyTracker queryLatencyTracker) {}
 
   /**
    * Apply the cleanAction on request.

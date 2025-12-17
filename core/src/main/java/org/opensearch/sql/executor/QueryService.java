@@ -28,6 +28,9 @@ import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.ast.statement.Explain;
@@ -54,6 +57,7 @@ import org.opensearch.sql.planner.physical.PhysicalPlan;
 @AllArgsConstructor
 @Log4j2
 public class QueryService {
+  private static final Logger LOG = LogManager.getLogger(QueryService.class);
   private static final HepProgram FILTER_MERGE_PROGRAM =
       new HepProgramBuilder().addRuleInstance(FilterMergeRule.Config.DEFAULT.toRule()).build();
 
@@ -98,6 +102,12 @@ public class QueryService {
     CalcitePlanContext.run(
         () -> {
           try {
+            QueryLatencyTracker latencyTracker = QueryLatencyTracker.startIfEnabled();
+            long analyzeStart = System.nanoTime();
+            LOG.debug(
+                "[{}] analyze startTime={}",
+                ThreadContext.get("request_id"),
+                System.currentTimeMillis());
             CalcitePlanContext context =
                 CalcitePlanContext.create(
                     buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
@@ -105,6 +115,11 @@ public class QueryService {
             relNode = mergeAdjacentFilters(relNode);
             RelNode optimized = optimize(relNode, context);
             RelNode calcitePlan = convertToCalcitePlan(optimized);
+            LOG.debug(
+                "[{}] analyze endTime={}",
+                ThreadContext.get("request_id"),
+                System.currentTimeMillis());
+            latencyTracker.recordAnalyze(System.nanoTime() - analyzeStart);
             executionEngine.execute(calcitePlan, context, listener);
           } catch (Throwable t) {
             if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {

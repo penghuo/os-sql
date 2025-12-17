@@ -10,11 +10,13 @@ import static org.opensearch.sql.executor.execution.QueryPlanFactory.NO_CONSUMER
 
 import lombok.extern.log4j.Log4j2;
 import org.antlr.v4.runtime.tree.ParseTree;
+import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.sql.ast.statement.Statement;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
+import org.opensearch.sql.executor.QueryLatencyTracker;
 import org.opensearch.sql.executor.QueryManager;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.executor.execution.AbstractPlan;
@@ -64,6 +66,10 @@ public class PPLService {
       ResponseListener<QueryResponse> queryListener,
       ResponseListener<ExplainResponse> explainListener) {
     try {
+      if (request.profile()) {
+        ThreadContext.put("request_id", QueryContext.getRequestId());
+        ThreadContext.put(QueryLatencyTracker.PROFILE_FLAG, Boolean.toString(true));
+      }
       queryManager.submit(plan(request, queryListener, explainListener));
     } catch (Exception e) {
       queryListener.onFailure(e);
@@ -79,6 +85,10 @@ public class PPLService {
    */
   public void explain(PPLQueryRequest request, ResponseListener<ExplainResponse> listener) {
     try {
+      if (request.profile()) {
+        ThreadContext.put("request_id", QueryContext.getRequestId());
+        ThreadContext.put(QueryLatencyTracker.PROFILE_FLAG, Boolean.toString(true));
+      }
       queryManager.submit(plan(request, NO_CONSUMER_RESPONSE_LISTENER, listener));
     } catch (Exception e) {
       listener.onFailure(e);

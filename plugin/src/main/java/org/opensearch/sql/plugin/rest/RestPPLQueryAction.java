@@ -32,6 +32,7 @@ import org.opensearch.sql.exception.SemanticCheckException;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.opensearch.response.error.ErrorMessageFactory;
+import org.opensearch.sql.opensearch.util.RestRequestUtil;
 import org.opensearch.sql.plugin.request.PPLQueryRequestFactory;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
@@ -83,6 +84,8 @@ public class RestPPLQueryAction extends BaseRestHandler {
 
   @Override
   protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient nodeClient) {
+    RestRequestUtil.consumeAllRequestParameters(request);
+
     TransportPPLQueryRequest transportPPLQueryRequest =
         new TransportPPLQueryRequest(PPLQueryRequestFactory.getPPLRequest(request));
 

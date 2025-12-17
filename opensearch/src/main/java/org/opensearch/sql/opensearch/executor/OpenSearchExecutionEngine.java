@@ -34,6 +34,7 @@ import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
 import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.sql.ast.statement.Explain.ExplainFormat;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
@@ -48,6 +49,7 @@ import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
+import org.opensearch.sql.executor.QueryLatencyTracker;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
@@ -92,6 +94,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     PhysicalPlan plan = executionProtector.protect(physicalPlan);
     client.schedule(
         () -> {
+          QueryLatencyTracker latencyTracker = QueryLatencyTracker.startIfEnabled();
           try {
             List<ExprValue> result = new ArrayList<>();
 
@@ -107,7 +110,9 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                 new QueryResponse(
                     physicalPlan.schema(), result, planSerializer.convertToCursor(plan));
             listener.onResponse(response);
+            latencyTracker.finish();
           } catch (Exception e) {
+            latencyTracker.finish();
             listener.onFailure(e);
           } finally {
             plan.close();
@@ -203,27 +208,41 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
+          QueryLatencyTracker latencyTracker = QueryLatencyTracker.current();
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
             ResultSet result = statement.executeQuery();
-            buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit(), listener);
+            buildResultSet(
+                result,
+                rel.getRowType(),
+                context.sysLimit.querySizeLimit(),
+                listener,
+                latencyTracker);
           } catch (SQLException e) {
             throw new RuntimeException(e);
           }
         });
   }
 
-  private void buildResultSet(
+  private int buildResultSet(
       ResultSet resultSet,
       RelDataType rowTypes,
       Integer querySizeLimit,
-      ResponseListener<QueryResponse> listener)
+      ResponseListener<QueryResponse> listener,
+      QueryLatencyTracker latencyTracker)
       throws SQLException {
+
     // Get the ResultSet metadata to know about columns
     ResultSetMetaData metaData = resultSet.getMetaData();
     int columnCount = metaData.getColumnCount();
     List<RelDataType> fieldTypes =
         rowTypes.getFieldList().stream().map(RelDataTypeField::getType).toList();
     List<ExprValue> values = new ArrayList<>();
+
+    logger.debug(
+        "[{}] buildResultSet startTime={}",
+        ThreadContext.get("request_id"),
+        System.currentTimeMillis());
+    long buildStart = System.nanoTime();
     // Iterate through the ResultSet
     while (resultSet.next() && (querySizeLimit == null || values.size() < querySizeLimit)) {
       Map<String, ExprValue> row = new LinkedHashMap<String, ExprValue>();
@@ -239,7 +258,17 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       }
       values.add(ExprTupleValue.fromExprValueMap(row));
     }
+    logger.debug(
+        "[{}] buildResultSet endTime={}",
+        ThreadContext.get("request_id"),
+        System.currentTimeMillis());
+    latencyTracker.recordBuildResultSet(System.nanoTime() - buildStart, values.size());
 
+    logger.debug(
+        "[{}] buildFinalResults startTime={}",
+        ThreadContext.get("request_id"),
+        System.currentTimeMillis());
+    long buildFinalResults = System.nanoTime();
     List<Column> columns = new ArrayList<>(metaData.getColumnCount());
     for (int i = 1; i <= columnCount; ++i) {
       String columnName = metaData.getColumnName(i);
@@ -260,9 +289,16 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       }
       columns.add(new Column(columnName, null, exprType));
     }
+    latencyTracker.recordFinalResultSet(System.nanoTime() - buildFinalResults);
+
     Schema schema = new Schema(columns);
     QueryResponse response = new QueryResponse(schema, values, null);
+
+    logger.debug(
+        "[{}] query startTime={}", ThreadContext.get("request_id"), System.currentTimeMillis());
+    latencyTracker.finish();
     listener.onResponse(response);
+    return values.size();
   }
 
   /** Registers opensearch-dependent functions */

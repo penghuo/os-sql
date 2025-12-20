@@ -23,6 +23,7 @@ public class PPLQueryRequestFactory {
   private static final String DEFAULT_RESPONSE_FORMAT = "jdbc";
   private static final String DEFAULT_EXPLAIN_FORMAT = "standard";
   private static final String QUERY_PARAMS_PRETTY = "pretty";
+  private static final String QUERY_PARAMS_PROFILE = "profile";
 
   /**
    * Build {@link PPLQueryRequest} from {@link RestRequest}.
@@ -59,12 +60,14 @@ public class PPLQueryRequestFactory {
     boolean pretty = getPrettyOption(restRequest.params());
     try {
       jsonContent = new JSONObject(content);
+      boolean profile = jsonContent.optBoolean(QUERY_PARAMS_PROFILE, false);
       PPLQueryRequest pplRequest =
           new PPLQueryRequest(
               jsonContent.getString(PPL_FIELD_NAME),
               jsonContent,
               restRequest.path(),
-              format.getFormatName());
+              format.getFormatName(),
+              profile);
       // set sanitize option if csv format
       if (format.equals(Format.CSV)) {
         pplRequest.sanitize(getSanitizeOption(restRequest.params()));

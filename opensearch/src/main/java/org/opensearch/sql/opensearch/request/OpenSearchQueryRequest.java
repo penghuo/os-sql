@@ -31,6 +31,9 @@ import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.sql.monitor.profile.MetricName;
+import org.opensearch.sql.monitor.profile.ProfileMetric;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
@@ -174,22 +177,26 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
         return new OpenSearchResponse(
             SearchHits.empty(), exprValueFactory, includes, isCountAggRequest());
       } else {
+        ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
+        long executionStartTime = System.nanoTime();
         // get the value before set searchDone = true
         boolean isCountAggRequest = isCountAggRequest();
         searchDone = true;
-        return new OpenSearchResponse(
-            searchAction.apply(
-                new SearchRequest().indices(indexName.getIndexNames()).source(sourceBuilder)),
-            exprValueFactory,
-            includes,
-            isCountAggRequest);
+        OpenSearchResponse openSearchResponse =
+            new OpenSearchResponse(
+                searchAction.apply(
+                    new SearchRequest().indices(indexName.getIndexNames()).source(sourceBuilder)),
+                exprValueFactory,
+                includes,
+                isCountAggRequest);
+        metric.add(System.nanoTime() - executionStartTime);
+        return openSearchResponse;
       }
     } else {
       // Search with PIT instead of scroll API
       return searchWithPIT(searchAction);
     }
   }
-
   public OpenSearchResponse searchWithPIT(Function<SearchRequest, SearchResponse> searchAction) {
     OpenSearchResponse openSearchResponse;
     if (searchDone) {
@@ -197,6 +204,8 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
           new OpenSearchResponse(
               SearchHits.empty(), exprValueFactory, includes, isCountAggRequest());
     } else {
+      ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
+      long executionStartTime = System.nanoTime();
       this.sourceBuilder.pointInTimeBuilder(new PointInTimeBuilder(this.pitId));
       this.sourceBuilder.timeout(cursorKeepAlive);
       // check for search after
@@ -225,6 +234,7 @@ public class OpenSearchQueryRequest implements OpenSearchRequest {
         searchAfter = searchHits[searchHits.length - 1].getSortValues();
         this.sourceBuilder.searchAfter(searchAfter);
       }
+      metric.add(System.nanoTime() - executionStartTime);
     }
     return openSearchResponse;
   }

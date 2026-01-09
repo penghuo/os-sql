@@ -38,9 +38,19 @@ import org.opensearch.sql.calcite.plan.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.LogicalSystemLimit.SystemLimitType;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
+import org.opensearch.sql.common.utils.QueryContext;
+import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.NonFallbackCalciteException;
+import org.opensearch.sql.monitor.profile.MetricName;
+import org.opensearch.sql.monitor.profile.ProfileContext;
+import org.opensearch.sql.monitor.profile.ProfileMetric;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
+import org.opensearch.sql.monitor.profile.MetricName;
+import org.opensearch.sql.monitor.profile.ProfileContext;
+import org.opensearch.sql.monitor.profile.ProfileMetric;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.planner.PlanContext;
 import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPaginate;
@@ -93,6 +103,10 @@ public class QueryService {
     CalcitePlanContext.run(
         () -> {
           try {
+            ProfileContext profileContext =
+                QueryProfiling.activate(QueryContext.isProfileEnabled());
+            ProfileMetric analyzeMetric = profileContext.getOrCreateMetric(MetricName.ANALYZE);
+            long analyzeStart = System.nanoTime();
             AccessController.doPrivileged(
                 (PrivilegedAction<Void>)
                     () -> {
@@ -102,6 +116,7 @@ public class QueryService {
                       RelNode relNode = analyze(plan, context);
                       RelNode optimized = optimize(relNode, context);
                       RelNode calcitePlan = convertToCalcitePlan(optimized);
+                      analyzeMetric.set(System.nanoTime() - analyzeStart);
                       executionEngine.execute(calcitePlan, context, listener);
                       return null;
                     });
@@ -136,6 +151,7 @@ public class QueryService {
     CalcitePlanContext.run(
         () -> {
           try {
+            QueryProfiling.noop();
             AccessController.doPrivileged(
                 (PrivilegedAction<Void>)
                     () -> {

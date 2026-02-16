@@ -45,6 +45,9 @@ public abstract class Settings {
         "plugins.calcite.pushdown.rowcount.estimation.factor"),
     CALCITE_SUPPORT_ALL_JOIN_TYPES("plugins.calcite.all_join_types.allowed"),
 
+    /** Distributed execution settings. */
+    DISTRIBUTED_EXECUTION_ENABLED("plugins.query.distributed.enabled"),
+
     /** Query Settings. */
     FIELD_TYPE_TOLERANCE("plugins.query.field_type_tolerance"),
 

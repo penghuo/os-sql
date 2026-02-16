@@ -6,6 +6,7 @@
 package org.opensearch.sql.plugin.config;
 
 import lombok.RequiredArgsConstructor;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.AbstractModule;
 import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
@@ -24,12 +25,17 @@ import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.sql.opensearch.executor.distributed.DistributedExecutionEngine;
+import org.opensearch.sql.opensearch.executor.distributed.ExchangeService;
+import org.opensearch.sql.opensearch.executor.distributed.OpenSearchShardSplitManager;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.executor.protector.OpenSearchExecutionProtector;
 import org.opensearch.sql.opensearch.monitor.OpenSearchMemoryHealthy;
 import org.opensearch.sql.opensearch.monitor.OpenSearchResourceMonitor;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
 import org.opensearch.sql.planner.Planner;
+import org.opensearch.sql.planner.distributed.FragmentPlanner;
+import org.opensearch.sql.planner.distributed.ShardSplitManager;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.ppl.PPLService;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
@@ -95,16 +101,51 @@ public class OpenSearchPluginModule extends AbstractModule {
     return new SQLService(new SQLSyntaxParser(), queryManager, queryPlanFactory);
   }
 
+  @Provides
+  @Singleton
+  public ShardSplitManager shardSplitManager(ClusterService clusterService) {
+    return new OpenSearchShardSplitManager(clusterService);
+  }
+
+  @Provides
+  @Singleton
+  public ExchangeService exchangeService() {
+    return new ExchangeService();
+  }
+
   /** {@link QueryPlanFactory}. */
   @Provides
   public QueryPlanFactory queryPlanFactory(
-      DataSourceService dataSourceService, ExecutionEngine executionEngine, Settings settings) {
+      DataSourceService dataSourceService,
+      ExecutionEngine executionEngine,
+      Settings settings,
+      ClusterService clusterService,
+      ShardSplitManager shardSplitManager,
+      ExchangeService exchangeService) {
     Analyzer analyzer =
         new Analyzer(
             new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
     Planner planner = new Planner(LogicalPlanOptimizer.create());
+
+    // Create distributed execution engine with fallback to the single-node engine
+    String localNodeId = clusterService.localNode().getId();
+    DistributedExecutionEngine distributedEngine =
+        new DistributedExecutionEngine(
+            new FragmentPlanner(),
+            shardSplitManager,
+            exchangeService,
+            executionEngine,
+            localNodeId);
+
     QueryService queryService =
-        new QueryService(analyzer, executionEngine, planner, dataSourceService, settings);
+        new QueryService(
+            analyzer,
+            executionEngine,
+            planner,
+            dataSourceService,
+            settings,
+            distributedEngine,
+            shardSplitManager);
     return new QueryPlanFactory(queryService);
   }
 }

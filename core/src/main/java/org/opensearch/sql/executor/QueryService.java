@@ -8,9 +8,7 @@ package org.opensearch.sql.executor;
 import java.util.List;
 import java.util.Optional;
 import javax.annotation.Nullable;
-import lombok.AllArgsConstructor;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.plan.RelTraitDef;
@@ -46,13 +44,15 @@ import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.planner.PlanContext;
 import org.opensearch.sql.planner.Planner;
+import org.opensearch.sql.planner.distributed.CardinalityEstimator;
+import org.opensearch.sql.planner.distributed.FragmentPlanner;
+import org.opensearch.sql.planner.distributed.QueryRouter;
+import org.opensearch.sql.planner.distributed.ShardSplitManager;
 import org.opensearch.sql.planner.logical.LogicalPaginate;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
 /** The low level interface of core engine. */
-@RequiredArgsConstructor
-@AllArgsConstructor
 @Log4j2
 public class QueryService {
   private final Analyzer analyzer;
@@ -60,6 +60,47 @@ public class QueryService {
   private final Planner planner;
   private DataSourceService dataSourceService;
   private Settings settings;
+
+  /**
+   * Optional distributed execution engine. When set and distributed execution is enabled, queries
+   * that benefit from distribution are routed here instead of to the default executionEngine.
+   */
+  @Nullable private ExecutionEngine distributedEngine;
+
+  @Nullable private ShardSplitManager shardSplitManager;
+
+  /** Constructor with required fields only. */
+  public QueryService(Analyzer analyzer, ExecutionEngine executionEngine, Planner planner) {
+    this.analyzer = analyzer;
+    this.executionEngine = executionEngine;
+    this.planner = planner;
+  }
+
+  /** Constructor with required fields and data source/settings. */
+  public QueryService(
+      Analyzer analyzer,
+      ExecutionEngine executionEngine,
+      Planner planner,
+      DataSourceService dataSourceService,
+      Settings settings) {
+    this(analyzer, executionEngine, planner);
+    this.dataSourceService = dataSourceService;
+    this.settings = settings;
+  }
+
+  /** Constructor with all fields including distributed execution support. */
+  public QueryService(
+      Analyzer analyzer,
+      ExecutionEngine executionEngine,
+      Planner planner,
+      DataSourceService dataSourceService,
+      Settings settings,
+      @Nullable ExecutionEngine distributedEngine,
+      @Nullable ShardSplitManager shardSplitManager) {
+    this(analyzer, executionEngine, planner, dataSourceService, settings);
+    this.distributedEngine = distributedEngine;
+    this.shardSplitManager = shardSplitManager;
+  }
 
   @Getter(lazy = true)
   private final CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor(dataSourceService);
@@ -106,7 +147,10 @@ public class QueryService {
             RelNode relNode = analyze(plan, context);
             RelNode calcitePlan = convertToCalcitePlan(relNode, context);
             analyzeMetric.set(System.nanoTime() - analyzeStart);
-            executionEngine.execute(calcitePlan, context, listener);
+
+            // Route to distributed engine if enabled and beneficial
+            ExecutionEngine targetEngine = selectEngine(calcitePlan);
+            targetEngine.execute(calcitePlan, context, listener);
           } catch (Throwable t) {
             if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {
               log.warn("Fallback to V2 query engine since got exception", t);
@@ -146,7 +190,8 @@ public class QueryService {
                 () -> {
                   RelNode relNode = analyze(plan, context);
                   RelNode calcitePlan = convertToCalcitePlan(relNode, context);
-                  executionEngine.explain(calcitePlan, mode, context, listener);
+                  ExecutionEngine targetEngine = selectEngine(calcitePlan);
+                  targetEngine.explain(calcitePlan, mode, context, listener);
                 },
                 settings);
           } catch (Throwable t) {
@@ -264,6 +309,24 @@ public class QueryService {
   /** Translate {@link LogicalPlan} to {@link PhysicalPlan}. */
   public PhysicalPlan plan(LogicalPlan plan) {
     return planner.plan(plan);
+  }
+
+  /**
+   * Selects the execution engine based on whether distributed execution is enabled and beneficial
+   * for the given plan.
+   *
+   * @param calcitePlan the optimized Calcite plan
+   * @return the distributed engine if routing decides to distribute, otherwise the default engine
+   */
+  /**
+   * Selects the execution engine. When a distributed engine is configured, it is always used for
+   * PPL queries regardless of cluster topology or query characteristics.
+   */
+  private ExecutionEngine selectEngine(RelNode calcitePlan) {
+    if (distributedEngine != null) {
+      return distributedEngine;
+    }
+    return executionEngine;
   }
 
   private boolean isCalciteFallbackAllowed(@Nullable Throwable t) {

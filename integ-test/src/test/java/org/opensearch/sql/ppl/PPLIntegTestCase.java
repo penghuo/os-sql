@@ -202,6 +202,18 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
             "persistent", Settings.Key.CALCITE_ENGINE_ENABLED.getKeyValue(), "true"));
   }
 
+  public static void enableDistributedExecution() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_EXECUTION_ENABLED.getKeyValue(), "true"));
+  }
+
+  public static void disableDistributedExecution() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_EXECUTION_ENABLED.getKeyValue(), "false"));
+  }
+
   public static void disableCalcite() throws IOException {
     updateClusterSettings(
         new SQLIntegTestCase.ClusterSetting(

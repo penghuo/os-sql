@@ -5,6 +5,11 @@
 
 package org.opensearch.sql.planner.physical;
 
+import org.opensearch.sql.planner.physical.distributed.DistributedExchangeOperator;
+import org.opensearch.sql.planner.physical.distributed.DistributedHashJoinOperator;
+import org.opensearch.sql.planner.physical.distributed.DistributedSortOperator;
+import org.opensearch.sql.planner.physical.distributed.FinalAggregationOperator;
+import org.opensearch.sql.planner.physical.distributed.PartialAggregationOperator;
 import org.opensearch.sql.storage.TableScanOperator;
 import org.opensearch.sql.storage.write.TableWriteOperator;
 
@@ -101,6 +106,26 @@ public abstract class PhysicalPlanNodeVisitor<R, C> {
   }
 
   public R visitCursorClose(CursorCloseOperator node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitPartialAggregation(PartialAggregationOperator node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitFinalAggregation(FinalAggregationOperator node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitDistributedExchange(DistributedExchangeOperator node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitDistributedHashJoin(DistributedHashJoinOperator node, C context) {
+    return visitNode(node, context);
+  }
+
+  public R visitDistributedSort(DistributedSortOperator node, C context) {
     return visitNode(node, context);
   }
 }

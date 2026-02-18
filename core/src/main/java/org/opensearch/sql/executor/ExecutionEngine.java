@@ -117,7 +117,8 @@ public interface ExecutionEngine {
             new ExecutionEngine.ExplainResponseNodeV2(
                 normalizeLf(calcite.getLogical()),
                 normalizeLf(calcite.getPhysical()),
-                normalizeLf(calcite.getExtended())));
+                normalizeLf(calcite.getExtended()),
+                normalizeLf(calcite.getDistributed())));
       }
       return response;
     }
@@ -136,12 +137,25 @@ public interface ExecutionEngine {
     private List<ExplainResponseNode> children;
   }
 
-  @RequiredArgsConstructor
   @Data
   @ToString
   class ExplainResponseNodeV2 {
     private final String logical;
     private final String physical;
     private final String extended;
+    /** Distributed plan showing Exchange nodes from PlanSplitter (DQE Phase 2). */
+    private final String distributed;
+
+    public ExplainResponseNodeV2(String logical, String physical, String extended) {
+      this(logical, physical, extended, null);
+    }
+
+    public ExplainResponseNodeV2(
+        String logical, String physical, String extended, String distributed) {
+      this.logical = logical;
+      this.physical = physical;
+      this.extended = extended;
+      this.distributed = distributed;
+    }
   }
 }

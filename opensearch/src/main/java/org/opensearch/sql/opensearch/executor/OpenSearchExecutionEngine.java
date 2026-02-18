@@ -175,8 +175,14 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
           try {
             if (mode == ExplainMode.SIMPLE) {
               String logical = RelOptUtil.toString(rel, SqlExplainLevel.NO_ATTRIBUTES);
+              // Also show the distributed plan with Exchange nodes
+              RelNode distributedPlan = generateDistributedPlan(rel);
+              String distributed = distributedPlan != null
+                  ? RelOptUtil.toString(distributedPlan, SqlExplainLevel.NO_ATTRIBUTES)
+                  : null;
               listener.onResponse(
-                  new ExplainResponse(new ExplainResponseNodeV2(logical, null, null)));
+                  new ExplainResponse(
+                      new ExplainResponseNodeV2(logical, null, null, distributed)));
             } else {
               SqlExplainLevel level =
                   mode == ExplainMode.COST
@@ -193,9 +199,15 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                 // triggers the hook
                 OpenSearchRelRunners.run(context, rel);
               }
+              // Also show the distributed plan with Exchange nodes
+              RelNode distributedPlan = generateDistributedPlan(rel);
+              String distributed = distributedPlan != null
+                  ? RelOptUtil.toString(distributedPlan, level)
+                  : null;
               listener.onResponse(
                   new ExplainResponse(
-                      new ExplainResponseNodeV2(logical, physical.get(), javaCode.get())));
+                      new ExplainResponseNodeV2(
+                          logical, physical.get(), javaCode.get(), distributed)));
             }
           } catch (Exception e) {
             listener.onFailure(e);
@@ -211,17 +223,25 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     client.schedule(
         () -> {
           try {
-            // Apply PlanSplitter for distributed execution when legacy pushdown is disabled
-            RelNode planToExecute = applyPlanSplitting(rel, context);
-            try (PreparedStatement statement =
-                OpenSearchRelRunners.run(context, planToExecute)) {
+            // Note: PlanSplitter is not applied during execution yet. Exchange nodes
+            // (ConcatExchange, HashExchange, MergeSortExchange, etc.) are infrastructure
+            // for distributed shard dispatch which is not yet wired into the execution
+            // pipeline. The PlanSplitter output is visible via the explain API's
+            // "distributed" field for diagnostics and planning validation.
+            //
+            // Once shard dispatch is fully wired, this method will:
+            //   1. Apply PlanSplitter to get the distributed plan
+            //   2. Extract shard fragments below Exchange nodes
+            //   3. Serialize + scatter fragments to data nodes
+            //   4. Merge results on coordinator via Exchange.scan()
+            try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
               ProfileMetric metric =
                   QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
               long execTime = System.nanoTime();
               ResultSet result = statement.executeQuery();
               QueryResponse response =
                   buildResultSet(
-                      result, planToExecute.getRowType(), context.sysLimit.querySizeLimit());
+                      result, rel.getRowType(), context.sysLimit.querySizeLimit());
               metric.add(System.nanoTime() - execTime);
               listener.onResponse(response);
             }
@@ -232,47 +252,22 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   /**
-   * Applies PlanSplitter to insert Exchange nodes for distributed execution. The PlanSplitter
-   * walks the optimized plan and inserts Exchange nodes at the shard/coordinator boundary.
+   * Generates the distributed execution plan by running the PlanSplitter on the optimized
+   * physical plan. This shows where Exchange nodes would be inserted for shard dispatch.
    *
-   * <p>When legacy pushdown is enabled (via CalciteLogicalIndexScan.register()), pushdown rules
-   * are already applied and the plan already contains pushed-down scans — in that case, the
-   * PlanSplitter produces a minimal plan with just ConcatExchange wrapping the scan.
+   * <p>Used by the explain API to show the distributed plan layout without affecting execution.
    *
-   * <p>Phase 2: The split plan may contain HashExchange nodes, indicating multi-phase execution:
-   * <ol>
-   *   <li>Phase 1 (scatter): Ship shard fragments to data nodes, execute locally
-   *   <li>Phase 2 (shuffle): Repartition intermediate results by hash key across nodes
-   *   <li>Phase 3 (gather): Collect final results from all partitions
-   * </ol>
+   * @param physicalPlan the optimized physical plan (after VolcanoPlanner)
+   * @return the plan with Exchange nodes inserted at shard/coordinator boundaries
    */
-  private RelNode applyPlanSplitting(RelNode rel, CalcitePlanContext context) {
-    PlanSplitter splitter = new PlanSplitter();
-    RelNode splitPlan = splitter.split(rel);
-
-    if (containsHashExchange(splitPlan)) {
-      logger.debug("Multi-phase execution detected: plan contains HashExchange nodes");
+  private RelNode generateDistributedPlan(RelNode physicalPlan) {
+    try {
+      PlanSplitter splitter = new PlanSplitter();
+      return splitter.split(physicalPlan);
+    } catch (Exception e) {
+      logger.debug("PlanSplitter failed on physical plan, skipping distributed view", e);
+      return null;
     }
-
-    return splitPlan;
-  }
-
-  /**
-   * Checks if the plan contains any HashExchange nodes, indicating multi-phase (shuffle) execution.
-   */
-  private boolean containsHashExchange(RelNode plan) {
-    boolean[] found = {false};
-    plan.accept(
-        new org.apache.calcite.rel.RelShuttleImpl() {
-          @Override
-          public RelNode visit(RelNode other) {
-            if (other instanceof org.opensearch.sql.opensearch.planner.merge.HashExchange) {
-              found[0] = true;
-            }
-            return found[0] ? other : super.visit(other);
-          }
-        });
-    return found[0];
   }
 
   /**

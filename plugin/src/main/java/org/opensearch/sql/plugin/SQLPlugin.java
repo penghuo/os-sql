@@ -97,7 +97,13 @@ import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.plugin.rest.RestPPLQueryAction;
 import org.opensearch.sql.plugin.rest.RestPPLStatsAction;
 import org.opensearch.sql.plugin.rest.RestQuerySettingsAction;
+import org.opensearch.sql.plugin.transport.CalciteShardAction;
+import org.opensearch.sql.plugin.transport.CalciteShardResponse;
+import org.opensearch.sql.plugin.transport.CalciteShuffleAction;
+import org.opensearch.sql.plugin.transport.CalciteShuffleResponse;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
+import org.opensearch.sql.plugin.transport.TransportCalciteShardAction;
+import org.opensearch.sql.plugin.transport.TransportCalciteShuffleAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.sql.prometheus.storage.PrometheusStorageFactory;
@@ -180,6 +186,12 @@ public class SQLPlugin extends Plugin
         new ActionHandler<>(
             new ActionType<>(PPLQueryAction.NAME, TransportPPLQueryResponse::new),
             TransportPPLQueryAction.class),
+        new ActionHandler<>(
+            new ActionType<>(CalciteShardAction.NAME, CalciteShardResponse::new),
+            TransportCalciteShardAction.class),
+        new ActionHandler<>(
+            new ActionType<>(CalciteShuffleAction.NAME, CalciteShuffleResponse::new),
+            TransportCalciteShuffleAction.class),
         new ActionHandler<>(
             new ActionType<>(
                 TransportCreateDataSourceAction.NAME, CreateDataSourceActionResponse::new),

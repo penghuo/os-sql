@@ -58,6 +58,7 @@ import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.planner.PlanSplitter;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
@@ -209,19 +210,69 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
-          try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
-            ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
-            long execTime = System.nanoTime();
-            ResultSet result = statement.executeQuery();
-            QueryResponse response =
-                buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit());
-            metric.add(System.nanoTime() - execTime);
-            listener.onResponse(response);
-
+          try {
+            // Apply PlanSplitter for distributed execution when legacy pushdown is disabled
+            RelNode planToExecute = applyPlanSplitting(rel, context);
+            try (PreparedStatement statement =
+                OpenSearchRelRunners.run(context, planToExecute)) {
+              ProfileMetric metric =
+                  QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
+              long execTime = System.nanoTime();
+              ResultSet result = statement.executeQuery();
+              QueryResponse response =
+                  buildResultSet(
+                      result, planToExecute.getRowType(), context.sysLimit.querySizeLimit());
+              metric.add(System.nanoTime() - execTime);
+              listener.onResponse(response);
+            }
           } catch (SQLException e) {
             throw new RuntimeException(e);
           }
         });
+  }
+
+  /**
+   * Applies PlanSplitter to insert Exchange nodes for distributed execution. The PlanSplitter
+   * walks the optimized plan and inserts Exchange nodes at the shard/coordinator boundary.
+   *
+   * <p>When legacy pushdown is enabled (via CalciteLogicalIndexScan.register()), pushdown rules
+   * are already applied and the plan already contains pushed-down scans — in that case, the
+   * PlanSplitter produces a minimal plan with just ConcatExchange wrapping the scan.
+   *
+   * <p>Phase 2: The split plan may contain HashExchange nodes, indicating multi-phase execution:
+   * <ol>
+   *   <li>Phase 1 (scatter): Ship shard fragments to data nodes, execute locally
+   *   <li>Phase 2 (shuffle): Repartition intermediate results by hash key across nodes
+   *   <li>Phase 3 (gather): Collect final results from all partitions
+   * </ol>
+   */
+  private RelNode applyPlanSplitting(RelNode rel, CalcitePlanContext context) {
+    PlanSplitter splitter = new PlanSplitter();
+    RelNode splitPlan = splitter.split(rel);
+
+    if (containsHashExchange(splitPlan)) {
+      logger.debug("Multi-phase execution detected: plan contains HashExchange nodes");
+    }
+
+    return splitPlan;
+  }
+
+  /**
+   * Checks if the plan contains any HashExchange nodes, indicating multi-phase (shuffle) execution.
+   */
+  private boolean containsHashExchange(RelNode plan) {
+    boolean[] found = {false};
+    plan.accept(
+        new org.apache.calcite.rel.RelShuttleImpl() {
+          @Override
+          public RelNode visit(RelNode other) {
+            if (other instanceof org.opensearch.sql.opensearch.planner.merge.HashExchange) {
+              found[0] = true;
+            }
+            return found[0] ? other : super.visit(other);
+          }
+        });
+    return found[0];
   }
 
   /**

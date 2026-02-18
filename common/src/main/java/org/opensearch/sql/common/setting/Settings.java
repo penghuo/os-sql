@@ -45,6 +45,9 @@ public abstract class Settings {
         "plugins.calcite.pushdown.rowcount.estimation.factor"),
     CALCITE_SUPPORT_ALL_JOIN_TYPES("plugins.calcite.all_join_types.allowed"),
 
+    /** Deprecated: emergency rollback to legacy pushdown path. Removed in next minor. */
+    CALCITE_LEGACY_PUSHDOWN_ENABLED("plugins.calcite.legacy_pushdown.enabled"),
+
     /** Query Settings. */
     FIELD_TYPE_TOLERANCE("plugins.query.field_type_tolerance"),
 

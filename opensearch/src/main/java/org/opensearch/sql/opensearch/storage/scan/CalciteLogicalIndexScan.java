@@ -130,7 +130,14 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
     for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_NON_PUSHDOWN_RULES) {
       planner.addRule(rule);
     }
-    if ((Boolean) osIndex.getSettings().getSettingValue(Settings.Key.CALCITE_PUSHDOWN_ENABLED)) {
+    // When legacy pushdown is enabled (emergency rollback), use the old pushdown rules.
+    // When disabled (default), DQE handles operator placement via PlanSplitter.
+    boolean legacyPushdownEnabled =
+        (Boolean)
+            osIndex.getSettings().getSettingValue(Settings.Key.CALCITE_LEGACY_PUSHDOWN_ENABLED);
+    if (legacyPushdownEnabled
+        && (Boolean)
+            osIndex.getSettings().getSettingValue(Settings.Key.CALCITE_PUSHDOWN_ENABLED)) {
       for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_PUSHDOWN_RULES) {
         planner.addRule(rule);
       }

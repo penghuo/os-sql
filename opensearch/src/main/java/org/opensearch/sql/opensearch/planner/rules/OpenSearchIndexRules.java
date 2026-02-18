@@ -57,7 +57,14 @@ public class OpenSearchIndexRules {
   private static final EnumerableTopKMergeRule ENUMERABLE_TOP_K_MERGE_RULE =
       EnumerableTopKMergeRule.Config.DEFAULT.toRule();
 
-  /** The rules will apply only when the pushdown is enabled. */
+  /**
+   * Deprecated: These pushdown rules are only used when legacy pushdown is enabled
+   * (plugins.calcite.legacy_pushdown.enabled=true). In the default DQE path, PlanSplitter
+   * handles operator placement and these rules are not registered.
+   *
+   * @deprecated Will be removed in next minor version along with the legacy pushdown setting.
+   */
+  @Deprecated
   public static final List<RelOptRule> OPEN_SEARCH_PUSHDOWN_RULES =
       ImmutableList.of(
           PROJECT_INDEX_SCAN,

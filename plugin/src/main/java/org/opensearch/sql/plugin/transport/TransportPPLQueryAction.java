@@ -27,11 +27,15 @@ import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
+import org.opensearch.sql.distributed.DistributedQueryExecutorImpl;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
+import org.opensearch.indices.IndicesService;
+import org.opensearch.sql.plugin.config.NodeLocalSourceProvider;
 import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.ppl.PPLService;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
@@ -64,7 +68,8 @@ public class TransportPPLQueryAction
       NodeClient client,
       ClusterService clusterService,
       DataSourceServiceImpl dataSourceService,
-      org.opensearch.common.settings.Settings clusterSettings) {
+      org.opensearch.common.settings.Settings clusterSettings,
+      IndicesService indicesService) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
 
     ModulesBuilder modules = new ModulesBuilder();
@@ -77,6 +82,13 @@ public class TransportPPLQueryAction
           b.bind(DataSourceService.class).toInstance(dataSourceService);
         });
     this.injector = Guice.createInjector(modules);
+
+    // Wire the distributed query executor
+    QueryService queryService = injector.getInstance(QueryService.class);
+    NodeLocalSourceProvider sourceProvider =
+        new NodeLocalSourceProvider(indicesService, clusterService);
+    queryService.setDistributedQueryExecutor(new DistributedQueryExecutorImpl(sourceProvider));
+
     this.pplEnabled =
         () ->
             MULTI_ALLOW_EXPLICIT_INDEX.get(clusterSettings)

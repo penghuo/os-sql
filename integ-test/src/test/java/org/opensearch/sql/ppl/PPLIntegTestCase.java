@@ -409,6 +409,80 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
     }
   }
 
+  // ---- Distributed Engine Test Helpers ----
+
+  /** Enable the distributed engine feature flag. */
+  public static void enableDistributedEngine() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_ENGINE_ENABLED.getKeyValue(), "true"));
+    LOG.info("Distributed engine enabled");
+  }
+
+  /** Disable the distributed engine feature flag. */
+  public static void disableDistributedEngine() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_ENGINE_ENABLED.getKeyValue(), "false"));
+    LOG.info("Distributed engine disabled");
+  }
+
+  /** Enable strict mode for the distributed engine. */
+  public static void enableStrictMode() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_ENGINE_STRICT_MODE.getKeyValue(), "true"));
+    LOG.info("Distributed engine strict mode enabled");
+  }
+
+  /** Disable strict mode for the distributed engine. */
+  public static void disableStrictMode() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DISTRIBUTED_ENGINE_STRICT_MODE.getKeyValue(), "false"));
+    LOG.info("Distributed engine strict mode disabled");
+  }
+
+  /**
+   * Assert that the query response indicates it was processed by the expected engine.
+   *
+   * @param expectedEngine one of "distributed", "calcite_local", "legacy_dsl"
+   * @param response the JSON response from the query
+   */
+  protected void assertEngineUsed(String expectedEngine, JSONObject response) {
+    if (response.has("engine")) {
+      Assert.assertEquals(
+          "Expected engine '" + expectedEngine + "' but got '" + response.getString("engine") + "'",
+          expectedEngine,
+          response.getString("engine"));
+    }
+  }
+
+  /** Run a block with the distributed engine enabled, restoring the original state afterward. */
+  public static void withDistributedEngine(Runnable f) throws IOException {
+    try {
+      enableDistributedEngine();
+      f.run();
+    } finally {
+      disableDistributedEngine();
+    }
+  }
+
+  /**
+   * Run a block with the distributed engine and strict mode both enabled, restoring original state
+   * afterward.
+   */
+  public static void withStrictMode(Runnable f) throws IOException {
+    try {
+      enableDistributedEngine();
+      enableStrictMode();
+      f.run();
+    } finally {
+      disableStrictMode();
+      disableDistributedEngine();
+    }
+  }
+
   protected String loadExpectedPlan(String fileName) throws IOException {
     String prefix;
     if (isCalciteEnabled()) {

@@ -8,9 +8,9 @@ package org.opensearch.sql.executor;
 import java.util.List;
 import java.util.Optional;
 import javax.annotation.Nullable;
-import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.plan.RelTraitDef;
@@ -52,7 +52,6 @@ import org.opensearch.sql.planner.physical.PhysicalPlan;
 
 /** The low level interface of core engine. */
 @RequiredArgsConstructor
-@AllArgsConstructor
 @Log4j2
 public class QueryService {
   private final Analyzer analyzer;
@@ -60,6 +59,31 @@ public class QueryService {
   private final Planner planner;
   private DataSourceService dataSourceService;
   private Settings settings;
+
+  /**
+   * Optional distributed query executor. When set and the distributed engine feature flag is
+   * enabled, queries are attempted through the distributed engine first, with fallback to the
+   * existing DSL/Calcite path on failure or unsupported patterns.
+   */
+  @Setter private DistributedQueryExecutor distributedQueryExecutor;
+
+  /** Metrics collector for tracking distributed engine execution statistics. */
+  @Setter
+  private DistributedEngineMetricsCollector metricsCollector =
+      DistributedEngineMetricsCollector.NOOP;
+
+  public QueryService(
+      Analyzer analyzer,
+      ExecutionEngine executionEngine,
+      Planner planner,
+      DataSourceService dataSourceService,
+      Settings settings) {
+    this.analyzer = analyzer;
+    this.executionEngine = executionEngine;
+    this.planner = planner;
+    this.dataSourceService = dataSourceService;
+    this.settings = settings;
+  }
 
   @Getter(lazy = true)
   private final CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor(dataSourceService);
@@ -124,6 +148,30 @@ public class QueryService {
             RelNode relNode = analyze(plan, context);
             RelNode calcitePlan = convertToCalcitePlan(relNode, context);
             analyzeMetric.set(System.nanoTime() - analyzeStart);
+
+            // Attempt distributed execution if enabled
+            if (isDistributedEngineEnabled() && distributedQueryExecutor != null) {
+              metricsCollector.recordQueryTotal();
+              try {
+                distributedQueryExecutor.execute(calcitePlan, context, listener);
+                metricsCollector.recordQueryDistributed();
+                return;
+              } catch (UnsupportedOperationException e) {
+                // Expected fallback: unsupported pattern (joins, windows, etc.)
+                metricsCollector.recordFallbackExpected();
+                log.debug("Distributed engine unsupported pattern, falling back to DSL: {}",
+                    e.getMessage());
+              } catch (Exception e) {
+                // Unexpected failure of a supported pattern
+                metricsCollector.recordFallbackError();
+                if (isStrictModeEnabled()) {
+                  throw new StrictModeViolationException(
+                      "Distributed execution failed in strict mode: " + e.getMessage(), e);
+                }
+                log.warn("Distributed execution failed, falling back to DSL", e);
+              }
+            }
+
             executionEngine.execute(calcitePlan, context, listener);
           } catch (Throwable t) {
             if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {
@@ -153,7 +201,16 @@ public class QueryService {
                 () -> {
                   RelNode relNode = analyze(plan, context);
                   RelNode calcitePlan = convertToCalcitePlan(relNode, context);
-                  executionEngine.explain(calcitePlan, mode, context, listener);
+
+                  // Try to generate distributed plan info if the distributed engine is enabled
+                  ExecutionEngine.DistributedExplainInfo distributedInfo =
+                      tryDistributedExplain(calcitePlan, context);
+
+                  // Wrap the listener to merge distributed info into the response
+                  ResponseListener<ExecutionEngine.ExplainResponse> wrappedListener =
+                      wrapListenerWithDistributedInfo(listener, distributedInfo);
+
+                  executionEngine.explain(calcitePlan, mode, context, wrappedListener);
                 },
                 settings);
           } catch (Throwable t) {
@@ -267,6 +324,55 @@ public class QueryService {
     return planner.plan(plan);
   }
 
+  /**
+   * Attempts to generate distributed explain info for the given Calcite plan. Returns null if the
+   * distributed engine is disabled, the executor is not set, the pattern is unsupported, or an
+   * error occurs during explain generation.
+   */
+  private ExecutionEngine.DistributedExplainInfo tryDistributedExplain(
+      RelNode calcitePlan, CalcitePlanContext context) {
+    if (!isDistributedEngineEnabled() || distributedQueryExecutor == null) {
+      return null;
+    }
+    try {
+      return distributedQueryExecutor.explain(calcitePlan, context);
+    } catch (UnsupportedOperationException e) {
+      // Expected: unsupported pattern (joins, windows, etc.) - leave distributed section empty
+      log.debug(
+          "Distributed explain unsupported pattern, omitting distributed section: {}",
+          e.getMessage());
+      return null;
+    } catch (Exception e) {
+      // Unexpected failure - do not break the explain response, just log
+      log.warn("Failed to generate distributed explain plan", e);
+      return null;
+    }
+  }
+
+  /**
+   * Wraps the explain response listener to merge distributed plan info into the response. If
+   * distributedInfo is null, the original listener is returned unchanged.
+   */
+  private ResponseListener<ExecutionEngine.ExplainResponse> wrapListenerWithDistributedInfo(
+      ResponseListener<ExecutionEngine.ExplainResponse> delegate,
+      ExecutionEngine.DistributedExplainInfo distributedInfo) {
+    if (distributedInfo == null) {
+      return delegate;
+    }
+    return new ResponseListener<>() {
+      @Override
+      public void onResponse(ExecutionEngine.ExplainResponse response) {
+        response.setDistributed(distributedInfo);
+        delegate.onResponse(response);
+      }
+
+      @Override
+      public void onFailure(Exception e) {
+        delegate.onFailure(e);
+      }
+    };
+  }
+
   private boolean isCalciteFallbackAllowed(@Nullable Throwable t) {
     // We always allow fallback the query failed with CalciteUnsupportedException.
     // This is for avoiding breaking changes when enable Calcite by default.
@@ -291,6 +397,22 @@ public class QueryService {
     } else {
       return false;
     }
+  }
+
+  private boolean isDistributedEngineEnabled() {
+    if (settings != null) {
+      Boolean enabled = settings.getSettingValue(Settings.Key.DISTRIBUTED_ENGINE_ENABLED);
+      return enabled != null && enabled;
+    }
+    return false;
+  }
+
+  private boolean isStrictModeEnabled() {
+    if (settings != null) {
+      Boolean strict = settings.getSettingValue(Settings.Key.DISTRIBUTED_ENGINE_STRICT_MODE);
+      return strict != null && strict;
+    }
+    return false;
   }
 
   // TODO https://github.com/opensearch-project/sql/issues/3457

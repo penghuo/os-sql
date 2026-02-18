@@ -37,6 +37,10 @@ public abstract class Settings {
     PPL_SUBSEARCH_MAXOUT("plugins.ppl.subsearch.maxout"),
     PPL_JOIN_SUBSEARCH_MAXOUT("plugins.ppl.join.subsearch_maxout"),
 
+    /** Distributed Engine Settings. */
+    DISTRIBUTED_ENGINE_ENABLED("plugins.sql.distributed_engine.enabled"),
+    DISTRIBUTED_ENGINE_STRICT_MODE("plugins.sql.distributed_engine.strict_mode"),
+
     /** Enable Calcite as execution engine */
     CALCITE_ENGINE_ENABLED("plugins.calcite.enabled"),
     CALCITE_FALLBACK_ALLOWED("plugins.calcite.fallback.allowed"),

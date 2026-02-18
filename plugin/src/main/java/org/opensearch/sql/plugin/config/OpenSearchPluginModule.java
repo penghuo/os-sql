@@ -95,16 +95,21 @@ public class OpenSearchPluginModule extends AbstractModule {
     return new SQLService(new SQLSyntaxParser(), queryManager, queryPlanFactory);
   }
 
-  /** {@link QueryPlanFactory}. */
+  /** {@link QueryService}. */
   @Provides
-  public QueryPlanFactory queryPlanFactory(
+  @Singleton
+  public QueryService queryService(
       DataSourceService dataSourceService, ExecutionEngine executionEngine, Settings settings) {
     Analyzer analyzer =
         new Analyzer(
             new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
     Planner planner = new Planner(LogicalPlanOptimizer.create());
-    QueryService queryService =
-        new QueryService(analyzer, executionEngine, planner, dataSourceService, settings);
+    return new QueryService(analyzer, executionEngine, planner, dataSourceService, settings);
+  }
+
+  /** {@link QueryPlanFactory}. */
+  @Provides
+  public QueryPlanFactory queryPlanFactory(QueryService queryService) {
     return new QueryPlanFactory(queryService);
   }
 }

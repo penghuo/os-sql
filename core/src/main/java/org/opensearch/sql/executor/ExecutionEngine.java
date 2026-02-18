@@ -57,12 +57,19 @@ public interface ExecutionEngine {
       CalcitePlanContext context,
       ResponseListener<ExplainResponse> listener) {}
 
+  /** Execution engine identifiers for tracking which engine processed a query. */
+  String ENGINE_DISTRIBUTED = "distributed";
+  String ENGINE_CALCITE_LOCAL = "calcite_local";
+  String ENGINE_LEGACY_DSL = "legacy_dsl";
+
   /** Data class that encapsulates ExprValue. */
   @Data
   class QueryResponse {
     private final Schema schema;
     private final List<ExprValue> results;
     private final Cursor cursor;
+    /** Identifies which engine produced this response ("distributed", "calcite_local", etc). */
+    private String engine = ENGINE_CALCITE_LOCAL;
   }
 
   @Data
@@ -86,15 +93,19 @@ public interface ExecutionEngine {
     private final ExplainResponseNode root;
     // used in Calcite plan explain
     private final ExplainResponseNodeV2 calcite;
+    // distributed engine plan info (null when distributed engine is disabled or unsupported)
+    private DistributedExplainInfo distributed;
 
     public ExplainResponse(ExplainResponseNode root) {
       this.root = root;
       this.calcite = null;
+      this.distributed = null;
     }
 
     public ExplainResponse(ExplainResponseNodeV2 calcite) {
       this.root = null;
       this.calcite = calcite;
+      this.distributed = null;
     }
 
     @Override
@@ -113,11 +124,20 @@ public interface ExecutionEngine {
     public static ExplainResponse normalizeLf(ExplainResponse response) {
       ExecutionEngine.ExplainResponseNodeV2 calcite = response.getCalcite();
       if (calcite != null) {
-        return new ExplainResponse(
-            new ExecutionEngine.ExplainResponseNodeV2(
-                normalizeLf(calcite.getLogical()),
-                normalizeLf(calcite.getPhysical()),
-                normalizeLf(calcite.getExtended())));
+        ExplainResponse normalized =
+            new ExplainResponse(
+                new ExecutionEngine.ExplainResponseNodeV2(
+                    normalizeLf(calcite.getLogical()),
+                    normalizeLf(calcite.getPhysical()),
+                    normalizeLf(calcite.getExtended())));
+        // Preserve distributed info through normalization
+        if (response.getDistributed() != null) {
+          DistributedExplainInfo dist = response.getDistributed();
+          normalized.setDistributed(
+              new DistributedExplainInfo(
+                  normalizeLf(dist.getPlan()), dist.getStages(), dist.getEngine()));
+        }
+        return normalized;
       }
       return response;
     }
@@ -125,6 +145,24 @@ public interface ExecutionEngine {
     private static String normalizeLf(String value) {
       return value == null ? null : value.replace("\r\n", "\n");
     }
+  }
+
+  /**
+   * Contains the distributed execution plan information shown in explain output. Only populated
+   * when the distributed engine is enabled and supports the query pattern.
+   */
+  @RequiredArgsConstructor
+  @Data
+  @ToString
+  class DistributedExplainInfo {
+    /** The PlanNode tree after conversion from RelNode (before exchange insertion). */
+    private final String plan;
+
+    /** Stage descriptions after fragmentation (leaf and root stages with their operators). */
+    private final List<String> stages;
+
+    /** The engine identifier (always "distributed" when present). */
+    private final String engine;
   }
 
   @AllArgsConstructor

@@ -151,6 +151,20 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  public static final Setting<?> DISTRIBUTED_ENGINE_ENABLED_SETTING =
+      Setting.boolSetting(
+          Key.DISTRIBUTED_ENGINE_ENABLED.getKeyValue(),
+          false,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  public static final Setting<?> DISTRIBUTED_ENGINE_STRICT_MODE_SETTING =
+      Setting.boolSetting(
+          Key.DISTRIBUTED_ENGINE_STRICT_MODE.getKeyValue(),
+          false,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   public static final Setting<?> CALCITE_ENGINE_ENABLED_SETTING =
       Setting.boolSetting(
           Key.CALCITE_ENGINE_ENABLED.getKeyValue(),
@@ -440,6 +454,18 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
+        Key.DISTRIBUTED_ENGINE_ENABLED,
+        DISTRIBUTED_ENGINE_ENABLED_SETTING,
+        new Updater(Key.DISTRIBUTED_ENGINE_ENABLED));
+    register(
+        settingBuilder,
+        clusterSettings,
+        Key.DISTRIBUTED_ENGINE_STRICT_MODE,
+        DISTRIBUTED_ENGINE_STRICT_MODE_SETTING,
+        new Updater(Key.DISTRIBUTED_ENGINE_STRICT_MODE));
+    register(
+        settingBuilder,
+        clusterSettings,
         Key.CALCITE_ENGINE_ENABLED,
         CALCITE_ENGINE_ENABLED_SETTING,
         new Updater(Key.CALCITE_ENGINE_ENABLED));
@@ -653,6 +679,8 @@ public class OpenSearchSettings extends Settings {
         .add(PPL_ENABLED_SETTING)
         .add(PPL_QUERY_TIMEOUT_SETTING)
         .add(PPL_SYNTAX_LEGACY_PREFERRED_SETTING)
+        .add(DISTRIBUTED_ENGINE_ENABLED_SETTING)
+        .add(DISTRIBUTED_ENGINE_STRICT_MODE_SETTING)
         .add(CALCITE_ENGINE_ENABLED_SETTING)
         .add(CALCITE_FALLBACK_ALLOWED_SETTING)
         .add(CALCITE_PUSHDOWN_ENABLED_SETTING)

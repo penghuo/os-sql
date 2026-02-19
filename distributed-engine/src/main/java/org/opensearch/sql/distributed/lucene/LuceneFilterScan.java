@@ -16,6 +16,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.Bits;
 import org.opensearch.sql.distributed.context.OperatorContext;
 import org.opensearch.sql.distributed.data.Page;
 import org.opensearch.sql.distributed.operator.Operator;
@@ -171,19 +172,24 @@ public class LuceneFilterScan implements SourceOperator {
   }
 
   /**
-   * Collects up to batchSize matching document IDs from the current iterator.
+   * Collects up to batchSize matching document IDs from the current iterator, skipping
+   * soft-deleted documents that still appear in the posting lists.
    *
    * @param docIds output array to fill with matching doc IDs
    * @return number of matching docs collected
    */
   private int collectMatchingDocs(int[] docIds) throws IOException {
+    Bits liveDocs = leaves.get(currentLeafIndex).reader().getLiveDocs();
     int count = 0;
     while (count < batchSize) {
       int docId = currentIterator.nextDoc();
       if (docId == DocIdSetIterator.NO_MORE_DOCS) {
         break;
       }
-      docIds[count++] = docId;
+      // Skip soft-deleted documents
+      if (liveDocs == null || liveDocs.get(docId)) {
+        docIds[count++] = docId;
+      }
     }
     return count;
   }

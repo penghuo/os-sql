@@ -21,10 +21,16 @@ public class SumAccumulator implements Accumulator {
 
   private double[] sums;
   private boolean[] hasValue;
+  private final boolean returnZeroForEmpty; // SUM0 semantics: return 0 instead of null
 
   public SumAccumulator() {
+    this(false);
+  }
+
+  public SumAccumulator(boolean returnZeroForEmpty) {
     this.sums = new double[64];
     this.hasValue = new boolean[64];
+    this.returnZeroForEmpty = returnZeroForEmpty;
   }
 
   @Override
@@ -44,12 +50,16 @@ public class SumAccumulator implements Accumulator {
 
   @Override
   public Object getResult(int groupId) {
-    return hasValue[groupId] ? sums[groupId] : null;
+    if (hasValue[groupId]) {
+      return sums[groupId];
+    }
+    // SUM0 returns 0 for groups with no non-null input (Calcite $SUM0 semantics)
+    return returnZeroForEmpty ? 0.0 : null;
   }
 
   @Override
   public boolean isNull(int groupId) {
-    return !hasValue[groupId];
+    return !hasValue[groupId] && !returnZeroForEmpty;
   }
 
   @Override

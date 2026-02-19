@@ -208,9 +208,16 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
   public Void visitLimit(LimitNode node, Void context) {
     node.getSource().accept(this, null);
 
+    long offset = node.getOffset();
     int limit = Math.toIntExact(node.getLimit());
-    // LIMIT without ORDER BY: use TopN with empty sort spec (preserves input order)
-    operatorFactories.add(new TopNOperator.TopNOperatorFactory(limit, List.of(), List.of()));
+    // LIMIT with OFFSET: collect offset+limit rows, then skip the first offset rows
+    int totalRows = (int) Math.min((long) limit + offset, Integer.MAX_VALUE);
+    operatorFactories.add(
+        new TopNOperator.TopNOperatorFactory(totalRows, List.of(), List.of()));
+    if (offset > 0) {
+      // Add an offset operator that skips the first 'offset' rows
+      operatorFactories.add(new OffsetOperatorFactory(Math.toIntExact(offset)));
+    }
     return null;
   }
 
@@ -658,6 +665,129 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
     /** Creates a source factory for inline values. */
     default OperatorFactory createValuesFactory(ValuesNode node) {
       throw new UnsupportedOperationException("ValuesNode not supported");
+    }
+  }
+
+  /**
+   * An OperatorFactory that skips the first N rows from its input, implementing OFFSET semantics.
+   */
+  private static class OffsetOperatorFactory implements OperatorFactory {
+    private final int offset;
+    private boolean closed;
+
+    OffsetOperatorFactory(int offset) {
+      this.offset = offset;
+    }
+
+    @Override
+    public Operator createOperator(OperatorContext operatorContext) {
+      if (closed) {
+        throw new IllegalStateException("Factory is already closed");
+      }
+      return new OffsetOperator(operatorContext, offset);
+    }
+
+    @Override
+    public void noMoreOperators() {
+      closed = true;
+    }
+  }
+
+  /** Operator that skips the first N rows from its input, implementing OFFSET semantics. */
+  private static class OffsetOperator implements Operator {
+    private final OperatorContext operatorContext;
+    private final int offset;
+    private int skipped;
+    private boolean finishing;
+    private boolean finished;
+    private Page pendingOutput;
+
+    OffsetOperator(OperatorContext operatorContext, int offset) {
+      this.operatorContext = operatorContext;
+      this.offset = offset;
+      this.skipped = 0;
+    }
+
+    @Override
+    public com.google.common.util.concurrent.ListenableFuture<?> isBlocked() {
+      return NOT_BLOCKED;
+    }
+
+    @Override
+    public boolean needsInput() {
+      return !finishing && pendingOutput == null;
+    }
+
+    @Override
+    public void addInput(Page page) {
+      if (!needsInput()) {
+        throw new IllegalStateException("Operator does not need input");
+      }
+      int positionCount = page.getPositionCount();
+      int remaining = offset - skipped;
+      if (remaining >= positionCount) {
+        // Skip entire page
+        skipped += positionCount;
+        return;
+      }
+      if (remaining > 0) {
+        // Skip partial page: take positions from 'remaining' to end
+        int outputCount = positionCount - remaining;
+        int[] positions = new int[outputCount];
+        for (int i = 0; i < outputCount; i++) {
+          positions[i] = remaining + i;
+        }
+        org.opensearch.sql.distributed.data.Block[] outputBlocks =
+            new org.opensearch.sql.distributed.data.Block[page.getChannelCount()];
+        for (int ch = 0; ch < page.getChannelCount(); ch++) {
+          org.opensearch.sql.distributed.data.Block block = page.getBlock(ch);
+          if (block instanceof org.opensearch.sql.distributed.data.ValueBlock valueBlock) {
+            outputBlocks[ch] = valueBlock.copyPositions(positions, 0, outputCount);
+          } else {
+            outputBlocks[ch] = block;
+          }
+        }
+        pendingOutput = new Page(outputCount, outputBlocks);
+        skipped = offset;
+      } else {
+        // No more skipping needed, pass through
+        pendingOutput = page;
+      }
+    }
+
+    @Override
+    public Page getOutput() {
+      if (pendingOutput != null) {
+        Page output = pendingOutput;
+        pendingOutput = null;
+        return output;
+      }
+      return null;
+    }
+
+    @Override
+    public void finish() {
+      finishing = true;
+      if (pendingOutput == null) {
+        finished = true;
+      }
+    }
+
+    @Override
+    public boolean isFinished() {
+      return finished && pendingOutput == null;
+    }
+
+    @Override
+    public OperatorContext getOperatorContext() {
+      return operatorContext;
+    }
+
+    @Override
+    public void close() {
+      pendingOutput = null;
+      finished = true;
+      finishing = true;
     }
   }
 }

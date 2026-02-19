@@ -11,6 +11,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.opensearch.sql.distributed.operator.aggregation.Accumulator;
 import org.opensearch.sql.distributed.operator.aggregation.AvgAccumulator;
 import org.opensearch.sql.distributed.operator.aggregation.CountAccumulator;
+import org.opensearch.sql.distributed.operator.aggregation.DistinctCountAccumulator;
 import org.opensearch.sql.distributed.operator.aggregation.MaxAccumulator;
 import org.opensearch.sql.distributed.operator.aggregation.MinAccumulator;
 import org.opensearch.sql.distributed.operator.aggregation.SumAccumulator;
@@ -34,12 +35,18 @@ public final class AccumulatorFactory {
     SqlKind kind = aggCall.getAggregation().getKind();
     switch (kind) {
       case COUNT:
+        // COUNT(DISTINCT column) needs special handling
+        if (aggCall.isDistinct()) {
+          return DistinctCountAccumulator::new;
+        }
         // COUNT(*) has empty argList, COUNT(column) has one arg
         boolean countAll = aggCall.getArgList().isEmpty();
         return () -> new CountAccumulator(countAll);
       case SUM:
       case SUM0:
-        return SumAccumulator::new;
+        // Both SUM and SUM0 use returnZeroForEmpty=true for PPL semantics
+        // where SUM returns 0 (not null) when all input values are null
+        return () -> new SumAccumulator(true);
       case AVG:
         return AvgAccumulator::new;
       case MIN:

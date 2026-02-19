@@ -77,12 +77,7 @@ public class OrderByOperator implements Operator {
         outputIterator = pagesIndex.getSortedPages();
       }
       if (outputIterator.hasNext()) {
-        Page sortedPage = outputIterator.next();
-        // Apply output channel projection if not all channels
-        if (needsProjection()) {
-          return sortedPage.getColumns(outputChannels);
-        }
-        return sortedPage;
+        return outputIterator.next();
       }
       state = State.FINISHED;
     }

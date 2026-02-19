@@ -11,6 +11,7 @@ import java.io.UncheckedIOException;
 import java.util.List;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.util.Bits;
 import org.opensearch.sql.distributed.context.OperatorContext;
 import org.opensearch.sql.distributed.data.Page;
 import org.opensearch.sql.distributed.operator.Operator;
@@ -102,14 +103,17 @@ public class LuceneFullScan implements SourceOperator {
           continue;
         }
 
-        int remaining = maxDoc - currentDocInLeaf;
-        int count = Math.min(remaining, batchSize);
-
-        int[] docIds = new int[count];
-        for (int i = 0; i < count; i++) {
-          docIds[i] = currentDocInLeaf + i;
+        // Filter out soft-deleted documents using the liveDocs bitset.
+        // maxDoc includes deleted docs; liveDocs tells us which are still alive.
+        Bits liveDocs = leafCtx.reader().getLiveDocs();
+        int[] docIds = new int[Math.min(maxDoc - currentDocInLeaf, batchSize)];
+        int count = 0;
+        while (currentDocInLeaf < maxDoc && count < batchSize) {
+          if (liveDocs == null || liveDocs.get(currentDocInLeaf)) {
+            docIds[count++] = currentDocInLeaf;
+          }
+          currentDocInLeaf++;
         }
-        currentDocInLeaf += count;
 
         Page page = DocValuesToBlockConverter.readDocValues(leafCtx, columns, docIds, count);
         if (page.getPositionCount() > 0) {

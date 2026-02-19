@@ -187,13 +187,21 @@ public class NodeLocalSourceProvider
       ColumnMapping mapping;
 
       if (fieldType == null || !fieldType.hasDocValues()) {
-        // No DocValues: produce all-null output (e.g., _id metadata field, text fields)
-        mapping =
-            new ColumnMapping(
-                name,
-                ColumnMapping.DocValuesType.NONE,
-                ColumnMapping.BlockType.VARIABLE_WIDTH,
-                index);
+        // Try to find a .keyword sub-field for text fields that lack DocValues
+        String keywordSubField = name + ".keyword";
+        MappedFieldType keywordFieldType = mapperService.fieldType(keywordSubField);
+        if (keywordFieldType != null && keywordFieldType.hasDocValues()) {
+          // Use the keyword sub-field to read values via DocValues
+          mapping = buildMappingFromFieldType(keywordSubField, index, keywordFieldType);
+        } else {
+          // No DocValues available: produce all-null output (e.g., _id metadata field)
+          mapping =
+              new ColumnMapping(
+                  name,
+                  ColumnMapping.DocValuesType.NONE,
+                  ColumnMapping.BlockType.VARIABLE_WIDTH,
+                  index);
+        }
       } else {
         mapping = buildMappingFromFieldType(name, index, fieldType);
       }
@@ -274,7 +282,8 @@ public class NodeLocalSourceProvider
               name,
               ColumnMapping.DocValuesType.SORTED_SET,
               ColumnMapping.BlockType.VARIABLE_WIDTH,
-              index);
+              index,
+              true);
       case "binary" ->
           new ColumnMapping(
               name,

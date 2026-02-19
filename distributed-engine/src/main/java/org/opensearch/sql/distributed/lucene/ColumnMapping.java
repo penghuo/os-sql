@@ -49,13 +49,24 @@ public final class ColumnMapping {
   private final DocValuesType docValuesType;
   private final BlockType blockType;
   private final int columnIndex;
+  private final boolean ipField;
 
   public ColumnMapping(
       String fieldName, DocValuesType docValuesType, BlockType blockType, int columnIndex) {
+    this(fieldName, docValuesType, blockType, columnIndex, false);
+  }
+
+  public ColumnMapping(
+      String fieldName,
+      DocValuesType docValuesType,
+      BlockType blockType,
+      int columnIndex,
+      boolean ipField) {
     this.fieldName = Objects.requireNonNull(fieldName, "fieldName");
     this.docValuesType = Objects.requireNonNull(docValuesType, "docValuesType");
     this.blockType = Objects.requireNonNull(blockType, "blockType");
     this.columnIndex = columnIndex;
+    this.ipField = ipField;
   }
 
   public String getFieldName() {
@@ -72,6 +83,11 @@ public final class ColumnMapping {
 
   public int getColumnIndex() {
     return columnIndex;
+  }
+
+  /** Returns true if this column is an IP address field requiring binary-to-string decoding. */
+  public boolean isIpField() {
+    return ipField;
   }
 
   /**
@@ -144,6 +160,7 @@ public final class ColumnMapping {
     if (!(o instanceof ColumnMapping)) return false;
     ColumnMapping that = (ColumnMapping) o;
     return columnIndex == that.columnIndex
+        && ipField == that.ipField
         && fieldName.equals(that.fieldName)
         && docValuesType == that.docValuesType
         && blockType == that.blockType;
@@ -151,6 +168,6 @@ public final class ColumnMapping {
 
   @Override
   public int hashCode() {
-    return Objects.hash(fieldName, docValuesType, blockType, columnIndex);
+    return Objects.hash(fieldName, docValuesType, blockType, columnIndex, ipField);
   }
 }

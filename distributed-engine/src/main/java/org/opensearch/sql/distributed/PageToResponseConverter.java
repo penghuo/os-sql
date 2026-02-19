@@ -133,7 +133,11 @@ public final class PageToResponseConverter {
     } else if (block instanceof IntArrayBlock intBlock) {
       return ExprValueUtils.integerValue(intBlock.getInt(position));
     } else if (block instanceof DoubleArrayBlock doubleBlock) {
-      return ExprValueUtils.doubleValue(doubleBlock.getDouble(position));
+      double value = doubleBlock.getDouble(position);
+      if (isTimeBased) {
+        return ExprValueUtils.timestampValue(Instant.ofEpochMilli((long) value));
+      }
+      return ExprValueUtils.doubleValue(value);
     } else if (block instanceof BooleanArrayBlock boolBlock) {
       return ExprValueUtils.booleanValue(boolBlock.getBoolean(position));
     } else if (block instanceof ShortArrayBlock shortBlock) {

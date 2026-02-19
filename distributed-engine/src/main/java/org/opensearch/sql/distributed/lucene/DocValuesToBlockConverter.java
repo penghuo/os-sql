@@ -6,7 +6,11 @@
 package org.opensearch.sql.distributed.lucene;
 
 import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.util.List;
+import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
@@ -71,11 +75,12 @@ public final class DocValuesToBlockConverter {
   }
 
   /**
-   * Reads all documents in a segment (from doc 0 to maxDoc-1) for the given columns.
+   * Reads all live documents in a segment for the given columns. Skips soft-deleted documents by
+   * consulting the segment's liveDocs bitset.
    *
    * @param leafCtx the Lucene segment reader context
    * @param columns the column mappings
-   * @return a Page containing all documents in the segment
+   * @return a Page containing all live documents in the segment
    * @throws IOException if reading DocValues fails
    */
   public static Page readAllDocs(LeafReaderContext leafCtx, List<ColumnMapping> columns)
@@ -84,11 +89,18 @@ public final class DocValuesToBlockConverter {
     if (maxDoc == 0) {
       return createEmptyPage(columns);
     }
+    org.apache.lucene.util.Bits liveDocs = leafCtx.reader().getLiveDocs();
     int[] allDocIds = new int[maxDoc];
+    int count = 0;
     for (int i = 0; i < maxDoc; i++) {
-      allDocIds[i] = i;
+      if (liveDocs == null || liveDocs.get(i)) {
+        allDocIds[count++] = i;
+      }
     }
-    return readDocValues(leafCtx, columns, allDocIds, maxDoc);
+    if (count == 0) {
+      return createEmptyPage(columns);
+    }
+    return readDocValues(leafCtx, columns, allDocIds, count);
   }
 
   private static Block readColumn(
@@ -188,19 +200,36 @@ public final class DocValuesToBlockConverter {
 
   /**
    * Reads SortedSetDocValues (multi-valued keyword fields). For Phase 1, takes only the first
-   * value. Documents with no values get null.
+   * value. Documents with no values get null. IP fields get special decoding from binary to
+   * human-readable string form.
    */
   private static Block readSortedSetDocValues(
       LeafReaderContext leafCtx, ColumnMapping col, int[] docIds, int docCount) throws IOException {
     SortedSetDocValues ssdv = DocValues.getSortedSet(leafCtx.reader(), col.getFieldName());
     BlockBuilder builder = BlockBuilder.create(ColumnMapping.BlockType.VARIABLE_WIDTH, docCount);
+    boolean isIp = col.isIpField();
 
     for (int i = 0; i < docCount; i++) {
       int docId = docIds[i];
       if (ssdv.advanceExact(docId) && ssdv.docValueCount() > 0) {
         long ord = ssdv.nextOrd();
         BytesRef value = ssdv.lookupOrd(ord);
-        builder.appendBytes(value.bytes, value.offset, value.length);
+        if (isIp) {
+          // Decode binary IP address to human-readable string
+          byte[] ipBytes = new byte[value.length];
+          System.arraycopy(value.bytes, value.offset, ipBytes, 0, value.length);
+          try {
+            InetAddress addr = InetAddressPoint.decode(ipBytes);
+            String formatted = formatInetAddress(addr);
+            byte[] strBytes = formatted.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            builder.appendBytes(strBytes, 0, strBytes.length);
+          } catch (Exception e) {
+            // Fallback: use raw bytes if decoding fails
+            builder.appendBytes(value.bytes, value.offset, value.length);
+          }
+        } else {
+          builder.appendBytes(value.bytes, value.offset, value.length);
+        }
       } else {
         builder.appendNull();
       }
@@ -232,5 +261,56 @@ public final class DocValuesToBlockConverter {
       blocks[i] = BlockBuilder.create(columns.get(i).getBlockType(), 0).build();
     }
     return new Page(0, blocks);
+  }
+
+  /**
+   * Formats an InetAddress to its canonical string representation. IPv4 addresses use dotted
+   * decimal notation. IPv6 addresses use the compressed form with :: for zero runs (RFC 5952).
+   */
+  static String formatInetAddress(InetAddress addr) {
+    if (addr instanceof Inet4Address) {
+      return addr.getHostAddress();
+    }
+    // For IPv6, compress zero groups using :: notation
+    byte[] bytes = addr.getAddress();
+    int[] groups = new int[8];
+    for (int i = 0; i < 8; i++) {
+      groups[i] = ((bytes[i * 2] & 0xFF) << 8) | (bytes[i * 2 + 1] & 0xFF);
+    }
+    // Find the longest run of consecutive zero groups
+    int bestStart = -1, bestLen = 0;
+    int curStart = -1, curLen = 0;
+    for (int i = 0; i < 8; i++) {
+      if (groups[i] == 0) {
+        if (curStart == -1) curStart = i;
+        curLen++;
+        if (curLen > bestLen) {
+          bestStart = curStart;
+          bestLen = curLen;
+        }
+      } else {
+        curStart = -1;
+        curLen = 0;
+      }
+    }
+    // Build the compressed string
+    StringBuilder sb = new StringBuilder();
+    if (bestLen >= 1) {
+      for (int i = 0; i < bestStart; i++) {
+        if (i > 0) sb.append(':');
+        sb.append(Integer.toHexString(groups[i]));
+      }
+      sb.append("::");
+      for (int i = bestStart + bestLen; i < 8; i++) {
+        if (i > bestStart + bestLen) sb.append(':');
+        sb.append(Integer.toHexString(groups[i]));
+      }
+    } else {
+      for (int i = 0; i < 8; i++) {
+        if (i > 0) sb.append(':');
+        sb.append(Integer.toHexString(groups[i]));
+      }
+    }
+    return sb.toString();
   }
 }

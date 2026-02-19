@@ -122,6 +122,13 @@ public class RelNodeToPlanNodeConverter {
     if (hasCollation && hasFetch) {
       // Sort with limit -> TopN
       long limit = extractLongValue(sort.fetch);
+      long offset = hasOffset ? extractLongValue(sort.offset) : 0;
+      if (offset > 0) {
+        // TopN with offset: sort top (limit + offset) rows, then skip the first 'offset'
+        PlanNode topN =
+            new TopNNode(PlanNodeId.next("TopN"), source, collation, limit + offset);
+        return new LimitNode(PlanNodeId.next("Offset"), topN, limit, offset);
+      }
       return new TopNNode(PlanNodeId.next("TopN"), source, collation, limit);
     } else if (hasCollation) {
       // Sort only

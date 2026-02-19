@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
@@ -58,11 +59,12 @@ import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
-import org.opensearch.sql.opensearch.planner.PlanSplitter;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
+import org.opensearch.sql.opensearch.planner.PlanSplitter;
+import org.opensearch.sql.opensearch.planner.merge.Exchange;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
 import org.opensearch.transport.client.node.NodeClient;
@@ -76,13 +78,29 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   private final ExecutionProtector executionProtector;
   private final PlanSerializer planSerializer;
 
+  /**
+   * Optional distributed executor function. Takes (distributedPlan, indexName) and returns result
+   * rows. Injected by the plugin module where transport action classes are available. When null,
+   * distributed execution is disabled and all queries use the single-node Calcite JDBC path.
+   */
+  private final BiFunction<RelNode, String, List<Object[]>> distributedExecutor;
+
   public OpenSearchExecutionEngine(
       OpenSearchClient client,
       ExecutionProtector executionProtector,
       PlanSerializer planSerializer) {
+    this(client, executionProtector, planSerializer, null);
+  }
+
+  public OpenSearchExecutionEngine(
+      OpenSearchClient client,
+      ExecutionProtector executionProtector,
+      PlanSerializer planSerializer,
+      BiFunction<RelNode, String, List<Object[]>> distributedExecutor) {
     this.client = client;
     this.executionProtector = executionProtector;
     this.planSerializer = planSerializer;
+    this.distributedExecutor = distributedExecutor;
     registerOpenSearchFunctions();
   }
 
@@ -223,32 +241,134 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     client.schedule(
         () -> {
           try {
-            // Note: PlanSplitter is not applied during execution yet. Exchange nodes
-            // (ConcatExchange, HashExchange, MergeSortExchange, etc.) are infrastructure
-            // for distributed shard dispatch which is not yet wired into the execution
-            // pipeline. The PlanSplitter output is visible via the explain API's
-            // "distributed" field for diagnostics and planning validation.
-            //
-            // Once shard dispatch is fully wired, this method will:
-            //   1. Apply PlanSplitter to get the distributed plan
-            //   2. Extract shard fragments below Exchange nodes
-            //   3. Serialize + scatter fragments to data nodes
-            //   4. Merge results on coordinator via Exchange.scan()
-            try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
-              ProfileMetric metric =
-                  QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
-              long execTime = System.nanoTime();
-              ResultSet result = statement.executeQuery();
-              QueryResponse response =
-                  buildResultSet(
-                      result, rel.getRowType(), context.sysLimit.querySizeLimit());
-              metric.add(System.nanoTime() - execTime);
-              listener.onResponse(response);
+            // Try distributed execution via PlanSplitter
+            RelNode distributedPlan = generateDistributedPlan(rel);
+            if (distributedPlan != null && containsExchange(distributedPlan)
+                && distributedExecutor != null) {
+              // Distributed path: scatter to shards, merge on coordinator
+              executeDistributed(distributedPlan, rel, context, listener);
+            } else {
+              // Fallback: single-node execution via Calcite JDBC
+              executeSingleNode(rel, context, listener);
             }
-          } catch (SQLException e) {
-            throw new RuntimeException(e);
+          } catch (Exception e) {
+            listener.onFailure(e);
           }
         });
+  }
+
+  /**
+   * Executes a query using the distributed path: dispatches shard fragments via the injected
+   * distributed executor function and builds the response from merged results.
+   */
+  private void executeDistributed(
+      RelNode distributedPlan,
+      RelNode originalPlan,
+      CalcitePlanContext context,
+      ResponseListener<QueryResponse> listener) {
+    try {
+      ProfileMetric metric =
+          QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
+      long execTime = System.nanoTime();
+
+      // Extract index name from the plan tree
+      String indexName = ShardRoutingResolver.extractIndexName(originalPlan);
+      if (indexName == null) {
+        indexName = ShardRoutingResolver.extractIndexName(distributedPlan);
+      }
+
+      List<Object[]> resultRows = distributedExecutor.apply(distributedPlan, indexName);
+
+      // Build QueryResponse from result rows
+      QueryResponse response = buildDistributedResultSet(
+          resultRows, originalPlan.getRowType(), context.sysLimit.querySizeLimit());
+
+      metric.add(System.nanoTime() - execTime);
+      listener.onResponse(response);
+    } catch (Exception e) {
+      logger.warn("Distributed execution failed, falling back to single-node", e);
+      // Fall back to single-node execution
+      executeSingleNode(originalPlan, context, listener);
+    }
+  }
+
+  /**
+   * Executes a query using the single-node path via Calcite JDBC. This is the fallback for
+   * queries that cannot be distributed (metadata queries, no Exchange nodes, etc.).
+   */
+  private void executeSingleNode(
+      RelNode rel,
+      CalcitePlanContext context,
+      ResponseListener<QueryResponse> listener) {
+    try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+      ProfileMetric metric =
+          QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
+      long execTime = System.nanoTime();
+      ResultSet result = statement.executeQuery();
+      QueryResponse response =
+          buildResultSet(
+              result, rel.getRowType(), context.sysLimit.querySizeLimit());
+      metric.add(System.nanoTime() - execTime);
+      listener.onResponse(response);
+    } catch (SQLException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * Checks whether a plan tree contains any {@link Exchange} node, indicating it should be
+   * executed via the distributed path.
+   */
+  private boolean containsExchange(RelNode plan) {
+    if (plan instanceof Exchange) {
+      return true;
+    }
+    for (RelNode child : plan.getInputs()) {
+      if (containsExchange(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Builds a QueryResponse from distributed execution result rows (Object arrays).
+   */
+  private QueryResponse buildDistributedResultSet(
+      List<Object[]> rows, RelDataType rowType, Integer querySizeLimit) {
+    List<RelDataTypeField> fields = rowType.getFieldList();
+    List<ExprValue> values = new ArrayList<>();
+
+    int limit = querySizeLimit != null ? querySizeLimit : Integer.MAX_VALUE;
+    for (Object[] row : rows) {
+      if (values.size() >= limit) {
+        break;
+      }
+      Map<String, ExprValue> exprRow = new LinkedHashMap<>();
+      for (int i = 0; i < fields.size() && i < row.length; i++) {
+        String columnName = fields.get(i).getName();
+        Object converted = processValue(row[i]);
+        exprRow.put(columnName, ExprValueUtils.fromObjectValue(converted));
+      }
+      values.add(ExprTupleValue.fromExprValueMap(exprRow));
+    }
+
+    List<Column> columns = new ArrayList<>(fields.size());
+    for (RelDataTypeField field : fields) {
+      ExprType exprType;
+      if (field.getType().getSqlTypeName() == SqlTypeName.ANY) {
+        if (!values.isEmpty()) {
+          exprType = values.getFirst().tupleValue().get(field.getName()).type();
+        } else {
+          exprType = ExprCoreType.UNDEFINED;
+        }
+      } else {
+        exprType = OpenSearchTypeFactory.convertRelDataTypeToExprType(field.getType());
+      }
+      columns.add(new Column(field.getName(), null, exprType));
+    }
+
+    return new QueryResponse(new Schema(columns), values, null);
   }
 
   /**

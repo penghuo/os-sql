@@ -17,35 +17,38 @@ import org.apache.calcite.rel.RelNode;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
- * Exchange operator that performs unordered concatenation of shard results.
+ * Exchange operator that broadcasts the small side of a join to all nodes.
  *
- * <p>Used for simple scans, filter+project, and dedup where no ordering or aggregation merge is
- * needed on the coordinator side. Results from all shards are simply appended together.
+ * <p>Used when one side of a join is small enough to fit in memory on every node. Instead of
+ * shuffling both sides by join key (HashExchange), the small side is broadcast to all nodes and
+ * joined locally with each shard's portion of the large side.
  */
-public class ConcatExchange extends Exchange {
+public class BroadcastExchange extends Exchange {
 
-    public ConcatExchange(RelOptCluster cluster, RelTraitSet traits, RelNode input) {
+    public BroadcastExchange(RelOptCluster cluster, RelTraitSet traits, RelNode input) {
         super(cluster, traits, input);
     }
 
-    /** Convenience factory that creates a ConcatExchange with enumerable convention traits. */
-    public static ConcatExchange create(RelNode input) {
+    /** Convenience factory that creates a BroadcastExchange with enumerable convention traits. */
+    public static BroadcastExchange create(RelNode input) {
         RelOptCluster cluster = input.getCluster();
-        return new ConcatExchange(cluster, enumerableTraitSet(cluster), input);
+        return new BroadcastExchange(cluster, enumerableTraitSet(cluster), input);
     }
 
     @Override
     public String getExchangeType() {
-        return "CONCAT";
+        return "BROADCAST";
     }
 
     @Override
     public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-        return new ConcatExchange(getCluster(), traitSet, sole(inputs));
+        return new BroadcastExchange(getCluster(), traitSet, sole(inputs));
     }
 
     @Override
     public Enumerable<@Nullable Object> scan() {
+        // The broadcast logic (sending data to all nodes) is handled by DistributedExecutor.
+        // On the coordinator side, just concatenate all collected results.
         if (shardResults == null || shardResults.isEmpty()) {
             return Linq4j.emptyEnumerable();
         }

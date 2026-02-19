@@ -6,8 +6,12 @@
 package org.opensearch.sql.opensearch.planner.merge;
 
 import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
 import java.util.List;
+import org.apache.calcite.linq4j.AbstractEnumerable;
 import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
+import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
@@ -86,7 +90,40 @@ public class HashExchange extends Exchange {
 
     @Override
     public Enumerable<@Nullable Object> scan() {
-        // Full implementation will be wired in T7 when shuffle dispatch is available
-        throw new UnsupportedOperationException("HashExchange.scan() not yet implemented");
+        // HashExchange results are pre-partitioned by DistributedExecutor.
+        // Just concatenate all partition results.
+        if (shardResults == null || shardResults.isEmpty()) {
+            return Linq4j.emptyEnumerable();
+        }
+        List<Object[]> allRows = new ArrayList<>();
+        for (ShardResult result : shardResults) {
+            allRows.addAll(result.getRows());
+        }
+        return new AbstractEnumerable<@Nullable Object>() {
+            @Override
+            public Enumerator<@Nullable Object> enumerator() {
+                return new Enumerator<>() {
+                    private int index = -1;
+
+                    @Override
+                    public Object current() {
+                        return allRows.get(index);
+                    }
+
+                    @Override
+                    public boolean moveNext() {
+                        return ++index < allRows.size();
+                    }
+
+                    @Override
+                    public void reset() {
+                        index = -1;
+                    }
+
+                    @Override
+                    public void close() {}
+                };
+            }
+        };
     }
 }

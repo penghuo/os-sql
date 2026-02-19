@@ -8,7 +8,6 @@ package org.opensearch.sql.opensearch.planner.merge;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.lenient;
 
 import com.google.common.collect.ImmutableList;
@@ -87,8 +86,8 @@ class HashExchangeTest {
     }
 
     @Test
-    @DisplayName("scan throws UnsupportedOperationException")
-    void testScanNotYetImplemented() {
+    @DisplayName("scan returns empty when no shard results set")
+    void testScanWithNoResults() {
         HashExchange exchange =
                 new HashExchange(
                         cluster,
@@ -96,7 +95,8 @@ class HashExchangeTest {
                         mockInput,
                         ImmutableList.of(0),
                         8);
-        assertThrows(UnsupportedOperationException.class, exchange::scan);
+        // scan() returns empty enumerable when shardResults is null
+        assertEquals(0, exchange.scan().count());
     }
 
     @Test

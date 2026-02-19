@@ -19,6 +19,7 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.Window;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.sql.opensearch.planner.merge.BroadcastExchange;
 import org.opensearch.sql.opensearch.planner.merge.ConcatExchange;
 import org.opensearch.sql.opensearch.planner.merge.Exchange;
 import org.opensearch.sql.opensearch.planner.merge.HashExchange;
@@ -182,15 +183,48 @@ public class PlanSplitter {
         }
 
         /**
-         * Splits an equi-join by inserting HashExchange on both inputs by their respective join
-         * keys, then wrapping the result with a ConcatExchange to concatenate partition results
-         * on the coordinator.
+         * Splits an equi-join by choosing a join strategy based on input sizes. If one side is
+         * small enough for broadcast, uses BroadcastExchange for the small side and
+         * ConcatExchange for the large side. Otherwise, uses HashExchange on both sides by their
+         * respective join keys.
          */
         private RelNode splitEquiJoin(
                 Join join, List<Integer> leftKeys, List<Integer> rightKeys) {
             RelNode left = join.getLeft();
             RelNode right = join.getRight();
 
+            // Check if either side is small enough for broadcast
+            boolean leftIsSmall = isSmallSide(left);
+            boolean rightIsSmall = isSmallSide(right);
+
+            if (leftIsSmall && rightIsSmall) {
+                // Both small: just gather both to coordinator
+                return splitNonEquiJoin(join);
+            }
+
+            if (rightIsSmall) {
+                // Broadcast right side to all nodes, ConcatExchange left side
+                if (needsExchange(left)) {
+                    left = ConcatExchange.create(left);
+                }
+                if (needsExchange(right)) {
+                    right = BroadcastExchange.create(right);
+                }
+                return join.copy(join.getTraitSet(), List.of(left, right));
+            }
+
+            if (leftIsSmall) {
+                // Broadcast left side to all nodes, ConcatExchange right side
+                if (needsExchange(left)) {
+                    left = BroadcastExchange.create(left);
+                }
+                if (needsExchange(right)) {
+                    right = ConcatExchange.create(right);
+                }
+                return join.copy(join.getTraitSet(), List.of(left, right));
+            }
+
+            // Default: hash exchange both sides
             int numPartitions = 8; // Default partition count; will be configurable
 
             // Insert HashExchange on both sides by their respective join keys
@@ -206,6 +240,18 @@ public class PlanSplitter {
 
             // Coordinator concatenates partition results
             return ConcatExchange.create(localJoin);
+        }
+
+        /**
+         * Simple heuristic to determine if a side of a join is "small" enough for broadcast.
+         * Currently always returns false to preserve existing HashExchange behavior. The {@link
+         * org.opensearch.sql.opensearch.statistics.IndexStatisticsProvider} will provide actual
+         * size estimates for cost-based decisions.
+         */
+        private boolean isSmallSide(RelNode node) {
+            // For now, always return false to preserve existing HashExchange behavior.
+            // The IndexStatisticsProvider will provide actual size estimates.
+            return false;
         }
 
         /**

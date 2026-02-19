@@ -46,6 +46,7 @@ import org.apache.calcite.util.Pair;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine.OperatorTable;
+import org.opensearch.sql.opensearch.planner.merge.BroadcastExchange;
 import org.opensearch.sql.opensearch.planner.merge.HashExchange;
 import org.opensearch.sql.opensearch.planner.merge.LocalJoinExchange;
 import org.opensearch.sql.opensearch.planner.merge.PartialAggregate;
@@ -212,6 +213,9 @@ public class RelNodeSerializer {
 
             case "EnumerableLimit":
                 return constructLimit(props, input, cluster, enumerableTraits, relJson);
+
+            case "BroadcastExchange":
+                return new BroadcastExchange(cluster, enumerableTraits, input);
 
             case "HashExchange":
                 return constructHashExchange(props, input, cluster, enumerableTraits);

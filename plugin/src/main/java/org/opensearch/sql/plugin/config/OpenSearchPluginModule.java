@@ -6,6 +6,7 @@
 package org.opensearch.sql.plugin.config;
 
 import lombok.RequiredArgsConstructor;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.AbstractModule;
 import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
@@ -26,6 +27,7 @@ import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.executor.protector.OpenSearchExecutionProtector;
+import org.opensearch.sql.plugin.transport.DistributedExecutor;
 import org.opensearch.sql.opensearch.monitor.OpenSearchMemoryHealthy;
 import org.opensearch.sql.opensearch.monitor.OpenSearchResourceMonitor;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
@@ -59,8 +61,13 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   public ExecutionEngine executionEngine(
-      OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-    return new OpenSearchExecutionEngine(client, protector, planSerializer);
+      OpenSearchClient client,
+      ExecutionProtector protector,
+      PlanSerializer planSerializer,
+      NodeClient nodeClient,
+      ClusterService clusterService) {
+    DistributedExecutor executor = new DistributedExecutor(nodeClient, clusterService);
+    return new OpenSearchExecutionEngine(client, protector, planSerializer, executor::execute);
   }
 
   @Provides

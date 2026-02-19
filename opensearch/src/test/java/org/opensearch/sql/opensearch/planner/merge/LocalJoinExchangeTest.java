@@ -8,7 +8,6 @@ package org.opensearch.sql.opensearch.planner.merge;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.lenient;
 import static org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.TYPE_FACTORY;
 
@@ -95,8 +94,8 @@ class LocalJoinExchangeTest {
     }
 
     @Test
-    @DisplayName("scan throws UnsupportedOperationException")
-    void testScanNotYetImplemented() {
+    @DisplayName("scan returns empty when no shard results set")
+    void testScanWithNoResults() {
         RexNode condition =
                 rexBuilder.makeLiteral(true, TYPE_FACTORY.createSqlType(SqlTypeName.BOOLEAN));
         LocalJoinExchange exchange =
@@ -106,6 +105,7 @@ class LocalJoinExchangeTest {
                         mockInput,
                         JoinRelType.INNER,
                         condition);
-        assertThrows(UnsupportedOperationException.class, exchange::scan);
+        // scan() returns empty enumerable when shardResults is null
+        assertEquals(0, exchange.scan().count());
     }
 }

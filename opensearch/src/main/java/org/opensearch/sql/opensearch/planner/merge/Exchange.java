@@ -5,7 +5,9 @@
 
 package org.opensearch.sql.opensearch.planner.merge;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableRel;
 import org.apache.calcite.adapter.enumerable.EnumerableRelImplementor;
@@ -33,8 +35,58 @@ import org.opensearch.sql.calcite.plan.Scannable;
  */
 public abstract class Exchange extends SingleRel implements EnumerableRel, Scannable {
 
+    /** Container for shard execution results, decoupled from transport layer. */
+    public static class ShardResult {
+        private final List<Object[]> rows;
+        private final List<String> columnNames;
+        private final int shardId;
+        private final Map<String, byte[]> binaryFields;
+
+        public ShardResult(List<Object[]> rows, List<String> columnNames, int shardId) {
+            this(rows, columnNames, shardId, Collections.emptyMap());
+        }
+
+        public ShardResult(
+                List<Object[]> rows,
+                List<String> columnNames,
+                int shardId,
+                Map<String, byte[]> binaryFields) {
+            this.rows = rows;
+            this.columnNames = columnNames;
+            this.shardId = shardId;
+            this.binaryFields = binaryFields != null ? binaryFields : Collections.emptyMap();
+        }
+
+        public List<Object[]> getRows() {
+            return rows;
+        }
+
+        public List<String> getColumnNames() {
+            return columnNames;
+        }
+
+        public int getShardId() {
+            return shardId;
+        }
+
+        public Map<String, byte[]> getBinaryFields() {
+            return binaryFields;
+        }
+    }
+
+    /** Shard results injected by DistributedExecutor after collecting from all shards. */
+    protected List<ShardResult> shardResults;
+
     protected Exchange(RelOptCluster cluster, RelTraitSet traits, RelNode input) {
         super(cluster, traits, input);
+    }
+
+    /**
+     * Sets the shard results collected by the coordinator. Called by DistributedExecutor after all
+     * shard responses are received.
+     */
+    public void setShardResults(List<ShardResult> results) {
+        this.shardResults = results;
     }
 
     /**

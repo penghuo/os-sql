@@ -5,8 +5,12 @@
 
 package org.opensearch.sql.opensearch.planner.merge;
 
+import java.util.ArrayList;
 import java.util.List;
+import org.apache.calcite.linq4j.AbstractEnumerable;
 import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
+import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
@@ -74,7 +78,39 @@ public class LocalJoinExchange extends Exchange {
 
     @Override
     public Enumerable<@Nullable Object> scan() {
-        // Full implementation will be wired in T8 when shard dispatch is available
-        throw new UnsupportedOperationException("LocalJoinExchange.scan() not yet implemented");
+        // Each partition's join results are independent — just concatenate all partition results.
+        if (shardResults == null || shardResults.isEmpty()) {
+            return Linq4j.emptyEnumerable();
+        }
+        List<Object[]> allRows = new ArrayList<>();
+        for (ShardResult result : shardResults) {
+            allRows.addAll(result.getRows());
+        }
+        return new AbstractEnumerable<@Nullable Object>() {
+            @Override
+            public Enumerator<@Nullable Object> enumerator() {
+                return new Enumerator<>() {
+                    private int index = -1;
+
+                    @Override
+                    public Object current() {
+                        return allRows.get(index);
+                    }
+
+                    @Override
+                    public boolean moveNext() {
+                        return ++index < allRows.size();
+                    }
+
+                    @Override
+                    public void reset() {
+                        index = -1;
+                    }
+
+                    @Override
+                    public void close() {}
+                };
+            }
+        };
     }
 }

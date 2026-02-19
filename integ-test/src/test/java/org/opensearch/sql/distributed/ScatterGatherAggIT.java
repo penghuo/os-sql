@@ -67,8 +67,7 @@ public class ScatterGatherAggIT extends ScatterGatherITBase {
   @Test
   @DisplayName("Multiple aggregation functions in one query")
   public void testMultipleAggFunctions() throws IOException {
-    JSONObject[] results =
-        dualPathQuery("stats count(), avg(salary), min(age), max(age) by dept");
+    JSONObject[] results = dualPathQuery("stats count(), avg(salary), min(age), max(age) by dept");
     assertResultsMatch(results[0], results[1]);
   }
 }

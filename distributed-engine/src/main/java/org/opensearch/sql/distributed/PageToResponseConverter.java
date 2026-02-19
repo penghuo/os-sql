@@ -78,8 +78,7 @@ public final class PageToResponseConverter {
           Block block = page.getBlock(ch);
           String columnName = ch < fields.size() ? fields.get(ch).getName() : "col" + ch;
           boolean isTimeBased =
-              ch < fields.size()
-                  && OpenSearchTypeFactory.isTimeBasedType(fields.get(ch).getType());
+              ch < fields.size() && OpenSearchTypeFactory.isTimeBasedType(fields.get(ch).getType());
           row.put(columnName, extractValue(block, pos, isTimeBased));
         }
         rows.add(ExprTupleValue.fromExprValueMap(row));

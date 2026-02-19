@@ -34,8 +34,7 @@ public class ScatterGatherFeatureFlagOffIT extends ScatterGatherITBase {
   @Test
   @DisplayName("Filter query works with flag off (DSL fallback)")
   public void testFilterWithFlagOff() throws IOException {
-    JSONObject result =
-        sgQuery("where status = 200 | fields id, status");
+    JSONObject result = sgQuery("where status = 200 | fields id, status");
     int rowCount = countRows(result);
     assertEquals(400, rowCount);
     // Should NOT use distributed engine
@@ -61,8 +60,7 @@ public class ScatterGatherFeatureFlagOffIT extends ScatterGatherITBase {
   @Test
   @DisplayName("Flag off results match flag on results for filter")
   public void testFlagOffMatchesFlagOnFilter() throws IOException {
-    JSONObject dslResult =
-        sgQuery("where status = 200 | fields id, status");
+    JSONObject dslResult = sgQuery("where status = 200 | fields id, status");
 
     enableDistributedEngine();
     JSONObject distResult;

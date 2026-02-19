@@ -20,7 +20,11 @@ public class PartitioningScheme {
     /** All data gathered to coordinator. */
     COORDINATOR_ONLY,
     /** Single node execution (no distribution). */
-    SINGLE
+    SINGLE,
+    /** Data hash-partitioned across nodes by key columns (Phase 2). */
+    HASH_DISTRIBUTED,
+    /** Data broadcast (replicated) to all nodes (Phase 2). */
+    BROADCAST
   }
 
   private final Partitioning partitioning;
@@ -58,8 +62,21 @@ public class PartitioningScheme {
     return new PartitioningScheme(Partitioning.SINGLE);
   }
 
+  /** Creates a HASH_DISTRIBUTED partitioning scheme with the given partition key columns. */
+  public static PartitioningScheme hashPartitioning(List<Integer> partitionColumns) {
+    return new PartitioningScheme(Partitioning.HASH_DISTRIBUTED, partitionColumns);
+  }
+
+  /** Creates a BROADCAST partitioning scheme (full replication to all nodes). */
+  public static PartitioningScheme broadcastPartitioning() {
+    return new PartitioningScheme(Partitioning.BROADCAST);
+  }
+
   @Override
   public String toString() {
-    return "PartitioningScheme{" + partitioning + "}";
+    if (partitionColumns.isEmpty()) {
+      return "PartitioningScheme{" + partitioning + "}";
+    }
+    return "PartitioningScheme{" + partitioning + ", columns=" + partitionColumns + "}";
   }
 }

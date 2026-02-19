@@ -25,8 +25,7 @@ public class ScatterGatherMemoryIT extends ScatterGatherITBase {
     long memBefore = getDistributedMemoryUsage();
     sgQuery("where status = 200 | fields id, status");
     long memAfter = getDistributedMemoryUsage();
-    Assert.assertEquals(
-        "Memory pool should return to baseline after query", memBefore, memAfter);
+    Assert.assertEquals("Memory pool should return to baseline after query", memBefore, memAfter);
   }
 
   @Test
@@ -60,9 +59,7 @@ public class ScatterGatherMemoryIT extends ScatterGatherITBase {
 
     long memAfter = getDistributedMemoryUsage();
     Assert.assertEquals(
-        "Memory pool should return to baseline after 5 sequential queries",
-        memBefore,
-        memAfter);
+        "Memory pool should return to baseline after 5 sequential queries", memBefore, memAfter);
   }
 
   @Test
@@ -76,8 +73,7 @@ public class ScatterGatherMemoryIT extends ScatterGatherITBase {
     }
 
     long memEnd = getDistributedMemoryUsage();
-    Assert.assertEquals(
-        "Memory should not grow across repeated queries", memStart, memEnd);
+    Assert.assertEquals("Memory should not grow across repeated queries", memStart, memEnd);
   }
 
   /**
@@ -88,8 +84,7 @@ public class ScatterGatherMemoryIT extends ScatterGatherITBase {
     try {
       Request request = new Request("GET", "/_plugins/_sql/stats");
       Response response = client().performRequest(request);
-      String body =
-          org.opensearch.sql.legacy.TestUtils.getResponseBody(response, true);
+      String body = org.opensearch.sql.legacy.TestUtils.getResponseBody(response, true);
       JSONObject stats = new JSONObject(body);
 
       // Look for distributed engine memory metrics

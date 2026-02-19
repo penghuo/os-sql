@@ -55,9 +55,7 @@ public class ScatterGatherSortLimitIT extends ScatterGatherITBase {
     for (int i = 1; i < datarows.length(); i++) {
       long prev = datarows.getJSONArray(i - 1).getLong(0);
       long curr = datarows.getJSONArray(i).getLong(0);
-      Assert.assertTrue(
-          "Expected descending order, got " + prev + " before " + curr,
-          prev >= curr);
+      Assert.assertTrue("Expected descending order, got " + prev + " before " + curr, prev >= curr);
     }
   }
 
@@ -69,9 +67,7 @@ public class ScatterGatherSortLimitIT extends ScatterGatherITBase {
     for (int i = 1; i < datarows.length(); i++) {
       long prev = datarows.getJSONArray(i - 1).getLong(0);
       long curr = datarows.getJSONArray(i).getLong(0);
-      Assert.assertTrue(
-          "Expected ascending order, got " + prev + " before " + curr,
-          prev <= curr);
+      Assert.assertTrue("Expected ascending order, got " + prev + " before " + curr, prev <= curr);
     }
   }
 

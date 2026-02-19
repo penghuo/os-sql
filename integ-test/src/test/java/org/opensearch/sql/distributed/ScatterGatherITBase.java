@@ -6,10 +6,6 @@
 package org.opensearch.sql.distributed;
 
 import static org.opensearch.sql.legacy.TestUtils.isIndexExist;
-import static org.opensearch.sql.util.MatcherUtils.rows;
-import static org.opensearch.sql.util.MatcherUtils.schema;
-import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
-import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -94,8 +90,7 @@ public abstract class ScatterGatherITBase extends PPLIntegTestCase {
 
     StringBuilder bulk = new StringBuilder();
     for (int i = 0; i < DOC_COUNT; i++) {
-      bulk.append(
-          String.format(Locale.ROOT, "{\"index\":{\"_id\":\"%d\"}}\n", i));
+      bulk.append(String.format(Locale.ROOT, "{\"index\":{\"_id\":\"%d\"}}\n", i));
       bulk.append(
           String.format(
               Locale.ROOT,
@@ -167,8 +162,7 @@ public abstract class ScatterGatherITBase extends PPLIntegTestCase {
     JSONArray expectedRows = expected.getJSONArray("datarows");
     JSONArray actualRows = actual.getJSONArray("datarows");
 
-    Assert.assertEquals(
-        "Row count mismatch", expectedRows.length(), actualRows.length());
+    Assert.assertEquals("Row count mismatch", expectedRows.length(), actualRows.length());
 
     // Compare sorted string representations for order-insensitive match
     java.util.List<String> expectedSorted = new java.util.ArrayList<>();
@@ -190,8 +184,7 @@ public abstract class ScatterGatherITBase extends PPLIntegTestCase {
     JSONArray expectedRows = expected.getJSONArray("datarows");
     JSONArray actualRows = actual.getJSONArray("datarows");
 
-    Assert.assertEquals(
-        "Row count mismatch", expectedRows.length(), actualRows.length());
+    Assert.assertEquals("Row count mismatch", expectedRows.length(), actualRows.length());
 
     for (int i = 0; i < expectedRows.length(); i++) {
       Assert.assertEquals(
@@ -208,12 +201,10 @@ public abstract class ScatterGatherITBase extends PPLIntegTestCase {
   protected void assertMultiShardDistribution() throws IOException {
     Request request = new Request("GET", "/" + SG_TEST_INDEX + "/_search_shards");
     Response response = client().performRequest(request);
-    String body =
-        org.opensearch.sql.legacy.TestUtils.getResponseBody(response, true);
+    String body = org.opensearch.sql.legacy.TestUtils.getResponseBody(response, true);
     JSONObject shardInfo = new JSONObject(body);
     JSONArray shards = shardInfo.getJSONArray("shards");
     Assert.assertTrue(
-        "Expected documents across multiple shards, got " + shards.length(),
-        shards.length() >= 2);
+        "Expected documents across multiple shards, got " + shards.length(), shards.length() >= 2);
   }
 }

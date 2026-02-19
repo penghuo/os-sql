@@ -39,8 +39,7 @@ public class ScatterGatherExplainIT extends ScatterGatherITBase {
   @DisplayName("Explain shows operator types for aggregation")
   public void testExplainShowsOperators() throws IOException {
     String explain =
-        explainQueryYaml(
-            String.format("source=%s | stats count() by city", SG_TEST_INDEX));
+        explainQueryYaml(String.format("source=%s | stats count() by city", SG_TEST_INDEX));
     Assert.assertTrue(
         "Explain should reference scan, aggregation, or table scan operators",
         explain.contains("Scan")
@@ -56,8 +55,7 @@ public class ScatterGatherExplainIT extends ScatterGatherITBase {
   @Test
   @DisplayName("Explain contains index or node reference for filter query")
   public void testExplainShowsShardAssignment() throws IOException {
-    String explain =
-        explainQueryYaml(String.format("source=%s | where age > 30", SG_TEST_INDEX));
+    String explain = explainQueryYaml(String.format("source=%s | where age > 30", SG_TEST_INDEX));
     // Distributed explain shows shards/nodes; Calcite explain shows index name/table ref
     Assert.assertTrue(
         "Explain should contain shard, node, or index information",
@@ -74,8 +72,7 @@ public class ScatterGatherExplainIT extends ScatterGatherITBase {
   @DisplayName("Explain shows exchange or plan structure for aggregation")
   public void testExplainShowsExchange() throws IOException {
     String explain =
-        explainQueryYaml(
-            String.format("source=%s | stats avg(salary) by dept", SG_TEST_INDEX));
+        explainQueryYaml(String.format("source=%s | stats avg(salary) by dept", SG_TEST_INDEX));
     Assert.assertTrue(
         "Explain should show exchange, gather, or aggregation plan structure",
         explain.contains("Exchange")

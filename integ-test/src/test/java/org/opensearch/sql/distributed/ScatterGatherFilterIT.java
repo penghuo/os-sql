@@ -5,8 +5,6 @@
 
 package org.opensearch.sql.distributed;
 
-import static org.opensearch.sql.util.MatcherUtils.verifyNumOfRows;
-
 import java.io.IOException;
 import org.json.JSONObject;
 import org.junit.Test;

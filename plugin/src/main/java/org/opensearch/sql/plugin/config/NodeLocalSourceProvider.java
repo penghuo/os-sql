@@ -111,14 +111,12 @@ public class NodeLocalSourceProvider
             throw new IllegalStateException("No local shards found for index: " + indexName);
           }
 
-          MultiReader multiReader =
-              new MultiReader(readers.toArray(new IndexReader[0]), false);
+          MultiReader multiReader = new MultiReader(readers.toArray(new IndexReader[0]), false);
           IndexSearcher combinedSearcher = new IndexSearcher(multiReader);
           MapperService mapperService = indexService.mapperService();
           List<ColumnMapping> columns = buildColumnMappings(rowType, mapperService);
 
-          return new CloseableLuceneFullScan(
-              operatorContext, combinedSearcher, columns, searchers);
+          return new CloseableLuceneFullScan(operatorContext, combinedSearcher, columns, searchers);
         } catch (Exception e) {
           // Release any acquired searchers on failure
           for (Engine.Searcher s : searchers) {
@@ -179,8 +177,7 @@ public class NodeLocalSourceProvider
    *   <li>boolean → SORTED_NUMERIC DocValues (0/1)
    * </ul>
    */
-  static List<ColumnMapping> buildColumnMappings(
-      RelDataType rowType, MapperService mapperService) {
+  static List<ColumnMapping> buildColumnMappings(RelDataType rowType, MapperService mapperService) {
     List<ColumnMapping> columns = new ArrayList<>();
     for (RelDataTypeField field : rowType.getFieldList()) {
       int index = field.getIndex();
@@ -216,27 +213,36 @@ public class NodeLocalSourceProvider
     return switch (typeName) {
       case "long" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.LONG,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.LONG,
               index);
       case "integer" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.INT,
-              index);
+              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.INT, index);
       case "short" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.SHORT,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.SHORT,
               index);
       case "byte" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.BYTE,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.BYTE,
               index);
       case "double", "scaled_float" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.DOUBLE,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.DOUBLE,
               index);
       case "float", "half_float" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.FLOAT,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.FLOAT,
               index);
       case "boolean" ->
           new ColumnMapping(
@@ -246,7 +252,9 @@ public class NodeLocalSourceProvider
               index);
       case "date", "date_nanos" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_NUMERIC, ColumnMapping.BlockType.LONG,
+              name,
+              ColumnMapping.DocValuesType.SORTED_NUMERIC,
+              ColumnMapping.BlockType.LONG,
               index);
       case "keyword", "constant_keyword", "wildcard" ->
           new ColumnMapping(
@@ -263,7 +271,9 @@ public class NodeLocalSourceProvider
               index);
       case "ip" ->
           new ColumnMapping(
-              name, ColumnMapping.DocValuesType.SORTED_SET, ColumnMapping.BlockType.VARIABLE_WIDTH,
+              name,
+              ColumnMapping.DocValuesType.SORTED_SET,
+              ColumnMapping.BlockType.VARIABLE_WIDTH,
               index);
       case "binary" ->
           new ColumnMapping(

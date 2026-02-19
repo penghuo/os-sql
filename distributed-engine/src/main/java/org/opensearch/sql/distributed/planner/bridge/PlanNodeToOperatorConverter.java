@@ -9,9 +9,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.opensearch.sql.distributed.context.OperatorContext;
+import org.opensearch.sql.distributed.data.Page;
 import org.opensearch.sql.distributed.operator.FilterAndProjectOperator;
 import org.opensearch.sql.distributed.operator.HashAggregationOperator;
+import org.opensearch.sql.distributed.operator.Operator;
 import org.opensearch.sql.distributed.operator.OperatorFactory;
 import org.opensearch.sql.distributed.operator.OrderByOperator;
 import org.opensearch.sql.distributed.operator.PageFilter;
@@ -19,10 +23,18 @@ import org.opensearch.sql.distributed.operator.PageProjection;
 import org.opensearch.sql.distributed.operator.SortOrder;
 import org.opensearch.sql.distributed.operator.TopNOperator;
 import org.opensearch.sql.distributed.operator.aggregation.Accumulator;
+import org.opensearch.sql.distributed.operator.join.HashBuilderOperator;
+import org.opensearch.sql.distributed.operator.join.JoinHash;
+import org.opensearch.sql.distributed.operator.join.JoinType;
+import org.opensearch.sql.distributed.operator.join.LookupJoinOperator;
+import org.opensearch.sql.distributed.operator.window.RowNumberFunction;
+import org.opensearch.sql.distributed.operator.window.WindowFunction;
+import org.opensearch.sql.distributed.operator.window.WindowOperator;
 import org.opensearch.sql.distributed.planner.AggregationNode;
 import org.opensearch.sql.distributed.planner.DedupNode;
 import org.opensearch.sql.distributed.planner.ExchangeNode;
 import org.opensearch.sql.distributed.planner.FilterNode;
+import org.opensearch.sql.distributed.planner.JoinNode;
 import org.opensearch.sql.distributed.planner.LimitNode;
 import org.opensearch.sql.distributed.planner.LuceneTableScanNode;
 import org.opensearch.sql.distributed.planner.PlanNode;
@@ -32,6 +44,7 @@ import org.opensearch.sql.distributed.planner.RemoteSourceNode;
 import org.opensearch.sql.distributed.planner.SortNode;
 import org.opensearch.sql.distributed.planner.TopNNode;
 import org.opensearch.sql.distributed.planner.ValuesNode;
+import org.opensearch.sql.distributed.planner.WindowNode;
 
 /**
  * Converts a PlanNode tree into a list of {@link OperatorFactory} instances that can be passed to a
@@ -205,6 +218,56 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
   public Void visitExchange(ExchangeNode node, Void context) {
     // In single-node execution, exchange is a pass-through
     node.getSource().accept(this, null);
+    return null;
+  }
+
+  @Override
+  public Void visitJoin(JoinNode node, Void context) {
+    // Visit left (probe) side — the pipeline's source
+    node.getLeft().accept(this, null);
+
+    // Convert build (right) side to operator factories
+    List<OperatorFactory> buildFactories = convert(node.getRight(), sourceProvider);
+
+    // Create the join bridge factory that runs the build pipeline and creates the probe operator
+    operatorFactories.add(new JoinBridgeFactory(node, buildFactories));
+    return null;
+  }
+
+  @Override
+  public Void visitWindow(WindowNode node, Void context) {
+    node.getSource().accept(this, null);
+
+    // Extract partition-by and order-by channels from the WindowNode
+    int[] partitionKeyChannels =
+        node.getPartitionByColumns().stream().mapToInt(Integer::intValue).toArray();
+    int[] orderKeyChannels =
+        SortOrderConverter.extractSortChannels(node.getOrderByCollation()).stream()
+            .mapToInt(Integer::intValue)
+            .toArray();
+
+    // Determine window functions from the output type.
+    // WindowNode output has the input columns followed by window function result columns.
+    // For now, we default to ROW_NUMBER for each extra output column. The planner should
+    // eventually pass explicit window function specifications via WindowNode.
+    int inputFieldCount = node.getSource() != null ? estimateInputFieldCount(node) : 0;
+    int outputFieldCount =
+        node.getOutputType() != null ? node.getOutputType().getFieldCount() : inputFieldCount;
+    int windowFunctionCount = Math.max(0, outputFieldCount - inputFieldCount);
+
+    List<WindowFunction> windowFunctions = new ArrayList<>();
+    for (int i = 0; i < windowFunctionCount; i++) {
+      // Default to ROW_NUMBER — the planner/optimizer should annotate the specific function type
+      windowFunctions.add(new RowNumberFunction());
+    }
+    // Fallback: at least one window function
+    if (windowFunctions.isEmpty()) {
+      windowFunctions.add(new RowNumberFunction());
+    }
+
+    operatorFactories.add(
+        new WindowOperator.WindowOperatorFactory(
+            partitionKeyChannels, orderKeyChannels, windowFunctions));
     return null;
   }
 
@@ -389,6 +452,195 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
       }
       throw new UnsupportedOperationException(
           "Cannot copy positions for: " + block.getClass().getSimpleName());
+    }
+  }
+
+  /**
+   * Estimates the input field count for a WindowNode by traversing the source tree to find a node
+   * with an explicit row type. Falls back to 0 if unknown.
+   */
+  private static int estimateInputFieldCount(WindowNode windowNode) {
+    // Walk the source chain looking for nodes with known field counts
+    PlanNode source = windowNode.getSource();
+    if (source instanceof LuceneTableScanNode scanNode) {
+      return scanNode.getOutputType().getFieldCount();
+    }
+    if (source instanceof ProjectNode projectNode) {
+      return projectNode.getOutputType().getFieldCount();
+    }
+    // For other nodes, estimate from the output type minus window functions
+    // (conservative: assume output type includes window columns)
+    return windowNode.getOutputType() != null ? windowNode.getOutputType().getFieldCount() - 1 : 0;
+  }
+
+  /**
+   * OperatorFactory that bridges the build-side pipeline with the probe-side join operator. At
+   * {@code createOperator()} time, this factory runs the build pipeline to completion, constructs
+   * the {@link JoinHash}, and creates a {@link LookupJoinOperator} wired to it.
+   */
+  public static class JoinBridgeFactory implements OperatorFactory {
+    private final JoinNode joinNode;
+    private final List<OperatorFactory> buildFactories;
+    private boolean closed;
+    private JoinHash cachedJoinHash;
+
+    public JoinBridgeFactory(JoinNode joinNode, List<OperatorFactory> buildFactories) {
+      this.joinNode = joinNode;
+      this.buildFactories = buildFactories;
+    }
+
+    public JoinNode getJoinNode() {
+      return joinNode;
+    }
+
+    @Override
+    public Operator createOperator(OperatorContext operatorContext) {
+      if (closed) {
+        throw new IllegalStateException("Factory is already closed");
+      }
+
+      // Build the hash table from the build side (runs inline)
+      JoinHash joinHash = getOrBuildJoinHash(operatorContext);
+
+      // Convert Calcite JoinRelType to our JoinType
+      JoinType joinType = convertJoinType(joinNode.getJoinType());
+
+      // Probe key channels from left side
+      int[] probeKeyChannels =
+          joinNode.getLeftJoinKeys().stream().mapToInt(Integer::intValue).toArray();
+
+      // Build key channels from right side (used during hash build)
+      // Output channels: all probe columns + all build columns (for INNER/LEFT/RIGHT/FULL)
+      // For SEMI/ANTI: only probe columns
+      int probeChannelCount = estimateProbeChannelCount();
+      int buildChannelCount = joinHash.getChannelCount();
+
+      int[] probeOutputChannels = identityArray(probeChannelCount);
+      int[] buildOutputChannels =
+          joinType.outputBuildColumns() ? identityArray(buildChannelCount) : new int[0];
+
+      return new LookupJoinOperator(
+          operatorContext,
+          joinHash,
+          joinType,
+          probeKeyChannels,
+          probeOutputChannels,
+          buildOutputChannels);
+    }
+
+    @Override
+    public void noMoreOperators() {
+      closed = true;
+    }
+
+    /**
+     * Builds or returns the cached JoinHash. The build pipeline is run once, and the resulting hash
+     * table is reused across multiple operator instances.
+     */
+    private JoinHash getOrBuildJoinHash(OperatorContext probeContext) {
+      if (cachedJoinHash != null) {
+        return cachedJoinHash;
+      }
+
+      int[] buildKeyChannels =
+          joinNode.getRightJoinKeys().stream().mapToInt(Integer::intValue).toArray();
+
+      // Create build-side operators
+      List<Operator> buildOperators = new ArrayList<>();
+      for (int i = 0; i < buildFactories.size(); i++) {
+        OperatorContext buildOpCtx =
+            new OperatorContext(
+                1000 + i, "BuildSide-" + buildFactories.get(i).getClass().getSimpleName());
+        buildOperators.add(buildFactories.get(i).createOperator(buildOpCtx));
+      }
+
+      // Create the HashBuilderOperator as the sink
+      OperatorContext hashBuilderCtx =
+          new OperatorContext(1000 + buildFactories.size(), "HashBuilderOperator");
+      HashBuilderOperator hashBuilder = new HashBuilderOperator(hashBuilderCtx, buildKeyChannels);
+      buildOperators.add(hashBuilder);
+
+      // Run the build pipeline to completion
+      runPipelineToCompletion(buildOperators);
+
+      cachedJoinHash = hashBuilder.getJoinHash();
+      return cachedJoinHash;
+    }
+
+    /** Runs a pipeline of operators to completion using a simplified driver loop. */
+    private static void runPipelineToCompletion(List<Operator> operators) {
+      boolean moreWork;
+      do {
+        moreWork = false;
+        for (int i = 0; i < operators.size() - 1; i++) {
+          Operator current = operators.get(i);
+          Operator next = operators.get(i + 1);
+
+          if (!current.isFinished() && next.needsInput()) {
+            Page page = current.getOutput();
+            if (page != null && page.getPositionCount() > 0) {
+              next.addInput(page);
+              moreWork = true;
+            }
+          }
+
+          if (current.isFinished()) {
+            next.finish();
+          }
+        }
+      } while (moreWork);
+
+      // Final finish propagation
+      for (int i = 0; i < operators.size() - 1; i++) {
+        if (operators.get(i).isFinished()) {
+          operators.get(i + 1).finish();
+        }
+      }
+    }
+
+    private int estimateProbeChannelCount() {
+      // Estimate probe (left) side channel count from the plan node tree
+      PlanNode left = joinNode.getLeft();
+      if (left instanceof LuceneTableScanNode scanNode) {
+        return scanNode.getOutputType().getFieldCount();
+      }
+      if (left instanceof ProjectNode projectNode) {
+        return projectNode.getOutputType().getFieldCount();
+      }
+      // Fallback: use the maximum key channel index + 1 as a minimum bound.
+      // The actual channel count will be determined from the first input page at runtime.
+      int maxKey = 0;
+      for (int key : joinNode.getLeftJoinKeys()) {
+        maxKey = Math.max(maxKey, key);
+      }
+      return maxKey + 1;
+    }
+
+    private static int[] identityArray(int count) {
+      int[] arr = new int[count];
+      for (int i = 0; i < count; i++) {
+        arr[i] = i;
+      }
+      return arr;
+    }
+
+    private static JoinType convertJoinType(JoinRelType calciteType) {
+      switch (calciteType) {
+        case INNER:
+          return JoinType.INNER;
+        case LEFT:
+          return JoinType.LEFT;
+        case RIGHT:
+          return JoinType.RIGHT;
+        case FULL:
+          return JoinType.FULL;
+        case SEMI:
+          return JoinType.SEMI;
+        case ANTI:
+          return JoinType.ANTI;
+        default:
+          throw new UnsupportedOperationException("Unsupported join type: " + calciteType);
+      }
     }
   }
 

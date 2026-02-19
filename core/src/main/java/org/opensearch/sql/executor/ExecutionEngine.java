@@ -59,6 +59,7 @@ public interface ExecutionEngine {
 
   /** Execution engine identifiers for tracking which engine processed a query. */
   String ENGINE_DISTRIBUTED = "distributed";
+
   String ENGINE_CALCITE_LOCAL = "calcite_local";
   String ENGINE_LEGACY_DSL = "legacy_dsl";
 
@@ -68,6 +69,7 @@ public interface ExecutionEngine {
     private final Schema schema;
     private final List<ExprValue> results;
     private final Cursor cursor;
+
     /** Identifies which engine produced this response ("distributed", "calcite_local", etc). */
     private String engine = ENGINE_CALCITE_LOCAL;
   }

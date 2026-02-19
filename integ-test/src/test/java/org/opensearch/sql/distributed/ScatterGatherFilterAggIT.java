@@ -43,7 +43,8 @@ public class ScatterGatherFilterAggIT extends ScatterGatherITBase {
   @Test
   @DisplayName("Filter then sum(salary) by dept")
   public void testFilterSumByDept() throws IOException {
-    JSONObject[] results = dualPathQuery("where age >= 30 AND age < 40 | stats sum(salary) by dept");
+    JSONObject[] results =
+        dualPathQuery("where age >= 30 AND age < 40 | stats sum(salary) by dept");
     assertResultsMatch(results[0], results[1]);
   }
 

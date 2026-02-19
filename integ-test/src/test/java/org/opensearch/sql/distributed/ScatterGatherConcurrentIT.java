@@ -5,7 +5,6 @@
 
 package org.opensearch.sql.distributed;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -33,8 +32,10 @@ public class ScatterGatherConcurrentIT extends ScatterGatherITBase {
     for (int i = 0; i < CONCURRENT_QUERIES; i++) {
       int statusValue = (i % 2 == 0) ? 200 : 404;
       queries.add(
-          String.format(java.util.Locale.ROOT,
-              "source=%s | where status = %d | fields id, status", SG_TEST_INDEX,
+          String.format(
+              java.util.Locale.ROOT,
+              "source=%s | where status = %d | fields id, status",
+              SG_TEST_INDEX,
               statusValue));
     }
     runConcurrentQueries(queries);
@@ -48,8 +49,7 @@ public class ScatterGatherConcurrentIT extends ScatterGatherITBase {
       String[] groupCols = {"city", "dept", "city", "dept", "city"};
       queries.add(
           String.format(
-              "source=%s | stats count() by %s",
-              SG_TEST_INDEX, groupCols[i % groupCols.length]));
+              "source=%s | stats count() by %s", SG_TEST_INDEX, groupCols[i % groupCols.length]));
     }
     runConcurrentQueries(queries);
   }
@@ -105,10 +105,7 @@ public class ScatterGatherConcurrentIT extends ScatterGatherITBase {
     try {
       List<Future<JSONObject>> futures = new ArrayList<>();
       for (String query : queries) {
-        futures.add(
-            executor.submit(
-                (Callable<JSONObject>)
-                    () -> executeQuery(query)));
+        futures.add(executor.submit((Callable<JSONObject>) () -> executeQuery(query)));
       }
 
       List<String> errors = new ArrayList<>();
@@ -116,17 +113,14 @@ public class ScatterGatherConcurrentIT extends ScatterGatherITBase {
         try {
           JSONObject result = futures.get(i).get();
           Assert.assertNotNull("Query " + i + " returned null", result);
-          Assert.assertTrue(
-              "Query " + i + " returned no datarows",
-              result.has("datarows"));
+          Assert.assertTrue("Query " + i + " returned no datarows", result.has("datarows"));
         } catch (ExecutionException e) {
           errors.add("Query " + i + " failed: " + e.getCause().getMessage());
         }
       }
 
       if (!errors.isEmpty()) {
-        Assert.fail(
-            "Concurrent queries failed:\n" + String.join("\n", errors));
+        Assert.fail("Concurrent queries failed:\n" + String.join("\n", errors));
       }
     } finally {
       executor.shutdown();

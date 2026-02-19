@@ -18,8 +18,8 @@ import org.junit.jupiter.api.Test;
 class ConvertUnsupportedTest extends ConverterTestBase {
 
   @Test
-  @DisplayName("LogicalJoin throws UnsupportedPatternException")
-  void convertJoinThrows() {
+  @DisplayName("LogicalJoin converts to JoinNode")
+  void convertJoinProducesJoinNode() {
     var left = createTableScan("users", "id", "name");
     var right = createTableScan("orders", "user_id", "amount");
     var join =
@@ -31,10 +31,12 @@ class ConvertUnsupportedTest extends ConverterTestBase {
             java.util.Set.of(),
             JoinRelType.INNER);
 
-    UnsupportedPatternException ex =
-        assertThrows(UnsupportedPatternException.class, () -> converter.convert(join));
+    PlanNode result = converter.convert(join);
 
-    assertTrue(ex.getMessage().contains("LogicalJoin"));
+    assertInstanceOf(JoinNode.class, result);
+    JoinNode joinNode = (JoinNode) result;
+    assertEquals(JoinRelType.INNER, joinNode.getJoinType());
+    assertEquals(2, joinNode.getSources().size());
   }
 
   @Test
@@ -51,23 +53,29 @@ class ConvertUnsupportedTest extends ConverterTestBase {
   }
 
   @Test
-  @DisplayName("UnsupportedPatternException message includes RelNode type")
-  void exceptionIncludesType() {
-    var left = createTableScan("users", "id");
-    var right = createTableScan("orders", "user_id");
+  @DisplayName("LogicalJoin with equi-join extracts key columns")
+  void joinExtractsKeys() {
+    var left = createTableScan("users", "id", "name");
+    var right = createTableScan("orders", "user_id", "amount");
+
+    // Build an equi-join condition: left.$0 = right.$0 (which is $2 in combined row)
+    var condition =
+        rexBuilder.makeCall(
+            org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(
+                typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.INTEGER), 0),
+            rexBuilder.makeInputRef(
+                typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.INTEGER), 2));
+
     var join =
         LogicalJoin.create(
-            left,
-            right,
-            List.of(),
-            rexBuilder.makeLiteral(true),
-            java.util.Set.of(),
-            JoinRelType.INNER);
+            left, right, List.of(), condition, java.util.Set.of(), JoinRelType.INNER);
 
-    UnsupportedPatternException ex =
-        assertThrows(UnsupportedPatternException.class, () -> converter.convert(join));
+    PlanNode result = converter.convert(join);
 
-    assertNotNull(ex.getMessage());
-    assertFalse(ex.getMessage().isEmpty());
+    assertInstanceOf(JoinNode.class, result);
+    JoinNode joinNode = (JoinNode) result;
+    assertEquals(List.of(0), joinNode.getLeftJoinKeys());
+    assertEquals(List.of(0), joinNode.getRightJoinKeys());
   }
 }

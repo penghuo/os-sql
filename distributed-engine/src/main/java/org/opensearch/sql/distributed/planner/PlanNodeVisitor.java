@@ -58,4 +58,12 @@ public abstract class PlanNodeVisitor<R, C> {
   public R visitValues(ValuesNode node, C context) {
     return visitPlan(node, context);
   }
+
+  public R visitJoin(JoinNode node, C context) {
+    return visitPlan(node, context);
+  }
+
+  public R visitWindow(WindowNode node, C context) {
+    return visitPlan(node, context);
+  }
 }

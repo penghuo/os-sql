@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalAggregate;
@@ -19,7 +20,9 @@ import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.logical.LogicalValues;
+import org.apache.calcite.rel.logical.LogicalWindow;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.opensearch.sql.calcite.plan.rel.Dedup;
@@ -73,21 +76,16 @@ public class RelNodeToPlanNodeConverter {
     } else if (relNode instanceof TableScan) {
       return visitTableScan((TableScan) relNode);
     } else if (relNode instanceof LogicalJoin) {
-      throw new UnsupportedPatternException(
-          "LogicalJoin is not supported in Phase 1 distributed engine");
+      return visitJoin((LogicalJoin) relNode);
+    } else if (relNode instanceof LogicalWindow) {
+      return visitWindow((LogicalWindow) relNode);
     } else if (relNode instanceof LogicalCorrelate) {
       throw new UnsupportedPatternException(
-          "LogicalCorrelate is not supported in Phase 1 distributed engine");
+          "LogicalCorrelate is not supported in the distributed engine");
     } else if (relNode instanceof LogicalUnion) {
       throw new UnsupportedPatternException(
-          "LogicalUnion is not supported in Phase 1 distributed engine");
+          "LogicalUnion is not supported in the distributed engine");
     } else {
-      // Check for window functions by class name to avoid hard dependency
-      String className = relNode.getClass().getSimpleName();
-      if (className.contains("Window")) {
-        throw new UnsupportedPatternException(
-            "Window functions are not supported in Phase 1 distributed engine");
-      }
       throw new UnsupportedPatternException(
           "Unsupported RelNode type: " + relNode.getClass().getName());
     }
@@ -160,6 +158,80 @@ public class RelNodeToPlanNodeConverter {
       tuples.add(List.copyOf(tuple));
     }
     return new ValuesNode(PlanNodeId.next("Values"), tuples, values.getRowType());
+  }
+
+  private JoinNode visitJoin(LogicalJoin join) {
+    PlanNode left = visitNode(join.getLeft());
+    PlanNode right = visitNode(join.getRight());
+
+    // Extract equi-join key columns from the join condition
+    List<Integer> leftKeys = new ArrayList<>();
+    List<Integer> rightKeys = new ArrayList<>();
+    extractJoinKeys(
+        join.getCondition(), join.getLeft().getRowType().getFieldCount(), leftKeys, rightKeys);
+
+    return new JoinNode(
+        PlanNodeId.next("Join"),
+        left,
+        right,
+        join.getCondition(),
+        join.getJoinType(),
+        leftKeys,
+        rightKeys);
+  }
+
+  private WindowNode visitWindow(LogicalWindow window) {
+    PlanNode source = visitNode(window.getInput());
+
+    // Extract partition-by columns and order-by collation from window groups.
+    // LogicalWindow may have multiple groups; we use the first group's specification.
+    List<Integer> partitionByColumns = List.of();
+    RelCollation orderByCollation = RelCollations.EMPTY;
+
+    if (!window.groups.isEmpty()) {
+      var group = window.groups.get(0);
+      partitionByColumns = group.keys.toList();
+      orderByCollation = group.orderKeys;
+    }
+
+    return new WindowNode(
+        PlanNodeId.next("Window"),
+        source,
+        partitionByColumns,
+        orderByCollation,
+        window.constants,
+        window.getRowType());
+  }
+
+  /**
+   * Extracts equi-join key column indices from a join condition. Looks for RexInputRef equality
+   * patterns (e.g., $0 = $5). Left-side refs have index < leftFieldCount; right-side refs are
+   * adjusted by subtracting leftFieldCount.
+   */
+  private void extractJoinKeys(
+      RexNode condition, int leftFieldCount, List<Integer> leftKeys, List<Integer> rightKeys) {
+    if (condition instanceof org.apache.calcite.rex.RexCall call) {
+      if (call.getKind() == org.apache.calcite.sql.SqlKind.EQUALS
+          && call.getOperands().size() == 2) {
+        RexNode op0 = call.getOperands().get(0);
+        RexNode op1 = call.getOperands().get(1);
+        if (op0 instanceof RexInputRef ref0 && op1 instanceof RexInputRef ref1) {
+          int idx0 = ref0.getIndex();
+          int idx1 = ref1.getIndex();
+          if (idx0 < leftFieldCount && idx1 >= leftFieldCount) {
+            leftKeys.add(idx0);
+            rightKeys.add(idx1 - leftFieldCount);
+          } else if (idx1 < leftFieldCount && idx0 >= leftFieldCount) {
+            leftKeys.add(idx1);
+            rightKeys.add(idx0 - leftFieldCount);
+          }
+        }
+      } else if (call.getKind() == org.apache.calcite.sql.SqlKind.AND) {
+        for (RexNode operand : call.getOperands()) {
+          extractJoinKeys(operand, leftFieldCount, leftKeys, rightKeys);
+        }
+      }
+    }
   }
 
   private LuceneTableScanNode visitTableScan(TableScan tableScan) {

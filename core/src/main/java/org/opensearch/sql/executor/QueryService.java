@@ -159,7 +159,8 @@ public class QueryService {
               } catch (UnsupportedOperationException e) {
                 // Expected fallback: unsupported pattern (joins, windows, etc.)
                 metricsCollector.recordFallbackExpected();
-                log.debug("Distributed engine unsupported pattern, falling back to DSL: {}",
+                log.debug(
+                    "Distributed engine unsupported pattern, falling back to DSL: {}",
                     e.getMessage());
               } catch (Exception e) {
                 // Unexpected failure of a supported pattern

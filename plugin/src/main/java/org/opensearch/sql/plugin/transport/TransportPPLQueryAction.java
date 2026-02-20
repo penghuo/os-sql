@@ -83,11 +83,18 @@ public class TransportPPLQueryAction
         });
     this.injector = Guice.createInjector(modules);
 
-    // Wire the distributed query executor
+    // Wire the distributed query executor with full distributed execution support.
+    // Use TransportService (not NodeClient) so that GatherExchange dispatches via
+    // transportService.sendRequest(), which routes to the GENERIC thread pool and
+    // avoids deadlock from inline doExecute() on the calling thread.
     QueryService queryService = injector.getInstance(QueryService.class);
     NodeLocalSourceProvider sourceProvider =
         new NodeLocalSourceProvider(indicesService, clusterService);
-    queryService.setDistributedQueryExecutor(new DistributedQueryExecutorImpl(sourceProvider));
+    queryService.setDistributedQueryExecutor(
+        new DistributedQueryExecutorImpl(
+            sourceProvider,
+            transportService,
+            clusterService));
 
     this.pplEnabled =
         () ->
@@ -196,7 +203,8 @@ public class TransportPPLQueryAction
         String responseContent =
             formatter.format(
                 new QueryResult(
-                    response.getSchema(), response.getResults(), response.getCursor(), PPL_SPEC));
+                    response.getSchema(), response.getResults(), response.getCursor(), PPL_SPEC,
+                    response.getEngine()));
         listener.onResponse(new TransportPPLQueryResponse(responseContent));
       }
 

@@ -7,6 +7,7 @@ package org.opensearch.sql.plugin.config;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.calcite.rel.type.RelDataType;
@@ -24,18 +25,27 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.ShardNotFoundException;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.sql.distributed.context.OperatorContext;
+import org.opensearch.sql.distributed.exchange.GatherExchange;
 import org.opensearch.sql.distributed.lucene.ColumnMapping;
 import org.opensearch.sql.distributed.lucene.LuceneFullScan;
 import org.opensearch.sql.distributed.operator.Operator;
 import org.opensearch.sql.distributed.operator.OperatorFactory;
+import org.opensearch.sql.distributed.planner.ExchangeNode;
 import org.opensearch.sql.distributed.planner.LuceneTableScanNode;
 import org.opensearch.sql.distributed.planner.RemoteSourceNode;
 import org.opensearch.sql.distributed.planner.bridge.PlanNodeToOperatorConverter;
+import org.opensearch.sql.distributed.scheduler.NodeAssignment;
+import org.opensearch.sql.distributed.scheduler.StageExecution;
+import org.opensearch.sql.distributed.transport.FragmentRegistry;
+import org.opensearch.transport.TransportService;
 
 /**
- * Source operator factory provider for single-node (local) execution. Acquires IndexSearcher from
- * all local shards via IndicesService and creates LuceneFullScan operators that read directly from
- * Lucene DocValues.
+ * Source operator factory provider that acquires IndexSearcher from local shards via IndicesService
+ * and creates LuceneFullScan operators that read directly from Lucene DocValues.
+ *
+ * <p>When distributed context is provided (TransportService + StageExecution), also supports
+ * creating GatherExchange operators for RemoteSourceNodes, enabling the root stage to pull results
+ * from leaf stages via the transport layer.
  */
 public class NodeLocalSourceProvider
     implements PlanNodeToOperatorConverter.SourceOperatorFactoryProvider {
@@ -43,9 +53,29 @@ public class NodeLocalSourceProvider
   private final IndicesService indicesService;
   private final ClusterService clusterService;
 
+  // Optional distributed context for handling RemoteSourceNode
+  private TransportService transportService;
+  private String queryId;
+  private StageExecution stageExecution;
+
   public NodeLocalSourceProvider(IndicesService indicesService, ClusterService clusterService) {
     this.indicesService = indicesService;
     this.clusterService = clusterService;
+  }
+
+  /**
+   * Sets the distributed execution context, enabling this provider to handle RemoteSourceNodes by
+   * creating GatherExchange operators that dispatch to leaf stages via transport.
+   *
+   * @param transportService the transport service for dispatching shard queries
+   * @param queryId the current query ID (used as FragmentRegistry key)
+   * @param stageExecution the scheduled stage execution with fragment and assignment info
+   */
+  public void setDistributedContext(
+      TransportService transportService, String queryId, StageExecution stageExecution) {
+    this.transportService = transportService;
+    this.queryId = queryId;
+    this.stageExecution = stageExecution;
   }
 
   @Override
@@ -56,8 +86,116 @@ public class NodeLocalSourceProvider
 
   @Override
   public OperatorFactory createRemoteSourceFactory(RemoteSourceNode node) {
-    throw new UnsupportedOperationException(
-        "Remote sources are not supported in Phase 1 single-node execution");
+    if (transportService == null || stageExecution == null || queryId == null) {
+      throw new UnsupportedOperationException(
+          "Remote sources require distributed context (TransportService + StageExecution). "
+              + "Call setDistributedContext() before processing plans with RemoteSourceNode.");
+    }
+
+    // For GATHER exchange: create a GatherExchange that dispatches ShardQueryRequests
+    // to the leaf stage nodes and collects their Pages
+    int sourceStageId = node.getSourceStageIds().get(0);
+    NodeAssignment leafAssignment = stageExecution.getAssignment(sourceStageId);
+
+    // Extract index name from the leaf fragment's plan tree
+    org.opensearch.sql.distributed.planner.plan.StageFragment leafFragment = null;
+    for (org.opensearch.sql.distributed.planner.plan.StageFragment f :
+        stageExecution.getFragments()) {
+      if (f.getStageId() == sourceStageId) {
+        leafFragment = f;
+        break;
+      }
+    }
+    if (leafFragment == null) {
+      throw new IllegalStateException("Leaf fragment not found for stage " + sourceStageId);
+    }
+    String indexName = extractIndexName(leafFragment);
+
+    // Use the FragmentRegistry key as the "serialized" fragment bytes
+    byte[] fragmentKey =
+        FragmentRegistry.key(queryId, sourceStageId).getBytes(StandardCharsets.UTF_8);
+
+    return new GatherExchangeFactory(
+        transportService, queryId, sourceStageId, fragmentKey, indexName, leafAssignment);
+  }
+
+  /** Extracts the index name from a leaf stage's plan tree by finding LuceneTableScanNode. */
+  private static String extractIndexName(
+      org.opensearch.sql.distributed.planner.plan.StageFragment fragment) {
+    IndexNameExtractor extractor = new IndexNameExtractor();
+    fragment.getRoot().accept(extractor, null);
+    if (extractor.indexName == null) {
+      throw new IllegalStateException(
+          "Leaf stage does not contain a LuceneTableScanNode: " + fragment.getRoot());
+    }
+    return extractor.indexName;
+  }
+
+  /** Visitor that finds the first LuceneTableScanNode and extracts its index name. */
+  private static class IndexNameExtractor
+      extends org.opensearch.sql.distributed.planner.PlanNodeVisitor<Void, Void> {
+    String indexName;
+
+    @Override
+    public Void visitLuceneTableScan(LuceneTableScanNode node, Void context) {
+      if (indexName == null) {
+        indexName = node.getIndexName();
+      }
+      return null;
+    }
+
+    @Override
+    public Void visitPlan(
+        org.opensearch.sql.distributed.planner.PlanNode node, Void context) {
+      for (org.opensearch.sql.distributed.planner.PlanNode child : node.getSources()) {
+        child.accept(this, context);
+        if (indexName != null) {
+          break;
+        }
+      }
+      return null;
+    }
+  }
+
+  /** OperatorFactory that creates GatherExchange source operators. */
+  private static class GatherExchangeFactory implements OperatorFactory {
+    private final TransportService transportService;
+    private final String queryId;
+    private final int stageId;
+    private final byte[] serializedFragment;
+    private final String indexName;
+    private final NodeAssignment nodeAssignment;
+    private boolean closed;
+
+    GatherExchangeFactory(
+        TransportService transportService,
+        String queryId,
+        int stageId,
+        byte[] serializedFragment,
+        String indexName,
+        NodeAssignment nodeAssignment) {
+      this.transportService = transportService;
+      this.queryId = queryId;
+      this.stageId = stageId;
+      this.serializedFragment = serializedFragment;
+      this.indexName = indexName;
+      this.nodeAssignment = nodeAssignment;
+    }
+
+    @Override
+    public Operator createOperator(OperatorContext operatorContext) {
+      if (closed) {
+        throw new IllegalStateException("Factory is already closed");
+      }
+      return new GatherExchange(
+          operatorContext, transportService, queryId, stageId, serializedFragment, indexName,
+          nodeAssignment);
+    }
+
+    @Override
+    public void noMoreOperators() {
+      closed = true;
+    }
   }
 
   /**
@@ -170,11 +308,11 @@ public class NodeLocalSourceProvider
    * <p>OpenSearch field types map to DocValues as follows:
    *
    * <ul>
-   *   <li>keyword → SORTED_SET DocValues, VARIABLE_WIDTH Block
-   *   <li>text → SORTED_SET DocValues (if fielddata enabled), VARIABLE_WIDTH Block
-   *   <li>long, integer, short, byte, date → SORTED_NUMERIC DocValues
-   *   <li>double, float, half_float, scaled_float → SORTED_NUMERIC DocValues
-   *   <li>boolean → SORTED_NUMERIC DocValues (0/1)
+   *   <li>keyword -> SORTED_SET DocValues, VARIABLE_WIDTH Block
+   *   <li>text -> SORTED_SET DocValues (if fielddata enabled), VARIABLE_WIDTH Block
+   *   <li>long, integer, short, byte, date -> SORTED_NUMERIC DocValues
+   *   <li>double, float, half_float, scaled_float -> SORTED_NUMERIC DocValues
+   *   <li>boolean -> SORTED_NUMERIC DocValues (0/1)
    * </ul>
    */
   static List<ColumnMapping> buildColumnMappings(RelDataType rowType, MapperService mapperService) {

@@ -33,13 +33,16 @@ public class QueryResult implements Iterable<Object[]> {
 
   private final LangSpec langSpec;
 
+  /** Identifies which engine produced this response (e.g., "distributed", "calcite_local"). */
+  @Getter private final String engine;
+
   public QueryResult(ExecutionEngine.Schema schema, Collection<ExprValue> exprValues) {
-    this(schema, exprValues, Cursor.None, LangSpec.SQL_SPEC);
+    this(schema, exprValues, Cursor.None, LangSpec.SQL_SPEC, null);
   }
 
   public QueryResult(
       ExecutionEngine.Schema schema, Collection<ExprValue> exprValues, Cursor cursor) {
-    this(schema, exprValues, cursor, LangSpec.SQL_SPEC);
+    this(schema, exprValues, cursor, LangSpec.SQL_SPEC, null);
   }
 
   public QueryResult(
@@ -47,10 +50,20 @@ public class QueryResult implements Iterable<Object[]> {
       Collection<ExprValue> exprValues,
       Cursor cursor,
       LangSpec langSpec) {
+    this(schema, exprValues, cursor, langSpec, null);
+  }
+
+  public QueryResult(
+      ExecutionEngine.Schema schema,
+      Collection<ExprValue> exprValues,
+      Cursor cursor,
+      LangSpec langSpec,
+      String engine) {
     this.schema = schema;
     this.exprValues = exprValues;
     this.cursor = cursor;
     this.langSpec = langSpec;
+    this.engine = engine;
   }
 
   /**

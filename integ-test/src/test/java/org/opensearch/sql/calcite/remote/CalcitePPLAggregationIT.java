@@ -1023,23 +1023,8 @@ public class CalcitePPLAggregationIT extends PPLIntegTestCase {
         executeQuery(
             String.format(
                 "source=%s | where 1=2 | stats sum(balance)", TEST_INDEX_BANK_WITH_NULL_VALUES));
-    assertJsonEquals(
-        "{\n"
-            + "  \"schema\": [\n"
-            + "    {\n"
-            + "      \"name\": \"sum(balance)\",\n"
-            + "      \"type\": \"bigint\"\n"
-            + "    }\n"
-            + "  ],\n"
-            + "  \"datarows\": [\n"
-            + "    [\n"
-            + "      null\n"
-            + "    ]\n"
-            + "  ],\n"
-            + "  \"total\": 1,\n"
-            + "  \"size\": 1\n"
-            + "}",
-        response.toString());
+    verifySchema(response, schema("sum(balance)", null, "bigint"));
+    verifyDataRows(response, rows(JSONObject.NULL));
   }
 
   // TODO https://github.com/opensearch-project/sql/issues/3408
@@ -1051,23 +1036,12 @@ public class CalcitePPLAggregationIT extends PPLIntegTestCase {
             String.format(
                 "source=%s | where age = 36 | stats sum(balance)",
                 TEST_INDEX_BANK_WITH_NULL_VALUES));
-    assertJsonEquals(
-        "{\n"
-            + "  \"schema\": [\n"
-            + "    {\n"
-            + "      \"name\": \"sum(balance)\",\n"
-            + "      \"type\": \"bigint\"\n"
-            + "    }\n"
-            + "  ],\n"
-            + "  \"datarows\": [\n"
-            + "    [\n"
-            + (isPushdownDisabled() ? "      null\n" : "      0\n")
-            + "    ]\n"
-            + "  ],\n"
-            + "  \"total\": 1,\n"
-            + "  \"size\": 1\n"
-            + "}",
-        response.toString());
+    verifySchema(response, schema("sum(balance)", null, "bigint"));
+    if (isPushdownDisabled()) {
+      verifyDataRows(response, rows(JSONObject.NULL));
+    } else {
+      verifyDataRows(response, rows(0));
+    }
   }
 
   @Test

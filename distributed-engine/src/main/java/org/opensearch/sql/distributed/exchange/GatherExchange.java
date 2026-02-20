@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.log4j.Log4j2;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.distributed.context.OperatorContext;
 import org.opensearch.sql.distributed.data.Page;
 import org.opensearch.sql.distributed.data.PagesSerde;
@@ -24,20 +23,27 @@ import org.opensearch.sql.distributed.scheduler.NodeAssignment;
 import org.opensearch.sql.distributed.transport.ShardQueryAction;
 import org.opensearch.sql.distributed.transport.ShardQueryRequest;
 import org.opensearch.sql.distributed.transport.ShardQueryResponse;
-import org.opensearch.transport.client.Client;
+import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportResponseHandler;
+import org.opensearch.transport.TransportService;
 
 /**
  * Source operator on the coordinator side that implements scatter-gather exchange. Sends
- * ShardQueryRequests to each data node, collects response Pages, and outputs them in the pipeline.
+ * ShardQueryRequests to each data node via TransportService, collects response Pages, and outputs
+ * them in the pipeline.
  *
- * <p>Supports streaming: each data node may return multiple response chunks. The operator is
- * blocked until at least one page is available or all sources have completed.
+ * <p>Dispatch happens eagerly in {@link #isBlocked()} (the first method the Driver calls), not in
+ * {@link #getOutput()}, to avoid deadlock — the Driver calls isBlocked() before getOutput(), and
+ * if dispatch hasn't happened yet, the future never resolves.
+ *
+ * <p>Uses {@code transportService.sendRequest()} instead of {@code client.execute()} to ensure
+ * the transport handler runs on the GENERIC thread pool, not inline on the calling thread.
  */
 @Log4j2
 public class GatherExchange implements SourceOperator {
 
   private final OperatorContext operatorContext;
-  private final Client client;
+  private final TransportService transportService;
   private final String queryId;
   private final int stageId;
   private final byte[] serializedFragment;
@@ -54,14 +60,14 @@ public class GatherExchange implements SourceOperator {
 
   public GatherExchange(
       OperatorContext operatorContext,
-      Client client,
+      TransportService transportService,
       String queryId,
       int stageId,
       byte[] serializedFragment,
       String indexName,
       NodeAssignment nodeAssignment) {
     this.operatorContext = operatorContext;
-    this.client = client;
+    this.transportService = transportService;
     this.queryId = queryId;
     this.stageId = stageId;
     this.serializedFragment = serializedFragment;
@@ -72,6 +78,13 @@ public class GatherExchange implements SourceOperator {
 
   @Override
   public ListenableFuture<?> isBlocked() {
+    // Eagerly dispatch on first call — Driver calls isBlocked() before getOutput(),
+    // so dispatching here ensures the transport requests are in flight before
+    // we check whether we're blocked.
+    if (!started.getAndSet(true)) {
+      dispatchRequests();
+    }
+
     if (!receivedPages.isEmpty() || finished.get() || failure != null) {
       return NOT_BLOCKED;
     }
@@ -89,10 +102,6 @@ public class GatherExchange implements SourceOperator {
   public Page getOutput() {
     if (failure != null) {
       throw new RuntimeException("GatherExchange failed", failure);
-    }
-
-    if (!started.getAndSet(true)) {
-      dispatchRequests();
     }
 
     Page page = receivedPages.poll();
@@ -125,7 +134,7 @@ public class GatherExchange implements SourceOperator {
     unblock();
   }
 
-  /** Dispatch ShardQueryRequests to each data node. */
+  /** Dispatch ShardQueryRequests to each data node via TransportService. */
   private void dispatchRequests() {
     Map<DiscoveryNode, List<Integer>> assignments = nodeAssignment.getNodeToShards();
     pendingResponses.set(assignments.size());
@@ -143,29 +152,41 @@ public class GatherExchange implements SourceOperator {
           queryId,
           shardIds);
 
-      client.execute(
-          ShardQueryAction.INSTANCE,
+      transportService.sendRequest(
+          node,
+          ShardQueryAction.NAME,
           request,
-          new ActionListener<>() {
+          new TransportResponseHandler<ShardQueryResponse>() {
             @Override
-            public void onResponse(ShardQueryResponse response) {
+            public ShardQueryResponse read(
+                org.opensearch.core.common.io.stream.StreamInput in)
+                throws java.io.IOException {
+              return new ShardQueryResponse(in);
+            }
+
+            @Override
+            public String executor() {
+              return org.opensearch.threadpool.ThreadPool.Names.SAME;
+            }
+
+            @Override
+            public void handleResponse(ShardQueryResponse response) {
               try {
                 List<Page> pages = response.getPages(pagesSerde);
                 receivedPages.addAll(pages);
-
                 if (pendingResponses.decrementAndGet() == 0 && !response.hasMore()) {
                   finished.set(true);
                 }
-
                 unblock();
               } catch (Exception e) {
-                onFailure(e);
+                handleException(new TransportException(e));
               }
             }
 
             @Override
-            public void onFailure(Exception e) {
-              log.error("Shard query failed on node {}: queryId={}", node.getName(), queryId, e);
+            public void handleException(TransportException e) {
+              log.error(
+                  "Shard query failed on node {}: queryId={}", node.getName(), queryId, e);
               failure = e;
               if (pendingResponses.decrementAndGet() == 0) {
                 finished.set(true);

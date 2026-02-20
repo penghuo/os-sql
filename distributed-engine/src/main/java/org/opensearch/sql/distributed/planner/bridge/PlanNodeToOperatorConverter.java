@@ -163,10 +163,18 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
     int[] aggregateInputChannels = new int[aggCalls.size()];
     List<Supplier<Accumulator>> accumulatorFactories = new ArrayList<>(aggCalls.size());
 
+    // Use the aggregation mode to create the right accumulators:
+    // PARTIAL/SINGLE: standard accumulators (COUNT counts rows, SUM sums values)
+    // FINAL: merge accumulators (COUNT becomes SUM to merge partial counts)
+    AggregationNode.AggregationMode mode = node.getMode();
+
     for (int i = 0; i < aggCalls.size(); i++) {
       AggregateCall aggCall = aggCalls.get(i);
-      aggregateInputChannels[i] = AccumulatorFactory.resolveInputChannel(aggCall);
-      accumulatorFactories.add(AccumulatorFactory.createAccumulatorSupplier(aggCall));
+      // In FINAL mode, input channel is the position in the partial result (matches group-by
+      // column count + aggregate index), which equals the original input channel mapping
+      aggregateInputChannels[i] = AccumulatorFactory.resolveInputChannel(aggCall, mode, i,
+          groupByChannels.length);
+      accumulatorFactories.add(AccumulatorFactory.createAccumulatorSupplier(aggCall, mode));
     }
 
     operatorFactories.add(
@@ -223,7 +231,13 @@ public class PlanNodeToOperatorConverter extends PlanNodeVisitor<Void, Void> {
 
   @Override
   public Void visitExchange(ExchangeNode node, Void context) {
-    // In single-node execution, exchange is a pass-through
+    // After PlanFragmenter.fragment(), all ExchangeNodes are replaced by RemoteSourceNodes.
+    // If visitExchange is called, it means we are in one of two scenarios:
+    //   1. Pre-fragmentation local execution: the plan was not fragmented, so exchanges
+    //      are logical markers only. Pass through to the child subtree.
+    //   2. Leaf fragment context: the leaf fragment's plan tree does NOT contain ExchangeNode
+    //      at the top (PlanFragmenter extracts only the subtree below the exchange).
+    // In both cases, the correct behavior is pass-through: just process the child.
     node.getSource().accept(this, null);
     return null;
   }

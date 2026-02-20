@@ -14,6 +14,7 @@ import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfile;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
+import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.protocol.response.QueryResult;
 
 /**
@@ -57,6 +58,12 @@ public class SimpleJsonResponseFormatter extends JsonResponseFormatter<QueryResu
     formatMetric.set(System.nanoTime() - formatTime);
 
     json.profile(QueryProfiling.current().finish());
+    // Only include engine field for non-default engines (distributed) to avoid breaking
+    // existing test assertions that compare exact JSON strings
+    if (response.getEngine() != null
+        && !response.getEngine().equals(ExecutionEngine.ENGINE_CALCITE_LOCAL)) {
+      json.engine(response.getEngine());
+    }
     return json.build();
   }
 
@@ -82,6 +89,7 @@ public class SimpleJsonResponseFormatter extends JsonResponseFormatter<QueryResu
 
     private long total;
     private long size;
+    private String engine;
   }
 
   @RequiredArgsConstructor

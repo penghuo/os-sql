@@ -450,12 +450,14 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
    * @param response the JSON response from the query
    */
   protected void assertEngineUsed(String expectedEngine, JSONObject response) {
-    if (response.has("engine")) {
-      Assert.assertEquals(
-          "Expected engine '" + expectedEngine + "' but got '" + response.getString("engine") + "'",
-          expectedEngine,
-          response.getString("engine"));
-    }
+    Assert.assertTrue(
+        "Response must contain 'engine' field to verify execution path. "
+        + "If missing, the query likely fell through to a path that doesn't tag the engine.",
+        response.has("engine"));
+    Assert.assertEquals(
+        "Expected engine '" + expectedEngine + "' but got '" + response.getString("engine") + "'",
+        expectedEngine,
+        response.getString("engine"));
   }
 
   /** Run a block with the distributed engine enabled, restoring the original state afterward. */

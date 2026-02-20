@@ -97,6 +97,8 @@ import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.plugin.rest.RestPPLQueryAction;
 import org.opensearch.sql.plugin.rest.RestPPLStatsAction;
 import org.opensearch.sql.plugin.rest.RestQuerySettingsAction;
+import org.opensearch.sql.distributed.transport.ShardQueryAction;
+import org.opensearch.sql.distributed.transport.TransportShardQueryAction;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
@@ -225,7 +227,8 @@ public class SQLPlugin extends Plugin
             new ActionType<>(
                 TransportWriteDirectQueryResourcesRequestAction.NAME,
                 WriteDirectQueryResourcesActionResponse::new),
-            TransportWriteDirectQueryResourcesRequestAction.class));
+            TransportWriteDirectQueryResourcesRequestAction.class),
+        new ActionHandler<>(ShardQueryAction.INSTANCE, TransportShardQueryAction.class));
   }
 
   @Override

@@ -121,6 +121,23 @@ public class RelNodeSerializerTest {
     assertNotNull(d); assertEquals(1, d.getRowType().getFieldCount()); assertEquals("upper_name", d.getRowType().getFieldNames().get(0));
   }
 
+  @Test @DisplayName("Round-trip for PPL UDF (JSON_EXTRACT)") void roundTrip_pplUdf() {
+    // Test that PPL user-defined functions survive serialization round-trip
+    LogicalProject proj = LogicalProject.create(valuesRel, Collections.emptyList(),
+        List.of(rexBuilder.makeCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_EXTRACT,
+            rexBuilder.makeInputRef(rowType.getFieldList().get(0).getType(), 0),
+            rexBuilder.makeLiteral("$.key"))),
+        List.of("extracted"));
+    String j = RelNodeSerializer.serialize(proj);
+    assertNotNull(j);
+    assertTrue(j.contains("JSON_EXTRACT"));
+    RelNode d = RelNodeSerializer.deserialize(j, cluster, null);
+    assertNotNull(d);
+    assertEquals(1, d.getRowType().getFieldCount());
+    assertEquals("extracted", d.getRowType().getFieldNames().get(0));
+  }
+
   @Test @DisplayName("Round-trip for LogicalSystemLimit with QUERY_SIZE_LIMIT") void roundTrip_logicalSystemLimit() {
     // LogicalSystemLimit.create() requires RelCollationTraitDef to be registered in the planner
     VolcanoPlanner collationPlanner = new VolcanoPlanner();

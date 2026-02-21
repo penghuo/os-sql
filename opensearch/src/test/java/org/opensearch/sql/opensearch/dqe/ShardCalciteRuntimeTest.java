@@ -239,9 +239,9 @@ class ShardCalciteRuntimeTest {
     }
 
     @Test
-    @DisplayName("Non-Scannable plan returns error in result")
-    void execute_nonScannablePlan_returnsError() {
-        // LogicalValues is not Scannable
+    @DisplayName("Non-Scannable plan without Scannable leaf returns error in result")
+    void execute_nonScannablePlan_noLeaf_returnsError() {
+        // LogicalValues has no Scannable leaf, so the Interpreter path should fail
         RelDataType rowType =
                 OpenSearchTypeFactory.TYPE_FACTORY
                         .builder()
@@ -260,7 +260,7 @@ class ShardCalciteRuntimeTest {
 
             assertTrue(result.hasError());
             assertNotNull(result.getError());
-            assertTrue(result.getError().getMessage().contains("not Scannable"));
+            assertTrue(result.getError().getMessage().contains("No Scannable leaf found"));
         }
     }
 

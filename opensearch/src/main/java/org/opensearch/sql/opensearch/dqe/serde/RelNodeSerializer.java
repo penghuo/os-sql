@@ -59,11 +59,16 @@ public class RelNodeSerializer {
     if (pplSqlOperatorTable == null) {
       synchronized (RelNodeSerializer.class) {
         if (pplSqlOperatorTable == null) {
+          // Order matters: standard Calcite operators first so that standard aggregations
+          // (COUNT, SUM, AVG) are found before PPL nullable variants (AVG_NULLABLE etc.)
+          // which have the same SqlKind. PPL-only UDFs (JSON_EXTRACT, SPAN, etc.) are
+          // not in SqlStdOperatorTable, so they will only be found in PPLBuiltinOperators.
           pplSqlOperatorTable = SqlOperatorTables.chain(
-              PPLBuiltinOperators.instance(), SqlStdOperatorTable.instance(),
-              OperatorTable.instance(),
+              SqlStdOperatorTable.instance(),
               SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(
-                  SqlLibrary.MYSQL, SqlLibrary.BIG_QUERY, SqlLibrary.SPARK, SqlLibrary.POSTGRESQL));
+                  SqlLibrary.MYSQL, SqlLibrary.BIG_QUERY, SqlLibrary.SPARK, SqlLibrary.POSTGRESQL),
+              PPLBuiltinOperators.instance(),
+              OperatorTable.instance());
         }
       }
     }

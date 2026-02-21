@@ -37,7 +37,13 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.linq4j.AbstractEnumerable;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
+import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.opensearch.dqe.serde.ShardDeserializationContext;
+import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
+import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexEnumerator;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -70,7 +76,7 @@ import org.opensearch.sql.utils.Utils;
 
 /** The logical relational operator representing a scan of an OpenSearchIndex type. */
 @Getter
-public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
+public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan implements Scannable {
   private static final Logger LOG = LogManager.getLogger(CalciteLogicalIndexScan.class);
 
   public CalciteLogicalIndexScan(
@@ -131,6 +137,29 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
   @Override
   public RelWriter explainTerms(RelWriter pw) {
     return super.explainTerms(pw).item("rowType", getRowType());
+  }
+
+  /**
+   * Executes the scan against OpenSearch. Creates a fresh request builder from PushDownContext
+   * each time to avoid reusing source builder state (PIT, SearchAfter) from previous iterations.
+   * This enables CalciteLogicalIndexScan to serve as a Scannable leaf in shard-side plan execution.
+   */
+  @Override
+  public Enumerable<@org.checkerframework.checker.nullness.qual.Nullable Object> scan() {
+    return new AbstractEnumerable<>() {
+      @Override
+      public Enumerator<Object> enumerator() {
+        OpenSearchRequestBuilder requestBuilder = pushDownContext.createRequestBuilder();
+        return new OpenSearchIndexEnumerator(
+            osIndex.getClient(),
+            getRowType().getFieldNames(),
+            requestBuilder.getMaxResponseSize(),
+            requestBuilder.getMaxResultWindow(),
+            osIndex.getQueryBucketSize(),
+            osIndex.buildRequest(requestBuilder),
+            osIndex.createOpenSearchResourceMonitor());
+      }
+    };
   }
 
   @Override

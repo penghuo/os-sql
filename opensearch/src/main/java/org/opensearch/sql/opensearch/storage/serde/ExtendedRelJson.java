@@ -10,6 +10,7 @@ import static org.apache.calcite.util.Static.RESOURCE;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -147,6 +148,39 @@ public class ExtendedRelJson extends RelJson {
     this.jsonBuilder = jsonBuilder;
     this.inputTranslator = requireNonNull(inputTranslator, "inputTranslator");
     this.operatorTable = requireNonNull(operatorTable, "operatorTable");
+    // Propagate operatorTable to the base RelJson class via reflection.
+    // This is required because RelJson.toOp() is package-private in
+    // org.apache.calcite.rel.externalize and cannot be overridden from this package.
+    // When RelJsonReader's inner class calls relJson.toRex(RelInput, Object), the JVM
+    // dispatches to the base RelJson.toRex (not our override) because package-private
+    // methods don't participate in virtual dispatch across packages. The base toRex()
+    // calls toOp() which uses the base operatorTable. Without propagation, toOp() would
+    // use SqlStdOperatorTable and fail to find PPL UDFs (JSON_EXTRACT, COSH, SPAN, etc.).
+    //
+    // Note: we only propagate operatorTable, NOT inputTranslator. The base class's toRex()
+    // handles INPUT_REF and LOCAL_REF differently from ExtendedRelJson.toRex() and we must
+    // preserve the base class behavior for LogicalCalc program deserialization.
+    propagateOperatorTableToBaseClass(operatorTable);
+  }
+
+  /**
+   * Sets the base {@link RelJson}'s private {@code operatorTable} field via reflection so that
+   * its package-private {@code toOp()} method uses the correct operator table for PPL UDFs.
+   * This is necessary because {@code toOp()} is package-private in {@code RelJson} and cannot
+   * be overridden from a different package. Without this, shard-side deserialization of plans
+   * containing PPL UDFs would fail with {@code NoSuchMethodException} for anonymous UDF classes.
+   */
+  private void propagateOperatorTableToBaseClass(SqlOperatorTable operatorTable) {
+    try {
+      Field opTableField = RelJson.class.getDeclaredField("operatorTable");
+      opTableField.setAccessible(true);
+      opTableField.set(this, operatorTable);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException(
+          "Failed to propagate operatorTable to base RelJson. "
+              + "This may occur if the Calcite version changes the field names.",
+          e);
+    }
   }
 
   /** Creates a ExtendedRelJson. */

@@ -277,9 +277,9 @@ public final class PlanSplitter {
                 exchange);
 
         if (exchange instanceof MergeAggregateExchange) {
-            // The coordinator keeps the original Aggregate as the "final" aggregate.
-            // Its input is now the ExchangeLeaf (which produces merged partial results).
-            return coordinatorOp.copy(coordinatorOp.getTraitSet(), List.of(leaf));
+            // MergeAggregateExchange.scan() returns FULLY merged results.
+            // No coordinator Aggregate is needed — it would re-aggregate incorrectly.
+            return leaf;
         }
 
         if (exchange instanceof MergeSortExchange) {
@@ -412,7 +412,7 @@ public final class PlanSplitter {
                 org.apache.calcite.plan.RelOptCluster cluster,
                 org.apache.calcite.plan.RelTraitSet traitSet,
                 Exchange exchange) {
-            super(cluster, traitSet);
+            super(cluster, traitSet.replace(org.apache.calcite.adapter.enumerable.EnumerableConvention.INSTANCE));
             this.rowType = exchange.getRowType();
             this.exchange = exchange;
         }

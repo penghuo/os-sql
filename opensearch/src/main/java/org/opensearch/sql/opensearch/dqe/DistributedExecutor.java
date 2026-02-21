@@ -5,6 +5,9 @@
 
 package org.opensearch.sql.opensearch.dqe;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -19,6 +22,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.tools.RelRunner;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.core.action.ActionListener;
@@ -35,6 +39,7 @@ import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.opensearch.dqe.exchange.Exchange;
 import org.opensearch.sql.opensearch.dqe.exchange.ShardResult;
 import org.opensearch.sql.opensearch.dqe.serde.RelNodeSerializer;
+import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine;
 import org.opensearch.sql.opensearch.storage.scan.AbstractCalciteIndexScan;
 
 /**
@@ -67,9 +72,12 @@ public class DistributedExecutor {
    * collects results, then builds a QueryResponse from the coordinator plan.
    *
    * @param plan the distributed plan from PlanSplitter
+   * @param connection Calcite JDBC connection for executing coordinator plans (may be null for fast
+   *     path)
    * @param listener callback for the query response
    */
-  public void execute(DistributedPlan plan, ResponseListener<QueryResponse> listener) {
+  public void execute(
+      DistributedPlan plan, Connection connection, ResponseListener<QueryResponse> listener) {
     try {
       // Phase 1: Execute all exchanges (shard dispatch + collect)
       for (Exchange exchange : plan.getExchanges()) {
@@ -77,13 +85,13 @@ public class DistributedExecutor {
       }
 
       // Phase 2: Build QueryResponse from the coordinator plan
-      // The coordinator plan has ExchangeLeaf nodes whose exchanges are now populated
-      // with merged results. We read from the exchanges to build the final result.
-      QueryResponse response = buildResponse(plan);
+      QueryResponse response = buildResponse(plan, connection);
       listener.onResponse(response);
 
     } catch (Exception e) {
       listener.onFailure(e);
+    } finally {
+      closeQuietly(connection);
     }
   }
 
@@ -200,15 +208,55 @@ public class DistributedExecutor {
     return resultList;
   }
 
+  private static void closeQuietly(Connection connection) {
+    if (connection != null) {
+      try {
+        connection.close();
+      } catch (Exception e) {
+        LOG.debug("Failed to close connection", e);
+      }
+    }
+  }
+
   /**
-   * Builds a QueryResponse from the coordinator plan. Reads merged rows from all exchanges
-   * (populated after shard dispatch) and converts to ExprValue rows.
+   * Two-path response builder. Fast path: if the coordinator plan is just an ExchangeLeaf, read
+   * directly from the exchanges. Slow path: execute the coordinator plan via Calcite RelRunner.
+   */
+  private QueryResponse buildResponse(DistributedPlan plan, Connection connection)
+      throws Exception {
+    RelNode coordinatorPlan = plan.getCoordinatorPlan();
+
+    // Fast path: coordinator IS ExchangeLeaf — read from exchanges directly
+    if (coordinatorPlan instanceof PlanSplitter.ExchangeLeaf) {
+      return buildResponseDirectRead(plan);
+    }
+
+    // Slow path: execute coordinator plan via Calcite
+    return executeCoordinatorPlan(coordinatorPlan, connection);
+  }
+
+  /**
+   * Executes the coordinator plan via Calcite's RelRunner. Used when the coordinator plan has
+   * operators above the ExchangeLeaf (e.g., Sort, Project).
+   */
+  private QueryResponse executeCoordinatorPlan(RelNode plan, Connection connection)
+      throws Exception {
+    RelRunner runner = connection.unwrap(RelRunner.class);
+    try (PreparedStatement stmt = runner.prepareStatement(plan);
+        ResultSet rs = stmt.executeQuery()) {
+      return OpenSearchExecutionEngine.buildResultSet(rs, plan.getRowType(), null);
+    }
+  }
+
+  /**
+   * Builds a QueryResponse by reading directly from exchanges. Used when the coordinator plan is
+   * just an ExchangeLeaf (no additional coordinator-side operators needed).
    *
    * <p>Each exchange (ConcatExchange, MergeSortExchange, MergeAggregateExchange) already produces
-   * the correct final merged results via its {@code scan()} method. The coordinator plan's row
-   * type is used for schema and type conversion.
+   * the correct final merged results via its {@code scan()} method. The coordinator plan's row type
+   * is used for schema and type conversion.
    */
-  private QueryResponse buildResponse(DistributedPlan plan) {
+  private QueryResponse buildResponseDirectRead(DistributedPlan plan) {
     RelNode coordinatorPlan = plan.getCoordinatorPlan();
     List<Exchange> exchanges = plan.getExchanges();
 

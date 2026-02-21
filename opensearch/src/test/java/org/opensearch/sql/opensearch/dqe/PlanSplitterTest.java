@@ -474,6 +474,47 @@ class PlanSplitterTest {
     }
 
     @Test
+    @DisplayName("Decomposable agg coordinator plan is ExchangeLeaf (no redundant Aggregate)")
+    void decomposableAgg_coordinatorPlanIsExchangeLeaf() {
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .aggregate(
+                                        relBuilder.groupKey(relBuilder.field("b")),
+                                        relBuilder.countStar("cnt"))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        assertNotNull(result);
+        assertInstanceOf(PlanSplitter.ExchangeLeaf.class, result.getCoordinatorPlan());
+    }
+
+    @Test
+    @DisplayName("Sort above decomposable agg produces Sort → ExchangeLeaf coordinator plan")
+    void sortAboveDecomposableAgg_sortAboveExchangeLeaf() {
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .aggregate(
+                                        relBuilder.groupKey(relBuilder.field("b")),
+                                        relBuilder.countStar("cnt"))
+                                .sort(relBuilder.field("cnt"))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        assertNotNull(result);
+        // Coordinator plan should be Sort → ExchangeLeaf (sort without limit uses ConcatExchange)
+        // The aggregate is absorbed into MergeAggregateExchange; Sort stays on coordinator
+        RelNode coordinator = result.getCoordinatorPlan();
+        assertInstanceOf(org.apache.calcite.rel.core.Sort.class, coordinator);
+        assertInstanceOf(PlanSplitter.ExchangeLeaf.class, coordinator.getInputs().get(0));
+    }
+
+    @Test
     @DisplayName("CalciteEnumerableNestedAggregate causes DQE skip (returns null)")
     void nestedAggregate_skipsDQE() {
         RelNode scan = injectDSLScan(relBuilder.scan("t").build());

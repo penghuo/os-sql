@@ -227,7 +227,8 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       org.opensearch.sql.opensearch.dqe.DistributedPlan dqePlan =
           org.opensearch.sql.opensearch.dqe.PlanSplitter.split(rel);
       if (dqePlan != null) {
-        client.schedule(() -> distributedExecutor.execute(dqePlan, listener));
+        java.sql.Connection dqeConnection = context.connection;
+        client.schedule(() -> distributedExecutor.execute(dqePlan, dqeConnection, listener));
         return;
       }
       // dqePlan is null means no OpenSearch scan found or unsupported pattern — fall through
@@ -257,7 +258,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
    * Process values recursively, handling geo points and nested maps. Geo points are converted to
    * OpenSearchExprGeoPointValue. Maps are recursively processed to handle nested structures.
    */
-  private static Object processValue(Object value) {
+  public static Object processValue(Object value) {
     if (value == null) {
       return null;
     }
@@ -285,7 +286,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     return value;
   }
 
-  private QueryResponse buildResultSet(
+  public static QueryResponse buildResultSet(
       ResultSet resultSet, RelDataType rowTypes, Integer querySizeLimit) throws SQLException {
     // Get the ResultSet metadata to know about columns
     ResultSetMetaData metaData = resultSet.getMetaData();

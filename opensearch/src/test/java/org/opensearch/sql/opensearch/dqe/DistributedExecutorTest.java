@@ -24,11 +24,15 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.calcite.plan.ConventionTraitDef;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
+import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
+import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,6 +45,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.opensearch.dqe.exchange.ConcatExchange;
+import org.opensearch.sql.opensearch.dqe.exchange.Exchange;
 import org.opensearch.sql.opensearch.dqe.exchange.MergeAggregateExchange;
 import org.opensearch.sql.opensearch.dqe.exchange.MergeSortExchange;
 import org.opensearch.sql.opensearch.dqe.serde.RelNodeSerializer;
@@ -56,6 +61,7 @@ class DistributedExecutorTest {
   private DistributedExecutor executor;
   private RelDataTypeFactory typeFactory;
   private RelDataType rowType;
+  private RelOptCluster cluster;
 
   @BeforeEach
   void setUp() {
@@ -67,6 +73,10 @@ class DistributedExecutorTest {
                 typeFactory.createSqlType(SqlTypeName.VARCHAR, 100),
                 typeFactory.createSqlType(SqlTypeName.INTEGER)),
             List.of("name", "age"));
+    RexBuilder rexBuilder = new RexBuilder(typeFactory);
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    cluster = RelOptCluster.create(planner, rexBuilder);
   }
 
   // ============= Helper methods =============
@@ -87,6 +97,11 @@ class DistributedExecutorTest {
       shardIds.add(i);
     }
     return shardIds;
+  }
+
+  /** Creates an ExchangeLeaf coordinator node wrapping the given exchange. */
+  private PlanSplitter.ExchangeLeaf exchangeLeaf(Exchange exchange) {
+    return new PlanSplitter.ExchangeLeaf(cluster, cluster.traitSet(), exchange);
   }
 
   /**
@@ -156,12 +171,9 @@ class DistributedExecutorTest {
   void dispatchToNShards() {
     AbstractCalciteIndexScan scan = mockScanNode();
     ConcatExchange exchange = new ConcatExchange(scan, rowType);
+    PlanSplitter.ExchangeLeaf coordinator = exchangeLeaf(exchange);
     DistributedPlan plan =
-        new DistributedPlan(
-            mock(RelNode.class, RETURNS_DEEP_STUBS), Collections.singletonList(exchange));
-
-    // Mock coordinator plan row type
-    when(plan.getCoordinatorPlan().getRowType()).thenReturn(rowType);
+        new DistributedPlan(coordinator, Collections.singletonList(exchange));
 
     when(resolver.resolve("test_index")).thenReturn(createShardIds(3));
 
@@ -173,6 +185,7 @@ class DistributedExecutorTest {
     AtomicReference<QueryResponse> responseRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -197,10 +210,9 @@ class DistributedExecutorTest {
   void concatExchangeIntegration() {
     AbstractCalciteIndexScan scan = mockScanNode();
     ConcatExchange exchange = new ConcatExchange(scan, rowType);
-    RelNode mockCoordinator = mock(RelNode.class, RETURNS_DEEP_STUBS);
-    when(mockCoordinator.getRowType()).thenReturn(rowType);
+    PlanSplitter.ExchangeLeaf coordinator = exchangeLeaf(exchange);
     DistributedPlan plan =
-        new DistributedPlan(mockCoordinator, Collections.singletonList(exchange));
+        new DistributedPlan(coordinator, Collections.singletonList(exchange));
 
     when(resolver.resolve("test_index")).thenReturn(createShardIds(2));
 
@@ -212,6 +224,7 @@ class DistributedExecutorTest {
     AtomicReference<QueryResponse> responseRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -254,10 +267,9 @@ class DistributedExecutorTest {
                 org.opensearch.sql.opensearch.dqe.exchange.MergeFunction.SUM_COUNTS),
             1);
 
-    RelNode mockCoordinator = mock(RelNode.class, RETURNS_DEEP_STUBS);
-    when(mockCoordinator.getRowType()).thenReturn(aggRowType);
+    PlanSplitter.ExchangeLeaf coordinator = exchangeLeaf(exchange);
     DistributedPlan plan =
-        new DistributedPlan(mockCoordinator, Collections.singletonList(exchange));
+        new DistributedPlan(coordinator, Collections.singletonList(exchange));
 
     when(resolver.resolve("test_index")).thenReturn(createShardIds(2));
 
@@ -271,6 +283,7 @@ class DistributedExecutorTest {
     AtomicReference<QueryResponse> responseRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -310,10 +323,9 @@ class DistributedExecutorTest {
     MergeSortExchange exchange =
         new MergeSortExchange(scan, sortRowType, List.of(collation), 3);
 
-    RelNode mockCoordinator = mock(RelNode.class, RETURNS_DEEP_STUBS);
-    when(mockCoordinator.getRowType()).thenReturn(sortRowType);
+    PlanSplitter.ExchangeLeaf coordinator = exchangeLeaf(exchange);
     DistributedPlan plan =
-        new DistributedPlan(mockCoordinator, Collections.singletonList(exchange));
+        new DistributedPlan(coordinator, Collections.singletonList(exchange));
 
     when(resolver.resolve("test_index")).thenReturn(createShardIds(2));
 
@@ -332,6 +344,7 @@ class DistributedExecutorTest {
     AtomicReference<QueryResponse> responseRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -357,10 +370,9 @@ class DistributedExecutorTest {
   void allShardsReturnEmpty() {
     AbstractCalciteIndexScan scan = mockScanNode();
     ConcatExchange exchange = new ConcatExchange(scan, rowType);
-    RelNode mockCoordinator = mock(RelNode.class, RETURNS_DEEP_STUBS);
-    when(mockCoordinator.getRowType()).thenReturn(rowType);
+    PlanSplitter.ExchangeLeaf coordinator = exchangeLeaf(exchange);
     DistributedPlan plan =
-        new DistributedPlan(mockCoordinator, Collections.singletonList(exchange));
+        new DistributedPlan(coordinator, Collections.singletonList(exchange));
 
     when(resolver.resolve("test_index")).thenReturn(createShardIds(3));
 
@@ -369,6 +381,7 @@ class DistributedExecutorTest {
     AtomicReference<QueryResponse> responseRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -406,6 +419,7 @@ class DistributedExecutorTest {
     AtomicReference<Exception> failureRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -440,6 +454,7 @@ class DistributedExecutorTest {
     AtomicReference<Exception> failureRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -477,6 +492,7 @@ class DistributedExecutorTest {
     AtomicReference<Exception> failureRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {
@@ -512,6 +528,7 @@ class DistributedExecutorTest {
     AtomicReference<Exception> failureRef = new AtomicReference<>();
     executor.execute(
         plan,
+        null,
         new ResponseListener<>() {
           @Override
           public void onResponse(QueryResponse response) {

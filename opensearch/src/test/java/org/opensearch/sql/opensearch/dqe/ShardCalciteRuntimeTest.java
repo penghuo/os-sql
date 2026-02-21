@@ -12,10 +12,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.when;
 
 import java.util.List;
+import java.util.Map;
 import org.apache.calcite.linq4j.AbstractEnumerable;
 import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.Enumerator;
@@ -37,7 +39,9 @@ import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
+import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.dqe.serde.RelNodeSerializer;
+import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
 class ShardCalciteRuntimeTest {
@@ -45,6 +49,7 @@ class ShardCalciteRuntimeTest {
     private ShardCalciteRuntime runtime;
     private RelOptCluster cluster;
     private RexBuilder rexBuilder;
+    private OpenSearchIndex mockOsIndex;
 
     @BeforeEach
     void setUp() {
@@ -53,6 +58,19 @@ class ShardCalciteRuntimeTest {
         VolcanoPlanner planner = new VolcanoPlanner();
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         cluster = RelOptCluster.create(planner, rexBuilder);
+
+        OpenSearchClient mockClient = mock(OpenSearchClient.class);
+        org.opensearch.sql.common.setting.Settings mockSettings =
+                mock(org.opensearch.sql.common.setting.Settings.class);
+        mockOsIndex = mock(OpenSearchIndex.class);
+        // Provide a minimal row type for schema resolution
+        RelDataType minimalRowType =
+                OpenSearchTypeFactory.TYPE_FACTORY
+                        .builder()
+                        .add("dummy", SqlTypeName.VARCHAR)
+                        .build();
+        when(mockOsIndex.getRowType(any())).thenReturn(minimalRowType);
+        when(mockOsIndex.getFieldTypes()).thenReturn(Map.of());
     }
 
     @Test
@@ -77,10 +95,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(mockPlan);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertFalse(result.hasError(), "Result should not have an error");
             assertNull(result.getError());
@@ -117,10 +135,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(mockPlan);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertFalse(result.hasError());
             assertEquals(1, result.getRows().size());
@@ -154,10 +172,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(mockPlan);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertFalse(result.hasError());
             assertEquals(2, result.getRows().size());
@@ -176,7 +194,8 @@ class ShardCalciteRuntimeTest {
     @Test
     @DisplayName("Malformed plan JSON returns error in result, not an exception")
     void execute_malformedPlanJson_returnsError() {
-        ShardCalciteRuntime.Result result = runtime.execute("not valid json", "test-index", 0);
+        ShardCalciteRuntime.Result result =
+                runtime.execute("not valid json", "test-index", 0, mockOsIndex);
 
         assertTrue(result.hasError(), "Result should have an error");
         assertNotNull(result.getError());
@@ -207,10 +226,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(throwingPlan);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertTrue(result.hasError());
             assertNotNull(result.getError());
@@ -234,10 +253,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(logicalValues);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertTrue(result.hasError());
             assertNotNull(result.getError());
@@ -260,10 +279,10 @@ class ShardCalciteRuntimeTest {
 
         try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
             serializer
-                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), isNull()))
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
                     .thenReturn(mockPlan);
 
-            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0);
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
             assertFalse(result.hasError());
             assertEquals(0, result.getRows().size());

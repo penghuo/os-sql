@@ -23,6 +23,8 @@ import org.apache.calcite.rel.AbstractRelNode;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
+import org.apache.calcite.rel.RelInput;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
@@ -35,6 +37,7 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.opensearch.sql.opensearch.dqe.serde.ShardDeserializationContext;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -91,6 +94,43 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
       RelDataType schema,
       PushDownContext pushDownContext) {
     super(cluster, traitSet, hints, table, osIndex, schema, pushDownContext);
+  }
+
+  /**
+   * Constructor for Calcite JSON deserialization. Calcite's {@code RelJsonReader} requires a
+   * {@code (RelInput)} constructor on every RelNode class it deserializes. Since
+   * CalciteLogicalIndexScan needs an {@link OpenSearchIndex} (which is not serializable through
+   * Calcite's standard JSON format), the index is retrieved from {@link
+   * ShardDeserializationContext} which must be set on the current thread before deserialization.
+   */
+  public CalciteLogicalIndexScan(RelInput input) {
+    super(
+        input.getCluster(),
+        input.getTraitSet(),
+        List.of(),
+        input.getTable("table"),
+        getOpenSearchIndexFromContext(),
+        input.getRowType("rowType"),
+        new PushDownContext(getOpenSearchIndexFromContext()));
+  }
+
+  private static OpenSearchIndex getOpenSearchIndexFromContext() {
+    ShardDeserializationContext ctx = ShardDeserializationContext.get();
+    if (ctx == null) {
+      throw new IllegalStateException(
+          "ShardDeserializationContext not set. CalciteLogicalIndexScan(RelInput) can only be "
+              + "used during shard-side plan deserialization.");
+    }
+    return ctx.getOpenSearchIndex();
+  }
+
+  /**
+   * Override to include rowType in the serialized form so it can be reconstructed during
+   * deserialization via the {@code CalciteLogicalIndexScan(RelInput)} constructor.
+   */
+  @Override
+  public RelWriter explainTerms(RelWriter pw) {
+    return super.explainTerms(pw).item("rowType", getRowType());
   }
 
   @Override

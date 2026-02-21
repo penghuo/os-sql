@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.calcite.plan.rel;
 
+import static java.util.Objects.requireNonNull;
+
 import java.util.Collections;
 import java.util.List;
 import lombok.Getter;
@@ -13,6 +15,7 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.Sort;
@@ -51,6 +54,16 @@ public class LogicalSystemLimit extends Sort {
     super(cluster, traitSet, hints, input, collation, offset, fetch);
     assert traitSet.containsIfApplicable(Convention.NONE);
     this.type = type;
+  }
+
+  /**
+   * Constructor used by {@link org.apache.calcite.rel.externalize.RelJsonReader} during
+   * deserialization. Reconstructs the {@link SystemLimitType} from the serialized string.
+   */
+  public LogicalSystemLimit(RelInput input) {
+    super(input);
+    this.type =
+        SystemLimitType.valueOf(requireNonNull((String) input.get("type"), "SystemLimitType"));
   }
 
   public static LogicalSystemLimit create(SystemLimitType type, RelNode input, RexNode fetch) {

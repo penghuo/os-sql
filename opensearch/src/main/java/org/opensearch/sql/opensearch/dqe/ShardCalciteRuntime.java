@@ -12,17 +12,23 @@ import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.Enumerator;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptSchema;
+import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
+import org.apache.calcite.prepare.RelOptTableImpl;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.schema.impl.AbstractSchema;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.opensearch.dqe.serde.RelNodeSerializer;
+import org.opensearch.sql.opensearch.dqe.serde.ShardDeserializationContext;
+import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 
 /**
  * Executes a serialized Calcite plan fragment on a local shard. This is the shard-side runtime
@@ -84,15 +90,26 @@ public class ShardCalciteRuntime {
      * @param planJson serialized RelNode plan JSON from RelNodeSerializer
      * @param indexName the OpenSearch index name (for binding context)
      * @param shardId the shard ID on this node (for binding context)
+     * @param osIndex the OpenSearch index for shard-side scan construction
      * @return Result containing typed rows or an error
      */
-    public Result execute(String planJson, String indexName, int shardId) {
+    public Result execute(String planJson, String indexName, int shardId,
+            OpenSearchIndex osIndex) {
         try {
             // Step 1: Create RelOptCluster with OpenSearchTypeFactory
             RelOptCluster cluster = createCluster();
 
-            // Step 2: Deserialize the plan JSON
-            RelNode plan = RelNodeSerializer.deserialize(planJson, cluster, null);
+            // Step 2: Set up deserialization context with OpenSearchIndex
+            // so DSLScan(RelInput) can retrieve it during construction.
+            ShardDeserializationContext.set(new ShardDeserializationContext(osIndex));
+            RelNode plan;
+            try {
+                // Create a RelOptSchema that can resolve the table name during deserialization.
+                RelOptSchema relOptSchema = createShardSchema(osIndex, cluster);
+                plan = RelNodeSerializer.deserialize(planJson, cluster, relOptSchema);
+            } finally {
+                ShardDeserializationContext.clear();
+            }
 
             // Step 3: Verify the deserialized plan root implements Scannable
             if (!(plan instanceof Scannable)) {
@@ -144,6 +161,35 @@ public class ShardCalciteRuntime {
         VolcanoPlanner planner = new VolcanoPlanner();
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         return RelOptCluster.create(planner, rexBuilder);
+    }
+
+    /**
+     * Creates a minimal {@link RelOptSchema} for shard-side deserialization. The schema resolves
+     * any table name to a {@link RelOptTable} backed by the given {@link OpenSearchIndex}. This
+     * allows Calcite's {@code RelJsonReader} to resolve table references when constructing
+     * {@code DSLScan} nodes from JSON.
+     */
+    private static RelOptSchema createShardSchema(OpenSearchIndex osIndex,
+            RelOptCluster cluster) {
+        return new RelOptSchema() {
+            @Override
+            public RelOptTable getTableForMember(java.util.List<String> qualifiedName) {
+                RelDataType rowType = osIndex.getRowType(cluster.getTypeFactory());
+                return RelOptTableImpl.create(
+                        this, rowType, osIndex,
+                        com.google.common.collect.ImmutableList.copyOf(qualifiedName));
+            }
+
+            @Override
+            public org.apache.calcite.rel.type.RelDataTypeFactory getTypeFactory() {
+                return cluster.getTypeFactory();
+            }
+
+            @Override
+            public void registerRules(org.apache.calcite.plan.RelOptPlanner planner) {
+                // No rules to register for shard-side deserialization
+            }
+        };
     }
 
     /**

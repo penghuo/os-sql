@@ -119,6 +119,9 @@ public class ExtendedRelJson extends RelJson {
     registerEnum(enumByName, SqlTrimFunction.Flag.class);
     registerEnum(enumByName, TimeUnitRange.class);
     registerEnum(enumByName, TableModify.Operation.class);
+    // Note: SqlTypeName is NOT registered here because some of its constants (DISTINCT, NULL)
+    // collide with constants in other registered enums. SqlTypeName is handled via a fallback
+    // in toEnumWithSqlTypeName() instead.
     ENUM_BY_NAME = enumByName.build();
   }
 
@@ -173,6 +176,11 @@ public class ExtendedRelJson extends RelJson {
       return toJson((RelDataTypeField) value);
     } else if (value instanceof RelDataType) {
       return toJson((RelDataType) value);
+    } else if (value instanceof Enum) {
+      // Serialize enum constants (e.g., SystemLimitType, SqlTypeName) as their name string.
+      // Calcite's base RelJson.toJson(Object) does not handle arbitrary enums, so custom
+      // enums used in explainTerms() would otherwise throw UnsupportedOperationException.
+      return ((Enum<?>) value).name();
     }
     return super.toJson(value);
   }
@@ -200,8 +208,16 @@ public class ExtendedRelJson extends RelJson {
         final Object value = literal.getValue3();
         map = jsonBuilder().map();
         //noinspection rawtypes
-        map.put(
-            "literal", value instanceof Enum ? RelEnumTypes.fromEnum((Enum) value) : toJson(value));
+        if (value instanceof Enum) {
+          if (value instanceof SqlTypeName) {
+            // SqlTypeName is not registered in RelEnumTypes, so serialize it directly.
+            map.put("literal", ((SqlTypeName) value).name());
+          } else {
+            map.put("literal", RelEnumTypes.fromEnum((Enum) value));
+          }
+        } else {
+          map.put("literal", toJson(value));
+        }
         map.put("type", toJson(node.getType()));
         return map;
       case INPUT_REF:
@@ -509,7 +525,7 @@ public class ExtendedRelJson extends RelJson {
           return rexBuilder.makeSearchArgumentLiteral(sarg, type);
         }
         if (type.getSqlTypeName() == SqlTypeName.SYMBOL) {
-          literal = toEnum((String) literal);
+          literal = toEnumWithSqlTypeName((String) literal);
         }
         return rexBuilder.makeLiteral(literal, type);
       }
@@ -628,6 +644,24 @@ public class ExtendedRelJson extends RelJson {
   @SuppressWarnings("unchecked")
   private static <E extends Enum<E>> E toEnum(String name) {
     return (E) requireNonNull(ENUM_BY_NAME.get(name), () -> "No enum registered for name: " + name);
+  }
+
+  /**
+   * Converts a string to an enum value, with fallback to {@link SqlTypeName}. SqlTypeName values
+   * (e.g., BIGINT) cannot be registered in ENUM_BY_NAME because some names collide with other
+   * registered enums (DISTINCT, UNKNOWN, NULL).
+   */
+  @SuppressWarnings("unchecked")
+  private static <E extends Enum<E>> E toEnumWithSqlTypeName(String name) {
+    Enum<?> result = ENUM_BY_NAME.get(name);
+    if (result != null) {
+      return (E) result;
+    }
+    try {
+      return (E) SqlTypeName.valueOf(name);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("No enum registered for name: " + name, e);
+    }
   }
 
   // Copied from RelJson because it's private but used in toRex(RelInput, Object)

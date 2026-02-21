@@ -21,6 +21,7 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.type.RelDataType;
@@ -29,6 +30,7 @@ import org.apache.logging.log4j.Logger;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRules;
+import org.opensearch.sql.opensearch.dqe.serde.ShardDeserializationContext;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 import org.opensearch.sql.opensearch.storage.scan.AbstractCalciteIndexScan;
@@ -64,6 +66,43 @@ public class DSLScan extends AbstractCalciteIndexScan implements Scannable, Enum
             RelDataType schema,
             PushDownContext pushDownContext) {
         super(cluster, traits, hints, table, index, schema, pushDownContext);
+    }
+
+    /**
+     * Constructor for Calcite JSON deserialization. Calcite's {@code RelJsonReader} requires a
+     * {@code (RelInput)} constructor on every RelNode class it deserializes. Since DSLScan needs
+     * an {@link OpenSearchIndex} (which is not serializable through Calcite's standard JSON
+     * format), the index is retrieved from {@link ShardDeserializationContext} which must be set
+     * on the current thread before deserialization.
+     */
+    public DSLScan(RelInput input) {
+        super(
+                input.getCluster(),
+                input.getTraitSet(),
+                List.of(),
+                input.getTable("table"),
+                getOpenSearchIndexFromContext(),
+                input.getRowType("rowType"),
+                new PushDownContext(getOpenSearchIndexFromContext()));
+    }
+
+    private static OpenSearchIndex getOpenSearchIndexFromContext() {
+        ShardDeserializationContext ctx = ShardDeserializationContext.get();
+        if (ctx == null) {
+            throw new IllegalStateException(
+                    "ShardDeserializationContext not set. DSLScan(RelInput) can only be used "
+                            + "during shard-side plan deserialization.");
+        }
+        return ctx.getOpenSearchIndex();
+    }
+
+    /**
+     * Override to include rowType in the serialized form so it can be reconstructed during
+     * deserialization via the {@code DSLScan(RelInput)} constructor.
+     */
+    @Override
+    public org.apache.calcite.rel.RelWriter explainTerms(org.apache.calcite.rel.RelWriter pw) {
+        return super.explainTerms(pw).item("rowType", getRowType());
     }
 
     @Override

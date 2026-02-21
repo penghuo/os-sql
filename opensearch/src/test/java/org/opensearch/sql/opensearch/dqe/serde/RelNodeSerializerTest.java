@@ -121,6 +121,34 @@ public class RelNodeSerializerTest {
     assertNotNull(d); assertEquals(1, d.getRowType().getFieldCount()); assertEquals("upper_name", d.getRowType().getFieldNames().get(0));
   }
 
+  @Test @DisplayName("Round-trip for LogicalSystemLimit with QUERY_SIZE_LIMIT") void roundTrip_logicalSystemLimit() {
+    // LogicalSystemLimit.create() requires RelCollationTraitDef to be registered in the planner
+    VolcanoPlanner collationPlanner = new VolcanoPlanner();
+    collationPlanner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    collationPlanner.addRelTraitDef(RelCollationTraitDef.INSTANCE);
+    RelOptCluster collationCluster = RelOptCluster.create(collationPlanner, rexBuilder);
+    LogicalValues collationValues = LogicalValues.createEmpty(collationCluster, rowType);
+    org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit sysLimit =
+        org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.create(
+            org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType.QUERY_SIZE_LIMIT,
+            collationValues,
+            rexBuilder.makeLiteral(10000, TYPE_FACTORY.createSqlType(SqlTypeName.INTEGER)));
+    String j = RelNodeSerializer.serialize(sysLimit);
+    assertNotNull(j);
+    assertTrue(j.contains("LogicalSystemLimit"));
+    assertTrue(j.contains("QUERY_SIZE_LIMIT"));
+    RelNode d = RelNodeSerializer.deserialize(j, collationCluster, null);
+    assertNotNull(d);
+    assertInstanceOf(org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.class, d);
+    org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit deserialized =
+        (org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit) d;
+    assertEquals(
+        org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType.QUERY_SIZE_LIMIT,
+        deserialized.getType());
+    assertEquals(sysLimit.getRowType().getFieldCount(), d.getRowType().getFieldCount());
+    assertEquals(sysLimit.getRowType().getFieldNames(), d.getRowType().getFieldNames());
+  }
+
   @Test @DisplayName("Malformed JSON error") void deserialize_malformed() { assertThrows(IllegalArgumentException.class, () -> RelNodeSerializer.deserialize("not valid json", cluster, null)); }
   @Test @DisplayName("Empty rels error") void deserialize_emptyRels() { assertThrows(Exception.class, () -> RelNodeSerializer.deserialize("{\"rels\":[]}", cluster, null)); }
 

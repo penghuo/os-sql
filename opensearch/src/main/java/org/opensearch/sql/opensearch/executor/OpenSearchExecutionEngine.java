@@ -75,6 +75,12 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   private final ExecutionProtector executionProtector;
   private final PlanSerializer planSerializer;
 
+  /**
+   * Optional DQE executor. When non-null, the engine will attempt to use the Distributed Query
+   * Engine for RelNode execution by splitting the plan and dispatching to shards.
+   */
+  private volatile org.opensearch.sql.opensearch.dqe.DistributedExecutor distributedExecutor;
+
   public OpenSearchExecutionEngine(
       OpenSearchClient client,
       ExecutionProtector executionProtector,
@@ -83,6 +89,15 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     this.executionProtector = executionProtector;
     this.planSerializer = planSerializer;
     registerOpenSearchFunctions();
+  }
+
+  /**
+   * Sets the distributed executor for DQE mode. When set, the engine will split RelNode plans and
+   * execute them via the distributed path.
+   */
+  public void setDistributedExecutor(
+      org.opensearch.sql.opensearch.dqe.DistributedExecutor distributedExecutor) {
+    this.distributedExecutor = distributedExecutor;
   }
 
   @Override
@@ -207,6 +222,24 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   @Override
   public void execute(
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
+    // DQE path: if distributed executor is configured, try to split and distribute the plan
+    if (distributedExecutor != null) {
+      try {
+        org.opensearch.sql.opensearch.dqe.DistributedPlan dqePlan =
+            org.opensearch.sql.opensearch.dqe.PlanSplitter.split(rel);
+        if (dqePlan != null) {
+          client.schedule(() -> distributedExecutor.execute(dqePlan, listener));
+          return;
+        }
+      } catch (Exception e) {
+        // If plan splitting fails for any reason, fall through to legacy path.
+        // This handles edge cases like unsupported operators not yet detected by PlanSplitter.
+        logger.debug("DQE plan splitting failed, falling back to legacy path", e);
+      }
+      // dqePlan is null means no OpenSearch scan found, unsupported pattern, or split failed
+    }
+
+    // Legacy JDBC path
     client.schedule(
         () -> {
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {

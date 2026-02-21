@@ -76,6 +76,20 @@ public class OpenSearchIndexRules {
           EXPAND_COLLATION_ON_PROJECT_EXPR,
           SORT_EXPR_INDEX_SCAN);
 
+  /**
+   * DQE pushdown rules: a subset of pushdown rules used when the Distributed Query Engine is
+   * enabled. These rules push filter, project, limit, sort, and relevance function operations into
+   * the scan, but NOT aggregations (which are handled by the DQE's exchange-based merge). The
+   * DSLScanRule (registered separately) replaces EnumerableIndexScanRule.
+   */
+  public static final List<RelOptRule> DQE_PUSHDOWN_RULES =
+      ImmutableList.of(
+          FILTER_INDEX_SCAN,
+          PROJECT_INDEX_SCAN,
+          LIMIT_INDEX_SCAN,
+          SORT_INDEX_SCAN,
+          RELEVANCE_FUNCTION_RULE);
+
   // prevent instantiation
   private OpenSearchIndexRules() {}
 }

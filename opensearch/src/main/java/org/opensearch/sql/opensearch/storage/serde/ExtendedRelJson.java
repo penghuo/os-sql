@@ -237,6 +237,11 @@ public class ExtendedRelJson extends RelJson {
               map.put("type", toJson(node.getType()));
               break;
             default:
+              // Preserve type for calls returning UDTs (e.g., WIDTH_BUCKET on timestamp)
+              // so the type can be reconstructed correctly during deserialization.
+              if (node.getType() instanceof AbstractExprRelDataType) {
+                map.put("type", toJson(node.getType()));
+              }
               break;
           }
           if (call.getOperator() instanceof SqlFunction) {

@@ -15,6 +15,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.opensearch.sql.opensearch.setting.OpenSearchSettings.ASYNC_QUERY_EXTERNAL_SCHEDULER_ENABLED_SETTING;
 import static org.opensearch.sql.opensearch.setting.OpenSearchSettings.ASYNC_QUERY_EXTERNAL_SCHEDULER_INTERVAL_SETTING;
+import static org.opensearch.sql.opensearch.setting.OpenSearchSettings.DQE_ENABLED_SETTING;
 import static org.opensearch.sql.opensearch.setting.OpenSearchSettings.QUERY_MEMORY_LIMIT_SETTING;
 import static org.opensearch.sql.opensearch.setting.OpenSearchSettings.SPARK_EXECUTION_ENGINE_CONFIG;
 
@@ -152,5 +153,47 @@ class OpenSearchSettingsTest {
         "",
         ASYNC_QUERY_EXTERNAL_SCHEDULER_INTERVAL_SETTING.get(
             org.opensearch.common.settings.Settings.builder().build()));
+  }
+
+  @Test
+  void dqeEnabledKeyExists() {
+    assertEquals("plugins.query.dqe.enabled", Settings.Key.DQE_ENABLED.getKeyValue());
+  }
+
+  @Test
+  void dqeEnabledDefaultsToFalse() {
+    // Default is false
+    assertEquals(
+        false,
+        DQE_ENABLED_SETTING.get(org.opensearch.common.settings.Settings.builder().build()));
+  }
+
+  @Test
+  void dqeEnabledSettingDefaultValueFromOpenSearchSettings() {
+    when(clusterSettings.get(ClusterName.CLUSTER_NAME_SETTING)).thenReturn(ClusterName.DEFAULT);
+    when(clusterSettings.get(not((eq(ClusterName.CLUSTER_NAME_SETTING))))).thenReturn(null);
+    OpenSearchSettings settings = new OpenSearchSettings(clusterSettings);
+
+    Boolean defaultValue = settings.getSettingValue(Settings.Key.DQE_ENABLED);
+    assertEquals(false, defaultValue);
+  }
+
+  @Test
+  void dqeEnabledSettingIsDynamic() {
+    when(clusterSettings.get(ClusterName.CLUSTER_NAME_SETTING)).thenReturn(ClusterName.DEFAULT);
+    when(clusterSettings.get(not((eq(ClusterName.CLUSTER_NAME_SETTING))))).thenReturn(null);
+    OpenSearchSettings settings = new OpenSearchSettings(clusterSettings);
+
+    // Verify default is false
+    Boolean defaultValue = settings.getSettingValue(Settings.Key.DQE_ENABLED);
+    assertEquals(false, defaultValue);
+
+    // Simulate dynamic update
+    OpenSearchSettings.Updater updater = settings.new Updater(Settings.Key.DQE_ENABLED);
+    updater.accept(true);
+
+    // Verify updated value
+    Boolean newValue = settings.getSettingValue(Settings.Key.DQE_ENABLED);
+    assertEquals(true, newValue);
   }
 }

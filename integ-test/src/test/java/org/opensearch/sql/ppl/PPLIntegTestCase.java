@@ -208,6 +208,18 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
             "persistent", Settings.Key.CALCITE_ENGINE_ENABLED.getKeyValue(), "false"));
   }
 
+  public static void enableDQE() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DQE_ENABLED.getKeyValue(), "true"));
+  }
+
+  public static void disableDQE() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.DQE_ENABLED.getKeyValue(), "false"));
+  }
+
   public static void withCalciteEnabled(Runnable f) throws IOException {
     boolean isCalciteEnabled = isCalciteEnabled();
     if (isCalciteEnabled) f.run();

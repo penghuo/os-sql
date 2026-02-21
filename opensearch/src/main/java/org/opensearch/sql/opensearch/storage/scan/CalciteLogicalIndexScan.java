@@ -127,12 +127,34 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan {
   @Override
   public void register(RelOptPlanner planner) {
     super.register(planner);
-    for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_NON_PUSHDOWN_RULES) {
-      planner.addRule(rule);
-    }
-    if ((Boolean) osIndex.getSettings().getSettingValue(Settings.Key.CALCITE_PUSHDOWN_ENABLED)) {
-      for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_PUSHDOWN_RULES) {
+
+    boolean dqeEnabled =
+        (Boolean) osIndex.getSettings().getSettingValue(Settings.Key.DQE_ENABLED);
+
+    if (dqeEnabled) {
+      // DQE mode: use DQE-specific pushdown rules + DSLScanRule (replaces EnumerableIndexScanRule)
+      // System index scan and nested aggregate rules are still needed
+      planner.addRule(
+          org.opensearch.sql.opensearch.planner.rules.EnumerableSystemIndexScanRule.DEFAULT_CONFIG
+              .toRule());
+      planner.addRule(
+          org.opensearch.sql.opensearch.planner.rules.EnumerableNestedAggregateRule.DEFAULT_CONFIG
+              .toRule());
+      for (RelOptRule rule : OpenSearchIndexRules.DQE_PUSHDOWN_RULES) {
         planner.addRule(rule);
+      }
+      planner.addRule(
+          org.opensearch.sql.opensearch.dqe.DSLScanRule.DEFAULT_CONFIG.toRule());
+    } else {
+      // Legacy mode: existing behavior
+      for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_NON_PUSHDOWN_RULES) {
+        planner.addRule(rule);
+      }
+      if ((Boolean)
+          osIndex.getSettings().getSettingValue(Settings.Key.CALCITE_PUSHDOWN_ENABLED)) {
+        for (RelOptRule rule : OpenSearchIndexRules.OPEN_SEARCH_PUSHDOWN_RULES) {
+          planner.addRule(rule);
+        }
       }
     }
   }

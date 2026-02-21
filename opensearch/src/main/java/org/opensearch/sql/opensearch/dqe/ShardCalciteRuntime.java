@@ -10,6 +10,7 @@ import java.util.List;
 import lombok.Getter;
 import org.apache.calcite.DataContext;
 import org.apache.calcite.interpreter.Interpreter;
+import org.apache.calcite.linq4j.AbstractEnumerable;
 import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.Enumerator;
 import org.apache.calcite.linq4j.QueryProvider;
@@ -21,11 +22,11 @@ import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.prepare.RelOptTableImpl;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.schema.ScannableTable;
 import org.apache.calcite.schema.SchemaPlus;
-import org.apache.calcite.schema.impl.AbstractSchema;
 import org.apache.calcite.schema.impl.AbstractTable;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.tools.Frameworks;
@@ -35,8 +36,10 @@ import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.opensearch.dqe.serde.RelNodeSerializer;
 import org.opensearch.sql.opensearch.dqe.serde.ShardDeserializationContext;
+import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
-import org.opensearch.sql.opensearch.storage.scan.AbstractCalciteIndexScan;
+import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexEnumerator;
+import org.opensearch.sql.opensearch.storage.scan.context.PushDownContext;
 
 /**
  * Executes a serialized Calcite plan fragment on a local shard. This is the shard-side runtime
@@ -171,9 +174,11 @@ public class ShardCalciteRuntime {
 
     /**
      * Creates a minimal {@link RelOptSchema} for shard-side deserialization. The schema resolves
-     * any table name to a {@link RelOptTable} backed by the given {@link OpenSearchIndex}. This
-     * allows Calcite's {@code RelJsonReader} to resolve table references when constructing
-     * {@code DSLScan} nodes from JSON.
+     * any table name to a {@link RelOptTable} backed by a {@link ShardScannableTable} wrapper
+     * around the given {@link OpenSearchIndex}. This allows Calcite's {@code RelJsonReader} to
+     * resolve table references when constructing {@code DSLScan} nodes from JSON, and ensures
+     * that Calcite's {@link org.apache.calcite.interpreter.TableScanNode} can unwrap the table
+     * as a {@link ScannableTable} during Interpreter-based execution.
      */
     private static RelOptSchema createShardSchema(OpenSearchIndex osIndex,
             RelOptCluster cluster) {
@@ -181,8 +186,9 @@ public class ShardCalciteRuntime {
             @Override
             public RelOptTable getTableForMember(java.util.List<String> qualifiedName) {
                 RelDataType rowType = osIndex.getRowType(cluster.getTypeFactory());
+                ScannableTable scannableWrapper = new ShardScannableTable(osIndex, rowType);
                 return RelOptTableImpl.create(
-                        this, rowType, osIndex,
+                        this, rowType, scannableWrapper,
                         com.google.common.collect.ImmutableList.copyOf(qualifiedName));
             }
 
@@ -202,69 +208,20 @@ public class ShardCalciteRuntime {
      * Executes a non-Scannable plan tree using Calcite's {@link Interpreter}. The Interpreter can
      * handle standard logical operators (Filter, Project, Sort, Aggregate, etc.) natively.
      *
-     * <p>The scan leaf (CalciteLogicalIndexScan or DSLScan) is located in the plan tree and wrapped
-     * in a {@link ScannableTable} so that the Interpreter's {@code TableScanNode} can read data
-     * from it. A {@link DataContext} is created with a root schema containing this table.
+     * <p>The scan leaf's {@link RelOptTable} was created in {@link #createShardSchema} backed by a
+     * {@link ShardScannableTable}, so the Interpreter's {@code TableScanNode} can unwrap it as a
+     * {@link ScannableTable} and read data directly.
      *
      * @param plan the deserialized plan tree with a non-Scannable root
      * @return an Enumerable of Object[] rows
      */
     private Enumerable<Object[]> executeWithInterpreter(RelNode plan) {
-        // Find the Scannable leaf in the plan tree
-        Scannable scannableLeaf = findScannableLeaf(plan);
-        if (scannableLeaf == null) {
-            throw new IllegalStateException(
-                    "No Scannable leaf found in plan tree rooted at "
-                            + plan.getClass().getName()
-                            + ". The shard plan must contain a DSLScan or "
-                            + "CalciteLogicalIndexScan leaf.");
-        }
+        // Create a minimal DataContext for the Interpreter
+        DataContext dataContext = createInterpreterDataContext(
+                Frameworks.createRootSchema(false));
 
-        // Get the table name from the scan leaf's RelOptTable
-        AbstractCalciteIndexScan scanNode = (AbstractCalciteIndexScan) scannableLeaf;
-        List<String> qualifiedName = scanNode.getTable().getQualifiedName();
-
-        // Create a ScannableTable wrapper that delegates to the leaf's scan()
-        ScannableTable scannableTable = new ScannableTableAdapter(scannableLeaf, scanNode);
-
-        // Build a SchemaPlus with the ScannableTable registered under the table name
-        SchemaPlus rootSchema = Frameworks.createRootSchema(false);
-        // Register the table under each component of the qualified name path
-        // For a single-component name like ["myindex"], register directly in root
-        // For multi-component like ["opensearch", "myindex"], create intermediate schemas
-        SchemaPlus targetSchema = rootSchema;
-        for (int i = 0; i < qualifiedName.size() - 1; i++) {
-            SchemaPlus child = targetSchema.getSubSchema(qualifiedName.get(i));
-            if (child == null) {
-                child = targetSchema.add(qualifiedName.get(i), new AbstractSchema());
-            }
-            targetSchema = child;
-        }
-        String tableName = qualifiedName.get(qualifiedName.size() - 1);
-        targetSchema.add(tableName, scannableTable);
-
-        // Create a DataContext with the root schema
-        DataContext dataContext = createInterpreterDataContext(rootSchema);
-
-        // Execute via Interpreter
+        // Execute via Interpreter — the scan leaf's RelOptTable already wraps a ScannableTable
         return new Interpreter(dataContext, plan);
-    }
-
-    /**
-     * Walks the plan tree to find the first {@link Scannable} leaf node. Returns null if none
-     * found.
-     */
-    private static Scannable findScannableLeaf(RelNode node) {
-        if (node instanceof Scannable) {
-            return (Scannable) node;
-        }
-        for (RelNode child : node.getInputs()) {
-            Scannable found = findScannableLeaf(child);
-            if (found != null) {
-                return found;
-            }
-        }
-        return null;
     }
 
     /**
@@ -321,47 +278,61 @@ public class ShardCalciteRuntime {
     }
 
     /**
-     * A {@link ScannableTable} adapter that wraps a {@link Scannable} leaf node's output for use
-     * by Calcite's {@link Interpreter}. The Interpreter's {@code TableScanNode} requires a
-     * {@link ScannableTable} to read data from. This adapter bridges between our custom
-     * {@link Scannable} interface (which returns {@code Enumerable<Object>} with scalars for
-     * single-column rows) and Calcite's {@link ScannableTable} (which returns
-     * {@code Enumerable<Object[]>}).
+     * A {@link ScannableTable} implementation that wraps an {@link OpenSearchIndex} for shard-side
+     * execution. This is used during plan deserialization so that the {@link RelOptTableImpl}
+     * created by {@link #createShardSchema} is backed by a {@link ScannableTable}. Calcite's
+     * Interpreter {@code TableScanNode} calls {@code relOptTable.unwrap(ScannableTable.class)}
+     * to obtain the table, so this wrapper ensures that unwrap succeeds.
+     *
+     * <p>The scan implementation creates a fresh {@link PushDownContext} and
+     * {@link OpenSearchRequestBuilder} from the {@link OpenSearchIndex}, then returns rows via
+     * {@link OpenSearchIndexEnumerator}. Single-column rows from the enumerator (which are
+     * returned as scalars) are wrapped in {@code Object[]} since the Interpreter expects
+     * {@code Enumerable<Object[]>}.
      */
-    private static class ScannableTableAdapter extends AbstractTable implements ScannableTable {
-        private final Scannable scannableLeaf;
-        private final AbstractCalciteIndexScan scanNode;
+    static class ShardScannableTable extends AbstractTable implements ScannableTable {
+        private final OpenSearchIndex osIndex;
+        private final RelDataType rowType;
 
-        ScannableTableAdapter(Scannable scannableLeaf, AbstractCalciteIndexScan scanNode) {
-            this.scannableLeaf = scannableLeaf;
-            this.scanNode = scanNode;
+        ShardScannableTable(OpenSearchIndex osIndex, RelDataType rowType) {
+            this.osIndex = osIndex;
+            this.rowType = rowType;
         }
 
         @Override
-        public RelDataType getRowType(
-                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
-            return scanNode.getRowType();
+        public RelDataType getRowType(RelDataTypeFactory typeFactory) {
+            return rowType;
         }
 
         @Override
         public Enumerable<Object[]> scan(DataContext root) {
-            Enumerable<?> raw = scannableLeaf.scan();
-            int columnCount = scanNode.getRowType().getFieldCount();
-            return new org.apache.calcite.linq4j.AbstractEnumerable<Object[]>() {
+            PushDownContext ctx = new PushDownContext(osIndex);
+            OpenSearchRequestBuilder requestBuilder = ctx.createRequestBuilder();
+            List<String> fieldNames = rowType.getFieldNames();
+            int columnCount = fieldNames.size();
+
+            return new AbstractEnumerable<>() {
                 @Override
                 public Enumerator<Object[]> enumerator() {
-                    Enumerator<?> inner = raw.enumerator();
+                    Enumerator<Object> inner = new OpenSearchIndexEnumerator(
+                            osIndex.getClient(),
+                            fieldNames,
+                            requestBuilder.getMaxResponseSize(),
+                            requestBuilder.getMaxResultWindow(),
+                            osIndex.getQueryBucketSize(),
+                            osIndex.buildRequest(requestBuilder),
+                            osIndex.createOpenSearchResourceMonitor());
                     return new Enumerator<>() {
                         @Override
                         public Object[] current() {
                             Object current = inner.current();
                             if (current == null) {
                                 return new Object[columnCount];
-                            } else if (columnCount == 1) {
-                                return new Object[] {current};
                             } else if (current instanceof Object[]) {
                                 return (Object[]) current;
                             } else {
+                                // Single-column rows are returned as scalars by
+                                // OpenSearchIndexEnumerator; wrap in Object[]
                                 return new Object[] {current};
                             }
                         }

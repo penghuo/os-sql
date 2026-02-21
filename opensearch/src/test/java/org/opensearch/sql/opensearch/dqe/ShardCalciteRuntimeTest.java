@@ -239,9 +239,9 @@ class ShardCalciteRuntimeTest {
     }
 
     @Test
-    @DisplayName("Non-Scannable plan without Scannable leaf returns error in result")
-    void execute_nonScannablePlan_noLeaf_returnsError() {
-        // LogicalValues has no Scannable leaf, so the Interpreter path should fail
+    @DisplayName("Non-Scannable plan without Scannable leaf is handled by Interpreter natively")
+    void execute_nonScannablePlan_noLeaf_handledByInterpreter() {
+        // LogicalValues has no Scannable leaf but the Interpreter handles it natively
         RelDataType rowType =
                 OpenSearchTypeFactory.TYPE_FACTORY
                         .builder()
@@ -258,9 +258,10 @@ class ShardCalciteRuntimeTest {
 
             ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
-            assertTrue(result.hasError());
-            assertNotNull(result.getError());
-            assertTrue(result.getError().getMessage().contains("No Scannable leaf found"));
+            assertFalse(result.hasError());
+            assertEquals(0, result.getRows().size());
+            assertEquals(List.of("x"), result.getColumnNames());
+            assertEquals(List.of(SqlTypeName.INTEGER), result.getColumnTypes());
         }
     }
 

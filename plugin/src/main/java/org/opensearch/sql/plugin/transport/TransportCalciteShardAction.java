@@ -9,12 +9,13 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.sql.opensearch.dqe.ShardCalciteRuntime;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
 /**
  * Transport action handler that receives a serialized Calcite shard plan and executes it locally.
- * Delegates actual plan execution to ShardCalciteRuntime (T9).
+ * Delegates actual plan execution to {@link ShardCalciteRuntime}.
  */
 public class TransportCalciteShardAction
     extends HandledTransportAction<CalciteShardRequest, CalciteShardResponse> {
@@ -29,19 +30,17 @@ public class TransportCalciteShardAction
   protected void doExecute(
       Task task, CalciteShardRequest request, ActionListener<CalciteShardResponse> listener) {
     try {
-      // TODO: Integrate with ShardCalciteRuntime (T9) to execute the plan.
-      // ShardCalciteRuntime will deserialize the planJson, bind to the local shard,
-      // execute the plan fragment, and return typed rows.
-      //
-      // Placeholder: once T9 is available, replace with:
-      //   ShardCalciteRuntime runtime = ...;
-      //   CalciteShardResponse response = runtime.execute(
-      //       request.getPlanJson(), request.getIndexName(), request.getShardId());
-      //   listener.onResponse(response);
+      ShardCalciteRuntime runtime = new ShardCalciteRuntime();
+      ShardCalciteRuntime.Result result =
+          runtime.execute(request.getPlanJson(), request.getIndexName(), request.getShardId());
 
-      listener.onFailure(
-          new UnsupportedOperationException(
-              "ShardCalciteRuntime (T9) not yet integrated"));
+      if (result.hasError()) {
+        listener.onResponse(new CalciteShardResponse(result.getError()));
+      } else {
+        listener.onResponse(
+            new CalciteShardResponse(
+                result.getRows(), result.getColumnNames(), result.getColumnTypes()));
+      }
     } catch (Exception e) {
       listener.onResponse(new CalciteShardResponse(e));
     }

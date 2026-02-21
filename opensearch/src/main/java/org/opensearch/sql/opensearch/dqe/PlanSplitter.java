@@ -6,8 +6,19 @@
 package org.opensearch.sql.opensearch.dqe;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
+import org.apache.calcite.adapter.enumerable.EnumerableRel;
+import org.apache.calcite.adapter.enumerable.EnumerableRelImplementor;
+import org.apache.calcite.adapter.enumerable.PhysType;
+import org.apache.calcite.adapter.enumerable.PhysTypeImpl;
+import org.apache.calcite.linq4j.AbstractEnumerable;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
+import org.apache.calcite.linq4j.tree.Blocks;
+import org.apache.calcite.linq4j.tree.Expression;
+import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Calc;
@@ -17,6 +28,8 @@ import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.Window;
 import org.apache.calcite.rex.RexLiteral;
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.opensearch.dqe.agg.PartialAggregate;
 import org.opensearch.sql.opensearch.dqe.agg.PartialAggregateSpec;
@@ -386,10 +399,13 @@ public final class PlanSplitter {
     }
 
     /**
-     * A placeholder RelNode that represents an Exchange in the coordinator plan tree. The
-     * coordinator executor uses this to identify where to inject shard results.
+     * A placeholder RelNode that represents an Exchange in the coordinator plan tree. Implements
+     * {@link EnumerableRel} so that Calcite's code generation can execute coordinator plans that
+     * have operators above ExchangeLeaf nodes (e.g., Join, Project). Also implements
+     * {@link Scannable} for direct invocation without code generation.
      */
-    static class ExchangeLeaf extends org.apache.calcite.rel.AbstractRelNode {
+    static class ExchangeLeaf extends org.apache.calcite.rel.AbstractRelNode
+            implements EnumerableRel, Scannable {
         private final Exchange exchange;
 
         ExchangeLeaf(
@@ -408,6 +424,58 @@ public final class PlanSplitter {
         @Override
         protected org.apache.calcite.rel.type.RelDataType deriveRowType() {
             return rowType;
+        }
+
+        @Override
+        public Result implement(EnumerableRelImplementor implementor, Prefer pref) {
+            PhysType physType =
+                    PhysTypeImpl.of(
+                            implementor.getTypeFactory(),
+                            getRowType(),
+                            pref.preferArray());
+
+            Expression scanOperator = implementor.stash(this, ExchangeLeaf.class);
+            return implementor.result(
+                    physType,
+                    Blocks.toBlock(Expressions.call(scanOperator, "scan")));
+        }
+
+        @Override
+        public Enumerable<@Nullable Object> scan() {
+            int columnCount = getRowType().getFieldCount();
+            return new AbstractEnumerable<>() {
+                @Override
+                public Enumerator<@Nullable Object> enumerator() {
+                    Iterator<Object[]> iterator = exchange.scan();
+                    return new Enumerator<>() {
+                        Object current;
+
+                        @Override
+                        public Object current() {
+                            return current;
+                        }
+
+                        @Override
+                        public boolean moveNext() {
+                            if (iterator.hasNext()) {
+                                Object[] row = iterator.next();
+                                // Single-column rows are optimized to scalars by Calcite
+                                current = (columnCount == 1) ? row[0] : row;
+                                return true;
+                            }
+                            return false;
+                        }
+
+                        @Override
+                        public void reset() {
+                            throw new UnsupportedOperationException("reset not supported");
+                        }
+
+                        @Override
+                        public void close() {}
+                    };
+                }
+            };
         }
     }
 }

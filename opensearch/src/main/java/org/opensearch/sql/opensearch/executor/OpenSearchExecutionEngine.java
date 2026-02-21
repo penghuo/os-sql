@@ -224,19 +224,15 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     // DQE path: if distributed executor is configured, try to split and distribute the plan
     if (distributedExecutor != null) {
-      try {
-        org.opensearch.sql.opensearch.dqe.DistributedPlan dqePlan =
-            org.opensearch.sql.opensearch.dqe.PlanSplitter.split(rel);
-        if (dqePlan != null) {
-          client.schedule(() -> distributedExecutor.execute(dqePlan, listener));
-          return;
-        }
-      } catch (Exception e) {
-        // If plan splitting fails for any reason, fall through to legacy path.
-        // This handles edge cases like unsupported operators not yet detected by PlanSplitter.
-        logger.debug("DQE plan splitting failed, falling back to legacy path", e);
+      org.opensearch.sql.opensearch.dqe.DistributedPlan dqePlan =
+          org.opensearch.sql.opensearch.dqe.PlanSplitter.split(rel);
+      if (dqePlan != null) {
+        client.schedule(() -> distributedExecutor.execute(dqePlan, listener));
+        return;
       }
-      // dqePlan is null means no OpenSearch scan found, unsupported pattern, or split failed
+      // dqePlan is null means no OpenSearch scan found or unsupported pattern — fall through
+      // to legacy path by design (PlanSplitter.split() returns null for system tables and
+      // patterns detected by containsUnsupportedForDQE)
     }
 
     // Legacy JDBC path

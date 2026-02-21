@@ -201,17 +201,14 @@ public class DistributedExecutor {
   }
 
   /**
-   * Builds a QueryResponse from the coordinator plan. Reads merged rows from the exchanges (via
-   * ExchangeLeaf nodes in the coordinator plan) and converts to ExprValue rows.
+   * Builds a QueryResponse from the coordinator plan. Reads merged rows from all exchanges
+   * (populated after shard dispatch) and converts to ExprValue rows.
+   *
+   * <p>Each exchange (ConcatExchange, MergeSortExchange, MergeAggregateExchange) already produces
+   * the correct final merged results via its {@code scan()} method. The coordinator plan's row
+   * type is used for schema and type conversion.
    */
   private QueryResponse buildResponse(DistributedPlan plan) {
-    // For the coordinator plan, we need to read from the exchanges
-    // The simplest case: we have exchanges that are now populated with merged results.
-    // We iterate over the exchanges and build rows from them.
-    // If there's a coordinator plan above the exchanges, we'd need to execute it.
-    // For now, handle the common case where the coordinator plan IS the exchange leaf
-    // or a simple operator on top of exchange leaves.
-
     RelNode coordinatorPlan = plan.getCoordinatorPlan();
     List<Exchange> exchanges = plan.getExchanges();
 
@@ -226,10 +223,6 @@ public class DistributedExecutor {
     }
     Schema schema = new Schema(columns);
 
-    // Read rows from the first exchange (the common case for simple plans)
-    // For more complex coordinator plans (e.g., with additional operators above exchanges),
-    // we would need to execute the full coordinator pipeline. For Phase 1, we handle the
-    // case where exchanges contain the final merged results.
     // Pre-compute column types for type-aware conversion (e.g., timestamps, dates)
     List<RelDataTypeField> fields = rowType.getFieldList();
     ExprType[] columnTypes = new ExprType[fields.size()];
@@ -237,18 +230,19 @@ public class DistributedExecutor {
       columnTypes[i] = OpenSearchTypeFactory.convertRelDataTypeToExprType(fields.get(i).getType());
     }
 
+    // Read merged rows from all exchanges. Each exchange's scan() returns the fully merged
+    // result: ConcatExchange concatenates, MergeSortExchange merge-sorts with limit,
+    // MergeAggregateExchange groups and applies merge functions.
     List<ExprValue> resultValues = new ArrayList<>();
-    if (!exchanges.isEmpty()) {
-      Exchange primaryExchange = exchanges.get(0);
-      var iterator = primaryExchange.scan();
-      List<String> fieldNames = rowType.getFieldNames();
+    List<String> fieldNames = rowType.getFieldNames();
+    for (Exchange exchange : exchanges) {
+      var iterator = exchange.scan();
       while (iterator.hasNext()) {
         Object[] row = iterator.next();
         Map<String, ExprValue> rowMap = new LinkedHashMap<>();
         for (int i = 0; i < fieldNames.size() && i < row.length; i++) {
           Object value = coerceForType(row[i], columnTypes[i]);
-          rowMap.put(fieldNames.get(i),
-              ExprValueUtils.fromObjectValue(value, columnTypes[i]));
+          rowMap.put(fieldNames.get(i), ExprValueUtils.fromObjectValue(value, columnTypes[i]));
         }
         resultValues.add(ExprTupleValue.fromExprValueMap(rowMap));
       }

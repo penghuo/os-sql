@@ -38,6 +38,7 @@ import org.apache.logging.log4j.Logger;
 import org.locationtech.jts.geom.Point;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
@@ -224,16 +225,17 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     // DQE path: if distributed executor is configured, try to split and distribute the plan
     if (distributedExecutor != null) {
+      // Optimize before splitting so pushdown rules have been applied
+      RelNode optimizedRel = CalciteToolsHelper.optimize(rel, context);
       org.opensearch.sql.opensearch.dqe.DistributedPlan dqePlan =
-          org.opensearch.sql.opensearch.dqe.PlanSplitter.split(rel);
+          org.opensearch.sql.opensearch.dqe.PlanSplitter.split(optimizedRel);
       if (dqePlan != null) {
         java.sql.Connection dqeConnection = context.connection;
         client.schedule(() -> distributedExecutor.execute(dqePlan, dqeConnection, listener));
         return;
       }
       // dqePlan is null means no OpenSearch scan found or unsupported pattern — fall through
-      // to legacy path by design (PlanSplitter.split() returns null for system tables and
-      // patterns detected by containsUnsupportedForDQE)
+      // to legacy path with original rel so legacy path can optimize as it normally does
     }
 
     // Legacy JDBC path

@@ -69,6 +69,7 @@ import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.SqlSelectKeyword;
 import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.apache.calcite.sql.fun.SqlTrimFunction;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -621,10 +622,26 @@ public class ExtendedRelJson extends RelJson {
         sqlSyntax,
         operators,
         SqlNameMatchers.liberal());
+    // When the serialized JSON indicates the original operator was a UDF (has "class" field),
+    // prefer SqlUserDefinedFunction matches over plain SqlFunction/SqlBasicFunction matches.
+    // This handles name collisions (e.g., DATE, TIME, DATETIME) where both Calcite's
+    // SqlLibraryOperators and PPLBuiltinOperators define operators with the same name and kind.
+    // The library versions lack ImplementableFunction, causing Janino compilation failures
+    // ("No applicable constructor/method") during Interpreter-based shard execution.
+    boolean preferUdf = map.containsKey("class");
+    SqlOperator fallback = null;
     for (SqlOperator operator : operators) {
       if (operator.kind == sqlKind) {
-        return operator;
+        if (preferUdf && operator instanceof SqlUserDefinedFunction) {
+          return operator;
+        }
+        if (fallback == null) {
+          fallback = operator;
+        }
       }
+    }
+    if (fallback != null) {
+      return fallback;
     }
     String class_ = (String) map.get("class");
     if (class_ != null) {

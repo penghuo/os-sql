@@ -253,8 +253,19 @@ public class ShardCalciteRuntime {
     }
 
     /**
-     * Collect rows from an Enumerable result. For single-column results, Calcite optimizes the
-     * representation to scalar values (not Object[]), so we wrap them.
+     * Collect rows from an Enumerable result. Two producers feed into this method:
+     *
+     * <ul>
+     *   <li><b>Fast path</b> ({@link Scannable#scan()}): returns {@code Enumerable<Object>} where
+     *       single-column rows are scalar values and multi-column rows are {@code Object[]}.
+     *   <li><b>Interpreter path</b> ({@link Interpreter}): returns {@code Enumerable<Object[]>}
+     *       where every row is always {@code Object[]}, even for single-column results.
+     * </ul>
+     *
+     * <p>The {@code instanceof Object[]} check must come BEFORE the {@code columnCount == 1}
+     * check. Otherwise, an Interpreter single-column row like {@code Object[]{42L}} would be
+     * double-wrapped into {@code Object[]{Object[]{42L}}}, causing downstream "Object[] cannot
+     * be cast to Number/String" errors in exchange merge logic.
      */
     private List<Object[]> collectRows(Enumerable<?> enumerable, int columnCount) {
         List<Object[]> rows = new ArrayList<>();
@@ -263,13 +274,12 @@ public class ShardCalciteRuntime {
                 Object current = enumerator.current();
                 if (current == null) {
                     rows.add(new Object[columnCount]);
-                } else if (columnCount == 1) {
-                    // Single-column rows are optimized to scalar values by Calcite
-                    rows.add(new Object[] {current});
                 } else if (current instanceof Object[]) {
+                    // Interpreter always returns Object[] (even for single-column).
+                    // Fast path returns Object[] for multi-column rows.
                     rows.add((Object[]) current);
                 } else {
-                    // Unexpected type — wrap in single-element array
+                    // Fast path single-column scalar, or unexpected type — wrap in array
                     rows.add(new Object[] {current});
                 }
             }

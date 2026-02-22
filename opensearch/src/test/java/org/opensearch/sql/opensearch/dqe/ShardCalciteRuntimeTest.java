@@ -294,6 +294,42 @@ class ShardCalciteRuntimeTest {
     }
 
     @Test
+    @DisplayName("Interpreter single-column result (Object[]) is not double-wrapped")
+    void execute_interpreterSingleColumn_notDoubleWrapped() {
+        // The Interpreter always returns Object[] rows, even for single columns.
+        // Simulate a non-Scannable plan that goes through the Interpreter path by
+        // using a Scannable that returns Object[] for single-column (as Interpreter does).
+        RelDataType rowType =
+                OpenSearchTypeFactory.TYPE_FACTORY
+                        .builder()
+                        .add("cnt", SqlTypeName.BIGINT)
+                        .build();
+
+        // Simulate Interpreter-style output: Object[]{42L} for single-column
+        InterpreterStyleRelNode mockPlan = new InterpreterStyleRelNode(
+                cluster, rowType, new Object[][] {{42L}, {99L}});
+        String fakePlanJson = "{\"rels\":[{\"interpreter-single-col\":\"plan\"}]}";
+
+        try (MockedStatic<RelNodeSerializer> serializer = mockStatic(RelNodeSerializer.class)) {
+            serializer
+                    .when(() -> RelNodeSerializer.deserialize(eq(fakePlanJson), any(), any()))
+                    .thenReturn(mockPlan);
+
+            ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
+
+            assertFalse(result.hasError(), "Result should not have an error");
+            assertEquals(2, result.getRows().size());
+
+            // Critical: row[0] must be the scalar 42L, NOT an Object[]
+            Object firstCell = result.getRows().get(0)[0];
+            assertFalse(firstCell instanceof Object[],
+                    "Single-column cell must be scalar, not Object[]. Got: " + firstCell.getClass());
+            assertEquals(42L, firstCell);
+            assertEquals(99L, result.getRows().get(1)[0]);
+        }
+    }
+
+    @Test
     @DisplayName("createCluster produces a valid cluster with OpenSearchTypeFactory")
     void createCluster_returnsValidCluster() {
         RelOptCluster cluster = ShardCalciteRuntime.createCluster();
@@ -303,6 +339,64 @@ class ShardCalciteRuntimeTest {
         assertNotNull(cluster.getPlanner());
         assertEquals(
                 OpenSearchTypeFactory.TYPE_FACTORY, cluster.getRexBuilder().getTypeFactory());
+    }
+
+    /**
+     * A test-only RelNode that simulates Interpreter-style output: always returns Object[] rows
+     * even for single-column results. Used to verify that collectRows does not double-wrap them.
+     * Implements Scannable but returns Enumerable<Object[]> cast to Enumerable<Object>.
+     */
+    private static class InterpreterStyleRelNode extends LogicalValues implements Scannable {
+        private final Object[][] data;
+        private final RelDataType rowType;
+
+        InterpreterStyleRelNode(RelOptCluster cluster, RelDataType rowType, Object[][] data) {
+            super(
+                    cluster,
+                    cluster.traitSetOf(org.apache.calcite.plan.Convention.NONE),
+                    rowType,
+                    com.google.common.collect.ImmutableList.of());
+            this.rowType = rowType;
+            this.data = data;
+        }
+
+        @Override
+        public RelDataType deriveRowType() {
+            return rowType;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Enumerable<@Nullable Object> scan() {
+            // Return Object[] for EVERY row (including single-column), matching Interpreter behavior
+            return new AbstractEnumerable<>() {
+                @Override
+                public Enumerator<Object> enumerator() {
+                    return new Enumerator<>() {
+                        private int index = -1;
+
+                        @Override
+                        public Object current() {
+                            // Always return Object[], even for single-column (Interpreter style)
+                            return data[index];
+                        }
+
+                        @Override
+                        public boolean moveNext() {
+                            return data != null && ++index < data.length;
+                        }
+
+                        @Override
+                        public void reset() {
+                            index = -1;
+                        }
+
+                        @Override
+                        public void close() {}
+                    };
+                }
+            };
+        }
     }
 
     /**

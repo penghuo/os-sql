@@ -27,7 +27,12 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.Window;
+import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
+import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -80,6 +85,14 @@ public final class PlanSplitter {
         // Skip DQE for plans containing operators that require OpenSearch DSL pushdown
         // and cannot be executed in a distributed manner (e.g., nested aggregation).
         if (containsUnsupportedForDQE(plan)) {
+            return null;
+        }
+
+        // Skip DQE for plans containing custom UDF calls (e.g., date(), time(), datetime(),
+        // week()). The shard-side Interpreter cannot execute SqlUserDefinedFunction operators
+        // because they use ImplementableFunction/CallImplementor which requires code generation
+        // (EnumerableRel path). The Interpreter only handles standard Calcite built-in functions.
+        if (containsCustomUDFCalls(plan)) {
             return null;
         }
 
@@ -374,6 +387,73 @@ public final class PlanSplitter {
         return false;
     }
 
+    /**
+     * Checks whether the plan contains any {@link SqlUserDefinedFunction} or
+     * {@link SqlUserDefinedAggFunction} calls. The Calcite
+     * {@link org.apache.calcite.interpreter.Interpreter} cannot execute these because they require
+     * code generation via {@code ImplementableFunction/CallImplementor}.
+     *
+     * <p>Checks Project (projections), Filter (condition), Calc (program), and Aggregate (agg
+     * calls) for custom UDF/UDAF references. Plans with UDFs fall back to the non-DQE execution
+     * path which uses full Calcite code generation.
+     */
+    private static boolean containsCustomUDFCalls(RelNode node) {
+        if (node instanceof Project) {
+            for (RexNode rex : ((Project) node).getProjects()) {
+                if (containsUDFCall(rex)) {
+                    return true;
+                }
+            }
+        }
+        if (node instanceof Filter) {
+            if (containsUDFCall(((Filter) node).getCondition())) {
+                return true;
+            }
+        }
+        if (node instanceof Calc) {
+            Calc calc = (Calc) node;
+            for (RexNode rex : calc.getProgram().getExprList()) {
+                if (containsUDFCall(rex)) {
+                    return true;
+                }
+            }
+        }
+        if (node instanceof Aggregate) {
+            for (AggregateCall aggCall : ((Aggregate) node).getAggCallList()) {
+                if (aggCall.getAggregation() instanceof SqlUserDefinedAggFunction) {
+                    return true;
+                }
+            }
+        }
+        // Recurse into children
+        for (RelNode child : node.getInputs()) {
+            if (containsCustomUDFCalls(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks whether a single {@link RexNode} expression tree contains a call to a
+     * {@link SqlUserDefinedFunction}. Walks the expression tree recursively.
+     */
+    private static boolean containsUDFCall(RexNode rex) {
+        if (rex instanceof RexCall) {
+            RexCall call = (RexCall) rex;
+            if (call.getOperator() instanceof SqlUserDefinedFunction) {
+                return true;
+            }
+            // Recurse into operands
+            for (RexNode operand : call.getOperands()) {
+                if (containsUDFCall(operand)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** Checks whether the plan contains at least one OpenSearch scan (DSLScan or similar). */
     private static boolean containsOpenSearchScan(RelNode node) {
         if (node instanceof AbstractCalciteIndexScan) {
@@ -404,11 +484,11 @@ public final class PlanSplitter {
      * have operators above ExchangeLeaf nodes (e.g., Join, Project). Also implements
      * {@link Scannable} for direct invocation without code generation.
      */
-    static class ExchangeLeaf extends org.apache.calcite.rel.AbstractRelNode
+    public static class ExchangeLeaf extends org.apache.calcite.rel.AbstractRelNode
             implements EnumerableRel, Scannable {
         private final Exchange exchange;
 
-        ExchangeLeaf(
+        public ExchangeLeaf(
                 org.apache.calcite.plan.RelOptCluster cluster,
                 org.apache.calcite.plan.RelTraitSet traitSet,
                 Exchange exchange) {

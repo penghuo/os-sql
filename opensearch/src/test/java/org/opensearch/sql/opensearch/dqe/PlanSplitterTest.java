@@ -40,6 +40,7 @@ import org.apache.calcite.tools.RelBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.opensearch.dqe.exchange.ConcatExchange;
 import org.opensearch.sql.opensearch.dqe.exchange.MergeAggregateExchange;
 import org.opensearch.sql.opensearch.dqe.exchange.MergeSortExchange;
@@ -512,6 +513,67 @@ class PlanSplitterTest {
         RelNode coordinator = result.getCoordinatorPlan();
         assertInstanceOf(org.apache.calcite.rel.core.Sort.class, coordinator);
         assertInstanceOf(PlanSplitter.ExchangeLeaf.class, coordinator.getInputs().get(0));
+    }
+
+    @Test
+    @DisplayName("Project with SqlUserDefinedFunction (e.g. date()) causes DQE skip")
+    void projectWithUDF_skipsDQE() {
+        // Build a project that uses PPL's DATE() UDF
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .project(
+                                        relBuilder.call(
+                                                PPLBuiltinOperators.DATE,
+                                                relBuilder.field("b")))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        // Plans containing custom UDFs should fall back to non-DQE path
+        assertNull(result, "Plans with custom UDFs should skip DQE");
+    }
+
+    @Test
+    @DisplayName("Filter with SqlUserDefinedFunction causes DQE skip")
+    void filterWithUDF_skipsDQE() {
+        // Build a filter that uses PPL's DATE() UDF in its condition
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .filter(
+                                        relBuilder.call(
+                                                SqlStdOperatorTable.EQUALS,
+                                                relBuilder.call(
+                                                        PPLBuiltinOperators.DATE,
+                                                        relBuilder.field("b")),
+                                                relBuilder.literal("2024-01-01")))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        assertNull(result, "Plans with custom UDFs in filter should skip DQE");
+    }
+
+    @Test
+    @DisplayName("Plan with only standard Calcite functions does NOT skip DQE")
+    void planWithStandardFunctions_doesNotSkipDQE() {
+        // UPPER is a standard Calcite function, not a custom UDF
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .project(
+                                        relBuilder.call(
+                                                SqlStdOperatorTable.UPPER,
+                                                relBuilder.field("b")))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        assertNotNull(result, "Plans with only standard functions should use DQE");
     }
 
     @Test

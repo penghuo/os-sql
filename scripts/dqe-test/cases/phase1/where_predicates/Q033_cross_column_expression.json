@@ -1,0 +1,14 @@
+{
+  "id": "Q033",
+  "name": "cross_column_expression",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_int + count_long > 200",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,14 @@
+{
+  "id": "Q039",
+  "name": "unsigned_long_exceeding_bigint",
+  "query": "SELECT id FROM dqe_test_all_types WHERE big_number > 9223372036854775807",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

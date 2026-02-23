@@ -1,0 +1,21 @@
+{
+  "id": "Q063",
+  "name": "multi_column_sort",
+  "query": "SELECT id, status, count_int FROM dqe_test_all_types ORDER BY status ASC, count_int DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "count_int",
+        "type": "INTEGER"
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "Q076",
+  "name": "range_scan_across_shards",
+  "query": "SELECT id FROM dqe_test_sharded WHERE id BETWEEN 'id_00001' AND 'id_00100' ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

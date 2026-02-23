@@ -1,0 +1,14 @@
+{
+  "id": "Q008",
+  "name": "cast_to_string",
+  "query": "SELECT CAST(count_int AS VARCHAR) FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "_col0",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

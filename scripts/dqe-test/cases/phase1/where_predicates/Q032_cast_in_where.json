@@ -1,0 +1,14 @@
+{
+  "id": "Q032",
+  "name": "cast_in_where",
+  "query": "SELECT id FROM dqe_test_all_types WHERE CAST(count_int AS DOUBLE) > 10.5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

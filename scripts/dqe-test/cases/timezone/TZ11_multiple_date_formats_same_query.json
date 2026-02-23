@@ -1,0 +1,21 @@
+{
+  "id": "TZ11",
+  "name": "multiple_date_formats_same_query",
+  "query": "SELECT id, created_at, custom_date FROM dqe_test_all_types WHERE created_at IS NOT NULL AND custom_date IS NOT NULL ORDER BY created_at LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+      },
+      {
+        "name": "custom_date",
+        "type": "TIMESTAMP"
+      }
+    ]
+  }
+}

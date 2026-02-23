@@ -1,0 +1,14 @@
+{
+  "id": "C13",
+  "name": "cast_int_to_bigint",
+  "query": "SELECT CAST(count_int AS BIGINT) AS result FROM dqe_test_all_types WHERE count_int IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BIGINT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

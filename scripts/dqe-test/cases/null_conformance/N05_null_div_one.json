@@ -1,0 +1,14 @@
+{
+  "id": "N05",
+  "name": "null_div_one",
+  "query": "SELECT NULL / 1 AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "_note": "Result must be NULL for all NULL arithmetic"
+}

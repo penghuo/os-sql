@@ -1,0 +1,18 @@
+{
+  "id": "Q091",
+  "name": "case_as_conditional",
+  "query": "SELECT id, CASE WHEN is_active THEN 'yes' ELSE 'no' END AS active_label FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "active_label",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

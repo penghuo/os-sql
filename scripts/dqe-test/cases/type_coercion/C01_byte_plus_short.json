@@ -1,0 +1,14 @@
+{
+  "id": "C01",
+  "name": "byte_plus_short",
+  "query": "SELECT count_byte + count_short AS result FROM dqe_test_all_types WHERE count_byte IS NOT NULL AND count_short IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "SMALLINT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

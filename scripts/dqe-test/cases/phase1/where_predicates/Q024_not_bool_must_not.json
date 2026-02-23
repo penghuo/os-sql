@@ -1,0 +1,14 @@
+{
+  "id": "Q024",
+  "name": "not_bool_must_not",
+  "query": "SELECT id FROM dqe_test_all_types WHERE NOT is_active",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

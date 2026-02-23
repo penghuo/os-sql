@@ -1,0 +1,14 @@
+{
+  "id": "N04",
+  "name": "null_minus_null",
+  "query": "SELECT NULL - NULL AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "_note": "Result must be NULL for all NULL arithmetic"
+}

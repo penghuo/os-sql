@@ -1,0 +1,15 @@
+{
+  "id": "Q046",
+  "name": "float_real",
+  "query": "SELECT price_float FROM dqe_test_all_types WHERE price_float > 0.0 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "price_float",
+        "type": "REAL"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.001
+}

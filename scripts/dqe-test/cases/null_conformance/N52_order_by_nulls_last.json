@@ -1,0 +1,18 @@
+{
+  "id": "N52",
+  "name": "order_by_nulls_last",
+  "query": "SELECT id, int_val FROM dqe_test_nulls ORDER BY int_val ASC NULLS LAST LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "int_val",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "_note": "First rows must have non-NULL int_val"
+}

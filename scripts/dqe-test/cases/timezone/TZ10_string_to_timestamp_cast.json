@@ -1,0 +1,17 @@
+{
+  "id": "TZ10",
+  "name": "string_to_timestamp_cast",
+  "query": "SELECT id, CAST('2024-03-10T02:30:00Z' AS TIMESTAMP) AS parsed FROM dqe_test_all_types LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "parsed",
+        "type": "TIMESTAMP"
+      }
+    ]
+  }
+}

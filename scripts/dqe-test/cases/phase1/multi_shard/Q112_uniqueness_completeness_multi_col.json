@@ -1,0 +1,23 @@
+{
+  "id": "Q112",
+  "name": "uniqueness_completeness_multi_col",
+  "query": "SELECT id, category, amount FROM dqe_test_sharded ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "category",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "amount",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "float_tolerance": 0.01,
+  "_note": "Validator must check: row_count=500, all id values unique"
+}

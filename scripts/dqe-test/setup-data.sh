@@ -85,13 +85,29 @@ setup_index "dqe_test_employees" \
     "${MAPPINGS_DIR}/dqe_test_employees.json" \
     "${BULK_DIR}/dqe_test_employees.ndjson"
 
+setup_index "dqe_test_datatypes" \
+    "${MAPPINGS_DIR}/dqe_test_datatypes.json" \
+    "${BULK_DIR}/dqe_test_datatypes.ndjson"
+
+setup_index "dqe_test_all_types" \
+    "${MAPPINGS_DIR}/dqe_test_all_types.json" \
+    "${BULK_DIR}/dqe_test_all_types.ndjson"
+
 setup_index "dqe_test_nulls" \
     "${MAPPINGS_DIR}/dqe_test_nulls.json" \
     "${BULK_DIR}/dqe_test_nulls.ndjson"
 
-setup_index "dqe_test_datatypes" \
-    "${MAPPINGS_DIR}/dqe_test_datatypes.json" \
-    "${BULK_DIR}/dqe_test_datatypes.ndjson"
+setup_index "dqe_test_conflict_a" \
+    "${MAPPINGS_DIR}/dqe_test_conflict_a.json" \
+    "${BULK_DIR}/dqe_test_conflict_a.ndjson"
+
+setup_index "dqe_test_conflict_b" \
+    "${MAPPINGS_DIR}/dqe_test_conflict_b.json" \
+    "${BULK_DIR}/dqe_test_conflict_b.ndjson"
+
+setup_index "dqe_test_sharded" \
+    "${MAPPINGS_DIR}/dqe_test_sharded.json" \
+    "${BULK_DIR}/dqe_test_sharded.ndjson"
 
 echo "=== DQE Test Data Setup Complete ==="
 echo ""

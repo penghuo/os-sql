@@ -1,0 +1,14 @@
+{
+  "id": "N18",
+  "name": "null_ge_one",
+  "query": "SELECT (NULL >= 1) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ]
+  },
+  "_note": "Result must be NULL (three-valued logic)"
+}

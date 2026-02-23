@@ -1,0 +1,18 @@
+{
+  "id": "Q003",
+  "name": "column_aliases",
+  "query": "SELECT id AS identifier, name AS label FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "identifier",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "label",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,8 @@
+{
+  "id": "Q106",
+  "name": "unsupported_distinct",
+  "query": "SELECT DISTINCT status FROM dqe_test_all_types",
+  "error": {
+    "message_contains": "DISTINCT"
+  }
+}

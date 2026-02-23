@@ -1,0 +1,1000 @@
+{"index": {"_id": "1"}}
+{"id": "id_00001", "category": "cat_01", "amount": 1.99}
+{"index": {"_id": "2"}}
+{"id": "id_00002", "category": "cat_02", "amount": 3.99}
+{"index": {"_id": "3"}}
+{"id": "id_00003", "category": "cat_03", "amount": 5.99}
+{"index": {"_id": "4"}}
+{"id": "id_00004", "category": "cat_04", "amount": 7.99}
+{"index": {"_id": "5"}}
+{"id": "id_00005", "category": "cat_05", "amount": 9.99}
+{"index": {"_id": "6"}}
+{"id": "id_00006", "category": "cat_06", "amount": 11.99}
+{"index": {"_id": "7"}}
+{"id": "id_00007", "category": "cat_07", "amount": 13.99}
+{"index": {"_id": "8"}}
+{"id": "id_00008", "category": "cat_08", "amount": 15.99}
+{"index": {"_id": "9"}}
+{"id": "id_00009", "category": "cat_09", "amount": 17.99}
+{"index": {"_id": "10"}}
+{"id": "id_00010", "category": "cat_10", "amount": 19.99}
+{"index": {"_id": "11"}}
+{"id": "id_00011", "category": "cat_11", "amount": 21.99}
+{"index": {"_id": "12"}}
+{"id": "id_00012", "category": "cat_12", "amount": 23.99}
+{"index": {"_id": "13"}}
+{"id": "id_00013", "category": "cat_13", "amount": 25.99}
+{"index": {"_id": "14"}}
+{"id": "id_00014", "category": "cat_14", "amount": 27.99}
+{"index": {"_id": "15"}}
+{"id": "id_00015", "category": "cat_15", "amount": 29.99}
+{"index": {"_id": "16"}}
+{"id": "id_00016", "category": "cat_16", "amount": 31.99}
+{"index": {"_id": "17"}}
+{"id": "id_00017", "category": "cat_17", "amount": 33.99}
+{"index": {"_id": "18"}}
+{"id": "id_00018", "category": "cat_18", "amount": 35.99}
+{"index": {"_id": "19"}}
+{"id": "id_00019", "category": "cat_19", "amount": 37.99}
+{"index": {"_id": "20"}}
+{"id": "id_00020", "category": "cat_20", "amount": 39.99}
+{"index": {"_id": "21"}}
+{"id": "id_00021", "category": "cat_21", "amount": 41.99}
+{"index": {"_id": "22"}}
+{"id": "id_00022", "category": "cat_22", "amount": 43.99}
+{"index": {"_id": "23"}}
+{"id": "id_00023", "category": "cat_23", "amount": 45.99}
+{"index": {"_id": "24"}}
+{"id": "id_00024", "category": "cat_24", "amount": 47.99}
+{"index": {"_id": "25"}}
+{"id": "id_00025", "category": "cat_25", "amount": 49.99}
+{"index": {"_id": "26"}}
+{"id": "id_00026", "category": "cat_26", "amount": 51.99}
+{"index": {"_id": "27"}}
+{"id": "id_00027", "category": "cat_27", "amount": 53.99}
+{"index": {"_id": "28"}}
+{"id": "id_00028", "category": "cat_28", "amount": 55.99}
+{"index": {"_id": "29"}}
+{"id": "id_00029", "category": "cat_29", "amount": 57.99}
+{"index": {"_id": "30"}}
+{"id": "id_00030", "category": "cat_30", "amount": 59.99}
+{"index": {"_id": "31"}}
+{"id": "id_00031", "category": "cat_31", "amount": 61.99}
+{"index": {"_id": "32"}}
+{"id": "id_00032", "category": "cat_32", "amount": 63.99}
+{"index": {"_id": "33"}}
+{"id": "id_00033", "category": "cat_33", "amount": 65.99}
+{"index": {"_id": "34"}}
+{"id": "id_00034", "category": "cat_34", "amount": 67.99}
+{"index": {"_id": "35"}}
+{"id": "id_00035", "category": "cat_35", "amount": 69.99}
+{"index": {"_id": "36"}}
+{"id": "id_00036", "category": "cat_36", "amount": 71.99}
+{"index": {"_id": "37"}}
+{"id": "id_00037", "category": "cat_37", "amount": 73.99}
+{"index": {"_id": "38"}}
+{"id": "id_00038", "category": "cat_38", "amount": 75.99}
+{"index": {"_id": "39"}}
+{"id": "id_00039", "category": "cat_39", "amount": 77.99}
+{"index": {"_id": "40"}}
+{"id": "id_00040", "category": "cat_40", "amount": 79.99}
+{"index": {"_id": "41"}}
+{"id": "id_00041", "category": "cat_41", "amount": 81.99}
+{"index": {"_id": "42"}}
+{"id": "id_00042", "category": "cat_42", "amount": 83.99}
+{"index": {"_id": "43"}}
+{"id": "id_00043", "category": "cat_43", "amount": 85.99}
+{"index": {"_id": "44"}}
+{"id": "id_00044", "category": "cat_44", "amount": 87.99}
+{"index": {"_id": "45"}}
+{"id": "id_00045", "category": "cat_45", "amount": 89.99}
+{"index": {"_id": "46"}}
+{"id": "id_00046", "category": "cat_46", "amount": 91.99}
+{"index": {"_id": "47"}}
+{"id": "id_00047", "category": "cat_47", "amount": 93.99}
+{"index": {"_id": "48"}}
+{"id": "id_00048", "category": "cat_48", "amount": 95.99}
+{"index": {"_id": "49"}}
+{"id": "id_00049", "category": "cat_49", "amount": 97.99}
+{"index": {"_id": "50"}}
+{"id": "id_00050", "category": "cat_50", "amount": 99.99}
+{"index": {"_id": "51"}}
+{"id": "id_00051", "category": "cat_51", "amount": 101.99}
+{"index": {"_id": "52"}}
+{"id": "id_00052", "category": "cat_52", "amount": 103.99}
+{"index": {"_id": "53"}}
+{"id": "id_00053", "category": "cat_53", "amount": 105.99}
+{"index": {"_id": "54"}}
+{"id": "id_00054", "category": "cat_54", "amount": 107.99}
+{"index": {"_id": "55"}}
+{"id": "id_00055", "category": "cat_55", "amount": 109.99}
+{"index": {"_id": "56"}}
+{"id": "id_00056", "category": "cat_56", "amount": 111.99}
+{"index": {"_id": "57"}}
+{"id": "id_00057", "category": "cat_57", "amount": 113.99}
+{"index": {"_id": "58"}}
+{"id": "id_00058", "category": "cat_58", "amount": 115.99}
+{"index": {"_id": "59"}}
+{"id": "id_00059", "category": "cat_59", "amount": 117.99}
+{"index": {"_id": "60"}}
+{"id": "id_00060", "category": "cat_60", "amount": 119.99}
+{"index": {"_id": "61"}}
+{"id": "id_00061", "category": "cat_61", "amount": 121.99}
+{"index": {"_id": "62"}}
+{"id": "id_00062", "category": "cat_62", "amount": 123.99}
+{"index": {"_id": "63"}}
+{"id": "id_00063", "category": "cat_63", "amount": 125.99}
+{"index": {"_id": "64"}}
+{"id": "id_00064", "category": "cat_64", "amount": 127.99}
+{"index": {"_id": "65"}}
+{"id": "id_00065", "category": "cat_65", "amount": 129.99}
+{"index": {"_id": "66"}}
+{"id": "id_00066", "category": "cat_66", "amount": 131.99}
+{"index": {"_id": "67"}}
+{"id": "id_00067", "category": "cat_67", "amount": 133.99}
+{"index": {"_id": "68"}}
+{"id": "id_00068", "category": "cat_68", "amount": 135.99}
+{"index": {"_id": "69"}}
+{"id": "id_00069", "category": "cat_69", "amount": 137.99}
+{"index": {"_id": "70"}}
+{"id": "id_00070", "category": "cat_70", "amount": 139.99}
+{"index": {"_id": "71"}}
+{"id": "id_00071", "category": "cat_71", "amount": 141.99}
+{"index": {"_id": "72"}}
+{"id": "id_00072", "category": "cat_72", "amount": 143.99}
+{"index": {"_id": "73"}}
+{"id": "id_00073", "category": "cat_73", "amount": 145.99}
+{"index": {"_id": "74"}}
+{"id": "id_00074", "category": "cat_74", "amount": 147.99}
+{"index": {"_id": "75"}}
+{"id": "id_00075", "category": "cat_75", "amount": 149.99}
+{"index": {"_id": "76"}}
+{"id": "id_00076", "category": "cat_76", "amount": 151.99}
+{"index": {"_id": "77"}}
+{"id": "id_00077", "category": "cat_77", "amount": 153.99}
+{"index": {"_id": "78"}}
+{"id": "id_00078", "category": "cat_78", "amount": 155.99}
+{"index": {"_id": "79"}}
+{"id": "id_00079", "category": "cat_79", "amount": 157.99}
+{"index": {"_id": "80"}}
+{"id": "id_00080", "category": "cat_80", "amount": 159.99}
+{"index": {"_id": "81"}}
+{"id": "id_00081", "category": "cat_81", "amount": 161.99}
+{"index": {"_id": "82"}}
+{"id": "id_00082", "category": "cat_82", "amount": 163.99}
+{"index": {"_id": "83"}}
+{"id": "id_00083", "category": "cat_83", "amount": 165.99}
+{"index": {"_id": "84"}}
+{"id": "id_00084", "category": "cat_84", "amount": 167.99}
+{"index": {"_id": "85"}}
+{"id": "id_00085", "category": "cat_85", "amount": 169.99}
+{"index": {"_id": "86"}}
+{"id": "id_00086", "category": "cat_86", "amount": 171.99}
+{"index": {"_id": "87"}}
+{"id": "id_00087", "category": "cat_87", "amount": 173.99}
+{"index": {"_id": "88"}}
+{"id": "id_00088", "category": "cat_88", "amount": 175.99}
+{"index": {"_id": "89"}}
+{"id": "id_00089", "category": "cat_89", "amount": 177.99}
+{"index": {"_id": "90"}}
+{"id": "id_00090", "category": "cat_90", "amount": 179.99}
+{"index": {"_id": "91"}}
+{"id": "id_00091", "category": "cat_91", "amount": 181.99}
+{"index": {"_id": "92"}}
+{"id": "id_00092", "category": "cat_92", "amount": 183.99}
+{"index": {"_id": "93"}}
+{"id": "id_00093", "category": "cat_93", "amount": 185.99}
+{"index": {"_id": "94"}}
+{"id": "id_00094", "category": "cat_94", "amount": 187.99}
+{"index": {"_id": "95"}}
+{"id": "id_00095", "category": "cat_95", "amount": 189.99}
+{"index": {"_id": "96"}}
+{"id": "id_00096", "category": "cat_96", "amount": 191.99}
+{"index": {"_id": "97"}}
+{"id": "id_00097", "category": "cat_97", "amount": 193.99}
+{"index": {"_id": "98"}}
+{"id": "id_00098", "category": "cat_98", "amount": 195.99}
+{"index": {"_id": "99"}}
+{"id": "id_00099", "category": "cat_99", "amount": 197.99}
+{"index": {"_id": "100"}}
+{"id": "id_00100", "category": "cat_100", "amount": 199.99}
+{"index": {"_id": "101"}}
+{"id": "id_00101", "category": "cat_01", "amount": 201.99}
+{"index": {"_id": "102"}}
+{"id": "id_00102", "category": "cat_02", "amount": 203.99}
+{"index": {"_id": "103"}}
+{"id": "id_00103", "category": "cat_03", "amount": 205.99}
+{"index": {"_id": "104"}}
+{"id": "id_00104", "category": "cat_04", "amount": 207.99}
+{"index": {"_id": "105"}}
+{"id": "id_00105", "category": "cat_05", "amount": 209.99}
+{"index": {"_id": "106"}}
+{"id": "id_00106", "category": "cat_06", "amount": 211.99}
+{"index": {"_id": "107"}}
+{"id": "id_00107", "category": "cat_07", "amount": 213.99}
+{"index": {"_id": "108"}}
+{"id": "id_00108", "category": "cat_08", "amount": 215.99}
+{"index": {"_id": "109"}}
+{"id": "id_00109", "category": "cat_09", "amount": 217.99}
+{"index": {"_id": "110"}}
+{"id": "id_00110", "category": "cat_10", "amount": 219.99}
+{"index": {"_id": "111"}}
+{"id": "id_00111", "category": "cat_11", "amount": 221.99}
+{"index": {"_id": "112"}}
+{"id": "id_00112", "category": "cat_12", "amount": 223.99}
+{"index": {"_id": "113"}}
+{"id": "id_00113", "category": "cat_13", "amount": 225.99}
+{"index": {"_id": "114"}}
+{"id": "id_00114", "category": "cat_14", "amount": 227.99}
+{"index": {"_id": "115"}}
+{"id": "id_00115", "category": "cat_15", "amount": 229.99}
+{"index": {"_id": "116"}}
+{"id": "id_00116", "category": "cat_16", "amount": 231.99}
+{"index": {"_id": "117"}}
+{"id": "id_00117", "category": "cat_17", "amount": 233.99}
+{"index": {"_id": "118"}}
+{"id": "id_00118", "category": "cat_18", "amount": 235.99}
+{"index": {"_id": "119"}}
+{"id": "id_00119", "category": "cat_19", "amount": 237.99}
+{"index": {"_id": "120"}}
+{"id": "id_00120", "category": "cat_20", "amount": 239.99}
+{"index": {"_id": "121"}}
+{"id": "id_00121", "category": "cat_21", "amount": 241.99}
+{"index": {"_id": "122"}}
+{"id": "id_00122", "category": "cat_22", "amount": 243.99}
+{"index": {"_id": "123"}}
+{"id": "id_00123", "category": "cat_23", "amount": 245.99}
+{"index": {"_id": "124"}}
+{"id": "id_00124", "category": "cat_24", "amount": 247.99}
+{"index": {"_id": "125"}}
+{"id": "id_00125", "category": "cat_25", "amount": 249.99}
+{"index": {"_id": "126"}}
+{"id": "id_00126", "category": "cat_26", "amount": 251.99}
+{"index": {"_id": "127"}}
+{"id": "id_00127", "category": "cat_27", "amount": 253.99}
+{"index": {"_id": "128"}}
+{"id": "id_00128", "category": "cat_28", "amount": 255.99}
+{"index": {"_id": "129"}}
+{"id": "id_00129", "category": "cat_29", "amount": 257.99}
+{"index": {"_id": "130"}}
+{"id": "id_00130", "category": "cat_30", "amount": 259.99}
+{"index": {"_id": "131"}}
+{"id": "id_00131", "category": "cat_31", "amount": 261.99}
+{"index": {"_id": "132"}}
+{"id": "id_00132", "category": "cat_32", "amount": 263.99}
+{"index": {"_id": "133"}}
+{"id": "id_00133", "category": "cat_33", "amount": 265.99}
+{"index": {"_id": "134"}}
+{"id": "id_00134", "category": "cat_34", "amount": 267.99}
+{"index": {"_id": "135"}}
+{"id": "id_00135", "category": "cat_35", "amount": 269.99}
+{"index": {"_id": "136"}}
+{"id": "id_00136", "category": "cat_36", "amount": 271.99}
+{"index": {"_id": "137"}}
+{"id": "id_00137", "category": "cat_37", "amount": 273.99}
+{"index": {"_id": "138"}}
+{"id": "id_00138", "category": "cat_38", "amount": 275.99}
+{"index": {"_id": "139"}}
+{"id": "id_00139", "category": "cat_39", "amount": 277.99}
+{"index": {"_id": "140"}}
+{"id": "id_00140", "category": "cat_40", "amount": 279.99}
+{"index": {"_id": "141"}}
+{"id": "id_00141", "category": "cat_41", "amount": 281.99}
+{"index": {"_id": "142"}}
+{"id": "id_00142", "category": "cat_42", "amount": 283.99}
+{"index": {"_id": "143"}}
+{"id": "id_00143", "category": "cat_43", "amount": 285.99}
+{"index": {"_id": "144"}}
+{"id": "id_00144", "category": "cat_44", "amount": 287.99}
+{"index": {"_id": "145"}}
+{"id": "id_00145", "category": "cat_45", "amount": 289.99}
+{"index": {"_id": "146"}}
+{"id": "id_00146", "category": "cat_46", "amount": 291.99}
+{"index": {"_id": "147"}}
+{"id": "id_00147", "category": "cat_47", "amount": 293.99}
+{"index": {"_id": "148"}}
+{"id": "id_00148", "category": "cat_48", "amount": 295.99}
+{"index": {"_id": "149"}}
+{"id": "id_00149", "category": "cat_49", "amount": 297.99}
+{"index": {"_id": "150"}}
+{"id": "id_00150", "category": "cat_50", "amount": 299.99}
+{"index": {"_id": "151"}}
+{"id": "id_00151", "category": "cat_51", "amount": 301.99}
+{"index": {"_id": "152"}}
+{"id": "id_00152", "category": "cat_52", "amount": 303.99}
+{"index": {"_id": "153"}}
+{"id": "id_00153", "category": "cat_53", "amount": 305.99}
+{"index": {"_id": "154"}}
+{"id": "id_00154", "category": "cat_54", "amount": 307.99}
+{"index": {"_id": "155"}}
+{"id": "id_00155", "category": "cat_55", "amount": 309.99}
+{"index": {"_id": "156"}}
+{"id": "id_00156", "category": "cat_56", "amount": 311.99}
+{"index": {"_id": "157"}}
+{"id": "id_00157", "category": "cat_57", "amount": 313.99}
+{"index": {"_id": "158"}}
+{"id": "id_00158", "category": "cat_58", "amount": 315.99}
+{"index": {"_id": "159"}}
+{"id": "id_00159", "category": "cat_59", "amount": 317.99}
+{"index": {"_id": "160"}}
+{"id": "id_00160", "category": "cat_60", "amount": 319.99}
+{"index": {"_id": "161"}}
+{"id": "id_00161", "category": "cat_61", "amount": 321.99}
+{"index": {"_id": "162"}}
+{"id": "id_00162", "category": "cat_62", "amount": 323.99}
+{"index": {"_id": "163"}}
+{"id": "id_00163", "category": "cat_63", "amount": 325.99}
+{"index": {"_id": "164"}}
+{"id": "id_00164", "category": "cat_64", "amount": 327.99}
+{"index": {"_id": "165"}}
+{"id": "id_00165", "category": "cat_65", "amount": 329.99}
+{"index": {"_id": "166"}}
+{"id": "id_00166", "category": "cat_66", "amount": 331.99}
+{"index": {"_id": "167"}}
+{"id": "id_00167", "category": "cat_67", "amount": 333.99}
+{"index": {"_id": "168"}}
+{"id": "id_00168", "category": "cat_68", "amount": 335.99}
+{"index": {"_id": "169"}}
+{"id": "id_00169", "category": "cat_69", "amount": 337.99}
+{"index": {"_id": "170"}}
+{"id": "id_00170", "category": "cat_70", "amount": 339.99}
+{"index": {"_id": "171"}}
+{"id": "id_00171", "category": "cat_71", "amount": 341.99}
+{"index": {"_id": "172"}}
+{"id": "id_00172", "category": "cat_72", "amount": 343.99}
+{"index": {"_id": "173"}}
+{"id": "id_00173", "category": "cat_73", "amount": 345.99}
+{"index": {"_id": "174"}}
+{"id": "id_00174", "category": "cat_74", "amount": 347.99}
+{"index": {"_id": "175"}}
+{"id": "id_00175", "category": "cat_75", "amount": 349.99}
+{"index": {"_id": "176"}}
+{"id": "id_00176", "category": "cat_76", "amount": 351.99}
+{"index": {"_id": "177"}}
+{"id": "id_00177", "category": "cat_77", "amount": 353.99}
+{"index": {"_id": "178"}}
+{"id": "id_00178", "category": "cat_78", "amount": 355.99}
+{"index": {"_id": "179"}}
+{"id": "id_00179", "category": "cat_79", "amount": 357.99}
+{"index": {"_id": "180"}}
+{"id": "id_00180", "category": "cat_80", "amount": 359.99}
+{"index": {"_id": "181"}}
+{"id": "id_00181", "category": "cat_81", "amount": 361.99}
+{"index": {"_id": "182"}}
+{"id": "id_00182", "category": "cat_82", "amount": 363.99}
+{"index": {"_id": "183"}}
+{"id": "id_00183", "category": "cat_83", "amount": 365.99}
+{"index": {"_id": "184"}}
+{"id": "id_00184", "category": "cat_84", "amount": 367.99}
+{"index": {"_id": "185"}}
+{"id": "id_00185", "category": "cat_85", "amount": 369.99}
+{"index": {"_id": "186"}}
+{"id": "id_00186", "category": "cat_86", "amount": 371.99}
+{"index": {"_id": "187"}}
+{"id": "id_00187", "category": "cat_87", "amount": 373.99}
+{"index": {"_id": "188"}}
+{"id": "id_00188", "category": "cat_88", "amount": 375.99}
+{"index": {"_id": "189"}}
+{"id": "id_00189", "category": "cat_89", "amount": 377.99}
+{"index": {"_id": "190"}}
+{"id": "id_00190", "category": "cat_90", "amount": 379.99}
+{"index": {"_id": "191"}}
+{"id": "id_00191", "category": "cat_91", "amount": 381.99}
+{"index": {"_id": "192"}}
+{"id": "id_00192", "category": "cat_92", "amount": 383.99}
+{"index": {"_id": "193"}}
+{"id": "id_00193", "category": "cat_93", "amount": 385.99}
+{"index": {"_id": "194"}}
+{"id": "id_00194", "category": "cat_94", "amount": 387.99}
+{"index": {"_id": "195"}}
+{"id": "id_00195", "category": "cat_95", "amount": 389.99}
+{"index": {"_id": "196"}}
+{"id": "id_00196", "category": "cat_96", "amount": 391.99}
+{"index": {"_id": "197"}}
+{"id": "id_00197", "category": "cat_97", "amount": 393.99}
+{"index": {"_id": "198"}}
+{"id": "id_00198", "category": "cat_98", "amount": 395.99}
+{"index": {"_id": "199"}}
+{"id": "id_00199", "category": "cat_99", "amount": 397.99}
+{"index": {"_id": "200"}}
+{"id": "id_00200", "category": "cat_100", "amount": 399.99}
+{"index": {"_id": "201"}}
+{"id": "id_00201", "category": "cat_01", "amount": 401.99}
+{"index": {"_id": "202"}}
+{"id": "id_00202", "category": "cat_02", "amount": 403.99}
+{"index": {"_id": "203"}}
+{"id": "id_00203", "category": "cat_03", "amount": 405.99}
+{"index": {"_id": "204"}}
+{"id": "id_00204", "category": "cat_04", "amount": 407.99}
+{"index": {"_id": "205"}}
+{"id": "id_00205", "category": "cat_05", "amount": 409.99}
+{"index": {"_id": "206"}}
+{"id": "id_00206", "category": "cat_06", "amount": 411.99}
+{"index": {"_id": "207"}}
+{"id": "id_00207", "category": "cat_07", "amount": 413.99}
+{"index": {"_id": "208"}}
+{"id": "id_00208", "category": "cat_08", "amount": 415.99}
+{"index": {"_id": "209"}}
+{"id": "id_00209", "category": "cat_09", "amount": 417.99}
+{"index": {"_id": "210"}}
+{"id": "id_00210", "category": "cat_10", "amount": 419.99}
+{"index": {"_id": "211"}}
+{"id": "id_00211", "category": "cat_11", "amount": 421.99}
+{"index": {"_id": "212"}}
+{"id": "id_00212", "category": "cat_12", "amount": 423.99}
+{"index": {"_id": "213"}}
+{"id": "id_00213", "category": "cat_13", "amount": 425.99}
+{"index": {"_id": "214"}}
+{"id": "id_00214", "category": "cat_14", "amount": 427.99}
+{"index": {"_id": "215"}}
+{"id": "id_00215", "category": "cat_15", "amount": 429.99}
+{"index": {"_id": "216"}}
+{"id": "id_00216", "category": "cat_16", "amount": 431.99}
+{"index": {"_id": "217"}}
+{"id": "id_00217", "category": "cat_17", "amount": 433.99}
+{"index": {"_id": "218"}}
+{"id": "id_00218", "category": "cat_18", "amount": 435.99}
+{"index": {"_id": "219"}}
+{"id": "id_00219", "category": "cat_19", "amount": 437.99}
+{"index": {"_id": "220"}}
+{"id": "id_00220", "category": "cat_20", "amount": 439.99}
+{"index": {"_id": "221"}}
+{"id": "id_00221", "category": "cat_21", "amount": 441.99}
+{"index": {"_id": "222"}}
+{"id": "id_00222", "category": "cat_22", "amount": 443.99}
+{"index": {"_id": "223"}}
+{"id": "id_00223", "category": "cat_23", "amount": 445.99}
+{"index": {"_id": "224"}}
+{"id": "id_00224", "category": "cat_24", "amount": 447.99}
+{"index": {"_id": "225"}}
+{"id": "id_00225", "category": "cat_25", "amount": 449.99}
+{"index": {"_id": "226"}}
+{"id": "id_00226", "category": "cat_26", "amount": 451.99}
+{"index": {"_id": "227"}}
+{"id": "id_00227", "category": "cat_27", "amount": 453.99}
+{"index": {"_id": "228"}}
+{"id": "id_00228", "category": "cat_28", "amount": 455.99}
+{"index": {"_id": "229"}}
+{"id": "id_00229", "category": "cat_29", "amount": 457.99}
+{"index": {"_id": "230"}}
+{"id": "id_00230", "category": "cat_30", "amount": 459.99}
+{"index": {"_id": "231"}}
+{"id": "id_00231", "category": "cat_31", "amount": 461.99}
+{"index": {"_id": "232"}}
+{"id": "id_00232", "category": "cat_32", "amount": 463.99}
+{"index": {"_id": "233"}}
+{"id": "id_00233", "category": "cat_33", "amount": 465.99}
+{"index": {"_id": "234"}}
+{"id": "id_00234", "category": "cat_34", "amount": 467.99}
+{"index": {"_id": "235"}}
+{"id": "id_00235", "category": "cat_35", "amount": 469.99}
+{"index": {"_id": "236"}}
+{"id": "id_00236", "category": "cat_36", "amount": 471.99}
+{"index": {"_id": "237"}}
+{"id": "id_00237", "category": "cat_37", "amount": 473.99}
+{"index": {"_id": "238"}}
+{"id": "id_00238", "category": "cat_38", "amount": 475.99}
+{"index": {"_id": "239"}}
+{"id": "id_00239", "category": "cat_39", "amount": 477.99}
+{"index": {"_id": "240"}}
+{"id": "id_00240", "category": "cat_40", "amount": 479.99}
+{"index": {"_id": "241"}}
+{"id": "id_00241", "category": "cat_41", "amount": 481.99}
+{"index": {"_id": "242"}}
+{"id": "id_00242", "category": "cat_42", "amount": 483.99}
+{"index": {"_id": "243"}}
+{"id": "id_00243", "category": "cat_43", "amount": 485.99}
+{"index": {"_id": "244"}}
+{"id": "id_00244", "category": "cat_44", "amount": 487.99}
+{"index": {"_id": "245"}}
+{"id": "id_00245", "category": "cat_45", "amount": 489.99}
+{"index": {"_id": "246"}}
+{"id": "id_00246", "category": "cat_46", "amount": 491.99}
+{"index": {"_id": "247"}}
+{"id": "id_00247", "category": "cat_47", "amount": 493.99}
+{"index": {"_id": "248"}}
+{"id": "id_00248", "category": "cat_48", "amount": 495.99}
+{"index": {"_id": "249"}}
+{"id": "id_00249", "category": "cat_49", "amount": 497.99}
+{"index": {"_id": "250"}}
+{"id": "id_00250", "category": "cat_50", "amount": 499.99}
+{"index": {"_id": "251"}}
+{"id": "id_00251", "category": "cat_51", "amount": 501.99}
+{"index": {"_id": "252"}}
+{"id": "id_00252", "category": "cat_52", "amount": 503.99}
+{"index": {"_id": "253"}}
+{"id": "id_00253", "category": "cat_53", "amount": 505.99}
+{"index": {"_id": "254"}}
+{"id": "id_00254", "category": "cat_54", "amount": 507.99}
+{"index": {"_id": "255"}}
+{"id": "id_00255", "category": "cat_55", "amount": 509.99}
+{"index": {"_id": "256"}}
+{"id": "id_00256", "category": "cat_56", "amount": 511.99}
+{"index": {"_id": "257"}}
+{"id": "id_00257", "category": "cat_57", "amount": 513.99}
+{"index": {"_id": "258"}}
+{"id": "id_00258", "category": "cat_58", "amount": 515.99}
+{"index": {"_id": "259"}}
+{"id": "id_00259", "category": "cat_59", "amount": 517.99}
+{"index": {"_id": "260"}}
+{"id": "id_00260", "category": "cat_60", "amount": 519.99}
+{"index": {"_id": "261"}}
+{"id": "id_00261", "category": "cat_61", "amount": 521.99}
+{"index": {"_id": "262"}}
+{"id": "id_00262", "category": "cat_62", "amount": 523.99}
+{"index": {"_id": "263"}}
+{"id": "id_00263", "category": "cat_63", "amount": 525.99}
+{"index": {"_id": "264"}}
+{"id": "id_00264", "category": "cat_64", "amount": 527.99}
+{"index": {"_id": "265"}}
+{"id": "id_00265", "category": "cat_65", "amount": 529.99}
+{"index": {"_id": "266"}}
+{"id": "id_00266", "category": "cat_66", "amount": 531.99}
+{"index": {"_id": "267"}}
+{"id": "id_00267", "category": "cat_67", "amount": 533.99}
+{"index": {"_id": "268"}}
+{"id": "id_00268", "category": "cat_68", "amount": 535.99}
+{"index": {"_id": "269"}}
+{"id": "id_00269", "category": "cat_69", "amount": 537.99}
+{"index": {"_id": "270"}}
+{"id": "id_00270", "category": "cat_70", "amount": 539.99}
+{"index": {"_id": "271"}}
+{"id": "id_00271", "category": "cat_71", "amount": 541.99}
+{"index": {"_id": "272"}}
+{"id": "id_00272", "category": "cat_72", "amount": 543.99}
+{"index": {"_id": "273"}}
+{"id": "id_00273", "category": "cat_73", "amount": 545.99}
+{"index": {"_id": "274"}}
+{"id": "id_00274", "category": "cat_74", "amount": 547.99}
+{"index": {"_id": "275"}}
+{"id": "id_00275", "category": "cat_75", "amount": 549.99}
+{"index": {"_id": "276"}}
+{"id": "id_00276", "category": "cat_76", "amount": 551.99}
+{"index": {"_id": "277"}}
+{"id": "id_00277", "category": "cat_77", "amount": 553.99}
+{"index": {"_id": "278"}}
+{"id": "id_00278", "category": "cat_78", "amount": 555.99}
+{"index": {"_id": "279"}}
+{"id": "id_00279", "category": "cat_79", "amount": 557.99}
+{"index": {"_id": "280"}}
+{"id": "id_00280", "category": "cat_80", "amount": 559.99}
+{"index": {"_id": "281"}}
+{"id": "id_00281", "category": "cat_81", "amount": 561.99}
+{"index": {"_id": "282"}}
+{"id": "id_00282", "category": "cat_82", "amount": 563.99}
+{"index": {"_id": "283"}}
+{"id": "id_00283", "category": "cat_83", "amount": 565.99}
+{"index": {"_id": "284"}}
+{"id": "id_00284", "category": "cat_84", "amount": 567.99}
+{"index": {"_id": "285"}}
+{"id": "id_00285", "category": "cat_85", "amount": 569.99}
+{"index": {"_id": "286"}}
+{"id": "id_00286", "category": "cat_86", "amount": 571.99}
+{"index": {"_id": "287"}}
+{"id": "id_00287", "category": "cat_87", "amount": 573.99}
+{"index": {"_id": "288"}}
+{"id": "id_00288", "category": "cat_88", "amount": 575.99}
+{"index": {"_id": "289"}}
+{"id": "id_00289", "category": "cat_89", "amount": 577.99}
+{"index": {"_id": "290"}}
+{"id": "id_00290", "category": "cat_90", "amount": 579.99}
+{"index": {"_id": "291"}}
+{"id": "id_00291", "category": "cat_91", "amount": 581.99}
+{"index": {"_id": "292"}}
+{"id": "id_00292", "category": "cat_92", "amount": 583.99}
+{"index": {"_id": "293"}}
+{"id": "id_00293", "category": "cat_93", "amount": 585.99}
+{"index": {"_id": "294"}}
+{"id": "id_00294", "category": "cat_94", "amount": 587.99}
+{"index": {"_id": "295"}}
+{"id": "id_00295", "category": "cat_95", "amount": 589.99}
+{"index": {"_id": "296"}}
+{"id": "id_00296", "category": "cat_96", "amount": 591.99}
+{"index": {"_id": "297"}}
+{"id": "id_00297", "category": "cat_97", "amount": 593.99}
+{"index": {"_id": "298"}}
+{"id": "id_00298", "category": "cat_98", "amount": 595.99}
+{"index": {"_id": "299"}}
+{"id": "id_00299", "category": "cat_99", "amount": 597.99}
+{"index": {"_id": "300"}}
+{"id": "id_00300", "category": "cat_100", "amount": 599.99}
+{"index": {"_id": "301"}}
+{"id": "id_00301", "category": "cat_01", "amount": 601.99}
+{"index": {"_id": "302"}}
+{"id": "id_00302", "category": "cat_02", "amount": 603.99}
+{"index": {"_id": "303"}}
+{"id": "id_00303", "category": "cat_03", "amount": 605.99}
+{"index": {"_id": "304"}}
+{"id": "id_00304", "category": "cat_04", "amount": 607.99}
+{"index": {"_id": "305"}}
+{"id": "id_00305", "category": "cat_05", "amount": 609.99}
+{"index": {"_id": "306"}}
+{"id": "id_00306", "category": "cat_06", "amount": 611.99}
+{"index": {"_id": "307"}}
+{"id": "id_00307", "category": "cat_07", "amount": 613.99}
+{"index": {"_id": "308"}}
+{"id": "id_00308", "category": "cat_08", "amount": 615.99}
+{"index": {"_id": "309"}}
+{"id": "id_00309", "category": "cat_09", "amount": 617.99}
+{"index": {"_id": "310"}}
+{"id": "id_00310", "category": "cat_10", "amount": 619.99}
+{"index": {"_id": "311"}}
+{"id": "id_00311", "category": "cat_11", "amount": 621.99}
+{"index": {"_id": "312"}}
+{"id": "id_00312", "category": "cat_12", "amount": 623.99}
+{"index": {"_id": "313"}}
+{"id": "id_00313", "category": "cat_13", "amount": 625.99}
+{"index": {"_id": "314"}}
+{"id": "id_00314", "category": "cat_14", "amount": 627.99}
+{"index": {"_id": "315"}}
+{"id": "id_00315", "category": "cat_15", "amount": 629.99}
+{"index": {"_id": "316"}}
+{"id": "id_00316", "category": "cat_16", "amount": 631.99}
+{"index": {"_id": "317"}}
+{"id": "id_00317", "category": "cat_17", "amount": 633.99}
+{"index": {"_id": "318"}}
+{"id": "id_00318", "category": "cat_18", "amount": 635.99}
+{"index": {"_id": "319"}}
+{"id": "id_00319", "category": "cat_19", "amount": 637.99}
+{"index": {"_id": "320"}}
+{"id": "id_00320", "category": "cat_20", "amount": 639.99}
+{"index": {"_id": "321"}}
+{"id": "id_00321", "category": "cat_21", "amount": 641.99}
+{"index": {"_id": "322"}}
+{"id": "id_00322", "category": "cat_22", "amount": 643.99}
+{"index": {"_id": "323"}}
+{"id": "id_00323", "category": "cat_23", "amount": 645.99}
+{"index": {"_id": "324"}}
+{"id": "id_00324", "category": "cat_24", "amount": 647.99}
+{"index": {"_id": "325"}}
+{"id": "id_00325", "category": "cat_25", "amount": 649.99}
+{"index": {"_id": "326"}}
+{"id": "id_00326", "category": "cat_26", "amount": 651.99}
+{"index": {"_id": "327"}}
+{"id": "id_00327", "category": "cat_27", "amount": 653.99}
+{"index": {"_id": "328"}}
+{"id": "id_00328", "category": "cat_28", "amount": 655.99}
+{"index": {"_id": "329"}}
+{"id": "id_00329", "category": "cat_29", "amount": 657.99}
+{"index": {"_id": "330"}}
+{"id": "id_00330", "category": "cat_30", "amount": 659.99}
+{"index": {"_id": "331"}}
+{"id": "id_00331", "category": "cat_31", "amount": 661.99}
+{"index": {"_id": "332"}}
+{"id": "id_00332", "category": "cat_32", "amount": 663.99}
+{"index": {"_id": "333"}}
+{"id": "id_00333", "category": "cat_33", "amount": 665.99}
+{"index": {"_id": "334"}}
+{"id": "id_00334", "category": "cat_34", "amount": 667.99}
+{"index": {"_id": "335"}}
+{"id": "id_00335", "category": "cat_35", "amount": 669.99}
+{"index": {"_id": "336"}}
+{"id": "id_00336", "category": "cat_36", "amount": 671.99}
+{"index": {"_id": "337"}}
+{"id": "id_00337", "category": "cat_37", "amount": 673.99}
+{"index": {"_id": "338"}}
+{"id": "id_00338", "category": "cat_38", "amount": 675.99}
+{"index": {"_id": "339"}}
+{"id": "id_00339", "category": "cat_39", "amount": 677.99}
+{"index": {"_id": "340"}}
+{"id": "id_00340", "category": "cat_40", "amount": 679.99}
+{"index": {"_id": "341"}}
+{"id": "id_00341", "category": "cat_41", "amount": 681.99}
+{"index": {"_id": "342"}}
+{"id": "id_00342", "category": "cat_42", "amount": 683.99}
+{"index": {"_id": "343"}}
+{"id": "id_00343", "category": "cat_43", "amount": 685.99}
+{"index": {"_id": "344"}}
+{"id": "id_00344", "category": "cat_44", "amount": 687.99}
+{"index": {"_id": "345"}}
+{"id": "id_00345", "category": "cat_45", "amount": 689.99}
+{"index": {"_id": "346"}}
+{"id": "id_00346", "category": "cat_46", "amount": 691.99}
+{"index": {"_id": "347"}}
+{"id": "id_00347", "category": "cat_47", "amount": 693.99}
+{"index": {"_id": "348"}}
+{"id": "id_00348", "category": "cat_48", "amount": 695.99}
+{"index": {"_id": "349"}}
+{"id": "id_00349", "category": "cat_49", "amount": 697.99}
+{"index": {"_id": "350"}}
+{"id": "id_00350", "category": "cat_50", "amount": 699.99}
+{"index": {"_id": "351"}}
+{"id": "id_00351", "category": "cat_51", "amount": 701.99}
+{"index": {"_id": "352"}}
+{"id": "id_00352", "category": "cat_52", "amount": 703.99}
+{"index": {"_id": "353"}}
+{"id": "id_00353", "category": "cat_53", "amount": 705.99}
+{"index": {"_id": "354"}}
+{"id": "id_00354", "category": "cat_54", "amount": 707.99}
+{"index": {"_id": "355"}}
+{"id": "id_00355", "category": "cat_55", "amount": 709.99}
+{"index": {"_id": "356"}}
+{"id": "id_00356", "category": "cat_56", "amount": 711.99}
+{"index": {"_id": "357"}}
+{"id": "id_00357", "category": "cat_57", "amount": 713.99}
+{"index": {"_id": "358"}}
+{"id": "id_00358", "category": "cat_58", "amount": 715.99}
+{"index": {"_id": "359"}}
+{"id": "id_00359", "category": "cat_59", "amount": 717.99}
+{"index": {"_id": "360"}}
+{"id": "id_00360", "category": "cat_60", "amount": 719.99}
+{"index": {"_id": "361"}}
+{"id": "id_00361", "category": "cat_61", "amount": 721.99}
+{"index": {"_id": "362"}}
+{"id": "id_00362", "category": "cat_62", "amount": 723.99}
+{"index": {"_id": "363"}}
+{"id": "id_00363", "category": "cat_63", "amount": 725.99}
+{"index": {"_id": "364"}}
+{"id": "id_00364", "category": "cat_64", "amount": 727.99}
+{"index": {"_id": "365"}}
+{"id": "id_00365", "category": "cat_65", "amount": 729.99}
+{"index": {"_id": "366"}}
+{"id": "id_00366", "category": "cat_66", "amount": 731.99}
+{"index": {"_id": "367"}}
+{"id": "id_00367", "category": "cat_67", "amount": 733.99}
+{"index": {"_id": "368"}}
+{"id": "id_00368", "category": "cat_68", "amount": 735.99}
+{"index": {"_id": "369"}}
+{"id": "id_00369", "category": "cat_69", "amount": 737.99}
+{"index": {"_id": "370"}}
+{"id": "id_00370", "category": "cat_70", "amount": 739.99}
+{"index": {"_id": "371"}}
+{"id": "id_00371", "category": "cat_71", "amount": 741.99}
+{"index": {"_id": "372"}}
+{"id": "id_00372", "category": "cat_72", "amount": 743.99}
+{"index": {"_id": "373"}}
+{"id": "id_00373", "category": "cat_73", "amount": 745.99}
+{"index": {"_id": "374"}}
+{"id": "id_00374", "category": "cat_74", "amount": 747.99}
+{"index": {"_id": "375"}}
+{"id": "id_00375", "category": "cat_75", "amount": 749.99}
+{"index": {"_id": "376"}}
+{"id": "id_00376", "category": "cat_76", "amount": 751.99}
+{"index": {"_id": "377"}}
+{"id": "id_00377", "category": "cat_77", "amount": 753.99}
+{"index": {"_id": "378"}}
+{"id": "id_00378", "category": "cat_78", "amount": 755.99}
+{"index": {"_id": "379"}}
+{"id": "id_00379", "category": "cat_79", "amount": 757.99}
+{"index": {"_id": "380"}}
+{"id": "id_00380", "category": "cat_80", "amount": 759.99}
+{"index": {"_id": "381"}}
+{"id": "id_00381", "category": "cat_81", "amount": 761.99}
+{"index": {"_id": "382"}}
+{"id": "id_00382", "category": "cat_82", "amount": 763.99}
+{"index": {"_id": "383"}}
+{"id": "id_00383", "category": "cat_83", "amount": 765.99}
+{"index": {"_id": "384"}}
+{"id": "id_00384", "category": "cat_84", "amount": 767.99}
+{"index": {"_id": "385"}}
+{"id": "id_00385", "category": "cat_85", "amount": 769.99}
+{"index": {"_id": "386"}}
+{"id": "id_00386", "category": "cat_86", "amount": 771.99}
+{"index": {"_id": "387"}}
+{"id": "id_00387", "category": "cat_87", "amount": 773.99}
+{"index": {"_id": "388"}}
+{"id": "id_00388", "category": "cat_88", "amount": 775.99}
+{"index": {"_id": "389"}}
+{"id": "id_00389", "category": "cat_89", "amount": 777.99}
+{"index": {"_id": "390"}}
+{"id": "id_00390", "category": "cat_90", "amount": 779.99}
+{"index": {"_id": "391"}}
+{"id": "id_00391", "category": "cat_91", "amount": 781.99}
+{"index": {"_id": "392"}}
+{"id": "id_00392", "category": "cat_92", "amount": 783.99}
+{"index": {"_id": "393"}}
+{"id": "id_00393", "category": "cat_93", "amount": 785.99}
+{"index": {"_id": "394"}}
+{"id": "id_00394", "category": "cat_94", "amount": 787.99}
+{"index": {"_id": "395"}}
+{"id": "id_00395", "category": "cat_95", "amount": 789.99}
+{"index": {"_id": "396"}}
+{"id": "id_00396", "category": "cat_96", "amount": 791.99}
+{"index": {"_id": "397"}}
+{"id": "id_00397", "category": "cat_97", "amount": 793.99}
+{"index": {"_id": "398"}}
+{"id": "id_00398", "category": "cat_98", "amount": 795.99}
+{"index": {"_id": "399"}}
+{"id": "id_00399", "category": "cat_99", "amount": 797.99}
+{"index": {"_id": "400"}}
+{"id": "id_00400", "category": "cat_100", "amount": 799.99}
+{"index": {"_id": "401"}}
+{"id": "id_00401", "category": "cat_01", "amount": 801.99}
+{"index": {"_id": "402"}}
+{"id": "id_00402", "category": "cat_02", "amount": 803.99}
+{"index": {"_id": "403"}}
+{"id": "id_00403", "category": "cat_03", "amount": 805.99}
+{"index": {"_id": "404"}}
+{"id": "id_00404", "category": "cat_04", "amount": 807.99}
+{"index": {"_id": "405"}}
+{"id": "id_00405", "category": "cat_05", "amount": 809.99}
+{"index": {"_id": "406"}}
+{"id": "id_00406", "category": "cat_06", "amount": 811.99}
+{"index": {"_id": "407"}}
+{"id": "id_00407", "category": "cat_07", "amount": 813.99}
+{"index": {"_id": "408"}}
+{"id": "id_00408", "category": "cat_08", "amount": 815.99}
+{"index": {"_id": "409"}}
+{"id": "id_00409", "category": "cat_09", "amount": 817.99}
+{"index": {"_id": "410"}}
+{"id": "id_00410", "category": "cat_10", "amount": 819.99}
+{"index": {"_id": "411"}}
+{"id": "id_00411", "category": "cat_11", "amount": 821.99}
+{"index": {"_id": "412"}}
+{"id": "id_00412", "category": "cat_12", "amount": 823.99}
+{"index": {"_id": "413"}}
+{"id": "id_00413", "category": "cat_13", "amount": 825.99}
+{"index": {"_id": "414"}}
+{"id": "id_00414", "category": "cat_14", "amount": 827.99}
+{"index": {"_id": "415"}}
+{"id": "id_00415", "category": "cat_15", "amount": 829.99}
+{"index": {"_id": "416"}}
+{"id": "id_00416", "category": "cat_16", "amount": 831.99}
+{"index": {"_id": "417"}}
+{"id": "id_00417", "category": "cat_17", "amount": 833.99}
+{"index": {"_id": "418"}}
+{"id": "id_00418", "category": "cat_18", "amount": 835.99}
+{"index": {"_id": "419"}}
+{"id": "id_00419", "category": "cat_19", "amount": 837.99}
+{"index": {"_id": "420"}}
+{"id": "id_00420", "category": "cat_20", "amount": 839.99}
+{"index": {"_id": "421"}}
+{"id": "id_00421", "category": "cat_21", "amount": 841.99}
+{"index": {"_id": "422"}}
+{"id": "id_00422", "category": "cat_22", "amount": 843.99}
+{"index": {"_id": "423"}}
+{"id": "id_00423", "category": "cat_23", "amount": 845.99}
+{"index": {"_id": "424"}}
+{"id": "id_00424", "category": "cat_24", "amount": 847.99}
+{"index": {"_id": "425"}}
+{"id": "id_00425", "category": "cat_25", "amount": 849.99}
+{"index": {"_id": "426"}}
+{"id": "id_00426", "category": "cat_26", "amount": 851.99}
+{"index": {"_id": "427"}}
+{"id": "id_00427", "category": "cat_27", "amount": 853.99}
+{"index": {"_id": "428"}}
+{"id": "id_00428", "category": "cat_28", "amount": 855.99}
+{"index": {"_id": "429"}}
+{"id": "id_00429", "category": "cat_29", "amount": 857.99}
+{"index": {"_id": "430"}}
+{"id": "id_00430", "category": "cat_30", "amount": 859.99}
+{"index": {"_id": "431"}}
+{"id": "id_00431", "category": "cat_31", "amount": 861.99}
+{"index": {"_id": "432"}}
+{"id": "id_00432", "category": "cat_32", "amount": 863.99}
+{"index": {"_id": "433"}}
+{"id": "id_00433", "category": "cat_33", "amount": 865.99}
+{"index": {"_id": "434"}}
+{"id": "id_00434", "category": "cat_34", "amount": 867.99}
+{"index": {"_id": "435"}}
+{"id": "id_00435", "category": "cat_35", "amount": 869.99}
+{"index": {"_id": "436"}}
+{"id": "id_00436", "category": "cat_36", "amount": 871.99}
+{"index": {"_id": "437"}}
+{"id": "id_00437", "category": "cat_37", "amount": 873.99}
+{"index": {"_id": "438"}}
+{"id": "id_00438", "category": "cat_38", "amount": 875.99}
+{"index": {"_id": "439"}}
+{"id": "id_00439", "category": "cat_39", "amount": 877.99}
+{"index": {"_id": "440"}}
+{"id": "id_00440", "category": "cat_40", "amount": 879.99}
+{"index": {"_id": "441"}}
+{"id": "id_00441", "category": "cat_41", "amount": 881.99}
+{"index": {"_id": "442"}}
+{"id": "id_00442", "category": "cat_42", "amount": 883.99}
+{"index": {"_id": "443"}}
+{"id": "id_00443", "category": "cat_43", "amount": 885.99}
+{"index": {"_id": "444"}}
+{"id": "id_00444", "category": "cat_44", "amount": 887.99}
+{"index": {"_id": "445"}}
+{"id": "id_00445", "category": "cat_45", "amount": 889.99}
+{"index": {"_id": "446"}}
+{"id": "id_00446", "category": "cat_46", "amount": 891.99}
+{"index": {"_id": "447"}}
+{"id": "id_00447", "category": "cat_47", "amount": 893.99}
+{"index": {"_id": "448"}}
+{"id": "id_00448", "category": "cat_48", "amount": 895.99}
+{"index": {"_id": "449"}}
+{"id": "id_00449", "category": "cat_49", "amount": 897.99}
+{"index": {"_id": "450"}}
+{"id": "id_00450", "category": "cat_50", "amount": 899.99}
+{"index": {"_id": "451"}}
+{"id": "id_00451", "category": "cat_51", "amount": 901.99}
+{"index": {"_id": "452"}}
+{"id": "id_00452", "category": "cat_52", "amount": 903.99}
+{"index": {"_id": "453"}}
+{"id": "id_00453", "category": "cat_53", "amount": 905.99}
+{"index": {"_id": "454"}}
+{"id": "id_00454", "category": "cat_54", "amount": 907.99}
+{"index": {"_id": "455"}}
+{"id": "id_00455", "category": "cat_55", "amount": 909.99}
+{"index": {"_id": "456"}}
+{"id": "id_00456", "category": "cat_56", "amount": 911.99}
+{"index": {"_id": "457"}}
+{"id": "id_00457", "category": "cat_57", "amount": 913.99}
+{"index": {"_id": "458"}}
+{"id": "id_00458", "category": "cat_58", "amount": 915.99}
+{"index": {"_id": "459"}}
+{"id": "id_00459", "category": "cat_59", "amount": 917.99}
+{"index": {"_id": "460"}}
+{"id": "id_00460", "category": "cat_60", "amount": 919.99}
+{"index": {"_id": "461"}}
+{"id": "id_00461", "category": "cat_61", "amount": 921.99}
+{"index": {"_id": "462"}}
+{"id": "id_00462", "category": "cat_62", "amount": 923.99}
+{"index": {"_id": "463"}}
+{"id": "id_00463", "category": "cat_63", "amount": 925.99}
+{"index": {"_id": "464"}}
+{"id": "id_00464", "category": "cat_64", "amount": 927.99}
+{"index": {"_id": "465"}}
+{"id": "id_00465", "category": "cat_65", "amount": 929.99}
+{"index": {"_id": "466"}}
+{"id": "id_00466", "category": "cat_66", "amount": 931.99}
+{"index": {"_id": "467"}}
+{"id": "id_00467", "category": "cat_67", "amount": 933.99}
+{"index": {"_id": "468"}}
+{"id": "id_00468", "category": "cat_68", "amount": 935.99}
+{"index": {"_id": "469"}}
+{"id": "id_00469", "category": "cat_69", "amount": 937.99}
+{"index": {"_id": "470"}}
+{"id": "id_00470", "category": "cat_70", "amount": 939.99}
+{"index": {"_id": "471"}}
+{"id": "id_00471", "category": "cat_71", "amount": 941.99}
+{"index": {"_id": "472"}}
+{"id": "id_00472", "category": "cat_72", "amount": 943.99}
+{"index": {"_id": "473"}}
+{"id": "id_00473", "category": "cat_73", "amount": 945.99}
+{"index": {"_id": "474"}}
+{"id": "id_00474", "category": "cat_74", "amount": 947.99}
+{"index": {"_id": "475"}}
+{"id": "id_00475", "category": "cat_75", "amount": 949.99}
+{"index": {"_id": "476"}}
+{"id": "id_00476", "category": "cat_76", "amount": 951.99}
+{"index": {"_id": "477"}}
+{"id": "id_00477", "category": "cat_77", "amount": 953.99}
+{"index": {"_id": "478"}}
+{"id": "id_00478", "category": "cat_78", "amount": 955.99}
+{"index": {"_id": "479"}}
+{"id": "id_00479", "category": "cat_79", "amount": 957.99}
+{"index": {"_id": "480"}}
+{"id": "id_00480", "category": "cat_80", "amount": 959.99}
+{"index": {"_id": "481"}}
+{"id": "id_00481", "category": "cat_81", "amount": 961.99}
+{"index": {"_id": "482"}}
+{"id": "id_00482", "category": "cat_82", "amount": 963.99}
+{"index": {"_id": "483"}}
+{"id": "id_00483", "category": "cat_83", "amount": 965.99}
+{"index": {"_id": "484"}}
+{"id": "id_00484", "category": "cat_84", "amount": 967.99}
+{"index": {"_id": "485"}}
+{"id": "id_00485", "category": "cat_85", "amount": 969.99}
+{"index": {"_id": "486"}}
+{"id": "id_00486", "category": "cat_86", "amount": 971.99}
+{"index": {"_id": "487"}}
+{"id": "id_00487", "category": "cat_87", "amount": 973.99}
+{"index": {"_id": "488"}}
+{"id": "id_00488", "category": "cat_88", "amount": 975.99}
+{"index": {"_id": "489"}}
+{"id": "id_00489", "category": "cat_89", "amount": 977.99}
+{"index": {"_id": "490"}}
+{"id": "id_00490", "category": "cat_90", "amount": 979.99}
+{"index": {"_id": "491"}}
+{"id": "id_00491", "category": "cat_91", "amount": 981.99}
+{"index": {"_id": "492"}}
+{"id": "id_00492", "category": "cat_92", "amount": 983.99}
+{"index": {"_id": "493"}}
+{"id": "id_00493", "category": "cat_93", "amount": 985.99}
+{"index": {"_id": "494"}}
+{"id": "id_00494", "category": "cat_94", "amount": 987.99}
+{"index": {"_id": "495"}}
+{"id": "id_00495", "category": "cat_95", "amount": 989.99}
+{"index": {"_id": "496"}}
+{"id": "id_00496", "category": "cat_96", "amount": 991.99}
+{"index": {"_id": "497"}}
+{"id": "id_00497", "category": "cat_97", "amount": 993.99}
+{"index": {"_id": "498"}}
+{"id": "id_00498", "category": "cat_98", "amount": 995.99}
+{"index": {"_id": "499"}}
+{"id": "id_00499", "category": "cat_99", "amount": 997.99}
+{"index": {"_id": "500"}}
+{"id": "id_00500", "category": "cat_100", "amount": 999.99}

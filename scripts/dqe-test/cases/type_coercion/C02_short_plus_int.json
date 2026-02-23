@@ -1,0 +1,14 @@
+{
+  "id": "C02",
+  "name": "short_plus_int",
+  "query": "SELECT count_short + count_int AS result FROM dqe_test_all_types WHERE count_short IS NOT NULL AND count_int IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,14 @@
+{
+  "id": "TZ02",
+  "name": "date_nanos_precision",
+  "query": "SELECT precise_time FROM dqe_test_all_types WHERE precise_time IS NOT NULL LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "precise_time",
+        "type": "TIMESTAMP"
+      }
+    ]
+  },
+  "_note": "TIMESTAMP(9) with nanosecond precision"
+}

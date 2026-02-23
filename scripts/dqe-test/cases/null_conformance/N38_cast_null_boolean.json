@@ -1,0 +1,18 @@
+{
+  "id": "N38",
+  "name": "cast_null_boolean",
+  "query": "SELECT CAST(NULL AS BOOLEAN) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

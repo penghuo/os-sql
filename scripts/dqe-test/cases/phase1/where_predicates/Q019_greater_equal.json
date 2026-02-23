@@ -1,0 +1,14 @@
+{
+  "id": "Q019",
+  "name": "greater_equal",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_int >= 100",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

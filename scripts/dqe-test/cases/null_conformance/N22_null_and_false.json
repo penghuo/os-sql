@@ -1,0 +1,18 @@
+{
+  "id": "N22",
+  "name": "null_and_false",
+  "query": "SELECT (NULL AND FALSE) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ],
+    "data": [
+      [
+        false
+      ]
+    ]
+  }
+}

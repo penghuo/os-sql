@@ -1,0 +1,14 @@
+{
+  "id": "TZ03",
+  "name": "custom_date_format",
+  "query": "SELECT custom_date FROM dqe_test_all_types WHERE custom_date IS NOT NULL LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "custom_date",
+        "type": "TIMESTAMP"
+      }
+    ]
+  },
+  "_note": "Custom format yyyy/MM/dd HH:mm:ss parsed correctly"
+}

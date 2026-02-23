@@ -1,0 +1,18 @@
+{
+  "id": "N39",
+  "name": "cast_null_double",
+  "query": "SELECT CAST(NULL AS DOUBLE) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "DOUBLE"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

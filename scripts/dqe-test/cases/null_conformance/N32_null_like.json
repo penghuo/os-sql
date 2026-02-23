@@ -1,0 +1,14 @@
+{
+  "id": "N32",
+  "name": "null_like",
+  "query": "SELECT (NULL LIKE '%test%') AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ]
+  },
+  "_note": "Result must be NULL"
+}

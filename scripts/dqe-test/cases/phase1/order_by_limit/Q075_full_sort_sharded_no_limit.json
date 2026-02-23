@@ -1,0 +1,13 @@
+{
+  "id": "Q075",
+  "name": "full_sort_sharded_no_limit",
+  "query": "SELECT id FROM dqe_test_sharded ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

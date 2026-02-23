@@ -1,0 +1,18 @@
+{
+  "id": "N55",
+  "name": "nullif_equal_values",
+  "query": "SELECT NULLIF(1, 1) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

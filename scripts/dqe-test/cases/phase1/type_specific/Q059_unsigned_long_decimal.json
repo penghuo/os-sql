@@ -1,0 +1,14 @@
+{
+  "id": "Q059",
+  "name": "unsigned_long_decimal",
+  "query": "SELECT big_number FROM dqe_test_all_types WHERE big_number IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "big_number",
+        "type": "DECIMAL"
+      }
+    ]
+  },
+  "ignore_order": true
+}

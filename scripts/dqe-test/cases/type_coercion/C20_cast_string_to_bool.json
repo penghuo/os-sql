@@ -1,0 +1,18 @@
+{
+  "id": "C20",
+  "name": "cast_string_to_bool",
+  "query": "SELECT CAST('true' AS BOOLEAN) AS result FROM dqe_test_all_types LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ],
+    "data": [
+      [
+        true
+      ]
+    ]
+  }
+}

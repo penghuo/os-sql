@@ -1,0 +1,18 @@
+{
+  "id": "Q071",
+  "name": "limit_one_topn",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY id LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": [
+      [
+        "id_00001"
+      ]
+    ]
+  }
+}

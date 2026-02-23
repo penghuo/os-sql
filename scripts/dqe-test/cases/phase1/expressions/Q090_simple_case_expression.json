@@ -1,0 +1,18 @@
+{
+  "id": "Q090",
+  "name": "simple_case_expression",
+  "query": "SELECT id, CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END AS status_code FROM dqe_test_all_types LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "status_code",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

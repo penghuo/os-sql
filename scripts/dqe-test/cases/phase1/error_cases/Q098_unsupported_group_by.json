@@ -1,0 +1,8 @@
+{
+  "id": "Q098",
+  "name": "unsupported_group_by",
+  "query": "SELECT id FROM dqe_test_all_types GROUP BY id",
+  "error": {
+    "message_contains": "GROUP BY"
+  }
+}

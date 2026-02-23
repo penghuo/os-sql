@@ -1,0 +1,18 @@
+{
+  "id": "Q001",
+  "name": "basic_column_selection",
+  "query": "SELECT id, name FROM dqe_test_all_types LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "name",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

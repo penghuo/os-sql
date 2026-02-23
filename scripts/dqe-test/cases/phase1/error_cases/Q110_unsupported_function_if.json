@@ -1,0 +1,8 @@
+{
+  "id": "Q110",
+  "name": "unsupported_function_if",
+  "query": "SELECT id, IF(is_active, 'yes', 'no') FROM dqe_test_all_types LIMIT 5",
+  "error": {
+    "message_contains": "IF"
+  }
+}

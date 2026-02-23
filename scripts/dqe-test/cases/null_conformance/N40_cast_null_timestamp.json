@@ -1,0 +1,18 @@
+{
+  "id": "N40",
+  "name": "cast_null_timestamp",
+  "query": "SELECT CAST(NULL AS TIMESTAMP) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "TIMESTAMP"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

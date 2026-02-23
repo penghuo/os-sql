@@ -1,0 +1,15 @@
+{
+  "id": "Q006",
+  "name": "cross_type_arithmetic",
+  "query": "SELECT count_long * price_double FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "_col0",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.001
+}

@@ -1,10 +1,100 @@
-{"index":{"_id":"1"}}
-{"id":1,"nullable_keyword":"present","nullable_integer":10,"nullable_double":1.5,"nullable_boolean":true,"nullable_date":"2023-01-01","empty_string_field":"","all_null_field":null}
-{"index":{"_id":"2"}}
-{"id":2,"nullable_keyword":null,"nullable_integer":null,"nullable_double":null,"nullable_boolean":null,"nullable_date":null,"empty_string_field":"","all_null_field":null}
-{"index":{"_id":"3"}}
-{"id":3,"nullable_keyword":"present","nullable_integer":30,"nullable_double":3.5,"nullable_boolean":false,"nullable_date":"2023-03-01","empty_string_field":"notempty","all_null_field":null}
-{"index":{"_id":"4"}}
-{"id":4,"nullable_keyword":null,"nullable_integer":null,"nullable_double":null,"nullable_boolean":null,"nullable_date":null,"empty_string_field":"","all_null_field":null}
-{"index":{"_id":"5"}}
-{"id":5,"nullable_keyword":"present","nullable_integer":50,"nullable_double":5.5,"nullable_boolean":true,"nullable_date":"2023-05-01","empty_string_field":"","all_null_field":null}
+{"index": {"_id": "1"}}
+{"id": "null_0001"}
+{"index": {"_id": "2"}}
+{"id": "null_0002", "int_val": 100, "str_val": "present", "bool_val": true, "date_val": "2024-06-15T00:00:00Z", "dbl_val": 3.14}
+{"index": {"_id": "3"}}
+{"id": "null_0003", "str_val": "value_3", "bool_val": false, "date_val": "2024-03-01T00:00:00Z", "dbl_val": 3.3}
+{"index": {"_id": "4"}}
+{"id": "null_0004", "int_val": 20, "bool_val": true, "date_val": "2024-04-01T00:00:00Z", "dbl_val": 4.4}
+{"index": {"_id": "5"}}
+{"id": "null_0005", "int_val": 30, "str_val": "value_5", "date_val": "2024-05-01T00:00:00Z", "dbl_val": 5.5}
+{"index": {"_id": "6"}}
+{"id": "null_0006", "int_val": 40, "str_val": "value_6", "bool_val": true, "dbl_val": 6.6}
+{"index": {"_id": "7"}}
+{"id": "null_0007", "int_val": 50, "str_val": "value_7", "bool_val": false, "date_val": "2024-07-01T00:00:00Z"}
+{"index": {"_id": "8"}}
+{"id": "null_0008", "int_val": -949, "str_val": "beta", "date_val": "2024-11-24T00:00:00Z", "dbl_val": -82.6122}
+{"index": {"_id": "9"}}
+{"id": "null_0009", "int_val": -939, "date_val": "2024-09-07T00:00:00Z", "dbl_val": 40.265}
+{"index": {"_id": "10"}}
+{"id": "null_0010", "int_val": -81, "str_val": "alpha", "bool_val": true, "date_val": "2024-06-09T00:00:00Z"}
+{"index": {"_id": "11"}}
+{"id": "null_0011", "int_val": -311, "bool_val": false, "date_val": "2024-10-09T00:00:00Z", "dbl_val": 45.9464}
+{"index": {"_id": "12"}}
+{"id": "null_0012", "int_val": 992, "str_val": "alpha", "bool_val": false, "date_val": "2024-12-03T00:00:00Z"}
+{"index": {"_id": "13"}}
+{"id": "null_0013"}
+{"index": {"_id": "14"}}
+{"id": "null_0014", "str_val": "gamma", "date_val": "2024-11-09T00:00:00Z", "dbl_val": 36.7095}
+{"index": {"_id": "15"}}
+{"id": "null_0015", "str_val": "present", "bool_val": true, "date_val": "2024-05-21T00:00:00Z", "dbl_val": -56.077}
+{"index": {"_id": "16"}}
+{"id": "null_0016", "int_val": 573, "str_val": "beta", "bool_val": false, "date_val": "2024-02-07T00:00:00Z", "dbl_val": 13.436}
+{"index": {"_id": "17"}}
+{"id": "null_0017", "int_val": -565, "str_val": "delta", "bool_val": false}
+{"index": {"_id": "18"}}
+{"id": "null_0018", "int_val": 103, "bool_val": false, "date_val": "2024-03-17T00:00:00Z", "dbl_val": 51.1564}
+{"index": {"_id": "19"}}
+{"id": "null_0019", "int_val": -687, "str_val": "value_x", "bool_val": true, "date_val": "2024-10-15T00:00:00Z", "dbl_val": 94.2157}
+{"index": {"_id": "20"}}
+{"id": "null_0020", "int_val": -977, "str_val": "alpha", "bool_val": false, "date_val": "2024-06-04T00:00:00Z"}
+{"index": {"_id": "21"}}
+{"id": "null_0021", "bool_val": false, "date_val": "2024-03-17T00:00:00Z", "dbl_val": 74.1037}
+{"index": {"_id": "22"}}
+{"id": "null_0022", "str_val": "present", "date_val": "2024-03-18T00:00:00Z", "dbl_val": 84.4868}
+{"index": {"_id": "23"}}
+{"id": "null_0023", "int_val": 226, "str_val": "alpha", "date_val": "2024-05-08T00:00:00Z"}
+{"index": {"_id": "24"}}
+{"id": "null_0024", "int_val": 939, "bool_val": true, "date_val": "2024-09-25T00:00:00Z"}
+{"index": {"_id": "25"}}
+{"id": "null_0025", "int_val": 939, "str_val": "gamma", "bool_val": false, "date_val": "2024-09-25T00:00:00Z", "dbl_val": -59.7698}
+{"index": {"_id": "26"}}
+{"id": "null_0026", "int_val": 375, "str_val": "delta", "bool_val": false}
+{"index": {"_id": "27"}}
+{"id": "null_0027", "int_val": 204, "str_val": "present", "dbl_val": -54.2116}
+{"index": {"_id": "28"}}
+{"id": "null_0028", "int_val": 760, "str_val": "present", "date_val": "2024-04-18T00:00:00Z"}
+{"index": {"_id": "29"}}
+{"id": "null_0029", "int_val": 169, "str_val": "beta", "bool_val": false}
+{"index": {"_id": "30"}}
+{"id": "null_0030", "int_val": -133, "str_val": "value_x", "date_val": "2024-11-04T00:00:00Z"}
+{"index": {"_id": "31"}}
+{"id": "null_0031", "int_val": 639, "str_val": "beta", "date_val": "2024-03-14T00:00:00Z"}
+{"index": {"_id": "32"}}
+{"id": "null_0032", "int_val": 790, "str_val": "delta", "bool_val": true, "dbl_val": 67.2055}
+{"index": {"_id": "33"}}
+{"id": "null_0033", "int_val": 897, "str_val": "beta", "date_val": "2024-04-28T00:00:00Z", "dbl_val": -88.2729}
+{"index": {"_id": "34"}}
+{"id": "null_0034", "int_val": -201, "bool_val": false, "dbl_val": 46.1011}
+{"index": {"_id": "35"}}
+{"id": "null_0035", "int_val": 355, "str_val": "beta"}
+{"index": {"_id": "36"}}
+{"id": "null_0036", "int_val": -876, "str_val": "alpha", "date_val": "2024-09-06T00:00:00Z"}
+{"index": {"_id": "37"}}
+{"id": "null_0037", "int_val": 743, "bool_val": true, "date_val": "2024-10-08T00:00:00Z", "dbl_val": -92.0517}
+{"index": {"_id": "38"}}
+{"id": "null_0038", "str_val": "present", "bool_val": false, "dbl_val": -52.2628}
+{"index": {"_id": "39"}}
+{"id": "null_0039", "int_val": 375, "str_val": "delta", "bool_val": true, "dbl_val": 12.5987}
+{"index": {"_id": "40"}}
+{"id": "null_0040", "str_val": "present", "date_val": "2024-02-08T00:00:00Z", "dbl_val": -68.4506}
+{"index": {"_id": "41"}}
+{"id": "null_0041", "int_val": 440, "str_val": "value_x", "bool_val": false, "date_val": "2024-02-05T00:00:00Z"}
+{"index": {"_id": "42"}}
+{"id": "null_0042", "int_val": 520, "str_val": "gamma", "dbl_val": 37.4994}
+{"index": {"_id": "43"}}
+{"id": "null_0043", "int_val": 35, "str_val": "alpha", "date_val": "2024-05-02T00:00:00Z"}
+{"index": {"_id": "44"}}
+{"id": "null_0044", "int_val": 304, "str_val": "beta", "bool_val": false, "date_val": "2024-02-03T00:00:00Z", "dbl_val": 38.2039}
+{"index": {"_id": "45"}}
+{"id": "null_0045", "bool_val": true, "date_val": "2024-01-10T00:00:00Z", "dbl_val": 86.6176}
+{"index": {"_id": "46"}}
+{"id": "null_0046", "int_val": -919, "str_val": "beta", "bool_val": true, "date_val": "2024-09-28T00:00:00Z", "dbl_val": 24.1323}
+{"index": {"_id": "47"}}
+{"id": "null_0047", "str_val": "beta", "bool_val": true, "date_val": "2024-01-06T00:00:00Z", "dbl_val": -33.5629}
+{"index": {"_id": "48"}}
+{"id": "null_0048", "int_val": 642, "str_val": "value_x", "bool_val": false, "dbl_val": -23.4917}
+{"index": {"_id": "49"}}
+{"id": "null_0049", "str_val": "beta", "bool_val": false, "date_val": "2024-04-08T00:00:00Z"}
+{"index": {"_id": "50"}}
+{"id": "null_0050", "str_val": "alpha", "bool_val": false, "date_val": "2024-09-13T00:00:00Z", "dbl_val": 68.7322}

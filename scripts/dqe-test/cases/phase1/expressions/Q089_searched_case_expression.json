@@ -1,0 +1,18 @@
+{
+  "id": "Q089",
+  "name": "searched_case_expression",
+  "query": "SELECT id, CASE WHEN count_int > 100 THEN 'high' WHEN count_int > 50 THEN 'medium' ELSE 'low' END AS level FROM dqe_test_all_types LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "level",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

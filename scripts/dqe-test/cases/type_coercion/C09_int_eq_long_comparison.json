@@ -1,0 +1,14 @@
+{
+  "id": "C09",
+  "name": "int_eq_long_comparison",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_int = count_long LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

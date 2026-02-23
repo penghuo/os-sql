@@ -1,0 +1,17 @@
+{
+  "id": "Q061",
+  "name": "single_column_asc",
+  "query": "SELECT id, count_int FROM dqe_test_all_types ORDER BY count_int ASC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "count_int",
+        "type": "INTEGER"
+      }
+    ]
+  }
+}

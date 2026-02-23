@@ -1,0 +1,15 @@
+{
+  "id": "C18",
+  "name": "cast_int_to_double",
+  "query": "SELECT CAST(count_int AS DOUBLE) AS result FROM dqe_test_all_types WHERE count_int IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.001
+}

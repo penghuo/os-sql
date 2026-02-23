@@ -1,0 +1,13 @@
+{
+  "id": "TZ12",
+  "name": "null_timestamps_filter_sort",
+  "query": "SELECT id FROM dqe_test_all_types WHERE created_at IS NULL ORDER BY id LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

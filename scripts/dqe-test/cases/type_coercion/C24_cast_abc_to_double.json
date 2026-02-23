@@ -1,0 +1,8 @@
+{
+  "id": "C24",
+  "name": "cast_abc_to_double",
+  "query": "SELECT CAST('abc' AS DOUBLE) AS result FROM dqe_test_all_types LIMIT 1",
+  "error": {
+    "message_contains": "CAST"
+  }
+}

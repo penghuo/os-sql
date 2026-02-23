@@ -1,0 +1,22 @@
+{
+  "id": "Q093",
+  "name": "nullif_coalesce_combined",
+  "query": "SELECT id, NULLIF(int_val, 0) AS non_zero, COALESCE(str_val, 'fallback') FROM dqe_test_nulls LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "non_zero",
+        "type": "INTEGER"
+      },
+      {
+        "name": "_col2",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

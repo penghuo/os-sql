@@ -1,0 +1,18 @@
+{
+  "id": "Q094",
+  "name": "coalesce_with_null",
+  "query": "SELECT id, COALESCE(int_val, -1) AS val FROM dqe_test_nulls LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "val",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,14 @@
+{
+  "id": "Q017",
+  "name": "inequality",
+  "query": "SELECT id FROM dqe_test_all_types WHERE status != 'active'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

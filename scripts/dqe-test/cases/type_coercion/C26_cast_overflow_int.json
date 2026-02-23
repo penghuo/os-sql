@@ -1,0 +1,8 @@
+{
+  "id": "C26",
+  "name": "cast_overflow_int",
+  "query": "SELECT CAST(99999999999999999999 AS INTEGER) AS result FROM dqe_test_all_types LIMIT 1",
+  "error": {
+    "message_contains": "overflow"
+  }
+}

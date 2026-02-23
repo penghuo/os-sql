@@ -1,0 +1,14 @@
+{
+  "id": "TZ01",
+  "name": "epoch_millis_precision",
+  "query": "SELECT created_at FROM dqe_test_all_types WHERE created_at IS NOT NULL LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+      }
+    ]
+  },
+  "_note": "TIMESTAMP(3) with millisecond precision"
+}

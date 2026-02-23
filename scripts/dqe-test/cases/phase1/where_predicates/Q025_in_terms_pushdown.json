@@ -1,0 +1,14 @@
+{
+  "id": "Q025",
+  "name": "in_terms_pushdown",
+  "query": "SELECT id FROM dqe_test_all_types WHERE status IN ('active', 'pending', 'closed')",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

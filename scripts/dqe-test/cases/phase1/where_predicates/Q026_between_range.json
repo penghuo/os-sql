@@ -1,0 +1,14 @@
+{
+  "id": "Q026",
+  "name": "between_range",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_int BETWEEN 10 AND 100",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

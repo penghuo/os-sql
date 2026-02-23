@@ -1,0 +1,14 @@
+{
+  "id": "Q022",
+  "name": "and_bool_must",
+  "query": "SELECT id FROM dqe_test_all_types WHERE status = 'active' AND count_int > 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

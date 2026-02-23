@@ -1,0 +1,14 @@
+{
+  "id": "Q034",
+  "name": "boolean_equality",
+  "query": "SELECT id FROM dqe_test_all_types WHERE is_active = true",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

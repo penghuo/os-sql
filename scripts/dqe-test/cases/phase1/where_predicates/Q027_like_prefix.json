@@ -1,0 +1,14 @@
+{
+  "id": "Q027",
+  "name": "like_prefix",
+  "query": "SELECT id FROM dqe_test_all_types WHERE name LIKE 'test%'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

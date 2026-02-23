@@ -1,0 +1,13 @@
+{
+  "id": "Q077",
+  "name": "full_scan_5_shards",
+  "query": "SELECT id FROM dqe_test_sharded ORDER BY id ASC LIMIT 500",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

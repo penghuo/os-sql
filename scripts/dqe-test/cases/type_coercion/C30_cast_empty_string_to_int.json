@@ -1,0 +1,8 @@
+{
+  "id": "C30",
+  "name": "cast_empty_string_to_int",
+  "query": "SELECT CAST('' AS INTEGER) AS result FROM dqe_test_all_types LIMIT 1",
+  "error": {
+    "message_contains": "CAST"
+  }
+}

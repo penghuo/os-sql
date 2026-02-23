@@ -1,0 +1,18 @@
+{
+  "id": "C28",
+  "name": "try_cast_abc_to_int",
+  "query": "SELECT TRY_CAST('abc' AS INTEGER) AS result FROM dqe_test_all_types LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

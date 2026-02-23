@@ -1,0 +1,14 @@
+{
+  "id": "Q028",
+  "name": "like_contains",
+  "query": "SELECT id FROM dqe_test_all_types WHERE name LIKE '%middle%'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

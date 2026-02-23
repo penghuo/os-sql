@@ -1,0 +1,14 @@
+{
+  "id": "Q030",
+  "name": "is_not_null",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_int IS NOT NULL",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

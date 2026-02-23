@@ -1,0 +1,14 @@
+{
+  "id": "N47",
+  "name": "value_in_list_with_null",
+  "query": "SELECT (1 IN (NULL, 2, 3)) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ]
+  },
+  "_note": "Result must be NULL (1 not in {2,3}, NULL makes it unknown)"
+}

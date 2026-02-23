@@ -1,0 +1,15 @@
+{
+  "id": "Q045",
+  "name": "double_double",
+  "query": "SELECT price_double FROM dqe_test_all_types WHERE price_double > 0.0 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "price_double",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.001
+}

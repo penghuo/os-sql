@@ -1,0 +1,18 @@
+{
+  "id": "C29",
+  "name": "try_cast_abc_to_double",
+  "query": "SELECT TRY_CAST('abc' AS DOUBLE) AS result FROM dqe_test_all_types LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "DOUBLE"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

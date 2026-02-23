@@ -1,0 +1,14 @@
+{
+  "id": "TZ07",
+  "name": "range_spanning_dst_gap",
+  "query": "SELECT id FROM dqe_test_all_types WHERE created_at BETWEEN TIMESTAMP '2024-03-10 00:00:00' AND TIMESTAMP '2024-03-10 04:00:00'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

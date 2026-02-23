@@ -1,0 +1,14 @@
+{
+  "id": "Q043",
+  "name": "short_smallint",
+  "query": "SELECT count_short FROM dqe_test_all_types WHERE count_short = 42 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "count_short",
+        "type": "SMALLINT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

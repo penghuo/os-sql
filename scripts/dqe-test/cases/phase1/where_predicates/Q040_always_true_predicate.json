@@ -1,0 +1,14 @@
+{
+  "id": "Q040",
+  "name": "always_true_predicate",
+  "query": "SELECT id FROM dqe_test_all_types WHERE 1 = 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

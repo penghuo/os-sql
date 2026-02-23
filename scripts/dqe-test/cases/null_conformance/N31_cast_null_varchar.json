@@ -1,0 +1,18 @@
+{
+  "id": "N31",
+  "name": "cast_null_varchar",
+  "query": "SELECT CAST(NULL AS VARCHAR) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "C14",
+  "name": "cast_long_to_int",
+  "query": "SELECT CAST(count_long AS INTEGER) AS result FROM dqe_test_all_types WHERE count_long IS NOT NULL AND count_long BETWEEN -2147483648 AND 2147483647 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

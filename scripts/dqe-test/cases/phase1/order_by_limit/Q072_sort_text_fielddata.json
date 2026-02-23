@@ -1,0 +1,13 @@
+{
+  "id": "Q072",
+  "name": "sort_text_fielddata",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY description ASC LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

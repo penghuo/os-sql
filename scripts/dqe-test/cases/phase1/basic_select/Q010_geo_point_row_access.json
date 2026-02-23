@@ -1,0 +1,19 @@
+{
+  "id": "Q010",
+  "name": "geo_point_row_access",
+  "query": "SELECT location.lat, location.lon FROM dqe_test_all_types WHERE location IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "lat",
+        "type": "DOUBLE"
+      },
+      {
+        "name": "lon",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.0001
+}

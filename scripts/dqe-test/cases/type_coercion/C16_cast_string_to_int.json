@@ -1,0 +1,18 @@
+{
+  "id": "C16",
+  "name": "cast_string_to_int",
+  "query": "SELECT CAST('123' AS INTEGER) AS result FROM dqe_test_all_types LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ],
+    "data": [
+      [
+        123
+      ]
+    ]
+  }
+}

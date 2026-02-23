@@ -1,0 +1,13 @@
+{
+  "id": "TZ04",
+  "name": "strict_date_comparison",
+  "query": "SELECT updated_at FROM dqe_test_all_types WHERE updated_at = TIMESTAMP '2024-06-15 10:30:00'",
+  "expected": {
+    "schema": [
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP"
+      }
+    ]
+  }
+}

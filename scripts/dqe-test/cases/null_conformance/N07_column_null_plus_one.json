@@ -1,0 +1,23 @@
+{
+  "id": "N07",
+  "name": "column_null_plus_one",
+  "query": "SELECT id, int_val + 1 AS result FROM dqe_test_nulls WHERE id = 'null_0001' LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ],
+    "data": [
+      [
+        "null_0001",
+        null
+      ]
+    ]
+  }
+}

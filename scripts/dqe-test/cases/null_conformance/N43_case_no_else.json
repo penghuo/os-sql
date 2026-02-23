@@ -1,0 +1,18 @@
+{
+  "id": "N43",
+  "name": "case_no_else",
+  "query": "SELECT CASE WHEN FALSE THEN 'a' END AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": [
+      [
+        null
+      ]
+    ]
+  }
+}

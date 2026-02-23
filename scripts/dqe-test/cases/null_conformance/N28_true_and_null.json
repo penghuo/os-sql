@@ -1,0 +1,14 @@
+{
+  "id": "N28",
+  "name": "true_and_null",
+  "query": "SELECT (TRUE AND NULL) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ]
+  },
+  "_note": "Result must be NULL (three-valued logic)"
+}

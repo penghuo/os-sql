@@ -1,0 +1,18 @@
+{
+  "id": "N20",
+  "name": "null_is_null",
+  "query": "SELECT (NULL IS NULL) AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BOOLEAN"
+      }
+    ],
+    "data": [
+      [
+        true
+      ]
+    ]
+  }
+}

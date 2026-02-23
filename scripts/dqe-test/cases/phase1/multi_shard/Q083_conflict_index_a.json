@@ -1,0 +1,22 @@
+{
+  "id": "Q083",
+  "name": "conflict_index_a",
+  "query": "SELECT * FROM dqe_test_conflict_a LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "value",
+        "type": "BIGINT"
+      },
+      {
+        "name": "label",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

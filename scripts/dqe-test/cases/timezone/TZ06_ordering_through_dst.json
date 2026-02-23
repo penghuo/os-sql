@@ -1,0 +1,17 @@
+{
+  "id": "TZ06",
+  "name": "ordering_through_dst",
+  "query": "SELECT id, created_at FROM dqe_test_all_types ORDER BY created_at ASC LIMIT 20",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP"
+      }
+    ]
+  }
+}

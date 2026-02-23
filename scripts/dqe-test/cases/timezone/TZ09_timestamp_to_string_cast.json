@@ -1,0 +1,18 @@
+{
+  "id": "TZ09",
+  "name": "timestamp_to_string_cast",
+  "query": "SELECT id, CAST(created_at AS VARCHAR) FROM dqe_test_all_types WHERE created_at IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "_col1",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

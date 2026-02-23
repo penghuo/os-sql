@@ -1,0 +1,18 @@
+{
+  "id": "Q088",
+  "name": "modulo_operator",
+  "query": "SELECT id, count_int % 3 AS modulo FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "modulo",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

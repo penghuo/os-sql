@@ -1,0 +1,14 @@
+{
+  "id": "TZ08",
+  "name": "nanosecond_precision_comparison",
+  "query": "SELECT id FROM dqe_test_all_types WHERE precise_time > TIMESTAMP '2024-01-01 00:00:00.123456789'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

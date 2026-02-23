@@ -1,0 +1,8 @@
+{
+  "id": "Q099",
+  "name": "unsupported_join",
+  "query": "SELECT id FROM dqe_test_all_types a JOIN dqe_test_nulls b ON a.id = b.id",
+  "error": {
+    "message_contains": "JOIN"
+  }
+}

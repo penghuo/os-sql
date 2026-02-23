@@ -1,0 +1,8 @@
+{
+  "id": "Q107",
+  "name": "unsupported_no_from",
+  "query": "SELECT 1 + 2 AS constant",
+  "error": {
+    "message_contains": "FROM"
+  }
+}

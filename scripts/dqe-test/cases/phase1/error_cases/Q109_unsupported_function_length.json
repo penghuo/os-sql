@@ -1,0 +1,8 @@
+{
+  "id": "Q109",
+  "name": "unsupported_function_length",
+  "query": "SELECT id, LENGTH(status) FROM dqe_test_all_types LIMIT 5",
+  "error": {
+    "message_contains": "LENGTH"
+  }
+}

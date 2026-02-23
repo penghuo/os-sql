@@ -1,0 +1,8 @@
+{
+  "id": "Q103",
+  "name": "unsortable_geo_point",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY location",
+  "error": {
+    "message_contains": "sort"
+  }
+}

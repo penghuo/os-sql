@@ -1,0 +1,13 @@
+{
+  "id": "Q070",
+  "name": "large_limit",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY id LIMIT 10000",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

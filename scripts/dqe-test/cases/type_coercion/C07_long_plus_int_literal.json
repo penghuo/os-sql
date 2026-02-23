@@ -1,0 +1,14 @@
+{
+  "id": "C07",
+  "name": "long_plus_int_literal",
+  "query": "SELECT count_long + 1 AS result FROM dqe_test_all_types WHERE count_long IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BIGINT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

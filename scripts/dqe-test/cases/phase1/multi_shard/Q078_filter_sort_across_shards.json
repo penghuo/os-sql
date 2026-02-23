@@ -1,0 +1,13 @@
+{
+  "id": "Q078",
+  "name": "filter_sort_across_shards",
+  "query": "SELECT id FROM dqe_test_sharded WHERE id >= 'id_00250' ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

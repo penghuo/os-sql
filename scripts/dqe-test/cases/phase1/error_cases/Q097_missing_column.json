@@ -1,0 +1,8 @@
+{
+  "id": "Q097",
+  "name": "missing_column",
+  "query": "SELECT nonexistent_column FROM dqe_test_all_types",
+  "error": {
+    "message_contains": "not found"
+  }
+}

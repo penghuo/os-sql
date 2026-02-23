@@ -1,0 +1,17 @@
+{
+  "id": "N45",
+  "name": "case_is_null_per_row",
+  "query": "SELECT id, CASE WHEN int_val IS NULL THEN 'null' ELSE 'not null' END AS result FROM dqe_test_nulls ORDER BY id LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "C17",
+  "name": "cast_double_to_int",
+  "query": "SELECT CAST(price_double AS INTEGER) AS result FROM dqe_test_all_types WHERE price_double IS NOT NULL AND price_double BETWEEN -2147483648 AND 2147483647 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "INTEGER"
+      }
+    ]
+  },
+  "ignore_order": true
+}

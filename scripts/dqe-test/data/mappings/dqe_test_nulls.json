@@ -1,14 +1,16 @@
 {
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
   "mappings": {
     "properties": {
-      "id": { "type": "integer" },
-      "nullable_keyword": { "type": "keyword" },
-      "nullable_integer": { "type": "integer" },
-      "nullable_double": { "type": "double" },
-      "nullable_boolean": { "type": "boolean" },
-      "nullable_date": { "type": "date" },
-      "empty_string_field": { "type": "keyword" },
-      "all_null_field": { "type": "keyword" }
+      "id":       { "type": "keyword" },
+      "int_val":  { "type": "integer" },
+      "str_val":  { "type": "keyword" },
+      "bool_val": { "type": "boolean" },
+      "date_val": { "type": "date" },
+      "dbl_val":  { "type": "double" }
     }
   }
 }

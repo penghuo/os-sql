@@ -1,0 +1,8 @@
+{
+  "id": "C27",
+  "name": "cast_invalid_target_type",
+  "query": "SELECT CAST(count_int AS geo_point) AS result FROM dqe_test_all_types LIMIT 1",
+  "error": {
+    "message_contains": "type"
+  }
+}

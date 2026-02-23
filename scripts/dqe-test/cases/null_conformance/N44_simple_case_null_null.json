@@ -1,0 +1,18 @@
+{
+  "id": "N44",
+  "name": "simple_case_null_null",
+  "query": "SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": [
+      [
+        "no match"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "Q035",
+  "name": "timestamp_comparison",
+  "query": "SELECT id FROM dqe_test_all_types WHERE created_at > TIMESTAMP '2024-01-01 00:00:00'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,17 @@
+{
+  "id": "Q074",
+  "name": "sort_unsigned_long",
+  "query": "SELECT id, big_number FROM dqe_test_all_types ORDER BY big_number ASC LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "big_number",
+        "type": "DECIMAL"
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "C12",
+  "name": "case_int_long",
+  "query": "SELECT CASE WHEN true THEN count_int ELSE count_long END AS result FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "BIGINT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

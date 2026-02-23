@@ -1,0 +1,14 @@
+{
+  "id": "Q111",
+  "name": "full_scan_uniqueness_assertion",
+  "query": "SELECT id FROM dqe_test_sharded ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "_note": "Validator must check: row_count=500, all id values unique"
+}

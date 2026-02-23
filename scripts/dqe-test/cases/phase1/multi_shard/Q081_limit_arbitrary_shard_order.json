@@ -1,0 +1,14 @@
+{
+  "id": "Q081",
+  "name": "limit_arbitrary_shard_order",
+  "query": "SELECT id FROM dqe_test_sharded LIMIT 100",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

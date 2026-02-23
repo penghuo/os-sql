@@ -1,0 +1,14 @@
+{
+  "id": "Q031",
+  "name": "nested_boolean",
+  "query": "SELECT id FROM dqe_test_all_types WHERE status = 'active' AND (count_int > 10 OR price_double < 5.0)",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

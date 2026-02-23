@@ -1,0 +1,24 @@
+{
+  "id": "N08",
+  "name": "column_null_multiply",
+  "query": "SELECT id, int_val * dbl_val AS result FROM dqe_test_nulls WHERE id = 'null_0001' LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "result",
+        "type": "DOUBLE"
+      }
+    ],
+    "data": [
+      [
+        "null_0001",
+        null
+      ]
+    ]
+  },
+  "float_tolerance": 0.001
+}

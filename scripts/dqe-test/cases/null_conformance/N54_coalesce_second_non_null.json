@@ -1,0 +1,18 @@
+{
+  "id": "N54",
+  "name": "coalesce_second_non_null",
+  "query": "SELECT COALESCE(NULL, 'b', 'c') AS result FROM dqe_test_nulls LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": [
+      [
+        "b"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "C08",
+  "name": "float_plus_double_literal",
+  "query": "SELECT price_float + 0.0 AS result FROM dqe_test_all_types WHERE price_float IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "DOUBLE"
+      }
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.001
+}

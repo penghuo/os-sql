@@ -1,0 +1,14 @@
+{
+  "id": "Q057",
+  "name": "flattened_map",
+  "query": "SELECT attributes FROM dqe_test_all_types WHERE attributes IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "attributes",
+        "type": "STRUCT"
+      }
+    ]
+  },
+  "ignore_order": true
+}

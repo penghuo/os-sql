@@ -1,0 +1,8 @@
+{
+  "id": "C23",
+  "name": "cast_abc_to_int",
+  "query": "SELECT CAST('abc' AS INTEGER) AS result FROM dqe_test_all_types LIMIT 1",
+  "error": {
+    "message_contains": "CAST"
+  }
+}

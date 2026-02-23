@@ -1,0 +1,14 @@
+{
+  "id": "C21",
+  "name": "cast_timestamp_to_varchar",
+  "query": "SELECT CAST(created_at AS VARCHAR) AS result FROM dqe_test_all_types WHERE created_at IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "result",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

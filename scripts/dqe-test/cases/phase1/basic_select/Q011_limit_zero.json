@@ -1,0 +1,14 @@
+{
+  "id": "Q011",
+  "name": "limit_zero",
+  "query": "SELECT id FROM dqe_test_all_types LIMIT 0",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ],
+    "data": []
+  }
+}

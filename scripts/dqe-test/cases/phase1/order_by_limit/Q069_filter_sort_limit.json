@@ -1,0 +1,17 @@
+{
+  "id": "Q069",
+  "name": "filter_sort_limit",
+  "query": "SELECT id, status FROM dqe_test_all_types WHERE status = 'active' ORDER BY count_int DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

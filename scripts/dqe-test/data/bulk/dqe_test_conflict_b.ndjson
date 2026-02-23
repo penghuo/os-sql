@@ -1,0 +1,10 @@
+{"index":{"_id":"1"}}
+{"id":"cb_001","value":10,"label":"delta text value"}
+{"index":{"_id":"2"}}
+{"id":"cb_002","value":20,"label":"epsilon text value"}
+{"index":{"_id":"3"}}
+{"id":"cb_003","value":30,"label":"zeta text value"}
+{"index":{"_id":"4"}}
+{"id":"cb_004","value":2147483647,"label":"max int text"}
+{"index":{"_id":"5"}}
+{"id":"cb_005","value":-50,"label":"negative text"}

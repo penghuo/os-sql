@@ -1,0 +1,14 @@
+{
+  "id": "Q038",
+  "name": "scaled_float_comparison",
+  "query": "SELECT id FROM dqe_test_all_types WHERE price_scaled > 99.99",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  },
+  "ignore_order": true
+}

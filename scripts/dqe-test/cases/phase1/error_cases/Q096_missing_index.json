@@ -1,0 +1,8 @@
+{
+  "id": "Q096",
+  "name": "missing_index",
+  "query": "SELECT * FROM nonexistent_index",
+  "error": {
+    "message_contains": "not found"
+  }
+}

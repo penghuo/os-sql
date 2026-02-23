@@ -1,0 +1,13 @@
+{
+  "id": "Q079",
+  "name": "reverse_sort_across_shards",
+  "query": "SELECT id FROM dqe_test_sharded ORDER BY id DESC LIMIT 100",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ]
+  }
+}

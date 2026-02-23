@@ -26,8 +26,9 @@ import org.opensearch.sql.protocol.response.format.Format;
 @RequiredArgsConstructor
 public class SQLQueryRequest {
   private static final String QUERY_FIELD_CURSOR = "cursor";
+  private static final String QUERY_FIELD_ENGINE = "engine";
   private static final Set<String> SUPPORTED_FIELDS =
-      Set.of("query", "fetch_size", "parameters", QUERY_FIELD_CURSOR);
+      Set.of("query", "fetch_size", "parameters", QUERY_FIELD_CURSOR, QUERY_FIELD_ENGINE);
   private static final String QUERY_PARAMS_FORMAT = "format";
   private static final String QUERY_PARAMS_SANITIZE = "sanitize";
   private static final String QUERY_PARAMS_PRETTY = "pretty";
@@ -135,6 +136,18 @@ public class SQLQueryRequest {
 
   private boolean isOnlySupportedFieldInPayload() {
     return jsonContent == null || SUPPORTED_FIELDS.containsAll(jsonContent.keySet());
+  }
+
+  /**
+   * Returns the engine field from the request body, or null if absent.
+   *
+   * @return engine value (e.g. "dqe", "calcite"), or null
+   */
+  public String getEngine() {
+    if (jsonContent != null && jsonContent.has(QUERY_FIELD_ENGINE)) {
+      return jsonContent.getString(QUERY_FIELD_ENGINE);
+    }
+    return null;
   }
 
   public Optional<String> getCursor() {

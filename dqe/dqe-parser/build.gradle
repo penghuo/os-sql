@@ -1,0 +1,14 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-parser: Wraps Trino's SqlParser with DQE-specific options.
+ * Produces Trino Statement ASTs and defines the exception hierarchy
+ * used across all DQE modules. Standalone — no internal DQE dependencies.
+ */
+
+dependencies {
+    api "io.trino:trino-parser:${trinoVersion}"
+}

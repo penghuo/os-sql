@@ -1,0 +1,10 @@
+{"index":{"_id":"1"}}
+{"id":1,"name":"Alice Smith","department":"Engineering","salary":95000.50,"age":30,"active":true,"hire_date":"2020-01-15","tags":["java","python"],"address":{"city":"Seattle","state":"WA","zip":"98101"}}
+{"index":{"_id":"2"}}
+{"id":2,"name":"Bob Johnson","department":"Marketing","salary":72000.00,"age":45,"active":true,"hire_date":"2018-06-01","tags":["marketing"],"address":{"city":"Portland","state":"OR","zip":"97201"}}
+{"index":{"_id":"3"}}
+{"id":3,"name":"Carol Williams","department":"Engineering","salary":110000.75,"age":35,"active":false,"hire_date":"2019-03-20","tags":["java","go","rust"],"address":{"city":"San Francisco","state":"CA","zip":"94102"}}
+{"index":{"_id":"4"}}
+{"id":4,"name":"David Brown","department":"Sales","salary":65000.25,"age":28,"active":true,"hire_date":"2021-11-10","tags":["sales"],"address":{"city":"Austin","state":"TX","zip":"73301"}}
+{"index":{"_id":"5"}}
+{"id":5,"name":"Eve Davis","department":"Engineering","salary":125000.00,"age":40,"active":true,"hire_date":"2017-09-05","tags":["python","ml"],"address":{"city":"Seattle","state":"WA","zip":"98102"}}

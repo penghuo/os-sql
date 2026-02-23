@@ -1,0 +1,15 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-memory: Memory tracking, circuit breaker integration, spill.
+ * Depends on dqe-parser (exceptions) and OpenSearch core.
+ */
+
+dependencies {
+    api project(':dqe:dqe-parser')
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "P004",
+  "name": "where_numeric_comparison",
+  "description": "WHERE with numeric comparison on salary, ordered by salary DESC",
+  "query": "SELECT id, name, salary FROM dqe_test_employees WHERE salary > 80000 ORDER BY salary DESC",
+  "expected": {
+    "schema": [
+      {"name": "id", "type": "INTEGER"},
+      {"name": "name", "type": "VARCHAR"},
+      {"name": "salary", "type": "DOUBLE"}
+    ],
+    "data": [
+      [5, "Eve Davis", 125000.0],
+      [3, "Carol Williams", 110000.75],
+      [1, "Alice Smith", 95000.50]
+    ]
+  },
+  "float_tolerance": 0.01
+}

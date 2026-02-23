@@ -1,0 +1,19 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-exchange: Exchange protocol over OpenSearch TransportService.
+ * Depends on dqe-execution, dqe-types, dqe-metadata, dqe-memory, and dqe-parser.
+ */
+
+dependencies {
+    api project(':dqe:dqe-execution')
+    api project(':dqe:dqe-types')
+    api project(':dqe:dqe-metadata')
+    api project(':dqe:dqe-memory')
+    api project(':dqe:dqe-parser')
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+}

@@ -1,0 +1,291 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-plugin: REST API, plugin entry point, settings, transport action registration.
+ * Produces the shaded shadow JAR containing all DQE modules and relocated Trino dependencies.
+ */
+
+plugins {
+    id 'com.gradleup.shadow'
+}
+
+dependencies {
+    api project(':dqe:dqe-exchange')
+    api project(':dqe:dqe-execution')
+    api project(':dqe:dqe-analyzer')
+    api project(':dqe:dqe-metadata')
+    api project(':dqe:dqe-types')
+    api project(':dqe:dqe-parser')
+    api project(':dqe:dqe-memory')
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+}
+
+// ---------------------------------------------------------------------------
+// BI-2: Shadow plugin configuration for Trino 439 shading
+// ---------------------------------------------------------------------------
+shadowJar {
+    archiveClassifier.set('all')
+
+    // Relocate Trino and all transitive dependencies to avoid classpath conflicts
+    // with OpenSearch core and other plugins.
+    relocate 'io.trino', 'org.opensearch.dqe.shaded.io.trino'
+    relocate 'io.airlift', 'org.opensearch.dqe.shaded.io.airlift'
+    relocate 'com.google.common', 'org.opensearch.dqe.shaded.com.google.common'
+    relocate 'com.fasterxml.jackson', 'org.opensearch.dqe.shaded.com.fasterxml.jackson'
+    relocate 'org.antlr', 'org.opensearch.dqe.shaded.org.antlr'
+
+    // Merge service descriptors so relocated services are properly discovered
+    mergeServiceFiles()
+
+    // Exclude module-info and signature files that break shaded JARs
+    exclude 'META-INF/MANIFEST.MF'
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    exclude 'module-info.class'
+}
+
+// Ensure shadowJar is built as part of the standard assemble lifecycle
+assemble.dependsOn shadowJar
+
+// ---------------------------------------------------------------------------
+// BI-3: No-leak CI validation
+// Scans the shaded JAR to verify no unshaded io.trino, io.airlift,
+// com.google.common, com.fasterxml.jackson, or org.antlr classes remain
+// after relocation. Fails the build if found.
+// ---------------------------------------------------------------------------
+tasks.register('verifyNoLeakedClasses') {
+    description = 'Verifies that no unshaded Trino/Airlift/Guava/Jackson/ANTLR classes remain in the shadow JAR.'
+    group = 'verification'
+    dependsOn shadowJar
+
+    doLast {
+        def shadowFile = shadowJar.archiveFile.get().asFile
+        if (!shadowFile.exists()) {
+            throw new GradleException("Shadow JAR not found at ${shadowFile.absolutePath}")
+        }
+
+        def disallowedPrefixes = [
+            'io/trino/',
+            'io/airlift/',
+            'com/google/common/',
+            'com/fasterxml/jackson/',
+            'org/antlr/',
+        ]
+        // These prefixes are the expected relocated paths
+        def allowedShadedPrefix = 'org/opensearch/dqe/shaded/'
+
+        def leakedClasses = []
+        def zipFile = new java.util.zip.ZipFile(shadowFile)
+        try {
+            zipFile.entries().each { entry ->
+                if (entry.name.endsWith('.class')) {
+                    disallowedPrefixes.each { prefix ->
+                        if (entry.name.startsWith(prefix) && !entry.name.startsWith(allowedShadedPrefix)) {
+                            leakedClasses << entry.name
+                        }
+                    }
+                }
+            }
+        } finally {
+            zipFile.close()
+        }
+
+        if (!leakedClasses.isEmpty()) {
+            def message = "Found ${leakedClasses.size()} unshaded class(es) in shadow JAR:\n"
+            leakedClasses.take(50).each { message += "  - ${it}\n" }
+            if (leakedClasses.size() > 50) {
+                message += "  ... and ${leakedClasses.size() - 50} more.\n"
+            }
+            throw new GradleException(message)
+        }
+
+        logger.lifecycle("No-leak check passed: shadow JAR contains no unshaded Trino/Airlift/Guava classes.")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BI-4: Classpath conflict check
+// Detects duplicate classes between the DQE shaded JAR and OpenSearch
+// core/plugin dependencies. Produces a report and fails if conflicts found.
+// ---------------------------------------------------------------------------
+tasks.register('checkClasspathConflicts') {
+    description = 'Detects duplicate classes between the DQE shadow JAR and OpenSearch dependencies.'
+    group = 'verification'
+    dependsOn shadowJar
+
+    doLast {
+        def shadowFile = shadowJar.archiveFile.get().asFile
+        if (!shadowFile.exists()) {
+            throw new GradleException("Shadow JAR not found at ${shadowFile.absolutePath}")
+        }
+
+        // Collect all class names from the shadow JAR
+        def shadowClasses = new HashSet<String>()
+        def zipFile = new java.util.zip.ZipFile(shadowFile)
+        try {
+            zipFile.entries().each { entry ->
+                if (entry.name.endsWith('.class') && !entry.name.startsWith('META-INF/')) {
+                    shadowClasses.add(entry.name)
+                }
+            }
+        } finally {
+            zipFile.close()
+        }
+
+        // Collect all class names from compileOnly (OpenSearch core) dependencies
+        def opensearchClasses = new HashSet<String>()
+        configurations.compileOnly.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+            def file = artifact.file
+            if (file.name.endsWith('.jar') && file.exists()) {
+                def jarFile = new java.util.zip.ZipFile(file)
+                try {
+                    jarFile.entries().each { entry ->
+                        if (entry.name.endsWith('.class') && !entry.name.startsWith('META-INF/')) {
+                            opensearchClasses.add(entry.name)
+                        }
+                    }
+                } finally {
+                    jarFile.close()
+                }
+            }
+        }
+
+        // Find intersection (conflicts)
+        def conflicts = shadowClasses.intersect(opensearchClasses)
+
+        // Generate report
+        def reportDir = layout.buildDirectory.dir('reports/classpath-conflicts').get().asFile
+        reportDir.mkdirs()
+        def reportFile = new File(reportDir, 'classpath-conflicts.txt')
+        reportFile.text = "DQE Classpath Conflict Report\n"
+        reportFile.append("Generated: ${new Date()}\n")
+        reportFile.append("Shadow JAR classes: ${shadowClasses.size()}\n")
+        reportFile.append("OpenSearch dependency classes: ${opensearchClasses.size()}\n")
+        reportFile.append("Conflicts: ${conflicts.size()}\n\n")
+
+        if (!conflicts.isEmpty()) {
+            reportFile.append("Conflicting classes:\n")
+            conflicts.sort().each { reportFile.append("  ${it}\n") }
+            logger.warn("Classpath conflict report written to: ${reportFile.absolutePath}")
+            throw new GradleException(
+                "Found ${conflicts.size()} class(es) duplicated between DQE shadow JAR and OpenSearch dependencies. " +
+                "See report at ${reportFile.absolutePath}")
+        }
+
+        reportFile.append("No conflicts found.\n")
+        logger.lifecycle("Classpath conflict check passed: no duplicates between shadow JAR and OpenSearch dependencies.")
+        logger.lifecycle("Report written to: ${reportFile.absolutePath}")
+    }
+}
+
+// Wire verification tasks into the check lifecycle
+check.dependsOn verifyNoLeakedClasses
+check.dependsOn checkClasspathConflicts
+
+// ---------------------------------------------------------------------------
+// BI-8: Third-party license report and NOTICE file generation
+// Generates a report of all shaded third-party dependencies and their licenses.
+// ---------------------------------------------------------------------------
+tasks.register('generateLicenseReport') {
+    description = 'Generates a third-party dependency license report for all shaded artifacts.'
+    group = 'documentation'
+
+    doLast {
+        def reportDir = layout.buildDirectory.dir('reports/licenses').get().asFile
+        reportDir.mkdirs()
+        def reportFile = new File(reportDir, 'THIRD-PARTY-LICENSES.txt')
+        def noticeFile = file("${project.rootDir}/dqe/NOTICE")
+
+        def sb = new StringBuilder()
+        sb.append("Third-Party Dependency License Report for DQE\n")
+        sb.append("=" * 60 + "\n")
+        sb.append("Generated: ${new Date()}\n")
+        sb.append("Trino Version: ${trinoVersion}\n\n")
+
+        def noticeBuilder = new StringBuilder()
+        noticeBuilder.append("OpenSearch DQE (Distributed Query Engine)\n")
+        noticeBuilder.append("Copyright OpenSearch Contributors\n\n")
+        noticeBuilder.append("This product includes software developed by:\n\n")
+
+        // Collect runtime dependencies (these are what gets shaded)
+        def runtimeDeps = configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts
+            .collect { artifact ->
+                [
+                    group: artifact.moduleVersion.id.group,
+                    name: artifact.moduleVersion.id.name,
+                    version: artifact.moduleVersion.id.version,
+                    file: artifact.file
+                ]
+            }
+            .sort { a, b -> "${a.group}:${a.name}" <=> "${b.group}:${b.name}" }
+
+        runtimeDeps.each { dep ->
+            // Skip internal DQE project dependencies
+            if (dep.group.startsWith('opensearch-sql')) {
+                return
+            }
+
+            def license = resolveLicense(dep.group, dep.name)
+            sb.append("${dep.group}:${dep.name}:${dep.version}\n")
+            sb.append("  License: ${license}\n\n")
+
+            noticeBuilder.append("- ${dep.group}:${dep.name}:${dep.version} (${license})\n")
+        }
+
+        reportFile.text = sb.toString()
+        logger.lifecycle("License report written to: ${reportFile.absolutePath}")
+
+        noticeBuilder.append("\nTrino (https://trino.io/) - Apache License 2.0\n")
+        noticeBuilder.append("Airlift (https://github.com/airlift) - Apache License 2.0\n")
+        noticeBuilder.append("Google Guava (https://github.com/google/guava) - Apache License 2.0\n")
+        noticeBuilder.append("Jackson (https://github.com/FasterXML/jackson) - Apache License 2.0\n")
+        noticeBuilder.append("ANTLR (https://www.antlr.org/) - BSD 3-Clause License\n")
+
+        noticeFile.text = noticeBuilder.toString()
+        logger.lifecycle("NOTICE file written to: ${noticeFile.absolutePath}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BI-6: Convenience run task
+// Starts a local OpenSearch cluster with the SQL plugin (which bundles DQE).
+// Delegates to the main opensearch-sql plugin's run task.
+// Usage: ./gradlew :dqe:dqe-plugin:run
+// ---------------------------------------------------------------------------
+tasks.register('run') {
+    description = 'Starts a local OpenSearch cluster with the DQE plugin loaded (delegates to opensearch-sql:run).'
+    group = 'application'
+    dependsOn ':opensearch-sql-plugin:run'
+}
+
+/**
+ * Resolves the license for a known dependency based on group/name.
+ * Falls back to 'Unknown — verify manually' for unrecognized dependencies.
+ */
+static String resolveLicense(String group, String name) {
+    if (group.startsWith('io.trino')) return 'Apache License 2.0'
+    if (group.startsWith('io.airlift')) return 'Apache License 2.0'
+    if (group.startsWith('com.google.guava') || group.startsWith('com.google.common')) return 'Apache License 2.0'
+    if (group.startsWith('com.google.code.findbugs')) return 'Apache License 2.0'
+    if (group.startsWith('com.google.errorprone')) return 'Apache License 2.0'
+    if (group.startsWith('com.google.inject')) return 'Apache License 2.0'
+    if (group.startsWith('com.google.j2objc')) return 'Apache License 2.0'
+    if (group.startsWith('com.fasterxml.jackson')) return 'Apache License 2.0'
+    if (group.startsWith('org.antlr') || name.startsWith('antlr')) return 'BSD 3-Clause License'
+    if (group.startsWith('org.checkerframework')) return 'MIT License'
+    if (group.startsWith('javax.annotation') || group.startsWith('jakarta.annotation')) return 'CDDL 1.1 / GPL 2.0'
+    if (group.startsWith('org.openjdk.jol')) return 'GPL 2.0 with Classpath Exception'
+    if (group == 'org.pcollections') return 'MIT License'
+    if (group == 'org.weakref' || name == 'jmxutils') return 'Apache License 2.0'
+    if (group == 'com.esri.geometry') return 'Apache License 2.0'
+    if (group.startsWith('org.slf4j')) return 'MIT License'
+    if (group.startsWith('commons-') || group.startsWith('org.apache.commons')) return 'Apache License 2.0'
+    if (group.startsWith('it.unimi.dsi')) return 'Apache License 2.0'
+    if (group.startsWith('dev.failsafe')) return 'Apache License 2.0'
+    return 'Unknown — verify manually'
+}

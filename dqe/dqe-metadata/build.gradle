@@ -1,0 +1,16 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-metadata: Catalog/schema/table from cluster state + stats.
+ * Depends on dqe-types and dqe-parser (exceptions).
+ */
+
+dependencies {
+    api project(':dqe:dqe-types')
+    api project(':dqe:dqe-parser')
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+}

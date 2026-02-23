@@ -1,0 +1,58 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Shared build configuration for all DQE submodules.
+ */
+subprojects {
+    apply plugin: 'java-library'
+    apply plugin: 'com.diffplug.spotless'
+
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+    }
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    dependencies {
+        testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+        testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"
+        testImplementation group: 'org.mockito', name: 'mockito-core', version: "${mockito_version}"
+        testImplementation group: 'org.mockito', name: 'mockito-junit-jupiter', version: "${mockito_version}"
+    }
+
+    test {
+        maxParallelForks = Runtime.runtime.availableProcessors()
+        useJUnitPlatform()
+        testLogging {
+            events "skipped", "failed"
+            exceptionFormat "full"
+        }
+    }
+
+    spotless {
+        java {
+            target fileTree('.') {
+                include '**/*.java'
+                exclude '**/build/**', '**/build-*/**'
+            }
+            importOrder()
+            licenseHeader("/*\n" +
+                    " * Copyright OpenSearch Contributors\n" +
+                    " * SPDX-License-Identifier: Apache-2.0\n" +
+                    " */\n\n")
+            removeUnusedImports()
+            trimTrailingWhitespace()
+            endWithNewline()
+            googleJavaFormat('1.32.0').reflowLongStrings().groupArtifact('com.google.googlejavaformat:google-java-format')
+        }
+    }
+}

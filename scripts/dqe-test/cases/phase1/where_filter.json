@@ -1,0 +1,18 @@
+{
+  "id": "P002",
+  "name": "where_equality_filter",
+  "description": "WHERE clause with equality filter on keyword field",
+  "query": "SELECT id, name, department FROM dqe_test_employees WHERE department = 'Engineering' ORDER BY id",
+  "expected": {
+    "schema": [
+      {"name": "id", "type": "INTEGER"},
+      {"name": "name", "type": "VARCHAR"},
+      {"name": "department", "type": "VARCHAR"}
+    ],
+    "data": [
+      [1, "Alice Smith", "Engineering"],
+      [3, "Carol Williams", "Engineering"],
+      [5, "Eve Davis", "Engineering"]
+    ]
+  }
+}

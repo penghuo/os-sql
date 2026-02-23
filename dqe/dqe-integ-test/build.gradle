@@ -1,0 +1,16 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-integ-test: Integration tests, golden result suite, conformance tests.
+ * Depends on dqe-plugin (test scope). Also includes dependency boundary validation.
+ */
+
+dependencies {
+    testImplementation project(':dqe:dqe-plugin')
+    testImplementation project(':dqe:dqe-parser')
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation 'com.tngtech.archunit:archunit-junit5:1.3.0'
+}

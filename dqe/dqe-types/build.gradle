@@ -1,0 +1,16 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-types: Trino type system + OpenSearch type mapping contract.
+ * Depends on dqe-parser for exceptions and shaded Trino SPI for Type.
+ */
+
+dependencies {
+    api project(':dqe:dqe-parser')
+    api "io.trino:trino-spi:${trinoVersion}"
+
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}

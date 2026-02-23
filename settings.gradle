@@ -25,8 +25,19 @@ include 'direct-query-core'
 include 'direct-query'
 include 'language-grammar'
 
+// DQE (Distributed Query Engine) modules
+include 'dqe:dqe-parser'
+include 'dqe:dqe-types'
+include 'dqe:dqe-metadata'
+include 'dqe:dqe-analyzer'
+include 'dqe:dqe-execution'
+include 'dqe:dqe-exchange'
+include 'dqe:dqe-memory'
+include 'dqe:dqe-plugin'
+
 // exclude integ-test/doctest in case of offline build since they need downloads
 if (!gradle.startParameter.offline) {
     include 'integ-test'
     include 'doctest'
+    include 'dqe:dqe-integ-test'
 }

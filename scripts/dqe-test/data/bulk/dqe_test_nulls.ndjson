@@ -1,0 +1,10 @@
+{"index":{"_id":"1"}}
+{"id":1,"nullable_keyword":"present","nullable_integer":10,"nullable_double":1.5,"nullable_boolean":true,"nullable_date":"2023-01-01","empty_string_field":"","all_null_field":null}
+{"index":{"_id":"2"}}
+{"id":2,"nullable_keyword":null,"nullable_integer":null,"nullable_double":null,"nullable_boolean":null,"nullable_date":null,"empty_string_field":"","all_null_field":null}
+{"index":{"_id":"3"}}
+{"id":3,"nullable_keyword":"present","nullable_integer":30,"nullable_double":3.5,"nullable_boolean":false,"nullable_date":"2023-03-01","empty_string_field":"notempty","all_null_field":null}
+{"index":{"_id":"4"}}
+{"id":4,"nullable_keyword":null,"nullable_integer":null,"nullable_double":null,"nullable_boolean":null,"nullable_date":null,"empty_string_field":"","all_null_field":null}
+{"index":{"_id":"5"}}
+{"id":5,"nullable_keyword":"present","nullable_integer":50,"nullable_double":5.5,"nullable_boolean":true,"nullable_date":"2023-05-01","empty_string_field":"","all_null_field":null}

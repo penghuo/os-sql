@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import org.apache.logging.log4j.LogManager;
@@ -83,10 +84,31 @@ public class RestSqlAction extends BaseRestHandler {
   /** New SQL query request handler. */
   private final RestSQLQueryAction newSqlQueryHandler;
 
+  /**
+   * DQE engine routing function. Accepts the request engine field (nullable) and returns true if
+   * the request should be handled by DQE. May throw a RuntimeException (e.g. DqeException) if DQE
+   * is disabled or the engine value is invalid. Defaults to always-false (DQE not wired).
+   *
+   * <p>Known limitation: Until the SQLPlugin wires the DqeEnginePlugin's EngineRouter into this
+   * handler, DQE routing is not active. This will be completed when PL-10 lands and the plugin
+   * module integrates dqe-plugin.
+   */
+  private volatile Function<String, Boolean> dqeRoutingFunction = engine -> false;
+
   public RestSqlAction(Settings settings, Injector injector) {
     super();
     this.allowExplicitIndex = MULTI_ALLOW_EXPLICIT_INDEX.get(settings);
     this.newSqlQueryHandler = new RestSQLQueryAction(injector);
+  }
+
+  /**
+   * Sets the DQE engine routing function. Called by SQLPlugin after DqeEnginePlugin is initialized
+   * to wire EngineRouter.shouldUseDqe() into the REST handler.
+   *
+   * @param routingFunction function that accepts the request engine field and returns true for DQE
+   */
+  public void setDqeEngineRouting(Function<String, Boolean> routingFunction) {
+    this.dqeRoutingFunction = routingFunction;
   }
 
   @Override
@@ -142,6 +164,40 @@ public class RestSqlAction extends BaseRestHandler {
               request.path(),
               request.params(),
               sqlRequest.cursor());
+
+      // DQE engine routing: check if the request should be handled by DQE.
+      // The routing function encapsulates EngineRouter.shouldUseDqe() logic, which:
+      // - Respects the per-request "engine" field (takes precedence)
+      // - Falls back to the "plugins.sql.engine" cluster setting
+      // - Checks the "plugins.dqe.enabled" flag (throws if DQE is disabled)
+      // - Validates engine field values (throws on invalid values like "spark")
+      String requestEngine = newSqlRequest.getEngine();
+      try {
+        if (dqeRoutingFunction.apply(requestEngine)) {
+          LOG.info(
+              "[{}] Request routed to DQE engine",
+              QueryContext.getRequestId());
+          // PL-10 (DqeQueryOrchestrator) is not yet implemented; return placeholder error.
+          return channel -> {
+            channel.sendResponse(
+                new BytesRestResponse(
+                    BAD_REQUEST,
+                    "application/json; charset=UTF-8",
+                    "{\"error\":{\"reason\":\"DQE query execution not yet implemented\","
+                        + "\"type\":\"DqeException\","
+                        + "\"engine\":\"dqe\"},"
+                        + "\"status\":400}"));
+          };
+        }
+      } catch (RuntimeException dqeEx) {
+        // DqeException (DQE_DISABLED, INVALID_REQUEST) — return as client error
+        LOG.warn(
+            "[{}] DQE routing error: {}",
+            QueryContext.getRequestId(),
+            dqeEx.getMessage());
+        return channel -> reportError(channel, dqeEx, BAD_REQUEST);
+      }
+
       return newSqlQueryHandler.prepareRequest(
           newSqlRequest,
           (restChannel, exception) -> {

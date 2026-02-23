@@ -1,0 +1,17 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * dqe-analyzer: Semantic analysis, scope resolution, type checking.
+ * Depends on dqe-metadata, dqe-types, and dqe-parser.
+ */
+
+dependencies {
+    api project(':dqe:dqe-metadata')
+    api project(':dqe:dqe-types')
+    api project(':dqe:dqe-parser')
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch:${opensearch_version}"
+}

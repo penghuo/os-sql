@@ -388,14 +388,13 @@ public final class PlanSplitter {
     }
 
     /**
-     * Checks whether the plan contains any {@link SqlUserDefinedFunction} or
-     * {@link SqlUserDefinedAggFunction} calls. The Calcite
-     * {@link org.apache.calcite.interpreter.Interpreter} cannot execute these because they require
-     * code generation via {@code ImplementableFunction/CallImplementor}.
+     * Checks whether the plan contains any custom UDF calls ({@link SqlUserDefinedFunction} or
+     * {@link SqlUserDefinedAggFunction}). Custom UDFs use {@code ImplementableFunction} /
+     * {@code CallImplementor} which requires Calcite code generation (EnumerableRel path).
+     * The shard-side Interpreter cannot execute them.
      *
-     * <p>Checks Project (projections), Filter (condition), Calc (program), and Aggregate (agg
-     * calls) for custom UDF/UDAF references. Plans with UDFs fall back to the non-DQE execution
-     * path which uses full Calcite code generation.
+     * <p>Checks Project (projections), Filter (condition), Calc (program), and Aggregate
+     * (agg calls) for UDF references.
      */
     private static boolean containsCustomUDFCalls(RelNode node) {
         if (node instanceof Project) {
@@ -425,7 +424,6 @@ public final class PlanSplitter {
                 }
             }
         }
-        // Recurse into children
         for (RelNode child : node.getInputs()) {
             if (containsCustomUDFCalls(child)) {
                 return true;
@@ -436,7 +434,7 @@ public final class PlanSplitter {
 
     /**
      * Checks whether a single {@link RexNode} expression tree contains a call to a
-     * {@link SqlUserDefinedFunction}. Walks the expression tree recursively.
+     * {@link SqlUserDefinedFunction}.
      */
     private static boolean containsUDFCall(RexNode rex) {
         if (rex instanceof RexCall) {
@@ -444,7 +442,6 @@ public final class PlanSplitter {
             if (call.getOperator() instanceof SqlUserDefinedFunction) {
                 return true;
             }
-            // Recurse into operands
             for (RexNode operand : call.getOperands()) {
                 if (containsUDFCall(operand)) {
                     return true;

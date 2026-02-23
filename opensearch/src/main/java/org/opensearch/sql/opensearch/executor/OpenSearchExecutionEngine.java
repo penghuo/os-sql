@@ -234,8 +234,8 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
         client.schedule(() -> distributedExecutor.execute(dqePlan, dqeConnection, listener));
         return;
       }
-      // dqePlan is null means no OpenSearch scan found or unsupported pattern — fall through
-      // to legacy path with original rel so legacy path can optimize as it normally does
+      // PlanSplitter returned null — plan pattern not supported by DQE (e.g., UDFs,
+      // system index queries). Fall through to the legacy JDBC path.
     }
 
     // Legacy JDBC path

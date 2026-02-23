@@ -52,9 +52,9 @@ import org.opensearch.sql.opensearch.storage.scan.context.PushDownContext;
  *       DSLScan, CalciteLogicalIndexScan), execute directly via {@code scan()}.
  *   <li><b>Interpreter path</b>: If the plan root is a non-Scannable operator (e.g., LogicalSort,
  *       LogicalAggregate, LogicalProject, LogicalFilter, LogicalSystemLimit), use Calcite's
- *       {@link Interpreter} to execute the plan tree. The Interpreter handles standard relational
- *       operators natively. The scan leaf is wrapped in a {@link ScannableTable} so the Interpreter
- *       can read data from it.
+ *       {@link Interpreter} to walk the plan tree. The Interpreter handles standard Calcite
+ *       built-in functions but cannot execute {@code SqlUserDefinedFunction} operators (which
+ *       require code generation).
  * </ul>
  *
  * <p>All exceptions are caught and returned in the result — this class never throws.
@@ -177,8 +177,8 @@ public class ShardCalciteRuntime {
      * any table name to a {@link RelOptTable} backed by a {@link ShardScannableTable} wrapper
      * around the given {@link OpenSearchIndex}. This allows Calcite's {@code RelJsonReader} to
      * resolve table references when constructing {@code DSLScan} nodes from JSON, and ensures
-     * that Calcite's {@link org.apache.calcite.interpreter.TableScanNode} can unwrap the table
-     * as a {@link ScannableTable} during Interpreter-based execution.
+     * that Calcite's code generation can unwrap the table as a {@link ScannableTable} during
+     * execution.
      */
     private static RelOptSchema createShardSchema(OpenSearchIndex osIndex,
             RelOptCluster cluster) {
@@ -205,28 +205,23 @@ public class ShardCalciteRuntime {
     }
 
     /**
-     * Executes a non-Scannable plan tree using Calcite's {@link Interpreter}. The Interpreter can
-     * handle standard logical operators (Filter, Project, Sort, Aggregate, etc.) natively.
-     *
-     * <p>The scan leaf's {@link RelOptTable} was created in {@link #createShardSchema} backed by a
-     * {@link ShardScannableTable}, so the Interpreter's {@code TableScanNode} can unwrap it as a
-     * {@link ScannableTable} and read data directly.
+     * Executes a non-Scannable plan tree using Calcite's {@link Interpreter}. The Interpreter
+     * walks the plan tree and evaluates operators one row at a time. It handles standard Calcite
+     * built-in functions but cannot execute {@code SqlUserDefinedFunction} operators (which
+     * require code generation via the EnumerableRel path).
      *
      * @param plan the deserialized plan tree with a non-Scannable root
-     * @return an Enumerable of Object[] rows
+     * @return an Enumerable of rows
      */
     private Enumerable<Object[]> executeWithInterpreter(RelNode plan) {
-        // Create a minimal DataContext for the Interpreter
-        DataContext dataContext = createInterpreterDataContext(
-                Frameworks.createRootSchema(false));
-
-        // Execute via Interpreter — the scan leaf's RelOptTable already wraps a ScannableTable
+        DataContext dataContext = createInterpreterDataContext(Frameworks.createRootSchema(false));
         return new Interpreter(dataContext, plan);
     }
 
     /**
-     * Creates a minimal {@link DataContext} for the Calcite {@link Interpreter}. The DataContext
-     * provides the root schema (containing the ScannableTable wrapper) and the type factory.
+     * Creates a minimal {@link DataContext} for the {@link Interpreter}. The DataContext provides
+     * the root schema and type factory needed by the Interpreter to resolve types and schemas
+     * during plan execution.
      */
     private static DataContext createInterpreterDataContext(SchemaPlus rootSchema) {
         return new DataContext() {
@@ -253,19 +248,12 @@ public class ShardCalciteRuntime {
     }
 
     /**
-     * Collect rows from an Enumerable result. Two producers feed into this method:
+     * Collect rows from an Enumerable result produced by the fast path ({@link Scannable#scan()}).
+     * Returns {@code Enumerable<Object>} where single-column rows are scalar values and
+     * multi-column rows are {@code Object[]}.
      *
-     * <ul>
-     *   <li><b>Fast path</b> ({@link Scannable#scan()}): returns {@code Enumerable<Object>} where
-     *       single-column rows are scalar values and multi-column rows are {@code Object[]}.
-     *   <li><b>Interpreter path</b> ({@link Interpreter}): returns {@code Enumerable<Object[]>}
-     *       where every row is always {@code Object[]}, even for single-column results.
-     * </ul>
-     *
-     * <p>The {@code instanceof Object[]} check must come BEFORE the {@code columnCount == 1}
-     * check. Otherwise, an Interpreter single-column row like {@code Object[]{42L}} would be
-     * double-wrapped into {@code Object[]{Object[]{42L}}}, causing downstream "Object[] cannot
-     * be cast to Number/String" errors in exchange merge logic.
+     * <p>The {@code instanceof Object[]} check must come BEFORE the scalar wrap to avoid
+     * double-wrapping multi-column rows.
      */
     private List<Object[]> collectRows(Enumerable<?> enumerable, int columnCount) {
         List<Object[]> rows = new ArrayList<>();
@@ -290,14 +278,14 @@ public class ShardCalciteRuntime {
     /**
      * A {@link ScannableTable} implementation that wraps an {@link OpenSearchIndex} for shard-side
      * execution. This is used during plan deserialization so that the {@link RelOptTableImpl}
-     * created by {@link #createShardSchema} is backed by a {@link ScannableTable}. Calcite's
-     * Interpreter {@code TableScanNode} calls {@code relOptTable.unwrap(ScannableTable.class)}
-     * to obtain the table, so this wrapper ensures that unwrap succeeds.
+     * created by {@link #createShardSchema} is backed by a {@link ScannableTable}. Calcite
+     * calls {@code relOptTable.unwrap(ScannableTable.class)} to obtain the table, so this
+     * wrapper ensures that unwrap succeeds.
      *
      * <p>The scan implementation creates a fresh {@link PushDownContext} and
      * {@link OpenSearchRequestBuilder} from the {@link OpenSearchIndex}, then returns rows via
      * {@link OpenSearchIndexEnumerator}. Single-column rows from the enumerator (which are
-     * returned as scalars) are wrapped in {@code Object[]} since the Interpreter expects
+     * returned as scalars) are wrapped in {@code Object[]} since Calcite expects
      * {@code Enumerable<Object[]>}.
      */
     static class ShardScannableTable extends AbstractTable implements ScannableTable {

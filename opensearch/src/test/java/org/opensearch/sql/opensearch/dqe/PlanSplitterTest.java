@@ -516,9 +516,10 @@ class PlanSplitterTest {
     }
 
     @Test
-    @DisplayName("Project with SqlUserDefinedFunction (e.g. date()) causes DQE skip")
+    @DisplayName("Project with UDF (e.g. date()) skips DQE (Interpreter cannot execute UDFs)")
     void projectWithUDF_skipsDQE() {
-        // Build a project that uses PPL's DATE() UDF
+        // SqlUserDefinedFunction operators require code generation (EnumerableRel path).
+        // The shard-side Interpreter cannot execute them, so DQE must be skipped.
         RelNode plan =
                 injectDSLScan(
                         relBuilder
@@ -531,14 +532,14 @@ class PlanSplitterTest {
 
         DistributedPlan result = PlanSplitter.split(plan);
 
-        // Plans containing custom UDFs should fall back to non-DQE path
-        assertNull(result, "Plans with custom UDFs should skip DQE");
+        assertNull(result, "Plans with UDFs should skip DQE");
     }
 
     @Test
-    @DisplayName("Filter with SqlUserDefinedFunction causes DQE skip")
+    @DisplayName("Filter with UDF (e.g. date()) skips DQE (Interpreter cannot execute UDFs)")
     void filterWithUDF_skipsDQE() {
-        // Build a filter that uses PPL's DATE() UDF in its condition
+        // SqlUserDefinedFunction operators require code generation (EnumerableRel path).
+        // The shard-side Interpreter cannot execute them, so DQE must be skipped.
         RelNode plan =
                 injectDSLScan(
                         relBuilder
@@ -554,7 +555,7 @@ class PlanSplitterTest {
 
         DistributedPlan result = PlanSplitter.split(plan);
 
-        assertNull(result, "Plans with custom UDFs in filter should skip DQE");
+        assertNull(result, "Plans with UDFs in filter should skip DQE");
     }
 
     @Test

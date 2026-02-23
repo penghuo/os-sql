@@ -239,9 +239,10 @@ class ShardCalciteRuntimeTest {
     }
 
     @Test
-    @DisplayName("Non-Scannable plan without Scannable leaf is handled by Interpreter natively")
+    @DisplayName("Non-Scannable plan without scan leaf is handled by Interpreter")
     void execute_nonScannablePlan_noLeaf_handledByInterpreter() {
-        // LogicalValues has no Scannable leaf but the Interpreter handles it natively
+        // LogicalValues is not Scannable, so it falls through to the Interpreter path.
+        // The Interpreter can handle LogicalValues (empty relation) and returns zero rows.
         RelDataType rowType =
                 OpenSearchTypeFactory.TYPE_FACTORY
                         .builder()
@@ -258,7 +259,8 @@ class ShardCalciteRuntimeTest {
 
             ShardCalciteRuntime.Result result = runtime.execute(fakePlanJson, "test-index", 0, mockOsIndex);
 
-            assertFalse(result.hasError());
+            // Interpreter handles LogicalValues (empty relation) and returns zero rows.
+            assertFalse(result.hasError(), "Interpreter should handle LogicalValues without error");
             assertEquals(0, result.getRows().size());
             assertEquals(List.of("x"), result.getColumnNames());
             assertEquals(List.of(SqlTypeName.INTEGER), result.getColumnTypes());
@@ -294,11 +296,10 @@ class ShardCalciteRuntimeTest {
     }
 
     @Test
-    @DisplayName("Interpreter single-column result (Object[]) is not double-wrapped")
+    @DisplayName("Interpreter single-column result returned as Object[] is not double-wrapped")
     void execute_interpreterSingleColumn_notDoubleWrapped() {
-        // The Interpreter always returns Object[] rows, even for single columns.
-        // Simulate a non-Scannable plan that goes through the Interpreter path by
-        // using a Scannable that returns Object[] for single-column (as Interpreter does).
+        // The Interpreter always returns Object[] rows, even for single-column results.
+        // Verify that collectRows does not double-wrap them.
         RelDataType rowType =
                 OpenSearchTypeFactory.TYPE_FACTORY
                         .builder()

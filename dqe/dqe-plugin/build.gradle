@@ -138,8 +138,14 @@ tasks.register('checkClasspathConflicts') {
         }
 
         // Collect all class names from compileOnly (OpenSearch core) dependencies
+        // Create a resolvable copy since compileOnly is not directly resolvable in Gradle 9+
         def opensearchClasses = new HashSet<String>()
-        configurations.compileOnly.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+        def resolvableCompileOnly = configurations.create("resolvableCompileOnly") {
+            extendsFrom configurations.compileOnly
+            canBeResolved = true
+            canBeConsumed = false
+        }
+        resolvableCompileOnly.resolvedConfiguration.resolvedArtifacts.each { artifact ->
             def file = artifact.file
             if (file.name.endsWith('.jar') && file.exists()) {
                 def jarFile = new java.util.zip.ZipFile(file)

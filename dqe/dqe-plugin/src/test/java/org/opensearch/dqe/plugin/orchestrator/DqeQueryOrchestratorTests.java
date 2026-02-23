@@ -140,9 +140,9 @@ class DqeQueryOrchestratorTests {
       assertEquals("dqe", response.getEngine());
       assertEquals(2, response.getSchema().size());
       assertEquals("col1", response.getSchema().get(0).getName());
-      assertEquals("bigint", response.getSchema().get(0).getType());
+      assertEquals("BIGINT", response.getSchema().get(0).getType());
       assertEquals("col2", response.getSchema().get(1).getName());
-      assertEquals("varchar", response.getSchema().get(1).getType());
+      assertEquals("VARCHAR", response.getSchema().get(1).getType());
     }
 
     @Test

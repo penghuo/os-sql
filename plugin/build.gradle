@@ -120,6 +120,10 @@ configurations.all {
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+    // DQE (Trino) brings newer versions; force to resolve conflicts.
+    // These are relocated in the shadow JAR at runtime.
+    resolutionStrategy.force "org.antlr:antlr4-runtime:4.13.1"
+    resolutionStrategy.force "jakarta.annotation:jakarta.annotation-api:2.1.1"
 }
 
 configurations {
@@ -166,6 +170,7 @@ dependencies {
     api project(':datasources')
     api project(':async-query')
     api project(':direct-query')
+    api project(':dqe:dqe-plugin')
 
     testImplementation group: 'net.bytebuddy', name: 'byte-buddy-agent', version: '1.15.11'
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"

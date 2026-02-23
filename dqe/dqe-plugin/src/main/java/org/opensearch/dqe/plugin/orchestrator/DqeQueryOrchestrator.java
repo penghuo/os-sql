@@ -199,7 +199,7 @@ public class DqeQueryOrchestrator {
       for (int i = 0; i < analyzed.getOutputColumnNames().size(); i++) {
         String colName = analyzed.getOutputColumnNames().get(i);
         DqeType colType = analyzed.getOutputColumnTypes().get(i);
-        schema.add(new DqeQueryResponse.ColumnSchema(colName, colType.getDisplayName().toLowerCase()));
+        schema.add(new DqeQueryResponse.ColumnSchema(colName, colType.getDisplayName()));
       }
 
       // Build stats

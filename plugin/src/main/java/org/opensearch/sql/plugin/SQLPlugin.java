@@ -89,6 +89,11 @@ import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
+import org.opensearch.dqe.plugin.DqeEnginePlugin;
+import org.opensearch.dqe.plugin.request.DqeRequestParser;
+import org.opensearch.dqe.plugin.response.DqeResponseFormatter;
+import org.opensearch.dqe.plugin.routing.EngineRouter;
+import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.opensearch.storage.OpenSearchDataSourceFactory;
@@ -138,6 +143,7 @@ public class SQLPlugin extends Plugin
   private DataSourceServiceImpl dataSourceService;
   private OpenSearchAsyncQueryScheduler asyncQueryScheduler;
   private Injector injector;
+  private DqeEnginePlugin dqeEnginePlugin;
 
   public String name() {
     return "sql";
@@ -161,9 +167,28 @@ public class SQLPlugin extends Plugin
 
     Metrics.getInstance().registerDefaultMetrics();
 
+    RestSqlAction restSqlAction = new RestSqlAction(settings, injector);
+
+    // Wire DQE routing and execution if the engine plugin was initialized
+    if (dqeEnginePlugin != null) {
+      EngineRouter engineRouter = dqeEnginePlugin.getEngineRouter();
+      restSqlAction.setDqeEngineRouting(engineRouter::shouldUseDqe);
+
+      DqeRequestParser dqeRequestParser =
+          new DqeRequestParser(dqeEnginePlugin.getDqeSettings());
+      DqeResponseFormatter dqeResponseFormatter = new DqeResponseFormatter();
+      restSqlAction.setDqeExecutionFunction(
+          requestBody -> {
+            var dqeRequest = dqeRequestParser.parse(requestBody);
+            var dqeResponse = engineRouter.executeQuery(dqeRequest);
+            return dqeResponseFormatter.formatSuccess(dqeResponse);
+          });
+      LOGGER.info("DQE engine routing and execution wired into RestSqlAction");
+    }
+
     return Arrays.asList(
         new RestPPLQueryAction(),
-        new RestSqlAction(settings, injector),
+        restSqlAction,
         new RestSqlStatsAction(settings, restController),
         new RestPPLStatsAction(settings, restController),
         new RestQuerySettingsAction(settings, restController),
@@ -285,6 +310,18 @@ public class SQLPlugin extends Plugin
     ScheduledAsyncQueryJobRunner.getJobRunnerInstance()
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);
 
+    // Initialize DQE engine plugin
+    try {
+      this.dqeEnginePlugin =
+          new DqeEnginePlugin(
+              environment.settings(), clusterService, threadPool, (NodeClient) client);
+      dqeEnginePlugin.initialize();
+      LOGGER.info("DQE engine plugin initialized successfully");
+    } catch (Exception e) {
+      LOGGER.warn("Failed to initialize DQE engine plugin; DQE routing will be disabled", e);
+      this.dqeEnginePlugin = null;
+    }
+
     return ImmutableList.of(
         dataSourceService,
         asyncQueryExecutorService,
@@ -340,6 +377,7 @@ public class SQLPlugin extends Plugin
     return new ImmutableList.Builder<Setting<?>>()
         .addAll(OpenSearchSettings.pluginSettings())
         .addAll(OpenSearchSettings.pluginNonDynamicSettings())
+        .addAll(DqeSettings.getAllSettings())
         .build();
   }
 

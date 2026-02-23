@@ -88,12 +88,14 @@ public class RestSqlAction extends BaseRestHandler {
    * DQE engine routing function. Accepts the request engine field (nullable) and returns true if
    * the request should be handled by DQE. May throw a RuntimeException (e.g. DqeException) if DQE
    * is disabled or the engine value is invalid. Defaults to always-false (DQE not wired).
-   *
-   * <p>Known limitation: Until the SQLPlugin wires the DqeEnginePlugin's EngineRouter into this
-   * handler, DQE routing is not active. This will be completed when PL-10 lands and the plugin
-   * module integrates dqe-plugin.
    */
   private volatile Function<String, Boolean> dqeRoutingFunction = engine -> false;
+
+  /**
+   * DQE execution function. Accepts a JSON request body and returns a JSON response string. Set by
+   * SQLPlugin after DqeEnginePlugin is initialized.
+   */
+  private volatile Function<String, String> dqeExecutionFunction = null;
 
   public RestSqlAction(Settings settings, Injector injector) {
     super();
@@ -109,6 +111,17 @@ public class RestSqlAction extends BaseRestHandler {
    */
   public void setDqeEngineRouting(Function<String, Boolean> routingFunction) {
     this.dqeRoutingFunction = routingFunction;
+  }
+
+  /**
+   * Sets the DQE execution function. Called by SQLPlugin after DqeEnginePlugin is initialized. The
+   * function accepts a JSON request body string and returns a JSON response string. Errors are
+   * thrown as RuntimeException (DqeException).
+   *
+   * @param executionFunction function that executes a DQE query and returns JSON
+   */
+  public void setDqeExecutionFunction(Function<String, String> executionFunction) {
+    this.dqeExecutionFunction = executionFunction;
   }
 
   @Override
@@ -177,16 +190,32 @@ public class RestSqlAction extends BaseRestHandler {
           LOG.info(
               "[{}] Request routed to DQE engine",
               QueryContext.getRequestId());
-          // PL-10 (DqeQueryOrchestrator) is not yet implemented; return placeholder error.
+          if (dqeExecutionFunction == null) {
+            return channel -> {
+              channel.sendResponse(
+                  new BytesRestResponse(
+                      INTERNAL_SERVER_ERROR,
+                      "application/json; charset=UTF-8",
+                      "{\"error\":{\"reason\":\"DQE engine not initialized\","
+                          + "\"type\":\"DqeException\","
+                          + "\"engine\":\"dqe\"},"
+                          + "\"status\":500}"));
+            };
+          }
+          // Execute the query through the DQE engine
+          final String requestBody = sqlRequest.getJsonContent().toString();
           return channel -> {
-            channel.sendResponse(
-                new BytesRestResponse(
-                    BAD_REQUEST,
-                    "application/json; charset=UTF-8",
-                    "{\"error\":{\"reason\":\"DQE query execution not yet implemented\","
-                        + "\"type\":\"DqeException\","
-                        + "\"engine\":\"dqe\"},"
-                        + "\"status\":400}"));
+            try {
+              String jsonResponse = dqeExecutionFunction.apply(requestBody);
+              channel.sendResponse(
+                  new BytesRestResponse(OK, "application/json; charset=UTF-8", jsonResponse));
+            } catch (RuntimeException dqeError) {
+              LOG.warn(
+                  "[{}] DQE execution error: {}",
+                  QueryContext.getRequestId(),
+                  dqeError.getMessage());
+              reportError(channel, dqeError, BAD_REQUEST);
+            }
           };
         }
       } catch (RuntimeException dqeEx) {

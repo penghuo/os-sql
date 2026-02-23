@@ -234,8 +234,11 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
         client.schedule(() -> distributedExecutor.execute(dqePlan, dqeConnection, listener));
         return;
       }
-      // PlanSplitter returned null — plan pattern not supported by DQE (e.g., UDFs,
-      // system index queries). Fall through to the legacy JDBC path.
+      // PlanSplitter returned null — plan not distributable (e.g., system index queries,
+      // relevance functions). Strict mode: surface this so we see the real DQE numbers.
+      throw new UnsupportedOperationException(
+          "DQE: PlanSplitter returned null for plan that reached the distributed executor. "
+              + "This plan pattern is not supported by DQE.");
     }
 
     // Legacy JDBC path

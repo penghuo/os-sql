@@ -8,7 +8,9 @@ package org.opensearch.sql.opensearch.dqe;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.calcite.adapter.enumerable.EnumerableRel;
 import org.apache.calcite.adapter.enumerable.EnumerableRelImplementor;
 import org.apache.calcite.adapter.enumerable.PhysType;
@@ -31,8 +33,7 @@ import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
-import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
+import org.apache.calcite.sql.SqlOperator;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -88,11 +89,12 @@ public final class PlanSplitter {
             return null;
         }
 
-        // Skip DQE for plans containing custom UDF calls (e.g., date(), time(), datetime(),
-        // week()). The shard-side Interpreter cannot execute SqlUserDefinedFunction operators
-        // because they use ImplementableFunction/CallImplementor which requires code generation
-        // (EnumerableRel path). The Interpreter only handles standard Calcite built-in functions.
-        if (containsCustomUDFCalls(plan)) {
+        // Skip DQE for plans containing relevance functions (match, query_string, etc.)
+        // that MUST be executed on OpenSearch via DSL pushdown and cannot run in the
+        // shard-side Interpreter. Regular UDFs (date(), time(), etc.) are allowed because
+        // the toOp() fix in ExtendedRelJson resolves them to SqlUserDefinedFunction with
+        // CallImplementor, which the Interpreter's JaninoRexCompiler can compile.
+        if (containsRelevanceFunctions(plan)) {
             return null;
         }
 
@@ -388,44 +390,53 @@ public final class PlanSplitter {
     }
 
     /**
-     * Checks whether the plan contains any custom UDF calls ({@link SqlUserDefinedFunction} or
-     * {@link SqlUserDefinedAggFunction}). Custom UDFs use {@code ImplementableFunction} /
-     * {@code CallImplementor} which requires Calcite code generation (EnumerableRel path).
-     * The shard-side Interpreter cannot execute them.
+     * Relevance function names that require OpenSearch DSL pushdown and cannot execute in the
+     * shard-side Interpreter. These are the only functions that should cause DQE to be skipped.
+     */
+    private static final Set<String> RELEVANCE_FUNCTION_NAMES = Set.of(
+            "match", "match_phrase", "match_bool_prefix", "match_phrase_prefix",
+            "simple_query_string", "query_string", "multi_match",
+            "wildcard_query", "query");
+
+    /**
+     * Checks whether the plan contains any relevance function calls that require OpenSearch DSL
+     * pushdown. Only these specific functions cause DQE to be skipped; regular UDFs (date(),
+     * time(), etc.) are allowed through because the Interpreter can compile them via
+     * CallImplementor.
      *
      * <p>Checks Project (projections), Filter (condition), Calc (program), and Aggregate
-     * (agg calls) for UDF references.
+     * (agg calls) for relevance function references.
      */
-    private static boolean containsCustomUDFCalls(RelNode node) {
+    private static boolean containsRelevanceFunctions(RelNode node) {
         if (node instanceof Project) {
             for (RexNode rex : ((Project) node).getProjects()) {
-                if (containsUDFCall(rex)) {
+                if (containsRelevanceCall(rex)) {
                     return true;
                 }
             }
         }
         if (node instanceof Filter) {
-            if (containsUDFCall(((Filter) node).getCondition())) {
+            if (containsRelevanceCall(((Filter) node).getCondition())) {
                 return true;
             }
         }
         if (node instanceof Calc) {
             Calc calc = (Calc) node;
             for (RexNode rex : calc.getProgram().getExprList()) {
-                if (containsUDFCall(rex)) {
+                if (containsRelevanceCall(rex)) {
                     return true;
                 }
             }
         }
         if (node instanceof Aggregate) {
             for (AggregateCall aggCall : ((Aggregate) node).getAggCallList()) {
-                if (aggCall.getAggregation() instanceof SqlUserDefinedAggFunction) {
+                if (isRelevanceOperator(aggCall.getAggregation())) {
                     return true;
                 }
             }
         }
         for (RelNode child : node.getInputs()) {
-            if (containsCustomUDFCalls(child)) {
+            if (containsRelevanceFunctions(child)) {
                 return true;
             }
         }
@@ -433,22 +444,30 @@ public final class PlanSplitter {
     }
 
     /**
-     * Checks whether a single {@link RexNode} expression tree contains a call to a
-     * {@link SqlUserDefinedFunction}.
+     * Checks whether a single {@link RexNode} expression tree contains a call to a relevance
+     * function that requires OpenSearch DSL pushdown.
      */
-    private static boolean containsUDFCall(RexNode rex) {
+    private static boolean containsRelevanceCall(RexNode rex) {
         if (rex instanceof RexCall) {
             RexCall call = (RexCall) rex;
-            if (call.getOperator() instanceof SqlUserDefinedFunction) {
+            if (isRelevanceOperator(call.getOperator())) {
                 return true;
             }
             for (RexNode operand : call.getOperands()) {
-                if (containsUDFCall(operand)) {
+                if (containsRelevanceCall(operand)) {
                     return true;
                 }
             }
         }
         return false;
+    }
+
+    /**
+     * Checks whether the given operator is a relevance function by comparing its name
+     * (case-insensitively) against the known set of relevance function names.
+     */
+    private static boolean isRelevanceOperator(SqlOperator operator) {
+        return RELEVANCE_FUNCTION_NAMES.contains(operator.getName().toLowerCase(Locale.ROOT));
     }
 
     /** Checks whether the plan contains at least one OpenSearch scan (DSLScan or similar). */

@@ -516,10 +516,10 @@ class PlanSplitterTest {
     }
 
     @Test
-    @DisplayName("Project with UDF (e.g. date()) skips DQE (Interpreter cannot execute UDFs)")
-    void projectWithUDF_skipsDQE() {
-        // SqlUserDefinedFunction operators require code generation (EnumerableRel path).
-        // The shard-side Interpreter cannot execute them, so DQE must be skipped.
+    @DisplayName("Project with UDF (e.g. date()) does NOT skip DQE (Interpreter handles UDFs via CallImplementor)")
+    void projectWithUDF_doesNotSkipDQE() {
+        // The toOp() fix in ExtendedRelJson resolves UDFs to SqlUserDefinedFunction with
+        // CallImplementor. The Interpreter's JaninoRexCompiler can compile them.
         RelNode plan =
                 injectDSLScan(
                         relBuilder
@@ -532,14 +532,14 @@ class PlanSplitterTest {
 
         DistributedPlan result = PlanSplitter.split(plan);
 
-        assertNull(result, "Plans with UDFs should skip DQE");
+        assertNotNull(result, "Plans with regular UDFs should use DQE");
     }
 
     @Test
-    @DisplayName("Filter with UDF (e.g. date()) skips DQE (Interpreter cannot execute UDFs)")
-    void filterWithUDF_skipsDQE() {
-        // SqlUserDefinedFunction operators require code generation (EnumerableRel path).
-        // The shard-side Interpreter cannot execute them, so DQE must be skipped.
+    @DisplayName("Filter with UDF (e.g. date()) does NOT skip DQE (Interpreter handles UDFs via CallImplementor)")
+    void filterWithUDF_doesNotSkipDQE() {
+        // The toOp() fix in ExtendedRelJson resolves UDFs to SqlUserDefinedFunction with
+        // CallImplementor. The Interpreter's JaninoRexCompiler can compile them.
         RelNode plan =
                 injectDSLScan(
                         relBuilder
@@ -555,7 +555,28 @@ class PlanSplitterTest {
 
         DistributedPlan result = PlanSplitter.split(plan);
 
-        assertNull(result, "Plans with UDFs in filter should skip DQE");
+        assertNotNull(result, "Plans with regular UDFs in filter should use DQE");
+    }
+
+    @Test
+    @DisplayName("Relevance function (match) in filter skips DQE (requires OpenSearch DSL pushdown)")
+    void filterWithRelevanceFunction_skipsDQE() {
+        // Relevance functions like match() require OpenSearch DSL pushdown and cannot
+        // execute in the shard-side Interpreter.
+        RelNode plan =
+                injectDSLScan(
+                        relBuilder
+                                .scan("t")
+                                .filter(
+                                        relBuilder.call(
+                                                PPLBuiltinOperators.MATCH,
+                                                relBuilder.field("b"),
+                                                relBuilder.literal("search term")))
+                                .build());
+
+        DistributedPlan result = PlanSplitter.split(plan);
+
+        assertNull(result, "Plans with relevance functions should skip DQE");
     }
 
     @Test

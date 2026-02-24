@@ -7,6 +7,8 @@ package org.opensearch.sql.opensearch.dqe;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
 import lombok.Getter;
 import org.apache.calcite.DataContext;
 import org.apache.calcite.interpreter.Interpreter;
@@ -221,9 +223,26 @@ public class ShardCalciteRuntime {
     /**
      * Creates a minimal {@link DataContext} for the {@link Interpreter}. The DataContext provides
      * the root schema and type factory needed by the Interpreter to resolve types and schemas
-     * during plan execution.
+     * during plan execution. It also supplies Calcite's built-in {@link DataContext.Variable}
+     * values (timestamps, timezone, locale) which Calcite-generated code retrieves via
+     * {@code Variable.get(DataContext)}.
      */
     private static DataContext createInterpreterDataContext(SchemaPlus rootSchema) {
+        long currentTimeMillis = System.currentTimeMillis();
+        TimeZone timeZone = TimeZone.getTimeZone("UTC");
+        long tzOffset = timeZone.getOffset(currentTimeMillis);
+
+        // Build a map matching what Calcite's CalciteConnectionImpl.DataContextImpl provides.
+        // Timestamps are in milliseconds since epoch (consistent with Calcite's internal usage).
+        java.util.Map<String, Object> variableMap = new java.util.HashMap<>();
+        variableMap.put(DataContext.Variable.UTC_TIMESTAMP.camelName, currentTimeMillis);
+        variableMap.put(
+                DataContext.Variable.CURRENT_TIMESTAMP.camelName, currentTimeMillis + tzOffset);
+        variableMap.put(
+                DataContext.Variable.LOCAL_TIMESTAMP.camelName, currentTimeMillis + tzOffset);
+        variableMap.put(DataContext.Variable.TIME_ZONE.camelName, timeZone);
+        variableMap.put(DataContext.Variable.LOCALE.camelName, Locale.ROOT);
+
         return new DataContext() {
             @Override
             public SchemaPlus getRootSchema() {
@@ -242,7 +261,7 @@ public class ShardCalciteRuntime {
 
             @Override
             public Object get(String name) {
-                return null;
+                return variableMap.get(name);
             }
         };
     }

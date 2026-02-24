@@ -29,6 +29,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprTupleValue;
+import org.opensearch.sql.data.model.ExprNullValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -290,7 +291,11 @@ public class DistributedExecutor {
         Map<String, ExprValue> rowMap = new LinkedHashMap<>();
         for (int i = 0; i < fieldNames.size() && i < row.length; i++) {
           Object value = coerceForType(row[i], columnTypes[i]);
-          rowMap.put(fieldNames.get(i), ExprValueUtils.fromObjectValue(value, columnTypes[i]));
+          rowMap.put(
+              fieldNames.get(i),
+              value == null
+                  ? ExprNullValue.of()
+                  : ExprValueUtils.fromObjectValue(value, columnTypes[i]));
         }
         resultValues.add(ExprTupleValue.fromExprValueMap(rowMap));
       }

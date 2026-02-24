@@ -44,10 +44,13 @@ import urllib.request
 import urllib.error
 
 
-def execute_query(url: str, query: str) -> dict:
-    """Execute a DQE SQL query via the REST API."""
+def execute_query(url: str, query: str, engine: str = "dqe") -> dict:
+    """Execute a SQL query via the REST API using the specified engine."""
     endpoint = f"{url}/_plugins/_sql"
-    payload = json.dumps({"query": query}).encode("utf-8")
+    body = {"query": query}
+    if engine:
+        body["engine"] = engine
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         endpoint,
         data=payload,

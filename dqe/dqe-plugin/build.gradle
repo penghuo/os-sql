@@ -47,6 +47,16 @@ shadowJar {
     exclude 'META-INF/*.DSA'
     exclude 'META-INF/*.RSA'
     exclude 'module-info.class'
+
+    // Exclude transitive dependency classes that are already on the OpenSearch
+    // classpath (jsr305, checker-framework, jol-core, etc.) to avoid jar hell.
+    exclude 'javax/**'
+    exclude 'jakarta/**'
+    exclude 'org/checkerframework/**'
+    exclude 'org/openjdk/**'
+    exclude 'io/opentelemetry/**'
+    exclude 'com/google/errorprone/**'
+    exclude 'com/google/thirdparty/**'
 }
 
 // Ensure shadowJar is built as part of the standard assemble lifecycle

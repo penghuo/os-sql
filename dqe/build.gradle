@@ -1,0 +1,102 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+plugins {
+    id 'java-library'
+    id "io.freefair.lombok"
+    id 'jacoco'
+    id 'com.diffplug.spotless'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Trino parser (includes AST tree nodes)
+    // Note: version 442 is the last release compiled for Java 21 (class file 65.0).
+    // Version 443+ requires Java 22+, and 467+ requires Java 23.
+    implementation('io.trino:trino-parser:442') {
+        exclude group: 'com.google.guava', module: 'guava'
+        exclude group: 'jakarta.annotation', module: 'jakarta.annotation-api'
+    }
+
+    // Trino SPI (Block, Page, Type system)
+    implementation('io.trino:trino-spi:442') {
+        exclude group: 'com.google.guava', module: 'guava'
+        exclude group: 'com.fasterxml.jackson.core'
+        exclude group: 'io.opentelemetry'
+    }
+
+    // Airlift Slice — standalone, used by Trino for string/binary data
+    implementation 'io.airlift:slice:2.3'
+
+    // ANTLR runtime (Trino's grammar uses 4.13.2)
+    implementation "org.antlr:antlr4-runtime:4.13.2"
+
+    // OpenSearch core
+    compileOnly group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
+    compileOnly group: 'org.opensearch', name: 'opensearch-x-content', version: "${opensearch_version}"
+
+    // Guava (provided by OpenSearch plugin at runtime)
+    implementation group: 'com.google.guava', name: 'guava', version: "${guava_version}"
+
+    // Logging
+    implementation group: 'org.apache.logging.log4j', name: 'log4j-core', version: "${versions.log4j}"
+
+    // Test
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
+    testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"
+    testImplementation group: 'org.mockito', name: 'mockito-core', version: "${mockito_version}"
+    testImplementation group: 'org.mockito', name: 'mockito-junit-jupiter', version: "${mockito_version}"
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+spotless {
+    java {
+        target fileTree('.') {
+            include '**/*.java'
+            exclude '**/build/**', '**/build-*/**'
+        }
+        importOrder()
+        licenseHeader("/*\n" +
+                " * Copyright OpenSearch Contributors\n" +
+                " * SPDX-License-Identifier: Apache-2.0\n" +
+                " */\n\n")
+        removeUnusedImports()
+        trimTrailingWhitespace()
+        endWithNewline()
+        googleJavaFormat('1.32.0').reflowLongStrings().groupArtifact('com.google.googlejavaformat:google-java-format')
+    }
+}
+
+test {
+    maxParallelForks = Runtime.runtime.availableProcessors()
+    useJUnitPlatform()
+    testLogging {
+        events "skipped", "failed"
+        exceptionFormat "full"
+    }
+}
+
+jacocoTestReport {
+    reports {
+        html.required = true
+        xml.required = true
+    }
+}
+test.finalizedBy(project.tasks.jacocoTestReport)
+jacocoTestCoverageVerification {
+    violationRules {
+        rule {
+            limit {
+                minimum = 0.5
+            }
+        }
+    }
+}
+check.dependsOn jacocoTestCoverageVerification
+jacocoTestCoverageVerification.dependsOn jacocoTestReport

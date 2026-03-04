@@ -21,6 +21,9 @@ public class SortNode extends DqePlanNode {
   private final List<Boolean> ascending;
 
   public SortNode(DqePlanNode child, List<String> sortKeys, List<Boolean> ascending) {
+    if (sortKeys.size() != ascending.size()) {
+      throw new IllegalArgumentException("sortKeys and ascending must have the same size");
+    }
     this.child = child;
     this.sortKeys = sortKeys;
     this.ascending = ascending;

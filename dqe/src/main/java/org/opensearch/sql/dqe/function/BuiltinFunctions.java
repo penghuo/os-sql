@@ -12,13 +12,20 @@ import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.List;
+import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
+import org.opensearch.sql.dqe.function.aggregate.AvgAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.BoolAggAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.CountAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.MinMaxAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.StddevVarianceAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.SumAccumulator;
 import org.opensearch.sql.dqe.function.scalar.DateTimeFunctions;
 import org.opensearch.sql.dqe.function.scalar.MathFunctions;
 import org.opensearch.sql.dqe.function.scalar.ScalarFunctionImplementation;
 import org.opensearch.sql.dqe.function.scalar.StringFunctions;
 import org.opensearch.sql.dqe.function.scalar.TrigFunctions;
 
-/** Creates and populates a {@link FunctionRegistry} with all built-in scalar functions. */
+/** Creates and populates a {@link FunctionRegistry} with all built-in functions. */
 public final class BuiltinFunctions {
 
   private BuiltinFunctions() {}
@@ -30,6 +37,7 @@ public final class BuiltinFunctions {
     registerMathFunctions(registry);
     registerDateTimeFunctions(registry);
     registerTrigFunctions(registry);
+    registerAggregateFunctions(registry);
     return registry;
   }
 
@@ -238,6 +246,118 @@ public final class BuiltinFunctions {
         TrigFunctions.atan2());
   }
 
+  private static void registerAggregateFunctions(FunctionRegistry r) {
+    regAgg(r, "count", List.of(), BigintType.BIGINT, CountAccumulator.factory());
+    regAgg(
+        r,
+        "count",
+        List.of(BigintType.BIGINT),
+        BigintType.BIGINT,
+        CountAccumulator.factoryForColumn());
+    regAgg(
+        r,
+        "count",
+        List.of(VarcharType.VARCHAR),
+        BigintType.BIGINT,
+        CountAccumulator.factoryForColumn());
+    regAgg(
+        r,
+        "sum",
+        List.of(BigintType.BIGINT),
+        BigintType.BIGINT,
+        SumAccumulator.factory(BigintType.BIGINT));
+    regAgg(
+        r,
+        "sum",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        SumAccumulator.factory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "avg",
+        List.of(BigintType.BIGINT),
+        DoubleType.DOUBLE,
+        AvgAccumulator.factory(BigintType.BIGINT));
+    regAgg(
+        r,
+        "avg",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        AvgAccumulator.factory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "min",
+        List.of(BigintType.BIGINT),
+        BigintType.BIGINT,
+        MinMaxAccumulator.minFactory(BigintType.BIGINT));
+    regAgg(
+        r,
+        "min",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        MinMaxAccumulator.minFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "min",
+        List.of(VarcharType.VARCHAR),
+        VarcharType.VARCHAR,
+        MinMaxAccumulator.minFactory(VarcharType.VARCHAR));
+    regAgg(
+        r,
+        "max",
+        List.of(BigintType.BIGINT),
+        BigintType.BIGINT,
+        MinMaxAccumulator.maxFactory(BigintType.BIGINT));
+    regAgg(
+        r,
+        "max",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        MinMaxAccumulator.maxFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "max",
+        List.of(VarcharType.VARCHAR),
+        VarcharType.VARCHAR,
+        MinMaxAccumulator.maxFactory(VarcharType.VARCHAR));
+    regAgg(
+        r,
+        "stddev",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        StddevVarianceAccumulator.stddevFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "stddev_samp",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        StddevVarianceAccumulator.stddevFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "variance",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        StddevVarianceAccumulator.varianceFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "var_samp",
+        List.of(DoubleType.DOUBLE),
+        DoubleType.DOUBLE,
+        StddevVarianceAccumulator.varianceFactory(DoubleType.DOUBLE));
+    regAgg(
+        r,
+        "bool_and",
+        List.of(BooleanType.BOOLEAN),
+        BooleanType.BOOLEAN,
+        BoolAggAccumulator.boolAndFactory());
+    regAgg(
+        r,
+        "bool_or",
+        List.of(BooleanType.BOOLEAN),
+        BooleanType.BOOLEAN,
+        BoolAggAccumulator.boolOrFactory());
+  }
+
   private static void reg(
       FunctionRegistry registry,
       String name,
@@ -251,6 +371,22 @@ public final class BuiltinFunctions {
             .returnType(returnType)
             .kind(FunctionKind.SCALAR)
             .scalarImplementation(impl)
+            .build());
+  }
+
+  private static void regAgg(
+      FunctionRegistry registry,
+      String name,
+      List<Type> argTypes,
+      Type returnType,
+      AggregateAccumulatorFactory factory) {
+    registry.register(
+        FunctionMetadata.builder()
+            .name(name)
+            .argumentTypes(argTypes)
+            .returnType(returnType)
+            .kind(FunctionKind.AGGREGATE)
+            .aggregateAccumulatorFactory(factory)
             .build());
   }
 }

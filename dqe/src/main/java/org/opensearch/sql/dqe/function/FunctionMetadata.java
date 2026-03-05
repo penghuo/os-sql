@@ -9,6 +9,7 @@ import io.trino.spi.type.Type;
 import java.util.List;
 import lombok.Builder;
 import lombok.Getter;
+import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
 import org.opensearch.sql.dqe.function.scalar.ScalarFunctionImplementation;
 
 /** Full descriptor for a registered function including its implementation. */
@@ -23,4 +24,5 @@ public class FunctionMetadata {
   @Builder.Default private final boolean deterministic = true;
   @Builder.Default private final boolean nullable = true;
   private final ScalarFunctionImplementation scalarImplementation;
+  private final AggregateAccumulatorFactory aggregateAccumulatorFactory;
 }

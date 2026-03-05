@@ -170,11 +170,17 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
   /**
    * Build a predicate function from a simple predicate string. Currently supports equality
-   * predicates of the form "column = value" where the value is a long integer.
+   * predicates of the form "column = value" where the value is a long integer. Handles
+   * surrounding parentheses that the Trino AST toString() may produce.
    */
   private BiFunction<Page, Integer, Boolean> buildPredicate(
       String predicateString, List<String> columns) {
-    Matcher matcher = EQUALITY_PREDICATE.matcher(predicateString);
+    // Strip surrounding parentheses produced by Trino's Expression.toString()
+    String normalized = predicateString.trim();
+    while (normalized.startsWith("(") && normalized.endsWith(")")) {
+      normalized = normalized.substring(1, normalized.length() - 1).trim();
+    }
+    Matcher matcher = EQUALITY_PREDICATE.matcher(normalized);
     if (!matcher.matches()) {
       throw new UnsupportedOperationException(
           "Unsupported predicate expression: " + predicateString);

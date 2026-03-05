@@ -44,7 +44,7 @@ class OpenSearchPageSourceTest {
   private static final int BATCH_SIZE = 1024;
 
   @Test
-  @DisplayName("SearchRequest uses _only_local preference")
+  @DisplayName("SearchRequest uses shard-scoped preference with _only_local")
   void usesOnlyLocalPreference() {
     // Arrange: capture the SearchRequest passed to the client
     ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
@@ -62,9 +62,9 @@ class OpenSearchPageSourceTest {
     // Act
     source.processNextBatch();
 
-    // Assert
+    // Assert: preference targets the specific shard and stays local
     SearchRequest captured = captor.getValue();
-    assertEquals("_only_local", captured.preference());
+    assertEquals("_shards:" + SHARD_ID + "|_only_local", captured.preference());
   }
 
   @Test

@@ -120,6 +120,10 @@ configurations.all {
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+    // DQE / Trino dependency alignment
+    resolutionStrategy.force "org.antlr:antlr4-runtime:4.13.2"
+    resolutionStrategy.force "io.airlift:slice:2.3"
+    resolutionStrategy.force "org.openjdk.jol:jol-core:0.17"
 }
 
 configurations {

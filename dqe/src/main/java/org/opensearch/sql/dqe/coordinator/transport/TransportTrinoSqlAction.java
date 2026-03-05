@@ -28,7 +28,6 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.io.stream.BytesStreamOutput;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.sql.dqe.common.config.DqeSettings;
@@ -42,6 +41,7 @@ import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
@@ -70,6 +70,9 @@ public class TransportTrinoSqlAction
   private final ClusterService clusterService;
   private final TransportService transportService;
 
+  /** Tracks the dynamic cluster setting for whether DQE is enabled. */
+  private volatile boolean dqeEnabled;
+
   /**
    * Constructor for plugin wiring with dependency injection.
    *
@@ -85,14 +88,19 @@ public class TransportTrinoSqlAction
     super(TrinoSqlAction.NAME, transportService, actionFilters, TrinoSqlRequest::new);
     this.clusterService = clusterService;
     this.transportService = transportService;
+
+    // Initialize from current settings and register a listener for dynamic updates
+    this.dqeEnabled = DqeSettings.DQE_ENABLED.get(clusterService.getSettings());
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(DqeSettings.DQE_ENABLED, enabled -> this.dqeEnabled = enabled);
   }
 
   @Override
   protected void doExecute(
       Task task, ActionRequest request, ActionListener<TrinoSqlResponse> listener) {
-    // Guard: check if DQE is enabled
-    Settings nodeSettings = clusterService.getSettings();
-    if (!DqeSettings.DQE_ENABLED.get(nodeSettings)) {
+    // Guard: check if DQE is enabled (uses volatile field updated by cluster settings listener)
+    if (!dqeEnabled) {
       listener.onFailure(
           new IllegalAccessException("DQE is disabled. Set plugins.dqe.enabled to true."));
       return;
@@ -143,7 +151,8 @@ public class TransportTrinoSqlAction
       List<PlanFragment> shardFragments = fragments.shardFragments();
       DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
-      long timeoutMillis = DqeSettings.QUERY_TIMEOUT.get(nodeSettings).millis();
+      long timeoutMillis =
+          DqeSettings.QUERY_TIMEOUT.get(clusterService.getSettings()).millis();
 
       GroupedActionListener<ShardExecuteResponse> groupedListener =
           new GroupedActionListener<>(
@@ -164,7 +173,14 @@ public class TransportTrinoSqlAction
                         mergedPages = merger.mergePassthrough(shardPages);
                       }
 
-                      // 10. Format response (Page -> JSON for REST client)
+                      // 10. Apply coordinator-level LIMIT (shards each apply their own limit,
+                      //     but the merged result may exceed the global limit)
+                      long globalLimit = findGlobalLimit(optimizedPlan);
+                      if (globalLimit >= 0) {
+                        mergedPages = applyGlobalLimit(mergedPages, globalLimit);
+                      }
+
+                      // 11. Format response (Page -> JSON for REST client)
                       String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
                       listener.onResponse(new TrinoSqlResponse(responseJson));
                     } catch (Exception e) {
@@ -439,5 +455,51 @@ public class TransportTrinoSqlAction
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t");
+  }
+
+  /**
+   * Walk the plan tree to find a LimitNode and return its count. Returns -1 if no limit is present.
+   */
+  static long findGlobalLimit(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<Long, Void>() {
+          @Override
+          public Long visitPlan(DqePlanNode node, Void context) {
+            if (node instanceof LimitNode limitNode) {
+              return limitNode.getCount();
+            }
+            for (DqePlanNode child : node.getChildren()) {
+              Long result = child.accept(this, context);
+              if (result >= 0) {
+                return result;
+              }
+            }
+            return -1L;
+          }
+        },
+        null);
+  }
+
+  /**
+   * Apply a global row limit to merged pages. Trims the list of pages so that at most {@code
+   * limit} total rows are retained.
+   */
+  static List<Page> applyGlobalLimit(List<Page> pages, long limit) {
+    List<Page> result = new ArrayList<>();
+    long remaining = limit;
+    for (Page page : pages) {
+      if (remaining <= 0) {
+        break;
+      }
+      if (page.getPositionCount() <= remaining) {
+        result.add(page);
+        remaining -= page.getPositionCount();
+      } else {
+        // Trim this page to the remaining count
+        result.add(page.getRegion(0, (int) remaining));
+        remaining = 0;
+      }
+    }
+    return result;
   }
 }

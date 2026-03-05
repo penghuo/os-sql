@@ -27,8 +27,10 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -47,6 +49,7 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.dqe.common.config.DqeSettings;
@@ -423,6 +426,11 @@ class TransportTrinoSqlActionTest {
     ClusterState clusterState = mock(ClusterState.class);
     when(clusterService.state()).thenReturn(clusterState);
     when(clusterService.getSettings()).thenReturn(settings);
+
+    // Mock ClusterSettings for dynamic settings update consumer registration
+    Set<org.opensearch.common.settings.Setting<?>> settingSet = new HashSet<>(DqeSettings.settings());
+    ClusterSettings clusterSettings = new ClusterSettings(settings, settingSet);
+    when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
 
     // Mock metadata for OpenSearchMetadata
     Metadata metadata = mock(Metadata.class);

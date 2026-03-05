@@ -193,6 +193,10 @@ configurations.all {
     resolutionStrategy.force "org.slf4j:slf4j-api:1.7.36"
     resolutionStrategy.force "com.amazonaws:aws-java-sdk-core:${aws_java_sdk_version}"
     resolutionStrategy.force "com.google.guava:guava:${guava_version}"
+    // DQE / Trino dependency alignment
+    resolutionStrategy.force "org.antlr:antlr4-runtime:4.13.2"
+    resolutionStrategy.force "io.airlift:slice:2.3"
+    resolutionStrategy.force "org.openjdk.jol:jol-core:0.17"
 }
 
 configurations {

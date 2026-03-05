@@ -91,10 +91,11 @@ public class OpenSearchPageSource implements Operator {
 
     SearchResponse response;
     if (scrollId == null) {
-      // First request: issue a new search with scroll
+      // First request: issue a new search with scroll, scoped to a specific shard
       SearchRequest request = new SearchRequest(indexName);
-      request.preference("_only_local");
-      request.source(new SearchSourceBuilder().query(dslQuery.query()).size(batchSize));
+      request.preference("_shards:" + shardId + "|_only_local");
+      dslQuery.size(batchSize);
+      request.source(dslQuery);
       request.scroll(SCROLL_TIMEOUT);
       response = client.search(request);
       scrollId = response.getScrollId();

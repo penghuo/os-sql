@@ -316,7 +316,8 @@ public class DqeEnginePlugin {
             stageScheduler,
             exchangePushHandler,
             transportService,
-            client);
+            client,
+            threadPool);
 
     // Explain handler (PL-5)
     PlanPrinter planPrinter = new PlanPrinter();

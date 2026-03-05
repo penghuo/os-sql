@@ -133,7 +133,8 @@ class DqeQueryOrchestratorTests {
             stageScheduler,
             new ExchangePushHandler(),
             null,
-            org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class));
+            org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+            org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class));
   }
 
   private AnalyzedQuery buildAnalyzedQuery() {
@@ -273,7 +274,8 @@ class DqeQueryOrchestratorTests {
               null,
               new ExchangePushHandler(),
               null,
-              org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class));
+              org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class));
 
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT 1 FROM t").build();
@@ -458,7 +460,8 @@ class DqeQueryOrchestratorTests {
                   null,
                   new ExchangePushHandler(),
                   null,
-                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -482,7 +485,8 @@ class DqeQueryOrchestratorTests {
                   null,
                   new ExchangePushHandler(),
                   null,
-                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -506,7 +510,8 @@ class DqeQueryOrchestratorTests {
                   null,
                   new ExchangePushHandler(),
                   null,
-                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -530,7 +535,8 @@ class DqeQueryOrchestratorTests {
                   null,
                   new ExchangePushHandler(),
                   null,
-                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
+              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
   }
 }

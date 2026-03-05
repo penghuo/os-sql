@@ -95,6 +95,7 @@ public class DqeQueryOrchestrator {
   private final ExchangePushHandler exchangePushHandler;
   private final TransportService transportService;
   private final org.opensearch.transport.client.Client client;
+  private final org.opensearch.threadpool.ThreadPool threadPool;
 
   /** Active queries by queryId, for cancellation support. */
   private final ConcurrentMap<String, QueryState> activeQueries = new ConcurrentHashMap<>();
@@ -132,7 +133,8 @@ public class DqeQueryOrchestrator {
       StageScheduler stageScheduler,
       ExchangePushHandler exchangePushHandler,
       TransportService transportService,
-      org.opensearch.transport.client.Client client) {
+      org.opensearch.transport.client.Client client,
+      org.opensearch.threadpool.ThreadPool threadPool) {
     this.parser = Objects.requireNonNull(parser, "parser must not be null");
     this.analyzer = Objects.requireNonNull(analyzer, "analyzer must not be null");
     this.metadata = Objects.requireNonNull(metadata, "metadata must not be null");
@@ -153,6 +155,7 @@ public class DqeQueryOrchestrator {
         Objects.requireNonNull(exchangePushHandler, "exchangePushHandler must not be null");
     this.transportService = transportService; // nullable until TransportService is available
     this.client = Objects.requireNonNull(client, "client must not be null");
+    this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
   }
 
   /**
@@ -291,82 +294,25 @@ public class DqeQueryOrchestrator {
         }
       } else if (!splits.isEmpty()) {
         // Local execution path (no TransportService / single-node fallback)
-        // Build shard pipelines directly in-process and collect results
+        // Must run on DQE worker pool to avoid blocking transport threads
         LOG.debug("[{}] Using local execution path ({} splits)", queryId, splits.size());
-
-        var predicateConverter = new org.opensearch.dqe.execution.predicate.PredicateToQueryDslConverter();
-        org.opensearch.index.query.QueryBuilder pushdownQuery = null;
-        if (analyzed.getPredicateAnalysis().isPresent()) {
-          var pushdowns = analyzed.getPredicateAnalysis().get().getPushdownPredicates();
-          if (!pushdowns.isEmpty()) {
-            pushdownQuery = predicateConverter.convertAll(pushdowns);
-          }
+        final AnalyzedQuery finalAnalyzed = analyzed;
+        final long finalBudgetBytes = budgetBytes;
+        final List<DqeShardSplit> finalSplits = splits;
+        java.util.concurrent.Future<?> localFuture = threadPool.executor(
+            org.opensearch.dqe.plugin.DqeEnginePlugin.DQE_WORKER_POOL).submit(() -> {
+          executeLocal(queryId, finalAnalyzed, finalSplits, budget, data, totalRows);
+        });
+        try {
+          localFuture.get(); // Wait for completion
+        } catch (java.util.concurrent.ExecutionException e) {
+          throw (e.getCause() instanceof DqeException) ? (DqeException) e.getCause()
+              : new DqeException("Local execution failed: " + e.getCause().getMessage(),
+                  DqeErrorCode.EXECUTION_ERROR, e.getCause());
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new DqeException("Local execution interrupted", DqeErrorCode.EXECUTION_ERROR, e);
         }
-
-        // Build column descriptors from required columns
-        var requiredColumnHandles = analyzed.getRequiredColumns().isAllColumns()
-            ? java.util.Set.copyOf(metadata.getColumnHandles(clusterService.state(), analyzed.getTable()))
-            : analyzed.getRequiredColumns().getColumns();
-
-        var orderedColumns = new ArrayList<>(requiredColumnHandles);
-        var columnDescriptors = orderedColumns.stream()
-            .map(col -> new org.opensearch.dqe.types.converter.ColumnDescriptor(
-                col.getFieldPath(), col.getType()))
-            .collect(Collectors.toList());
-        var requiredColumnPaths = orderedColumns.stream()
-            .map(org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath)
-            .collect(Collectors.toList());
-
-        // Column name -> channel index in scan output
-        var inputColumnMap = new java.util.LinkedHashMap<String, Integer>();
-        for (int i = 0; i < orderedColumns.size(); i++) {
-          inputColumnMap.put(orderedColumns.get(i).getFieldName(), i);
-          inputColumnMap.putIfAbsent(orderedColumns.get(i).getFieldPath(), i);
-        }
-
-        var converter = new org.opensearch.dqe.types.converter.SearchHitToPageConverter(columnDescriptors, 1000);
-
-        // Process each shard locally
-        for (var splitInfo : splits) {
-          var pitHandle = pitManager.createPit(
-              splitInfo.getIndexName(),
-              org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
-          pitManager.registerPit(queryId, pitHandle);
-          cleanup.registerCleanupAction(() -> {
-            try { pitManager.releasePit(pitHandle); } catch (Exception e) { /* ignore */ }
-          });
-
-          var searchReqBuilder = new org.opensearch.dqe.execution.operator.scan.SearchRequestBuilder(
-              splitInfo.getIndexName(), splitInfo.getShardId(),
-              requiredColumnPaths, pushdownQuery, null, 1000);
-          OperatorContext scanCtx = new OperatorContext(queryId, 0, 0, 0, "ShardScan", budget);
-          Operator pipeline = new org.opensearch.dqe.execution.operator.scan.ShardScanOperator(
-              scanCtx, searchReqBuilder, pitHandle, client, 1000, converter);
-
-          // Add projection if not SELECT *
-          if (!analyzed.isSelectAll() && analyzed.getOutputExpressions() != null
-              && !analyzed.getOutputExpressions().isEmpty()) {
-            var projections = new ArrayList<org.opensearch.dqe.execution.expression.ExpressionEvaluator>();
-            for (var expr : analyzed.getOutputExpressions()) {
-              projections.add(new org.opensearch.dqe.execution.expression.ExpressionEvaluator(expr, inputColumnMap));
-            }
-            OperatorContext projectCtx = new OperatorContext(queryId, 0, 0, 1, "Project", budget);
-            pipeline = new org.opensearch.dqe.execution.operator.ProjectOperator(projectCtx, pipeline, projections);
-          }
-
-          // Drive pipeline, collect pages
-          while (!pipeline.isFinished()) {
-            Page page = pipeline.getOutput();
-            if (page != null && page.getPositionCount() > 0) {
-              totalRows.addAndGet(page.getPositionCount());
-              data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
-            }
-          }
-          pipeline.close();
-        }
-
-        // Apply coordinator-side sort/limit if needed
-        // (For local path, we skip sort/limit for now — data is unordered from shards)
       }
 
       long elapsedMs = System.currentTimeMillis() - startTimeMs;
@@ -466,6 +412,112 @@ public class DqeQueryOrchestrator {
     }
     // Fall back to cluster setting
     return settings.getQueryMaxMemory().getBytes();
+  }
+
+  /** Local execution path — runs shard pipelines in-process without transport exchange. */
+  private void executeLocal(
+      String queryId,
+      AnalyzedQuery analyzed,
+      List<DqeShardSplit> splits,
+      QueryMemoryBudget budget,
+      List<List<Object>> data,
+      AtomicLong totalRows) {
+    var predicateConverter =
+        new org.opensearch.dqe.execution.predicate.PredicateToQueryDslConverter();
+    org.opensearch.index.query.QueryBuilder pushdownQuery = null;
+    if (analyzed.getPredicateAnalysis().isPresent()) {
+      var pushdowns = analyzed.getPredicateAnalysis().get().getPushdownPredicates();
+      if (!pushdowns.isEmpty()) {
+        pushdownQuery = predicateConverter.convertAll(pushdowns);
+      }
+    }
+
+    var requiredColumnHandles =
+        analyzed.getRequiredColumns().isAllColumns()
+            ? java.util.Set.copyOf(
+                metadata.getColumnHandles(clusterService.state(), analyzed.getTable()))
+            : analyzed.getRequiredColumns().getColumns();
+
+    var orderedColumns =
+        new ArrayList<org.opensearch.dqe.metadata.DqeColumnHandle>(requiredColumnHandles);
+    var columnDescriptors =
+        orderedColumns.stream()
+            .map(
+                col ->
+                    new org.opensearch.dqe.types.converter.ColumnDescriptor(
+                        col.getFieldPath(), col.getType()))
+            .collect(Collectors.toList());
+    var requiredColumnPaths =
+        orderedColumns.stream()
+            .map(org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath)
+            .collect(Collectors.toList());
+
+    var inputColumnMap = new java.util.LinkedHashMap<String, Integer>();
+    for (int i = 0; i < orderedColumns.size(); i++) {
+      inputColumnMap.put(orderedColumns.get(i).getFieldName(), i);
+      inputColumnMap.putIfAbsent(orderedColumns.get(i).getFieldPath(), i);
+    }
+
+    var converter =
+        new org.opensearch.dqe.types.converter.SearchHitToPageConverter(columnDescriptors, 1000);
+
+    for (var split : splits) {
+      PitHandle pitHandle =
+          pitManager.createPit(
+              split.getIndexName(),
+              org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
+      pitManager.registerPit(queryId, pitHandle);
+
+      try {
+        var searchReqBuilder =
+            new org.opensearch.dqe.execution.operator.scan.SearchRequestBuilder(
+                split.getIndexName(),
+                split.getShardId(),
+                requiredColumnPaths,
+                pushdownQuery,
+                null,
+                1000);
+        OperatorContext scanCtx =
+            new OperatorContext(queryId, 0, 0, 0, "ShardScan", budget);
+        Operator pipeline =
+            new org.opensearch.dqe.execution.operator.scan.ShardScanOperator(
+                scanCtx, searchReqBuilder, pitHandle, client, 1000, converter);
+
+        if (!analyzed.isSelectAll()
+            && analyzed.getOutputExpressions() != null
+            && !analyzed.getOutputExpressions().isEmpty()) {
+          var projections =
+              new ArrayList<org.opensearch.dqe.execution.expression.ExpressionEvaluator>();
+          for (var expr : analyzed.getOutputExpressions()) {
+            projections.add(
+                new org.opensearch.dqe.execution.expression.ExpressionEvaluator(
+                    expr, inputColumnMap));
+          }
+          OperatorContext projectCtx =
+              new OperatorContext(queryId, 0, 0, 1, "Project", budget);
+          pipeline =
+              new org.opensearch.dqe.execution.operator.ProjectOperator(
+                  projectCtx, pipeline, projections);
+        }
+
+        while (!pipeline.isFinished()) {
+          Page page = pipeline.getOutput();
+          if (page != null && page.getPositionCount() > 0) {
+            totalRows.addAndGet(page.getPositionCount());
+            synchronized (data) {
+              data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
+            }
+          }
+        }
+        pipeline.close();
+      } finally {
+        try {
+          pitManager.releasePit(pitHandle);
+        } catch (Exception e) {
+          LOG.warn("[{}] Failed to release PIT: {}", queryId, e.getMessage());
+        }
+      }
+    }
   }
 
   /** Tracks the state of an active query for cancellation support. */

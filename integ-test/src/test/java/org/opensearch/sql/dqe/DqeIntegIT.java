@@ -9,8 +9,7 @@ import java.io.IOException;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Ignore;
+import org.junit.Before;
 import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -29,14 +28,11 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
   private static final String INDEX_NAME = "dqe_test_logs";
   private static boolean indexCreated = false;
 
-  @BeforeClass
-  public static void setupTestData() throws IOException {
-    // Handled in setUp per-instance since BeforeClass can't use instance client()
-  }
-
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
+  @Before
+  public void setUpTestData() throws Exception {
+    if (client() == null) {
+      initClient();
+    }
     if (!indexCreated) {
       createTestIndex();
       indexCreated = true;
@@ -44,13 +40,14 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
   }
 
   @AfterClass
-  public static void resetFlag() {
+  public static void resetFlag() throws IOException {
+    wipeAllOpenSearchIndices();
     indexCreated = false;
   }
 
   @Override
   protected boolean preserveIndicesUponCompletion() {
-    return false;
+    return true;
   }
 
   private void createTestIndex() throws IOException {
@@ -174,9 +171,8 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
     assertTrue(result.has("fragments"));
   }
 
-  // ---- Tests 7-10: Marked @Ignore until expression evaluation is implemented ----
+  // ---- Tests 7-10: Complex WHERE predicates ----
 
-  @Ignore("Requires ExpressionEvaluator: buildPredicate only supports equality on long")
   @Test
   public void testWhereGreaterThan() throws IOException {
     JSONObject result =
@@ -189,7 +185,6 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
     }
   }
 
-  @Ignore("Requires ExpressionEvaluator: buildPredicate only supports equality on long")
   @Test
   public void testWhereAndOr() throws IOException {
     JSONObject result =
@@ -206,7 +201,6 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
     }
   }
 
-  @Ignore("Requires ExpressionEvaluator: buildPredicate cannot parse string literals")
   @Test
   public void testWhereStringEquality() throws IOException {
     JSONObject result =
@@ -219,7 +213,6 @@ public class DqeIntegIT extends OpenSearchSQLRestTestCase {
     }
   }
 
-  @Ignore("Requires ExpressionEvaluator: buildPredicate cannot handle arithmetic expressions")
   @Test
   public void testWhereArithmeticInPredicate() throws IOException {
     JSONObject result =

@@ -12,19 +12,28 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.ArithmeticBinaryExpression;
 import io.trino.sql.tree.BooleanLiteral;
+import io.trino.sql.tree.Cast;
+import io.trino.sql.tree.CoalesceExpression;
 import io.trino.sql.tree.ComparisonExpression;
 import io.trino.sql.tree.DecimalLiteral;
 import io.trino.sql.tree.DoubleLiteral;
 import io.trino.sql.tree.Expression;
 import io.trino.sql.tree.FunctionCall;
 import io.trino.sql.tree.Identifier;
+import io.trino.sql.tree.InListExpression;
+import io.trino.sql.tree.InPredicate;
 import io.trino.sql.tree.IsNotNullPredicate;
 import io.trino.sql.tree.IsNullPredicate;
+import io.trino.sql.tree.LikePredicate;
 import io.trino.sql.tree.LogicalExpression;
 import io.trino.sql.tree.LongLiteral;
 import io.trino.sql.tree.NotExpression;
+import io.trino.sql.tree.NullIfExpression;
 import io.trino.sql.tree.NullLiteral;
+import io.trino.sql.tree.SearchedCaseExpression;
 import io.trino.sql.tree.StringLiteral;
+import io.trino.sql.tree.WhenClause;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -82,6 +91,18 @@ public class ExpressionCompiler {
       return new IsNullExpression(compile(isNull.getValue()), false);
     } else if (expr instanceof IsNotNullPredicate isNotNull) {
       return new IsNullExpression(compile(isNotNull.getValue()), true);
+    } else if (expr instanceof Cast cast) {
+      return compileCast(cast);
+    } else if (expr instanceof SearchedCaseExpression caseExpr) {
+      return compileSearchedCase(caseExpr);
+    } else if (expr instanceof CoalesceExpression coalesce) {
+      return compileCoalesce(coalesce);
+    } else if (expr instanceof NullIfExpression nullIf) {
+      return new NullIfBlockExpression(compile(nullIf.getFirst()), compile(nullIf.getSecond()));
+    } else if (expr instanceof LikePredicate like) {
+      return compileLike(like);
+    } else if (expr instanceof InPredicate in) {
+      return compileIn(in);
     } else if (expr instanceof FunctionCall func) {
       return compileFunctionCall(func);
     }
@@ -112,6 +133,66 @@ public class ExpressionCompiler {
       }
     }
     return result;
+  }
+
+  private BlockExpression compileCast(Cast cast) {
+    BlockExpression child = compile(cast.getExpression());
+    String targetTypeName = cast.getType().toString().toLowerCase();
+    Type targetType;
+    switch (targetTypeName) {
+      case "double":
+        targetType = DoubleType.DOUBLE;
+        break;
+      case "bigint":
+        targetType = BigintType.BIGINT;
+        break;
+      case "varchar":
+        targetType = VarcharType.VARCHAR;
+        break;
+      case "boolean":
+        targetType = BooleanType.BOOLEAN;
+        break;
+      default:
+        throw new UnsupportedOperationException("Unsupported CAST target type: " + targetTypeName);
+    }
+    return new CastBlockExpression(child, targetType);
+  }
+
+  private BlockExpression compileSearchedCase(SearchedCaseExpression caseExpr) {
+    List<BlockExpression> conditions = new ArrayList<>();
+    List<BlockExpression> results = new ArrayList<>();
+    for (WhenClause when : caseExpr.getWhenClauses()) {
+      conditions.add(compile(when.getOperand()));
+      results.add(compile(when.getResult()));
+    }
+    BlockExpression elseExpr = caseExpr.getDefaultValue().map(this::compile).orElse(null);
+    Type outputType = results.isEmpty() ? VarcharType.VARCHAR : results.get(0).getType();
+    return new CaseBlockExpression(conditions, results, elseExpr, outputType);
+  }
+
+  private BlockExpression compileCoalesce(CoalesceExpression coalesce) {
+    List<BlockExpression> operands =
+        coalesce.getOperands().stream().map(this::compile).collect(Collectors.toList());
+    Type outputType = operands.isEmpty() ? VarcharType.VARCHAR : operands.get(0).getType();
+    return new CoalesceBlockExpression(operands, outputType);
+  }
+
+  private BlockExpression compileLike(LikePredicate like) {
+    BlockExpression child = compile(like.getValue());
+    if (!(like.getPattern() instanceof StringLiteral patternLiteral)) {
+      throw new UnsupportedOperationException("Only string literal LIKE patterns are supported");
+    }
+    return new LikeBlockExpression(child, patternLiteral.getValue());
+  }
+
+  private BlockExpression compileIn(InPredicate in) {
+    BlockExpression value = compile(in.getValue());
+    if (!(in.getValueList() instanceof InListExpression inList)) {
+      throw new UnsupportedOperationException("Only IN list expressions are supported");
+    }
+    List<BlockExpression> list =
+        inList.getValues().stream().map(this::compile).collect(Collectors.toList());
+    return new InBlockExpression(value, list);
   }
 
   private BlockExpression compileFunctionCall(FunctionCall func) {

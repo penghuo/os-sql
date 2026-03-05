@@ -22,6 +22,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchScrollRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
@@ -199,11 +200,21 @@ public class TransportShardExecuteAction
               .map(col -> new ColumnHandle(col, typeMap.getOrDefault(col, BigintType.BIGINT)))
               .collect(Collectors.toList());
 
+      SearchSourceBuilder dsl = new SearchSourceBuilder();
+      if (node.getDslFilter() != null) {
+        dsl.query(QueryBuilders.wrapperQuery(node.getDslFilter()));
+      }
+
+      // Apply _source filtering to only fetch needed columns
+      if (!node.getColumns().isEmpty()) {
+        dsl.fetchSource(node.getColumns().toArray(new String[0]), null);
+      }
+
       return new OpenSearchPageSource(
           searchClient,
           node.getIndexName(),
           req.getShardId(),
-          new SearchSourceBuilder(),
+          dsl,
           columns,
           DEFAULT_BATCH_SIZE);
     };

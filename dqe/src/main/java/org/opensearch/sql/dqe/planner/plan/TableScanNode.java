@@ -19,21 +19,35 @@ public class TableScanNode extends DqePlanNode {
   private final String indexName;
   private final List<String> columns;
 
+  /**
+   * Nullable JSON string representing a pushed-down DSL filter query. When set, the scan should
+   * include this filter in the OpenSearch request (e.g., as a {@code term} query) so that filtering
+   * happens at the storage layer rather than row-by-row in a {@code FilterOperator}.
+   */
+  private final String dslFilter;
+
   public TableScanNode(String indexName, List<String> columns) {
+    this(indexName, columns, null);
+  }
+
+  public TableScanNode(String indexName, List<String> columns, String dslFilter) {
     this.indexName = indexName;
     this.columns = columns;
+    this.dslFilter = dslFilter;
   }
 
   /** Deserialize from a stream. */
   public TableScanNode(StreamInput in) throws IOException {
     this.indexName = in.readString();
     this.columns = in.readStringList();
+    this.dslFilter = in.readOptionalString();
   }
 
   @Override
   public void writeTo(StreamOutput out) throws IOException {
     out.writeString(indexName);
     out.writeStringCollection(columns);
+    out.writeOptionalString(dslFilter);
   }
 
   @Override

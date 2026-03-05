@@ -36,6 +36,7 @@ import org.opensearch.sql.dqe.coordinator.merge.ResultMerger;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
 import org.opensearch.sql.dqe.planner.LogicalPlanner;
+import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
@@ -99,31 +100,36 @@ public class TransportTrinoSqlAction
       // 3. Plan
       DqePlanNode plan = LogicalPlanner.plan(stmt, metadata::getTableInfo);
 
-      // 4. Explain mode: return the plan description
+      // 4. Optimize
+      PlanOptimizer optimizer = new PlanOptimizer();
+      DqePlanNode optimizedPlan = optimizer.optimize(plan);
+
+      // 5. Explain mode: return the plan description
       if (sqlReq.isExplain()) {
-        listener.onResponse(new TrinoSqlResponse(formatExplain(plan)));
+        listener.onResponse(new TrinoSqlResponse(formatExplain(optimizedPlan)));
         return;
       }
 
-      // 5. Fragment
+      // 6. Fragment
       PlanFragmenter fragmenter = new PlanFragmenter();
-      PlanFragmenter.FragmentResult fragments = fragmenter.fragment(plan, clusterService.state());
+      PlanFragmenter.FragmentResult fragments =
+          fragmenter.fragment(optimizedPlan, clusterService.state());
 
-      // 6. Build column type information from metadata
-      String indexName = findIndexName(plan);
+      // 7. Build column type information from metadata
+      String indexName = findIndexName(optimizedPlan);
       TableInfo tableInfo = metadata.getTableInfo(indexName);
       Map<String, Type> columnTypeMap =
           tableInfo.columns().stream()
               .collect(
                   Collectors.toMap(TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::trinoType));
 
-      List<String> columnNames = resolveColumnNames(plan);
+      List<String> columnNames = resolveColumnNames(optimizedPlan);
       List<Type> columnTypes = new ArrayList<>();
       for (String col : columnNames) {
         columnTypes.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
       }
 
-      // 7. Dispatch to shards via transport
+      // 8. Dispatch to shards via transport
       List<PlanFragment> shardFragments = fragments.shardFragments();
       DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
@@ -134,7 +140,7 @@ public class TransportTrinoSqlAction
               ActionListener.wrap(
                   responses -> {
                     try {
-                      // 8. Merge Page-based results
+                      // 9. Merge Page-based results
                       List<List<Page>> shardPages =
                           responses.stream()
                               .map(ShardExecuteResponse::getPages)
@@ -148,7 +154,7 @@ public class TransportTrinoSqlAction
                         mergedPages = merger.mergePassthrough(shardPages);
                       }
 
-                      // 9. Format response (Page -> JSON for REST client)
+                      // 10. Format response (Page -> JSON for REST client)
                       String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
                       listener.onResponse(new TrinoSqlResponse(responseJson));
                     } catch (Exception e) {
@@ -280,8 +286,11 @@ public class TransportTrinoSqlAction
       sb.append("[")
           .append(scan.getIndexName())
           .append(", cols=")
-          .append(scan.getColumns())
-          .append("]");
+          .append(scan.getColumns());
+      if (scan.getDslFilter() != null) {
+        sb.append(", dslFilter=").append(scan.getDslFilter());
+      }
+      sb.append("]");
     } else if (node instanceof ProjectNode proj) {
       sb.append("[cols=").append(proj.getOutputColumns()).append("]");
     } else if (node instanceof AggregationNode agg) {

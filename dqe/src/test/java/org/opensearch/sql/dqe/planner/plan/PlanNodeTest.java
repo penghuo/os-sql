@@ -7,6 +7,7 @@ package org.opensearch.sql.dqe.planner.plan;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -35,6 +36,45 @@ class PlanNodeTest {
     TableScanNode scan = (TableScanNode) deserialized;
     assertEquals("logs", scan.getIndexName());
     assertEquals(List.of("category", "status"), scan.getColumns());
+  }
+
+  @Test
+  @DisplayName("TableScanNode with dslFilter round-trips correctly")
+  void tableScanWithDslFilterRoundTrip() throws IOException {
+    TableScanNode original =
+        new TableScanNode("logs", List.of("status"), "{\"term\":{\"status\":200}}");
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    DqePlanNode.writePlanNode(out, original);
+
+    InputStreamStreamInput in =
+        new InputStreamStreamInput(new ByteArrayInputStream(out.bytes().toBytesRef().bytes));
+    DqePlanNode deserialized = DqePlanNode.readPlanNode(in);
+
+    assertInstanceOf(TableScanNode.class, deserialized);
+    TableScanNode scan = (TableScanNode) deserialized;
+    assertEquals("logs", scan.getIndexName());
+    assertEquals(List.of("status"), scan.getColumns());
+    assertEquals("{\"term\":{\"status\":200}}", scan.getDslFilter());
+  }
+
+  @Test
+  @DisplayName("TableScanNode with null dslFilter round-trips correctly")
+  void tableScanWithNullDslFilterRoundTrip() throws IOException {
+    TableScanNode original = new TableScanNode("logs", List.of("category", "status"));
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    DqePlanNode.writePlanNode(out, original);
+
+    InputStreamStreamInput in =
+        new InputStreamStreamInput(new ByteArrayInputStream(out.bytes().toBytesRef().bytes));
+    DqePlanNode deserialized = DqePlanNode.readPlanNode(in);
+
+    assertInstanceOf(TableScanNode.class, deserialized);
+    TableScanNode scan = (TableScanNode) deserialized;
+    assertEquals("logs", scan.getIndexName());
+    assertEquals(List.of("category", "status"), scan.getColumns());
+    assertNull(scan.getDslFilter());
   }
 
   @Test

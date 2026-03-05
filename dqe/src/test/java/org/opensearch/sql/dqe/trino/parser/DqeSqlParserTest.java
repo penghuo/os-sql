@@ -9,6 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import io.trino.sql.tree.ComparisonExpression;
+import io.trino.sql.tree.Expression;
+import io.trino.sql.tree.LogicalExpression;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.Statement;
 import java.util.Set;
@@ -45,5 +48,34 @@ class DqeSqlParserTest {
   @DisplayName("Invalid SQL throws exception")
   void invalidSqlThrows() {
     assertThrows(Exception.class, () -> parser.parse("NOT VALID SQL !!!"));
+  }
+
+  @Test
+  @DisplayName("parseExpression returns ComparisonExpression for simple comparison")
+  void parseExpressionComparison() {
+    Expression expr = parser.parseExpression("status > 200");
+    assertInstanceOf(ComparisonExpression.class, expr);
+    ComparisonExpression cmp = (ComparisonExpression) expr;
+    assertEquals(ComparisonExpression.Operator.GREATER_THAN, cmp.getOperator());
+  }
+
+  @Test
+  @DisplayName("parseExpression returns LogicalExpression for AND predicate")
+  void parseExpressionLogicalAnd() {
+    Expression expr = parser.parseExpression("status > 200 AND category = 'error'");
+    assertInstanceOf(LogicalExpression.class, expr);
+    LogicalExpression logical = (LogicalExpression) expr;
+    assertEquals(LogicalExpression.Operator.AND, logical.getOperator());
+    assertEquals(2, logical.getTerms().size());
+  }
+
+  @Test
+  @DisplayName("parseExpression round-trips through toString()")
+  void parseExpressionRoundTrip() {
+    Expression original = parser.parseExpression("status > 200");
+    Expression roundTripped = parser.parseExpression(original.toString());
+    assertInstanceOf(ComparisonExpression.class, roundTripped);
+    ComparisonExpression cmp = (ComparisonExpression) roundTripped;
+    assertEquals(ComparisonExpression.Operator.GREATER_THAN, cmp.getOperator());
   }
 }

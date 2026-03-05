@@ -5,7 +5,6 @@
 
 package org.opensearch.sql.dqe.shard.executor;
 
-import io.trino.spi.Page;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.Type;
 import io.trino.sql.tree.Expression;
@@ -14,11 +13,15 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.opensearch.sql.dqe.function.BuiltinFunctions;
+import org.opensearch.sql.dqe.function.FunctionRegistry;
+import org.opensearch.sql.dqe.function.expression.BlockExpression;
+import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
+import org.opensearch.sql.dqe.operator.EvalOperator;
 import org.opensearch.sql.dqe.operator.FilterOperator;
 import org.opensearch.sql.dqe.operator.HashAggregationOperator;
 import org.opensearch.sql.dqe.operator.LimitOperator;
@@ -28,6 +31,7 @@ import org.opensearch.sql.dqe.operator.SortOperator;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
@@ -55,6 +59,7 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
   private final Function<TableScanNode, Operator> scanFactory;
   private final Map<String, Type> columnTypeMap;
+  private final FunctionRegistry functionRegistry;
 
   /**
    * Create a LocalExecutionPlanner with a scan factory and column type information.
@@ -68,6 +73,7 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
       Function<TableScanNode, Operator> scanFactory, Map<String, Type> columnTypeMap) {
     this.scanFactory = scanFactory;
     this.columnTypeMap = columnTypeMap;
+    this.functionRegistry = BuiltinFunctions.createRegistry();
   }
 
   /**
@@ -107,19 +113,37 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
     Operator child = node.getChild().accept(this, context);
     List<String> inputColumns = resolveInputColumns(node.getChild());
 
-    // Build column index map for the evaluator
     Map<String, Integer> columnIndexMap = new HashMap<>();
     for (int i = 0; i < inputColumns.size(); i++) {
       columnIndexMap.put(inputColumns.get(i), i);
     }
 
-    // Parse predicate string back into Trino Expression AST and build evaluator
     DqeSqlParser parser = new DqeSqlParser();
     Expression predicate = parser.parseExpression(node.getPredicateString());
-    ExpressionEvaluator evaluator = new ExpressionEvaluator(columnIndexMap, columnTypeMap);
-    BiFunction<Page, Integer, Boolean> predicateFn =
-        (page, pos) -> evaluator.evaluateAsBoolean(predicate, page, pos);
-    return new FilterOperator(child, predicateFn);
+    ExpressionCompiler compiler =
+        new ExpressionCompiler(functionRegistry, columnIndexMap, columnTypeMap);
+    BlockExpression blockPredicate = compiler.compile(predicate);
+    return new FilterOperator(child, blockPredicate);
+  }
+
+  @Override
+  public Operator visitEval(EvalNode node, Void context) {
+    Operator child = node.getChild().accept(this, context);
+    List<String> inputColumns = resolveInputColumns(node.getChild());
+
+    Map<String, Integer> columnIndexMap = new HashMap<>();
+    for (int i = 0; i < inputColumns.size(); i++) {
+      columnIndexMap.put(inputColumns.get(i), i);
+    }
+
+    DqeSqlParser parser = new DqeSqlParser();
+    ExpressionCompiler compiler =
+        new ExpressionCompiler(functionRegistry, columnIndexMap, columnTypeMap);
+    List<BlockExpression> outputExprs =
+        node.getExpressions().stream()
+            .map(exprStr -> compiler.compile(parser.parseExpression(exprStr)))
+            .collect(Collectors.toList());
+    return new EvalOperator(child, outputExprs);
   }
 
   @Override
@@ -174,6 +198,8 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
       List<String> output = new ArrayList<>(aggNode.getGroupByKeys());
       output.addAll(aggNode.getAggregateFunctions());
       return output;
+    } else if (node instanceof EvalNode) {
+      return ((EvalNode) node).getOutputColumnNames();
     }
     throw new IllegalArgumentException("Unknown plan node type: " + node.getClass().getName());
   }

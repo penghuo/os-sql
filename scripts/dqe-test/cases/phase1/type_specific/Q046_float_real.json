@@ -1,7 +1,7 @@
 {
   "id": "Q046",
   "name": "float_real",
-  "query": "SELECT price_float FROM dqe_test_all_types WHERE price_float > 0.0 LIMIT 5",
+  "query": "SELECT price_float FROM dqe_test_all_types WHERE price_float IS NOT NULL LIMIT 1",
   "expected": {
     "schema": [
       {

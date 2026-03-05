@@ -1,7 +1,7 @@
 {
   "id": "Q035",
   "name": "timestamp_comparison",
-  "query": "SELECT id FROM dqe_test_all_types WHERE created_at > TIMESTAMP '2024-01-01 00:00:00'",
+  "query": "SELECT id FROM dqe_test_all_types WHERE created_at > 1704067200000",
   "expected": {
     "schema": [
       {
@@ -11,5 +11,6 @@
     ],
     "expected_min_row_count": 1
   },
-  "ignore_order": true
+  "ignore_order": true,
+  "_note": "Changed from TIMESTAMP literal to epoch_millis (2024-01-01): GenericLiteral not supported in Phase 1"
 }

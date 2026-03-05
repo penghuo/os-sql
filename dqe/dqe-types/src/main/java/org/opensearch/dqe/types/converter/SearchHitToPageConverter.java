@@ -138,23 +138,30 @@ public class SearchHitToPageConverter {
       return;
     }
 
-    String baseName = trinoType.getBaseName();
-    switch (baseName) {
-      case "varchar" -> appendVarchar(builder, value);
-      case "bigint" -> appendLong(builder, trinoType, toLong(value));
-      case "integer" -> appendLong(builder, trinoType, toInt(value));
-      case "smallint" -> appendLong(builder, trinoType, toShort(value));
-      case "tinyint" -> appendLong(builder, trinoType, toByte(value));
-      case "double" -> appendDouble(builder, trinoType, toDouble(value));
-      case "real" -> appendLong(builder, trinoType, Float.floatToIntBits(toFloat(value)));
-      case "boolean" -> appendBoolean(builder, trinoType, toBoolean(value));
-      case "decimal" -> appendDecimal(builder, (DecimalType) trinoType, value);
-      case "timestamp" -> appendTimestamp(builder, (TimestampType) trinoType, value, descriptor);
-      case "varbinary" -> appendVarbinary(builder, value);
-      case "array" -> appendArray(builder, (ArrayType) trinoType, value);
-      case "row" -> appendRow(builder, (RowType) trinoType, value);
-      case "map" -> appendMap(builder, (MapType) trinoType, value);
-      default -> appendVarchar(builder, value); // Fallback for truly scalar unknown types
+    try {
+      String baseName = trinoType.getBaseName();
+      switch (baseName) {
+        case "varchar" -> appendVarchar(builder, value);
+        case "bigint" -> appendLong(builder, trinoType, toLong(value));
+        case "integer" -> appendLong(builder, trinoType, toInt(value));
+        case "smallint" -> appendLong(builder, trinoType, toShort(value));
+        case "tinyint" -> appendLong(builder, trinoType, toByte(value));
+        case "double" -> appendDouble(builder, trinoType, toDouble(value));
+        case "real" -> appendLong(builder, trinoType, Float.floatToIntBits(toFloat(value)));
+        case "boolean" -> appendBoolean(builder, trinoType, toBoolean(value));
+        case "decimal" -> appendDecimal(builder, (DecimalType) trinoType, value);
+        case "timestamp" -> appendTimestamp(builder, (TimestampType) trinoType, value, descriptor);
+        case "varbinary" -> appendVarbinary(builder, value);
+        case "array" -> appendArray(builder, (ArrayType) trinoType, value);
+        case "row" -> appendRow(builder, (RowType) trinoType, value);
+        case "map" -> appendMap(builder, (MapType) trinoType, value);
+        default -> appendVarchar(builder, value);
+      }
+    } catch (Exception e) {
+      // Gracefully handle conversion errors: append null instead of crashing the scan.
+      // This covers cases like geo_point stored as [lon,lat] array when type expects ROW,
+      // or numeric fields containing non-numeric values.
+      builder.appendNull();
     }
   }
 

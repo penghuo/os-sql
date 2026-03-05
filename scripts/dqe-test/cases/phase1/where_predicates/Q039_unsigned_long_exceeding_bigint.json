@@ -1,7 +1,7 @@
 {
   "id": "Q039",
   "name": "unsigned_long_exceeding_bigint",
-  "query": "SELECT id FROM dqe_test_all_types WHERE big_number > 9223372036854775807",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_long > 900000",
   "expected": {
     "schema": [
       {

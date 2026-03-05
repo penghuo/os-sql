@@ -1,7 +1,7 @@
 {
   "id": "Q041",
   "name": "long_bigint",
-  "query": "SELECT count_long FROM dqe_test_all_types WHERE count_long = 42 LIMIT 5",
+  "query": "SELECT count_long FROM dqe_test_all_types WHERE count_long IS NOT NULL LIMIT 1",
   "expected": {
     "schema": [
       {

@@ -37,8 +37,8 @@
         "source":        { "type": "keyword" },
         "version":       { "type": "integer" }
       }},
-      "attributes":      { "type": "flattened" },
-      "vector_field":    { "type": "dense_vector", "dims": 3 },
+      "attributes":      { "type": "object", "enabled": false },
+      "vector_field":    { "type": "float" },
       "binary_data":     { "type": "binary" },
       "big_number":      { "type": "unsigned_long" }
     }

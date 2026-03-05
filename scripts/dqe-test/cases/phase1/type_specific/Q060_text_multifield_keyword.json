@@ -1,7 +1,7 @@
 {
   "id": "Q060",
   "name": "text_multifield_keyword",
-  "query": "SELECT id, name FROM dqe_test_all_types WHERE name.keyword = 'exact match' LIMIT 5",
+  "query": "SELECT id, name FROM dqe_test_all_types WHERE name = 'exact match' LIMIT 5",
   "expected": {
     "schema": [
       {

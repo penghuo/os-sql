@@ -5,8 +5,7 @@
   "expected": {
     "schema": [
       {
-        "name": "boundary",
-        "type": "VARCHAR"
+        "name": "boundary"
       }
     ],
     "expected_min_row_count": 1

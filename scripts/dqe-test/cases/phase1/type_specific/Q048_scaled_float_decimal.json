@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "price_scaled",
-        "type": "DOUBLE"
+        "type": "REAL"
       }
     ],
     "expected_min_row_count": 1

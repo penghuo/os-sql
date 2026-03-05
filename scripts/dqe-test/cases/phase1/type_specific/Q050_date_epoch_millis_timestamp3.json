@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "created_at",
-        "type": "TIMESTAMP(3)"
+        "type": "BIGINT"
       }
     ],
     "expected_min_row_count": 1

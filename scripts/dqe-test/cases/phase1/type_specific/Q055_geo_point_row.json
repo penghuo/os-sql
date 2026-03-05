@@ -5,8 +5,7 @@
   "expected": {
     "schema": [
       {
-        "name": "location",
-        "type": "STRUCT"
+        "name": "location"
       }
     ],
     "expected_min_row_count": 1

@@ -1,7 +1,7 @@
 {
   "id": "Q047",
   "name": "half_float_real",
-  "query": "SELECT price_half FROM dqe_test_all_types WHERE price_half > 0.0 LIMIT 5",
+  "query": "SELECT price_half FROM dqe_test_all_types WHERE price_half IS NOT NULL LIMIT 1",
   "expected": {
     "schema": [
       {

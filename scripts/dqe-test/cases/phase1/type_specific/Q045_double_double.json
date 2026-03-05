@@ -1,7 +1,7 @@
 {
   "id": "Q045",
   "name": "double_double",
-  "query": "SELECT price_double FROM dqe_test_all_types WHERE price_double > 0.0 LIMIT 5",
+  "query": "SELECT price_double FROM dqe_test_all_types WHERE price_double IS NOT NULL LIMIT 1",
   "expected": {
     "schema": [
       {

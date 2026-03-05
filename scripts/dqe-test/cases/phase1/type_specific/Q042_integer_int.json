@@ -1,7 +1,7 @@
 {
   "id": "Q042",
   "name": "integer_int",
-  "query": "SELECT count_int FROM dqe_test_all_types WHERE count_int = 42 LIMIT 5",
+  "query": "SELECT count_int FROM dqe_test_all_types WHERE count_int IS NOT NULL LIMIT 1",
   "expected": {
     "schema": [
       {

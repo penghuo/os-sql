@@ -10,7 +10,7 @@
       },
       {
         "name": "NULLIF(int_val, 0)",
-        "type": "BIGINT"
+        "type": "INTEGER"
       }
     ],
     "expected_row_count": 10

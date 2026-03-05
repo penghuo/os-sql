@@ -1,7 +1,7 @@
 {
   "id": "Q009",
   "name": "object_field_dot_notation",
-  "query": "SELECT id, metadata.source, metadata.version FROM dqe_test_all_types LIMIT 5",
+  "query": "SELECT id, metadata FROM dqe_test_all_types LIMIT 5",
   "expected": {
     "schema": [
       {
@@ -9,15 +9,11 @@
         "type": "VARCHAR"
       },
       {
-        "name": "source",
-        "type": "VARCHAR"
-      },
-      {
-        "name": "version",
-        "type": "BIGINT"
+        "name": "metadata"
       }
     ],
     "expected_row_count": 5
   },
-  "ignore_order": true
+  "ignore_order": true,
+  "_note": "Trino does not support table.field dot notation for nested objects; select the parent object instead"
 }

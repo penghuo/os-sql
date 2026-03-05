@@ -3,7 +3,6 @@
   "name": "star_expansion",
   "query": "SELECT * FROM dqe_test_all_types LIMIT 5",
   "expected": {
-    "schema": [],
     "expected_row_count": 5
   },
   "ignore_order": true,

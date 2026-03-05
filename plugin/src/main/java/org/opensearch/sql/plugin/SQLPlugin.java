@@ -373,7 +373,7 @@ public class SQLPlugin extends Plugin
     // pool is a separate queue for asynchronous requests to other nodes. We keep them separate to
     // prevent deadlocks during async fetches on small node counts. Tasks in the background pool
     // should do no work except I/O to other services.
-    return List.of(
+    List<ExecutorBuilder<?>> builders = new java.util.ArrayList<>(List.of(
         new FixedExecutorBuilder(
             settings,
             SQL_WORKER_THREAD_POOL_NAME,
@@ -386,7 +386,22 @@ public class SQLPlugin extends Plugin
             settings.getAsInt(
                 "thread_pool.search.size", OpenSearchExecutors.allocatedProcessors(settings)),
             1000,
-            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME));
+            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME)));
+    // Add DQE thread pools
+    int cores = OpenSearchExecutors.allocatedProcessors(settings);
+    builders.add(new FixedExecutorBuilder(
+        settings, DqeEnginePlugin.DQE_WORKER_POOL,
+        Math.max(1, Math.min(4, cores / 2)), 100,
+        "thread_pool." + DqeEnginePlugin.DQE_WORKER_POOL));
+    builders.add(new FixedExecutorBuilder(
+        settings, DqeEnginePlugin.DQE_EXCHANGE_POOL,
+        Math.max(1, Math.min(2, cores / 4)), 200,
+        "thread_pool." + DqeEnginePlugin.DQE_EXCHANGE_POOL));
+    builders.add(new FixedExecutorBuilder(
+        settings, DqeEnginePlugin.DQE_COORDINATOR_POOL,
+        Math.max(1, Math.min(2, cores / 4)), 50,
+        "thread_pool." + DqeEnginePlugin.DQE_COORDINATOR_POOL));
+    return builders;
   }
 
   @Override

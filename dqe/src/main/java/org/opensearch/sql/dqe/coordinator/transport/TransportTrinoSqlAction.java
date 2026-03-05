@@ -70,9 +70,6 @@ public class TransportTrinoSqlAction
   private final ClusterService clusterService;
   private final TransportService transportService;
 
-  /** Tracks the dynamic cluster setting for whether DQE is enabled. */
-  private volatile boolean dqeEnabled;
-
   /**
    * Constructor for plugin wiring with dependency injection.
    *
@@ -88,24 +85,11 @@ public class TransportTrinoSqlAction
     super(TrinoSqlAction.NAME, transportService, actionFilters, TrinoSqlRequest::new);
     this.clusterService = clusterService;
     this.transportService = transportService;
-
-    // Initialize from current settings and register a listener for dynamic updates
-    this.dqeEnabled = DqeSettings.DQE_ENABLED.get(clusterService.getSettings());
-    clusterService
-        .getClusterSettings()
-        .addSettingsUpdateConsumer(DqeSettings.DQE_ENABLED, enabled -> this.dqeEnabled = enabled);
   }
 
   @Override
   protected void doExecute(
       Task task, ActionRequest request, ActionListener<TrinoSqlResponse> listener) {
-    // Guard: check if DQE is enabled (uses volatile field updated by cluster settings listener)
-    if (!dqeEnabled) {
-      listener.onFailure(
-          new IllegalAccessException("DQE is disabled. Set plugins.dqe.enabled to true."));
-      return;
-    }
-
     TrinoSqlRequest sqlReq = TrinoSqlRequest.fromActionRequest(request);
     try {
       // 1. Parse
@@ -151,8 +135,7 @@ public class TransportTrinoSqlAction
       List<PlanFragment> shardFragments = fragments.shardFragments();
       DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
-      long timeoutMillis =
-          DqeSettings.QUERY_TIMEOUT.get(clusterService.getSettings()).millis();
+      long timeoutMillis = DqeSettings.QUERY_TIMEOUT.get(clusterService.getSettings()).millis();
 
       GroupedActionListener<ShardExecuteResponse> groupedListener =
           new GroupedActionListener<>(
@@ -309,10 +292,7 @@ public class TransportTrinoSqlAction
     sb.append(prefix).append(node.getClass().getSimpleName());
 
     if (node instanceof TableScanNode scan) {
-      sb.append("[")
-          .append(scan.getIndexName())
-          .append(", cols=")
-          .append(scan.getColumns());
+      sb.append("[").append(scan.getIndexName()).append(", cols=").append(scan.getColumns());
       if (scan.getDslFilter() != null) {
         sb.append(", dslFilter=").append(scan.getDslFilter());
       }
@@ -481,8 +461,8 @@ public class TransportTrinoSqlAction
   }
 
   /**
-   * Apply a global row limit to merged pages. Trims the list of pages so that at most {@code
-   * limit} total rows are retained.
+   * Apply a global row limit to merged pages. Trims the list of pages so that at most {@code limit}
+   * total rows are retained.
    */
   static List<Page> applyGlobalLimit(List<Page> pages, long limit) {
     List<Page> result = new ArrayList<>();

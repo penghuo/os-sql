@@ -16,12 +16,6 @@ import org.opensearch.common.unit.TimeValue;
 class DqeSettingsTest {
 
   @Test
-  @DisplayName("DQE_ENABLED defaults to false")
-  void enabledDefaultsFalse() {
-    assertEquals(false, DqeSettings.DQE_ENABLED.getDefault(Settings.EMPTY));
-  }
-
-  @Test
   @DisplayName("QUERY_TIMEOUT defaults to 30 seconds")
   void timeoutDefaults30s() {
     assertEquals(
@@ -35,8 +29,8 @@ class DqeSettingsTest {
   }
 
   @Test
-  @DisplayName("settings() returns all three settings")
+  @DisplayName("settings() returns both settings")
   void settingsListComplete() {
-    assertEquals(3, DqeSettings.settings().size());
+    assertEquals(2, DqeSettings.settings().size());
   }
 }

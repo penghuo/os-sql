@@ -1,0 +1,85 @@
+{
+  "setup": {
+    "index": "dqe_test_logs",
+    "settings": {
+      "number_of_shards": 2,
+      "number_of_replicas": 0
+    },
+    "mapping": {
+      "properties": {
+        "category": {"type": "keyword"},
+        "status": {"type": "long"},
+        "message": {"type": "text"},
+        "amount": {"type": "double"}
+      }
+    },
+    "data": [
+      {"category": "error", "status": 500, "message": "Internal server error", "amount": 10.5},
+      {"category": "error", "status": 500, "message": "Database timeout", "amount": 20.0},
+      {"category": "warn",  "status": 400, "message": "Bad request", "amount": 5.0},
+      {"category": "warn",  "status": 400, "message": "Missing parameter", "amount": 3.0},
+      {"category": "info",  "status": 200, "message": "Request completed", "amount": 1.0},
+      {"category": "info",  "status": 200, "message": "Health check passed", "amount": 0.5},
+      {"category": "info",  "status": 200, "message": "Cache refreshed", "amount": 2.0},
+      {"category": "debug", "status": 200, "message": "Connection pool stats", "amount": 0.1},
+      {"category": "error", "status": 503, "message": "Service unavailable", "amount": 15.0},
+      {"category": "warn",  "status": 429, "message": "Rate limited", "amount": 8.0}
+    ]
+  },
+  "tests": [
+    {
+      "name": "Simple SELECT with two columns",
+      "query": "SELECT category, status FROM dqe_test_logs",
+      "assert": {
+        "status": 200,
+        "total": 10,
+        "schema_length": 2,
+        "schema_names": ["category", "status"]
+      }
+    },
+    {
+      "name": "SELECT with WHERE filter (status = 200)",
+      "query": "SELECT category, status FROM dqe_test_logs WHERE status = 200",
+      "assert": {
+        "status": 200,
+        "total": 4,
+        "all_rows_match": {"column_index": 1, "value": 200}
+      }
+    },
+    {
+      "name": "GROUP BY with COUNT",
+      "query": "SELECT category, COUNT(*) FROM dqe_test_logs GROUP BY category",
+      "assert": {
+        "status": 200,
+        "total_count_sum": 10,
+        "min_rows": 3
+      }
+    },
+    {
+      "name": "ORDER BY DESC with LIMIT",
+      "query": "SELECT category, status FROM dqe_test_logs ORDER BY status DESC LIMIT 3",
+      "assert": {
+        "status": 200,
+        "total": 3,
+        "descending_column_index": 1
+      }
+    },
+    {
+      "name": "SELECT with LIMIT only",
+      "query": "SELECT category FROM dqe_test_logs LIMIT 5",
+      "assert": {
+        "status": 200,
+        "total": 5,
+        "schema_length": 1
+      }
+    },
+    {
+      "name": "EXPLAIN returns plan",
+      "endpoint": "/_plugins/_trino_sql/_explain",
+      "query": "SELECT category FROM dqe_test_logs WHERE status = 200",
+      "assert": {
+        "contains": ["TableScanNode", "dqe_test_logs"]
+      }
+    }
+  ]
+}

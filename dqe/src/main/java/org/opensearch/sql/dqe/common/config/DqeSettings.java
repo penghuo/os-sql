@@ -12,10 +12,6 @@ import org.opensearch.common.unit.TimeValue;
 /** Cluster settings for the DQE module. */
 public final class DqeSettings {
 
-  public static final Setting<Boolean> DQE_ENABLED =
-      Setting.boolSetting(
-          "plugins.dqe.enabled", false, Setting.Property.NodeScope, Setting.Property.Dynamic);
-
   public static final Setting<TimeValue> QUERY_TIMEOUT =
       Setting.timeSetting(
           "plugins.dqe.query.timeout",
@@ -34,6 +30,6 @@ public final class DqeSettings {
   private DqeSettings() {}
 
   public static List<Setting<?>> settings() {
-    return List.of(DQE_ENABLED, QUERY_TIMEOUT, PAGE_BATCH_SIZE);
+    return List.of(QUERY_TIMEOUT, PAGE_BATCH_SIZE);
   }
 }

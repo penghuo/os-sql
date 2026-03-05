@@ -6,7 +6,6 @@
 package org.opensearch.sql.dqe.coordinator.transport;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -277,57 +276,10 @@ class TransportTrinoSqlActionTest {
   }
 
   @Test
-  @DisplayName("doExecute fails with IllegalAccessException when DQE is disabled")
-  void dqeDisabledRejectsQuery() throws Exception {
-    Settings disabledSettings =
-        Settings.builder().put("plugins.dqe.enabled", false).build();
-    ClusterService clusterService =
-        mockClusterService("logs", 2, Map.of("status", "long"), disabledSettings);
-    TransportService transportService = mock(TransportService.class);
-
-    TransportTrinoSqlAction action =
-        new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
-
-    TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
-
-    AtomicReference<Exception> errorRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-
-    action.doExecute(
-        null,
-        request,
-        new ActionListener<>() {
-          @Override
-          public void onResponse(TrinoSqlResponse response) {
-            latch.countDown();
-          }
-
-          @Override
-          public void onFailure(Exception e) {
-            errorRef.set(e);
-            latch.countDown();
-          }
-        });
-
-    assertTrue(latch.await(5, TimeUnit.SECONDS));
-    assertNotNull(errorRef.get(), "Should fail when DQE is disabled");
-    assertInstanceOf(IllegalAccessException.class, errorRef.get());
-    assertTrue(errorRef.get().getMessage().contains("DQE is disabled"));
-
-    // Verify no transport dispatch happened
-    verify(transportService, times(0)).sendRequest(any(), any(String.class), any(), any());
-  }
-
-  @Test
   @DisplayName("doExecute reads query timeout from cluster settings")
   void queryTimeoutReadFromSettings() throws Exception {
     // Configure a custom timeout of 10 seconds
-    Settings customSettings =
-        Settings.builder()
-            .put("plugins.dqe.enabled", true)
-            .put("plugins.dqe.query.timeout", "10s")
-            .build();
+    Settings customSettings = Settings.builder().put("plugins.dqe.query.timeout", "10s").build();
     ClusterService clusterService =
         mockClusterService("logs", 2, Map.of("status", "long"), customSettings);
     TransportService transportService = mock(TransportService.class);
@@ -359,10 +311,7 @@ class TransportTrinoSqlActionTest {
     // Capture the request sent to transport
     verify(transportService, times(2))
         .sendRequest(
-            any(DiscoveryNode.class),
-            eq(ShardExecuteAction.NAME),
-            requestCaptor.capture(),
-            any());
+            any(DiscoveryNode.class), eq(ShardExecuteAction.NAME), requestCaptor.capture(), any());
 
     // Verify the timeout in the shard request is 10000ms (10 seconds)
     ShardExecuteRequest capturedReq = requestCaptor.getValue();
@@ -409,16 +358,10 @@ class TransportTrinoSqlActionTest {
   @SuppressWarnings("unchecked")
   private ClusterService mockClusterService(
       String indexName, int numShards, Map<String, String> fieldTypes) {
-    return mockClusterService(
-        indexName,
-        numShards,
-        fieldTypes,
-        Settings.builder().put("plugins.dqe.enabled", true).build());
+    return mockClusterService(indexName, numShards, fieldTypes, Settings.EMPTY);
   }
 
-  /**
-   * Create a mock ClusterService with custom settings for testing settings enforcement.
-   */
+  /** Create a mock ClusterService with custom settings for testing settings enforcement. */
   @SuppressWarnings("unchecked")
   private ClusterService mockClusterService(
       String indexName, int numShards, Map<String, String> fieldTypes, Settings settings) {
@@ -428,7 +371,8 @@ class TransportTrinoSqlActionTest {
     when(clusterService.getSettings()).thenReturn(settings);
 
     // Mock ClusterSettings for dynamic settings update consumer registration
-    Set<org.opensearch.common.settings.Setting<?>> settingSet = new HashSet<>(DqeSettings.settings());
+    Set<org.opensearch.common.settings.Setting<?>> settingSet =
+        new HashSet<>(DqeSettings.settings());
     ClusterSettings clusterSettings = new ClusterSettings(settings, settingSet);
     when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
 

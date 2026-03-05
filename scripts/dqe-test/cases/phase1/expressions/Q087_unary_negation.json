@@ -10,7 +10,7 @@
       },
       {
         "name": "negated",
-        "type": "INTEGER"
+        "type": "BIGINT"
       }
     ],
     "expected_row_count": 5

@@ -3,6 +3,6 @@
   "name": "cast_failure",
   "query": "SELECT CAST('abc' AS INTEGER) FROM dqe_test_all_types LIMIT 1",
   "error": {
-    "message_contains": "CAST"
+    "message_contains": "cannot cast"
   }
 }

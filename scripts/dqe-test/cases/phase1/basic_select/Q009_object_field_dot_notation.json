@@ -14,7 +14,7 @@
       },
       {
         "name": "version",
-        "type": "INTEGER"
+        "type": "BIGINT"
       }
     ],
     "expected_row_count": 5

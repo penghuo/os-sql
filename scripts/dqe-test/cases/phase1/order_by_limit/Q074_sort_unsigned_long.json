@@ -10,7 +10,7 @@
       },
       {
         "name": "big_number",
-        "type": "DECIMAL"
+        "type": "BIGINT"
       }
     ],
     "expected_row_count": 5

@@ -9,11 +9,11 @@
         "type": "VARCHAR"
       },
       {
-        "name": "_col1",
+        "name": "CAST(count_int AS DOUBLE)",
         "type": "DOUBLE"
       },
       {
-        "name": "_col2",
+        "name": "CAST(price_double AS VARCHAR)",
         "type": "VARCHAR"
       }
     ],

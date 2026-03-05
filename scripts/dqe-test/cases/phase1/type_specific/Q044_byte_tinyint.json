@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "count_byte",
-        "type": "TINYINT"
+        "type": "BIGINT"
       }
     ],
     "expected_min_row_count": 1

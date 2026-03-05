@@ -10,10 +10,10 @@
       },
       {
         "name": "non_zero",
-        "type": "INTEGER"
+        "type": "BIGINT"
       },
       {
-        "name": "_col2",
+        "name": "COALESCE(str_val, 'fallback')",
         "type": "VARCHAR"
       }
     ],

@@ -10,7 +10,7 @@
       },
       {
         "name": "count_int",
-        "type": "INTEGER"
+        "type": "BIGINT"
       }
     ],
     "expected_min_row_count": 1

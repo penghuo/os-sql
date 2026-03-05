@@ -3,6 +3,6 @@
   "name": "type_mismatch_predicate",
   "query": "SELECT id FROM dqe_test_all_types WHERE count_int = 'not_a_number'",
   "error": {
-    "message_contains": "type"
+    "message_contains": "Type mismatch"
   }
 }

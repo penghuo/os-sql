@@ -440,6 +440,9 @@ public class DqeQueryOrchestrator {
 
     var orderedColumns =
         new ArrayList<org.opensearch.dqe.metadata.DqeColumnHandle>(requiredColumnHandles);
+    // Sort by field path for deterministic column ordering
+    orderedColumns.sort(java.util.Comparator.comparing(
+        org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath));
     var columnDescriptors =
         orderedColumns.stream()
             .map(
@@ -461,20 +464,24 @@ public class DqeQueryOrchestrator {
     var converter =
         new org.opensearch.dqe.types.converter.SearchHitToPageConverter(columnDescriptors, 1000);
 
-    // Phase 1: Collect raw pages from all shard scans
+    // Phase 1: Collect raw pages — scan once per unique index (PIT covers full index)
     List<Page> rawPages = new ArrayList<>();
-    for (var split : splits) {
+    var uniqueIndices = splits.stream()
+        .map(DqeShardSplit::getIndexName)
+        .distinct()
+        .collect(Collectors.toList());
+    for (var indexName : uniqueIndices) {
       PitHandle pitHandle =
           pitManager.createPit(
-              split.getIndexName(),
+              indexName,
               org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
       pitManager.registerPit(queryId, pitHandle);
 
       try {
         var searchReqBuilder =
             new org.opensearch.dqe.execution.operator.scan.SearchRequestBuilder(
-                split.getIndexName(),
-                split.getShardId(),
+                indexName,
+                0, // shard ID not used with PIT (PIT covers full index)
                 requiredColumnPaths,
                 pushdownQuery,
                 null,

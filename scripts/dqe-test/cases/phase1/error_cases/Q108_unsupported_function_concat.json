@@ -3,6 +3,6 @@
   "name": "unsupported_function_concat",
   "query": "SELECT id, CONCAT(status, '_suffix') FROM dqe_test_all_types LIMIT 5",
   "error": {
-    "message_contains": "CONCAT"
+    "message_contains": "concat"
   }
 }

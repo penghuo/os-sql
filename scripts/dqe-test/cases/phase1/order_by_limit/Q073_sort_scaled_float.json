@@ -10,7 +10,7 @@
       },
       {
         "name": "price_scaled",
-        "type": "DECIMAL"
+        "type": "DOUBLE"
       }
     ],
     "expected_row_count": 5

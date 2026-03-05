@@ -9,7 +9,7 @@
         "type": "VARCHAR"
       },
       {
-        "name": "_col1",
+        "name": "COALESCE(str_val, 'default')",
         "type": "VARCHAR"
       }
     ],

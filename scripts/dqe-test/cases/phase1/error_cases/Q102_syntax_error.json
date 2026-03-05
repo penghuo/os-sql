@@ -3,6 +3,6 @@
   "name": "syntax_error",
   "query": "THIS IS NOT SQL",
   "error": {
-    "message_contains": "Syntax error"
+    "message_contains": "mismatched input"
   }
 }

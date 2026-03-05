@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "precise_time",
-        "type": "TIMESTAMP"
+        "type": "TIMESTAMP(3)"
       }
     ],
     "expected_min_row_count": 1

@@ -9,7 +9,7 @@
         "type": "VARCHAR"
       },
       {
-        "name": "_col1",
+        "name": "TRY_CAST(status AS INTEGER)",
         "type": "INTEGER"
       }
     ],

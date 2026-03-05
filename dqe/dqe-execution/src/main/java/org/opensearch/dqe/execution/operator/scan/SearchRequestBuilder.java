@@ -91,9 +91,9 @@ public class SearchRequestBuilder {
 
   private SearchRequest buildSearchRequest(SearchSourceBuilder source, PitHandle pitHandle) {
     SearchRequest request = new SearchRequest();
-    // When using PIT, do not set the index on the request -- PIT already targets the index.
-    // Set shard preference for shard-level targeting
-    request.preference("_shards:" + shardId + "|_local");
+    // When using PIT, do not set index or preference — PIT already targets the index
+    // and OpenSearch rejects preference with PIT.
+    // For non-PIT requests (future), shard targeting via preference would go here.
     request.source(source);
     return request;
   }

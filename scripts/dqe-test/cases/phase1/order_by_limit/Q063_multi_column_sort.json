@@ -14,7 +14,7 @@
       },
       {
         "name": "count_int",
-        "type": "INTEGER"
+        "type": "BIGINT"
       }
     ],
     "expected_row_count": 10

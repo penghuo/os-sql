@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "count_short",
-        "type": "SMALLINT"
+        "type": "BIGINT"
       }
     ],
     "expected_min_row_count": 1

@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "incremented",
-        "type": "INTEGER"
+        "type": "BIGINT"
       }
     ],
     "expected_row_count": 5

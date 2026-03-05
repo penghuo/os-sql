@@ -5,7 +5,7 @@
   "expected": {
     "schema": [
       {
-        "name": "_col0",
+        "name": "CAST(count_int AS VARCHAR)",
         "type": "VARCHAR"
       }
     ],

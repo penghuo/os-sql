@@ -28,8 +28,10 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.sql.dqe.common.config.DqeSettings;
 import org.opensearch.sql.dqe.coordinator.fragment.PlanFragment;
 import org.opensearch.sql.dqe.coordinator.fragment.PlanFragmenter;
 import org.opensearch.sql.dqe.coordinator.merge.ResultMerger;
@@ -88,6 +90,14 @@ public class TransportTrinoSqlAction
   @Override
   protected void doExecute(
       Task task, ActionRequest request, ActionListener<TrinoSqlResponse> listener) {
+    // Guard: check if DQE is enabled
+    Settings nodeSettings = clusterService.getSettings();
+    if (!DqeSettings.DQE_ENABLED.get(nodeSettings)) {
+      listener.onFailure(
+          new IllegalAccessException("DQE is disabled. Set plugins.dqe.enabled to true."));
+      return;
+    }
+
     TrinoSqlRequest sqlReq = TrinoSqlRequest.fromActionRequest(request);
     try {
       // 1. Parse
@@ -133,7 +143,7 @@ public class TransportTrinoSqlAction
       List<PlanFragment> shardFragments = fragments.shardFragments();
       DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
-      long timeoutMillis = 30000L;
+      long timeoutMillis = DqeSettings.QUERY_TIMEOUT.get(nodeSettings).millis();
 
       GroupedActionListener<ShardExecuteResponse> groupedListener =
           new GroupedActionListener<>(

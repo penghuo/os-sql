@@ -23,7 +23,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.sql.dqe.common.config.DqeSettings;
 import org.opensearch.sql.dqe.operator.TestPageSource;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
@@ -236,6 +238,24 @@ class TransportShardExecuteActionTest {
   void resolveColumnNamesFromTableScan() {
     TableScanNode scan = new TableScanNode("logs", List.of("a", "b", "c"));
     assertEquals(List.of("a", "b", "c"), TransportShardExecuteAction.resolveColumnNames(scan));
+  }
+
+  @Test
+  @DisplayName("DQE thread pool name constant matches registered pool name")
+  void dqeThreadPoolNameMatchesRegisteredPool() {
+    assertEquals(
+        "dqe-shard-executor",
+        TransportShardExecuteAction.DQE_THREAD_POOL_NAME,
+        "Thread pool name must match the pool registered in SQLPlugin");
+  }
+
+  @Test
+  @DisplayName("PAGE_BATCH_SIZE setting default matches expected value")
+  void pageBatchSizeSettingDefault() {
+    assertEquals(
+        1024,
+        (int) DqeSettings.PAGE_BATCH_SIZE.getDefault(Settings.EMPTY),
+        "Default PAGE_BATCH_SIZE should be 1024");
   }
 
   /** Serialize a DqePlanNode to bytes using the standard writePlanNode mechanism. */

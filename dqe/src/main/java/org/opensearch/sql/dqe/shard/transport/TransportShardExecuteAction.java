@@ -22,12 +22,14 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchScrollRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
-import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.InputStreamStreamInput;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.sql.dqe.common.config.DqeSettings;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo.ColumnInfo;
@@ -56,6 +58,9 @@ import org.opensearch.transport.client.node.NodeClient;
 public class TransportShardExecuteAction
     extends HandledTransportAction<ActionRequest, ShardExecuteResponse> {
 
+  /** Thread pool name for shard-level DQE execution. */
+  public static final String DQE_THREAD_POOL_NAME = "dqe-shard-executor";
+
   /** NodeClient for executing search requests on the local node (production path). */
   private final NodeClient client;
 
@@ -71,12 +76,10 @@ public class TransportShardExecuteAction
   /** Column type map supplied directly (test path only). */
   private final Map<String, Type> columnTypeMap;
 
-  /** Default batch size for scroll queries. */
-  private static final int DEFAULT_BATCH_SIZE = 1024;
-
   /**
    * Production constructor for plugin wiring with Guice dependency injection. All parameters are
-   * standard OpenSearch injectable types.
+   * standard OpenSearch injectable types. Execution is routed to the {@value #DQE_THREAD_POOL_NAME}
+   * thread pool.
    *
    * @param transportService the transport service
    * @param actionFilters action filters
@@ -89,7 +92,12 @@ public class TransportShardExecuteAction
       ActionFilters actionFilters,
       NodeClient client,
       ClusterService clusterService) {
-    super(ShardExecuteAction.NAME, transportService, actionFilters, ShardExecuteRequest::new);
+    super(
+        ShardExecuteAction.NAME,
+        transportService,
+        actionFilters,
+        ShardExecuteRequest::new,
+        DQE_THREAD_POOL_NAME);
     this.client = client;
     this.clusterService = clusterService;
     this.scanFactory = null;
@@ -144,7 +152,9 @@ public class TransportShardExecuteAction
             tableInfo.columns().stream()
                 .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::trinoType));
 
-        effectiveScanFactory = buildScanFactory(req, effectiveColumnTypeMap);
+        Settings nodeSettings = clusterService.getSettings();
+        int batchSize = DqeSettings.PAGE_BATCH_SIZE.get(nodeSettings);
+        effectiveScanFactory = buildScanFactory(req, effectiveColumnTypeMap, batchSize);
       }
 
       // 3. Build operator pipeline
@@ -173,9 +183,13 @@ public class TransportShardExecuteAction
   /**
    * Build a scan factory that creates an {@link OpenSearchPageSource} for the given shard. The
    * factory wraps the {@link NodeClient} in a {@link OpenSearchPageSource.SearchClient} adapter.
+   *
+   * @param req the shard execute request
+   * @param typeMap mapping from column name to Trino Type
+   * @param batchSize number of documents per scroll batch
    */
   private Function<TableScanNode, Operator> buildScanFactory(
-      ShardExecuteRequest req, Map<String, Type> typeMap) {
+      ShardExecuteRequest req, Map<String, Type> typeMap, int batchSize) {
     OpenSearchPageSource.SearchClient searchClient =
         new OpenSearchPageSource.SearchClient() {
           @Override
@@ -216,7 +230,7 @@ public class TransportShardExecuteAction
           req.getShardId(),
           dsl,
           columns,
-          DEFAULT_BATCH_SIZE);
+          batchSize);
     };
   }
 

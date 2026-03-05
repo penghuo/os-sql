@@ -6,50 +6,58 @@
 package org.opensearch.sql.dqe.coordinator.transport;
 
 import io.trino.spi.Page;
+import io.trino.spi.block.Block;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.Statement;
+import java.io.IOException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.sql.dqe.coordinator.fragment.PlanFragment;
 import org.opensearch.sql.dqe.coordinator.fragment.PlanFragmenter;
 import org.opensearch.sql.dqe.coordinator.merge.ResultMerger;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
-import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.LogicalPlanner;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
-import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteRequest;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteResponse;
 import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 /**
  * Coordinator transport action that orchestrates the full DQE query pipeline: parse, plan,
- * fragment, execute (locally for MVP), merge, and format the response.
+ * fragment, dispatch to shards via transport, merge Pages, and format the response.
  *
- * <p>For the MVP, all shard fragments are executed locally on the coordinator thread using {@link
- * LocalExecutionPlanner}. Actual distributed transport dispatch to remote shards will be added
- * post-MVP.
+ * <p>Shard plan fragments are dispatched to their target nodes via {@link TransportService}. Each
+ * shard executes its fragment locally and returns serialized Trino Pages via {@link
+ * ShardExecuteResponse}.
  */
 public class TransportTrinoSqlAction
     extends HandledTransportAction<ActionRequest, TrinoSqlResponse> {
@@ -57,25 +65,23 @@ public class TransportTrinoSqlAction
   private static final Logger LOG = LogManager.getLogger();
 
   private final ClusterService clusterService;
-  private final Function<TableScanNode, Operator> scanFactory;
+  private final TransportService transportService;
 
   /**
    * Constructor for plugin wiring with dependency injection.
    *
-   * @param transportService the transport service
+   * @param transportService the transport service for dispatching shard requests
    * @param actionFilters action filters
    * @param clusterService the cluster service for metadata and routing
-   * @param scanFactory factory that creates a leaf Operator for a given TableScanNode
    */
   @Inject
   public TransportTrinoSqlAction(
       TransportService transportService,
       ActionFilters actionFilters,
-      ClusterService clusterService,
-      Function<TableScanNode, Operator> scanFactory) {
+      ClusterService clusterService) {
     super(TrinoSqlAction.NAME, transportService, actionFilters, TrinoSqlRequest::new);
     this.clusterService = clusterService;
-    this.scanFactory = scanFactory;
+    this.transportService = transportService;
   }
 
   @Override
@@ -103,7 +109,7 @@ public class TransportTrinoSqlAction
       PlanFragmenter fragmenter = new PlanFragmenter();
       PlanFragmenter.FragmentResult fragments = fragmenter.fragment(plan, clusterService.state());
 
-      // 6. Build column type map from metadata for operator execution
+      // 6. Build column type information from metadata
       String indexName = findIndexName(plan);
       TableInfo tableInfo = metadata.getTableInfo(indexName);
       Map<String, Type> columnTypeMap =
@@ -111,115 +117,92 @@ public class TransportTrinoSqlAction
               .collect(
                   Collectors.toMap(TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::trinoType));
 
-      // 7. Execute each shard fragment locally (MVP - no actual transport dispatch)
-      List<String> shardResults = new ArrayList<>();
-      for (PlanFragment frag : fragments.shardFragments()) {
-        LocalExecutionPlanner execPlanner = new LocalExecutionPlanner(scanFactory, columnTypeMap);
-        Operator pipeline = frag.shardPlan().accept(execPlanner, null);
-
-        List<String> columnNames = resolveColumnNames(frag.shardPlan());
-        List<Map<String, Object>> rows = drainPipelineToRows(pipeline, columnNames);
-        pipeline.close();
-
-        shardResults.add(rowsToJson(rows));
+      List<String> columnNames = resolveColumnNames(plan);
+      List<Type> columnTypes = new ArrayList<>();
+      for (String col : columnNames) {
+        columnTypes.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
       }
 
-      // 8. Merge
-      ResultMerger merger = new ResultMerger();
-      List<Map<String, Object>> finalRows;
-      if (fragments.coordinatorPlan() != null
-          && fragments.coordinatorPlan() instanceof AggregationNode) {
-        finalRows =
-            merger.mergeAggregation(shardResults, (AggregationNode) fragments.coordinatorPlan());
-      } else {
-        finalRows = merger.mergePassthrough(shardResults);
-      }
+      // 7. Dispatch to shards via transport
+      List<PlanFragment> shardFragments = fragments.shardFragments();
+      DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
-      // 9. Format response
-      String responseJson = formatResponse(finalRows, plan);
-      listener.onResponse(new TrinoSqlResponse(responseJson));
+      long timeoutMillis = 30000L;
+
+      GroupedActionListener<ShardExecuteResponse> groupedListener =
+          new GroupedActionListener<>(
+              ActionListener.wrap(
+                  responses -> {
+                    try {
+                      // 8. Merge Page-based results
+                      List<List<Page>> shardPages =
+                          responses.stream()
+                              .map(ShardExecuteResponse::getPages)
+                              .collect(Collectors.toList());
+
+                      ResultMerger merger = new ResultMerger();
+                      List<Page> mergedPages;
+                      if (coordinatorPlan instanceof AggregationNode aggNode) {
+                        mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
+                      } else {
+                        mergedPages = merger.mergePassthrough(shardPages);
+                      }
+
+                      // 9. Format response (Page -> JSON for REST client)
+                      String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
+                      listener.onResponse(new TrinoSqlResponse(responseJson));
+                    } catch (Exception e) {
+                      listener.onFailure(e);
+                    }
+                  },
+                  listener::onFailure),
+              shardFragments.size());
+
+      // Dispatch each fragment to its target node
+      for (PlanFragment frag : shardFragments) {
+        BytesStreamOutput planOut = new BytesStreamOutput();
+        DqePlanNode.writePlanNode(planOut, frag.shardPlan());
+        byte[] serializedPlan = planOut.bytes().toBytesRef().bytes;
+
+        ShardExecuteRequest shardReq =
+            new ShardExecuteRequest(
+                serializedPlan, frag.indexName(), frag.shardId(), timeoutMillis);
+
+        // Resolve target node
+        DiscoveryNode targetNode = clusterService.state().nodes().get(frag.nodeId());
+
+        // Send via transport
+        transportService.sendRequest(
+            targetNode,
+            ShardExecuteAction.NAME,
+            shardReq,
+            new TransportResponseHandler<ShardExecuteResponse>() {
+              @Override
+              public ShardExecuteResponse read(StreamInput in) throws IOException {
+                return new ShardExecuteResponse(in);
+              }
+
+              @Override
+              public void handleResponse(ShardExecuteResponse response) {
+                groupedListener.onResponse(response);
+              }
+
+              @Override
+              public void handleException(TransportException exp) {
+                groupedListener.onFailure(exp);
+              }
+
+              @Override
+              public String executor() {
+                return ThreadPool.Names.SAME;
+              }
+            });
+      }
 
     } catch (Exception e) {
       LOG.error("Error executing Trino SQL query: {}", sqlReq.getQuery(), e);
       listener.onFailure(e);
     }
-  }
-
-  /** Convert a list of row maps to a JSON array string. */
-  static String rowsToJson(List<Map<String, Object>> rows) {
-    StringBuilder sb = new StringBuilder("[");
-    for (int i = 0; i < rows.size(); i++) {
-      if (i > 0) {
-        sb.append(",");
-      }
-      sb.append("{");
-      Map<String, Object> row = rows.get(i);
-      int j = 0;
-      for (Map.Entry<String, Object> entry : row.entrySet()) {
-        if (j > 0) {
-          sb.append(",");
-        }
-        sb.append("\"").append(escapeJson(entry.getKey())).append("\":");
-        appendJsonValue(sb, entry.getValue());
-        j++;
-      }
-      sb.append("}");
-    }
-    sb.append("]");
-    return sb.toString();
-  }
-
-  /**
-   * Drain all pages from an operator pipeline and convert them into a list of row maps using the
-   * column names and type-based extraction.
-   */
-  private List<Map<String, Object>> drainPipelineToRows(
-      Operator pipeline, List<String> columnNames) {
-    List<Map<String, Object>> rows = new ArrayList<>();
-    Page page;
-    while ((page = pipeline.processNextBatch()) != null) {
-      for (int pos = 0; pos < page.getPositionCount(); pos++) {
-        Map<String, Object> row = new LinkedHashMap<>();
-        for (int col = 0; col < page.getChannelCount(); col++) {
-          String colName = col < columnNames.size() ? columnNames.get(col) : "col_" + col;
-          Object value = extractValue(page, col, pos);
-          row.put(colName, value);
-        }
-        rows.add(row);
-      }
-    }
-    return rows;
-  }
-
-  /**
-   * Extract a typed value from a Page at the given column and row position. Tries BIGINT, VARCHAR,
-   * DOUBLE, BOOLEAN in sequence.
-   */
-  private Object extractValue(Page page, int channel, int position) {
-    if (page.getBlock(channel).isNull(position)) {
-      return null;
-    }
-    try {
-      return BigintType.BIGINT.getLong(page.getBlock(channel), position);
-    } catch (Exception e) {
-      // Fall back to other types
-    }
-    try {
-      return VarcharType.VARCHAR.getSlice(page.getBlock(channel), position).toStringUtf8();
-    } catch (Exception e) {
-      // Fall back
-    }
-    try {
-      return DoubleType.DOUBLE.getDouble(page.getBlock(channel), position);
-    } catch (Exception e) {
-      // Fall back
-    }
-    try {
-      return BooleanType.BOOLEAN.getBoolean(page.getBlock(channel), position);
-    } catch (Exception e) {
-      // Fall back
-    }
-    return page.getBlock(channel).toString();
   }
 
   /**
@@ -319,30 +302,25 @@ public class TransportTrinoSqlAction
   }
 
   /**
-   * Format the query result as a JSON response matching the OpenSearch SQL response format:
+   * Format the query result as a JSON response matching the OpenSearch SQL response format. Works
+   * directly with Trino Pages.
    *
-   * <pre>
-   * {
-   *   "schema": [{"name": "col", "type": "long"}, ...],
-   *   "datarows": [[val1, val2], ...],
-   *   "total": N,
-   *   "size": N,
-   *   "status": 200
-   * }
-   * </pre>
+   * @param pages the merged result pages
+   * @param columnNames the output column names
+   * @param columnTypes the Trino types for each column
+   * @return JSON response string
    */
-  static String formatResponse(List<Map<String, Object>> rows, DqePlanNode plan) {
-    List<String> columns = resolveColumnNames(plan);
+  static String formatResponse(List<Page> pages, List<String> columnNames, List<Type> columnTypes) {
     StringBuilder sb = new StringBuilder();
     sb.append("{\"schema\":[");
 
-    // Build schema from column names
-    for (int i = 0; i < columns.size(); i++) {
+    // Build schema from column names and types
+    for (int i = 0; i < columnNames.size(); i++) {
       if (i > 0) {
         sb.append(",");
       }
-      String colName = columns.get(i);
-      String type = inferType(rows, colName);
+      String colName = columnNames.get(i);
+      String type = trinoTypeToOpenSearchType(columnTypes.get(i));
       sb.append("{\"name\":\"")
           .append(escapeJson(colName))
           .append("\",\"type\":\"")
@@ -351,46 +329,74 @@ public class TransportTrinoSqlAction
     }
     sb.append("],\"datarows\":[");
 
-    // Build data rows
-    for (int r = 0; r < rows.size(); r++) {
-      if (r > 0) {
-        sb.append(",");
-      }
-      sb.append("[");
-      Map<String, Object> row = rows.get(r);
-      for (int c = 0; c < columns.size(); c++) {
-        if (c > 0) {
+    // Build data rows from Pages
+    int totalRows = 0;
+    boolean firstRow = true;
+    for (Page page : pages) {
+      for (int pos = 0; pos < page.getPositionCount(); pos++) {
+        if (!firstRow) {
           sb.append(",");
         }
-        Object val = row.get(columns.get(c));
-        appendJsonValue(sb, val);
+        firstRow = false;
+        sb.append("[");
+        for (int col = 0; col < columnNames.size(); col++) {
+          if (col > 0) {
+            sb.append(",");
+          }
+          if (col < page.getChannelCount()) {
+            appendJsonValue(sb, extractValue(page, col, pos, columnTypes.get(col)));
+          } else {
+            sb.append("null");
+          }
+        }
+        sb.append("]");
+        totalRows++;
       }
-      sb.append("]");
     }
 
-    sb.append("],\"total\":").append(rows.size());
-    sb.append(",\"size\":").append(rows.size());
+    sb.append("],\"total\":").append(totalRows);
+    sb.append(",\"size\":").append(totalRows);
     sb.append(",\"status\":200}");
     return sb.toString();
   }
 
-  /** Infer the type name for a column by looking at the first non-null value in the rows. */
-  private static String inferType(List<Map<String, Object>> rows, String columnName) {
-    for (Map<String, Object> row : rows) {
-      Object val = row.get(columnName);
-      if (val != null) {
-        if (val instanceof Long || val instanceof Integer) {
-          return "long";
-        } else if (val instanceof Double || val instanceof Float) {
-          return "double";
-        } else if (val instanceof Boolean) {
-          return "boolean";
-        } else {
-          return "keyword";
-        }
+  /** Extract a typed value from a Page at the given column and row position. */
+  private static Object extractValue(Page page, int channel, int position, Type type) {
+    Block block = page.getBlock(channel);
+    if (block.isNull(position)) {
+      return null;
+    }
+    if (type instanceof BigintType) {
+      return BigintType.BIGINT.getLong(block, position);
+    } else if (type instanceof DoubleType) {
+      return DoubleType.DOUBLE.getDouble(block, position);
+    } else if (type instanceof BooleanType) {
+      return BooleanType.BOOLEAN.getBoolean(block, position);
+    } else if (type instanceof VarcharType) {
+      return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else {
+      // Default: try getLong for other numeric types
+      try {
+        return type.getLong(block, position);
+      } catch (Exception e) {
+        return block.toString();
       }
     }
-    return "keyword";
+  }
+
+  /** Map Trino Type to OpenSearch type name for schema output. */
+  private static String trinoTypeToOpenSearchType(Type type) {
+    if (type instanceof BigintType) {
+      return "long";
+    } else if (type instanceof DoubleType) {
+      return "double";
+    } else if (type instanceof BooleanType) {
+      return "boolean";
+    } else if (type instanceof VarcharType) {
+      return "keyword";
+    } else {
+      return "keyword";
+    }
   }
 
   private static void appendJsonValue(StringBuilder sb, Object value) {

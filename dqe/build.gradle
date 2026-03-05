@@ -40,9 +40,6 @@ dependencies {
     compileOnly group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
     compileOnly group: 'org.opensearch', name: 'opensearch-x-content', version: "${opensearch_version}"
 
-    // Jackson databind for JSON parsing (coordinator-side result merging)
-    implementation "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
-
     // Guava (provided by OpenSearch plugin at runtime)
     implementation group: 'com.google.guava', name: 'guava', version: "${guava_version}"
 
@@ -50,6 +47,7 @@ dependencies {
     implementation group: 'org.apache.logging.log4j', name: 'log4j-core', version: "${versions.log4j}"
 
     // Test
+    testImplementation "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"
     testImplementation group: 'org.mockito', name: 'mockito-core', version: "${mockito_version}"

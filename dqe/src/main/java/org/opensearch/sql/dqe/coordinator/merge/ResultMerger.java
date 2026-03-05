@@ -5,34 +5,35 @@
 
 package org.opensearch.sql.dqe.coordinator.merge;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.trino.spi.Page;
+import io.trino.spi.block.Block;
+import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.type.BigintType;
+import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.Type;
+import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 
 /**
- * Merges partial results from multiple shards on the coordinator. Supports three merge modes:
+ * Merges partial results from multiple shards on the coordinator. Works directly with Trino Pages
+ * instead of JSON strings. Supports three merge modes:
  *
  * <ol>
- *   <li><b>Passthrough</b>: Non-aggregate queries -- concatenate JSON rows from all shards.
+ *   <li><b>Passthrough</b>: Non-aggregate queries -- concatenate Pages from all shards.
  *   <li><b>Aggregation merge</b>: Run FINAL aggregation over partial results from shards.
  *   <li><b>Sorted merge with limit</b>: Merge pre-sorted shard results and apply final limit.
  * </ol>
  */
 public class ResultMerger {
-
-  private static final ObjectMapper MAPPER = new ObjectMapper();
-  private static final TypeReference<List<Map<String, Object>>> LIST_OF_MAPS =
-      new TypeReference<>() {};
 
   /**
    * Pattern to extract the aggregate function name and optional column from expressions like {@code
@@ -41,13 +42,13 @@ public class ResultMerger {
   private static final Pattern AGG_PATTERN =
       Pattern.compile("^(COUNT|SUM|MIN|MAX)\\((.+)\\)$", Pattern.CASE_INSENSITIVE);
 
-  /** Merge shard results for a non-aggregate query. Simple concatenation of all rows. */
-  public List<Map<String, Object>> mergePassthrough(List<String> shardJsonResults) {
-    List<Map<String, Object>> allRows = new ArrayList<>();
-    for (String json : shardJsonResults) {
-      allRows.addAll(parseJsonRows(json));
+  /** Merge shard results for a non-aggregate query. Simple concatenation of all pages. */
+  public List<Page> mergePassthrough(List<List<Page>> shardResults) {
+    List<Page> allPages = new ArrayList<>();
+    for (List<Page> shardPages : shardResults) {
+      allPages.addAll(shardPages);
     }
-    return allRows;
+    return allPages;
   }
 
   /**
@@ -60,93 +61,154 @@ public class ResultMerger {
    *   <li>{@code MIN(col)} -- MIN of partial mins
    *   <li>{@code MAX(col)} -- MAX of partial maxes
    * </ul>
+   *
+   * @param shardResults pages from each shard
+   * @param finalAggNode the FINAL aggregation node with group-by keys and functions
+   * @param columnTypes the Trino types for the output columns (group-by keys + agg results)
+   * @return merged result pages
    */
-  public List<Map<String, Object>> mergeAggregation(
-      List<String> shardJsonResults, AggregationNode finalAggNode) {
+  public List<Page> mergeAggregation(
+      List<List<Page>> shardResults, AggregationNode finalAggNode, List<Type> columnTypes) {
 
     List<String> groupByKeys = finalAggNode.getGroupByKeys();
     List<String> aggregateFunctions = finalAggNode.getAggregateFunctions();
+    int numGroupByCols = groupByKeys.size();
+    int numAggCols = aggregateFunctions.size();
+    int totalCols = numGroupByCols + numAggCols;
 
-    // Collect all rows from all shards
-    List<Map<String, Object>> allRows = new ArrayList<>();
-    for (String json : shardJsonResults) {
-      allRows.addAll(parseJsonRows(json));
+    // Flatten all pages into a combined list of rows represented as Object arrays
+    List<Object[]> allRows = new ArrayList<>();
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          Object[] row = new Object[totalCols];
+          for (int col = 0; col < totalCols; col++) {
+            row[col] = extractValue(page, col, pos, columnTypes.get(col));
+          }
+          allRows.add(row);
+        }
+      }
     }
 
-    // Group by the group-by key values. For global aggregations (no group-by keys),
-    // all rows belong to a single group with an empty key.
-    Map<String, List<Map<String, Object>>> groups =
-        allRows.stream().collect(Collectors.groupingBy(row -> buildGroupKey(row, groupByKeys)));
+    // Group by the group-by key values
+    Map<String, List<Object[]>> groups = new HashMap<>();
+    for (Object[] row : allRows) {
+      String key = buildGroupKey(row, numGroupByCols);
+      groups.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+    }
 
     // Merge each group
-    List<Map<String, Object>> result = new ArrayList<>();
-    for (Map.Entry<String, List<Map<String, Object>>> entry : groups.entrySet()) {
-      List<Map<String, Object>> groupRows = entry.getValue();
-      Map<String, Object> mergedRow = new LinkedHashMap<>();
+    List<Object[]> mergedRows = new ArrayList<>();
+    for (List<Object[]> groupRows : groups.values()) {
+      Object[] mergedRow = new Object[totalCols];
 
       // Copy group-by key values from the first row in the group
       if (!groupRows.isEmpty()) {
-        Map<String, Object> firstRow = groupRows.get(0);
-        for (String key : groupByKeys) {
-          mergedRow.put(key, firstRow.get(key));
+        Object[] firstRow = groupRows.get(0);
+        for (int i = 0; i < numGroupByCols; i++) {
+          mergedRow[i] = firstRow[i];
         }
       }
 
       // Merge each aggregate function
-      for (String aggExpr : aggregateFunctions) {
-        mergedRow.put(aggExpr, mergeAggregate(aggExpr, groupRows));
+      for (int a = 0; a < numAggCols; a++) {
+        int colIdx = numGroupByCols + a;
+        mergedRow[colIdx] = mergeAggregate(aggregateFunctions.get(a), groupRows, colIdx);
       }
 
-      result.add(mergedRow);
+      mergedRows.add(mergedRow);
     }
-    return result;
+
+    // Build result page from merged rows
+    return List.of(buildPage(mergedRows, columnTypes));
   }
 
   /**
-   * Merge-sort shard results for ORDER BY with limit. Combines all shard rows, sorts by the
-   * specified sort keys and directions, and returns the first {@code limit} rows.
+   * Merge-sort shard results for ORDER BY with limit. Combines all shard pages, sorts by the
+   * specified sort column indices and directions, and returns the first {@code limit} rows.
+   *
+   * @param shardResults pages from each shard
+   * @param sortColumnIndices column indices to sort by
+   * @param ascending sort directions for each column
+   * @param columnTypes Trino types for each column
+   * @param limit maximum number of rows to return
+   * @return sorted and limited result pages
    */
-  public List<Map<String, Object>> mergeSorted(
-      List<String> shardJsonResults, List<String> sortKeys, List<Boolean> ascending, long limit) {
+  public List<Page> mergeSorted(
+      List<List<Page>> shardResults,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      List<Type> columnTypes,
+      long limit) {
 
-    List<Map<String, Object>> allRows = new ArrayList<>();
-    for (String json : shardJsonResults) {
-      allRows.addAll(parseJsonRows(json));
+    int numCols = columnTypes.size();
+
+    // Flatten all pages
+    List<Object[]> allRows = new ArrayList<>();
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          Object[] row = new Object[numCols];
+          for (int col = 0; col < numCols; col++) {
+            row[col] = extractValue(page, col, pos, columnTypes.get(col));
+          }
+          allRows.add(row);
+        }
+      }
     }
 
-    Comparator<Map<String, Object>> comparator = buildComparator(sortKeys, ascending);
+    // Sort
+    Comparator<Object[]> comparator = buildComparator(sortColumnIndices, ascending);
     allRows.sort(comparator);
 
-    return allRows.subList(0, (int) Math.min(limit, allRows.size()));
+    // Apply limit
+    List<Object[]> limited = allRows.subList(0, (int) Math.min(limit, allRows.size()));
+
+    // Build result page
+    if (limited.isEmpty()) {
+      return List.of();
+    }
+    return List.of(buildPage(limited, columnTypes));
   }
 
-  /** Parse a JSON array string into a list of row maps. */
-  private List<Map<String, Object>> parseJsonRows(String json) {
-    try {
-      return MAPPER.readValue(json, LIST_OF_MAPS);
-    } catch (JsonProcessingException e) {
-      throw new IllegalArgumentException("Failed to parse shard JSON result: " + e.getMessage(), e);
+  /** Extract a typed value from a Page at the given column and row position. */
+  private Object extractValue(Page page, int channel, int position, Type type) {
+    Block block = page.getBlock(channel);
+    if (block.isNull(position)) {
+      return null;
+    }
+    if (type instanceof BigintType) {
+      return BigintType.BIGINT.getLong(block, position);
+    } else if (type instanceof DoubleType) {
+      return DoubleType.DOUBLE.getDouble(block, position);
+    } else if (type instanceof BooleanType) {
+      return BooleanType.BOOLEAN.getBoolean(block, position);
+    } else if (type instanceof VarcharType) {
+      return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else {
+      // Default: try getLong for integer-like types
+      return type.getLong(block, position);
     }
   }
 
   /** Build a string key from the group-by column values of a row. */
-  private String buildGroupKey(Map<String, Object> row, List<String> groupByKeys) {
-    if (groupByKeys.isEmpty()) {
+  private String buildGroupKey(Object[] row, int numGroupByCols) {
+    if (numGroupByCols == 0) {
       return "";
     }
     StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < groupByKeys.size(); i++) {
+    for (int i = 0; i < numGroupByCols; i++) {
       if (i > 0) {
         sb.append('\0');
       }
-      Object val = row.get(groupByKeys.get(i));
+      Object val = row[i];
       sb.append(val == null ? "null" : val.toString());
     }
     return sb.toString();
   }
 
   /** Merge a single aggregate expression across all rows in a group. */
-  private Number mergeAggregate(String aggExpr, List<Map<String, Object>> groupRows) {
+  private Number mergeAggregate(String aggExpr, List<Object[]> groupRows, int colIdx) {
     Matcher matcher = AGG_PATTERN.matcher(aggExpr);
     if (!matcher.matches()) {
       throw new UnsupportedOperationException("Unsupported aggregate expression: " + aggExpr);
@@ -156,24 +218,24 @@ public class ResultMerger {
     switch (funcName) {
       case "COUNT":
       case "SUM":
-        return sumValues(aggExpr, groupRows);
+        return sumValues(groupRows, colIdx);
       case "MIN":
-        return minValue(aggExpr, groupRows);
+        return minValue(groupRows, colIdx);
       case "MAX":
-        return maxValue(aggExpr, groupRows);
+        return maxValue(groupRows, colIdx);
       default:
         throw new UnsupportedOperationException("Unsupported aggregate function: " + funcName);
     }
   }
 
   /** Sum numeric values for a given column across all rows. */
-  private Number sumValues(String column, List<Map<String, Object>> rows) {
+  private Number sumValues(List<Object[]> rows, int colIdx) {
     long sum = 0;
     boolean hasDouble = false;
     double dSum = 0.0;
 
-    for (Map<String, Object> row : rows) {
-      Number val = (Number) row.get(column);
+    for (Object[] row : rows) {
+      Number val = (Number) row[colIdx];
       if (val != null) {
         if (val instanceof Double || val instanceof Float) {
           hasDouble = true;
@@ -188,13 +250,13 @@ public class ResultMerger {
   }
 
   /** Find the minimum numeric value for a given column across all rows. */
-  private Number minValue(String column, List<Map<String, Object>> rows) {
+  private Number minValue(List<Object[]> rows, int colIdx) {
     double min = Double.MAX_VALUE;
     boolean hasDouble = false;
     long longMin = Long.MAX_VALUE;
 
-    for (Map<String, Object> row : rows) {
-      Number val = (Number) row.get(column);
+    for (Object[] row : rows) {
+      Number val = (Number) row[colIdx];
       if (val != null) {
         if (val instanceof Double || val instanceof Float) {
           hasDouble = true;
@@ -209,13 +271,13 @@ public class ResultMerger {
   }
 
   /** Find the maximum numeric value for a given column across all rows. */
-  private Number maxValue(String column, List<Map<String, Object>> rows) {
+  private Number maxValue(List<Object[]> rows, int colIdx) {
     double max = -Double.MAX_VALUE;
     boolean hasDouble = false;
     long longMax = Long.MIN_VALUE;
 
-    for (Map<String, Object> row : rows) {
-      Number val = (Number) row.get(column);
+    for (Object[] row : rows) {
+      Number val = (Number) row[colIdx];
       if (val != null) {
         if (val instanceof Double || val instanceof Float) {
           hasDouble = true;
@@ -230,23 +292,23 @@ public class ResultMerger {
   }
 
   /**
-   * Build a composite comparator for sorting rows by multiple keys with independent sort
+   * Build a composite comparator for sorting rows by multiple column indices with independent sort
    * directions.
    */
   @SuppressWarnings("unchecked")
-  private Comparator<Map<String, Object>> buildComparator(
-      List<String> sortKeys, List<Boolean> ascending) {
+  private Comparator<Object[]> buildComparator(
+      List<Integer> sortColumnIndices, List<Boolean> ascending) {
 
-    Comparator<Map<String, Object>> comparator = (a, b) -> 0;
+    Comparator<Object[]> comparator = (a, b) -> 0;
 
-    for (int i = 0; i < sortKeys.size(); i++) {
-      String key = sortKeys.get(i);
+    for (int i = 0; i < sortColumnIndices.size(); i++) {
+      int colIdx = sortColumnIndices.get(i);
       boolean asc = ascending.get(i);
 
-      Comparator<Map<String, Object>> keyComparator =
+      Comparator<Object[]> keyComparator =
           (row1, row2) -> {
-            Object v1 = row1.get(key);
-            Object v2 = row2.get(key);
+            Object v1 = row1[colIdx];
+            Object v2 = row2[colIdx];
             if (v1 == null && v2 == null) return 0;
             if (v1 == null) return 1;
             if (v2 == null) return -1;
@@ -263,5 +325,47 @@ public class ResultMerger {
       comparator = comparator.thenComparing(keyComparator);
     }
     return comparator;
+  }
+
+  /** Build a Page from a list of rows (Object arrays) using the given column types. */
+  private Page buildPage(List<Object[]> rows, List<Type> columnTypes) {
+    int numCols = columnTypes.size();
+    BlockBuilder[] builders = new BlockBuilder[numCols];
+    for (int i = 0; i < numCols; i++) {
+      builders[i] = columnTypes.get(i).createBlockBuilder(null, rows.size());
+    }
+
+    for (Object[] row : rows) {
+      for (int col = 0; col < numCols; col++) {
+        Object val = row[col];
+        if (val == null) {
+          builders[col].appendNull();
+        } else {
+          appendValue(builders[col], columnTypes.get(col), val);
+        }
+      }
+    }
+
+    io.trino.spi.block.Block[] blocks = new io.trino.spi.block.Block[numCols];
+    for (int i = 0; i < numCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return new Page(blocks);
+  }
+
+  /** Append a typed value to a BlockBuilder. */
+  private void appendValue(BlockBuilder builder, Type type, Object value) {
+    if (type instanceof BigintType) {
+      BigintType.BIGINT.writeLong(builder, ((Number) value).longValue());
+    } else if (type instanceof DoubleType) {
+      DoubleType.DOUBLE.writeDouble(builder, ((Number) value).doubleValue());
+    } else if (type instanceof BooleanType) {
+      BooleanType.BOOLEAN.writeBoolean(builder, (Boolean) value);
+    } else if (type instanceof VarcharType) {
+      VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+    } else {
+      // Default: try writeLong for integer-like types
+      type.writeLong(builder, ((Number) value).longValue());
+    }
   }
 }

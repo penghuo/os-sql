@@ -11,10 +11,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.opensearch.sql.dqe.operator.TestPageSource.buildBigintPage;
 
+import io.trino.spi.Page;
+import io.trino.spi.type.BigintType;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -33,7 +34,7 @@ import org.opensearch.transport.TransportService;
 class TransportShardExecuteActionTest {
 
   @Test
-  @DisplayName("doExecute with TableScan returns all rows as JSON")
+  @DisplayName("doExecute with TableScan returns all rows as Pages")
   void doExecuteTableScan() throws Exception {
     // 1. Create a plan: TableScan with 3 BIGINT rows
     TableScanNode scan = new TableScanNode("logs", List.of("value"));
@@ -79,12 +80,15 @@ class TransportShardExecuteActionTest {
 
     ShardExecuteResponse response = responseRef.get();
     assertNotNull(response);
-    String json = response.getResultJson();
-    assertNotNull(json);
-    // Should contain 3 rows with values 0, 1, 2
-    assertTrue(json.contains("\"value\":0"), "JSON should contain value 0: " + json);
-    assertTrue(json.contains("\"value\":1"), "JSON should contain value 1: " + json);
-    assertTrue(json.contains("\"value\":2"), "JSON should contain value 2: " + json);
+    assertNotNull(response.getPages());
+    // Should contain pages with 3 rows total
+    int totalRows = response.getPages().stream().mapToInt(Page::getPositionCount).sum();
+    assertEquals(3, totalRows);
+    // Verify values 0, 1, 2 in the first page
+    Page page = response.getPages().get(0);
+    assertEquals(0L, BigintType.BIGINT.getLong(page.getBlock(0), 0));
+    assertEquals(1L, BigintType.BIGINT.getLong(page.getBlock(0), 1));
+    assertEquals(2L, BigintType.BIGINT.getLong(page.getBlock(0), 2));
   }
 
   @Test
@@ -132,16 +136,17 @@ class TransportShardExecuteActionTest {
 
     ShardExecuteResponse response = responseRef.get();
     assertNotNull(response);
-    String json = response.getResultJson();
     // Should contain exactly 2 rows (limited from 5)
-    assertTrue(json.contains("\"value\":0"), "JSON should contain value 0: " + json);
-    assertTrue(json.contains("\"value\":1"), "JSON should contain value 1: " + json);
-    // Should NOT contain rows 2-4
-    assertTrue(!json.contains("\"value\":2"), "JSON should not contain value 2: " + json);
+    int totalRows = response.getPages().stream().mapToInt(Page::getPositionCount).sum();
+    assertEquals(2, totalRows);
+    // Verify values 0 and 1
+    Page page = response.getPages().get(0);
+    assertEquals(0L, BigintType.BIGINT.getLong(page.getBlock(0), 0));
+    assertEquals(1L, BigintType.BIGINT.getLong(page.getBlock(0), 1));
   }
 
   @Test
-  @DisplayName("doExecute with empty result returns empty JSON array")
+  @DisplayName("doExecute with empty result returns empty page list")
   void doExecuteEmptyResult() throws Exception {
     TableScanNode scan = new TableScanNode("logs", List.of("value"));
     byte[] fragmentBytes = serializePlan(scan);
@@ -184,7 +189,7 @@ class TransportShardExecuteActionTest {
 
     ShardExecuteResponse response = responseRef.get();
     assertNotNull(response);
-    assertEquals("[]", response.getResultJson());
+    assertTrue(response.getPages().isEmpty());
   }
 
   @Test
@@ -227,37 +232,10 @@ class TransportShardExecuteActionTest {
   }
 
   @Test
-  @DisplayName("toJson produces correct JSON for row maps")
-  void toJsonProducesValidJson() {
-    Map<String, Object> row1 = Map.of("a", 1L, "b", "hello");
-    Map<String, Object> row2 = Map.of("a", 2L, "b", "world");
-    String json = TransportShardExecuteAction.toJson(List.of(row1, row2));
-
-    assertNotNull(json);
-    assertTrue(json.startsWith("["));
-    assertTrue(json.endsWith("]"));
-    assertTrue(json.contains("\"a\":1"));
-    assertTrue(json.contains("\"a\":2"));
-    assertTrue(json.contains("\"hello\""));
-    assertTrue(json.contains("\"world\""));
-  }
-
-  @Test
-  @DisplayName("toJson handles null values")
-  void toJsonHandlesNulls() {
-    Map<String, Object> row = new java.util.LinkedHashMap<>();
-    row.put("a", 1L);
-    row.put("b", null);
-    String json = TransportShardExecuteAction.toJson(List.of(row));
-
-    assertEquals("[{\"a\":1,\"b\":null}]", json);
-  }
-
-  @Test
-  @DisplayName("toJson handles empty list")
-  void toJsonEmptyList() {
-    String json = TransportShardExecuteAction.toJson(List.of());
-    assertEquals("[]", json);
+  @DisplayName("resolveColumnNames returns columns from TableScanNode")
+  void resolveColumnNamesFromTableScan() {
+    TableScanNode scan = new TableScanNode("logs", List.of("a", "b", "c"));
+    assertEquals(List.of("a", "b", "c"), TransportShardExecuteAction.resolveColumnNames(scan));
   }
 
   /** Serialize a DqePlanNode to bytes using the standard writePlanNode mechanism. */

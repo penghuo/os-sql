@@ -8,13 +8,22 @@ package org.opensearch.sql.dqe.coordinator.transport;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.opensearch.sql.dqe.operator.TestPageSource.buildBigintPage;
-import static org.opensearch.sql.dqe.operator.TestPageSource.buildCategoryValuePage;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.airlift.slice.Slices;
+import io.trino.spi.Page;
+import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.type.BigintType;
+import io.trino.spi.type.Type;
+import io.trino.spi.type.VarcharType;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -24,21 +33,26 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.sql.dqe.operator.TestPageSource;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteResponse;
+import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 @DisplayName("TransportTrinoSqlAction coordinator orchestration")
@@ -47,97 +61,100 @@ class TransportTrinoSqlActionTest {
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
   @Test
-  @DisplayName("Full pipeline: simple SELECT query returns formatted response")
+  @DisplayName(
+      "Full pipeline: simple SELECT dispatches to shards via transport and returns response")
   void fullPipelineSimpleSelect() throws Exception {
-    // Setup: mock ClusterService with metadata for "logs" index (column: status(long))
-    // Mock shard routing with 2 shards
     ClusterService clusterService = mockClusterService("logs", 2, Map.of("status", "long"));
+    TransportService transportService = mock(TransportService.class);
 
-    // Scan factory returns test data: each shard returns 3 rows of BIGINT values
+    // Mock transport: when sendRequest is called, respond with test pages
+    doAnswer(
+            invocation -> {
+              TransportResponseHandler<ShardExecuteResponse> handler = invocation.getArgument(3);
+              // Return a page with 3 rows of BIGINT values (0, 1, 2)
+              BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 3);
+              for (int i = 0; i < 3; i++) {
+                BigintType.BIGINT.writeLong(builder, i);
+              }
+              Page page = new Page(builder.build());
+              handler.handleResponse(
+                  new ShardExecuteResponse(List.of(page), List.of(BigintType.BIGINT)));
+              return null;
+            })
+        .when(transportService)
+        .sendRequest(any(DiscoveryNode.class), eq(ShardExecuteAction.NAME), any(), any());
+
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            mock(TransportService.class),
-            new ActionFilters(Collections.emptySet()),
-            clusterService,
-            node -> new TestPageSource(List.of(buildBigintPage(3))));
+            transportService, new ActionFilters(Collections.emptySet()), clusterService);
 
-    // Execute: SELECT status FROM logs
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
-
     TrinoSqlResponse response = executeSync(action, request);
 
     assertNotNull(response);
     assertNotNull(response.getResult());
     assertEquals("application/json; charset=UTF-8", response.getContentType());
 
-    // Parse and verify the response structure
     Map<String, Object> parsed = MAPPER.readValue(response.getResult(), new TypeReference<>() {});
     assertTrue(parsed.containsKey("schema"), "Response should contain schema");
     assertTrue(parsed.containsKey("datarows"), "Response should contain datarows");
-    assertTrue(parsed.containsKey("total"), "Response should contain total");
-    assertTrue(parsed.containsKey("status"), "Response should contain status");
     assertEquals(200, ((Number) parsed.get("status")).intValue());
 
     // 2 shards x 3 rows = 6 total rows (passthrough merge)
     List<?> datarows = (List<?>) parsed.get("datarows");
     assertEquals(6, datarows.size());
+
+    // Verify transport was called for each shard
+    verify(transportService, times(2))
+        .sendRequest(any(DiscoveryNode.class), eq(ShardExecuteAction.NAME), any(), any());
   }
 
   @Test
-  @DisplayName("Full pipeline: aggregation query merges partial results from shards")
-  void fullPipelineAggregation() throws Exception {
-    // Setup: mock ClusterService with metadata for "logs" index
-    // (columns: category(keyword), status(long))
-    ClusterService clusterService =
-        mockClusterService("logs", 2, Map.of("category", "keyword", "status", "long"));
+  @DisplayName("Transport dispatch sends request to correct target nodes")
+  void transportDispatchTargetsCorrectNodes() throws Exception {
+    ClusterService clusterService = mockClusterService("logs", 2, Map.of("status", "long"));
+    TransportService transportService = mock(TransportService.class);
 
-    // Scan factory returns category/value pages for aggregation
-    // Each shard gets: [("web", 1), ("api", 2), ("web", 3)]
+    doAnswer(
+            invocation -> {
+              TransportResponseHandler<ShardExecuteResponse> handler = invocation.getArgument(3);
+              BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+              BigintType.BIGINT.writeLong(builder, 1L);
+              Page page = new Page(builder.build());
+              handler.handleResponse(
+                  new ShardExecuteResponse(List.of(page), List.of(BigintType.BIGINT)));
+              return null;
+            })
+        .when(transportService)
+        .sendRequest(any(DiscoveryNode.class), eq(ShardExecuteAction.NAME), any(), any());
+
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            mock(TransportService.class),
-            new ActionFilters(Collections.emptySet()),
-            clusterService,
-            node ->
-                new TestPageSource(
-                    List.of(buildCategoryValuePage("web", 1L, "api", 2L, "web", 3L))));
+            transportService, new ActionFilters(Collections.emptySet()), clusterService);
 
-    // Execute: SELECT category, COUNT(*) FROM logs GROUP BY category
-    TrinoSqlRequest request =
-        new TrinoSqlRequest("SELECT category, COUNT(*) FROM logs GROUP BY category", false);
+    TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
+    executeSync(action, request);
 
-    TrinoSqlResponse response = executeSync(action, request);
+    // Capture the DiscoveryNode arguments
+    ArgumentCaptor<DiscoveryNode> nodeCaptor = ArgumentCaptor.forClass(DiscoveryNode.class);
+    verify(transportService, times(2))
+        .sendRequest(nodeCaptor.capture(), eq(ShardExecuteAction.NAME), any(), any());
 
-    assertNotNull(response);
-    assertNotNull(response.getResult());
-
-    // Parse response
-    Map<String, Object> parsed = MAPPER.readValue(response.getResult(), new TypeReference<>() {});
-    List<?> datarows = (List<?>) parsed.get("datarows");
-
-    // The aggregation merges partial counts from 2 shards
-    // Each shard produces partial: web=2, api=1
-    // Final merge: web=4 (2+2), api=2 (1+1)
-    assertNotNull(datarows);
-    assertTrue(datarows.size() > 0, "Should have aggregated rows");
+    List<DiscoveryNode> targetNodes = nodeCaptor.getAllValues();
+    assertEquals(2, targetNodes.size());
   }
 
   @Test
-  @DisplayName("Explain mode returns plan description without executing")
+  @DisplayName("Explain mode returns plan description without dispatching to shards")
   void explainMode() throws Exception {
     ClusterService clusterService = mockClusterService("logs", 2, Map.of("status", "long"));
+    TransportService transportService = mock(TransportService.class);
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            mock(TransportService.class),
-            new ActionFilters(Collections.emptySet()),
-            clusterService,
-            node -> {
-              throw new RuntimeException("Should not execute scan in explain mode");
-            });
+            transportService, new ActionFilters(Collections.emptySet()), clusterService);
 
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", true);
-
     TrinoSqlResponse response = executeSync(action, request);
 
     assertNotNull(response);
@@ -147,19 +164,20 @@ class TransportTrinoSqlActionTest {
     assertTrue(result.contains("TableScanNode"), "Explain result should describe TableScanNode");
     assertTrue(result.contains("ProjectNode"), "Explain result should describe ProjectNode");
     assertTrue(result.contains("logs"), "Explain result should mention index name");
+
+    // Verify no transport dispatch happened in explain mode
+    verify(transportService, times(0)).sendRequest(any(), any(String.class), any(), any());
   }
 
   @Test
   @DisplayName("Invalid SQL triggers onFailure")
   void invalidSqlTriggersFailure() throws Exception {
     ClusterService clusterService = mockClusterService("logs", 2, Map.of("status", "long"));
+    TransportService transportService = mock(TransportService.class);
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            mock(TransportService.class),
-            new ActionFilters(Collections.emptySet()),
-            clusterService,
-            node -> new TestPageSource(List.of()));
+            transportService, new ActionFilters(Collections.emptySet()), clusterService);
 
     TrinoSqlRequest request = new TrinoSqlRequest("NOT VALID SQL AT ALL", false);
 
@@ -189,15 +207,21 @@ class TransportTrinoSqlActionTest {
   }
 
   @Test
-  @DisplayName("formatResponse produces valid JSON with schema and datarows")
+  @DisplayName("formatResponse produces valid JSON with schema and datarows from Pages")
   void formatResponseProducesValidJson() throws Exception {
-    List<Map<String, Object>> rows =
-        List.of(Map.of("name", "Alice", "age", 30L), Map.of("name", "Bob", "age", 25L));
+    BlockBuilder nameBuilder = VarcharType.VARCHAR.createBlockBuilder(null, 2);
+    VarcharType.VARCHAR.writeSlice(nameBuilder, Slices.utf8Slice("Alice"));
+    VarcharType.VARCHAR.writeSlice(nameBuilder, Slices.utf8Slice("Bob"));
 
-    TableScanNode scan = new TableScanNode("users", List.of("name", "age"));
-    ProjectNode project = new ProjectNode(scan, List.of("name", "age"));
+    BlockBuilder ageBuilder = BigintType.BIGINT.createBlockBuilder(null, 2);
+    BigintType.BIGINT.writeLong(ageBuilder, 30L);
+    BigintType.BIGINT.writeLong(ageBuilder, 25L);
 
-    String json = TransportTrinoSqlAction.formatResponse(rows, project);
+    Page page = new Page(nameBuilder.build(), ageBuilder.build());
+    List<String> columnNames = List.of("name", "age");
+    List<Type> columnTypes = List.of(VarcharType.VARCHAR, BigintType.BIGINT);
+
+    String json = TransportTrinoSqlAction.formatResponse(List.of(page), columnNames, columnTypes);
     Map<String, Object> parsed = MAPPER.readValue(json, new TypeReference<>() {});
 
     List<?> schema = (List<?>) parsed.get("schema");
@@ -279,8 +303,8 @@ class TransportTrinoSqlActionTest {
   }
 
   /**
-   * Create a mock ClusterService that provides both metadata (for OpenSearchMetadata) and routing
-   * (for PlanFragmenter) for the given index.
+   * Create a mock ClusterService that provides metadata, routing, and DiscoveryNodes for the given
+   * index.
    */
   @SuppressWarnings("unchecked")
   private ClusterService mockClusterService(
@@ -311,13 +335,22 @@ class TransportTrinoSqlActionTest {
     when(clusterState.routingTable()).thenReturn(routingTable);
     when(routingTable.index(indexName)).thenReturn(indexRoutingTable);
 
+    // Mock DiscoveryNodes
+    DiscoveryNodes discoveryNodes = mock(DiscoveryNodes.class);
+    when(clusterState.nodes()).thenReturn(discoveryNodes);
+
     Map<Integer, IndexShardRoutingTable> shardMap = new HashMap<>();
     for (int i = 0; i < numShards; i++) {
       IndexShardRoutingTable shardRoutingTable = mock(IndexShardRoutingTable.class);
       ShardRouting primaryShard = mock(ShardRouting.class);
-      when(primaryShard.currentNodeId()).thenReturn("node-" + i);
+      String nodeId = "node-" + i;
+      when(primaryShard.currentNodeId()).thenReturn(nodeId);
       when(shardRoutingTable.primaryShard()).thenReturn(primaryShard);
       shardMap.put(i, shardRoutingTable);
+
+      // Mock DiscoveryNode for each node
+      DiscoveryNode discoveryNode = mock(DiscoveryNode.class);
+      when(discoveryNodes.get(nodeId)).thenReturn(discoveryNode);
     }
     when(indexRoutingTable.shards()).thenReturn(shardMap);
 

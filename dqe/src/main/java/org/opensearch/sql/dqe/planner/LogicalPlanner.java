@@ -29,6 +29,7 @@ import java.util.function.Function;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
@@ -84,18 +85,23 @@ public class LogicalPlanner {
       current = buildAggregation(current, querySpec, groupBy.get());
     }
 
-    // 4. Wrap with ProjectNode (SELECT columns)
+    // 4. Insert EvalNode for computed columns if needed (outside of GROUP BY)
+    if (groupBy.isEmpty()) {
+      current = maybeInsertEvalNode(current, querySpec);
+    }
+
+    // 5. Wrap with ProjectNode (SELECT columns)
     List<String> outputColumns = extractOutputColumns(querySpec);
     current = new ProjectNode(current, outputColumns);
 
-    // 5. Wrap with SortNode if ORDER BY exists
+    // 6. Wrap with SortNode if ORDER BY exists
     // For simple queries, ORDER BY lives on QuerySpecification; for compound queries, on Query.
     Optional<OrderBy> orderBy = querySpec.getOrderBy().or(query::getOrderBy);
     if (orderBy.isPresent()) {
       current = buildSort(current, orderBy.get());
     }
 
-    // 6. Wrap with LimitNode if LIMIT exists
+    // 7. Wrap with LimitNode if LIMIT exists
     // For simple queries, LIMIT lives on QuerySpecification; for compound queries, on Query.
     Optional<Node> limit = querySpec.getLimit().or(query::getLimit);
     if (limit.isPresent()) {
@@ -103,6 +109,43 @@ public class LogicalPlanner {
     }
 
     return current;
+  }
+
+  /**
+   * If any SELECT item has a computed expression (not a plain Identifier), insert an EvalNode to
+   * compute those expressions. The EvalNode output column names become the input for ProjectNode.
+   */
+  private static DqePlanNode maybeInsertEvalNode(
+      DqePlanNode current, QuerySpecification querySpec) {
+    boolean hasComputed = false;
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
+        if (!(singleColumn.getExpression() instanceof Identifier)) {
+          hasComputed = true;
+          break;
+        }
+      }
+    }
+
+    if (!hasComputed) {
+      return current;
+    }
+
+    List<String> expressions = new ArrayList<>();
+    List<String> outputColumnNames = new ArrayList<>();
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
+        Expression expr = singleColumn.getExpression();
+        expressions.add(expr.toString());
+        String colName =
+            singleColumn
+                .getAlias()
+                .map(Identifier::getValue)
+                .orElseGet(() -> expressionToColumnName(expr));
+        outputColumnNames.add(colName);
+      }
+    }
+    return new EvalNode(current, expressions, outputColumnNames);
   }
 
   private static DqePlanNode buildTableScan(

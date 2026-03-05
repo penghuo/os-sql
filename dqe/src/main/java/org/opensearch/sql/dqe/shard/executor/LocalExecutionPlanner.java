@@ -170,8 +170,8 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
   /**
    * Build a predicate function from a simple predicate string. Currently supports equality
-   * predicates of the form "column = value" where the value is a long integer. Handles
-   * surrounding parentheses that the Trino AST toString() may produce.
+   * predicates of the form "column = value" where the value is a long integer. Handles surrounding
+   * parentheses that the Trino AST toString() may produce.
    */
   private BiFunction<Page, Integer, Boolean> buildPredicate(
       String predicateString, List<String> columns) {

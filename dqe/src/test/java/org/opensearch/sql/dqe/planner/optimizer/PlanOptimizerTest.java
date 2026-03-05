@@ -267,8 +267,7 @@ class PlanOptimizerTest {
       //       AggregationNode(FINAL, groupBy=category, aggs=COUNT(*)) -> TableScan(20 columns)
       // Note: This is an unusual plan shape, but tests that all rules fire.
       TableScanNode scan =
-          new TableScanNode(
-              "logs", List.of("category", "status", "message", "timestamp", "level"));
+          new TableScanNode("logs", List.of("category", "status", "message", "timestamp", "level"));
       FilterNode filter = new FilterNode(scan, "status = 200");
       AggregationNode agg =
           new AggregationNode(
@@ -354,8 +353,7 @@ class PlanOptimizerTest {
     @DisplayName("Converts string equality to term query")
     void stringEquality() {
       assertEquals(
-          "{\"term\":{\"level\":\"error\"}}",
-          PlanOptimizer.tryConvertToDsl("level = 'error'"));
+          "{\"term\":{\"level\":\"error\"}}", PlanOptimizer.tryConvertToDsl("level = 'error'"));
     }
 
     @Test
@@ -373,8 +371,7 @@ class PlanOptimizerTest {
     @Test
     @DisplayName("Converts double equality to term query")
     void doubleEquality() {
-      assertEquals(
-          "{\"term\":{\"price\":19.99}}", PlanOptimizer.tryConvertToDsl("price = 19.99"));
+      assertEquals("{\"term\":{\"price\":19.99}}", PlanOptimizer.tryConvertToDsl("price = 19.99"));
     }
   }
 }

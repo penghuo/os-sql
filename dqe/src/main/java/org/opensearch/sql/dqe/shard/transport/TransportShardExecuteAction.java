@@ -225,12 +225,7 @@ public class TransportShardExecuteAction
       }
 
       return new OpenSearchPageSource(
-          searchClient,
-          node.getIndexName(),
-          req.getShardId(),
-          dsl,
-          columns,
-          batchSize);
+          searchClient, node.getIndexName(), req.getShardId(), dsl, columns, batchSize);
     };
   }
 

@@ -243,7 +243,9 @@ public class PlanOptimizer {
       } else if (node instanceof AggregationNode aggNode) {
         DqePlanNode prunedChild = pruneSubtree(aggNode.getChild(), requiredColumns);
         return new AggregationNode(
-            prunedChild, aggNode.getGroupByKeys(), aggNode.getAggregateFunctions(),
+            prunedChild,
+            aggNode.getGroupByKeys(),
+            aggNode.getAggregateFunctions(),
             aggNode.getStep());
       }
       return node;
@@ -260,8 +262,7 @@ public class PlanOptimizer {
     /** Extract column references from an aggregate function like "SUM(amount)". */
     private void extractAggregateColumnRefs(String funcStr, Set<String> columns) {
       Pattern aggPattern =
-          Pattern.compile(
-              "^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
+          Pattern.compile("^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
       Matcher matcher = aggPattern.matcher(funcStr);
       if (matcher.matches()) {
         String arg = matcher.group(2).trim();

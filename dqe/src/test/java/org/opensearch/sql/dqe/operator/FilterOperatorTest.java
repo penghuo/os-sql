@@ -15,6 +15,7 @@ import io.trino.sql.tree.ComparisonExpression;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.dqe.function.expression.BlockExpression;
 import org.opensearch.sql.dqe.function.expression.ColumnReference;
 import org.opensearch.sql.dqe.function.expression.ComparisonBlockExpression;
 import org.opensearch.sql.dqe.function.expression.ConstantExpression;
@@ -22,16 +23,30 @@ import org.opensearch.sql.dqe.function.expression.ConstantExpression;
 @DisplayName("FilterOperator")
 class FilterOperatorTest {
 
+  /** col0 >= threshold */
+  private static BlockExpression geq(long threshold) {
+    return new ComparisonBlockExpression(
+        ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL,
+        new ColumnReference(0, BigintType.BIGINT),
+        new ConstantExpression(threshold, BigintType.BIGINT));
+  }
+
+  /** Always-true predicate: col0 >= 0 (all values in test pages are non-negative) */
+  private static BlockExpression alwaysTrue() {
+    return geq(0);
+  }
+
+  /** Always-false predicate: col0 >= Long.MAX_VALUE */
+  private static BlockExpression alwaysFalse() {
+    return geq(Long.MAX_VALUE);
+  }
+
   @Test
   @DisplayName("Keeps only rows matching predicate")
   void filtersRows() {
-    // Page with values 0, 1, 2, 3, 4
-    Page input = buildBigintPage(5);
+    Page input = buildBigintPage(5); // values 0, 1, 2, 3, 4
     Operator source = new TestPageSource(List.of(input));
-    // Keep only rows where value >= 3
-    FilterOperator filter =
-        new FilterOperator(
-            source, (page, pos) -> BigintType.BIGINT.getLong(page.getBlock(0), pos) >= 3);
+    FilterOperator filter = new FilterOperator(source, geq(3));
 
     Page result = filter.processNextBatch();
     assertEquals(2, result.getPositionCount());
@@ -44,7 +59,7 @@ class FilterOperatorTest {
   void allFilteredOut() {
     Page input = buildBigintPage(3);
     Operator source = new TestPageSource(List.of(input));
-    FilterOperator filter = new FilterOperator(source, (page, pos) -> false);
+    FilterOperator filter = new FilterOperator(source, alwaysFalse());
 
     assertNull(filter.processNextBatch());
   }
@@ -54,7 +69,7 @@ class FilterOperatorTest {
   void allRowsMatch() {
     Page input = buildBigintPage(4);
     Operator source = new TestPageSource(List.of(input));
-    FilterOperator filter = new FilterOperator(source, (page, pos) -> true);
+    FilterOperator filter = new FilterOperator(source, alwaysTrue());
 
     Page result = filter.processNextBatch();
     assertEquals(4, result.getPositionCount());
@@ -66,10 +81,7 @@ class FilterOperatorTest {
     Page page1 = buildBigintPage(3); // values 0, 1, 2
     Page page2 = buildBigintPage(5); // values 0, 1, 2, 3, 4
     Operator source = new TestPageSource(List.of(page1, page2));
-    // Keep only values >= 3 (none in page1, two in page2)
-    FilterOperator filter =
-        new FilterOperator(
-            source, (page, pos) -> BigintType.BIGINT.getLong(page.getBlock(0), pos) >= 3);
+    FilterOperator filter = new FilterOperator(source, geq(3));
 
     Page result = filter.processNextBatch();
     assertEquals(2, result.getPositionCount());
@@ -81,27 +93,8 @@ class FilterOperatorTest {
   @DisplayName("Returns null for empty source")
   void emptySource() {
     Operator source = new TestPageSource(List.of());
-    FilterOperator filter = new FilterOperator(source, (page, pos) -> true);
+    FilterOperator filter = new FilterOperator(source, alwaysTrue());
 
     assertNull(filter.processNextBatch());
-  }
-
-  @Test
-  @DisplayName("BlockExpression predicate filters rows correctly")
-  void blockExpressionPredicate() {
-    Page input = buildBigintPage(5); // values 0, 1, 2, 3, 4
-    Operator source = new TestPageSource(List.of(input));
-    // col0 >= 3 via BlockExpression
-    ComparisonBlockExpression predicate =
-        new ComparisonBlockExpression(
-            ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL,
-            new ColumnReference(0, BigintType.BIGINT),
-            new ConstantExpression(3L, BigintType.BIGINT));
-    FilterOperator filter = new FilterOperator(source, predicate);
-
-    Page result = filter.processNextBatch();
-    assertEquals(2, result.getPositionCount());
-    assertEquals(3L, BigintType.BIGINT.getLong(result.getBlock(0), 0));
-    assertEquals(4L, BigintType.BIGINT.getLong(result.getBlock(0), 1));
   }
 }

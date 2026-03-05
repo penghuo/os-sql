@@ -29,6 +29,13 @@ import org.opensearch.dqe.analyzer.DqeAnalyzer;
 import org.opensearch.dqe.analyzer.projection.RequiredColumns;
 import org.opensearch.dqe.analyzer.sort.OperatorSelectionRule;
 import org.opensearch.dqe.analyzer.sort.PipelineDecision;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.dqe.exchange.gather.ExchangePushHandler;
+import org.opensearch.dqe.exchange.stage.StageScheduleResult;
+import org.opensearch.dqe.exchange.stage.StageScheduler;
+import org.opensearch.dqe.execution.pit.PitManager;
 import org.opensearch.dqe.memory.AdmissionController;
 import org.opensearch.dqe.memory.DqeMemoryTracker;
 import org.opensearch.dqe.metadata.DqeMetadata;
@@ -43,6 +50,7 @@ import org.opensearch.dqe.plugin.request.DqeQueryRequest;
 import org.opensearch.dqe.plugin.response.DqeQueryResponse;
 import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.dqe.types.DqeTypes;
+import org.opensearch.transport.TransportService;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayName("DqeQueryOrchestrator")
@@ -84,6 +92,31 @@ class DqeQueryOrchestratorTests {
     slowQueryLogger = new SlowQueryLogger(settings);
     auditLogger = new DqeAuditLogger();
 
+    // Mock ClusterState for execution path
+    ClusterState clusterState = org.mockito.Mockito.mock(ClusterState.class);
+    DiscoveryNodes discoveryNodes = org.mockito.Mockito.mock(DiscoveryNodes.class);
+    lenient().when(clusterService.state()).thenReturn(clusterState);
+    lenient().when(clusterState.nodes()).thenReturn(discoveryNodes);
+    lenient().when(discoveryNodes.getLocalNodeId()).thenReturn("local-node-1");
+
+    // Mock metadata.getSplits to return empty (no shards to scan)
+    lenient()
+        .when(metadata.getSplits(any(), any(), any()))
+        .thenReturn(java.util.Collections.emptyList());
+
+    // Mock StageScheduler that immediately responds with 0 nodes scheduled
+    StageScheduler stageScheduler = org.mockito.Mockito.mock(StageScheduler.class);
+    lenient()
+        .doAnswer(
+            inv -> {
+              ActionListener<StageScheduleResult> listener = inv.getArgument(6);
+              listener.onResponse(
+                  new StageScheduleResult(inv.getArgument(0), inv.getArgument(1), 0));
+              return null;
+            })
+        .when(stageScheduler)
+        .scheduleStage(any(), any(int.class), any(), any(), any(), any(long.class), any());
+
     orchestrator =
         new DqeQueryOrchestrator(
             parser,
@@ -95,7 +128,11 @@ class DqeQueryOrchestratorTests {
             metrics,
             slowQueryLogger,
             auditLogger,
-            clusterService);
+            clusterService,
+            org.mockito.Mockito.mock(PitManager.class),
+            stageScheduler,
+            new ExchangePushHandler(),
+            null);
   }
 
   private AnalyzedQuery buildAnalyzedQuery() {
@@ -192,16 +229,36 @@ class DqeQueryOrchestratorTests {
     }
 
     @Test
-    @DisplayName("Phase 1 returns empty data list")
-    void phase1ReturnsEmptyData() {
+    @DisplayName("execution fails gracefully when stage scheduler not configured")
+    void executionFailsWithoutStageScheduler() {
+      // Create a separate orchestrator with null stageScheduler
+      DqeQueryOrchestrator noSchedulerOrchestrator =
+          new DqeQueryOrchestrator(
+              parser,
+              analyzer,
+              metadata,
+              settings,
+              admissionController,
+              memoryTracker,
+              metrics,
+              slowQueryLogger,
+              auditLogger,
+              clusterService,
+              org.mockito.Mockito.mock(PitManager.class),
+              null, // no stage scheduler
+              new ExchangePushHandler(),
+              null);
+
       AnalyzedQuery analyzed = buildAnalyzedQuery();
       when(analyzer.analyze(any(Statement.class), any(), any())).thenReturn(analyzed);
 
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT col1 FROM test_index").build();
 
-      DqeQueryResponse response = orchestrator.execute(request);
-      assertTrue(response.getData().isEmpty());
+      DqeException ex =
+          assertThrows(DqeException.class, () -> noSchedulerOrchestrator.execute(request));
+      assertEquals(DqeErrorCode.EXECUTION_ERROR, ex.getErrorCode());
+      assertTrue(ex.getMessage().contains("stage scheduler"));
     }
   }
 
@@ -227,7 +284,11 @@ class DqeQueryOrchestratorTests {
               metrics,
               slowQueryLogger,
               auditLogger,
-              clusterService);
+              clusterService,
+              org.mockito.Mockito.mock(PitManager.class),
+              null,
+              new ExchangePushHandler(),
+              null);
 
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT 1 FROM t").build();
@@ -407,7 +468,11 @@ class DqeQueryOrchestratorTests {
                   metrics,
                   slowQueryLogger,
                   auditLogger,
-                  clusterService));
+                  clusterService,
+                  org.mockito.Mockito.mock(PitManager.class),
+                  null,
+                  new ExchangePushHandler(),
+                  null));
     }
 
     @Test
@@ -426,7 +491,11 @@ class DqeQueryOrchestratorTests {
                   metrics,
                   slowQueryLogger,
                   auditLogger,
-                  clusterService));
+                  clusterService,
+                  org.mockito.Mockito.mock(PitManager.class),
+                  null,
+                  new ExchangePushHandler(),
+                  null));
     }
 
     @Test
@@ -445,7 +514,11 @@ class DqeQueryOrchestratorTests {
                   metrics,
                   slowQueryLogger,
                   auditLogger,
-                  clusterService));
+                  clusterService,
+                  org.mockito.Mockito.mock(PitManager.class),
+                  null,
+                  new ExchangePushHandler(),
+                  null));
     }
 
     @Test
@@ -464,7 +537,11 @@ class DqeQueryOrchestratorTests {
                   null,
                   slowQueryLogger,
                   auditLogger,
-                  clusterService));
+                  clusterService,
+                  org.mockito.Mockito.mock(PitManager.class),
+                  null,
+                  new ExchangePushHandler(),
+                  null));
     }
   }
 }

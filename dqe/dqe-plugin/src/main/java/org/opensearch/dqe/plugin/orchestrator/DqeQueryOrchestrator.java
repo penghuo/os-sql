@@ -5,27 +5,46 @@
 
 package org.opensearch.dqe.plugin.orchestrator;
 
+import io.trino.spi.Page;
 import io.trino.sql.tree.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.dqe.analyzer.AnalyzedQuery;
 import org.opensearch.dqe.analyzer.DqeAnalyzer;
 import org.opensearch.dqe.analyzer.security.SecurityContext;
+import org.opensearch.dqe.exchange.action.DqeStageExecuteRequest.ShardSplitInfo;
+import org.opensearch.dqe.exchange.buffer.ExchangeBuffer;
+import org.opensearch.dqe.exchange.gather.ExchangePushHandler;
+import org.opensearch.dqe.exchange.gather.ExchangeSourceOperator;
+import org.opensearch.dqe.exchange.gather.GatherExchangeSource;
+import org.opensearch.dqe.exchange.stage.StageScheduleResult;
+import org.opensearch.dqe.exchange.stage.StageScheduler;
+import org.opensearch.dqe.execution.driver.Driver;
+import org.opensearch.dqe.execution.driver.Pipeline;
+import org.opensearch.dqe.execution.operator.OperatorContext;
+import org.opensearch.dqe.execution.pit.PitHandle;
+import org.opensearch.dqe.execution.pit.PitManager;
+import org.opensearch.dqe.execution.plan.PlanFragment;
 import org.opensearch.dqe.memory.AdmissionController;
 import org.opensearch.dqe.memory.DqeMemoryTracker;
 import org.opensearch.dqe.memory.QueryCleanup;
 import org.opensearch.dqe.memory.QueryMemoryBudget;
 import org.opensearch.dqe.metadata.DqeMetadata;
+import org.opensearch.dqe.metadata.DqeShardSplit;
 import org.opensearch.dqe.parser.DqeErrorCode;
 import org.opensearch.dqe.parser.DqeException;
 import org.opensearch.dqe.parser.DqeSqlParser;
+import org.opensearch.dqe.plugin.execution.CoordinatorPipelineBuilder;
 import org.opensearch.dqe.plugin.logging.DqeAuditLogger;
 import org.opensearch.dqe.plugin.logging.SlowQueryLogger;
 import org.opensearch.dqe.plugin.metrics.DqeMetrics;
@@ -34,6 +53,8 @@ import org.opensearch.dqe.plugin.response.DqeQueryResponse;
 import org.opensearch.dqe.plugin.security.PermissiveSecurityContext;
 import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.dqe.types.DqeType;
+import org.opensearch.dqe.types.converter.PageToRowConverter;
+import org.opensearch.transport.TransportService;
 
 /**
  * Orchestrates end-to-end DQE query execution. This is the central coordinator that wires together
@@ -50,8 +71,9 @@ import org.opensearch.dqe.types.DqeType;
  *   <li>Cleanup: release memory, close PIT, record metrics, log
  * </ol>
  *
- * <p>Phase 1 implements steps 1-3 and 7-8 fully. Steps 4-6 (operator execution) are stubbed and
- * will be wired when dqe-execution and dqe-exchange modules are complete.
+ * <p>Phase 1 execution is fully wired: shard splits are scheduled to data nodes via
+ * StageScheduler, data flows through gather exchange, and the coordinator pipeline applies
+ * Sort/TopN/Limit per the PipelineDecision before converting pages to row data.
  */
 public class DqeQueryOrchestrator {
 
@@ -67,6 +89,10 @@ public class DqeQueryOrchestrator {
   private final SlowQueryLogger slowQueryLogger;
   private final DqeAuditLogger auditLogger;
   private final ClusterService clusterService;
+  private final PitManager pitManager;
+  private final StageScheduler stageScheduler;
+  private final ExchangePushHandler exchangePushHandler;
+  private final TransportService transportService;
 
   /** Active queries by queryId, for cancellation support. */
   private final ConcurrentMap<String, QueryState> activeQueries = new ConcurrentHashMap<>();
@@ -84,6 +110,10 @@ public class DqeQueryOrchestrator {
    * @param slowQueryLogger slow query logger
    * @param auditLogger audit logger
    * @param clusterService for obtaining ClusterState
+   * @param pitManager PIT lifecycle manager
+   * @param stageScheduler stage scheduler for dispatching to data nodes
+   * @param exchangePushHandler exchange push handler for registering buffers
+   * @param transportService transport service for node ID resolution
    */
   public DqeQueryOrchestrator(
       DqeSqlParser parser,
@@ -95,7 +125,11 @@ public class DqeQueryOrchestrator {
       DqeMetrics metrics,
       SlowQueryLogger slowQueryLogger,
       DqeAuditLogger auditLogger,
-      ClusterService clusterService) {
+      ClusterService clusterService,
+      PitManager pitManager,
+      StageScheduler stageScheduler,
+      ExchangePushHandler exchangePushHandler,
+      TransportService transportService) {
     this.parser = Objects.requireNonNull(parser, "parser must not be null");
     this.analyzer = Objects.requireNonNull(analyzer, "analyzer must not be null");
     this.metadata = Objects.requireNonNull(metadata, "metadata must not be null");
@@ -110,6 +144,11 @@ public class DqeQueryOrchestrator {
     this.auditLogger = Objects.requireNonNull(auditLogger, "auditLogger must not be null");
     this.clusterService =
         Objects.requireNonNull(clusterService, "clusterService must not be null");
+    this.pitManager = Objects.requireNonNull(pitManager, "pitManager must not be null");
+    this.stageScheduler = stageScheduler; // nullable until TransportService is available
+    this.exchangePushHandler =
+        Objects.requireNonNull(exchangePushHandler, "exchangePushHandler must not be null");
+    this.transportService = transportService; // nullable until TransportService is available
   }
 
   /**
@@ -173,25 +212,87 @@ public class DqeQueryOrchestrator {
       auditLogger.logQueryStarted(
           queryId, securityContext.getUserName(), request.getQuery(), indices);
 
-      // Step 6: Build operator tree (Phase 2 - E-9)
-      // TODO(PL-10/E-9): Build shard pipeline + coordinator pipeline from AnalyzedQuery.
-      //   - PitManager.createPit(indexName, keepAlive)
-      //   - Build scan operators from analyzed.getRequiredColumns()
-      //   - Build filter operators from analyzed.getPredicateAnalysis()
-      //   - Build sort/topN/limit from analyzed.getPipelineDecision()
+      // Verify execution dependencies are available
+      if (stageScheduler == null) {
+        throw new DqeException(
+            "DQE stage scheduler not available: TransportService not configured",
+            DqeErrorCode.EXECUTION_ERROR);
+      }
 
-      // Step 7: Schedule stages (Phase 2 - X-6)
-      // TODO(PL-10/X-6): StageScheduler.scheduleStage(splits, fragment, ...)
-      //   - Get shard splits from metadata.getShardSplits(table, localNodeId)
-      //   - Create GatherExchangeSource
-      //   - Dispatch stage execute requests to data nodes
+      // Step 6: Get shard splits
+      String localNodeId = clusterService.state().nodes().getLocalNodeId();
+      List<DqeShardSplit> splits =
+          metadata.getSplits(clusterService.state(), analyzed.getTable(), localNodeId);
+      LOG.debug("[{}] Got {} shard splits", queryId, splits.size());
 
-      // Step 8: Execute and collect results (Phase 2 - E-9, X-6)
-      // TODO(PL-10/E-9): Drive operators via Driver, read pages from GatherExchangeSource
-      //   - Merge pages from exchange source
-      //   - Apply coordinator-side operators (merge sort, final project)
+      // Collect results via exchange pipeline
+      List<List<Object>> data = new ArrayList<>();
+      AtomicLong totalRows = new AtomicLong(0);
 
-      // Phase 1: return analyzed metadata as the response (no actual data)
+      if (!splits.isEmpty()) {
+        // Step 7: Create exchange infrastructure
+        ExchangeBuffer exchangeBuffer =
+            new ExchangeBuffer(
+                settings.getExchangeBufferSize().getBytes(),
+                settings.getExchangeBackpressureTimeout().millis(),
+                memoryTracker,
+                queryId);
+        cleanup.registerCleanupAction(exchangeBuffer::close);
+
+        GatherExchangeSource exchangeSource =
+            new GatherExchangeSource(queryId, 0, splits.size(), exchangeBuffer);
+        cleanup.registerCleanupAction(exchangeSource::close);
+
+        exchangePushHandler.registerBuffer(queryId, 0, exchangeBuffer);
+        cleanup.registerCleanupAction(() -> exchangePushHandler.deregisterBuffer(queryId, 0));
+
+        // Step 8: Build and serialize plan fragment
+        PlanFragment planFragment = new PlanFragment(request.getQuery(), queryId, 300L, 1000);
+        byte[] serializedFragment = planFragment.serialize();
+
+        // Step 9: Convert splits to ShardSplitInfo and schedule stage
+        List<ShardSplitInfo> splitInfos =
+            splits.stream()
+                .map(
+                    s ->
+                        new ShardSplitInfo(
+                            s.getShardId(), s.getNodeId(), s.getIndexName(), s.isPrimary()))
+                .collect(Collectors.toList());
+
+        PlainActionFuture<StageScheduleResult> scheduleFuture = new PlainActionFuture<>();
+        stageScheduler.scheduleStage(
+            queryId, 0, serializedFragment, splitInfos, localNodeId, budgetBytes, scheduleFuture);
+        scheduleFuture.actionGet();
+        cleanup.registerCleanupAction(() -> stageScheduler.deregisterQuery(queryId));
+
+        // Step 10: Build coordinator pipeline
+        OperatorContext exchangeOpCtx =
+            new OperatorContext(queryId, 0, 0, 0, "ExchangeSource", budget);
+        ExchangeSourceOperator exchangeOp =
+            new ExchangeSourceOperator(exchangeOpCtx, exchangeSource);
+        Pipeline coordinatorPipeline =
+            CoordinatorPipelineBuilder.build(exchangeOp, analyzed, budget);
+        cleanup.registerCleanupAction(coordinatorPipeline::close);
+
+        // Step 11: Drive coordinator pipeline, collect results
+        List<Page> resultPages = new ArrayList<>();
+        Driver driver =
+            new Driver(
+                coordinatorPipeline,
+                page -> {
+                  resultPages.add(page);
+                  totalRows.addAndGet(page.getPositionCount());
+                });
+        while (driver.process()) {
+          // pull pages
+        }
+
+        // Step 12: Convert pages to row data
+        for (Page page : resultPages) {
+          data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
+        }
+      }
+
       long elapsedMs = System.currentTimeMillis() - startTimeMs;
 
       // Build schema from analyzed output
@@ -208,17 +309,17 @@ public class DqeQueryOrchestrator {
               .state("COMPLETED")
               .queryId(queryId)
               .elapsedMs(elapsedMs)
-              .rowsProcessed(0) // Phase 1: no actual execution
-              .bytesProcessed(0)
+              .rowsProcessed(totalRows.get())
+              .bytesProcessed(budget.getUsedBytes())
               .stages(1)
-              .shardsQueried(0)
+              .shardsQueried(splits.size())
               .build();
 
       DqeQueryResponse response =
           DqeQueryResponse.builder()
               .engine("dqe")
               .schema(schema)
-              .data(List.of()) // Phase 1: no actual data
+              .data(data)
               .stats(stats)
               .build();
 

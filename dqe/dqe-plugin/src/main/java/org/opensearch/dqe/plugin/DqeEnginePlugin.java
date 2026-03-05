@@ -8,6 +8,7 @@ package org.opensearch.dqe.plugin;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import javax.annotation.Nullable;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
@@ -16,11 +17,23 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.dqe.analyzer.DqeAnalyzer;
+import org.opensearch.dqe.exchange.action.DqeExchangePushAction;
+import org.opensearch.dqe.exchange.action.DqeExchangePushRequest;
+import org.opensearch.dqe.exchange.action.DqeStageCancelAction;
+import org.opensearch.dqe.exchange.action.DqeStageCancelRequest;
+import org.opensearch.dqe.exchange.action.DqeStageExecuteAction;
+import org.opensearch.dqe.exchange.action.DqeStageExecuteRequest;
+import org.opensearch.dqe.exchange.gather.ExchangePushHandler;
+import org.opensearch.dqe.exchange.stage.StageCancelHandler;
+import org.opensearch.dqe.exchange.stage.StageExecutionHandler;
+import org.opensearch.dqe.exchange.stage.StageScheduler;
+import org.opensearch.dqe.execution.pit.PitManager;
 import org.opensearch.dqe.memory.AdmissionController;
 import org.opensearch.dqe.memory.DqeMemoryTracker;
 import org.opensearch.dqe.metadata.DqeMetadata;
 import org.opensearch.dqe.metadata.StatisticsCache;
 import org.opensearch.dqe.parser.DqeSqlParser;
+import org.opensearch.dqe.plugin.execution.ShardStageExecutor;
 import org.opensearch.dqe.plugin.explain.DqeExplainHandler;
 import org.opensearch.dqe.plugin.explain.PlanPrinter;
 import org.opensearch.dqe.plugin.logging.DqeAuditLogger;
@@ -29,6 +42,7 @@ import org.opensearch.dqe.plugin.metrics.DqeMetrics;
 import org.opensearch.dqe.plugin.orchestrator.DqeQueryOrchestrator;
 import org.opensearch.dqe.plugin.routing.EngineRouter;
 import org.opensearch.dqe.plugin.settings.DqeSettings;
+import org.opensearch.transport.TransportService;
 import org.opensearch.dqe.types.mapping.DateFormatResolver;
 import org.opensearch.dqe.types.mapping.MultiFieldResolver;
 import org.opensearch.dqe.types.mapping.OpenSearchTypeMappingResolver;
@@ -175,6 +189,15 @@ public class DqeEnginePlugin {
    * receives the fully wired orchestrator and explain handler.
    */
   public void initialize() {
+    initialize(null);
+  }
+
+  /**
+   * Initialize DQE components with TransportService for inter-node exchange.
+   *
+   * @param transportService the transport service (null to skip exchange registration)
+   */
+  public void initialize(@Nullable TransportService transportService) {
     if (initialized) {
       LOG.warn("DqeEnginePlugin.initialize() called more than once; ignoring.");
       return;
@@ -212,7 +235,57 @@ public class DqeEnginePlugin {
     SlowQueryLogger slowQueryLogger = new SlowQueryLogger(dqeSettings);
     DqeAuditLogger auditLogger = new DqeAuditLogger();
 
-    // Orchestrator (PL-10)
+    // PIT manager
+    PitManager pitManager = new PitManager(client);
+
+    // Exchange push handler (coordinator-side, works with or without transport)
+    ExchangePushHandler exchangePushHandler = new ExchangePushHandler();
+
+    // Stage scheduling and exchange (requires TransportService for inter-node communication)
+    StageScheduler stageScheduler = null;
+    if (transportService != null) {
+      stageScheduler = new StageScheduler(transportService, clusterService);
+
+      // Stage execution handler (data-node side)
+      StageExecutionHandler stageExecutionHandler =
+          new StageExecutionHandler(threadPool, transportService, memoryTracker);
+      StageCancelHandler stageCancelHandler = new StageCancelHandler(stageExecutionHandler);
+
+      // Shard stage executor (data-node side pipeline builder)
+      ShardStageExecutor shardStageExecutor =
+          new ShardStageExecutor(
+              parser,
+              analyzer,
+              metadata,
+              pitManager,
+              transportService,
+              clusterService,
+              memoryTracker,
+              threadPool,
+              client);
+      stageExecutionHandler.setExecutionCallback(shardStageExecutor);
+
+      // Register transport actions for exchange and stage execution
+      transportService.registerRequestHandler(
+          DqeExchangePushAction.NAME,
+          ThreadPool.Names.SAME,
+          DqeExchangePushRequest::new,
+          exchangePushHandler);
+      transportService.registerRequestHandler(
+          DqeStageExecuteAction.NAME,
+          DQE_WORKER_POOL,
+          DqeStageExecuteRequest::new,
+          stageExecutionHandler);
+      transportService.registerRequestHandler(
+          DqeStageCancelAction.NAME,
+          ThreadPool.Names.SAME,
+          DqeStageCancelRequest::new,
+          stageCancelHandler);
+    } else {
+      LOG.warn("TransportService not provided; DQE exchange transport handlers not registered");
+    }
+
+    // Orchestrator (PL-10) — now with full execution wiring
     this.orchestrator =
         new DqeQueryOrchestrator(
             parser,
@@ -224,7 +297,11 @@ public class DqeEnginePlugin {
             metrics,
             slowQueryLogger,
             auditLogger,
-            clusterService);
+            clusterService,
+            pitManager,
+            stageScheduler,
+            exchangePushHandler,
+            transportService);
 
     // Explain handler (PL-5)
     PlanPrinter planPrinter = new PlanPrinter();

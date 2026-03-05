@@ -47,6 +47,8 @@ public abstract class DqePlanNode implements Writeable {
       return new SortNode(in);
     } else if (className.equals(LimitNode.class.getName())) {
       return new LimitNode(in);
+    } else if (className.equals(EvalNode.class.getName())) {
+      return new EvalNode(in);
     }
     throw new IOException("Unknown plan node type: " + className);
   }

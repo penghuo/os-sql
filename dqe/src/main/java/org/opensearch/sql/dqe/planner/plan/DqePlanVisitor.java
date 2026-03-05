@@ -38,4 +38,8 @@ public abstract class DqePlanVisitor<R, C> {
   public R visitLimit(LimitNode node, C context) {
     return visitPlan(node, context);
   }
+
+  public R visitEval(EvalNode node, C context) {
+    return visitPlan(node, context);
+  }
 }

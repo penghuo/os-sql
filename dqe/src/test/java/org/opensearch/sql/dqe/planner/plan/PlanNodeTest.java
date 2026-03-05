@@ -181,6 +181,28 @@ class PlanNodeTest {
   }
 
   @Test
+  @DisplayName("EvalNode round-trips with child, expressions, and output column names")
+  void evalNodeRoundTrip() throws IOException {
+    TableScanNode scan = new TableScanNode("logs", List.of("status", "category"));
+    EvalNode eval =
+        new EvalNode(
+            scan, List.of("status * 2", "upper(category)"), List.of("doubled", "upper_cat"));
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    DqePlanNode.writePlanNode(out, eval);
+
+    InputStreamStreamInput in =
+        new InputStreamStreamInput(new ByteArrayInputStream(out.bytes().toBytesRef().bytes));
+    DqePlanNode deserialized = DqePlanNode.readPlanNode(in);
+
+    assertInstanceOf(EvalNode.class, deserialized);
+    EvalNode result = (EvalNode) deserialized;
+    assertEquals(List.of("status * 2", "upper(category)"), result.getExpressions());
+    assertEquals(List.of("doubled", "upper_cat"), result.getOutputColumnNames());
+    assertInstanceOf(TableScanNode.class, result.getChild());
+  }
+
+  @Test
   @DisplayName("Nested plan tree round-trips correctly")
   void nestedPlanRoundTrip() throws IOException {
     TableScanNode scan = new TableScanNode("logs", List.of("category", "status"));

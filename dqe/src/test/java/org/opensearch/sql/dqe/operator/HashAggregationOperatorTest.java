@@ -20,6 +20,9 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
+import org.opensearch.sql.dqe.function.aggregate.CountAccumulator;
+import org.opensearch.sql.dqe.function.aggregate.SumAccumulator;
 
 @DisplayName("HashAggregationOperator")
 class HashAggregationOperatorTest {
@@ -230,5 +233,37 @@ class HashAggregationOperatorTest {
             source, List.of(0), List.of(HashAggregationOperator.count()), columnTypes);
 
     assertNull(agg.processNextBatch());
+  }
+
+  @Test
+  @DisplayName("AccumulatorFactory path: COUNT and SUM produce same results")
+  void accumulatorFactoryPath() {
+    Page input = buildCategoryValuePage("a", 10L, "b", 20L, "a", 30L);
+    Operator source = new TestPageSource(List.of(input));
+    List<Type> columnTypes = List.of(VarcharType.VARCHAR, BigintType.BIGINT);
+
+    List<AggregateAccumulatorFactory> factories =
+        List.of(CountAccumulator.factory(), SumAccumulator.factory(BigintType.BIGINT));
+    List<Integer> aggColumnIndices = List.of(-1, 1); // -1 for COUNT(*), 1 for SUM(value)
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(source, List.of(0), factories, aggColumnIndices, columnTypes);
+
+    Page result = agg.processNextBatch();
+    assertNotNull(result);
+    assertEquals(2, result.getPositionCount()); // 2 groups
+    assertEquals(3, result.getChannelCount()); // category + count + sum
+
+    Map<String, Long> counts = new HashMap<>();
+    Map<String, Long> sums = new HashMap<>();
+    for (int i = 0; i < result.getPositionCount(); i++) {
+      String key = VarcharType.VARCHAR.getSlice(result.getBlock(0), i).toStringUtf8();
+      counts.put(key, BigintType.BIGINT.getLong(result.getBlock(1), i));
+      sums.put(key, BigintType.BIGINT.getLong(result.getBlock(2), i));
+    }
+    assertEquals(2L, counts.get("a"));
+    assertEquals(1L, counts.get("b"));
+    assertEquals(40L, sums.get("a"));
+    assertEquals(20L, sums.get("b"));
   }
 }

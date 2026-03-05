@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
 
 /**
  * Physical operator that performs hash-based aggregation. Buffers all input from the child
@@ -50,6 +51,48 @@ public class HashAggregationOperator implements Operator {
     this.aggregateFunctions = aggregateFunctions;
     this.columnTypes = columnTypes;
     this.finished = false;
+  }
+
+  /**
+   * Create a HashAggregationOperator using standalone AggregateAccumulatorFactory instances. Each
+   * factory specifies the column index it operates on and wraps into the existing AggregateFunction
+   * interface.
+   *
+   * @param source child operator providing input pages
+   * @param groupByColumnIndices indices of columns to group by
+   * @param accumulatorFactories list of accumulator factories with their column indices
+   * @param aggColumnIndices column index for each aggregate (-1 for COUNT(*))
+   * @param columnTypes types of all columns in the input pages
+   */
+  public HashAggregationOperator(
+      Operator source,
+      List<Integer> groupByColumnIndices,
+      List<AggregateAccumulatorFactory> accumulatorFactories,
+      List<Integer> aggColumnIndices,
+      List<Type> columnTypes) {
+    this.source = source;
+    this.groupByColumnIndices = groupByColumnIndices;
+    this.columnTypes = columnTypes;
+    this.finished = false;
+
+    // Wrap each factory into the existing AggregateFunction interface
+    this.aggregateFunctions = new ArrayList<>();
+    for (int i = 0; i < accumulatorFactories.size(); i++) {
+      AggregateAccumulatorFactory factory = accumulatorFactories.get(i);
+      int colIdx = aggColumnIndices.get(i);
+      this.aggregateFunctions.add(
+          new AggregateFunction() {
+            @Override
+            public Accumulator createAccumulator() {
+              return new FactoryAccumulatorAdapter(factory.createAccumulator(), colIdx);
+            }
+
+            @Override
+            public Type getOutputType() {
+              return factory.getOutputType();
+            }
+          });
+    }
   }
 
   @Override
@@ -432,5 +475,39 @@ public class HashAggregationOperator implements Operator {
         return DoubleType.DOUBLE;
       }
     };
+  }
+
+  /**
+   * Adapter that bridges the standalone {@link
+   * org.opensearch.sql.dqe.function.aggregate.Accumulator} (Block-level) to the row-at-a-time
+   * {@link Accumulator} interface used by this operator.
+   */
+  private static class FactoryAccumulatorAdapter implements Accumulator {
+
+    private final org.opensearch.sql.dqe.function.aggregate.Accumulator delegate;
+    private final int columnIndex;
+
+    FactoryAccumulatorAdapter(
+        org.opensearch.sql.dqe.function.aggregate.Accumulator delegate, int columnIndex) {
+      this.delegate = delegate;
+      this.columnIndex = columnIndex;
+    }
+
+    @Override
+    public void add(Page page, int position) {
+      // For row-at-a-time: extract single-position block and delegate
+      Block block = columnIndex >= 0 ? page.getBlock(columnIndex) : null;
+      if (block == null) {
+        // COUNT(*) — just count; use a non-null dummy
+        delegate.addBlock(page.getBlock(0).getSingleValueBlock(position), 1);
+      } else {
+        delegate.addBlock(block.getSingleValueBlock(position), 1);
+      }
+    }
+
+    @Override
+    public void writeTo(BlockBuilder builder) {
+      delegate.writeFinalTo(builder);
+    }
   }
 }

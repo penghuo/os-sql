@@ -13,47 +13,105 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.opensearch.action.ActionRequest;
+import org.opensearch.action.search.ClearScrollRequest;
+import org.opensearch.action.search.ClearScrollResponse;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.search.SearchScrollRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.InputStreamStreamInput;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
+import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
+import org.opensearch.sql.dqe.coordinator.metadata.TableInfo.ColumnInfo;
 import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
+import org.opensearch.sql.dqe.shard.source.ColumnHandle;
+import org.opensearch.sql.dqe.shard.source.OpenSearchPageSource;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.node.NodeClient;
 
 /**
  * Transport action that executes a DQE plan fragment on a shard. The coordinator sends a serialized
  * plan fragment to this action, which deserializes it, builds an operator pipeline via {@link
  * LocalExecutionPlanner}, drains all pages, and returns the result as serialized Trino Pages.
+ *
+ * <p>The production {@link Inject @Inject} constructor takes only standard Guice-injectable
+ * dependencies ({@link NodeClient}, {@link ClusterService}). The scan factory and column type map
+ * are built dynamically inside {@link #doExecute} from the request's index metadata, so no custom
+ * Guice bindings are required.
  */
 public class TransportShardExecuteAction
     extends HandledTransportAction<ActionRequest, ShardExecuteResponse> {
 
-  private final Function<TableScanNode, Operator> scanFactory;
-  private final Map<String, Type> columnTypeMap;
+  /** NodeClient for executing search requests on the local node (production path). */
+  private final NodeClient client;
+
+  /** ClusterService for resolving index metadata (production path). */
+  private final ClusterService clusterService;
 
   /**
-   * Constructor for plugin wiring with dependency injection.
+   * Scan factory supplied directly (test path only). When non-null, the action uses this factory
+   * and the companion {@link #columnTypeMap} instead of building them from cluster metadata.
+   */
+  private final Function<TableScanNode, Operator> scanFactory;
+
+  /** Column type map supplied directly (test path only). */
+  private final Map<String, Type> columnTypeMap;
+
+  /** Default batch size for scroll queries. */
+  private static final int DEFAULT_BATCH_SIZE = 1024;
+
+  /**
+   * Production constructor for plugin wiring with Guice dependency injection. All parameters are
+   * standard OpenSearch injectable types.
+   *
+   * @param transportService the transport service
+   * @param actionFilters action filters
+   * @param client the node-local client for executing search requests
+   * @param clusterService cluster service for resolving index metadata
+   */
+  @Inject
+  public TransportShardExecuteAction(
+      TransportService transportService,
+      ActionFilters actionFilters,
+      NodeClient client,
+      ClusterService clusterService) {
+    super(ShardExecuteAction.NAME, transportService, actionFilters, ShardExecuteRequest::new);
+    this.client = client;
+    this.clusterService = clusterService;
+    this.scanFactory = null;
+    this.columnTypeMap = null;
+  }
+
+  /**
+   * Test constructor that accepts a scan factory and column type map directly, bypassing the need
+   * for a real NodeClient and ClusterService.
    *
    * @param transportService the transport service
    * @param actionFilters action filters
    * @param scanFactory factory that creates a leaf Operator for a given TableScanNode
    * @param columnTypeMap mapping from column name to Trino Type
    */
-  @Inject
-  public TransportShardExecuteAction(
+  TransportShardExecuteAction(
       TransportService transportService,
       ActionFilters actionFilters,
       Function<TableScanNode, Operator> scanFactory,
       Map<String, Type> columnTypeMap) {
     super(ShardExecuteAction.NAME, transportService, actionFilters, ShardExecuteRequest::new);
+    this.client = null;
+    this.clusterService = null;
     this.scanFactory = scanFactory;
     this.columnTypeMap = columnTypeMap;
   }
@@ -68,11 +126,32 @@ public class TransportShardExecuteAction
           DqePlanNode.readPlanNode(
               new InputStreamStreamInput(new ByteArrayInputStream(req.getSerializedFragment())));
 
-      // 2. Build operator pipeline
-      LocalExecutionPlanner planner = new LocalExecutionPlanner(scanFactory, columnTypeMap);
+      // 2. Resolve scan factory and column types
+      final Function<TableScanNode, Operator> effectiveScanFactory;
+      final Map<String, Type> effectiveColumnTypeMap;
+
+      if (scanFactory != null) {
+        // Test path: use directly injected factory and type map
+        effectiveScanFactory = scanFactory;
+        effectiveColumnTypeMap = columnTypeMap != null ? columnTypeMap : Map.of();
+      } else {
+        // Production path: build from cluster metadata and NodeClient
+        String indexName = findIndexName(plan);
+        OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
+        TableInfo tableInfo = metadata.getTableInfo(indexName);
+        effectiveColumnTypeMap =
+            tableInfo.columns().stream()
+                .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::trinoType));
+
+        effectiveScanFactory = buildScanFactory(req, effectiveColumnTypeMap);
+      }
+
+      // 3. Build operator pipeline
+      LocalExecutionPlanner planner =
+          new LocalExecutionPlanner(effectiveScanFactory, effectiveColumnTypeMap);
       Operator pipeline = plan.accept(planner, null);
 
-      // 3. Execute: drain pages
+      // 4. Execute: drain pages
       List<Page> pages = new ArrayList<>();
       Page page;
       while ((page = pipeline.processNextBatch()) != null) {
@@ -80,10 +159,10 @@ public class TransportShardExecuteAction
       }
       pipeline.close();
 
-      // 4. Resolve column types from the plan
-      List<Type> columnTypes = resolveColumnTypes(plan);
+      // 5. Resolve column types from the plan
+      List<Type> columnTypes = resolveColumnTypes(plan, effectiveColumnTypeMap);
 
-      // 5. Return Page-based response
+      // 6. Return Page-based response
       listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
     } catch (Exception e) {
       listener.onFailure(e);
@@ -91,14 +170,70 @@ public class TransportShardExecuteAction
   }
 
   /**
+   * Build a scan factory that creates an {@link OpenSearchPageSource} for the given shard. The
+   * factory wraps the {@link NodeClient} in a {@link OpenSearchPageSource.SearchClient} adapter.
+   */
+  private Function<TableScanNode, Operator> buildScanFactory(
+      ShardExecuteRequest req, Map<String, Type> typeMap) {
+    OpenSearchPageSource.SearchClient searchClient =
+        new OpenSearchPageSource.SearchClient() {
+          @Override
+          public SearchResponse search(SearchRequest request) {
+            return client.search(request).actionGet();
+          }
+
+          @Override
+          public SearchResponse searchScroll(SearchScrollRequest request) {
+            return client.searchScroll(request).actionGet();
+          }
+
+          @Override
+          public ClearScrollResponse clearScroll(ClearScrollRequest request) {
+            return client.clearScroll(request).actionGet();
+          }
+        };
+
+    return node -> {
+      List<ColumnHandle> columns =
+          node.getColumns().stream()
+              .map(col -> new ColumnHandle(col, typeMap.getOrDefault(col, BigintType.BIGINT)))
+              .collect(Collectors.toList());
+
+      return new OpenSearchPageSource(
+          searchClient,
+          node.getIndexName(),
+          req.getShardId(),
+          new SearchSourceBuilder(),
+          columns,
+          DEFAULT_BATCH_SIZE);
+    };
+  }
+
+  /**
+   * Walk the plan tree to find the index name from the leaf {@link TableScanNode}.
+   *
+   * @throws IllegalStateException if no TableScanNode is found
+   */
+  static String findIndexName(DqePlanNode node) {
+    if (node instanceof TableScanNode) {
+      return ((TableScanNode) node).getIndexName();
+    }
+    List<DqePlanNode> children = node.getChildren();
+    if (!children.isEmpty()) {
+      return findIndexName(children.get(0));
+    }
+    throw new IllegalStateException("Plan tree contains no TableScanNode");
+  }
+
+  /**
    * Resolve column types from the plan node by walking the tree to determine output column names
    * and mapping them to types.
    */
-  private List<Type> resolveColumnTypes(DqePlanNode node) {
+  private List<Type> resolveColumnTypes(DqePlanNode node, Map<String, Type> typeMap) {
     List<String> columnNames = resolveColumnNames(node);
     List<Type> types = new ArrayList<>();
     for (String col : columnNames) {
-      types.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
+      types.add(typeMap.getOrDefault(col, BigintType.BIGINT));
     }
     return types;
   }

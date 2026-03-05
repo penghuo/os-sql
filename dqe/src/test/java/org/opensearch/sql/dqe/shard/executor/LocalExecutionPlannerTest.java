@@ -107,8 +107,7 @@ class LocalExecutionPlannerTest {
     TableScanNode scan = new TableScanNode("logs", List.of("status"));
     FilterNode filter = new FilterNode(scan, "status = 200");
     // Source has 1 BIGINT column with values: 100, 200, 300, 200, 400
-    Page testPage =
-        TestPageSource.buildBigintPageWithValues(100L, 200L, 300L, 200L, 400L);
+    Page testPage = TestPageSource.buildBigintPageWithValues(100L, 200L, 300L, 200L, 400L);
     LocalExecutionPlanner planner =
         new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)));
 
@@ -149,9 +148,10 @@ class LocalExecutionPlannerTest {
             scan, List.of("category"), List.of("COUNT(*)"), AggregationNode.Step.PARTIAL);
     // Source: [("a",10), ("b",20), ("a",30)]
     Page testPage = buildCategoryValuePage("a", 10L, "b", 20L, "a", 30L);
-    Map<String, Type> typeMap = Map.of(
-        "category", VarcharType.VARCHAR,
-        "amount", BigintType.BIGINT);
+    Map<String, Type> typeMap =
+        Map.of(
+            "category", VarcharType.VARCHAR,
+            "amount", BigintType.BIGINT);
     LocalExecutionPlanner planner =
         new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)), typeMap);
 
@@ -179,9 +179,10 @@ class LocalExecutionPlannerTest {
         new AggregationNode(
             scan, List.of("category"), List.of("SUM(amount)"), AggregationNode.Step.PARTIAL);
     Page testPage = buildCategoryValuePage("a", 10L, "b", 20L, "a", 30L);
-    Map<String, Type> typeMap = Map.of(
-        "category", VarcharType.VARCHAR,
-        "amount", BigintType.BIGINT);
+    Map<String, Type> typeMap =
+        Map.of(
+            "category", VarcharType.VARCHAR,
+            "amount", BigintType.BIGINT);
     LocalExecutionPlanner planner =
         new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)), typeMap);
 

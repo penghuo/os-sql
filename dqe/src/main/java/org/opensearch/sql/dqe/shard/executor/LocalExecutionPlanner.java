@@ -62,8 +62,8 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
    *
    * @param scanFactory factory that converts a TableScanNode into a leaf Operator
    * @param columnTypeMap mapping from column name to Trino Type; used by operators that need type
-   *     information (sort, aggregation, filter). Pass an empty map if only simple operators
-   *     (limit, project) are used.
+   *     information (sort, aggregation, filter). Pass an empty map if only simple operators (limit,
+   *     project) are used.
    */
   public LocalExecutionPlanner(
       Function<TableScanNode, Operator> scanFactory, Map<String, Type> columnTypeMap) {

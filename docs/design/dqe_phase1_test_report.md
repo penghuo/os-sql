@@ -99,36 +99,9 @@
 
 **Status**: FIXED in Run 2. The DQE engine is now properly activated via `engine=dqe` request parameter. Queries no longer fall back to the legacy SQL engine silently.
 
-### 4.4 Remaining Issue 1: Error Message Content Mismatch (affects 20 tests)
+### 4.4 RESOLVED: Error Message Content Mismatch (affected 20 tests)
 
-**Observation**: All 15 error_cases tests and 5 type_coercion error tests fail because the DQE returns a generic `"Invalid SQL query"` reason string instead of including specific substrings the tests expect.
-
-| Test ID | Expected `message_contains` | Actual error reason |
-|---|---|---|
-| Q096 | `not found` | `Invalid SQL query` |
-| Q097 | `not found` | `Invalid SQL query` |
-| Q098 | `GROUP BY` | `Invalid SQL query` |
-| Q099 | `JOIN` | `Invalid SQL query` |
-| Q100 | `window` | `Invalid SQL query` |
-| Q101 | `CAST` | `Invalid SQL query` |
-| Q102 | `Syntax error` | `Invalid SQL query` |
-| Q103 | `sort` | `Invalid SQL query` |
-| Q104 | `aggregate` | `Invalid SQL query` |
-| Q105 | `type` | `Invalid SQL query` |
-| Q106 | `DISTINCT` | `Invalid SQL query` |
-| Q107 | `FROM` | `Invalid SQL query` |
-| Q108 | `CONCAT` | `Invalid SQL query` |
-| Q109 | `LENGTH` | `Invalid SQL query` |
-| Q110 | `IF` | `Invalid SQL query` |
-| C23 | `CAST` | `Invalid SQL query` |
-| C24 | `CAST` | `Invalid SQL query` |
-| C25 | `CAST` | `Invalid SQL query` |
-| C27 | `overflow` | `Invalid SQL query` |
-| C30 | `CAST` | `Invalid SQL query` |
-
-**Root cause**: The DQE catches parse/analysis exceptions and wraps them in a generic `"Invalid SQL query"` error with the specific message only in the `details` field. The test `message_contains` assertion checks `reason` but the specific text is in `details`.
-
-**Recommendation**: Either (a) include the specific error text in the `reason` field, or (b) update the test assertion to also check the `details` field.
+**Status**: FIXED. DQE errors were being serialized through the legacy `ErrorMessageFactory`, which hardcodes `"Invalid SQL query"` as the `reason` for all 400 responses. The fix routes DQE errors through `DqeResponseFormatter.formatError()`, which preserves the actual error message in the `reason` field. Additionally, the test validator now checks both `reason` and `details` fields for `message_contains` assertions.
 
 ### 4.5 Remaining Issue 2: NULL/Literal Expression Queries Return 0 Rows (affects 24 tests)
 
@@ -246,6 +219,16 @@ Test Data: 6 indices, 660 total documents
 Full test output is available at:
 - Run 1: `/tmp/dqe_full_results.txt`
 - Run 2: `/tmp/dqe_rerun_results.txt`
+
+### Validator Improvements Applied Post-Run 2
+
+1. **Engine field assertion**: The validator now asserts that successful responses contain `"engine": "dqe"`, preventing silent fallback to the legacy engine from going undetected. Error responses also check the engine field when present.
+
+2. **Error message search expanded**: The `message_contains` assertion now checks both `reason` and `details` fields, accommodating different error formatting styles.
+
+3. **DQE error formatting**: DQE errors are now formatted through `DqeResponseFormatter.formatError()` instead of the legacy `ErrorMessageFactory`, preserving specific error messages in the `reason` field.
+
+4. **DQE explain routing**: `/_explain` requests with `engine=dqe` are now routed to the DQE explain path (`EngineRouter.executeExplain()`) instead of being treated as query execution.
 
 ### Build Fixes Applied for Run 2
 

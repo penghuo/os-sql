@@ -97,6 +97,19 @@ public class RestSqlAction extends BaseRestHandler {
    */
   private volatile Function<String, String> dqeExecutionFunction = null;
 
+  /**
+   * DQE explain function. Accepts a JSON request body and returns an explain output string. Set by
+   * SQLPlugin after DqeEnginePlugin is initialized.
+   */
+  private volatile Function<String, String> dqeExplainFunction = null;
+
+  /**
+   * DQE error formatter. Accepts a RuntimeException and returns a JSON error response string using
+   * DQE's own error format (with actual error messages, not the legacy "Invalid SQL query" stub).
+   * Set by SQLPlugin after DqeEnginePlugin is initialized.
+   */
+  private volatile Function<RuntimeException, String> dqeErrorFormatter = null;
+
   public RestSqlAction(Settings settings, Injector injector) {
     super();
     this.allowExplicitIndex = MULTI_ALLOW_EXPLICIT_INDEX.get(settings);
@@ -122,6 +135,28 @@ public class RestSqlAction extends BaseRestHandler {
    */
   public void setDqeExecutionFunction(Function<String, String> executionFunction) {
     this.dqeExecutionFunction = executionFunction;
+  }
+
+  /**
+   * Sets the DQE explain function. Called by SQLPlugin after DqeEnginePlugin is initialized. The
+   * function accepts a JSON request body string and returns an explain output string. Errors are
+   * thrown as RuntimeException (DqeException).
+   *
+   * @param explainFunction function that explains a DQE query and returns output
+   */
+  public void setDqeExplainFunction(Function<String, String> explainFunction) {
+    this.dqeExplainFunction = explainFunction;
+  }
+
+  /**
+   * Sets the DQE error formatter. Called by SQLPlugin after DqeEnginePlugin is initialized. The
+   * function accepts a RuntimeException and returns a JSON error response string using DQE's own
+   * error format (preserving the actual error message in the "reason" field).
+   *
+   * @param errorFormatter function that formats a DQE error as JSON
+   */
+  public void setDqeErrorFormatter(Function<RuntimeException, String> errorFormatter) {
+    this.dqeErrorFormatter = errorFormatter;
   }
 
   @Override
@@ -190,6 +225,38 @@ public class RestSqlAction extends BaseRestHandler {
           LOG.info(
               "[{}] Request routed to DQE engine",
               QueryContext.getRequestId());
+
+          // Route /_explain to the DQE explain path
+          if (isExplainRequest(request)) {
+            if (dqeExplainFunction == null) {
+              return channel -> {
+                channel.sendResponse(
+                    new BytesRestResponse(
+                        INTERNAL_SERVER_ERROR,
+                        "application/json; charset=UTF-8",
+                        "{\"error\":{\"reason\":\"DQE explain not initialized\","
+                            + "\"type\":\"DqeException\","
+                            + "\"engine\":\"dqe\"},"
+                            + "\"status\":500}"));
+              };
+            }
+            final String requestBody = sqlRequest.getJsonContent().toString();
+            return channel -> {
+              try {
+                String explainOutput = dqeExplainFunction.apply(requestBody);
+                channel.sendResponse(
+                    new BytesRestResponse(OK, "application/json; charset=UTF-8", explainOutput));
+              } catch (RuntimeException dqeError) {
+                LOG.warn(
+                    "[{}] DQE explain error: {}",
+                    QueryContext.getRequestId(),
+                    dqeError.getMessage());
+                reportDqeError(channel, dqeError);
+              }
+            };
+          }
+
+          // Route query execution to the DQE engine
           if (dqeExecutionFunction == null) {
             return channel -> {
               channel.sendResponse(
@@ -202,7 +269,6 @@ public class RestSqlAction extends BaseRestHandler {
                           + "\"status\":500}"));
             };
           }
-          // Execute the query through the DQE engine
           final String requestBody = sqlRequest.getJsonContent().toString();
           return channel -> {
             try {
@@ -214,7 +280,7 @@ public class RestSqlAction extends BaseRestHandler {
                   "[{}] DQE execution error: {}",
                   QueryContext.getRequestId(),
                   dqeError.getMessage());
-              reportError(channel, dqeError, BAD_REQUEST);
+              reportDqeError(channel, dqeError);
             }
           };
         }
@@ -224,7 +290,7 @@ public class RestSqlAction extends BaseRestHandler {
             "[{}] DQE routing error: {}",
             QueryContext.getRequestId(),
             dqeEx.getMessage());
-        return channel -> reportError(channel, dqeEx, BAD_REQUEST);
+        return channel -> reportDqeError(channel, dqeEx);
       }
 
       return newSqlQueryHandler.prepareRequest(
@@ -377,6 +443,21 @@ public class RestSqlAction extends BaseRestHandler {
   private void reportError(final RestChannel channel, final Exception e, final RestStatus status) {
     sendResponse(
         channel, ErrorMessageFactory.createErrorMessage(e, status.getStatus()).toString(), status);
+  }
+
+  /**
+   * Report a DQE error using the DQE error formatter if available, falling back to the legacy
+   * error formatter. The DQE formatter preserves the actual error message in the "reason" field
+   * instead of replacing it with a generic "Invalid SQL query".
+   */
+  private void reportDqeError(final RestChannel channel, final RuntimeException e) {
+    if (dqeErrorFormatter != null) {
+      String errorJson = dqeErrorFormatter.apply(e);
+      channel.sendResponse(
+          new BytesRestResponse(BAD_REQUEST, "application/json; charset=UTF-8", errorJson));
+    } else {
+      reportError(channel, e, BAD_REQUEST);
+    }
   }
 
   private boolean isSQLFeatureEnabled() {

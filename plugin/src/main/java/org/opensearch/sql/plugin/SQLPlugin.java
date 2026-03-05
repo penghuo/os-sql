@@ -89,6 +89,8 @@ import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
+import org.opensearch.dqe.parser.DqeErrorCode;
+import org.opensearch.dqe.parser.DqeException;
 import org.opensearch.dqe.plugin.DqeEnginePlugin;
 import org.opensearch.dqe.plugin.request.DqeRequestParser;
 import org.opensearch.dqe.plugin.response.DqeResponseFormatter;
@@ -183,7 +185,22 @@ public class SQLPlugin extends Plugin
             var dqeResponse = engineRouter.executeQuery(dqeRequest);
             return dqeResponseFormatter.formatSuccess(dqeResponse);
           });
-      LOGGER.info("DQE engine routing and execution wired into RestSqlAction");
+      restSqlAction.setDqeExplainFunction(
+          requestBody -> {
+            var dqeRequest = dqeRequestParser.parse(requestBody);
+            return engineRouter.executeExplain(dqeRequest);
+          });
+      restSqlAction.setDqeErrorFormatter(
+          error -> {
+            if (error instanceof DqeException) {
+              return dqeResponseFormatter.formatError((DqeException) error, null);
+            }
+            DqeException wrapped =
+                new DqeException(
+                    "Internal error: " + error.getMessage(), DqeErrorCode.EXECUTION_ERROR);
+            return dqeResponseFormatter.formatError(wrapped, null);
+          });
+      LOGGER.info("DQE engine routing, execution, explain, and error formatting wired into RestSqlAction");
     }
 
     return Arrays.asList(

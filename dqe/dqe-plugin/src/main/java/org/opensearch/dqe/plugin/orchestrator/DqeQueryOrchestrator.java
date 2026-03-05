@@ -31,6 +31,7 @@ import org.opensearch.dqe.exchange.stage.StageScheduleResult;
 import org.opensearch.dqe.exchange.stage.StageScheduler;
 import org.opensearch.dqe.execution.driver.Driver;
 import org.opensearch.dqe.execution.driver.Pipeline;
+import org.opensearch.dqe.execution.operator.Operator;
 import org.opensearch.dqe.execution.operator.OperatorContext;
 import org.opensearch.dqe.execution.pit.PitHandle;
 import org.opensearch.dqe.execution.pit.PitManager;
@@ -93,6 +94,7 @@ public class DqeQueryOrchestrator {
   private final StageScheduler stageScheduler;
   private final ExchangePushHandler exchangePushHandler;
   private final TransportService transportService;
+  private final org.opensearch.transport.client.Client client;
 
   /** Active queries by queryId, for cancellation support. */
   private final ConcurrentMap<String, QueryState> activeQueries = new ConcurrentHashMap<>();
@@ -129,7 +131,8 @@ public class DqeQueryOrchestrator {
       PitManager pitManager,
       StageScheduler stageScheduler,
       ExchangePushHandler exchangePushHandler,
-      TransportService transportService) {
+      TransportService transportService,
+      org.opensearch.transport.client.Client client) {
     this.parser = Objects.requireNonNull(parser, "parser must not be null");
     this.analyzer = Objects.requireNonNull(analyzer, "analyzer must not be null");
     this.metadata = Objects.requireNonNull(metadata, "metadata must not be null");
@@ -149,6 +152,7 @@ public class DqeQueryOrchestrator {
     this.exchangePushHandler =
         Objects.requireNonNull(exchangePushHandler, "exchangePushHandler must not be null");
     this.transportService = transportService; // nullable until TransportService is available
+    this.client = Objects.requireNonNull(client, "client must not be null");
   }
 
   /**
@@ -212,13 +216,6 @@ public class DqeQueryOrchestrator {
       auditLogger.logQueryStarted(
           queryId, securityContext.getUserName(), request.getQuery(), indices);
 
-      // Verify execution dependencies are available
-      if (stageScheduler == null) {
-        throw new DqeException(
-            "DQE stage scheduler not available: TransportService not configured",
-            DqeErrorCode.EXECUTION_ERROR);
-      }
-
       // Step 6: Get shard splits
       String localNodeId = clusterService.state().nodes().getLocalNodeId();
       List<DqeShardSplit> splits =
@@ -229,7 +226,8 @@ public class DqeQueryOrchestrator {
       List<List<Object>> data = new ArrayList<>();
       AtomicLong totalRows = new AtomicLong(0);
 
-      if (!splits.isEmpty()) {
+      if (!splits.isEmpty() && stageScheduler != null) {
+        // Distributed execution path (via transport exchange)
         // Step 7: Create exchange infrastructure
         ExchangeBuffer exchangeBuffer =
             new ExchangeBuffer(
@@ -291,6 +289,84 @@ public class DqeQueryOrchestrator {
         for (Page page : resultPages) {
           data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
         }
+      } else if (!splits.isEmpty()) {
+        // Local execution path (no TransportService / single-node fallback)
+        // Build shard pipelines directly in-process and collect results
+        LOG.debug("[{}] Using local execution path ({} splits)", queryId, splits.size());
+
+        var predicateConverter = new org.opensearch.dqe.execution.predicate.PredicateToQueryDslConverter();
+        org.opensearch.index.query.QueryBuilder pushdownQuery = null;
+        if (analyzed.getPredicateAnalysis().isPresent()) {
+          var pushdowns = analyzed.getPredicateAnalysis().get().getPushdownPredicates();
+          if (!pushdowns.isEmpty()) {
+            pushdownQuery = predicateConverter.convertAll(pushdowns);
+          }
+        }
+
+        // Build column descriptors from required columns
+        var requiredColumnHandles = analyzed.getRequiredColumns().isAllColumns()
+            ? java.util.Set.copyOf(metadata.getColumnHandles(clusterService.state(), analyzed.getTable()))
+            : analyzed.getRequiredColumns().getColumns();
+
+        var orderedColumns = new ArrayList<>(requiredColumnHandles);
+        var columnDescriptors = orderedColumns.stream()
+            .map(col -> new org.opensearch.dqe.types.converter.ColumnDescriptor(
+                col.getFieldPath(), col.getType()))
+            .collect(Collectors.toList());
+        var requiredColumnPaths = orderedColumns.stream()
+            .map(org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath)
+            .collect(Collectors.toList());
+
+        // Column name -> channel index in scan output
+        var inputColumnMap = new java.util.LinkedHashMap<String, Integer>();
+        for (int i = 0; i < orderedColumns.size(); i++) {
+          inputColumnMap.put(orderedColumns.get(i).getFieldName(), i);
+          inputColumnMap.putIfAbsent(orderedColumns.get(i).getFieldPath(), i);
+        }
+
+        var converter = new org.opensearch.dqe.types.converter.SearchHitToPageConverter(columnDescriptors, 1000);
+
+        // Process each shard locally
+        for (var splitInfo : splits) {
+          var pitHandle = pitManager.createPit(
+              splitInfo.getIndexName(),
+              org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
+          pitManager.registerPit(queryId, pitHandle);
+          cleanup.registerCleanupAction(() -> {
+            try { pitManager.releasePit(pitHandle); } catch (Exception e) { /* ignore */ }
+          });
+
+          var searchReqBuilder = new org.opensearch.dqe.execution.operator.scan.SearchRequestBuilder(
+              splitInfo.getIndexName(), splitInfo.getShardId(),
+              requiredColumnPaths, pushdownQuery, null, 1000);
+          OperatorContext scanCtx = new OperatorContext(queryId, 0, 0, 0, "ShardScan", budget);
+          Operator pipeline = new org.opensearch.dqe.execution.operator.scan.ShardScanOperator(
+              scanCtx, searchReqBuilder, pitHandle, client, 1000, converter);
+
+          // Add projection if not SELECT *
+          if (!analyzed.isSelectAll() && analyzed.getOutputExpressions() != null
+              && !analyzed.getOutputExpressions().isEmpty()) {
+            var projections = new ArrayList<org.opensearch.dqe.execution.expression.ExpressionEvaluator>();
+            for (var expr : analyzed.getOutputExpressions()) {
+              projections.add(new org.opensearch.dqe.execution.expression.ExpressionEvaluator(expr, inputColumnMap));
+            }
+            OperatorContext projectCtx = new OperatorContext(queryId, 0, 0, 1, "Project", budget);
+            pipeline = new org.opensearch.dqe.execution.operator.ProjectOperator(projectCtx, pipeline, projections);
+          }
+
+          // Drive pipeline, collect pages
+          while (!pipeline.isFinished()) {
+            Page page = pipeline.getOutput();
+            if (page != null && page.getPositionCount() > 0) {
+              totalRows.addAndGet(page.getPositionCount());
+              data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
+            }
+          }
+          pipeline.close();
+        }
+
+        // Apply coordinator-side sort/limit if needed
+        // (For local path, we skip sort/limit for now — data is unordered from shards)
       }
 
       long elapsedMs = System.currentTimeMillis() - startTimeMs;

@@ -132,7 +132,8 @@ class DqeQueryOrchestratorTests {
             org.mockito.Mockito.mock(PitManager.class),
             stageScheduler,
             new ExchangePushHandler(),
-            null);
+            null,
+            org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class));
   }
 
   private AnalyzedQuery buildAnalyzedQuery() {
@@ -229,36 +230,19 @@ class DqeQueryOrchestratorTests {
     }
 
     @Test
-    @DisplayName("execution fails gracefully when stage scheduler not configured")
-    void executionFailsWithoutStageScheduler() {
-      // Create a separate orchestrator with null stageScheduler
-      DqeQueryOrchestrator noSchedulerOrchestrator =
-          new DqeQueryOrchestrator(
-              parser,
-              analyzer,
-              metadata,
-              settings,
-              admissionController,
-              memoryTracker,
-              metrics,
-              slowQueryLogger,
-              auditLogger,
-              clusterService,
-              org.mockito.Mockito.mock(PitManager.class),
-              null, // no stage scheduler
-              new ExchangePushHandler(),
-              null);
-
+    @DisplayName("uses local execution when stage scheduler not configured")
+    void usesLocalExecutionWithoutStageScheduler() {
+      // Without stageScheduler, orchestrator falls back to local execution path
+      // With 0 splits (mocked), this returns an empty result set
       AnalyzedQuery analyzed = buildAnalyzedQuery();
       when(analyzer.analyze(any(Statement.class), any(), any())).thenReturn(analyzed);
 
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT col1 FROM test_index").build();
 
-      DqeException ex =
-          assertThrows(DqeException.class, () -> noSchedulerOrchestrator.execute(request));
-      assertEquals(DqeErrorCode.EXECUTION_ERROR, ex.getErrorCode());
-      assertTrue(ex.getMessage().contains("stage scheduler"));
+      DqeQueryResponse response = orchestrator.execute(request);
+      assertNotNull(response);
+      assertEquals("dqe", response.getEngine());
     }
   }
 
@@ -288,7 +272,8 @@ class DqeQueryOrchestratorTests {
               org.mockito.Mockito.mock(PitManager.class),
               null,
               new ExchangePushHandler(),
-              null);
+              null,
+              org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class));
 
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT 1 FROM t").build();
@@ -472,7 +457,8 @@ class DqeQueryOrchestratorTests {
                   org.mockito.Mockito.mock(PitManager.class),
                   null,
                   new ExchangePushHandler(),
-                  null));
+                  null,
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
     }
 
     @Test
@@ -495,7 +481,8 @@ class DqeQueryOrchestratorTests {
                   org.mockito.Mockito.mock(PitManager.class),
                   null,
                   new ExchangePushHandler(),
-                  null));
+                  null,
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
     }
 
     @Test
@@ -518,7 +505,8 @@ class DqeQueryOrchestratorTests {
                   org.mockito.Mockito.mock(PitManager.class),
                   null,
                   new ExchangePushHandler(),
-                  null));
+                  null,
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
     }
 
     @Test
@@ -541,7 +529,8 @@ class DqeQueryOrchestratorTests {
                   org.mockito.Mockito.mock(PitManager.class),
                   null,
                   new ExchangePushHandler(),
-                  null));
+                  null,
+                  org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class)));
     }
   }
 }

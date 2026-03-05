@@ -224,7 +224,7 @@ def validate_test_case(url: str, test_case: dict) -> tuple:
 
 
 def load_test_cases(path: str) -> list:
-    """Load test cases from a file or directory."""
+    """Load test cases from a file or directory (recursive)."""
     cases = []
     if os.path.isfile(path):
         with open(path, "r") as f:
@@ -234,15 +234,16 @@ def load_test_cases(path: str) -> list:
             else:
                 cases.append(data)
     elif os.path.isdir(path):
-        for filename in sorted(os.listdir(path)):
-            if filename.endswith(".json"):
-                filepath = os.path.join(path, filename)
-                with open(filepath, "r") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        cases.extend(data)
-                    else:
-                        cases.append(data)
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for filename in sorted(filenames):
+                if filename.endswith(".json"):
+                    filepath = os.path.join(dirpath, filename)
+                    with open(filepath, "r") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            cases.extend(data)
+                        else:
+                            cases.append(data)
     return cases
 
 

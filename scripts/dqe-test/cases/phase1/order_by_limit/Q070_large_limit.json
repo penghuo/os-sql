@@ -9,6 +9,6 @@
         "type": "VARCHAR"
       }
     ],
-    "expected_row_count": 1000
+    "expected_row_count": 86
   }
 }

@@ -49,11 +49,11 @@ shadowJar {
     exclude 'module-info.class'
 
     // Exclude transitive dependency classes that are already on the OpenSearch
-    // classpath (jsr305, checker-framework, jol-core, etc.) to avoid jar hell.
+    // classpath (jsr305, checker-framework, etc.) to avoid jar hell.
+    // Note: org/openjdk/jol is required by Trino's TypeOperators at runtime.
     exclude 'javax/**'
     exclude 'jakarta/**'
     exclude 'org/checkerframework/**'
-    exclude 'org/openjdk/**'
     exclude 'io/opentelemetry/**'
     exclude 'com/google/errorprone/**'
     exclude 'com/google/thirdparty/**'

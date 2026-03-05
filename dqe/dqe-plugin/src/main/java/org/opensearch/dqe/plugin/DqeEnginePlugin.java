@@ -29,6 +29,8 @@ import org.opensearch.dqe.exchange.stage.StageExecutionHandler;
 import org.opensearch.dqe.exchange.stage.StageScheduler;
 import org.opensearch.dqe.execution.pit.PitManager;
 import org.opensearch.dqe.memory.AdmissionController;
+import org.opensearch.dqe.metadata.DqeColumnHandle;
+import org.opensearch.dqe.metadata.DqeTableHandle;
 import org.opensearch.dqe.memory.DqeMemoryTracker;
 import org.opensearch.dqe.metadata.DqeMetadata;
 import org.opensearch.dqe.metadata.StatisticsCache;
@@ -214,7 +216,19 @@ public class DqeEnginePlugin {
     OpenSearchTypeMappingResolver typeMappingResolver =
         new OpenSearchTypeMappingResolver(new MultiFieldResolver(), new DateFormatResolver());
     StatisticsCache statisticsCache = new StatisticsCache(60_000L);
-    DqeMetadata metadata = new DqeMetadata(typeMappingResolver, statisticsCache);
+    // Create metadata with ClusterState-aware overrides for analyzer use
+    DqeMetadata metadata =
+        new DqeMetadata(typeMappingResolver, statisticsCache) {
+          @Override
+          public DqeTableHandle getTableHandle(String schema, String tableName) {
+            return getTableHandle(clusterService.state(), schema, tableName);
+          }
+
+          @Override
+          public java.util.List<DqeColumnHandle> getColumnHandles(DqeTableHandle table) {
+            return getColumnHandles(clusterService.state(), table);
+          }
+        };
 
     // Admission control
     AdmissionController admissionController =
@@ -301,7 +315,8 @@ public class DqeEnginePlugin {
             pitManager,
             stageScheduler,
             exchangePushHandler,
-            transportService);
+            transportService,
+            client);
 
     // Explain handler (PL-5)
     PlanPrinter planPrinter = new PlanPrinter();

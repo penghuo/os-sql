@@ -414,7 +414,7 @@ public class DqeQueryOrchestrator {
     return settings.getQueryMaxMemory().getBytes();
   }
 
-  /** Local execution path — runs shard pipelines in-process without transport exchange. */
+  /** Local execution path — runs shard pipelines in-process, applies coordinator pipeline. */
   private void executeLocal(
       String queryId,
       AnalyzedQuery analyzed,
@@ -461,6 +461,8 @@ public class DqeQueryOrchestrator {
     var converter =
         new org.opensearch.dqe.types.converter.SearchHitToPageConverter(columnDescriptors, 1000);
 
+    // Phase 1: Collect raw pages from all shard scans
+    List<Page> rawPages = new ArrayList<>();
     for (var split : splits) {
       PitHandle pitHandle =
           pitManager.createPit(
@@ -503,10 +505,7 @@ public class DqeQueryOrchestrator {
         while (!pipeline.isFinished()) {
           Page page = pipeline.getOutput();
           if (page != null && page.getPositionCount() > 0) {
-            totalRows.addAndGet(page.getPositionCount());
-            synchronized (data) {
-              data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
-            }
+            rawPages.add(page);
           }
         }
         pipeline.close();
@@ -516,6 +515,115 @@ public class DqeQueryOrchestrator {
         } catch (Exception e) {
           LOG.warn("[{}] Failed to release PIT: {}", queryId, e.getMessage());
         }
+      }
+    }
+
+    // Phase 2: Apply coordinator pipeline (Sort/TopN/Limit) via in-memory source
+    List<Page> finalPages = new ArrayList<>();
+    // Create an in-memory source operator that yields the collected pages
+    final java.util.Iterator<Page> pageIter = rawPages.iterator();
+    Operator memSource =
+        new Operator() {
+          private boolean finished = false;
+          private final OperatorContext ctx =
+              new OperatorContext(queryId, 0, 0, 0, "MemorySource", budget);
+
+          @Override
+          public Page getOutput() {
+            if (pageIter.hasNext()) return pageIter.next();
+            finished = true;
+            return null;
+          }
+
+          @Override
+          public boolean isFinished() {
+            return finished && !pageIter.hasNext();
+          }
+
+          @Override
+          public void finish() {
+            finished = true;
+          }
+
+          @Override
+          public void close() {}
+
+          @Override
+          public OperatorContext getOperatorContext() {
+            return ctx;
+          }
+        };
+
+    // Build coordinator pipeline using CoordinatorPipelineBuilder's logic
+    var decision = analyzed.getPipelineDecision();
+    var strategy = decision.getStrategy();
+    List<Integer> outputChannels =
+        java.util.stream.IntStream.range(0, analyzed.getOutputColumnNames().size())
+            .boxed()
+            .collect(Collectors.toList());
+
+    List<Operator> operators = new ArrayList<>();
+    operators.add(memSource);
+    int opId = 1;
+
+    switch (strategy) {
+      case SCAN_ONLY:
+        break;
+      case LIMIT_ONLY: {
+        long limit = decision.getLimit().orElse(0);
+        long offset = decision.getOffset().orElse(0);
+        var ctx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
+        operators.add(
+            new org.opensearch.dqe.execution.operator.LimitOperator(
+                ctx, operators.get(operators.size() - 1), limit, offset));
+        break;
+      }
+      case FULL_SORT: {
+        var ctx = new OperatorContext(queryId, 0, 0, opId++, "Sort", budget);
+        operators.add(
+            new org.opensearch.dqe.execution.operator.SortOperator(
+                ctx, operators.get(operators.size() - 1),
+                decision.getSortSpecifications(), outputChannels));
+        break;
+      }
+      case TOP_N: {
+        long n = decision.getEffectiveTopN().orElse(decision.getLimit().orElse(Long.MAX_VALUE));
+        var ctx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
+        operators.add(
+            new org.opensearch.dqe.execution.operator.TopNOperator(
+                ctx, operators.get(operators.size() - 1),
+                decision.getSortSpecifications(), n, outputChannels));
+        break;
+      }
+      case TOP_N_WITH_OFFSET: {
+        long limit = decision.getLimit().orElse(0);
+        long offset = decision.getOffset().orElse(0);
+        long effectiveN = decision.getEffectiveTopN().orElse(limit + offset);
+        var topNCtx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
+        operators.add(
+            new org.opensearch.dqe.execution.operator.TopNOperator(
+                topNCtx, operators.get(operators.size() - 1),
+                decision.getSortSpecifications(), effectiveN, outputChannels));
+        var limitCtx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
+        operators.add(
+            new org.opensearch.dqe.execution.operator.LimitOperator(
+                limitCtx, operators.get(operators.size() - 1), limit, offset));
+        break;
+      }
+    }
+
+    Pipeline coordPipeline = new Pipeline(operators);
+    Driver driver = new Driver(coordPipeline, page -> {
+      finalPages.add(page);
+      totalRows.addAndGet(page.getPositionCount());
+    });
+    while (driver.process()) { /* pull */ }
+    coordPipeline.close();
+
+    // Phase 3: Convert final pages to row data
+    synchronized (data) {
+      for (Page page : finalPages) {
+        data.addAll(PageToRowConverter.convert(page, analyzed.getOutputColumnTypes()));
       }
     }
   }

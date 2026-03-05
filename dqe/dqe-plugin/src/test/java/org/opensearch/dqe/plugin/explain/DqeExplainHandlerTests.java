@@ -56,8 +56,7 @@ class DqeExplainHandlerTests {
     @Test
     @DisplayName("explains SELECT with WHERE")
     void explainsSelectWithWhere() {
-      DqeQueryRequest request =
-          new DqeQueryRequest("SELECT a FROM t WHERE a > 10", "dqe");
+      DqeQueryRequest request = new DqeQueryRequest("SELECT a FROM t WHERE a > 10", "dqe");
       String output = handler.explain(request);
       assertNotNull(output);
       assertTrue(output.contains("DQE Query Plan"));

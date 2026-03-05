@@ -8,6 +8,7 @@ package org.opensearch.dqe.analyzer;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,18 +19,14 @@ import org.opensearch.dqe.metadata.DqeColumnHandle;
 import org.opensearch.dqe.metadata.DqeTableHandle;
 import org.opensearch.dqe.types.DqeTypes;
 
-import java.util.OptionalLong;
-
 @DisplayName("AnalyzedQuery")
 class AnalyzedQueryTest {
 
   @Test
   @DisplayName("Builder creates immutable AnalyzedQuery")
   void builderCreatesImmutableQuery() {
-    DqeTableHandle table =
-        new DqeTableHandle("test", null, List.of("test"), 1L, null);
-    DqeColumnHandle col =
-        new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, null, false);
+    DqeTableHandle table = new DqeTableHandle("test", null, List.of("test"), 1L, null);
+    DqeColumnHandle col = new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, null, false);
     RequiredColumns required = new RequiredColumns(Set.of(col));
     PipelineDecision decision =
         new PipelineDecision(
@@ -63,8 +60,7 @@ class AnalyzedQueryTest {
   @Test
   @DisplayName("Builder with limit and offset")
   void builderWithLimitAndOffset() {
-    DqeTableHandle table =
-        new DqeTableHandle("test", null, List.of("test"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test", null, List.of("test"), 1L, null);
     RequiredColumns required = new RequiredColumns(Set.of());
     PipelineDecision decision =
         new PipelineDecision(
@@ -94,8 +90,7 @@ class AnalyzedQueryTest {
   @Test
   @DisplayName("Output column lists are immutable")
   void outputColumnsImmutable() {
-    DqeTableHandle table =
-        new DqeTableHandle("test", null, List.of("test"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test", null, List.of("test"), 1L, null);
     RequiredColumns required = new RequiredColumns(Set.of());
     PipelineDecision decision =
         new PipelineDecision(
@@ -115,8 +110,7 @@ class AnalyzedQueryTest {
             .build();
 
     assertThrows(
-        UnsupportedOperationException.class,
-        () -> query.getOutputColumnNames().add("extra"));
+        UnsupportedOperationException.class, () -> query.getOutputColumnNames().add("extra"));
     assertThrows(
         UnsupportedOperationException.class,
         () -> query.getOutputColumnTypes().add(DqeTypes.BIGINT));
@@ -136,10 +130,6 @@ class AnalyzedQueryTest {
 
     assertThrows(
         NullPointerException.class,
-        () ->
-            AnalyzedQuery.builder()
-                .requiredColumns(required)
-                .pipelineDecision(decision)
-                .build());
+        () -> AnalyzedQuery.builder().requiredColumns(required).pipelineDecision(decision).build());
   }
 }

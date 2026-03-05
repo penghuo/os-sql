@@ -99,7 +99,8 @@ public class OrderByAnalyzer {
     }
 
     throw new DqeAnalysisException(
-        "ORDER BY expression must be a column reference. Complex expressions in ORDER BY are not supported in Phase 1.");
+        "ORDER BY expression must be a column reference. Complex expressions in ORDER BY are not"
+            + " supported in Phase 1.");
   }
 
   private SortSpecification.NullOrdering resolveNullOrdering(

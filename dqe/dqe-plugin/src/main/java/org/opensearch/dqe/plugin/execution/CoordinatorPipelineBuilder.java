@@ -70,58 +70,62 @@ public final class CoordinatorPipelineBuilder {
         // No additional operators needed
         break;
 
-      case LIMIT_ONLY: {
-        long limit = decision.getLimit().orElse(0);
-        long offset = decision.getOffset().orElse(0);
-        OperatorContext ctx =
-            new OperatorContext(queryId, stageId, 0, operatorId++, "Limit", budget);
-        operators.add(new LimitOperator(ctx, lastOperator(operators), limit, offset));
-        break;
-      }
+      case LIMIT_ONLY:
+        {
+          long limit = decision.getLimit().orElse(0);
+          long offset = decision.getOffset().orElse(0);
+          OperatorContext ctx =
+              new OperatorContext(queryId, stageId, 0, operatorId++, "Limit", budget);
+          operators.add(new LimitOperator(ctx, lastOperator(operators), limit, offset));
+          break;
+        }
 
-      case FULL_SORT: {
-        OperatorContext ctx =
-            new OperatorContext(queryId, stageId, 0, operatorId++, "Sort", budget);
-        operators.add(
-            new SortOperator(
-                ctx, lastOperator(operators), decision.getSortSpecifications(), outputChannels));
-        break;
-      }
+      case FULL_SORT:
+        {
+          OperatorContext ctx =
+              new OperatorContext(queryId, stageId, 0, operatorId++, "Sort", budget);
+          operators.add(
+              new SortOperator(
+                  ctx, lastOperator(operators), decision.getSortSpecifications(), outputChannels));
+          break;
+        }
 
-      case TOP_N: {
-        long n = decision.getEffectiveTopN().orElse(decision.getLimit().orElse(Long.MAX_VALUE));
-        OperatorContext ctx =
-            new OperatorContext(queryId, stageId, 0, operatorId++, "TopN", budget);
-        operators.add(
-            new TopNOperator(
-                ctx,
-                lastOperator(operators),
-                decision.getSortSpecifications(),
-                n,
-                outputChannels));
-        break;
-      }
+      case TOP_N:
+        {
+          long n = decision.getEffectiveTopN().orElse(decision.getLimit().orElse(Long.MAX_VALUE));
+          OperatorContext ctx =
+              new OperatorContext(queryId, stageId, 0, operatorId++, "TopN", budget);
+          operators.add(
+              new TopNOperator(
+                  ctx,
+                  lastOperator(operators),
+                  decision.getSortSpecifications(),
+                  n,
+                  outputChannels));
+          break;
+        }
 
-      case TOP_N_WITH_OFFSET: {
-        long limit = decision.getLimit().orElse(0);
-        long offset = decision.getOffset().orElse(0);
-        long effectiveN = decision.getEffectiveTopN().orElse(limit + offset);
+      case TOP_N_WITH_OFFSET:
+        {
+          long limit = decision.getLimit().orElse(0);
+          long offset = decision.getOffset().orElse(0);
+          long effectiveN = decision.getEffectiveTopN().orElse(limit + offset);
 
-        OperatorContext topNCtx =
-            new OperatorContext(queryId, stageId, 0, operatorId++, "TopN", budget);
-        operators.add(
-            new TopNOperator(
-                topNCtx,
-                lastOperator(operators),
-                decision.getSortSpecifications(),
-                effectiveN,
-                outputChannels));
+          OperatorContext topNCtx =
+              new OperatorContext(queryId, stageId, 0, operatorId++, "TopN", budget);
+          operators.add(
+              new TopNOperator(
+                  topNCtx,
+                  lastOperator(operators),
+                  decision.getSortSpecifications(),
+                  effectiveN,
+                  outputChannels));
 
-        OperatorContext limitCtx =
-            new OperatorContext(queryId, stageId, 0, operatorId++, "Limit", budget);
-        operators.add(new LimitOperator(limitCtx, lastOperator(operators), limit, offset));
-        break;
-      }
+          OperatorContext limitCtx =
+              new OperatorContext(queryId, stageId, 0, operatorId++, "Limit", budget);
+          operators.add(new LimitOperator(limitCtx, lastOperator(operators), limit, offset));
+          break;
+        }
     }
 
     return new Pipeline(operators);

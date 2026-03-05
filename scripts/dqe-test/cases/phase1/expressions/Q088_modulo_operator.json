@@ -10,7 +10,7 @@
       },
       {
         "name": "modulo",
-        "type": "BIGINT"
+        "type": "INTEGER"
       }
     ],
     "expected_row_count": 5

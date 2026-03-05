@@ -166,8 +166,7 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("OFFSET with FETCH NEXT (SQL standard)")
     void offsetWithFetch() {
-      Statement stmt =
-          parser.parse("SELECT * FROM t OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY");
+      Statement stmt = parser.parse("SELECT * FROM t OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY");
       assertNotNull(stmt);
     }
 
@@ -204,8 +203,7 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("IS NULL / IS NOT NULL")
     void isNull() {
-      Statement stmt =
-          parser.parse("SELECT * FROM t WHERE name IS NULL OR age IS NOT NULL");
+      Statement stmt = parser.parse("SELECT * FROM t WHERE name IS NULL OR age IS NOT NULL");
       assertNotNull(stmt);
     }
 
@@ -235,7 +233,8 @@ class DqeSqlParserTest {
     void caseExpression() {
       Statement stmt =
           parser.parse(
-              "SELECT CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END FROM t");
+              "SELECT CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END"
+                  + " FROM t");
       assertNotNull(stmt);
     }
 
@@ -286,7 +285,8 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("GROUP BY parses successfully")
     void groupBy() {
-      Statement stmt = parser.parse("SELECT department, COUNT(*) FROM employees GROUP BY department");
+      Statement stmt =
+          parser.parse("SELECT department, COUNT(*) FROM employees GROUP BY department");
       assertNotNull(stmt);
     }
 
@@ -302,8 +302,7 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("Subquery parses successfully")
     void subquery() {
-      Statement stmt =
-          parser.parse("SELECT * FROM t WHERE id IN (SELECT id FROM other_table)");
+      Statement stmt = parser.parse("SELECT * FROM t WHERE id IN (SELECT id FROM other_table)");
       assertNotNull(stmt);
     }
 
@@ -319,8 +318,7 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("UNION parses successfully")
     void union() {
-      Statement stmt =
-          parser.parse("SELECT name FROM t1 UNION ALL SELECT name FROM t2");
+      Statement stmt = parser.parse("SELECT name FROM t1 UNION ALL SELECT name FROM t2");
       assertNotNull(stmt);
     }
 
@@ -343,7 +341,8 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("Missing FROM clause")
     void missingFrom() {
-      DqeParsingException ex = assertThrows(DqeParsingException.class, () -> parser.parse("SELECT"));
+      DqeParsingException ex =
+          assertThrows(DqeParsingException.class, () -> parser.parse("SELECT"));
       assertThat(ex.getMessage(), notNullValue());
       assertEquals(DqeErrorCode.PARSING_ERROR, ex.getErrorCode());
       assertThat(ex.getLineNumber(), greaterThan(0));
@@ -362,8 +361,7 @@ class DqeSqlParserTest {
     @DisplayName("Invalid token")
     void invalidToken() {
       DqeParsingException ex =
-          assertThrows(
-              DqeParsingException.class, () -> parser.parse("SELECT * FROM t WHERE @@@"));
+          assertThrows(DqeParsingException.class, () -> parser.parse("SELECT * FROM t WHERE @@@"));
       assertEquals(DqeErrorCode.PARSING_ERROR, ex.getErrorCode());
     }
 
@@ -389,8 +387,7 @@ class DqeSqlParserTest {
     void lineNumber() {
       DqeParsingException ex =
           assertThrows(
-              DqeParsingException.class,
-              () -> parser.parse("SELECT *\nFROM t\nWHERE !!!"));
+              DqeParsingException.class, () -> parser.parse("SELECT *\nFROM t\nWHERE !!!"));
       assertEquals(DqeErrorCode.PARSING_ERROR, ex.getErrorCode());
       assertThat(ex.getLineNumber(), greaterThan(0));
     }
@@ -453,8 +450,7 @@ class DqeSqlParserTest {
     @Test
     @DisplayName("DqeTypeMismatchException fields")
     void typeMismatch() {
-      DqeTypeMismatchException ex =
-          new DqeTypeMismatchException("age", "INTEGER", "VARCHAR");
+      DqeTypeMismatchException ex = new DqeTypeMismatchException("age", "INTEGER", "VARCHAR");
       assertThat(ex.getMessage(), containsString("age"));
       assertThat(ex.getMessage(), containsString("INTEGER"));
       assertThat(ex.getMessage(), containsString("VARCHAR"));

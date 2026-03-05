@@ -25,12 +25,10 @@ import org.opensearch.dqe.analyzer.sort.SortSpecification;
 import org.opensearch.dqe.exchange.gather.ExchangeSourceOperator;
 import org.opensearch.dqe.execution.driver.Pipeline;
 import org.opensearch.dqe.execution.operator.LimitOperator;
-import org.opensearch.dqe.execution.operator.Operator;
 import org.opensearch.dqe.execution.operator.OperatorContext;
 import org.opensearch.dqe.execution.operator.SortOperator;
 import org.opensearch.dqe.execution.operator.TopNOperator;
 import org.opensearch.dqe.memory.QueryMemoryBudget;
-import org.opensearch.dqe.types.DqeTypes;
 
 @ExtendWith(MockitoExtension.class)
 class CoordinatorPipelineBuilderTests {

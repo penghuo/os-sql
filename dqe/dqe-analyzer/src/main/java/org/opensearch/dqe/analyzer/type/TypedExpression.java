@@ -12,7 +12,9 @@ import io.trino.sql.tree.Literal;
 import java.util.Objects;
 import org.opensearch.dqe.types.DqeType;
 
-/** An expression paired with its resolved DQE type. Wraps the original Trino Expression AST node. */
+/**
+ * An expression paired with its resolved DQE type. Wraps the original Trino Expression AST node.
+ */
 public class TypedExpression {
 
   private final Expression expression;

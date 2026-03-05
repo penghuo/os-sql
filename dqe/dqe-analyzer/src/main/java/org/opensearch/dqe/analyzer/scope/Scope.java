@@ -25,8 +25,7 @@ public class Scope {
   private final Optional<String> tableAlias;
   private final Map<String, DqeType> columnAliases;
 
-  public Scope(
-      DqeTableHandle table, List<DqeColumnHandle> columns, Optional<String> tableAlias) {
+  public Scope(DqeTableHandle table, List<DqeColumnHandle> columns, Optional<String> tableAlias) {
     this.table = Objects.requireNonNull(table, "table must not be null");
     this.columns = List.copyOf(Objects.requireNonNull(columns, "columns must not be null"));
     this.tableAlias = Objects.requireNonNull(tableAlias, "tableAlias must not be null");

@@ -76,9 +76,7 @@ public class DqeRequestParser {
         XContentType.JSON
             .xContent()
             .createParser(
-                NamedXContentRegistry.EMPTY,
-                DeprecationHandler.IGNORE_DEPRECATIONS,
-                requestBody)) {
+                NamedXContentRegistry.EMPTY, DeprecationHandler.IGNORE_DEPRECATIONS, requestBody)) {
 
       XContentParser.Token token = parser.nextToken();
       if (token != XContentParser.Token.START_OBJECT) {
@@ -170,10 +168,7 @@ public class DqeRequestParser {
 
       if (!ALLOWED_SESSION_PROPERTIES.contains(key)) {
         throw new DqeException(
-            "Unknown session property: '"
-                + key
-                + "'. Allowed: "
-                + ALLOWED_SESSION_PROPERTIES,
+            "Unknown session property: '" + key + "'. Allowed: " + ALLOWED_SESSION_PROPERTIES,
             DqeErrorCode.INVALID_REQUEST);
       }
       props.put(key, parser.text());
@@ -216,9 +211,7 @@ public class DqeRequestParser {
       }
     } catch (NumberFormatException e) {
       throw new DqeException(
-          "Invalid query_timeout value: '"
-              + value
-              + "'. Use '30s', '5m', or milliseconds",
+          "Invalid query_timeout value: '" + value + "'. Use '30s', '5m', or milliseconds",
           DqeErrorCode.INVALID_REQUEST);
     }
   }

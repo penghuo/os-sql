@@ -27,6 +27,7 @@ public class DqeExplainHandler {
 
   private final DqeSqlParser parser;
   private final PlanPrinter planPrinter;
+
   // DqeAnalyzer and DqeMetadata will be wired when available (PL-10)
 
   /**

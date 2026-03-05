@@ -40,8 +40,7 @@ class DqeAuditLoggerTests {
     @Test
     @DisplayName("handles null query gracefully")
     void handlesNullQuery() {
-      assertDoesNotThrow(
-          () -> auditLogger.logQueryStarted("q-2", "testuser", null, List.of()));
+      assertDoesNotThrow(() -> auditLogger.logQueryStarted("q-2", "testuser", null, List.of()));
     }
 
     @Test
@@ -76,8 +75,7 @@ class DqeAuditLoggerTests {
     @Test
     @DisplayName("logs without error for valid inputs")
     void logsValidInputs() {
-      assertDoesNotThrow(
-          () -> auditLogger.logQueryFailed("q-1", "testuser", "SYNTAX_ERROR"));
+      assertDoesNotThrow(() -> auditLogger.logQueryFailed("q-1", "testuser", "SYNTAX_ERROR"));
     }
 
     @Test
@@ -94,8 +92,7 @@ class DqeAuditLoggerTests {
     @Test
     @DisplayName("logs without error for valid inputs")
     void logsValidInputs() {
-      assertDoesNotThrow(
-          () -> auditLogger.logQueryCancelled("q-1", "testuser", "user_cancelled"));
+      assertDoesNotThrow(() -> auditLogger.logQueryCancelled("q-1", "testuser", "user_cancelled"));
     }
 
     @Test
@@ -113,18 +110,14 @@ class DqeAuditLoggerTests {
     @DisplayName("short queries are not truncated")
     void shortQueryNotTruncated() {
       // Just verify no exception -- the logger uses a private truncation method
-      assertDoesNotThrow(
-          () ->
-              auditLogger.logQueryStarted("q-1", "user", "SELECT 1", List.of()));
+      assertDoesNotThrow(() -> auditLogger.logQueryStarted("q-1", "user", "SELECT 1", List.of()));
     }
 
     @Test
     @DisplayName("long queries are truncated without error")
     void longQueryTruncated() {
       String longQuery = "SELECT " + "x".repeat(1000) + " FROM t";
-      assertDoesNotThrow(
-          () ->
-              auditLogger.logQueryStarted("q-2", "user", longQuery, List.of("t")));
+      assertDoesNotThrow(() -> auditLogger.logQueryStarted("q-2", "user", longQuery, List.of("t")));
     }
 
     @Test

@@ -10,7 +10,7 @@
       },
       {
         "name": "non_zero",
-        "type": "BIGINT"
+        "type": "INTEGER"
       },
       {
         "name": "COALESCE(str_val, 'fallback')",

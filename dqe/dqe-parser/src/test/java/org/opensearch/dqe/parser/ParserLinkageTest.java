@@ -55,7 +55,8 @@ class ParserLinkageTest {
 
     Statement stmt =
         parser.parse(
-            "SELECT id, name, CAST(salary AS DOUBLE) FROM employees WHERE age > 25 ORDER BY name LIMIT 100");
+            "SELECT id, name, CAST(salary AS DOUBLE) FROM employees WHERE age > 25 ORDER BY name"
+                + " LIMIT 100");
     assertNotNull(stmt, "Parsed statement should not be null");
     assertThat("Statement should be a Query", stmt, instanceOf(Query.class));
   }

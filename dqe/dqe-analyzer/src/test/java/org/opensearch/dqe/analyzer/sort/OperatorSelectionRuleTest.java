@@ -37,8 +37,7 @@ class OperatorSelectionRuleTest {
   @Test
   @DisplayName("No ORDER BY, no LIMIT -> SCAN_ONLY")
   void scanOnly() {
-    PipelineDecision decision =
-        rule.decide(List.of(), OptionalLong.empty(), OptionalLong.empty());
+    PipelineDecision decision = rule.decide(List.of(), OptionalLong.empty(), OptionalLong.empty());
     assertEquals(OperatorSelectionRule.PipelineStrategy.SCAN_ONLY, decision.getStrategy());
     assertTrue(decision.getEffectiveTopN().isEmpty());
   }
@@ -46,8 +45,7 @@ class OperatorSelectionRuleTest {
   @Test
   @DisplayName("LIMIT only -> LIMIT_ONLY")
   void limitOnly() {
-    PipelineDecision decision =
-        rule.decide(List.of(), OptionalLong.of(10), OptionalLong.empty());
+    PipelineDecision decision = rule.decide(List.of(), OptionalLong.of(10), OptionalLong.empty());
     assertEquals(OperatorSelectionRule.PipelineStrategy.LIMIT_ONLY, decision.getStrategy());
     assertTrue(decision.getEffectiveTopN().isEmpty());
   }
@@ -55,8 +53,7 @@ class OperatorSelectionRuleTest {
   @Test
   @DisplayName("ORDER BY without LIMIT -> FULL_SORT")
   void fullSort() {
-    PipelineDecision decision =
-        rule.decide(sortSpecs, OptionalLong.empty(), OptionalLong.empty());
+    PipelineDecision decision = rule.decide(sortSpecs, OptionalLong.empty(), OptionalLong.empty());
     assertEquals(OperatorSelectionRule.PipelineStrategy.FULL_SORT, decision.getStrategy());
     assertTrue(decision.getEffectiveTopN().isEmpty());
   }
@@ -64,8 +61,7 @@ class OperatorSelectionRuleTest {
   @Test
   @DisplayName("ORDER BY + LIMIT -> TOP_N")
   void topN() {
-    PipelineDecision decision =
-        rule.decide(sortSpecs, OptionalLong.of(10), OptionalLong.empty());
+    PipelineDecision decision = rule.decide(sortSpecs, OptionalLong.of(10), OptionalLong.empty());
     assertEquals(OperatorSelectionRule.PipelineStrategy.TOP_N, decision.getStrategy());
     assertEquals(10L, decision.getEffectiveTopN().getAsLong());
   }
@@ -74,8 +70,7 @@ class OperatorSelectionRuleTest {
   @DisplayName("ORDER BY + LIMIT + OFFSET -> TOP_N_WITH_OFFSET")
   void topNWithOffset() {
     PipelineDecision decision = rule.decide(sortSpecs, OptionalLong.of(10), OptionalLong.of(20));
-    assertEquals(
-        OperatorSelectionRule.PipelineStrategy.TOP_N_WITH_OFFSET, decision.getStrategy());
+    assertEquals(OperatorSelectionRule.PipelineStrategy.TOP_N_WITH_OFFSET, decision.getStrategy());
     assertEquals(30L, decision.getEffectiveTopN().getAsLong());
   }
 
@@ -89,8 +84,7 @@ class OperatorSelectionRuleTest {
   @Test
   @DisplayName("Null sort specs treated as empty")
   void nullSortSpecs() {
-    PipelineDecision decision =
-        rule.decide(null, OptionalLong.empty(), OptionalLong.empty());
+    PipelineDecision decision = rule.decide(null, OptionalLong.empty(), OptionalLong.empty());
     assertEquals(OperatorSelectionRule.PipelineStrategy.SCAN_ONLY, decision.getStrategy());
   }
 }

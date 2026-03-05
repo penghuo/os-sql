@@ -64,9 +64,7 @@ public class EngineRouter {
       String normalized = requestEngineField.toLowerCase();
       if (!ENGINE_DQE.equals(normalized) && !ENGINE_CALCITE.equals(normalized)) {
         throw new DqeException(
-            "Invalid engine value: '"
-                + requestEngineField
-                + "'. Must be 'calcite' or 'dqe'.",
+            "Invalid engine value: '" + requestEngineField + "'. Must be 'calcite' or 'dqe'.",
             DqeErrorCode.INVALID_REQUEST);
       }
       return normalized;
@@ -118,8 +116,7 @@ public class EngineRouter {
    */
   public String executeExplain(DqeQueryRequest request) throws DqeException {
     if (explainHandler == null) {
-      throw new DqeException(
-          "DQE explain not yet implemented", DqeErrorCode.UNSUPPORTED_OPERATION);
+      throw new DqeException("DQE explain not yet implemented", DqeErrorCode.UNSUPPORTED_OPERATION);
     }
     return explainHandler.explain(request);
   }

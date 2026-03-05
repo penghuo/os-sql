@@ -67,8 +67,7 @@ class DqeRequestParserTests {
     @Test
     @DisplayName("ignores parameters and cursor fields")
     void ignoresParametersAndCursor() {
-      String body =
-          "{\"query\": \"SELECT 1\", \"parameters\": [], \"cursor\": \"abc\"}";
+      String body = "{\"query\": \"SELECT 1\", \"parameters\": [], \"cursor\": \"abc\"}";
       DqeQueryRequest req = parser.parse(body);
       assertEquals("SELECT 1", req.getQuery());
     }
@@ -102,8 +101,7 @@ class DqeRequestParserTests {
     @Test
     @DisplayName("rejects invalid JSON")
     void rejectsInvalidJson() {
-      DqeException ex =
-          assertThrows(DqeException.class, () -> parser.parse("{not valid json}"));
+      DqeException ex = assertThrows(DqeException.class, () -> parser.parse("{not valid json}"));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
       assertTrue(ex.getMessage().contains("Invalid JSON"));
     }
@@ -119,8 +117,7 @@ class DqeRequestParserTests {
     @Test
     @DisplayName("rejects empty query")
     void rejectsEmptyQuery() {
-      DqeException ex =
-          assertThrows(DqeException.class, () -> parser.parse("{\"query\": \"\"}"));
+      DqeException ex = assertThrows(DqeException.class, () -> parser.parse("{\"query\": \"\"}"));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
     }
 
@@ -130,8 +127,7 @@ class DqeRequestParserTests {
       String longQuery = "S".repeat(DqeRequestParser.MAX_QUERY_LENGTH + 1);
       DqeException ex =
           assertThrows(
-              DqeException.class,
-              () -> parser.parse("{\"query\": \"" + longQuery + "\"}"));
+              DqeException.class, () -> parser.parse("{\"query\": \"" + longQuery + "\"}"));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
       assertTrue(ex.getMessage().contains("exceeds maximum"));
     }
@@ -177,8 +173,7 @@ class DqeRequestParserTests {
     @DisplayName("rejects unknown session property")
     void rejectsUnknownSessionProperty() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"invalid_prop\": \"value\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"invalid_prop\": \"value\"}}";
       DqeException ex = assertThrows(DqeException.class, () -> parser.parse(body));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
       assertTrue(ex.getMessage().contains("Unknown session property"));
@@ -199,8 +194,7 @@ class DqeRequestParserTests {
     @DisplayName("parses query_max_memory with gb suffix")
     void parsesMemoryGb() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_max_memory\": \"1gb\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_max_memory\": \"1gb\"}}";
       DqeQueryRequest req = parser.parse(body);
       assertEquals(1024L * 1024 * 1024, req.getQueryMaxMemoryBytes().get());
     }
@@ -229,8 +223,7 @@ class DqeRequestParserTests {
     @DisplayName("parses query_timeout with seconds suffix")
     void parsesTimeoutSeconds() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_timeout\": \"30s\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_timeout\": \"30s\"}}";
       DqeQueryRequest req = parser.parse(body);
       assertTrue(req.getQueryTimeout().isPresent());
       assertEquals(Duration.ofSeconds(30), req.getQueryTimeout().get());
@@ -240,8 +233,7 @@ class DqeRequestParserTests {
     @DisplayName("parses query_timeout with minutes suffix")
     void parsesTimeoutMinutes() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_timeout\": \"5m\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_timeout\": \"5m\"}}";
       DqeQueryRequest req = parser.parse(body);
       assertEquals(Duration.ofMinutes(5), req.getQueryTimeout().get());
     }
@@ -250,8 +242,7 @@ class DqeRequestParserTests {
     @DisplayName("parses query_timeout with ms suffix")
     void parsesTimeoutMs() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_timeout\": \"500ms\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_timeout\": \"500ms\"}}";
       DqeQueryRequest req = parser.parse(body);
       assertEquals(Duration.ofMillis(500), req.getQueryTimeout().get());
     }
@@ -260,8 +251,7 @@ class DqeRequestParserTests {
     @DisplayName("rejects invalid memory value")
     void rejectsInvalidMemory() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_max_memory\": \"abc\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_max_memory\": \"abc\"}}";
       DqeException ex = assertThrows(DqeException.class, () -> parser.parse(body));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
     }
@@ -270,8 +260,7 @@ class DqeRequestParserTests {
     @DisplayName("rejects invalid timeout value")
     void rejectsInvalidTimeout() {
       String body =
-          "{\"query\": \"SELECT 1\", \"session_properties\": "
-              + "{\"query_timeout\": \"abc\"}}";
+          "{\"query\": \"SELECT 1\", \"session_properties\": " + "{\"query_timeout\": \"abc\"}}";
       DqeException ex = assertThrows(DqeException.class, () -> parser.parse(body));
       assertEquals(DqeErrorCode.INVALID_REQUEST, ex.getErrorCode());
     }

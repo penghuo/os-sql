@@ -99,14 +99,16 @@ public class ExchangePushHandler implements TransportRequestHandler<DqeExchangeP
           request.getPageCount(),
           request.isLast());
     } catch (DqeException e) {
-      logger.warn("[{}] Failed to add chunk to buffer for stage {}: {}", queryId, stageId, e.getMessage());
+      logger.warn(
+          "[{}] Failed to add chunk to buffer for stage {}: {}", queryId, stageId, e.getMessage());
       channel.sendResponse(new DqeExchangePushResponse(false, 0));
     }
   }
 
   /** Reconstruct a DqeExchangeChunk from the push request fields. */
   static DqeExchangeChunk reconstructChunk(DqeExchangePushRequest request) {
-    List<DqeDataPage> pages = deserializePages(request.getSerializedPages(), request.getPageCount());
+    List<DqeDataPage> pages =
+        deserializePages(request.getSerializedPages(), request.getPageCount());
     return new DqeExchangeChunk(
         request.getQueryId(),
         request.getStageId(),

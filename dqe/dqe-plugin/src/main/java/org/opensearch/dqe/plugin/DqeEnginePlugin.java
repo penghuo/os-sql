@@ -29,10 +29,10 @@ import org.opensearch.dqe.exchange.stage.StageExecutionHandler;
 import org.opensearch.dqe.exchange.stage.StageScheduler;
 import org.opensearch.dqe.execution.pit.PitManager;
 import org.opensearch.dqe.memory.AdmissionController;
-import org.opensearch.dqe.metadata.DqeColumnHandle;
-import org.opensearch.dqe.metadata.DqeTableHandle;
 import org.opensearch.dqe.memory.DqeMemoryTracker;
+import org.opensearch.dqe.metadata.DqeColumnHandle;
 import org.opensearch.dqe.metadata.DqeMetadata;
+import org.opensearch.dqe.metadata.DqeTableHandle;
 import org.opensearch.dqe.metadata.StatisticsCache;
 import org.opensearch.dqe.parser.DqeSqlParser;
 import org.opensearch.dqe.plugin.execution.ShardStageExecutor;
@@ -44,7 +44,6 @@ import org.opensearch.dqe.plugin.metrics.DqeMetrics;
 import org.opensearch.dqe.plugin.orchestrator.DqeQueryOrchestrator;
 import org.opensearch.dqe.plugin.routing.EngineRouter;
 import org.opensearch.dqe.plugin.settings.DqeSettings;
-import org.opensearch.transport.TransportService;
 import org.opensearch.dqe.types.mapping.DateFormatResolver;
 import org.opensearch.dqe.types.mapping.MultiFieldResolver;
 import org.opensearch.dqe.types.mapping.OpenSearchTypeMappingResolver;
@@ -53,6 +52,7 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -108,8 +108,7 @@ public class DqeEnginePlugin {
   public DqeEnginePlugin(
       Settings settings, ClusterService clusterService, ThreadPool threadPool, NodeClient client) {
     this.settings = Objects.requireNonNull(settings, "settings must not be null");
-    this.clusterService =
-        Objects.requireNonNull(clusterService, "clusterService must not be null");
+    this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
     this.client = Objects.requireNonNull(client, "client must not be null");
   }
@@ -160,11 +159,7 @@ public class DqeEnginePlugin {
         new FixedExecutorBuilder(
             settings, DQE_WORKER_POOL, workerSize, 100, "thread_pool." + DQE_WORKER_POOL),
         new FixedExecutorBuilder(
-            settings,
-            DQE_EXCHANGE_POOL,
-            exchangeSize,
-            200,
-            "thread_pool." + DQE_EXCHANGE_POOL),
+            settings, DQE_EXCHANGE_POOL, exchangeSize, 200, "thread_pool." + DQE_EXCHANGE_POOL),
         new FixedExecutorBuilder(
             settings,
             DQE_COORDINATOR_POOL,

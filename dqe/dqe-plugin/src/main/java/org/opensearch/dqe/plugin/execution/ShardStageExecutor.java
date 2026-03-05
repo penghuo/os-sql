@@ -15,7 +15,6 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.transport.client.Client;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.dqe.analyzer.AnalyzedQuery;
@@ -52,6 +51,7 @@ import org.opensearch.dqe.types.converter.ColumnDescriptor;
 import org.opensearch.dqe.types.converter.SearchHitToPageConverter;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.Client;
 
 /**
  * Data-node-side {@link StageExecutionHandler.StageExecutionCallback} that builds shard scan
@@ -88,8 +88,7 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
     this.pitManager = Objects.requireNonNull(pitManager, "pitManager must not be null");
     this.transportService =
         Objects.requireNonNull(transportService, "transportService must not be null");
-    this.clusterService =
-        Objects.requireNonNull(clusterService, "clusterService must not be null");
+    this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.memoryTracker = Objects.requireNonNull(memoryTracker, "memoryTracker must not be null");
     this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
     this.client = Objects.requireNonNull(client, "client must not be null");
@@ -169,9 +168,7 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
             .map(col -> new ColumnDescriptor(col.getFieldPath(), col.getType()))
             .collect(Collectors.toList());
     List<String> requiredColumnPaths =
-        orderedColumns.stream()
-            .map(DqeColumnHandle::getFieldPath)
-            .collect(Collectors.toList());
+        orderedColumns.stream().map(DqeColumnHandle::getFieldPath).collect(Collectors.toList());
 
     // Column name -> channel index in scan output
     Map<String, Integer> inputColumnMap = new LinkedHashMap<>();
@@ -220,11 +217,15 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
                 planFragment.getBatchSize());
 
         OperatorContext scanCtx =
-            new OperatorContext(
-                queryId, stageId, 0, operatorId++, "ShardScan", budget);
+            new OperatorContext(queryId, stageId, 0, operatorId++, "ShardScan", budget);
         Operator pipeline =
             new ShardScanOperator(
-                scanCtx, searchReqBuilder, pitHandle, client, planFragment.getBatchSize(), converter);
+                scanCtx,
+                searchReqBuilder,
+                pitHandle,
+                client,
+                planFragment.getBatchSize(),
+                converter);
 
         // Add filter for residual predicates if present
         if (analyzed.getPredicateAnalysis().isPresent()) {
@@ -234,8 +235,7 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
             var residualExpr = predicateResult.getResidualPredicates().get(0);
             ExpressionEvaluator filterEval = new ExpressionEvaluator(residualExpr, inputColumnMap);
             OperatorContext filterCtx =
-                new OperatorContext(
-                    queryId, stageId, 0, operatorId++, "Filter", budget);
+                new OperatorContext(queryId, stageId, 0, operatorId++, "Filter", budget);
             pipeline = new FilterOperator(filterCtx, pipeline, filterEval);
           }
         }
@@ -247,8 +247,7 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
             projections.add(new ExpressionEvaluator(expr, inputColumnMap));
           }
           OperatorContext projectCtx =
-              new OperatorContext(
-                  queryId, stageId, 0, operatorId++, "Project", budget);
+              new OperatorContext(queryId, stageId, 0, operatorId++, "Project", budget);
           pipeline = new ProjectOperator(projectCtx, pipeline, projections);
         }
 
@@ -270,7 +269,8 @@ public class ShardStageExecutor implements StageExecutionHandler.StageExecutionC
       // Abort the sink on failure
       sink.abort();
       throw new DqeException(
-          String.format("Stage %d execution failed for query [%s]: %s", stageId, queryId, e.getMessage()),
+          String.format(
+              "Stage %d execution failed for query [%s]: %s", stageId, queryId, e.getMessage()),
           DqeErrorCode.STAGE_EXECUTION_FAILED,
           e);
     } finally {

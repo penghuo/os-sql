@@ -31,9 +31,7 @@ class SlowQueryLoggerTests {
   @BeforeEach
   void setUp() {
     settings = mock(DqeSettings.class);
-    lenient()
-        .when(settings.getSlowQueryLogThreshold())
-        .thenReturn(TimeValue.timeValueSeconds(10));
+    lenient().when(settings.getSlowQueryLogThreshold()).thenReturn(TimeValue.timeValueSeconds(10));
     logger = new SlowQueryLogger(settings);
   }
 

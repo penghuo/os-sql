@@ -6,8 +6,8 @@
 package org.opensearch.dqe.parser;
 
 /**
- * Thrown when SQL parsing fails. Wraps Trino's {@code ParsingException} with structured
- * line/column information for the REST error response.
+ * Thrown when SQL parsing fails. Wraps Trino's {@code ParsingException} with structured line/column
+ * information for the REST error response.
  */
 public class DqeParsingException extends DqeException {
 

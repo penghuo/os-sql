@@ -9,7 +9,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.trino.sql.tree.ArithmeticBinaryExpression;
 import io.trino.sql.tree.Identifier;
-import io.trino.sql.tree.LongLiteral;
 import io.trino.sql.tree.StringLiteral;
 import java.util.List;
 import java.util.Optional;
@@ -34,10 +33,8 @@ class ProjectionAnalyzerTest {
   @BeforeEach
   void setUp() {
     projectionAnalyzer = new ProjectionAnalyzer();
-    DqeTableHandle table =
-        new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
-    nameCol =
-        new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
+    DqeTableHandle table = new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
+    nameCol = new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
     ageCol = new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
     salaryCol = new DqeColumnHandle("salary", "salary", DqeTypes.DOUBLE, true, null, false);
     scope = new Scope(table, List.of(nameCol, ageCol, salaryCol), Optional.empty());
@@ -76,8 +73,7 @@ class ProjectionAnalyzerTest {
             ArithmeticBinaryExpression.Operator.MULTIPLY,
             new Identifier("salary"),
             new Identifier("age"));
-    List<TypedExpression> select =
-        List.of(new TypedExpression(arith, DqeTypes.DOUBLE));
+    List<TypedExpression> select = List.of(new TypedExpression(arith, DqeTypes.DOUBLE));
     RequiredColumns required =
         projectionAnalyzer.computeRequiredColumns(select, null, List.of(), scope);
     assertEquals(2, required.size());

@@ -206,18 +206,53 @@ public class DqeMetrics {
       this.breakerTrippedCount = breakerTrippedCount;
     }
 
-    public long getQueriesSubmitted() { return queriesSubmitted; }
-    public long getQueriesSucceeded() { return queriesSucceeded; }
-    public long getQueriesFailed() { return queriesFailed; }
-    public long getQueriesCancelled() { return queriesCancelled; }
-    public long getActiveQueries() { return activeQueries; }
-    public long getTotalWallTimeMs() { return totalWallTimeMs; }
-    public long getTotalRowsReturned() { return totalRowsReturned; }
-    public long getTotalRowsScanned() { return totalRowsScanned; }
-    public long getTotalBytesScanned() { return totalBytesScanned; }
-    public long getMemoryUsedBytes() { return memoryUsedBytes; }
-    public long getBreakerLimitBytes() { return breakerLimitBytes; }
-    public long getBreakerTrippedCount() { return breakerTrippedCount; }
+    public long getQueriesSubmitted() {
+      return queriesSubmitted;
+    }
+
+    public long getQueriesSucceeded() {
+      return queriesSucceeded;
+    }
+
+    public long getQueriesFailed() {
+      return queriesFailed;
+    }
+
+    public long getQueriesCancelled() {
+      return queriesCancelled;
+    }
+
+    public long getActiveQueries() {
+      return activeQueries;
+    }
+
+    public long getTotalWallTimeMs() {
+      return totalWallTimeMs;
+    }
+
+    public long getTotalRowsReturned() {
+      return totalRowsReturned;
+    }
+
+    public long getTotalRowsScanned() {
+      return totalRowsScanned;
+    }
+
+    public long getTotalBytesScanned() {
+      return totalBytesScanned;
+    }
+
+    public long getMemoryUsedBytes() {
+      return memoryUsedBytes;
+    }
+
+    public long getBreakerLimitBytes() {
+      return breakerLimitBytes;
+    }
+
+    public long getBreakerTrippedCount() {
+      return breakerTrippedCount;
+    }
 
     /**
      * Format this snapshot as a JSON string for the stats endpoint.
@@ -226,19 +261,31 @@ public class DqeMetrics {
      */
     public String toJson() {
       return "{"
-          + "\"queries\":{\"submitted\":" + queriesSubmitted
-          + ",\"succeeded\":" + queriesSucceeded
-          + ",\"failed\":" + queriesFailed
-          + ",\"cancelled\":" + queriesCancelled
-          + ",\"active\":" + activeQueries
-          + ",\"wall_time_ms\":" + totalWallTimeMs
-          + ",\"rows_returned\":" + totalRowsReturned
-          + ",\"rows_scanned\":" + totalRowsScanned
-          + ",\"bytes_scanned\":" + totalBytesScanned
+          + "\"queries\":{\"submitted\":"
+          + queriesSubmitted
+          + ",\"succeeded\":"
+          + queriesSucceeded
+          + ",\"failed\":"
+          + queriesFailed
+          + ",\"cancelled\":"
+          + queriesCancelled
+          + ",\"active\":"
+          + activeQueries
+          + ",\"wall_time_ms\":"
+          + totalWallTimeMs
+          + ",\"rows_returned\":"
+          + totalRowsReturned
+          + ",\"rows_scanned\":"
+          + totalRowsScanned
+          + ",\"bytes_scanned\":"
+          + totalBytesScanned
           + "},"
-          + "\"memory\":{\"used_bytes\":" + memoryUsedBytes
-          + ",\"breaker_limit_bytes\":" + breakerLimitBytes
-          + ",\"breaker_tripped\":" + breakerTrippedCount
+          + "\"memory\":{\"used_bytes\":"
+          + memoryUsedBytes
+          + ",\"breaker_limit_bytes\":"
+          + breakerLimitBytes
+          + ",\"breaker_tripped\":"
+          + breakerTrippedCount
           + "}}";
     }
   }

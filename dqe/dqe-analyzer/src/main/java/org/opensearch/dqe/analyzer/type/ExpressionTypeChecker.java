@@ -31,7 +31,6 @@ import io.trino.sql.tree.SearchedCaseExpression;
 import io.trino.sql.tree.SimpleCaseExpression;
 import io.trino.sql.tree.StringLiteral;
 import io.trino.sql.tree.WhenClause;
-import java.util.List;
 import java.util.Optional;
 import org.opensearch.dqe.analyzer.DqeAnalysisException;
 import org.opensearch.dqe.analyzer.scope.ResolvedField;
@@ -167,8 +166,7 @@ public class ExpressionTypeChecker {
     }
 
     throw new DqeUnsupportedOperationException(
-        expression.getClass().getSimpleName(),
-        "expression type not supported in Phase 1");
+        expression.getClass().getSimpleName(), "expression type not supported in Phase 1");
   }
 
   private TypedExpression checkIdentifier(Identifier id, Scope scope) {
@@ -200,8 +198,7 @@ public class ExpressionTypeChecker {
     throw new DqeAnalysisException("Cannot resolve nested field reference: " + deref);
   }
 
-  private TypedExpression checkArithmeticBinary(
-      ArithmeticBinaryExpression arith, Scope scope) {
+  private TypedExpression checkArithmeticBinary(ArithmeticBinaryExpression arith, Scope scope) {
     TypedExpression left = check(arith.getLeft(), scope);
     TypedExpression right = check(arith.getRight(), scope);
 
@@ -215,17 +212,18 @@ public class ExpressionTypeChecker {
     }
 
     Optional<DqeType> common = DqeTypeCoercion.getCommonSuperType(left.getType(), right.getType());
-    DqeType resultType = common.orElseThrow(
-        () -> new DqeTypeMismatchException(
-            arith.toString(),
-            left.getType().getDisplayName(),
-            right.getType().getDisplayName()));
+    DqeType resultType =
+        common.orElseThrow(
+            () ->
+                new DqeTypeMismatchException(
+                    arith.toString(),
+                    left.getType().getDisplayName(),
+                    right.getType().getDisplayName()));
 
     return new TypedExpression(arith, resultType);
   }
 
-  private TypedExpression checkArithmeticUnary(
-      ArithmeticUnaryExpression unary, Scope scope) {
+  private TypedExpression checkArithmeticUnary(ArithmeticUnaryExpression unary, Scope scope) {
     TypedExpression value = check(unary.getValue(), scope);
     if (!value.getType().isNumeric()) {
       throw new DqeTypeMismatchException(
@@ -254,9 +252,7 @@ public class ExpressionTypeChecker {
           DqeTypeCoercion.getCommonSuperType(left.getType(), right.getType());
       if (common.isEmpty()) {
         throw new DqeTypeMismatchException(
-            cmp.toString(),
-            left.getType().getDisplayName(),
-            right.getType().getDisplayName());
+            cmp.toString(), left.getType().getDisplayName(), right.getType().getDisplayName());
       }
     }
 
@@ -444,9 +440,7 @@ public class ExpressionTypeChecker {
           DqeTypeCoercion.getCommonSuperType(first.getType(), second.getType());
       if (common.isEmpty()) {
         throw new DqeTypeMismatchException(
-            "NULLIF",
-            first.getType().getDisplayName(),
-            second.getType().getDisplayName());
+            "NULLIF", first.getType().getDisplayName(), second.getType().getDisplayName());
       }
     }
 
@@ -465,8 +459,9 @@ public class ExpressionTypeChecker {
     }
     Optional<DqeType> common = DqeTypeCoercion.getCommonSuperType(existing, incoming);
     return common.orElseThrow(
-        () -> new DqeTypeMismatchException(
-            context, existing.getDisplayName(), incoming.getDisplayName()));
+        () ->
+            new DqeTypeMismatchException(
+                context, existing.getDisplayName(), incoming.getDisplayName()));
   }
 
   /** Resolves a SQL type name string to a DqeType. */

@@ -58,8 +58,7 @@ public class TransportChunkSender implements GatherExchangeSink.ChunkSender {
       int stageId) {
     this.transportService =
         Objects.requireNonNull(transportService, "transportService must not be null");
-    this.clusterService =
-        Objects.requireNonNull(clusterService, "clusterService must not be null");
+    this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.coordinatorNodeId =
         Objects.requireNonNull(coordinatorNodeId, "coordinatorNodeId must not be null");
     this.queryId = Objects.requireNonNull(queryId, "queryId must not be null");
@@ -138,9 +137,7 @@ public class TransportChunkSender implements GatherExchangeSink.ChunkSender {
       return BytesReference.toBytes(out.bytes());
     } catch (IOException e) {
       throw new DqeException(
-          "Failed to serialize exchange pages: " + e.getMessage(),
-          DqeErrorCode.EXECUTION_ERROR,
-          e);
+          "Failed to serialize exchange pages: " + e.getMessage(), DqeErrorCode.EXECUTION_ERROR, e);
     }
   }
 }

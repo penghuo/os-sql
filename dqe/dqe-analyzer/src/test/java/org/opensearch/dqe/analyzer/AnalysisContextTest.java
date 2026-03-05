@@ -29,10 +29,8 @@ class AnalysisContextTest {
     SecurityContext security = mock(SecurityContext.class);
     AnalysisContext ctx = new AnalysisContext(metadata, security);
 
-    DqeTableHandle table =
-        new DqeTableHandle("test", null, List.of("test"), 1L, null);
-    DqeColumnHandle col =
-        new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, null, false);
+    DqeTableHandle table = new DqeTableHandle("test", null, List.of("test"), 1L, null);
+    DqeColumnHandle col = new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, null, false);
     Scope scope = new Scope(table, List.of(col), Optional.empty());
 
     ctx.pushScope(scope);

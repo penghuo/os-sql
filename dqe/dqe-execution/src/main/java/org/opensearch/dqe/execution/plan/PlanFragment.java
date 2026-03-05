@@ -71,9 +71,7 @@ public class PlanFragment {
       return baos.toByteArray();
     } catch (IOException e) {
       throw new DqeException(
-          "Failed to serialize PlanFragment: " + e.getMessage(),
-          DqeErrorCode.EXECUTION_ERROR,
-          e);
+          "Failed to serialize PlanFragment: " + e.getMessage(), DqeErrorCode.EXECUTION_ERROR, e);
     }
   }
 
@@ -99,9 +97,7 @@ public class PlanFragment {
       return new PlanFragment(queryText, queryId, pitKeepAliveSeconds, batchSize);
     } catch (IOException e) {
       throw new DqeException(
-          "Failed to deserialize PlanFragment: " + e.getMessage(),
-          DqeErrorCode.EXECUTION_ERROR,
-          e);
+          "Failed to deserialize PlanFragment: " + e.getMessage(), DqeErrorCode.EXECUTION_ERROR, e);
     }
   }
 }

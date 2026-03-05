@@ -20,7 +20,6 @@ import org.opensearch.dqe.metadata.DqeColumnHandle;
 import org.opensearch.dqe.metadata.DqeTableHandle;
 import org.opensearch.dqe.parser.DqeTypeMismatchException;
 import org.opensearch.dqe.parser.DqeUnsupportedOperationException;
-import org.opensearch.dqe.types.DqeType;
 import org.opensearch.dqe.types.DqeTypes;
 
 @DisplayName("ExpressionTypeChecker")
@@ -32,18 +31,15 @@ class ExpressionTypeCheckerTest {
   @BeforeEach
   void setUp() {
     typeChecker = new ExpressionTypeChecker();
-    DqeTableHandle table =
-        new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
     DqeColumnHandle nameCol =
         new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
-    DqeColumnHandle ageCol =
-        new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
+    DqeColumnHandle ageCol = new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
     DqeColumnHandle salaryCol =
         new DqeColumnHandle("salary", "salary", DqeTypes.DOUBLE, true, null, false);
     DqeColumnHandle activeCol =
         new DqeColumnHandle("active", "active", DqeTypes.BOOLEAN, true, null, false);
-    scope =
-        new Scope(table, List.of(nameCol, ageCol, salaryCol, activeCol), Optional.empty());
+    scope = new Scope(table, List.of(nameCol, ageCol, salaryCol, activeCol), Optional.empty());
   }
 
   @Nested
@@ -103,8 +99,7 @@ class ExpressionTypeCheckerTest {
     @DisplayName("Unknown column throws")
     void unknownColumnThrows() {
       assertThrows(
-          DqeAnalysisException.class,
-          () -> typeChecker.check(new Identifier("unknown"), scope));
+          DqeAnalysisException.class, () -> typeChecker.check(new Identifier("unknown"), scope));
     }
   }
 
@@ -177,9 +172,7 @@ class ExpressionTypeCheckerTest {
     void integerEqualsBigint() {
       ComparisonExpression expr =
           new ComparisonExpression(
-              ComparisonExpression.Operator.EQUAL,
-              new Identifier("age"),
-              new LongLiteral("25"));
+              ComparisonExpression.Operator.EQUAL, new Identifier("age"), new LongLiteral("25"));
       TypedExpression result = typeChecker.check(expr, scope);
       assertEquals(DqeTypes.BOOLEAN, result.getType());
     }
@@ -223,8 +216,7 @@ class ExpressionTypeCheckerTest {
     @Test
     @DisplayName("NOT of boolean returns BOOLEAN")
     void notExpression() {
-      NotExpression expr =
-          new NotExpression(new Identifier("active"));
+      NotExpression expr = new NotExpression(new Identifier("active"));
       TypedExpression result = typeChecker.check(expr, scope);
       assertEquals(DqeTypes.BOOLEAN, result.getType());
     }
@@ -266,8 +258,7 @@ class ExpressionTypeCheckerTest {
     @DisplayName("BETWEEN with compatible types returns BOOLEAN")
     void betweenCompatible() {
       BetweenPredicate expr =
-          new BetweenPredicate(
-              new Identifier("age"), new LongLiteral("18"), new LongLiteral("65"));
+          new BetweenPredicate(new Identifier("age"), new LongLiteral("18"), new LongLiteral("65"));
       TypedExpression result = typeChecker.check(expr, scope);
       assertEquals(DqeTypes.BOOLEAN, result.getType());
     }
@@ -297,7 +288,8 @@ class ExpressionTypeCheckerTest {
     @Test
     @DisplayName("LIKE on VARCHAR returns BOOLEAN")
     void likeOnVarchar() {
-      LikePredicate expr = new LikePredicate(new Identifier("name"), new StringLiteral("A%"), Optional.empty());
+      LikePredicate expr =
+          new LikePredicate(new Identifier("name"), new StringLiteral("A%"), Optional.empty());
       TypedExpression result = typeChecker.check(expr, scope);
       assertEquals(DqeTypes.BOOLEAN, result.getType());
     }
@@ -335,8 +327,7 @@ class ExpressionTypeCheckerTest {
     @DisplayName("COALESCE with same types returns that type")
     void coalesceSameTypes() {
       CoalesceExpression expr =
-          new CoalesceExpression(
-              List.of(new Identifier("name"), new StringLiteral("unknown")));
+          new CoalesceExpression(List.of(new Identifier("name"), new StringLiteral("unknown")));
       TypedExpression result = typeChecker.check(expr, scope);
       assertEquals(DqeTypes.VARCHAR, result.getType());
     }
@@ -374,8 +365,7 @@ class ExpressionTypeCheckerTest {
               Optional.empty(),
               Optional.empty(),
               List.of());
-      assertThrows(
-          DqeUnsupportedOperationException.class, () -> typeChecker.check(fc, scope));
+      assertThrows(DqeUnsupportedOperationException.class, () -> typeChecker.check(fc, scope));
     }
   }
 

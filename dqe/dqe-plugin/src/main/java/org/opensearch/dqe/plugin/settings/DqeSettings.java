@@ -275,5 +275,4 @@ public class DqeSettings {
   static int defaultCoordinatorPoolSize() {
     return Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 4));
   }
-
 }

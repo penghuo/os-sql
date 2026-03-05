@@ -39,6 +39,13 @@ import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.dqe.parser.DqeErrorCode;
+import org.opensearch.dqe.parser.DqeException;
+import org.opensearch.dqe.plugin.DqeEnginePlugin;
+import org.opensearch.dqe.plugin.request.DqeRequestParser;
+import org.opensearch.dqe.plugin.response.DqeResponseFormatter;
+import org.opensearch.dqe.plugin.routing.EngineRouter;
+import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.indices.SystemIndexDescriptor;
@@ -89,13 +96,6 @@ import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
-import org.opensearch.dqe.parser.DqeErrorCode;
-import org.opensearch.dqe.parser.DqeException;
-import org.opensearch.dqe.plugin.DqeEnginePlugin;
-import org.opensearch.dqe.plugin.request.DqeRequestParser;
-import org.opensearch.dqe.plugin.response.DqeResponseFormatter;
-import org.opensearch.dqe.plugin.routing.EngineRouter;
-import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.opensearch.storage.OpenSearchDataSourceFactory;
@@ -176,8 +176,7 @@ public class SQLPlugin extends Plugin
       EngineRouter engineRouter = dqeEnginePlugin.getEngineRouter();
       restSqlAction.setDqeEngineRouting(engineRouter::shouldUseDqe);
 
-      DqeRequestParser dqeRequestParser =
-          new DqeRequestParser(dqeEnginePlugin.getDqeSettings());
+      DqeRequestParser dqeRequestParser = new DqeRequestParser(dqeEnginePlugin.getDqeSettings());
       DqeResponseFormatter dqeResponseFormatter = new DqeResponseFormatter();
       restSqlAction.setDqeExecutionFunction(
           requestBody -> {
@@ -200,7 +199,8 @@ public class SQLPlugin extends Plugin
                     "Internal error: " + error.getMessage(), DqeErrorCode.EXECUTION_ERROR);
             return dqeResponseFormatter.formatError(wrapped, null);
           });
-      LOGGER.info("DQE engine routing, execution, explain, and error formatting wired into RestSqlAction");
+      LOGGER.info(
+          "DQE engine routing, execution, explain, and error formatting wired into RestSqlAction");
     }
 
     return Arrays.asList(
@@ -373,34 +373,46 @@ public class SQLPlugin extends Plugin
     // pool is a separate queue for asynchronous requests to other nodes. We keep them separate to
     // prevent deadlocks during async fetches on small node counts. Tasks in the background pool
     // should do no work except I/O to other services.
-    List<ExecutorBuilder<?>> builders = new java.util.ArrayList<>(List.of(
-        new FixedExecutorBuilder(
-            settings,
-            SQL_WORKER_THREAD_POOL_NAME,
-            OpenSearchExecutors.allocatedProcessors(settings),
-            1000,
-            "thread_pool." + SQL_WORKER_THREAD_POOL_NAME),
-        new FixedExecutorBuilder(
-            settings,
-            SQL_BACKGROUND_THREAD_POOL_NAME,
-            settings.getAsInt(
-                "thread_pool.search.size", OpenSearchExecutors.allocatedProcessors(settings)),
-            1000,
-            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME)));
+    List<ExecutorBuilder<?>> builders =
+        new java.util.ArrayList<>(
+            List.of(
+                new FixedExecutorBuilder(
+                    settings,
+                    SQL_WORKER_THREAD_POOL_NAME,
+                    OpenSearchExecutors.allocatedProcessors(settings),
+                    1000,
+                    "thread_pool." + SQL_WORKER_THREAD_POOL_NAME),
+                new FixedExecutorBuilder(
+                    settings,
+                    SQL_BACKGROUND_THREAD_POOL_NAME,
+                    settings.getAsInt(
+                        "thread_pool.search.size",
+                        OpenSearchExecutors.allocatedProcessors(settings)),
+                    1000,
+                    "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME)));
     // Add DQE thread pools
     int cores = OpenSearchExecutors.allocatedProcessors(settings);
-    builders.add(new FixedExecutorBuilder(
-        settings, DqeEnginePlugin.DQE_WORKER_POOL,
-        Math.max(1, Math.min(4, cores / 2)), 100,
-        "thread_pool." + DqeEnginePlugin.DQE_WORKER_POOL));
-    builders.add(new FixedExecutorBuilder(
-        settings, DqeEnginePlugin.DQE_EXCHANGE_POOL,
-        Math.max(1, Math.min(2, cores / 4)), 200,
-        "thread_pool." + DqeEnginePlugin.DQE_EXCHANGE_POOL));
-    builders.add(new FixedExecutorBuilder(
-        settings, DqeEnginePlugin.DQE_COORDINATOR_POOL,
-        Math.max(1, Math.min(2, cores / 4)), 50,
-        "thread_pool." + DqeEnginePlugin.DQE_COORDINATOR_POOL));
+    builders.add(
+        new FixedExecutorBuilder(
+            settings,
+            DqeEnginePlugin.DQE_WORKER_POOL,
+            Math.max(1, Math.min(4, cores / 2)),
+            100,
+            "thread_pool." + DqeEnginePlugin.DQE_WORKER_POOL));
+    builders.add(
+        new FixedExecutorBuilder(
+            settings,
+            DqeEnginePlugin.DQE_EXCHANGE_POOL,
+            Math.max(1, Math.min(2, cores / 4)),
+            200,
+            "thread_pool." + DqeEnginePlugin.DQE_EXCHANGE_POOL));
+    builders.add(
+        new FixedExecutorBuilder(
+            settings,
+            DqeEnginePlugin.DQE_COORDINATOR_POOL,
+            Math.max(1, Math.min(2, cores / 4)),
+            50,
+            "thread_pool." + DqeEnginePlugin.DQE_COORDINATOR_POOL));
     return builders;
   }
 

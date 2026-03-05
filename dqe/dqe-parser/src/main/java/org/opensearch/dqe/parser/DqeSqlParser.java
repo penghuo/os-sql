@@ -44,8 +44,7 @@ public class DqeSqlParser {
     try {
       return sqlParser.createStatement(sql);
     } catch (ParsingException e) {
-      throw new DqeParsingException(
-          e.getErrorMessage(), e.getLineNumber(), e.getColumnNumber(), e);
+      throw new DqeParsingException(e.getErrorMessage(), e.getLineNumber(), e.getColumnNumber(), e);
     }
   }
 }

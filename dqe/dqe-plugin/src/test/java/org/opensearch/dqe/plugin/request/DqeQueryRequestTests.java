@@ -74,10 +74,7 @@ class DqeQueryRequestTests {
     @DisplayName("session properties are unmodifiable")
     void sessionPropertiesUnmodifiable() {
       DqeQueryRequest req =
-          DqeQueryRequest.builder()
-              .query("SELECT 1")
-              .sessionProperties(Map.of("k", "v"))
-              .build();
+          DqeQueryRequest.builder().query("SELECT 1").sessionProperties(Map.of("k", "v")).build();
       org.junit.jupiter.api.Assertions.assertThrows(
           UnsupportedOperationException.class, () -> req.getSessionProperties().put("x", "y"));
     }

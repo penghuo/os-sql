@@ -14,7 +14,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.PlainActionFuture;
@@ -72,9 +71,9 @@ import org.opensearch.transport.TransportService;
  *   <li>Cleanup: release memory, close PIT, record metrics, log
  * </ol>
  *
- * <p>Phase 1 execution is fully wired: shard splits are scheduled to data nodes via
- * StageScheduler, data flows through gather exchange, and the coordinator pipeline applies
- * Sort/TopN/Limit per the PipelineDecision before converting pages to row data.
+ * <p>Phase 1 execution is fully wired: shard splits are scheduled to data nodes via StageScheduler,
+ * data flows through gather exchange, and the coordinator pipeline applies Sort/TopN/Limit per the
+ * PipelineDecision before converting pages to row data.
  */
 public class DqeQueryOrchestrator {
 
@@ -141,14 +140,12 @@ public class DqeQueryOrchestrator {
     this.settings = Objects.requireNonNull(settings, "settings must not be null");
     this.admissionController =
         Objects.requireNonNull(admissionController, "admissionController must not be null");
-    this.memoryTracker =
-        Objects.requireNonNull(memoryTracker, "memoryTracker must not be null");
+    this.memoryTracker = Objects.requireNonNull(memoryTracker, "memoryTracker must not be null");
     this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
     this.slowQueryLogger =
         Objects.requireNonNull(slowQueryLogger, "slowQueryLogger must not be null");
     this.auditLogger = Objects.requireNonNull(auditLogger, "auditLogger must not be null");
-    this.clusterService =
-        Objects.requireNonNull(clusterService, "clusterService must not be null");
+    this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.pitManager = Objects.requireNonNull(pitManager, "pitManager must not be null");
     this.stageScheduler = stageScheduler; // nullable until TransportService is available
     this.exchangePushHandler =
@@ -211,8 +208,7 @@ public class DqeQueryOrchestrator {
 
       // Step 5: Analyze
       LOG.debug("Analyzing query [{}]", queryId);
-      AnalyzedQuery analyzed =
-          analyzer.analyze(statement, metadata, securityContext);
+      AnalyzedQuery analyzed = analyzer.analyze(statement, metadata, securityContext);
 
       // Update audit log with resolved indices
       List<String> indices = List.of(analyzed.getTable().getIndexName());
@@ -299,16 +295,22 @@ public class DqeQueryOrchestrator {
         final AnalyzedQuery finalAnalyzed = analyzed;
         final long finalBudgetBytes = budgetBytes;
         final List<DqeShardSplit> finalSplits = splits;
-        java.util.concurrent.Future<?> localFuture = threadPool.executor(
-            org.opensearch.dqe.plugin.DqeEnginePlugin.DQE_WORKER_POOL).submit(() -> {
-          executeLocal(queryId, finalAnalyzed, finalSplits, budget, data, totalRows);
-        });
+        java.util.concurrent.Future<?> localFuture =
+            threadPool
+                .executor(org.opensearch.dqe.plugin.DqeEnginePlugin.DQE_WORKER_POOL)
+                .submit(
+                    () -> {
+                      executeLocal(queryId, finalAnalyzed, finalSplits, budget, data, totalRows);
+                    });
         try {
           localFuture.get(); // Wait for completion
         } catch (java.util.concurrent.ExecutionException e) {
-          throw (e.getCause() instanceof DqeException) ? (DqeException) e.getCause()
-              : new DqeException("Local execution failed: " + e.getCause().getMessage(),
-                  DqeErrorCode.EXECUTION_ERROR, e.getCause());
+          throw (e.getCause() instanceof DqeException)
+              ? (DqeException) e.getCause()
+              : new DqeException(
+                  "Local execution failed: " + e.getCause().getMessage(),
+                  DqeErrorCode.EXECUTION_ERROR,
+                  e.getCause());
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           throw new DqeException("Local execution interrupted", DqeErrorCode.EXECUTION_ERROR, e);
@@ -338,12 +340,7 @@ public class DqeQueryOrchestrator {
               .build();
 
       DqeQueryResponse response =
-          DqeQueryResponse.builder()
-              .engine("dqe")
-              .schema(schema)
-              .data(data)
-              .stats(stats)
-              .build();
+          DqeQueryResponse.builder().engine("dqe").schema(schema).data(data).stats(stats).build();
 
       // Step 9: Record success metrics
       metrics.recordQuerySucceeded(elapsedMs, 0);
@@ -369,8 +366,7 @@ public class DqeQueryOrchestrator {
       auditLogger.logQueryFailed(queryId, "dqe_user", e.getMessage());
       LOG.error("DQE query [{}] failed with unexpected error after {} ms", queryId, elapsedMs, e);
       throw new DqeException(
-          "Internal error during query execution: " + e.getMessage(),
-          DqeErrorCode.EXECUTION_ERROR);
+          "Internal error during query execution: " + e.getMessage(), DqeErrorCode.EXECUTION_ERROR);
     } finally {
       cleanup.cleanup();
     }
@@ -441,8 +437,8 @@ public class DqeQueryOrchestrator {
     var orderedColumns =
         new ArrayList<org.opensearch.dqe.metadata.DqeColumnHandle>(requiredColumnHandles);
     // Sort by field path for deterministic column ordering
-    orderedColumns.sort(java.util.Comparator.comparing(
-        org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath));
+    orderedColumns.sort(
+        java.util.Comparator.comparing(org.opensearch.dqe.metadata.DqeColumnHandle::getFieldPath));
     var columnDescriptors =
         orderedColumns.stream()
             .map(
@@ -466,15 +462,11 @@ public class DqeQueryOrchestrator {
 
     // Phase 1: Collect raw pages — scan once per unique index (PIT covers full index)
     List<Page> rawPages = new ArrayList<>();
-    var uniqueIndices = splits.stream()
-        .map(DqeShardSplit::getIndexName)
-        .distinct()
-        .collect(Collectors.toList());
+    var uniqueIndices =
+        splits.stream().map(DqeShardSplit::getIndexName).distinct().collect(Collectors.toList());
     for (var indexName : uniqueIndices) {
       PitHandle pitHandle =
-          pitManager.createPit(
-              indexName,
-              org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
+          pitManager.createPit(indexName, org.opensearch.common.unit.TimeValue.timeValueMinutes(5));
       pitManager.registerPit(queryId, pitHandle);
 
       try {
@@ -486,8 +478,7 @@ public class DqeQueryOrchestrator {
                 pushdownQuery,
                 null,
                 1000);
-        OperatorContext scanCtx =
-            new OperatorContext(queryId, 0, 0, 0, "ShardScan", budget);
+        OperatorContext scanCtx = new OperatorContext(queryId, 0, 0, 0, "ShardScan", budget);
         Operator pipeline =
             new org.opensearch.dqe.execution.operator.scan.ShardScanOperator(
                 scanCtx, searchReqBuilder, pitHandle, client, 1000, converter);
@@ -502,8 +493,7 @@ public class DqeQueryOrchestrator {
                 new org.opensearch.dqe.execution.expression.ExpressionEvaluator(
                     expr, inputColumnMap));
           }
-          OperatorContext projectCtx =
-              new OperatorContext(queryId, 0, 0, 1, "Project", budget);
+          OperatorContext projectCtx = new OperatorContext(queryId, 0, 0, 1, "Project", budget);
           pipeline =
               new org.opensearch.dqe.execution.operator.ProjectOperator(
                   projectCtx, pipeline, projections);
@@ -576,55 +566,72 @@ public class DqeQueryOrchestrator {
     switch (strategy) {
       case SCAN_ONLY:
         break;
-      case LIMIT_ONLY: {
-        long limit = decision.getLimit().orElse(0);
-        long offset = decision.getOffset().orElse(0);
-        var ctx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
-        operators.add(
-            new org.opensearch.dqe.execution.operator.LimitOperator(
-                ctx, operators.get(operators.size() - 1), limit, offset));
-        break;
-      }
-      case FULL_SORT: {
-        var ctx = new OperatorContext(queryId, 0, 0, opId++, "Sort", budget);
-        operators.add(
-            new org.opensearch.dqe.execution.operator.SortOperator(
-                ctx, operators.get(operators.size() - 1),
-                decision.getSortSpecifications(), outputChannels));
-        break;
-      }
-      case TOP_N: {
-        long n = decision.getEffectiveTopN().orElse(decision.getLimit().orElse(Long.MAX_VALUE));
-        var ctx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
-        operators.add(
-            new org.opensearch.dqe.execution.operator.TopNOperator(
-                ctx, operators.get(operators.size() - 1),
-                decision.getSortSpecifications(), n, outputChannels));
-        break;
-      }
-      case TOP_N_WITH_OFFSET: {
-        long limit = decision.getLimit().orElse(0);
-        long offset = decision.getOffset().orElse(0);
-        long effectiveN = decision.getEffectiveTopN().orElse(limit + offset);
-        var topNCtx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
-        operators.add(
-            new org.opensearch.dqe.execution.operator.TopNOperator(
-                topNCtx, operators.get(operators.size() - 1),
-                decision.getSortSpecifications(), effectiveN, outputChannels));
-        var limitCtx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
-        operators.add(
-            new org.opensearch.dqe.execution.operator.LimitOperator(
-                limitCtx, operators.get(operators.size() - 1), limit, offset));
-        break;
-      }
+      case LIMIT_ONLY:
+        {
+          long limit = decision.getLimit().orElse(0);
+          long offset = decision.getOffset().orElse(0);
+          var ctx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
+          operators.add(
+              new org.opensearch.dqe.execution.operator.LimitOperator(
+                  ctx, operators.get(operators.size() - 1), limit, offset));
+          break;
+        }
+      case FULL_SORT:
+        {
+          var ctx = new OperatorContext(queryId, 0, 0, opId++, "Sort", budget);
+          operators.add(
+              new org.opensearch.dqe.execution.operator.SortOperator(
+                  ctx,
+                  operators.get(operators.size() - 1),
+                  decision.getSortSpecifications(),
+                  outputChannels));
+          break;
+        }
+      case TOP_N:
+        {
+          long n = decision.getEffectiveTopN().orElse(decision.getLimit().orElse(Long.MAX_VALUE));
+          var ctx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
+          operators.add(
+              new org.opensearch.dqe.execution.operator.TopNOperator(
+                  ctx,
+                  operators.get(operators.size() - 1),
+                  decision.getSortSpecifications(),
+                  n,
+                  outputChannels));
+          break;
+        }
+      case TOP_N_WITH_OFFSET:
+        {
+          long limit = decision.getLimit().orElse(0);
+          long offset = decision.getOffset().orElse(0);
+          long effectiveN = decision.getEffectiveTopN().orElse(limit + offset);
+          var topNCtx = new OperatorContext(queryId, 0, 0, opId++, "TopN", budget);
+          operators.add(
+              new org.opensearch.dqe.execution.operator.TopNOperator(
+                  topNCtx,
+                  operators.get(operators.size() - 1),
+                  decision.getSortSpecifications(),
+                  effectiveN,
+                  outputChannels));
+          var limitCtx = new OperatorContext(queryId, 0, 0, opId++, "Limit", budget);
+          operators.add(
+              new org.opensearch.dqe.execution.operator.LimitOperator(
+                  limitCtx, operators.get(operators.size() - 1), limit, offset));
+          break;
+        }
     }
 
     Pipeline coordPipeline = new Pipeline(operators);
-    Driver driver = new Driver(coordPipeline, page -> {
-      finalPages.add(page);
-      totalRows.addAndGet(page.getPositionCount());
-    });
-    while (driver.process()) { /* pull */ }
+    Driver driver =
+        new Driver(
+            coordPipeline,
+            page -> {
+              finalPages.add(page);
+              totalRows.addAndGet(page.getPositionCount());
+            });
+    while (driver.process()) {
+      /* pull */
+    }
     coordPipeline.close();
 
     // Phase 3: Convert final pages to row data

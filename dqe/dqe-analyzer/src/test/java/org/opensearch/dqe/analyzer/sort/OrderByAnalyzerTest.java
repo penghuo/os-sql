@@ -30,12 +30,10 @@ class OrderByAnalyzerTest {
   @BeforeEach
   void setUp() {
     analyzer = new OrderByAnalyzer(new ExpressionTypeChecker());
-    DqeTableHandle table =
-        new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
     DqeColumnHandle nameCol =
         new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
-    DqeColumnHandle ageCol =
-        new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
+    DqeColumnHandle ageCol = new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
     DqeColumnHandle unsortableCol =
         new DqeColumnHandle("description", "description", DqeTypes.VARCHAR, false, null, false);
     scope = new Scope(table, List.of(nameCol, ageCol, unsortableCol), Optional.empty());
@@ -46,9 +44,7 @@ class OrderByAnalyzerTest {
   void orderBySortableColumn() {
     SortItem item =
         new SortItem(
-            new Identifier("age"),
-            SortItem.Ordering.ASCENDING,
-            SortItem.NullOrdering.UNDEFINED);
+            new Identifier("age"), SortItem.Ordering.ASCENDING, SortItem.NullOrdering.UNDEFINED);
     List<SortSpecification> result = analyzer.analyze(List.of(item), scope);
     assertEquals(1, result.size());
     assertEquals("age", result.get(0).getColumn().getFieldName());
@@ -61,9 +57,7 @@ class OrderByAnalyzerTest {
   void orderByDesc() {
     SortItem item =
         new SortItem(
-            new Identifier("age"),
-            SortItem.Ordering.DESCENDING,
-            SortItem.NullOrdering.UNDEFINED);
+            new Identifier("age"), SortItem.Ordering.DESCENDING, SortItem.NullOrdering.UNDEFINED);
     List<SortSpecification> result = analyzer.analyze(List.of(item), scope);
     assertEquals(SortSpecification.SortDirection.DESC, result.get(0).getDirection());
     assertEquals(SortSpecification.NullOrdering.NULLS_FIRST, result.get(0).getNullOrdering());
@@ -74,9 +68,7 @@ class OrderByAnalyzerTest {
   void orderByExplicitNullsLast() {
     SortItem item =
         new SortItem(
-            new Identifier("age"),
-            SortItem.Ordering.DESCENDING,
-            SortItem.NullOrdering.LAST);
+            new Identifier("age"), SortItem.Ordering.DESCENDING, SortItem.NullOrdering.LAST);
     List<SortSpecification> result = analyzer.analyze(List.of(item), scope);
     assertEquals(SortSpecification.NullOrdering.NULLS_LAST, result.get(0).getNullOrdering());
   }
@@ -110,14 +102,10 @@ class OrderByAnalyzerTest {
   void multipleOrderByColumns() {
     SortItem item1 =
         new SortItem(
-            new Identifier("name"),
-            SortItem.Ordering.ASCENDING,
-            SortItem.NullOrdering.UNDEFINED);
+            new Identifier("name"), SortItem.Ordering.ASCENDING, SortItem.NullOrdering.UNDEFINED);
     SortItem item2 =
         new SortItem(
-            new Identifier("age"),
-            SortItem.Ordering.DESCENDING,
-            SortItem.NullOrdering.UNDEFINED);
+            new Identifier("age"), SortItem.Ordering.DESCENDING, SortItem.NullOrdering.UNDEFINED);
     List<SortSpecification> result = analyzer.analyze(List.of(item1, item2), scope);
     assertEquals(2, result.size());
     assertEquals("name", result.get(0).getColumn().getFieldName());

@@ -97,8 +97,7 @@ class ScopeResolverTest {
     @Test
     @DisplayName("Resolves alias.column reference")
     void resolveAliasDotColumn() {
-      Scope aliasedScope =
-          new Scope(table, List.of(nameCol, ageCol), Optional.of("e"));
+      Scope aliasedScope = new Scope(table, List.of(nameCol, ageCol), Optional.of("e"));
       ResolvedField resolved = resolver.resolveQualifiedColumn("e", "name", aliasedScope);
       assertEquals(nameCol, resolved.getColumn());
     }
@@ -144,9 +143,7 @@ class ScopeResolverTest {
     @Test
     @DisplayName("Columns are immutable copy")
     void columnsImmutable() {
-      assertThrows(
-          UnsupportedOperationException.class,
-          () -> scope.getColumns().add(nameCol));
+      assertThrows(UnsupportedOperationException.class, () -> scope.getColumns().add(nameCol));
     }
   }
 }

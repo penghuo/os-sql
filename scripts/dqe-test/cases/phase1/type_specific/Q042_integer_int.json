@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "count_int",
-        "type": "BIGINT"
+        "type": "INTEGER"
       }
     ],
     "expected_min_row_count": 1

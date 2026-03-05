@@ -99,8 +99,7 @@ public class PushdownClassifier {
     return Optional.empty();
   }
 
-  private Optional<PushdownPredicate> classifyComparison(
-      ComparisonExpression cmp, Scope scope) {
+  private Optional<PushdownPredicate> classifyComparison(ComparisonExpression cmp, Scope scope) {
     // We can push down column = literal, column < literal, etc.
     Expression left = cmp.getLeft();
     Expression right = cmp.getRight();
@@ -134,7 +133,8 @@ public class PushdownClassifier {
 
     var colType = colHandle != null ? colHandle.getType() : null;
 
-    ComparisonExpression.Operator op = reversed ? reverseOperator(cmp.getOperator()) : cmp.getOperator();
+    ComparisonExpression.Operator op =
+        reversed ? reverseOperator(cmp.getOperator()) : cmp.getOperator();
 
     return switch (op) {
       case EQUAL -> Optional.of(PushdownPredicate.termEquality(fieldName, colType, literalValue));
@@ -144,11 +144,13 @@ public class PushdownClassifier {
         yield Optional.of(PushdownPredicate.not(eq));
       }
       case LESS_THAN ->
-          Optional.of(PushdownPredicate.range(fieldName, colType, null, false, literalValue, false));
+          Optional.of(
+              PushdownPredicate.range(fieldName, colType, null, false, literalValue, false));
       case LESS_THAN_OR_EQUAL ->
           Optional.of(PushdownPredicate.range(fieldName, colType, null, false, literalValue, true));
       case GREATER_THAN ->
-          Optional.of(PushdownPredicate.range(fieldName, colType, literalValue, false, null, false));
+          Optional.of(
+              PushdownPredicate.range(fieldName, colType, literalValue, false, null, false));
       case GREATER_THAN_OR_EQUAL ->
           Optional.of(PushdownPredicate.range(fieldName, colType, literalValue, true, null, false));
       default -> Optional.empty();
@@ -163,8 +165,7 @@ public class PushdownClassifier {
     return Optional.empty();
   }
 
-  private Optional<PushdownPredicate> classifyIsNotNull(
-      IsNotNullPredicate isNotNull, Scope scope) {
+  private Optional<PushdownPredicate> classifyIsNotNull(IsNotNullPredicate isNotNull, Scope scope) {
     if (isColumnRef(isNotNull.getValue())) {
       String fieldName = resolveFieldName(isNotNull.getValue(), scope);
       return Optional.of(PushdownPredicate.exists(fieldName));
@@ -274,8 +275,7 @@ public class PushdownClassifier {
       return null;
     }
     for (DqeColumnHandle col : scope.getColumns()) {
-      if (col.getFieldName().equalsIgnoreCase(name)
-          || col.getFieldPath().equalsIgnoreCase(name)) {
+      if (col.getFieldName().equalsIgnoreCase(name) || col.getFieldPath().equalsIgnoreCase(name)) {
         return col;
       }
     }

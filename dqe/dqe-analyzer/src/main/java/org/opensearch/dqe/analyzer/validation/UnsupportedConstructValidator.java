@@ -45,17 +45,36 @@ public class UnsupportedConstructValidator {
   /** Well-known aggregate function names that are rejected in Phase 1. */
   private static final Set<String> AGGREGATE_FUNCTIONS =
       Set.of(
-          "count", "sum", "avg", "min", "max",
-          "array_agg", "collect_list", "collect_set",
-          "stddev", "stddev_pop", "stddev_samp",
-          "variance", "var_pop", "var_samp",
-          "approx_distinct", "approx_percentile",
-          "arbitrary", "every", "any_value",
-          "bool_and", "bool_or",
-          "corr", "covar_pop", "covar_samp",
-          "regr_intercept", "regr_slope",
-          "count_if", "histogram",
-          "listagg", "string_agg");
+          "count",
+          "sum",
+          "avg",
+          "min",
+          "max",
+          "array_agg",
+          "collect_list",
+          "collect_set",
+          "stddev",
+          "stddev_pop",
+          "stddev_samp",
+          "variance",
+          "var_pop",
+          "var_samp",
+          "approx_distinct",
+          "approx_percentile",
+          "arbitrary",
+          "every",
+          "any_value",
+          "bool_and",
+          "bool_or",
+          "corr",
+          "covar_pop",
+          "covar_samp",
+          "regr_intercept",
+          "regr_slope",
+          "count_if",
+          "histogram",
+          "listagg",
+          "string_agg");
 
   public UnsupportedConstructValidator() {}
 
@@ -93,8 +112,7 @@ public class UnsupportedConstructValidator {
       // SELECT-without-FROM
       if (qs.getFrom().isEmpty()) {
         throw new DqeUnsupportedOperationException(
-            "SELECT without FROM",
-            "Phase 1 requires a FROM clause with a single table");
+            "SELECT without FROM", "Phase 1 requires a FROM clause with a single table");
       }
 
       // DISTINCT
@@ -183,14 +201,12 @@ public class UnsupportedConstructValidator {
 
       // Check for aggregate functions
       if (AGGREGATE_FUNCTIONS.contains(name)) {
-        throw new DqeUnsupportedOperationException(
-            "aggregate function '" + fc.getName() + "'");
+        throw new DqeUnsupportedOperationException("aggregate function '" + fc.getName() + "'");
       }
 
       // Check for window functions
       if (fc.getWindow().isPresent()) {
-        throw new DqeUnsupportedOperationException(
-            "window function '" + fc.getName() + "'");
+        throw new DqeUnsupportedOperationException("window function '" + fc.getName() + "'");
       }
 
       // All other named function calls are rejected in Phase 1

@@ -57,8 +57,8 @@ class DqeAnalyzerTest {
     metadata = mock(DqeMetadata.class);
     when(metadata.getTableHandle("default", "employees")).thenReturn(EMPLOYEES_TABLE);
     when(metadata.getTableHandle("default", "t")).thenReturn(T_TABLE);
-    when(metadata.getTableHandle(eq("default"), argThat(name ->
-        !"employees".equals(name) && !"t".equals(name))))
+    when(metadata.getTableHandle(
+            eq("default"), argThat(name -> !"employees".equals(name) && !"t".equals(name))))
         .thenThrow(new DqeTableNotFoundException("unknown"));
     when(metadata.getColumnHandles(any(DqeTableHandle.class))).thenReturn(EMPLOYEE_COLUMNS);
 
@@ -183,8 +183,7 @@ class DqeAnalyzerTest {
     void whereNonBooleanThrows() {
       Statement stmt = parser.parse("SELECT * FROM employees WHERE age");
       assertThrows(
-          DqeAnalysisException.class,
-          () -> analyzer.analyze(stmt, metadata, allowAllSecurity));
+          DqeAnalysisException.class, () -> analyzer.analyze(stmt, metadata, allowAllSecurity));
     }
 
     @Test
@@ -287,8 +286,7 @@ class DqeAnalyzerTest {
       AnalyzedQuery result = analyzer.analyze(stmt, metadata, allowAllSecurity);
 
       assertEquals(
-          OperatorSelectionRule.PipelineStrategy.TOP_N,
-          result.getPipelineDecision().getStrategy());
+          OperatorSelectionRule.PipelineStrategy.TOP_N, result.getPipelineDecision().getStrategy());
     }
 
     @Test
@@ -412,8 +410,7 @@ class DqeAnalyzerTest {
     void unknownColumnThrows() {
       Statement stmt = parser.parse("SELECT nonexistent FROM employees");
       assertThrows(
-          DqeAnalysisException.class,
-          () -> analyzer.analyze(stmt, metadata, allowAllSecurity));
+          DqeAnalysisException.class, () -> analyzer.analyze(stmt, metadata, allowAllSecurity));
     }
   }
 }

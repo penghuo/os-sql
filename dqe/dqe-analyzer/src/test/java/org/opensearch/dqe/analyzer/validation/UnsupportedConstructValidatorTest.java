@@ -76,8 +76,7 @@ class UnsupportedConstructValidatorTest {
   @DisplayName("HAVING is rejected")
   void havingRejected() {
     Statement stmt =
-        parser.parse(
-            "SELECT department, COUNT(*) FROM t GROUP BY department HAVING COUNT(*) > 5");
+        parser.parse("SELECT department, COUNT(*) FROM t GROUP BY department HAVING COUNT(*) > 5");
     DqeUnsupportedOperationException ex =
         assertThrows(DqeUnsupportedOperationException.class, () -> validator.validate(stmt));
     // Could be rejected for GROUP BY first
@@ -169,8 +168,7 @@ class UnsupportedConstructValidatorTest {
   @Test
   @DisplayName("Window function is rejected")
   void windowFunctionRejected() {
-    Statement stmt =
-        parser.parse("SELECT ROW_NUMBER() OVER (ORDER BY salary DESC) FROM employees");
+    Statement stmt = parser.parse("SELECT ROW_NUMBER() OVER (ORDER BY salary DESC) FROM employees");
     DqeUnsupportedOperationException ex =
         assertThrows(DqeUnsupportedOperationException.class, () -> validator.validate(stmt));
     assertThat(ex.getMessage(), containsString("window function"));

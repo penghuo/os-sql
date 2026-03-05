@@ -10,7 +10,7 @@
       },
       {
         "name": "value",
-        "type": "BIGINT"
+        "type": "INTEGER"
       },
       {
         "name": "label",

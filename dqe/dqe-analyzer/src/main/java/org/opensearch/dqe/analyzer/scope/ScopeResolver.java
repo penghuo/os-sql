@@ -58,7 +58,8 @@ public class ScopeResolver {
               + "Column aliases from SELECT can only be referenced in ORDER BY.");
     }
 
-    throw new DqeAnalysisException("Column '" + columnName + "' not found in table " + scope.getTableName());
+    throw new DqeAnalysisException(
+        "Column '" + columnName + "' not found in table " + scope.getTableName());
   }
 
   /**
@@ -132,7 +133,6 @@ public class ScopeResolver {
       }
     }
 
-    throw new DqeAnalysisException(
-        "Column '" + columnName + "' not found in table " + qualifier);
+    throw new DqeAnalysisException("Column '" + columnName + "' not found in table " + qualifier);
   }
 }

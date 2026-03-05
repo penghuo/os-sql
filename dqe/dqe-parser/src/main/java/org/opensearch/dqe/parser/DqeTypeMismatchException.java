@@ -6,8 +6,8 @@
 package org.opensearch.dqe.parser;
 
 /**
- * Thrown when a type mismatch is detected during semantic analysis. Reports the
- * column/expression, expected type, and actual type.
+ * Thrown when a type mismatch is detected during semantic analysis. Reports the column/expression,
+ * expected type, and actual type.
  */
 public class DqeTypeMismatchException extends DqeException {
 

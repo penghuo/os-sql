@@ -33,7 +33,8 @@ class PlanFragmentTests {
   @Test
   @DisplayName("round-trip with unicode query text")
   void roundTripWithUnicode() {
-    PlanFragment original = new PlanFragment("SELECT * FROM tëst WHERE name = '日本語'", "q-1", 60L, 500);
+    PlanFragment original =
+        new PlanFragment("SELECT * FROM tëst WHERE name = '日本語'", "q-1", 60L, 500);
 
     byte[] serialized = original.serialize();
     PlanFragment deserialized = PlanFragment.deserialize(serialized);

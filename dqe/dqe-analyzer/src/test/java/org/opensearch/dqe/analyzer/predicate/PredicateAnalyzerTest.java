@@ -29,12 +29,10 @@ class PredicateAnalyzerTest {
   @BeforeEach
   void setUp() {
     analyzer = new PredicateAnalyzer();
-    DqeTableHandle table =
-        new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
     DqeColumnHandle nameCol =
         new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
-    DqeColumnHandle ageCol =
-        new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
+    DqeColumnHandle ageCol = new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
     DqeColumnHandle activeCol =
         new DqeColumnHandle("active", "active", DqeTypes.BOOLEAN, true, null, false);
     scope = new Scope(table, List.of(nameCol, ageCol, activeCol), Optional.empty());
@@ -108,8 +106,7 @@ class PredicateAnalyzerTest {
     @DisplayName("BETWEEN pushdown")
     void betweenPushdown() {
       BetweenPredicate expr =
-          new BetweenPredicate(
-              new Identifier("age"), new LongLiteral("18"), new LongLiteral("65"));
+          new BetweenPredicate(new Identifier("age"), new LongLiteral("18"), new LongLiteral("65"));
       TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
       PredicateAnalysisResult result = analyzer.analyze(typed, scope);
 
@@ -124,8 +121,7 @@ class PredicateAnalyzerTest {
       InPredicate expr =
           new InPredicate(
               new Identifier("age"),
-              new InListExpression(
-                  List.of(new LongLiteral("20"), new LongLiteral("30"))));
+              new InListExpression(List.of(new LongLiteral("20"), new LongLiteral("30"))));
       TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
       PredicateAnalysisResult result = analyzer.analyze(typed, scope);
 
@@ -195,8 +191,7 @@ class PredicateAnalyzerTest {
       assertTrue(result.isFullyPushedDown());
       assertEquals(1, result.getPushdownPredicates().size());
       assertEquals(
-          PushdownPredicate.PredicateType.BOOL_OR,
-          result.getPushdownPredicates().get(0).getType());
+          PushdownPredicate.PredicateType.BOOL_OR, result.getPushdownPredicates().get(0).getType());
     }
   }
 
@@ -210,9 +205,7 @@ class PredicateAnalyzerTest {
       // Expression between two columns (not column vs literal)
       ComparisonExpression expr =
           new ComparisonExpression(
-              ComparisonExpression.Operator.EQUAL,
-              new Identifier("name"),
-              new Identifier("name"));
+              ComparisonExpression.Operator.EQUAL, new Identifier("name"), new Identifier("name"));
       TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
       PredicateAnalysisResult result = analyzer.analyze(typed, scope);
 

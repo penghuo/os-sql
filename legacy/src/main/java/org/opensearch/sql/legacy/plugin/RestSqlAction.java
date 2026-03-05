@@ -222,9 +222,7 @@ public class RestSqlAction extends BaseRestHandler {
       String requestEngine = newSqlRequest.getEngine();
       try {
         if (dqeRoutingFunction.apply(requestEngine)) {
-          LOG.info(
-              "[{}] Request routed to DQE engine",
-              QueryContext.getRequestId());
+          LOG.info("[{}] Request routed to DQE engine", QueryContext.getRequestId());
 
           // Route /_explain to the DQE explain path
           if (isExplainRequest(request)) {
@@ -286,10 +284,7 @@ public class RestSqlAction extends BaseRestHandler {
         }
       } catch (RuntimeException dqeEx) {
         // DqeException (DQE_DISABLED, INVALID_REQUEST) — return as client error
-        LOG.warn(
-            "[{}] DQE routing error: {}",
-            QueryContext.getRequestId(),
-            dqeEx.getMessage());
+        LOG.warn("[{}] DQE routing error: {}", QueryContext.getRequestId(), dqeEx.getMessage());
         return channel -> reportDqeError(channel, dqeEx);
       }
 
@@ -446,9 +441,9 @@ public class RestSqlAction extends BaseRestHandler {
   }
 
   /**
-   * Report a DQE error using the DQE error formatter if available, falling back to the legacy
-   * error formatter. The DQE formatter preserves the actual error message in the "reason" field
-   * instead of replacing it with a generic "Invalid SQL query".
+   * Report a DQE error using the DQE error formatter if available, falling back to the legacy error
+   * formatter. The DQE formatter preserves the actual error message in the "reason" field instead
+   * of replacing it with a generic "Invalid SQL query".
    */
   private void reportDqeError(final RestChannel channel, final RuntimeException e) {
     if (dqeErrorFormatter != null) {

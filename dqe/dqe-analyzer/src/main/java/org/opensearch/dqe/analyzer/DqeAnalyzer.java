@@ -137,8 +137,7 @@ public class DqeAnalyzer {
     List<TypedExpression> orderByExpressions = new ArrayList<>();
     for (SortSpecification spec : sortSpecs) {
       orderByExpressions.add(
-          new TypedExpression(
-              new Identifier(spec.getColumn().getFieldName()), spec.getType()));
+          new TypedExpression(new Identifier(spec.getColumn().getFieldName()), spec.getType()));
     }
 
     RequiredColumns requiredColumns;

@@ -5,9 +5,7 @@
 
 package org.opensearch.dqe.parser;
 
-/**
- * Thrown when the user lacks permission to access a referenced index, table, or field.
- */
+/** Thrown when the user lacks permission to access a referenced index, table, or field. */
 public class DqeAccessDeniedException extends DqeException {
 
   private final String resource;

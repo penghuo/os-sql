@@ -28,12 +28,10 @@ class PushdownClassifierTest {
   @BeforeEach
   void setUp() {
     classifier = new PushdownClassifier();
-    DqeTableHandle table =
-        new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test_table", null, List.of("test_table"), 1L, null);
     DqeColumnHandle nameCol =
         new DqeColumnHandle("name", "name", DqeTypes.VARCHAR, true, "name.keyword", false);
-    DqeColumnHandle ageCol =
-        new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
+    DqeColumnHandle ageCol = new DqeColumnHandle("age", "age", DqeTypes.INTEGER, true, null, false);
     scope = new Scope(table, List.of(nameCol, ageCol), Optional.empty());
   }
 
@@ -74,9 +72,7 @@ class PushdownClassifierTest {
   void notEqual() {
     ComparisonExpression expr =
         new ComparisonExpression(
-            ComparisonExpression.Operator.NOT_EQUAL,
-            new Identifier("age"),
-            new LongLiteral("25"));
+            ComparisonExpression.Operator.NOT_EQUAL, new Identifier("age"), new LongLiteral("25"));
     TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
     Optional<PushdownPredicate> result = classifier.classify(typed, scope);
 
@@ -84,8 +80,7 @@ class PushdownClassifierTest {
     assertEquals(PushdownPredicate.PredicateType.BOOL_NOT, result.get().getType());
     assertEquals(1, result.get().getChildren().size());
     assertEquals(
-        PushdownPredicate.PredicateType.TERM_EQUALITY,
-        result.get().getChildren().get(0).getType());
+        PushdownPredicate.PredicateType.TERM_EQUALITY, result.get().getChildren().get(0).getType());
   }
 
   @Test
@@ -93,16 +88,13 @@ class PushdownClassifierTest {
   void lessThan() {
     ComparisonExpression expr =
         new ComparisonExpression(
-            ComparisonExpression.Operator.LESS_THAN,
-            new Identifier("age"),
-            new LongLiteral("30"));
+            ComparisonExpression.Operator.LESS_THAN, new Identifier("age"), new LongLiteral("30"));
     TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
     Optional<PushdownPredicate> result = classifier.classify(typed, scope);
 
     assertTrue(result.isPresent());
     assertEquals(PushdownPredicate.PredicateType.RANGE, result.get().getType());
-    PushdownPredicate.RangeBounds bounds =
-        (PushdownPredicate.RangeBounds) result.get().getValue();
+    PushdownPredicate.RangeBounds bounds = (PushdownPredicate.RangeBounds) result.get().getValue();
     assertNull(bounds.lowerBound());
     assertFalse(bounds.upperInclusive());
   }
@@ -120,8 +112,7 @@ class PushdownClassifierTest {
 
     assertTrue(result.isPresent());
     assertEquals(PushdownPredicate.PredicateType.RANGE, result.get().getType());
-    PushdownPredicate.RangeBounds bounds =
-        (PushdownPredicate.RangeBounds) result.get().getValue();
+    PushdownPredicate.RangeBounds bounds = (PushdownPredicate.RangeBounds) result.get().getValue();
     assertTrue(bounds.lowerInclusive());
   }
 
@@ -130,9 +121,7 @@ class PushdownClassifierTest {
   void columnToColumnNotPushable() {
     ComparisonExpression expr =
         new ComparisonExpression(
-            ComparisonExpression.Operator.EQUAL,
-            new Identifier("name"),
-            new Identifier("age"));
+            ComparisonExpression.Operator.EQUAL, new Identifier("name"), new Identifier("age"));
     TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
     Optional<PushdownPredicate> result = classifier.classify(typed, scope);
 
@@ -156,9 +145,7 @@ class PushdownClassifierTest {
   void isNotColumnLiteralComparison() {
     ComparisonExpression expr =
         new ComparisonExpression(
-            ComparisonExpression.Operator.EQUAL,
-            new Identifier("name"),
-            new Identifier("age"));
+            ComparisonExpression.Operator.EQUAL, new Identifier("name"), new Identifier("age"));
     TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
     assertFalse(classifier.isColumnLiteralComparison(typed));
   }
@@ -169,9 +156,7 @@ class PushdownClassifierTest {
     NotExpression expr =
         new NotExpression(
             new ComparisonExpression(
-                ComparisonExpression.Operator.EQUAL,
-                new Identifier("age"),
-                new LongLiteral("25")));
+                ComparisonExpression.Operator.EQUAL, new Identifier("age"), new LongLiteral("25")));
     TypedExpression typed = new TypedExpression(expr, DqeTypes.BOOLEAN);
     Optional<PushdownPredicate> result = classifier.classify(typed, scope);
 

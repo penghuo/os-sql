@@ -21,17 +21,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.dqe.analyzer.AnalyzedQuery;
 import org.opensearch.dqe.analyzer.DqeAnalyzer;
 import org.opensearch.dqe.analyzer.projection.RequiredColumns;
 import org.opensearch.dqe.analyzer.sort.OperatorSelectionRule;
 import org.opensearch.dqe.analyzer.sort.PipelineDecision;
-import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.dqe.exchange.gather.ExchangePushHandler;
 import org.opensearch.dqe.exchange.stage.StageScheduleResult;
 import org.opensearch.dqe.exchange.stage.StageScheduler;
@@ -50,7 +50,6 @@ import org.opensearch.dqe.plugin.request.DqeQueryRequest;
 import org.opensearch.dqe.plugin.response.DqeQueryResponse;
 import org.opensearch.dqe.plugin.settings.DqeSettings;
 import org.opensearch.dqe.types.DqeTypes;
-import org.opensearch.transport.TransportService;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayName("DqeQueryOrchestrator")
@@ -78,8 +77,7 @@ class DqeQueryOrchestratorTests {
     // Create real DqeSettings with default cluster settings
     Set<org.opensearch.common.settings.Setting<?>> settingsSet =
         new java.util.HashSet<>(DqeSettings.getAllSettings());
-    ClusterSettings clusterSettings =
-        new ClusterSettings(Settings.EMPTY, settingsSet);
+    ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, settingsSet);
     lenient().when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
     settings = new DqeSettings(clusterSettings);
 
@@ -138,8 +136,7 @@ class DqeQueryOrchestratorTests {
   }
 
   private AnalyzedQuery buildAnalyzedQuery() {
-    DqeTableHandle table =
-        new DqeTableHandle("test_index", null, List.of("test_index"), 1L, null);
+    DqeTableHandle table = new DqeTableHandle("test_index", null, List.of("test_index"), 1L, null);
     RequiredColumns requiredColumns = new RequiredColumns(Set.of());
     PipelineDecision pipelineDecision =
         new PipelineDecision(
@@ -277,8 +274,7 @@ class DqeQueryOrchestratorTests {
               org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
               org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class));
 
-      DqeQueryRequest request =
-          DqeQueryRequest.builder().query("SELECT 1 FROM t").build();
+      DqeQueryRequest request = DqeQueryRequest.builder().query("SELECT 1 FROM t").build();
 
       DqeException ex =
           assertThrows(DqeException.class, () -> restrictedOrchestrator.execute(request));
@@ -322,11 +318,9 @@ class DqeQueryOrchestratorTests {
     @Test
     @DisplayName("parse error propagates as DqeException")
     void parseErrorPropagates() {
-      DqeQueryRequest request =
-          DqeQueryRequest.builder().query("NOT VALID SQL AT ALL @#$").build();
+      DqeQueryRequest request = DqeQueryRequest.builder().query("NOT VALID SQL AT ALL @#$").build();
 
-      DqeException ex =
-          assertThrows(DqeException.class, () -> orchestrator.execute(request));
+      DqeException ex = assertThrows(DqeException.class, () -> orchestrator.execute(request));
       // Parser errors throw DqeException with SYNTAX_ERROR
       assertNotNull(ex.getMessage());
     }
@@ -341,8 +335,7 @@ class DqeQueryOrchestratorTests {
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT col1 FROM test_index").build();
 
-      DqeException ex =
-          assertThrows(DqeException.class, () -> orchestrator.execute(request));
+      DqeException ex = assertThrows(DqeException.class, () -> orchestrator.execute(request));
       assertEquals(DqeErrorCode.TABLE_NOT_FOUND, ex.getErrorCode());
     }
 
@@ -355,8 +348,7 @@ class DqeQueryOrchestratorTests {
       DqeQueryRequest request =
           DqeQueryRequest.builder().query("SELECT col1 FROM test_index").build();
 
-      DqeException ex =
-          assertThrows(DqeException.class, () -> orchestrator.execute(request));
+      DqeException ex = assertThrows(DqeException.class, () -> orchestrator.execute(request));
       assertEquals(DqeErrorCode.EXECUTION_ERROR, ex.getErrorCode());
       assertTrue(ex.getMessage().contains("Internal error"));
     }
@@ -461,7 +453,7 @@ class DqeQueryOrchestratorTests {
                   new ExchangePushHandler(),
                   null,
                   org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
-              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
+                  org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -486,7 +478,7 @@ class DqeQueryOrchestratorTests {
                   new ExchangePushHandler(),
                   null,
                   org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
-              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
+                  org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -511,7 +503,7 @@ class DqeQueryOrchestratorTests {
                   new ExchangePushHandler(),
                   null,
                   org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
-              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
+                  org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
 
     @Test
@@ -536,7 +528,7 @@ class DqeQueryOrchestratorTests {
                   new ExchangePushHandler(),
                   null,
                   org.mockito.Mockito.mock(org.opensearch.transport.client.Client.class),
-              org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
+                  org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class)));
     }
   }
 }

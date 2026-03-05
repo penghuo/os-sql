@@ -122,8 +122,7 @@ class DqeSettingsTests {
     @Test
     @DisplayName("EXCHANGE_BACKPRESSURE_TIMEOUT defaults to 30s")
     void exchangeBackpressureTimeoutDefault() {
-      assertEquals(
-          TimeValue.timeValueSeconds(30), dqeSettings.getExchangeBackpressureTimeout());
+      assertEquals(TimeValue.timeValueSeconds(30), dqeSettings.getExchangeBackpressureTimeout());
     }
 
     @Test
@@ -152,16 +151,14 @@ class DqeSettingsTests {
     @Test
     @DisplayName("SQL_ENGINE can be updated to dqe")
     void updateEngine() {
-      clusterSettings.applySettings(
-          Settings.builder().put("plugins.sql.engine", "dqe").build());
+      clusterSettings.applySettings(Settings.builder().put("plugins.sql.engine", "dqe").build());
       assertEquals("dqe", dqeSettings.getEngine());
     }
 
     @Test
     @DisplayName("DQE_ENABLED can be set to false")
     void disableDqe() {
-      clusterSettings.applySettings(
-          Settings.builder().put("plugins.dqe.enabled", false).build());
+      clusterSettings.applySettings(Settings.builder().put("plugins.dqe.enabled", false).build());
       assertFalse(dqeSettings.isDqeEnabled());
     }
 
@@ -213,8 +210,7 @@ class DqeSettingsTests {
     @Test
     @DisplayName("MAX_CONCURRENT_QUERIES rejects 0 via Setting.get()")
     void rejectsZeroConcurrent() {
-      Settings invalid =
-          Settings.builder().put("plugins.dqe.max_concurrent_queries", 0).build();
+      Settings invalid = Settings.builder().put("plugins.dqe.max_concurrent_queries", 0).build();
       assertThrows(
           IllegalArgumentException.class,
           () -> DqeSettings.MAX_CONCURRENT_QUERIES_SETTING.get(invalid));
@@ -225,8 +221,7 @@ class DqeSettingsTests {
     void rejectsZeroBatchSize() {
       Settings invalid = Settings.builder().put("plugins.dqe.scan.batch_size", 0).build();
       assertThrows(
-          IllegalArgumentException.class,
-          () -> DqeSettings.SCAN_BATCH_SIZE_SETTING.get(invalid));
+          IllegalArgumentException.class, () -> DqeSettings.SCAN_BATCH_SIZE_SETTING.get(invalid));
     }
   }
 

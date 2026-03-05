@@ -85,6 +85,14 @@ import org.opensearch.sql.directquery.transport.config.DirectQueryModule;
 import org.opensearch.sql.directquery.transport.model.ExecuteDirectQueryActionResponse;
 import org.opensearch.sql.directquery.transport.model.ReadDirectQueryResourcesActionResponse;
 import org.opensearch.sql.directquery.transport.model.WriteDirectQueryResourcesActionResponse;
+import org.opensearch.sql.dqe.common.config.DqeSettings;
+import org.opensearch.sql.dqe.coordinator.rest.RestTrinoSqlAction;
+import org.opensearch.sql.dqe.coordinator.transport.TransportTrinoSqlAction;
+import org.opensearch.sql.dqe.coordinator.transport.TrinoSqlAction;
+import org.opensearch.sql.dqe.coordinator.transport.TrinoSqlResponse;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
+import org.opensearch.sql.dqe.shard.transport.ShardExecuteResponse;
+import org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction;
 import org.opensearch.sql.legacy.esdomain.LocalClusterState;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
@@ -170,7 +178,8 @@ public class SQLPlugin extends Plugin
         new RestDataSourceQueryAction((OpenSearchSettings) pluginSettings),
         new RestAsyncQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryManagementAction((OpenSearchSettings) pluginSettings),
-        new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings));
+        new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings),
+        new RestTrinoSqlAction());
   }
 
   /** Register action and handler so that transportClient can find proxy for action. */
@@ -225,7 +234,13 @@ public class SQLPlugin extends Plugin
             new ActionType<>(
                 TransportWriteDirectQueryResourcesRequestAction.NAME,
                 WriteDirectQueryResourcesActionResponse::new),
-            TransportWriteDirectQueryResourcesRequestAction.class));
+            TransportWriteDirectQueryResourcesRequestAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoSqlAction.NAME, TrinoSqlResponse::new),
+            TransportTrinoSqlAction.class),
+        new ActionHandler<>(
+            new ActionType<>(ShardExecuteAction.NAME, ShardExecuteResponse::new),
+            TransportShardExecuteAction.class));
   }
 
   @Override
@@ -332,7 +347,13 @@ public class SQLPlugin extends Plugin
             settings.getAsInt(
                 "thread_pool.search.size", OpenSearchExecutors.allocatedProcessors(settings)),
             1000,
-            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME));
+            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME),
+        new FixedExecutorBuilder(
+            settings,
+            "dqe-shard-executor",
+            Math.max(1, OpenSearchExecutors.allocatedProcessors(settings) / 2),
+            1000,
+            "thread_pool.dqe-shard-executor"));
   }
 
   @Override
@@ -340,6 +361,7 @@ public class SQLPlugin extends Plugin
     return new ImmutableList.Builder<Setting<?>>()
         .addAll(OpenSearchSettings.pluginSettings())
         .addAll(OpenSearchSettings.pluginNonDynamicSettings())
+        .addAll(DqeSettings.settings())
         .build();
   }
 

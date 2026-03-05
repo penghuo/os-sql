@@ -11,9 +11,13 @@ import static org.opensearch.sql.dqe.operator.TestPageSource.buildBigintPage;
 
 import io.trino.spi.Page;
 import io.trino.spi.type.BigintType;
+import io.trino.sql.tree.ComparisonExpression;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.dqe.function.expression.ColumnReference;
+import org.opensearch.sql.dqe.function.expression.ComparisonBlockExpression;
+import org.opensearch.sql.dqe.function.expression.ConstantExpression;
 
 @DisplayName("FilterOperator")
 class FilterOperatorTest {
@@ -80,5 +84,24 @@ class FilterOperatorTest {
     FilterOperator filter = new FilterOperator(source, (page, pos) -> true);
 
     assertNull(filter.processNextBatch());
+  }
+
+  @Test
+  @DisplayName("BlockExpression predicate filters rows correctly")
+  void blockExpressionPredicate() {
+    Page input = buildBigintPage(5); // values 0, 1, 2, 3, 4
+    Operator source = new TestPageSource(List.of(input));
+    // col0 >= 3 via BlockExpression
+    ComparisonBlockExpression predicate =
+        new ComparisonBlockExpression(
+            ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL,
+            new ColumnReference(0, BigintType.BIGINT),
+            new ConstantExpression(3L, BigintType.BIGINT));
+    FilterOperator filter = new FilterOperator(source, predicate);
+
+    Page result = filter.processNextBatch();
+    assertEquals(2, result.getPositionCount());
+    assertEquals(3L, BigintType.BIGINT.getLong(result.getBlock(0), 0));
+    assertEquals(4L, BigintType.BIGINT.getLong(result.getBlock(0), 1));
   }
 }

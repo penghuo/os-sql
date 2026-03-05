@@ -41,8 +41,10 @@ import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
+import org.opensearch.sql.dqe.planner.plan.SortNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteRequest;
@@ -106,16 +108,16 @@ public class TransportTrinoSqlAction
       PlanOptimizer optimizer = new PlanOptimizer();
       DqePlanNode optimizedPlan = optimizer.optimize(plan);
 
-      // 5. Explain mode: return the plan description
-      if (sqlReq.isExplain()) {
-        listener.onResponse(new TrinoSqlResponse(formatExplain(optimizedPlan)));
-        return;
-      }
-
-      // 6. Fragment
+      // 5. Fragment (needed for both explain and execute)
       PlanFragmenter fragmenter = new PlanFragmenter();
       PlanFragmenter.FragmentResult fragments =
           fragmenter.fragment(optimizedPlan, clusterService.state());
+
+      // 6. Explain mode: return logical plan, optimized plan, and fragments
+      if (sqlReq.isExplain()) {
+        listener.onResponse(new TrinoSqlResponse(formatExplain(plan, optimizedPlan, fragments)));
+        return;
+      }
 
       // 7. Build column type information from metadata
       String indexName = findIndexName(optimizedPlan);
@@ -275,44 +277,97 @@ public class TransportTrinoSqlAction
   }
 
   /**
-   * Format the explain output for a logical plan. Produces a JSON object describing the plan tree.
+   * Format the explain output showing all three plan stages: logical plan (before optimization),
+   * optimized plan (after optimization), and per-shard fragments with coordinator merge plan.
    */
-  static String formatExplain(DqePlanNode plan) {
+  static String formatExplain(
+      DqePlanNode logicalPlan, DqePlanNode optimizedPlan, PlanFragmenter.FragmentResult fragments) {
     StringBuilder sb = new StringBuilder();
-    sb.append("{\"plan\":\"");
-    sb.append(escapeJson(describePlan(plan, 0)));
-    sb.append("\"}");
+    sb.append("{");
+
+    // 1. Logical plan (before optimization)
+    sb.append("\"logical_plan\":");
+    planToJson(sb, logicalPlan);
+
+    // 2. Optimized plan (after optimization)
+    sb.append(",\"optimized_plan\":");
+    planToJson(sb, optimizedPlan);
+
+    // 3. Fragments (per-shard plans + coordinator plan)
+    sb.append(",\"fragments\":[");
+    List<PlanFragment> frags = fragments.shardFragments();
+    for (int i = 0; i < frags.size(); i++) {
+      if (i > 0) {
+        sb.append(",");
+      }
+      PlanFragment f = frags.get(i);
+      sb.append("{\"shard_id\":").append(f.shardId());
+      sb.append(",\"node_id\":\"").append(escapeJson(f.nodeId())).append("\"");
+      sb.append(",\"index\":\"").append(escapeJson(f.indexName())).append("\"");
+      sb.append(",\"plan\":");
+      planToJson(sb, f.shardPlan());
+      sb.append("}");
+    }
+    sb.append("]");
+
+    // 4. Coordinator merge plan (null for non-aggregate queries)
+    sb.append(",\"coordinator_plan\":");
+    if (fragments.coordinatorPlan() != null) {
+      planToJson(sb, fragments.coordinatorPlan());
+    } else {
+      sb.append("null");
+    }
+
+    sb.append("}");
     return sb.toString();
   }
 
-  /** Recursively describe a plan node as a human-readable string. */
-  private static String describePlan(DqePlanNode node, int indent) {
-    StringBuilder sb = new StringBuilder();
-    String prefix = "  ".repeat(indent);
-    sb.append(prefix).append(node.getClass().getSimpleName());
+  /** Convert a plan node tree to a JSON object recursively. */
+  private static void planToJson(StringBuilder sb, DqePlanNode node) {
+    sb.append("{\"node\":\"").append(node.getClass().getSimpleName()).append("\"");
 
+    // Node-specific attributes
     if (node instanceof TableScanNode scan) {
-      sb.append("[").append(scan.getIndexName()).append(", cols=").append(scan.getColumns());
+      sb.append(",\"index\":\"").append(escapeJson(scan.getIndexName())).append("\"");
+      sb.append(",\"columns\":").append(toJsonArray(scan.getColumns()));
       if (scan.getDslFilter() != null) {
-        sb.append(", dslFilter=").append(scan.getDslFilter());
+        sb.append(",\"dsl_filter\":").append(scan.getDslFilter());
       }
-      sb.append("]");
+    } else if (node instanceof FilterNode filter) {
+      sb.append(",\"predicate\":\"").append(escapeJson(filter.getPredicateString())).append("\"");
     } else if (node instanceof ProjectNode proj) {
-      sb.append("[cols=").append(proj.getOutputColumns()).append("]");
+      sb.append(",\"columns\":").append(toJsonArray(proj.getOutputColumns()));
     } else if (node instanceof AggregationNode agg) {
-      sb.append("[groupBy=")
-          .append(agg.getGroupByKeys())
-          .append(", aggs=")
-          .append(agg.getAggregateFunctions())
-          .append(", step=")
-          .append(agg.getStep())
-          .append("]");
+      sb.append(",\"group_by\":").append(toJsonArray(agg.getGroupByKeys()));
+      sb.append(",\"aggregates\":").append(toJsonArray(agg.getAggregateFunctions()));
+      sb.append(",\"step\":\"").append(agg.getStep().name()).append("\"");
+    } else if (node instanceof SortNode sort) {
+      sb.append(",\"sort_keys\":").append(toJsonArray(sort.getSortKeys()));
+      sb.append(",\"ascending\":").append(sort.getAscending());
+    } else if (node instanceof LimitNode limit) {
+      sb.append(",\"count\":").append(limit.getCount());
     }
 
-    for (DqePlanNode child : node.getChildren()) {
-      sb.append("\\n");
-      sb.append(describePlan(child, indent + 1));
+    // Children
+    List<DqePlanNode> children = node.getChildren();
+    if (!children.isEmpty()) {
+      sb.append(",\"child\":");
+      planToJson(sb, children.get(0));
     }
+
+    sb.append("}");
+  }
+
+  /** Convert a list of strings to a JSON array. */
+  private static String toJsonArray(List<String> items) {
+    StringBuilder sb = new StringBuilder("[");
+    for (int i = 0; i < items.size(); i++) {
+      if (i > 0) {
+        sb.append(",");
+      }
+      sb.append("\"").append(escapeJson(items.get(i))).append("\"");
+    }
+    sb.append("]");
     return sb.toString();
   }
 

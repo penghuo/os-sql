@@ -52,6 +52,8 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.dqe.common.config.DqeSettings;
+import org.opensearch.sql.dqe.coordinator.fragment.PlanFragment;
+import org.opensearch.sql.dqe.coordinator.fragment.PlanFragmenter;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
@@ -166,10 +168,21 @@ class TransportTrinoSqlActionTest {
     assertNotNull(response);
     String result = response.getResult();
     assertNotNull(result);
-    assertTrue(result.contains("plan"), "Explain result should contain 'plan'");
-    assertTrue(result.contains("TableScanNode"), "Explain result should describe TableScanNode");
-    assertTrue(result.contains("ProjectNode"), "Explain result should describe ProjectNode");
-    assertTrue(result.contains("logs"), "Explain result should mention index name");
+
+    // Parse as structured JSON
+    Map<String, Object> parsed = MAPPER.readValue(result, new TypeReference<>() {});
+    assertTrue(parsed.containsKey("logical_plan"), "Should have logical_plan");
+    assertTrue(parsed.containsKey("optimized_plan"), "Should have optimized_plan");
+    assertTrue(parsed.containsKey("fragments"), "Should have fragments");
+    assertTrue(parsed.containsKey("coordinator_plan"), "Should have coordinator_plan");
+
+    // Verify plan node types are present
+    assertTrue(result.contains("TableScanNode"), "Should contain TableScanNode");
+    assertTrue(result.contains("logs"), "Should mention index name");
+
+    // Verify fragments have shard details
+    List<Map<String, Object>> frags = (List<Map<String, Object>>) parsed.get("fragments");
+    assertEquals(2, frags.size(), "Should have 2 fragments (2 shards)");
 
     // Verify no transport dispatch happened in explain mode
     verify(transportService, times(0)).sendRequest(any(), any(String.class), any(), any());
@@ -241,18 +254,34 @@ class TransportTrinoSqlActionTest {
   }
 
   @Test
-  @DisplayName("formatExplain produces JSON with plan key")
+  @DisplayName("formatExplain produces structured JSON with all plan stages")
   void formatExplainProducesJson() throws Exception {
     TableScanNode scan = new TableScanNode("logs", List.of("a", "b"));
     ProjectNode project = new ProjectNode(scan, List.of("a"));
 
-    String explain = TransportTrinoSqlAction.formatExplain(project);
+    // Create a simple fragment result for testing
+    PlanFragmenter.FragmentResult fragments =
+        new PlanFragmenter.FragmentResult(
+            List.of(new PlanFragment(project, "logs", 0, "node-0")), null);
+
+    String explain = TransportTrinoSqlAction.formatExplain(project, project, fragments);
     Map<String, Object> parsed = MAPPER.readValue(explain, new TypeReference<>() {});
 
-    assertTrue(parsed.containsKey("plan"));
-    String planStr = (String) parsed.get("plan");
-    assertTrue(planStr.contains("ProjectNode"));
-    assertTrue(planStr.contains("TableScanNode"));
+    // Should have all four sections
+    assertTrue(parsed.containsKey("logical_plan"), "missing logical_plan");
+    assertTrue(parsed.containsKey("optimized_plan"), "missing optimized_plan");
+    assertTrue(parsed.containsKey("fragments"), "missing fragments");
+    assertTrue(parsed.containsKey("coordinator_plan"), "missing coordinator_plan");
+
+    // Logical plan should be a structured object with node type
+    Map<String, Object> logicalPlan = (Map<String, Object>) parsed.get("logical_plan");
+    assertEquals("ProjectNode", logicalPlan.get("node"));
+
+    // Fragments should have shard details
+    List<Map<String, Object>> frags = (List<Map<String, Object>>) parsed.get("fragments");
+    assertEquals(1, frags.size());
+    assertEquals(0, frags.get(0).get("shard_id"));
+    assertEquals("node-0", frags.get(0).get("node_id"));
   }
 
   @Test

@@ -12,7 +12,8 @@
         "name": "negated",
         "type": "INTEGER"
       }
-    ]
+    ],
+    "expected_row_count": 5
   },
   "ignore_order": true
 }

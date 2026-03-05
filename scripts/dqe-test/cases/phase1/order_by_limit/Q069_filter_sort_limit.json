@@ -12,6 +12,7 @@
         "name": "status",
         "type": "VARCHAR"
       }
-    ]
+    ],
+    "expected_min_row_count": 1
   }
 }

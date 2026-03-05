@@ -8,7 +8,8 @@
         "name": "_col0",
         "type": "VARCHAR"
       }
-    ]
+    ],
+    "expected_row_count": 5
   },
   "ignore_order": true
 }

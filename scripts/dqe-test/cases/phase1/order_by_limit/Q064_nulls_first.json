@@ -12,6 +12,7 @@
         "name": "int_val",
         "type": "INTEGER"
       }
-    ]
+    ],
+    "expected_row_count": 10
   }
 }

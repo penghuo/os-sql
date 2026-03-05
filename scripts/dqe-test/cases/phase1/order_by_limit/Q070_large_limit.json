@@ -8,6 +8,7 @@
         "name": "id",
         "type": "VARCHAR"
       }
-    ]
+    ],
+    "expected_row_count": 1000
   }
 }

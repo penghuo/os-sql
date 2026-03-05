@@ -154,6 +154,12 @@ def validate_test_case(url: str, test_case: dict) -> tuple:
             return False, [f"Expected error but got success response"]
         error_resp = result["error"]
         errs = []
+        # Verify error response came from DQE engine when engine field is present
+        actual_engine = result.get("engine")
+        if actual_engine is not None and actual_engine != "dqe":
+            errs.append(
+                f"Error response engine mismatch: expected 'dqe', got '{actual_engine}'"
+            )
         if "error_code" in expected_error:
             actual_code = error_resp.get("type", error_resp.get("error_code", ""))
             if expected_error["error_code"] not in str(actual_code):
@@ -161,16 +167,29 @@ def validate_test_case(url: str, test_case: dict) -> tuple:
                     f"Error code mismatch: expected '{expected_error['error_code']}', got '{actual_code}'"
                 )
         if "message_contains" in expected_error:
-            actual_msg = str(error_resp.get("reason", error_resp.get("message", "")))
-            if expected_error["message_contains"] not in actual_msg:
+            # Check both 'reason' and 'details' fields for the expected substring,
+            # since the error message may appear in either field depending on the formatter
+            actual_reason = str(error_resp.get("reason", ""))
+            actual_details = str(error_resp.get("details", ""))
+            expected_substr = expected_error["message_contains"]
+            if expected_substr not in actual_reason and expected_substr not in actual_details:
                 errs.append(
-                    f"Error message does not contain '{expected_error['message_contains']}': got '{actual_msg}'"
+                    f"Error message does not contain '{expected_substr}': "
+                    f"reason='{actual_reason}', details='{actual_details}'"
                 )
         return len(errs) == 0, errs
 
     # Compare successful results
     expected = test_case.get("expected", {})
     errors = []
+
+    # Verify response came from DQE engine (not legacy fallback)
+    actual_engine = result.get("engine")
+    if actual_engine != "dqe":
+        errors.append(
+            f"Response engine mismatch: expected 'dqe', got '{actual_engine}'. "
+            f"Query may have fallen back to legacy engine."
+        )
 
     if "schema" in expected and "schema" in result:
         errors.extend(compare_schema(expected["schema"], result["schema"]))
@@ -180,6 +199,26 @@ def validate_test_case(url: str, test_case: dict) -> tuple:
         errors.extend(
             compare_data(expected["data"], actual_data, ignore_order, float_tolerance)
         )
+
+    # Check expected_row_count (lightweight assertion that real data is returned)
+    if "expected_row_count" in expected:
+        actual_data = result.get("datarows", result.get("data", []))
+        expected_count = expected["expected_row_count"]
+        actual_count = len(actual_data)
+        if actual_count != expected_count:
+            errors.append(
+                f"Row count mismatch: expected {expected_count}, got {actual_count}"
+            )
+
+    # Check expected_min_row_count (at least N rows returned)
+    if "expected_min_row_count" in expected:
+        actual_data = result.get("datarows", result.get("data", []))
+        min_count = expected["expected_min_row_count"]
+        actual_count = len(actual_data)
+        if actual_count < min_count:
+            errors.append(
+                f"Row count too low: expected at least {min_count}, got {actual_count}"
+            )
 
     return len(errors) == 0, errors
 

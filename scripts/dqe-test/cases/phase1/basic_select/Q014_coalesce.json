@@ -12,7 +12,8 @@
         "name": "_col1",
         "type": "VARCHAR"
       }
-    ]
+    ],
+    "expected_row_count": 10
   },
   "ignore_order": true
 }

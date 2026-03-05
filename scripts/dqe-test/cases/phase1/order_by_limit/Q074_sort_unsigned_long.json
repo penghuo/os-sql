@@ -12,6 +12,7 @@
         "name": "big_number",
         "type": "DECIMAL"
       }
-    ]
+    ],
+    "expected_row_count": 5
   }
 }

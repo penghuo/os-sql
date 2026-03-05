@@ -16,6 +16,7 @@
         "name": "count_int",
         "type": "INTEGER"
       }
-    ]
+    ],
+    "expected_row_count": 10
   }
 }

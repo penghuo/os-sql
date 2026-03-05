@@ -12,7 +12,8 @@
         "name": "status_code",
         "type": "INTEGER"
       }
-    ]
+    ],
+    "expected_row_count": 10
   },
   "ignore_order": true
 }

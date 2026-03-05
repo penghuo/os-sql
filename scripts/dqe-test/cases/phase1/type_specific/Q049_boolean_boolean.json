@@ -8,7 +8,8 @@
         "name": "is_active",
         "type": "BOOLEAN"
       }
-    ]
+    ],
+    "expected_min_row_count": 1
   },
   "ignore_order": true
 }

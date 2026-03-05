@@ -12,7 +12,8 @@
         "name": "val",
         "type": "INTEGER"
       }
-    ]
+    ],
+    "expected_row_count": 10
   },
   "ignore_order": true
 }

@@ -12,7 +12,8 @@
         "name": "lon",
         "type": "DOUBLE"
       }
-    ]
+    ],
+    "expected_min_row_count": 1
   },
   "ignore_order": true,
   "float_tolerance": 0.0001

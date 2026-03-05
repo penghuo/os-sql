@@ -8,7 +8,8 @@
         "name": "price_scaled",
         "type": "DECIMAL"
       }
-    ]
+    ],
+    "expected_min_row_count": 1
   },
   "ignore_order": true,
   "float_tolerance": 0.01

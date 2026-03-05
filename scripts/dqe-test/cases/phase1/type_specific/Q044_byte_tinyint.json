@@ -8,7 +8,8 @@
         "name": "count_byte",
         "type": "TINYINT"
       }
-    ]
+    ],
+    "expected_min_row_count": 1
   },
   "ignore_order": true
 }

@@ -12,7 +12,8 @@
         "name": "price_scaled",
         "type": "DECIMAL"
       }
-    ]
+    ],
+    "expected_row_count": 5
   },
   "float_tolerance": 0.01
 }

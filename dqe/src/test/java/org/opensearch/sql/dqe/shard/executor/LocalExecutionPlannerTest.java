@@ -120,6 +120,61 @@ class LocalExecutionPlannerTest {
   }
 
   @Test
+  @DisplayName("Filter with greater-than comparison")
+  void filterWithGreaterThan() {
+    TableScanNode scan = new TableScanNode("logs", List.of("status"));
+    FilterNode filter = new FilterNode(scan, "status > 200");
+    // Source: 100, 200, 300, 500
+    Page testPage = TestPageSource.buildBigintPageWithValues(100L, 200L, 300L, 500L);
+    LocalExecutionPlanner planner =
+        new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)));
+
+    Operator result = filter.accept(planner, null);
+    Page page = result.processNextBatch();
+    assertNotNull(page);
+    assertEquals(2, page.getPositionCount());
+    assertEquals(300L, BigintType.BIGINT.getLong(page.getBlock(0), 0));
+    assertEquals(500L, BigintType.BIGINT.getLong(page.getBlock(0), 1));
+  }
+
+  @Test
+  @DisplayName("Filter with AND compound predicate")
+  void filterWithAnd() {
+    TableScanNode scan = new TableScanNode("logs", List.of("status"));
+    FilterNode filter = new FilterNode(scan, "status > 200 AND status < 500");
+    // Source: 100, 200, 300, 500
+    Page testPage = TestPageSource.buildBigintPageWithValues(100L, 200L, 300L, 500L);
+    LocalExecutionPlanner planner =
+        new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)));
+
+    Operator result = filter.accept(planner, null);
+    Page page = result.processNextBatch();
+    assertNotNull(page);
+    assertEquals(1, page.getPositionCount());
+    assertEquals(300L, BigintType.BIGINT.getLong(page.getBlock(0), 0));
+  }
+
+  @Test
+  @DisplayName("Filter with string equality on VARCHAR column")
+  void filterWithStringEquality() {
+    TableScanNode scan = new TableScanNode("logs", List.of("category", "status"));
+    FilterNode filter = new FilterNode(scan, "category = 'error'");
+    // Source: ("error", 500), ("info", 200), ("error", 503)
+    Page testPage = buildCategoryValuePage("error", 500L, "info", 200L, "error", 503L);
+    Map<String, Type> typeMap =
+        Map.of(
+            "category", VarcharType.VARCHAR,
+            "status", BigintType.BIGINT);
+    LocalExecutionPlanner planner =
+        new LocalExecutionPlanner(node -> new TestPageSource(List.of(testPage)), typeMap);
+
+    Operator result = filter.accept(planner, null);
+    Page page = result.processNextBatch();
+    assertNotNull(page);
+    assertEquals(2, page.getPositionCount());
+  }
+
+  @Test
   @DisplayName("Sort(TableScan) produces SortOperator")
   void sortNodeProducesSortOperator() {
     TableScanNode scan = new TableScanNode("logs", List.of("a"));

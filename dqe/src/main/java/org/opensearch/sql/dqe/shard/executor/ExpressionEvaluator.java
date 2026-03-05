@@ -98,7 +98,7 @@ public class ExpressionEvaluator {
     if (page.getBlock(colIdx).isNull(position)) {
       return null;
     }
-    Type type = columnTypeMap.get(name);
+    Type type = columnTypeMap.getOrDefault(name, BigintType.BIGINT);
     if (type instanceof BigintType) {
       return BigintType.BIGINT.getLong(page.getBlock(colIdx), position);
     } else if (type instanceof DoubleType) {

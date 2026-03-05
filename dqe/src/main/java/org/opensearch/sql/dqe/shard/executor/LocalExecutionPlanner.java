@@ -8,8 +8,10 @@ package org.opensearch.sql.dqe.shard.executor;
 import io.trino.spi.Page;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.Type;
+import io.trino.sql.tree.Expression;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
@@ -31,6 +33,7 @@ import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.SortNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
+import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 
 /**
  * Converts a {@link DqePlanNode} tree into an {@link Operator} pipeline. Each plan node type maps
@@ -45,10 +48,6 @@ import org.opensearch.sql.dqe.planner.plan.TableScanNode;
  * directly in tests.
  */
 public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
-
-  /** Pattern for simple equality predicates like "column = value". */
-  private static final Pattern EQUALITY_PREDICATE =
-      Pattern.compile("^\\s*(\\w+)\\s*=\\s*(.+)\\s*$");
 
   /** Pattern for aggregate function expressions like "COUNT(*)", "SUM(column)". */
   private static final Pattern AGG_FUNCTION =
@@ -107,9 +106,20 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
   public Operator visitFilter(FilterNode node, Void context) {
     Operator child = node.getChild().accept(this, context);
     List<String> inputColumns = resolveInputColumns(node.getChild());
-    BiFunction<Page, Integer, Boolean> predicate =
-        buildPredicate(node.getPredicateString(), inputColumns);
-    return new FilterOperator(child, predicate);
+
+    // Build column index map for the evaluator
+    Map<String, Integer> columnIndexMap = new HashMap<>();
+    for (int i = 0; i < inputColumns.size(); i++) {
+      columnIndexMap.put(inputColumns.get(i), i);
+    }
+
+    // Parse predicate string back into Trino Expression AST and build evaluator
+    DqeSqlParser parser = new DqeSqlParser();
+    Expression predicate = parser.parseExpression(node.getPredicateString());
+    ExpressionEvaluator evaluator = new ExpressionEvaluator(columnIndexMap, columnTypeMap);
+    BiFunction<Page, Integer, Boolean> predicateFn =
+        (page, pos) -> evaluator.evaluateAsBoolean(predicate, page, pos);
+    return new FilterOperator(child, predicateFn);
   }
 
   @Override
@@ -166,38 +176,6 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
       return output;
     }
     throw new IllegalArgumentException("Unknown plan node type: " + node.getClass().getName());
-  }
-
-  /**
-   * Build a predicate function from a simple predicate string. Currently supports equality
-   * predicates of the form "column = value" where the value is a long integer. Handles surrounding
-   * parentheses that the Trino AST toString() may produce.
-   */
-  private BiFunction<Page, Integer, Boolean> buildPredicate(
-      String predicateString, List<String> columns) {
-    // Strip surrounding parentheses produced by Trino's Expression.toString()
-    String normalized = predicateString.trim();
-    while (normalized.startsWith("(") && normalized.endsWith(")")) {
-      normalized = normalized.substring(1, normalized.length() - 1).trim();
-    }
-    Matcher matcher = EQUALITY_PREDICATE.matcher(normalized);
-    if (!matcher.matches()) {
-      throw new UnsupportedOperationException(
-          "Unsupported predicate expression: " + predicateString);
-    }
-    String columnName = matcher.group(1);
-    String valueStr = matcher.group(2).trim();
-
-    int colIdx = resolveColumnIndex(columnName, columns);
-
-    // MVP: parse as long equality
-    long targetValue = Long.parseLong(valueStr);
-    return (page, pos) -> {
-      if (page.getBlock(colIdx).isNull(pos)) {
-        return false;
-      }
-      return BigintType.BIGINT.getLong(page.getBlock(colIdx), pos) == targetValue;
-    };
   }
 
   /**

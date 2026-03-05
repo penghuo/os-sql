@@ -5,6 +5,9 @@
 
 package org.opensearch.sql.dqe.planner.optimizer;
 
+import io.trino.sql.tree.DefaultTraversalVisitor;
+import io.trino.sql.tree.Expression;
+import io.trino.sql.tree.Identifier;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -19,6 +22,7 @@ import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.SortNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
+import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 
 /**
  * Optimizes a logical plan by applying rules in sequence: predicate pushdown, projection pruning,
@@ -251,11 +255,27 @@ public class PlanOptimizer {
       return node;
     }
 
-    /** Extract column references from a simple predicate string like "status = 200". */
+    /**
+     * Extract column references from a predicate string by parsing it into a Trino Expression AST
+     * and collecting all Identifier nodes.
+     */
     private void extractPredicateColumnRefs(String predicateString, Set<String> columns) {
-      Matcher matcher = EQUALITY_PREDICATE.matcher(predicateString);
-      if (matcher.matches()) {
-        columns.add(matcher.group(1));
+      try {
+        DqeSqlParser parser = new DqeSqlParser();
+        Expression expr = parser.parseExpression(predicateString);
+        new DefaultTraversalVisitor<Void>() {
+          @Override
+          protected Void visitIdentifier(Identifier node, Void context) {
+            columns.add(node.getValue());
+            return null;
+          }
+        }.process(expr, null);
+      } catch (Exception e) {
+        // Fallback: if parsing fails, use the old regex approach
+        Matcher matcher = EQUALITY_PREDICATE.matcher(predicateString);
+        if (matcher.matches()) {
+          columns.add(matcher.group(1));
+        }
       }
     }
 

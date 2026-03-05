@@ -103,6 +103,42 @@ class DqeEndToEndTest {
     assertEquals(2, totalRows);
   }
 
+  @Test
+  @DisplayName("SELECT with complex WHERE predicate through full pipeline")
+  void selectWithComplexWhere() {
+    DqeSqlParser parser = new DqeSqlParser();
+    Statement stmt = parser.parse("SELECT category, status FROM logs WHERE status > 200");
+
+    DqePlanNode plan = LogicalPlanner.plan(stmt, this::mockTableInfo2);
+    assertNotNull(plan);
+
+    Function<TableScanNode, Operator> scanFactory =
+        node -> {
+          List<ColumnHandle> cols =
+              List.of(
+                  new ColumnHandle("category", VarcharType.VARCHAR),
+                  new ColumnHandle("status", BigintType.BIGINT));
+          List<Map<String, Object>> rows =
+              List.of(
+                  Map.of("category", "error", "status", 500),
+                  Map.of("category", "info", "status", 200),
+                  Map.of("category", "warn", "status", 400));
+          return new TestPageSource(List.of(PageBuilder.build(cols, rows)));
+        };
+
+    Map<String, Type> typeMap =
+        Map.of(
+            "category", VarcharType.VARCHAR,
+            "status", BigintType.BIGINT);
+    LocalExecutionPlanner execPlanner = new LocalExecutionPlanner(scanFactory, typeMap);
+    Operator pipeline = plan.accept(execPlanner, null);
+
+    List<Page> results = TestPageSource.drainOperator(pipeline);
+    int totalRows = results.stream().mapToInt(Page::getPositionCount).sum();
+    // status > 200: error/500, warn/400 = 2 rows
+    assertEquals(2, totalRows);
+  }
+
   private TableInfo mockTableInfo(String indexName) {
     return new TableInfo(indexName, List.of(new ColumnInfo("a", "keyword", VarcharType.VARCHAR)));
   }

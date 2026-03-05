@@ -1,0 +1,21 @@
+{
+  "id": "Q3",
+  "name": "GROUP BY with COUNT aggregate",
+  "endpoint": "/_plugins/_trino_sql",
+  "query": "SELECT category, COUNT(*) FROM dqe_test_logs GROUP BY category",
+  "expected": {
+    "status": 200,
+    "schema": [
+      {"name": "category",  "type": "keyword"},
+      {"name": "COUNT(*)",  "type": "long"}
+    ],
+    "datarows": [
+      ["debug", 1],
+      ["error", 3],
+      ["info",  3],
+      ["warn",  3]
+    ],
+    "total": 4
+  },
+  "sort_before_compare": [0]
+}

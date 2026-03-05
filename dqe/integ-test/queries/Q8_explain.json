@@ -1,0 +1,10 @@
+{
+  "id": "Q8",
+  "name": "EXPLAIN shows optimized plan",
+  "endpoint": "/_plugins/_trino_sql/_explain",
+  "query": "SELECT category FROM dqe_test_logs WHERE status = 200",
+  "expected": {
+    "contains": ["TableScanNode", "dqe_test_logs", "dslFilter"]
+  },
+  "note": "Explain should show TableScanNode with dslFilter (predicate pushed down to DSL)."
+}

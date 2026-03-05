@@ -1,259 +1,257 @@
 #!/usr/bin/env bash
 #
-# DQE Phase 1 Integration Test
+# DQE Phase 1 Integration Test Runner
 #
-# Runs against a live OpenSearch cluster with the SQL plugin installed.
-# Tests the /_plugins/_trino_sql REST endpoint end-to-end.
+# Tests /_plugins/_trino_sql against a live OpenSearch cluster.
+# Reads test data from data/, queries from queries/, writes report to reports/.
 #
 # Usage:
 #   ./run-tests.sh                          # defaults to http://localhost:9200
-#   ./run-tests.sh http://my-cluster:9200   # custom endpoint
+#   ./run-tests.sh http://my-cluster:9200
 #
-# Prerequisites:
-#   - OpenSearch running with opensearch-sql plugin (including dqe module)
-#   - curl and jq installed
+# Prerequisites: curl, jq, bc
 #
 set -euo pipefail
 
 OPENSEARCH_URL="${1:-http://localhost:9200}"
-DQE_ENDPOINT="${OPENSEARCH_URL}/_plugins/_trino_sql"
-EXPLAIN_ENDPOINT="${OPENSEARCH_URL}/_plugins/_trino_sql/_explain"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-QUERIES_FILE="${SCRIPT_DIR}/queries.json"
+DATA_DIR="${SCRIPT_DIR}/data"
+QUERIES_DIR="${SCRIPT_DIR}/queries"
+REPORTS_DIR="${SCRIPT_DIR}/reports"
+REPORT_FILE="${REPORTS_DIR}/report-$(date +%Y%m%d-%H%M%S).txt"
 
 PASS=0
 FAIL=0
-ERRORS=""
+TOTAL=0
+RESULTS=()
 
 # Colors (disabled if not a terminal)
 if [ -t 1 ]; then
-  GREEN='\033[0;32m'
-  RED='\033[0;31m'
-  YELLOW='\033[0;33m'
-  NC='\033[0m'
+  GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\033[0m'
 else
-  GREEN='' RED='' YELLOW='' NC=''
+  GREEN='' RED='' YELLOW='' BOLD='' NC=''
 fi
 
-log_pass() { echo -e "${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); }
-log_fail() { echo -e "${RED}FAIL${NC}: $1 — $2"; FAIL=$((FAIL + 1)); ERRORS="${ERRORS}\n  - $1: $2"; }
-log_info() { echo -e "${YELLOW}INFO${NC}: $1"; }
+log_pass() { echo -e "  ${GREEN}PASS${NC}  $1"; }
+log_fail() { echo -e "  ${RED}FAIL${NC}  $1"; echo "        $2"; }
+log_info() { echo -e "${YELLOW}>>>${NC} $1"; }
 
-# --- Preflight ---
+record() {
+  local id="$1" name="$2" status="$3" detail="${4:-}"
+  RESULTS+=("${id}|${status}|${name}|${detail}")
+  TOTAL=$((TOTAL + 1))
+  if [ "${status}" = "PASS" ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+}
 
-log_info "Testing against: ${OPENSEARCH_URL}"
+# =====================================================================
+# Preflight
+# =====================================================================
 
-# Check cluster is reachable
+log_info "DQE Phase 1 Integration Tests"
+log_info "Cluster: ${OPENSEARCH_URL}"
+echo ""
+
 if ! curl -sf "${OPENSEARCH_URL}/_cluster/health" > /dev/null 2>&1; then
   echo "ERROR: Cannot reach OpenSearch at ${OPENSEARCH_URL}"
-  echo "Start OpenSearch with the SQL plugin before running this test."
   exit 1
 fi
+log_info "Cluster reachable"
 
-log_info "Cluster is reachable"
+# =====================================================================
+# Setup: Load test data from data/
+# =====================================================================
 
-# --- Setup: Create index and load test data ---
+for DATA_FILE in "${DATA_DIR}"/*.json; do
+  INDEX_NAME=$(jq -r '.index' "${DATA_FILE}")
+  log_info "Setting up index: ${INDEX_NAME}"
 
-INDEX_NAME="dqe_test_logs"
+  # Delete if exists
+  curl -sf -X DELETE "${OPENSEARCH_URL}/${INDEX_NAME}" > /dev/null 2>&1 || true
 
-# Delete index if it exists (clean slate)
-curl -sf -X DELETE "${OPENSEARCH_URL}/${INDEX_NAME}" > /dev/null 2>&1 || true
+  # Create with mapping
+  BODY=$(jq -c '{settings: .settings, mappings: {properties: .mapping.properties}}' "${DATA_FILE}")
+  curl -sf -X PUT "${OPENSEARCH_URL}/${INDEX_NAME}" \
+    -H "Content-Type: application/json" -d "${BODY}" > /dev/null
 
-# Create index with mapping
-log_info "Creating index ${INDEX_NAME} (2 shards)..."
-MAPPING=$(jq -c '{
-  settings: .setup.settings,
-  mappings: { properties: .setup.mapping.properties }
-}' "${QUERIES_FILE}")
+  # Bulk index documents
+  BULK=""
+  DOC_COUNT=$(jq '.documents | length' "${DATA_FILE}")
+  for i in $(seq 0 $((DOC_COUNT - 1))); do
+    DOC_ID=$(jq -r ".documents[$i]._id" "${DATA_FILE}")
+    DOC=$(jq -c ".documents[$i] | del(._id)" "${DATA_FILE}")
+    BULK="${BULK}{\"index\":{\"_id\":\"${DOC_ID}\"}}\n${DOC}\n"
+  done
+  echo -e "${BULK}" | curl -sf -X POST "${OPENSEARCH_URL}/${INDEX_NAME}/_bulk?refresh=wait_for" \
+    -H "Content-Type: application/x-ndjson" --data-binary @- > /dev/null
 
-CREATE_RESPONSE=$(curl -sf -X PUT "${OPENSEARCH_URL}/${INDEX_NAME}" \
-  -H "Content-Type: application/json" \
-  -d "${MAPPING}" 2>&1) || {
-  echo "ERROR: Failed to create index: ${CREATE_RESPONSE}"
-  exit 1
-}
-
-# Bulk-index test data
-log_info "Loading test data..."
-BULK_BODY=""
-DATA_COUNT=$(jq '.setup.data | length' "${QUERIES_FILE}")
-for i in $(seq 0 $((DATA_COUNT - 1))); do
-  DOC=$(jq -c ".setup.data[$i]" "${QUERIES_FILE}")
-  BULK_BODY="${BULK_BODY}{\"index\":{\"_id\":\"${i}\"}}\n${DOC}\n"
+  ACTUAL_COUNT=$(curl -sf "${OPENSEARCH_URL}/${INDEX_NAME}/_count" | jq '.count')
+  log_info "Indexed ${ACTUAL_COUNT}/${DOC_COUNT} documents"
 done
 
-echo -e "${BULK_BODY}" | curl -sf -X POST "${OPENSEARCH_URL}/${INDEX_NAME}/_bulk?refresh=wait_for" \
-  -H "Content-Type: application/x-ndjson" \
-  --data-binary @- > /dev/null 2>&1 || {
-  echo "ERROR: Failed to bulk-index test data"
-  exit 1
-}
-
-# Verify data loaded
-DOC_COUNT=$(curl -sf "${OPENSEARCH_URL}/${INDEX_NAME}/_count" | jq '.count')
-log_info "Indexed ${DOC_COUNT} documents into ${INDEX_NAME}"
-
-if [ "${DOC_COUNT}" != "${DATA_COUNT}" ]; then
-  echo "ERROR: Expected ${DATA_COUNT} documents, got ${DOC_COUNT}"
-  exit 1
-fi
-
-# --- Run Tests ---
+# =====================================================================
+# Run queries
+# =====================================================================
 
 echo ""
-log_info "Running Phase 1 DQE tests..."
-echo "---"
+log_info "Running queries..."
+echo ""
 
-TEST_COUNT=$(jq '.tests | length' "${QUERIES_FILE}")
-for i in $(seq 0 $((TEST_COUNT - 1))); do
-  TEST_NAME=$(jq -r ".tests[$i].name" "${QUERIES_FILE}")
-  QUERY=$(jq -r ".tests[$i].query" "${QUERIES_FILE}")
-  ENDPOINT=$(jq -r ".tests[$i].endpoint // \"/_plugins/_trino_sql\"" "${QUERIES_FILE}")
+for QUERY_FILE in "${QUERIES_DIR}"/Q*.json; do
+  QID=$(jq -r '.id' "${QUERY_FILE}")
+  QNAME=$(jq -r '.name' "${QUERY_FILE}")
+  QUERY=$(jq -r '.query' "${QUERY_FILE}")
+  ENDPOINT=$(jq -r '.endpoint' "${QUERY_FILE}")
   FULL_URL="${OPENSEARCH_URL}${ENDPOINT}"
 
-  # Execute query
+  # Execute
   RESPONSE=$(curl -sf -X POST "${FULL_URL}" \
     -H "Content-Type: application/json" \
     -d "{\"query\": \"${QUERY}\"}" 2>&1) || {
-    log_fail "${TEST_NAME}" "HTTP request failed: ${RESPONSE}"
+    log_fail "${QID}: ${QNAME}" "HTTP request failed"
+    record "${QID}" "${QNAME}" "FAIL" "HTTP request failed"
     continue
   }
 
-  # Parse assertions
-  ASSERTS=$(jq -c ".tests[$i].assert" "${QUERIES_FILE}")
+  EXPECTED=$(jq -c '.expected' "${QUERY_FILE}")
+  FAILED=""
 
-  # Assert: status
-  EXPECTED_STATUS=$(echo "${ASSERTS}" | jq -r '.status // empty')
-  if [ -n "${EXPECTED_STATUS}" ]; then
-    ACTUAL_STATUS=$(echo "${RESPONSE}" | jq -r '.status // empty')
-    if [ "${ACTUAL_STATUS}" != "${EXPECTED_STATUS}" ]; then
-      log_fail "${TEST_NAME}" "status: expected ${EXPECTED_STATUS}, got ${ACTUAL_STATUS}"
-      continue
-    fi
-  fi
-
-  # Assert: total row count
-  EXPECTED_TOTAL=$(echo "${ASSERTS}" | jq -r '.total // empty')
-  if [ -n "${EXPECTED_TOTAL}" ]; then
-    ACTUAL_TOTAL=$(echo "${RESPONSE}" | jq -r '.total // empty')
-    if [ "${ACTUAL_TOTAL}" != "${EXPECTED_TOTAL}" ]; then
-      log_fail "${TEST_NAME}" "total: expected ${EXPECTED_TOTAL}, got ${ACTUAL_TOTAL}"
-      continue
-    fi
-  fi
-
-  # Assert: schema length
-  EXPECTED_SCHEMA_LEN=$(echo "${ASSERTS}" | jq -r '.schema_length // empty')
-  if [ -n "${EXPECTED_SCHEMA_LEN}" ]; then
-    ACTUAL_SCHEMA_LEN=$(echo "${RESPONSE}" | jq '.schema | length')
-    if [ "${ACTUAL_SCHEMA_LEN}" != "${EXPECTED_SCHEMA_LEN}" ]; then
-      log_fail "${TEST_NAME}" "schema length: expected ${EXPECTED_SCHEMA_LEN}, got ${ACTUAL_SCHEMA_LEN}"
-      continue
-    fi
-  fi
-
-  # Assert: schema column names
-  EXPECTED_NAMES=$(echo "${ASSERTS}" | jq -c '.schema_names // empty')
-  if [ "${EXPECTED_NAMES}" != "" ] && [ "${EXPECTED_NAMES}" != "null" ]; then
-    ACTUAL_NAMES=$(echo "${RESPONSE}" | jq -c '[.schema[].name]')
-    if [ "${ACTUAL_NAMES}" != "${EXPECTED_NAMES}" ]; then
-      log_fail "${TEST_NAME}" "schema names: expected ${EXPECTED_NAMES}, got ${ACTUAL_NAMES}"
-      continue
-    fi
-  fi
-
-  # Assert: all rows in a column match a value
-  ALL_MATCH_COL=$(echo "${ASSERTS}" | jq -r '.all_rows_match.column_index // empty')
-  if [ -n "${ALL_MATCH_COL}" ]; then
-    EXPECTED_VAL=$(echo "${ASSERTS}" | jq -r '.all_rows_match.value')
-    BAD_ROWS=$(echo "${RESPONSE}" | jq "[.datarows[] | select(.[${ALL_MATCH_COL}] != ${EXPECTED_VAL})] | length")
-    if [ "${BAD_ROWS}" != "0" ]; then
-      log_fail "${TEST_NAME}" "${BAD_ROWS} rows have column[${ALL_MATCH_COL}] != ${EXPECTED_VAL}"
-      continue
-    fi
-  fi
-
-  # Assert: sum of COUNT column equals expected
-  EXPECTED_COUNT_SUM=$(echo "${ASSERTS}" | jq -r '.total_count_sum // empty')
-  if [ -n "${EXPECTED_COUNT_SUM}" ]; then
-    ACTUAL_SUM=$(echo "${RESPONSE}" | jq '[.datarows[][1]] | add')
-    if [ "${ACTUAL_SUM}" != "${EXPECTED_COUNT_SUM}" ]; then
-      log_fail "${TEST_NAME}" "count sum: expected ${EXPECTED_COUNT_SUM}, got ${ACTUAL_SUM}"
-      continue
-    fi
-  fi
-
-  # Assert: minimum number of rows
-  EXPECTED_MIN_ROWS=$(echo "${ASSERTS}" | jq -r '.min_rows // empty')
-  if [ -n "${EXPECTED_MIN_ROWS}" ]; then
-    ACTUAL_ROWS=$(echo "${RESPONSE}" | jq '.datarows | length')
-    if [ "${ACTUAL_ROWS}" -lt "${EXPECTED_MIN_ROWS}" ]; then
-      log_fail "${TEST_NAME}" "min rows: expected >= ${EXPECTED_MIN_ROWS}, got ${ACTUAL_ROWS}"
-      continue
-    fi
-  fi
-
-  # Assert: descending order on a column
-  DESC_COL=$(echo "${ASSERTS}" | jq -r '.descending_column_index // empty')
-  if [ -n "${DESC_COL}" ]; then
-    # Check each consecutive pair is non-increasing
-    ROW_COUNT=$(echo "${RESPONSE}" | jq '.datarows | length')
-    SORTED=true
-    for j in $(seq 0 $((ROW_COUNT - 2))); do
-      CURR=$(echo "${RESPONSE}" | jq ".datarows[$j][${DESC_COL}]")
-      NEXT=$(echo "${RESPONSE}" | jq ".datarows[$((j + 1))][${DESC_COL}]")
-      if [ "$(echo "${CURR} < ${NEXT}" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-        SORTED=false
+  # --- Assert: contains (for EXPLAIN) ---
+  CONTAINS=$(echo "${EXPECTED}" | jq -c '.contains // empty')
+  if [ -n "${CONTAINS}" ] && [ "${CONTAINS}" != "null" ]; then
+    for STR in $(echo "${CONTAINS}" | jq -r '.[]'); do
+      if ! echo "${RESPONSE}" | grep -q "${STR}"; then
+        FAILED="Response missing '${STR}'"
         break
       fi
     done
-    if [ "${SORTED}" != "true" ]; then
-      log_fail "${TEST_NAME}" "column[${DESC_COL}] is not in descending order"
-      continue
+    if [ -z "${FAILED}" ]; then
+      log_pass "${QID}: ${QNAME}"
+      record "${QID}" "${QNAME}" "PASS"
+    else
+      log_fail "${QID}: ${QNAME}" "${FAILED}"
+      record "${QID}" "${QNAME}" "FAIL" "${FAILED}"
+    fi
+    continue
+  fi
+
+  # --- Assert: status ---
+  EXP_STATUS=$(echo "${EXPECTED}" | jq -r '.status')
+  ACT_STATUS=$(echo "${RESPONSE}" | jq -r '.status')
+  if [ "${ACT_STATUS}" != "${EXP_STATUS}" ]; then
+    FAILED="status: expected ${EXP_STATUS}, got ${ACT_STATUS}"
+  fi
+
+  # --- Assert: total ---
+  EXP_TOTAL=$(echo "${EXPECTED}" | jq -r '.total')
+  ACT_TOTAL=$(echo "${RESPONSE}" | jq -r '.total')
+  if [ -z "${FAILED}" ] && [ "${ACT_TOTAL}" != "${EXP_TOTAL}" ]; then
+    FAILED="total: expected ${EXP_TOTAL}, got ${ACT_TOTAL}"
+  fi
+
+  # --- Assert: schema ---
+  EXP_SCHEMA=$(echo "${EXPECTED}" | jq -c '.schema // empty')
+  if [ -z "${FAILED}" ] && [ -n "${EXP_SCHEMA}" ] && [ "${EXP_SCHEMA}" != "null" ]; then
+    ACT_SCHEMA=$(echo "${RESPONSE}" | jq -c '.schema')
+    if [ "${ACT_SCHEMA}" != "${EXP_SCHEMA}" ]; then
+      FAILED="schema mismatch\n        expected: ${EXP_SCHEMA}\n        actual:   ${ACT_SCHEMA}"
     fi
   fi
 
-  # Assert: response contains substrings (for EXPLAIN)
-  CONTAINS=$(echo "${ASSERTS}" | jq -c '.contains // empty')
-  if [ "${CONTAINS}" != "" ] && [ "${CONTAINS}" != "null" ]; then
-    ALL_FOUND=true
-    MISSING=""
-    for k in $(echo "${CONTAINS}" | jq -r '.[]'); do
-      if ! echo "${RESPONSE}" | grep -q "${k}"; then
-        ALL_FOUND=false
-        MISSING="${k}"
-        break
+  # --- Assert: datarows (with optional sort) ---
+  EXP_ROWS=$(echo "${EXPECTED}" | jq -c '.datarows // empty')
+  if [ -z "${FAILED}" ] && [ -n "${EXP_ROWS}" ] && [ "${EXP_ROWS}" != "null" ]; then
+    SORT_COLS=$(jq -c '.sort_before_compare // empty' "${QUERY_FILE}")
+
+    if [ -n "${SORT_COLS}" ] && [ "${SORT_COLS}" != "null" ]; then
+      # Build a jq sort expression from column indices
+      # e.g., [0, 1] -> sort_by(.[0], .[1])
+      SORT_KEYS=$(echo "${SORT_COLS}" | jq -r '[.[] | ".[" + tostring + "]"] | join(", ")')
+      SORT_EXPR="sort_by(${SORT_KEYS})"
+      ACT_SORTED=$(echo "${RESPONSE}" | jq -c ".datarows | ${SORT_EXPR}")
+      EXP_SORTED=$(echo "${EXP_ROWS}" | jq -c "${SORT_EXPR}")
+    else
+      ACT_SORTED=$(echo "${RESPONSE}" | jq -c '.datarows')
+      EXP_SORTED="${EXP_ROWS}"
+    fi
+
+    if [ "${ACT_SORTED}" != "${EXP_SORTED}" ]; then
+      # Show first diff
+      ACT_LEN=$(echo "${ACT_SORTED}" | jq 'length')
+      EXP_LEN=$(echo "${EXP_SORTED}" | jq 'length')
+      if [ "${ACT_LEN}" != "${EXP_LEN}" ]; then
+        FAILED="datarows: expected ${EXP_LEN} rows, got ${ACT_LEN}"
+      else
+        # Find first differing row
+        for r in $(seq 0 $((ACT_LEN - 1))); do
+          ACT_ROW=$(echo "${ACT_SORTED}" | jq -c ".[$r]")
+          EXP_ROW=$(echo "${EXP_SORTED}" | jq -c ".[$r]")
+          if [ "${ACT_ROW}" != "${EXP_ROW}" ]; then
+            FAILED="datarows[${r}] mismatch\n        expected: ${EXP_ROW}\n        actual:   ${ACT_ROW}"
+            break
+          fi
+        done
       fi
-    done
-    if [ "${ALL_FOUND}" != "true" ]; then
-      log_fail "${TEST_NAME}" "response missing expected string: ${MISSING}"
-      continue
     fi
   fi
 
-  log_pass "${TEST_NAME}"
+  if [ -z "${FAILED}" ]; then
+    log_pass "${QID}: ${QNAME}"
+    record "${QID}" "${QNAME}" "PASS"
+  else
+    log_fail "${QID}: ${QNAME}" "${FAILED}"
+    record "${QID}" "${QNAME}" "FAIL" "${FAILED}"
+  fi
 done
 
-# --- Cleanup ---
-
-log_info "Cleaning up..."
-curl -sf -X DELETE "${OPENSEARCH_URL}/${INDEX_NAME}" > /dev/null 2>&1 || true
-
-# --- Summary ---
+# =====================================================================
+# Cleanup
+# =====================================================================
 
 echo ""
-echo "=== DQE Phase 1 Integration Test Results ==="
-echo "  Passed: ${PASS}"
-echo "  Failed: ${FAIL}"
-echo "  Total:  $((PASS + FAIL))"
+log_info "Cleaning up test indices..."
+for DATA_FILE in "${DATA_DIR}"/*.json; do
+  INDEX_NAME=$(jq -r '.index' "${DATA_FILE}")
+  curl -sf -X DELETE "${OPENSEARCH_URL}/${INDEX_NAME}" > /dev/null 2>&1 || true
+done
+
+# =====================================================================
+# Report
+# =====================================================================
+
+mkdir -p "${REPORTS_DIR}"
+
+{
+  echo "============================================"
+  echo "  DQE Phase 1 Integration Test Report"
+  echo "  $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "  Cluster: ${OPENSEARCH_URL}"
+  echo "============================================"
+  echo ""
+  printf "  %-6s %-6s %s\n" "ID" "Result" "Name"
+  printf "  %-6s %-6s %s\n" "------" "------" "----"
+  for ENTRY in "${RESULTS[@]}"; do
+    IFS='|' read -r ID STATUS NAME DETAIL <<< "${ENTRY}"
+    printf "  %-6s %-6s %s\n" "${ID}" "${STATUS}" "${NAME}"
+    if [ -n "${DETAIL}" ]; then
+      echo "               ${DETAIL}"
+    fi
+  done
+  echo ""
+  echo "  Passed: ${PASS}/${TOTAL}"
+  echo "  Failed: ${FAIL}/${TOTAL}"
+  echo ""
+  if [ "${FAIL}" -eq 0 ]; then
+    echo "  ALL TESTS PASSED"
+  else
+    echo "  SOME TESTS FAILED"
+  fi
+  echo "============================================"
+} | tee "${REPORT_FILE}"
+
+echo ""
+log_info "Report saved to: ${REPORT_FILE}"
 
 if [ "${FAIL}" -gt 0 ]; then
-  echo ""
-  echo "Failures:"
-  echo -e "${ERRORS}"
   exit 1
 fi
-
-echo ""
-echo "All tests passed."
 exit 0

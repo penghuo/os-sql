@@ -1,59 +1,77 @@
 # DQE Phase 1 Integration Tests
 
-Standalone REST-based tests for the `/_plugins/_trino_sql` endpoint.
-No Java test framework dependency — just `curl` and `jq`.
+Standalone REST-based tests for `/_plugins/_trino_sql`. No Java framework — just `curl` and `jq`.
 
-## Prerequisites
+## Structure
 
-- OpenSearch cluster running with the `opensearch-sql` plugin (includes DQE module)
-- `curl` and `jq` installed
+```
+dqe/integ-test/
+├── data/                        # Test datasets
+│   └── dqe_test_logs.json       #   Index mapping + 10 documents
+├── queries/                     # Numbered queries with expected results
+│   ├── Q1_simple_select.json
+│   ├── Q2_where_filter.json
+│   ├── Q3_group_by_count.json
+│   ├── Q4_order_by_limit.json
+│   ├── Q5_where_group_by.json
+│   ├── Q6_limit_only.json
+│   ├── Q7_order_by_asc.json
+│   └── Q8_explain.json
+├── reports/                     # Test reports (gitignored)
+├── run-tests.sh                 # Test runner
+└── README.md
+```
 
-## Build and start OpenSearch
+## Run
 
 ```bash
-# Build the plugin
+# Build plugin
 ./gradlew :opensearch-sql-plugin:bundlePlugin
 
-# Start OpenSearch with the plugin (example using Docker or local install)
-# The plugin ZIP is at: plugin/build/distributions/opensearch-sql-*.zip
+# Start OpenSearch with plugin installed, then:
+./dqe/integ-test/run-tests.sh                        # localhost:9200
+./dqe/integ-test/run-tests.sh http://cluster:9200     # custom
 ```
 
-## Run tests
+## Query catalog
 
-```bash
-# Against local cluster (default: http://localhost:9200)
-./dqe/integ-test/run-tests.sh
+| ID | SQL | Asserts |
+|----|-----|---------|
+| Q1 | `SELECT category, status FROM logs` | 10 rows, exact data |
+| Q2 | `SELECT ... WHERE status = 200` | 4 rows, all status=200 |
+| Q3 | `SELECT category, COUNT(*) ... GROUP BY` | 4 groups, counts match |
+| Q4 | `SELECT ... ORDER BY status DESC LIMIT 3` | 3 rows, descending, exact |
+| Q5 | `SELECT ... WHERE status=200 GROUP BY` | 2 groups after filter |
+| Q6 | `SELECT category ... LIMIT 5` | 5 rows, schema check |
+| Q7 | `SELECT ... ORDER BY status ASC LIMIT 4` | 4 rows, ascending, exact |
+| Q8 | `EXPLAIN SELECT ... WHERE` | Plan shows dslFilter pushdown |
 
-# Against a specific cluster
-./dqe/integ-test/run-tests.sh http://my-cluster:9200
-```
+## Assertions
 
-## Test structure
-
-- `queries.json` — Test data (index mapping + documents) and query definitions with assertions
-- `run-tests.sh` — Test runner: creates index, loads data, runs queries, asserts results, cleans up
-
-## What's tested
-
-| Test | SQL | Asserts |
-|------|-----|---------|
-| Simple SELECT | `SELECT category, status FROM dqe_test_logs` | 10 rows, 2 columns |
-| WHERE filter | `SELECT ... WHERE status = 200` | 4 rows, all status=200 |
-| GROUP BY + COUNT | `SELECT category, COUNT(*) ... GROUP BY category` | Count sum = 10 |
-| ORDER BY + LIMIT | `SELECT ... ORDER BY status DESC LIMIT 3` | 3 rows, descending |
-| LIMIT only | `SELECT category ... LIMIT 5` | 5 rows, 1 column |
-| EXPLAIN | `/_plugins/_trino_sql/_explain` | Plan contains index name |
-
-## Adding tests
-
-Add entries to `queries.json` under the `tests` array. Available assertions:
-
-- `status` — HTTP response `status` field (200)
+Each query file specifies expected results. The runner compares:
+- `status` — response status code
 - `total` — exact row count
-- `schema_length` — number of columns
-- `schema_names` — exact column name list
-- `all_rows_match` — every row has expected value at column index
-- `total_count_sum` — sum of values in column 1 (for GROUP BY + COUNT)
-- `min_rows` — at least N rows returned
-- `descending_column_index` — column values are non-increasing
+- `schema` — column names and types
+- `datarows` — exact row data (sorted if `sort_before_compare` is set)
 - `contains` — response body contains substrings (for EXPLAIN)
+
+When `sort_before_compare` is set (e.g., `[0, 1]`), both actual and expected rows are sorted by those column indices before comparison. This handles non-deterministic row ordering from distributed execution.
+
+## Adding queries
+
+Create `queries/Q9_your_test.json`:
+```json
+{
+  "id": "Q9",
+  "name": "Description",
+  "endpoint": "/_plugins/_trino_sql",
+  "query": "SELECT ...",
+  "expected": {
+    "status": 200,
+    "schema": [{"name": "col", "type": "long"}],
+    "datarows": [[1], [2]],
+    "total": 2
+  },
+  "sort_before_compare": [0]
+}
+```

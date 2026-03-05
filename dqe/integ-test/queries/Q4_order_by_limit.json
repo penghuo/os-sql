@@ -1,0 +1,21 @@
+{
+  "id": "Q4",
+  "name": "ORDER BY DESC with LIMIT",
+  "endpoint": "/_plugins/_trino_sql",
+  "query": "SELECT category, status FROM dqe_test_logs ORDER BY status DESC LIMIT 3",
+  "expected": {
+    "status": 200,
+    "schema": [
+      {"name": "category", "type": "keyword"},
+      {"name": "status",   "type": "long"}
+    ],
+    "datarows": [
+      ["error", 503],
+      ["error", 500],
+      ["error", 500]
+    ],
+    "total": 3
+  },
+  "sort_before_compare": null,
+  "note": "ORDER BY guarantees order. Within same status, secondary sort by category may vary — both rows are error/500 so order is deterministic."
+}

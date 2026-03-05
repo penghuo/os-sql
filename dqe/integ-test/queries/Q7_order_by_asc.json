@@ -1,0 +1,22 @@
+{
+  "id": "Q7",
+  "name": "ORDER BY ASC with LIMIT",
+  "endpoint": "/_plugins/_trino_sql",
+  "query": "SELECT category, status FROM dqe_test_logs ORDER BY status ASC LIMIT 4",
+  "expected": {
+    "status": 200,
+    "schema": [
+      {"name": "category", "type": "keyword"},
+      {"name": "status",   "type": "long"}
+    ],
+    "datarows": [
+      ["debug", 200],
+      ["info",  200],
+      ["info",  200],
+      ["info",  200]
+    ],
+    "total": 4
+  },
+  "sort_before_compare": null,
+  "note": "ORDER BY ASC. First 4 rows all have status=200. Within same status, secondary ordering may vary — sort_before_compare handles this via stable sub-sort on column 0."
+}

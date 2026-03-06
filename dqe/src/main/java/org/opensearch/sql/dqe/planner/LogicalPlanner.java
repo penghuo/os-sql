@@ -12,6 +12,7 @@ import io.trino.sql.tree.Identifier;
 import io.trino.sql.tree.Limit;
 import io.trino.sql.tree.LongLiteral;
 import io.trino.sql.tree.Node;
+import io.trino.sql.tree.Offset;
 import io.trino.sql.tree.OrderBy;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.QuerySpecification;
@@ -71,7 +72,8 @@ public class LogicalPlanner {
     }
 
     // 1. Build TableScanNode from FROM clause
-    DqePlanNode current = buildTableScan(querySpec, tableResolver);
+    TableScanNode scanNode = buildTableScan(querySpec, tableResolver);
+    DqePlanNode current = scanNode;
 
     // 2. Wrap with FilterNode if WHERE exists
     Optional<Expression> where = querySpec.getWhere();
@@ -91,7 +93,7 @@ public class LogicalPlanner {
     }
 
     // 5. Wrap with ProjectNode (SELECT columns)
-    List<String> outputColumns = extractOutputColumns(querySpec);
+    List<String> outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
     current = new ProjectNode(current, outputColumns);
 
     // 6. Wrap with SortNode if ORDER BY exists
@@ -104,8 +106,12 @@ public class LogicalPlanner {
     // 7. Wrap with LimitNode if LIMIT exists
     // For simple queries, LIMIT lives on QuerySpecification; for compound queries, on Query.
     Optional<Node> limit = querySpec.getLimit().or(query::getLimit);
+    Optional<Offset> offset = querySpec.getOffset().or(query::getOffset);
     if (limit.isPresent()) {
-      current = buildLimit(current, limit.get());
+      current = buildLimit(current, limit.get(), offset);
+    } else if (offset.isPresent()) {
+      // OFFSET without LIMIT: use a very large limit
+      current = new LimitNode(current, Long.MAX_VALUE, extractOffset(offset.get()));
     }
 
     return current;
@@ -148,7 +154,7 @@ public class LogicalPlanner {
     return new EvalNode(current, expressions, outputColumnNames);
   }
 
-  private static DqePlanNode buildTableScan(
+  private static TableScanNode buildTableScan(
       QuerySpecification querySpec, Function<String, TableInfo> tableResolver) {
     Optional<Relation> from = querySpec.getFrom();
     if (from.isEmpty()) {
@@ -168,7 +174,8 @@ public class LogicalPlanner {
     return new TableScanNode(tableName, allColumns);
   }
 
-  private static List<String> extractOutputColumns(QuerySpecification querySpec) {
+  private static List<String> extractOutputColumns(
+      QuerySpecification querySpec, List<String> allTableColumns) {
     List<String> columns = new ArrayList<>();
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn singleColumn) {
@@ -180,8 +187,8 @@ public class LogicalPlanner {
                 .orElseGet(() -> expressionToColumnName(singleColumn.getExpression()));
         columns.add(columnName);
       } else {
-        // AllColumns (SELECT *) — use expression toString as fallback
-        columns.add(item.toString());
+        // AllColumns (SELECT *) — expand to all table columns
+        columns.addAll(allTableColumns);
       }
     }
     return columns;
@@ -239,7 +246,8 @@ public class LogicalPlanner {
     return new SortNode(child, sortKeys, ascending);
   }
 
-  private static DqePlanNode buildLimit(DqePlanNode child, Node limitNode) {
+  private static DqePlanNode buildLimit(
+      DqePlanNode child, Node limitNode, Optional<Offset> offset) {
     if (!(limitNode instanceof Limit limit)) {
       throw new IllegalArgumentException("Unsupported limit node type: " + limitNode);
     }
@@ -250,6 +258,16 @@ public class LogicalPlanner {
           "Only integer literal LIMIT values are supported, got: " + rowCount);
     }
 
-    return new LimitNode(child, longLiteral.getParsedValue());
+    long offsetValue = offset.map(LogicalPlanner::extractOffset).orElse(0L);
+    return new LimitNode(child, longLiteral.getParsedValue(), offsetValue);
+  }
+
+  private static long extractOffset(Offset offset) {
+    Expression rowCount = offset.getRowCount();
+    if (rowCount instanceof LongLiteral longLiteral) {
+      return longLiteral.getParsedValue();
+    }
+    throw new IllegalArgumentException(
+        "Only integer literal OFFSET values are supported, got: " + rowCount);
   }
 }

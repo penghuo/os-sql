@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
@@ -133,6 +134,12 @@ public class PlanOptimizer {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       return new LimitNode(optimizedChild, node.getCount());
     }
+
+    @Override
+    public DqePlanNode visitEval(EvalNode node, Void context) {
+      DqePlanNode optimizedChild = node.getChild().accept(this, context);
+      return new EvalNode(optimizedChild, node.getExpressions(), node.getOutputColumnNames());
+    }
   }
 
   /**
@@ -142,10 +149,14 @@ public class PlanOptimizer {
    */
   private static class ProjectionPruningVisitor extends DqePlanVisitor<DqePlanNode, Void> {
 
+    // Columns required by ancestor nodes (Sort keys, Filter predicates above ProjectNode)
+    private final Set<String> ancestorRequiredColumns = new HashSet<>();
+
     @Override
     public DqePlanNode visitProject(ProjectNode node, Void context) {
       // Collect all columns that this ProjectNode and everything above it need
       Set<String> requiredColumns = new HashSet<>(node.getOutputColumns());
+      requiredColumns.addAll(ancestorRequiredColumns);
 
       // Recursively collect columns from intermediate nodes between Project and TableScan
       DqePlanNode child = node.getChild();
@@ -164,7 +175,8 @@ public class PlanOptimizer {
 
     @Override
     public DqePlanNode visitFilter(FilterNode node, Void context) {
-      // When a FilterNode is the root (unlikely), just recurse
+      // Collect filter predicate columns for descendants
+      extractPredicateColumnRefs(node.getPredicateString(), ancestorRequiredColumns);
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       return new FilterNode(optimizedChild, node.getPredicateString());
     }
@@ -188,6 +200,8 @@ public class PlanOptimizer {
 
     @Override
     public DqePlanNode visitSort(SortNode node, Void context) {
+      // Sort keys need to be available at the scan level
+      ancestorRequiredColumns.addAll(node.getSortKeys());
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       return new SortNode(optimizedChild, node.getSortKeys(), node.getAscending());
     }
@@ -196,6 +210,16 @@ public class PlanOptimizer {
     public DqePlanNode visitLimit(LimitNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       return new LimitNode(optimizedChild, node.getCount());
+    }
+
+    @Override
+    public DqePlanNode visitEval(EvalNode node, Void context) {
+      // EvalNode expressions may reference columns — extract them
+      for (String expr : node.getExpressions()) {
+        extractPredicateColumnRefs(expr, ancestorRequiredColumns);
+      }
+      DqePlanNode optimizedChild = node.getChild().accept(this, context);
+      return new EvalNode(optimizedChild, node.getExpressions(), node.getOutputColumnNames());
     }
 
     /**
@@ -217,6 +241,11 @@ public class PlanOptimizer {
           extractAggregateColumnRefs(func, requiredColumns);
         }
         collectRequiredColumns(aggNode.getChild(), requiredColumns);
+      } else if (node instanceof EvalNode evalNode) {
+        for (String expr : evalNode.getExpressions()) {
+          extractPredicateColumnRefs(expr, requiredColumns);
+        }
+        collectRequiredColumns(evalNode.getChild(), requiredColumns);
       }
       // TableScanNode is the leaf -- nothing to collect
     }
@@ -244,6 +273,10 @@ public class PlanOptimizer {
       } else if (node instanceof LimitNode limitNode) {
         DqePlanNode prunedChild = pruneSubtree(limitNode.getChild(), requiredColumns);
         return new LimitNode(prunedChild, limitNode.getCount());
+      } else if (node instanceof EvalNode evalNode) {
+        DqePlanNode prunedChild = pruneSubtree(evalNode.getChild(), requiredColumns);
+        return new EvalNode(
+            prunedChild, evalNode.getExpressions(), evalNode.getOutputColumnNames());
       } else if (node instanceof AggregationNode aggNode) {
         DqePlanNode prunedChild = pruneSubtree(aggNode.getChild(), requiredColumns);
         return new AggregationNode(
@@ -342,6 +375,12 @@ public class PlanOptimizer {
     public DqePlanNode visitLimit(LimitNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       return new LimitNode(optimizedChild, node.getCount());
+    }
+
+    @Override
+    public DqePlanNode visitEval(EvalNode node, Void context) {
+      DqePlanNode optimizedChild = node.getChild().accept(this, context);
+      return new EvalNode(optimizedChild, node.getExpressions(), node.getOutputColumnNames());
     }
   }
 

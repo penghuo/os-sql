@@ -11,6 +11,8 @@ import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.ArithmeticBinaryExpression;
+import io.trino.sql.tree.ArithmeticUnaryExpression;
+import io.trino.sql.tree.BetweenPredicate;
 import io.trino.sql.tree.BooleanLiteral;
 import io.trino.sql.tree.Cast;
 import io.trino.sql.tree.CoalesceExpression;
@@ -31,6 +33,7 @@ import io.trino.sql.tree.NotExpression;
 import io.trino.sql.tree.NullIfExpression;
 import io.trino.sql.tree.NullLiteral;
 import io.trino.sql.tree.SearchedCaseExpression;
+import io.trino.sql.tree.SimpleCaseExpression;
 import io.trino.sql.tree.StringLiteral;
 import io.trino.sql.tree.WhenClause;
 import java.util.ArrayList;
@@ -99,6 +102,29 @@ public class ExpressionCompiler {
       return compileCoalesce(coalesce);
     } else if (expr instanceof NullIfExpression nullIf) {
       return new NullIfBlockExpression(compile(nullIf.getFirst()), compile(nullIf.getSecond()));
+    } else if (expr instanceof BetweenPredicate between) {
+      // BETWEEN a AND b → (value >= a AND value <= b)
+      BlockExpression value = compile(between.getValue());
+      BlockExpression min = compile(between.getMin());
+      BlockExpression max = compile(between.getMax());
+      BlockExpression geMin =
+          new ComparisonBlockExpression(
+              ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL, value, min);
+      BlockExpression leMax =
+          new ComparisonBlockExpression(
+              ComparisonExpression.Operator.LESS_THAN_OR_EQUAL, value, max);
+      return new LogicalAndExpression(geMin, leMax);
+    } else if (expr instanceof ArithmeticUnaryExpression unary) {
+      BlockExpression child = compile(unary.getValue());
+      if (unary.getSign() == ArithmeticUnaryExpression.Sign.MINUS) {
+        // -x → 0 - x
+        BlockExpression zero = new ConstantExpression(0L, BigintType.BIGINT);
+        return new ArithmeticBlockExpression(
+            ArithmeticBinaryExpression.Operator.SUBTRACT, zero, child);
+      }
+      return child; // +x → x
+    } else if (expr instanceof SimpleCaseExpression simpleCase) {
+      return compileSimpleCase(simpleCase);
     } else if (expr instanceof LikePredicate like) {
       return compileLike(like);
     } else if (expr instanceof InPredicate in) {
@@ -175,6 +201,23 @@ public class ExpressionCompiler {
         coalesce.getOperands().stream().map(this::compile).collect(Collectors.toList());
     Type outputType = operands.isEmpty() ? VarcharType.VARCHAR : operands.get(0).getType();
     return new CoalesceBlockExpression(operands, outputType);
+  }
+
+  private BlockExpression compileSimpleCase(SimpleCaseExpression simpleCase) {
+    // CASE operand WHEN v1 THEN r1 WHEN v2 THEN r2 ... ELSE default END
+    // → CASE WHEN operand = v1 THEN r1 WHEN operand = v2 THEN r2 ... ELSE default END
+    BlockExpression operand = compile(simpleCase.getOperand());
+    List<BlockExpression> conditions = new ArrayList<>();
+    List<BlockExpression> results = new ArrayList<>();
+    for (WhenClause when : simpleCase.getWhenClauses()) {
+      BlockExpression whenValue = compile(when.getOperand());
+      conditions.add(
+          new ComparisonBlockExpression(ComparisonExpression.Operator.EQUAL, operand, whenValue));
+      results.add(compile(when.getResult()));
+    }
+    BlockExpression elseExpr = simpleCase.getDefaultValue().map(this::compile).orElse(null);
+    Type outputType = results.isEmpty() ? VarcharType.VARCHAR : results.get(0).getType();
+    return new CaseBlockExpression(conditions, results, elseExpr, outputType);
   }
 
   private BlockExpression compileLike(LikePredicate like) {

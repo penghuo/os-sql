@@ -10,6 +10,10 @@ import io.trino.spi.block.Block;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.RealType;
+import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.Statement;
@@ -155,11 +159,34 @@ public class TransportTrinoSqlAction
                       if (coordinatorPlan instanceof AggregationNode aggNode) {
                         mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
                       } else {
-                        mergedPages = merger.mergePassthrough(shardPages);
+                        // Check if we need sorted merge
+                        SortNode sortNode = findSortNode(optimizedPlan);
+                        if (sortNode != null) {
+                          List<Integer> sortIndices =
+                              sortNode.getSortKeys().stream()
+                                  .map(columnNames::indexOf)
+                                  .collect(Collectors.toList());
+                          long sortLimit =
+                              findGlobalLimit(optimizedPlan) >= 0
+                                  ? findGlobalLimit(optimizedPlan)
+                                  : Long.MAX_VALUE;
+                          mergedPages =
+                              merger.mergeSorted(
+                                  shardPages,
+                                  sortIndices,
+                                  sortNode.getAscending(),
+                                  columnTypes,
+                                  sortLimit);
+                        } else {
+                          mergedPages = merger.mergePassthrough(shardPages);
+                        }
                       }
 
-                      // 10. Apply coordinator-level LIMIT (shards each apply their own limit,
-                      //     but the merged result may exceed the global limit)
+                      // 10. Apply coordinator-level OFFSET + LIMIT
+                      long globalOffset = findGlobalOffset(optimizedPlan);
+                      if (globalOffset > 0) {
+                        mergedPages = applyGlobalOffset(mergedPages, globalOffset);
+                      }
                       long globalLimit = findGlobalLimit(optimizedPlan);
                       if (globalLimit >= 0) {
                         mergedPages = applyGlobalLimit(mergedPages, globalLimit);
@@ -438,8 +465,18 @@ public class TransportTrinoSqlAction
     }
     if (type instanceof BigintType) {
       return BigintType.BIGINT.getLong(block, position);
+    } else if (type instanceof IntegerType) {
+      return (int) IntegerType.INTEGER.getLong(block, position);
+    } else if (type instanceof SmallintType) {
+      return (short) SmallintType.SMALLINT.getLong(block, position);
+    } else if (type instanceof TinyintType) {
+      return (byte) TinyintType.TINYINT.getLong(block, position);
     } else if (type instanceof DoubleType) {
       return DoubleType.DOUBLE.getDouble(block, position);
+    } else if (type instanceof RealType) {
+      // RealType stores as int bits of float
+      long bits = RealType.REAL.getLong(block, position);
+      return (double) Float.intBitsToFloat((int) bits);
     } else if (type instanceof BooleanType) {
       return BooleanType.BOOLEAN.getBoolean(block, position);
     } else if (type instanceof VarcharType) {
@@ -458,8 +495,16 @@ public class TransportTrinoSqlAction
   private static String trinoTypeToOpenSearchType(Type type) {
     if (type instanceof BigintType) {
       return "long";
+    } else if (type instanceof IntegerType) {
+      return "integer";
+    } else if (type instanceof SmallintType) {
+      return "short";
+    } else if (type instanceof TinyintType) {
+      return "byte";
     } else if (type instanceof DoubleType) {
       return "double";
+    } else if (type instanceof RealType) {
+      return "float";
     } else if (type instanceof BooleanType) {
       return "boolean";
     } else if (type instanceof VarcharType) {
@@ -513,6 +558,65 @@ public class TransportTrinoSqlAction
           }
         },
         null);
+  }
+
+  /** Walk the plan tree to find a SortNode. Returns null if none. */
+  static SortNode findSortNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<SortNode, Void>() {
+          @Override
+          public SortNode visitPlan(DqePlanNode node, Void context) {
+            if (node instanceof SortNode sortNode) {
+              return sortNode;
+            }
+            for (DqePlanNode child : node.getChildren()) {
+              SortNode result = child.accept(this, context);
+              if (result != null) {
+                return result;
+              }
+            }
+            return null;
+          }
+        },
+        null);
+  }
+
+  /** Walk the plan tree to find a LimitNode and return its offset. Returns 0 if none. */
+  static long findGlobalOffset(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<Long, Void>() {
+          @Override
+          public Long visitPlan(DqePlanNode node, Void context) {
+            if (node instanceof LimitNode limitNode) {
+              return limitNode.getOffset();
+            }
+            for (DqePlanNode child : node.getChildren()) {
+              Long result = child.accept(this, context);
+              if (result > 0) {
+                return result;
+              }
+            }
+            return 0L;
+          }
+        },
+        null);
+  }
+
+  /** Skip the first {@code offset} rows from merged pages. */
+  static List<Page> applyGlobalOffset(List<Page> pages, long offset) {
+    List<Page> result = new ArrayList<>();
+    long remaining = offset;
+    for (Page page : pages) {
+      if (remaining <= 0) {
+        result.add(page);
+      } else if (page.getPositionCount() <= remaining) {
+        remaining -= page.getPositionCount();
+      } else {
+        result.add(page.getRegion((int) remaining, page.getPositionCount() - (int) remaining));
+        remaining = 0;
+      }
+    }
+    return result;
   }
 
   /**

@@ -34,13 +34,12 @@ install_opensearch() {
     sudo tar -xzf "$tarball" -C "$OS_INSTALL_DIR" --strip-components=1
     rm -f "$tarball"
 
-    # Configure for single-node benchmark (no security)
+    # Configure for single-node benchmark (min distribution has no security plugin)
     cat <<'YAML' | sudo tee "$OS_INSTALL_DIR/config/opensearch.yml" > /dev/null
 cluster.name: clickbench
 node.name: node-1
 network.host: 0.0.0.0
 discovery.type: single-node
-plugins.security.disabled: true
 YAML
 
     # Set heap to 50% of available memory (capped at 16g)
@@ -59,6 +58,33 @@ YAML
     sudo chown -R opensearch:opensearch "$OS_INSTALL_DIR"
 }
 
+# --- Install job-scheduler plugin (required dependency for SQL plugin) ---
+install_job_scheduler_plugin() {
+    local js_zip
+
+    if sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" list 2>/dev/null | grep -q opensearch-job-scheduler; then
+        log "Job-scheduler plugin already installed."
+        return 0
+    fi
+
+    # Look for cached job-scheduler zip from Gradle
+    js_zip=$(find "$HOME/.gradle/caches/modules-2" -name "opensearch-job-scheduler-*.zip" -path "*${OS_VERSION}*" 2>/dev/null | head -1)
+    if [ -z "$js_zip" ]; then
+        # Trigger download via Gradle dependency resolution
+        log "Resolving job-scheduler dependency via Gradle..."
+        cd "$REPO_DIR"
+        ./gradlew :opensearch-sql-plugin:assemble -x test -x integTest >/dev/null 2>&1
+        js_zip=$(find "$HOME/.gradle/caches/modules-2" -name "opensearch-job-scheduler-*.zip" -path "*${OS_VERSION}*" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$js_zip" ]; then
+        die "Job-scheduler plugin ZIP not found in Gradle cache."
+    fi
+
+    log "Installing job-scheduler plugin from $js_zip..."
+    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$js_zip"
+}
+
 # --- Build and install SQL plugin from local repo ---
 install_sql_plugin() {
     local plugin_zip
@@ -71,16 +97,16 @@ install_sql_plugin() {
 
     log "Building SQL plugin from local repo ($REPO_DIR)..."
     cd "$REPO_DIR"
-    ./gradlew :plugin:assemble -x test -x integTest
+    ./gradlew :opensearch-sql-plugin:assemble -x test -x integTest
 
     # Find the plugin zip
     plugin_zip=$(find "$REPO_DIR/plugin/build/distributions" -name "opensearch-sql-*.zip" | head -1)
     if [ -z "$plugin_zip" ]; then
-        die "Plugin ZIP not found after build. Check ./gradlew :plugin:assemble output."
+        die "Plugin ZIP not found after build. Check ./gradlew :opensearch-sql-plugin:assemble output."
     fi
 
     log "Installing SQL plugin from $plugin_zip..."
-    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install "file://$plugin_zip"
+    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$plugin_zip"
 
     cd "$BENCH_DIR"
 }
@@ -122,6 +148,7 @@ create_index() {
 # --- Main ---
 install_jdk
 install_opensearch
+install_job_scheduler_plugin
 install_sql_plugin
 start_opensearch
 create_index

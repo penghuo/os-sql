@@ -37,6 +37,7 @@ NUM_TRIES="${NUM_TRIES:-3}"
 INDEX_NAME="hits"
 
 # --- OpenSearch snapshot build ---
+OS_VERSION="${OS_VERSION:-3.6.0.0-SNAPSHOT}"
 OS_SNAPSHOT_URL="${OS_SNAPSHOT_URL:-https://artifacts.opensearch.org/snapshots/core/opensearch/3.6.0-SNAPSHOT/opensearch-min-3.6.0-SNAPSHOT-linux-x64-latest.tar.gz}"
 
 # --- EBS snapshot config ---

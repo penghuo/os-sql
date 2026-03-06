@@ -59,9 +59,8 @@ YAML
     sudo chown -R opensearch:opensearch "$OS_INSTALL_DIR"
 }
 
-# --- Build and install SQL plugin ---
+# --- Build and install SQL plugin from local repo ---
 install_sql_plugin() {
-    local plugin_dir="/tmp/opensearch-sql-plugin"
     local plugin_zip
 
     # Check if plugin already installed
@@ -70,25 +69,20 @@ install_sql_plugin() {
         return 0
     fi
 
-    log "Cloning SQL plugin (${SQL_PLUGIN_BRANCH})..."
-    rm -rf "$plugin_dir"
-    git clone --depth 1 --branch "$SQL_PLUGIN_BRANCH" "$SQL_PLUGIN_REPO" "$plugin_dir"
-
-    log "Building SQL plugin..."
-    cd "$plugin_dir"
-    ./gradlew assemble -x test -x integTest
+    log "Building SQL plugin from local repo ($REPO_DIR)..."
+    cd "$REPO_DIR"
+    ./gradlew :plugin:assemble -x test -x integTest
 
     # Find the plugin zip
-    plugin_zip=$(find "$plugin_dir/plugin/build/distributions" -name "opensearch-sql-*.zip" | head -1)
+    plugin_zip=$(find "$REPO_DIR/plugin/build/distributions" -name "opensearch-sql-*.zip" | head -1)
     if [ -z "$plugin_zip" ]; then
-        die "Plugin ZIP not found after build."
+        die "Plugin ZIP not found after build. Check ./gradlew :plugin:assemble output."
     fi
 
     log "Installing SQL plugin from $plugin_zip..."
     sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install "file://$plugin_zip"
 
     cd "$BENCH_DIR"
-    rm -rf "$plugin_dir"
 }
 
 # --- Start OpenSearch ---

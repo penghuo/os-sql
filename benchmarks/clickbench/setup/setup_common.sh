@@ -38,8 +38,6 @@ INDEX_NAME="hits"
 
 # --- OpenSearch snapshot build ---
 OS_SNAPSHOT_URL="${OS_SNAPSHOT_URL:-https://artifacts.opensearch.org/snapshots/core/opensearch/3.6.0-SNAPSHOT/opensearch-min-3.6.0-SNAPSHOT-linux-x64-latest.tar.gz}"
-SQL_PLUGIN_REPO="${SQL_PLUGIN_REPO:-https://github.com/opensearch-project/sql.git}"
-SQL_PLUGIN_BRANCH="${SQL_PLUGIN_BRANCH:-trino-v5}"
 
 # --- EBS snapshot config ---
 SNAPSHOT_CONFIG="${BENCH_DIR}/.snapshot_config"

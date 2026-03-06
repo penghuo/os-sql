@@ -210,7 +210,19 @@ public class ExpressionCompiler {
           "Function '" + funcName + "' has no scalar implementation");
     }
 
+    // Insert implicit casts where the resolved parameter type differs from the actual arg type
+    List<Type> paramTypes = resolved.getArgumentTypes();
+    List<BlockExpression> castArgs = new ArrayList<>();
+    for (int i = 0; i < compiledArgs.size(); i++) {
+      BlockExpression arg = compiledArgs.get(i);
+      if (!arg.getType().equals(paramTypes.get(i))) {
+        castArgs.add(new CastBlockExpression(arg, paramTypes.get(i)));
+      } else {
+        castArgs.add(arg);
+      }
+    }
+
     return new ScalarFunctionExpression(
-        metadata.getScalarImplementation(), compiledArgs, metadata.getReturnType());
+        metadata.getScalarImplementation(), castArgs, metadata.getReturnType());
   }
 }

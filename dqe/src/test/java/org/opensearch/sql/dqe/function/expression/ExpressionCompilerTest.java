@@ -16,6 +16,7 @@ import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.Expression;
@@ -174,5 +175,54 @@ class ExpressionCompilerTest {
     assertTrue(BooleanType.BOOLEAN.getBoolean(result, 0));
     assertFalse(BooleanType.BOOLEAN.getBoolean(result, 1));
     assertFalse(BooleanType.BOOLEAN.getBoolean(result, 2));
+  }
+
+  @Test
+  @DisplayName("FunctionCall inserts implicit cast when arg type differs from parameter type")
+  void functionCallWithImplicitCoercion() {
+    // Register abs(DOUBLE) -> DOUBLE
+    FunctionRegistry absRegistry = new FunctionRegistry();
+    absRegistry.register(
+        FunctionMetadata.builder()
+            .name("abs")
+            .argumentTypes(List.of(DoubleType.DOUBLE))
+            .returnType(DoubleType.DOUBLE)
+            .kind(FunctionKind.SCALAR)
+            .scalarImplementation(
+                (args, posCount) -> {
+                  Block input = args[0];
+                  BlockBuilder builder = DoubleType.DOUBLE.createBlockBuilder(null, posCount);
+                  for (int i = 0; i < posCount; i++) {
+                    if (input.isNull(i)) {
+                      builder.appendNull();
+                    } else {
+                      double val = DoubleType.DOUBLE.getDouble(input, i);
+                      DoubleType.DOUBLE.writeDouble(builder, Math.abs(val));
+                    }
+                  }
+                  return builder.build();
+                })
+            .build());
+
+    // Compiler with BIGINT column "status"
+    ExpressionCompiler absCompiler =
+        new ExpressionCompiler(
+            absRegistry, Map.of("status", 0), Map.of("status", BigintType.BIGINT));
+
+    // Build page: status (BIGINT) = [-200, 200, 100]
+    BlockBuilder statusBuilder = BigintType.BIGINT.createBlockBuilder(null, 3);
+    BigintType.BIGINT.writeLong(statusBuilder, -200L);
+    BigintType.BIGINT.writeLong(statusBuilder, 200L);
+    BigintType.BIGINT.writeLong(statusBuilder, 100L);
+    Page absPage = new Page(statusBuilder.build());
+
+    // Compile abs(status) = 200 — requires implicit BIGINT->DOUBLE cast
+    Expression expr = parser.parseExpression("abs(status) = 200");
+    BlockExpression compiled = absCompiler.compile(expr);
+    Block result = compiled.evaluate(absPage);
+
+    assertTrue(BooleanType.BOOLEAN.getBoolean(result, 0)); // abs(-200) = 200
+    assertTrue(BooleanType.BOOLEAN.getBoolean(result, 1)); // abs(200) = 200
+    assertFalse(BooleanType.BOOLEAN.getBoolean(result, 2)); // abs(100) != 200
   }
 }

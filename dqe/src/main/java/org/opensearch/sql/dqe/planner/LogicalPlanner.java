@@ -92,22 +92,22 @@ public class LogicalPlanner {
       current = maybeInsertEvalNode(current, querySpec);
     }
 
-    // 5. Wrap with ProjectNode (SELECT columns)
-    // If an EvalNode was inserted, use its output column names for projection
+    // 5. Wrap with SortNode if ORDER BY exists (BEFORE Project, so sort keys are available)
+    Optional<OrderBy> orderBy = querySpec.getOrderBy().or(query::getOrderBy);
+    if (orderBy.isPresent()) {
+      current = buildSort(current, orderBy.get());
+    }
+
+    // 6. Wrap with ProjectNode (SELECT columns — after sort so sort keys are still available)
     List<String> outputColumns;
-    if (current instanceof EvalNode evalNode) {
+    if (current instanceof SortNode && current.getChildren().get(0) instanceof EvalNode evalNode) {
+      outputColumns = evalNode.getOutputColumnNames();
+    } else if (current instanceof EvalNode evalNode) {
       outputColumns = evalNode.getOutputColumnNames();
     } else {
       outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
     }
     current = new ProjectNode(current, outputColumns);
-
-    // 6. Wrap with SortNode if ORDER BY exists
-    // For simple queries, ORDER BY lives on QuerySpecification; for compound queries, on Query.
-    Optional<OrderBy> orderBy = querySpec.getOrderBy().or(query::getOrderBy);
-    if (orderBy.isPresent()) {
-      current = buildSort(current, orderBy.get());
-    }
 
     // 7. Wrap with LimitNode if LIMIT exists
     // For simple queries, LIMIT lives on QuerySpecification; for compound queries, on Query.

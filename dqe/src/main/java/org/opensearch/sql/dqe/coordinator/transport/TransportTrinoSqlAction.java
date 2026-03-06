@@ -133,18 +133,20 @@ public class TransportTrinoSqlAction
               .collect(
                   Collectors.toMap(TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::trinoType));
 
-      // Use display names (with aliases) for the response schema
+      // Internal column names (for type lookup) vs display names (for response schema)
+      List<String> internalColumnNames = resolveColumnNames(optimizedPlan);
       List<String> columnNames;
-      if (stmt instanceof Query query
-          && query.getQueryBody() instanceof QuerySpecification querySpec) {
+      if (stmt instanceof Query query2
+          && query2.getQueryBody() instanceof QuerySpecification querySpec2) {
         columnNames =
             LogicalPlanner.extractDisplayColumnNames(
-                querySpec, tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList());
+                querySpec2, tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList());
       } else {
-        columnNames = resolveColumnNames(optimizedPlan);
+        columnNames = internalColumnNames;
       }
+      // Use internal names for type lookup (aliases don't exist in the type map)
       List<Type> columnTypes = new ArrayList<>();
-      for (String col : columnNames) {
+      for (String col : internalColumnNames) {
         columnTypes.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
       }
 

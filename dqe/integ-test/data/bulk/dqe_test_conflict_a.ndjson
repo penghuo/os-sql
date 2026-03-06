@@ -1,0 +1,10 @@
+{"index":{"_id":"1"}}
+{"id":"ca_001","value":100,"label":"alpha"}
+{"index":{"_id":"2"}}
+{"id":"ca_002","value":200,"label":"beta"}
+{"index":{"_id":"3"}}
+{"id":"ca_003","value":300,"label":"gamma"}
+{"index":{"_id":"4"}}
+{"id":"ca_004","value":9223372036854775000,"label":"big_value"}
+{"index":{"_id":"5"}}
+{"id":"ca_005","value":-100,"label":"negative"}

@@ -1,0 +1,40 @@
+{
+  "id": "Q060",
+  "name": "text_multifield_keyword",
+  "query": "SELECT id, name FROM dqe_test_all_types WHERE name = 'exact match' LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "name",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00002",
+        "exact match"
+      ],
+      [
+        "id_00010",
+        "exact match"
+      ],
+      [
+        "id_00034",
+        "exact match"
+      ],
+      [
+        "id_00066",
+        "exact match"
+      ],
+      [
+        "id_00084",
+        "exact match"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

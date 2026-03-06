@@ -1,0 +1,14 @@
+{
+  "id": "Q067",
+  "name": "sort_by_timestamp",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY created_at DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ],
+    "expected_row_count": 10
+  }
+}

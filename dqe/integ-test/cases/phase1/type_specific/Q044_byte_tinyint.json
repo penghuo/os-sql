@@ -1,0 +1,19 @@
+{
+  "id": "Q044",
+  "name": "byte_tinyint",
+  "query": "SELECT count_byte FROM dqe_test_all_types WHERE count_byte IS NOT NULL LIMIT 1",
+  "expected": {
+    "schema": [
+      {
+        "name": "count_byte",
+        "type": "tinyint"
+      }
+    ],
+    "data": [
+      [
+        42
+      ]
+    ]
+  },
+  "ignore_order": true
+}

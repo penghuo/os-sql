@@ -1,0 +1,60 @@
+{
+  "id": "Q015",
+  "name": "nullif",
+  "query": "SELECT id, NULLIF(int_val, 0) FROM dqe_test_nulls LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "_col1",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "null_0001",
+        null
+      ],
+      [
+        "null_0002",
+        100
+      ],
+      [
+        "null_0003",
+        null
+      ],
+      [
+        "null_0004",
+        20
+      ],
+      [
+        "null_0005",
+        30
+      ],
+      [
+        "null_0006",
+        40
+      ],
+      [
+        "null_0007",
+        50
+      ],
+      [
+        "null_0008",
+        -949
+      ],
+      [
+        "null_0009",
+        -939
+      ],
+      [
+        "null_0010",
+        -81
+      ]
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,82 @@
+{
+  "id": "Q031",
+  "name": "nested_boolean",
+  "query": "SELECT id FROM dqe_test_all_types WHERE status = 'active' AND (count_int > 10 OR count_int < -100)",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00001"
+      ],
+      [
+        "id_00003"
+      ],
+      [
+        "id_00018"
+      ],
+      [
+        "id_00022"
+      ],
+      [
+        "id_00025"
+      ],
+      [
+        "id_00028"
+      ],
+      [
+        "id_00037"
+      ],
+      [
+        "id_00042"
+      ],
+      [
+        "id_00047"
+      ],
+      [
+        "id_00049"
+      ],
+      [
+        "id_00053"
+      ],
+      [
+        "id_00054"
+      ],
+      [
+        "id_00056"
+      ],
+      [
+        "id_00070"
+      ],
+      [
+        "id_00073"
+      ],
+      [
+        "id_00079"
+      ],
+      [
+        "id_00080"
+      ],
+      [
+        "id_00082"
+      ],
+      [
+        "id_00083"
+      ],
+      [
+        "id_00086"
+      ],
+      [
+        "id_00092"
+      ],
+      [
+        "id_00099"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

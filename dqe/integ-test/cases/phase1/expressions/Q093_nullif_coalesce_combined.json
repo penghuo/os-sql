@@ -1,0 +1,74 @@
+{
+  "id": "Q093",
+  "name": "nullif_coalesce_combined",
+  "query": "SELECT id, NULLIF(int_val, 0) AS non_zero, COALESCE(str_val, 'fallback') FROM dqe_test_nulls LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "non_zero",
+        "type": "integer"
+      },
+      {
+        "name": "_col2",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "null_0001",
+        null,
+        "fallback"
+      ],
+      [
+        "null_0002",
+        100,
+        "present"
+      ],
+      [
+        "null_0003",
+        null,
+        "value_3"
+      ],
+      [
+        "null_0004",
+        20,
+        "fallback"
+      ],
+      [
+        "null_0005",
+        30,
+        "value_5"
+      ],
+      [
+        "null_0006",
+        40,
+        "value_6"
+      ],
+      [
+        "null_0007",
+        50,
+        "value_7"
+      ],
+      [
+        "null_0008",
+        -949,
+        "beta"
+      ],
+      [
+        "null_0009",
+        -939,
+        "fallback"
+      ],
+      [
+        "null_0010",
+        -81,
+        "alpha"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

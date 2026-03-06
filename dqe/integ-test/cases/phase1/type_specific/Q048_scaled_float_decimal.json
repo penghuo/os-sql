@@ -1,0 +1,32 @@
+{
+  "id": "Q048",
+  "name": "scaled_float_decimal",
+  "query": "SELECT price_scaled FROM dqe_test_all_types WHERE price_scaled > 0 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "price_scaled",
+        "type": "double"
+      }
+    ],
+    "data": [
+      [
+        100.5
+      ],
+      [
+        278.19
+      ],
+      [
+        422.16
+      ],
+      [
+        729.07
+      ],
+      [
+        460.3
+      ]
+    ]
+  },
+  "ignore_order": true,
+  "float_tolerance": 0.01
+}

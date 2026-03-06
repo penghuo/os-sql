@@ -1,0 +1,49 @@
+{
+  "id": "Q083",
+  "name": "conflict_index_a",
+  "query": "SELECT * FROM dqe_test_conflict_a LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "label",
+        "type": "varchar"
+      },
+      {
+        "name": "value",
+        "type": "bigint"
+      }
+    ],
+    "data": [
+      [
+        "ca_001",
+        "alpha",
+        100
+      ],
+      [
+        "ca_002",
+        "beta",
+        200
+      ],
+      [
+        "ca_003",
+        "gamma",
+        300
+      ],
+      [
+        "ca_004",
+        "big_value",
+        9223372036854775000
+      ],
+      [
+        "ca_005",
+        "negative",
+        -100
+      ]
+    ]
+  },
+  "ignore_order": true
+}

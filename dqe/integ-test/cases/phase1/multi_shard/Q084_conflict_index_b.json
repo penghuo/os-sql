@@ -1,0 +1,49 @@
+{
+  "id": "Q084",
+  "name": "conflict_index_b",
+  "query": "SELECT * FROM dqe_test_conflict_b LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "label",
+        "type": "varchar"
+      },
+      {
+        "name": "value",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "cb_001",
+        "delta text value",
+        10
+      ],
+      [
+        "cb_002",
+        "epsilon text value",
+        20
+      ],
+      [
+        "cb_003",
+        "zeta text value",
+        30
+      ],
+      [
+        "cb_004",
+        "max int text",
+        2147483647
+      ],
+      [
+        "cb_005",
+        "negative text",
+        -50
+      ]
+    ]
+  },
+  "ignore_order": true
+}

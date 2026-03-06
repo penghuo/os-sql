@@ -1,0 +1,31 @@
+{
+  "id": "Q113",
+  "name": "filtered_uniqueness",
+  "query": "SELECT id FROM dqe_test_sharded WHERE category = 'cat_01' ORDER BY id ASC",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00001"
+      ],
+      [
+        "id_00101"
+      ],
+      [
+        "id_00201"
+      ],
+      [
+        "id_00301"
+      ],
+      [
+        "id_00401"
+      ]
+    ]
+  },
+  "_note": "Validator must check: all returned id values unique"
+}

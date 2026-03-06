@@ -1,0 +1,59 @@
+{
+  "id": "Q062",
+  "name": "single_column_desc",
+  "query": "SELECT id, count_int FROM dqe_test_all_types ORDER BY count_int DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "count_int",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00093",
+        484
+      ],
+      [
+        "id_00063",
+        483
+      ],
+      [
+        "id_00055",
+        480
+      ],
+      [
+        "id_00076",
+        479
+      ],
+      [
+        "id_00031",
+        471
+      ],
+      [
+        "id_00013",
+        456
+      ],
+      [
+        "id_00007",
+        446
+      ],
+      [
+        "id_00019",
+        438
+      ],
+      [
+        "id_00069",
+        437
+      ],
+      [
+        "id_00039",
+        434
+      ]
+    ]
+  }
+}

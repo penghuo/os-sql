@@ -1,0 +1,19 @@
+{
+  "id": "Q010",
+  "name": "geo_point_row_access",
+  "query": "SELECT id, location FROM dqe_test_all_types WHERE location IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "location"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true,
+  "_note": "Trino does not support table.field dot notation; select the parent geo_point column"
+}

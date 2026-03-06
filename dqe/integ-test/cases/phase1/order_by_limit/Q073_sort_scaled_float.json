@@ -1,0 +1,40 @@
+{
+  "id": "Q073",
+  "name": "sort_scaled_float",
+  "query": "SELECT id, price_scaled FROM dqe_test_all_types ORDER BY price_scaled DESC LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "price_scaled",
+        "type": "double"
+      }
+    ],
+    "data": [
+      [
+        "id_00080",
+        977.56
+      ],
+      [
+        "id_00047",
+        963.16
+      ],
+      [
+        "id_00026",
+        923.1
+      ],
+      [
+        "id_00040",
+        921.03
+      ],
+      [
+        "id_00057",
+        908.91
+      ]
+    ]
+  },
+  "float_tolerance": 0.01
+}

@@ -1,0 +1,40 @@
+{
+  "id": "Q086",
+  "name": "arithmetic_chain",
+  "query": "SELECT id, count_int * 2 + 1 AS computed FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "computed",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        85
+      ],
+      [
+        "id_00002",
+        1
+      ],
+      [
+        "id_00003",
+        209
+      ],
+      [
+        "id_00004",
+        529
+      ],
+      [
+        "id_00005",
+        807
+      ]
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,14 @@
+{
+  "id": "Q056",
+  "name": "geo_shape_varchar",
+  "query": "SELECT boundary FROM dqe_test_all_types WHERE boundary IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "boundary"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

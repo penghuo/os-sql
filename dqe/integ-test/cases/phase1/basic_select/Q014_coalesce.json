@@ -1,0 +1,60 @@
+{
+  "id": "Q014",
+  "name": "coalesce",
+  "query": "SELECT id, COALESCE(str_val, 'default') FROM dqe_test_nulls LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "_col1",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "null_0001",
+        "default"
+      ],
+      [
+        "null_0002",
+        "present"
+      ],
+      [
+        "null_0003",
+        "value_3"
+      ],
+      [
+        "null_0004",
+        "default"
+      ],
+      [
+        "null_0005",
+        "value_5"
+      ],
+      [
+        "null_0006",
+        "value_6"
+      ],
+      [
+        "null_0007",
+        "value_7"
+      ],
+      [
+        "null_0008",
+        "beta"
+      ],
+      [
+        "null_0009",
+        "default"
+      ],
+      [
+        "null_0010",
+        "alpha"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

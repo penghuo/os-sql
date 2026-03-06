@@ -1,0 +1,15 @@
+{
+  "id": "Q051",
+  "name": "date_strict_timestamp3",
+  "query": "SELECT updated_at FROM dqe_test_all_types WHERE updated_at IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP(3)"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

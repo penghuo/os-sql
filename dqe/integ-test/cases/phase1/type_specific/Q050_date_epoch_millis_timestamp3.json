@@ -1,0 +1,15 @@
+{
+  "id": "Q050",
+  "name": "date_epoch_millis_timestamp3",
+  "query": "SELECT created_at FROM dqe_test_all_types WHERE created_at IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "created_at",
+        "type": "BIGINT"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

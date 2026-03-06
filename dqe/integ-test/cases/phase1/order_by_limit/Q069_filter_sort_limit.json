@@ -1,0 +1,59 @@
+{
+  "id": "Q069",
+  "name": "filter_sort_limit",
+  "query": "SELECT id, status FROM dqe_test_all_types WHERE status = 'active' ORDER BY count_int DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "status",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00053",
+        "active"
+      ],
+      [
+        "id_00037",
+        "active"
+      ],
+      [
+        "id_00083",
+        "active"
+      ],
+      [
+        "id_00079",
+        "active"
+      ],
+      [
+        "id_00025",
+        "active"
+      ],
+      [
+        "id_00080",
+        "active"
+      ],
+      [
+        "id_00092",
+        "active"
+      ],
+      [
+        "id_00003",
+        "active"
+      ],
+      [
+        "id_00042",
+        "active"
+      ],
+      [
+        "id_00001",
+        "active"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "Q012",
+  "name": "offset",
+  "query": "SELECT id FROM dqe_test_all_types OFFSET 3 LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00004"
+      ],
+      [
+        "id_00005"
+      ],
+      [
+        "id_00006"
+      ],
+      [
+        "id_00007"
+      ],
+      [
+        "id_00008"
+      ]
+    ]
+  },
+  "ignore_order": true,
+  "_note": "Trino syntax: OFFSET before LIMIT"
+}

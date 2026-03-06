@@ -1,0 +1,45 @@
+{
+  "id": "Q068",
+  "name": "sort_by_double",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY price_double ASC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00047"
+      ],
+      [
+        "id_00059"
+      ],
+      [
+        "id_00074"
+      ],
+      [
+        "id_00095"
+      ],
+      [
+        "id_00078"
+      ],
+      [
+        "id_00058"
+      ],
+      [
+        "id_00100"
+      ],
+      [
+        "id_00054"
+      ],
+      [
+        "id_00002"
+      ],
+      [
+        "id_00004"
+      ]
+    ]
+  }
+}

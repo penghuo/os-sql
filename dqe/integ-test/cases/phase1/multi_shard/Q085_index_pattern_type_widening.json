@@ -1,0 +1,18 @@
+{
+  "id": "Q085",
+  "name": "index_pattern_type_widening",
+  "query": "SELECT id, value FROM dqe_test_conflict_* ORDER BY id LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "value",
+        "type": "BIGINT"
+      }
+    ],
+    "expected_min_row_count": 1
+  }
+}

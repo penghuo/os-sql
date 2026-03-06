@@ -1,0 +1,40 @@
+{
+  "id": "Q087",
+  "name": "unary_negation",
+  "query": "SELECT id, -count_int AS negated FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "negated",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        -42
+      ],
+      [
+        "id_00002",
+        0
+      ],
+      [
+        "id_00003",
+        -104
+      ],
+      [
+        "id_00004",
+        -264
+      ],
+      [
+        "id_00005",
+        -403
+      ]
+    ]
+  },
+  "ignore_order": true
+}

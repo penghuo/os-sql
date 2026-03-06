@@ -1,0 +1,29 @@
+{
+  "id": "Q080",
+  "name": "point_lookup_single_shard",
+  "query": "SELECT * FROM dqe_test_sharded WHERE id = 'id_00001'",
+  "expected": {
+    "schema": [
+      {
+        "name": "amount",
+        "type": "double"
+      },
+      {
+        "name": "category",
+        "type": "varchar"
+      },
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        1.99,
+        "cat_01",
+        "id_00001"
+      ]
+    ]
+  },
+  "float_tolerance": 0.01
+}

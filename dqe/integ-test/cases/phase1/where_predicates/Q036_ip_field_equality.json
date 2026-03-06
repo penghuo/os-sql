@@ -1,0 +1,15 @@
+{
+  "id": "Q036",
+  "name": "ip_field_equality",
+  "query": "SELECT id FROM dqe_test_all_types WHERE ip_address = '192.168.1.1'",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,31 @@
+{
+  "id": "Q095",
+  "name": "combined_predicates",
+  "query": "SELECT id, count_int FROM dqe_test_all_types WHERE count_int BETWEEN 10 AND 100 AND status IN ('active', 'pending') ORDER BY count_int DESC LIMIT 20",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "count_int",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00042",
+        65
+      ],
+      [
+        "id_00001",
+        42
+      ],
+      [
+        "id_00087",
+        35
+      ]
+    ]
+  }
+}

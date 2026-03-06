@@ -1,0 +1,31 @@
+{
+  "id": "Q007",
+  "name": "explicit_cast_bigint",
+  "query": "SELECT CAST(count_int AS BIGINT) FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "_col0",
+        "type": "bigint"
+      }
+    ],
+    "data": [
+      [
+        42
+      ],
+      [
+        0
+      ],
+      [
+        104
+      ],
+      [
+        264
+      ],
+      [
+        403
+      ]
+    ]
+  },
+  "ignore_order": true
+}

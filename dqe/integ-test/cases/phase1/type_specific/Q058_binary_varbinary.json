@@ -1,0 +1,31 @@
+{
+  "id": "Q058",
+  "name": "binary_varbinary",
+  "query": "SELECT binary_data FROM dqe_test_all_types WHERE binary_data IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "binary_data",
+        "type": "varbinary"
+      }
+    ],
+    "data": [
+      [
+        "SGVsbG8gV29ybGQ="
+      ],
+      [
+        "AQID"
+      ],
+      [
+        "oc2JIWw="
+      ],
+      [
+        "2Gxmn8y/4Oc9fnMgrQp1cAMkHnU="
+      ],
+      [
+        "KV8jIng="
+      ]
+    ]
+  },
+  "ignore_order": true
+}

@@ -1,0 +1,49 @@
+{
+  "id": "Q004",
+  "name": "multi_column_selection",
+  "query": "SELECT id, status, count_int FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "status",
+        "type": "varchar"
+      },
+      {
+        "name": "count_int",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        "active",
+        42
+      ],
+      [
+        "id_00002",
+        "pending",
+        0
+      ],
+      [
+        "id_00003",
+        "active",
+        104
+      ],
+      [
+        "id_00004",
+        "pending",
+        264
+      ],
+      [
+        "id_00005",
+        "archived",
+        403
+      ]
+    ]
+  },
+  "ignore_order": true
+}

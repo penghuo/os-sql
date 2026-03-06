@@ -1,0 +1,40 @@
+{
+  "id": "Q092",
+  "name": "try_cast_null_on_failure",
+  "query": "SELECT id, TRY_CAST(status AS INTEGER) FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "_col1",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        null
+      ],
+      [
+        "id_00002",
+        null
+      ],
+      [
+        "id_00003",
+        null
+      ],
+      [
+        "id_00004",
+        null
+      ],
+      [
+        "id_00005",
+        null
+      ]
+    ]
+  },
+  "ignore_order": true
+}

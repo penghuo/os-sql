@@ -1,0 +1,10 @@
+{
+  "id": "Q002",
+  "name": "star_expansion",
+  "query": "SELECT * FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "expected_row_count": 5
+  },
+  "ignore_order": true,
+  "_note": "Schema validated by presence of all columns; exact schema depends on mapping"
+}

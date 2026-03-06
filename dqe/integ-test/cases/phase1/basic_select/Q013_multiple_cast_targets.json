@@ -1,0 +1,49 @@
+{
+  "id": "Q013",
+  "name": "multiple_cast_targets",
+  "query": "SELECT id, CAST(count_int AS DOUBLE), CAST(price_double AS VARCHAR) FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "_col1",
+        "type": "double"
+      },
+      {
+        "name": "_col2",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        42.0,
+        "9.999E1"
+      ],
+      [
+        "id_00002",
+        0.0,
+        "0E0"
+      ],
+      [
+        "id_00003",
+        104.0,
+        "5.62220602E3"
+      ],
+      [
+        "id_00004",
+        264.0,
+        "3.534E-3"
+      ],
+      [
+        "id_00005",
+        403.0,
+        "1.094509058E3"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

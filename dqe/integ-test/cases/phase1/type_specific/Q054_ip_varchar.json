@@ -1,0 +1,31 @@
+{
+  "id": "Q054",
+  "name": "ip_varchar",
+  "query": "SELECT ip_address FROM dqe_test_all_types WHERE ip_address IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "ip_address",
+        "type": "ipaddress"
+      }
+    ],
+    "data": [
+      [
+        "192.168.1.1"
+      ],
+      [
+        "10.0.0.1"
+      ],
+      [
+        "10.98.35.12"
+      ],
+      [
+        "255.255.255.255"
+      ],
+      [
+        "10.7.47.238"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

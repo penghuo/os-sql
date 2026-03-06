@@ -1,0 +1,14 @@
+{
+  "id": "Q066",
+  "name": "limit_with_offset",
+  "query": "SELECT id FROM dqe_test_all_types ORDER BY id LIMIT 5 OFFSET 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "VARCHAR"
+      }
+    ],
+    "expected_row_count": 5
+  }
+}

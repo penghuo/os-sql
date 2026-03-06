@@ -1,0 +1,60 @@
+{
+  "id": "Q001",
+  "name": "basic_column_selection",
+  "query": "SELECT id, name FROM dqe_test_all_types LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "name",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        "test_name_1"
+      ],
+      [
+        "id_00002",
+        "exact match"
+      ],
+      [
+        "id_00003",
+        "test_name_1"
+      ],
+      [
+        "id_00004",
+        "long_name_for_testing_purposes"
+      ],
+      [
+        "id_00005",
+        null
+      ],
+      [
+        "id_00006",
+        "test_name_2"
+      ],
+      [
+        "id_00007",
+        "beta_gadget"
+      ],
+      [
+        "id_00008",
+        "gamma_device"
+      ],
+      [
+        "id_00009",
+        "middle_content_here"
+      ],
+      [
+        "id_00010",
+        "exact match"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

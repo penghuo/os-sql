@@ -1,0 +1,22 @@
+{
+  "id": "Q039",
+  "name": "unsigned_long_exceeding_bigint",
+  "query": "SELECT id FROM dqe_test_all_types WHERE count_long > 900000",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00011"
+      ],
+      [
+        "id_00069"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

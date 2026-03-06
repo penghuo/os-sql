@@ -1,0 +1,15 @@
+{
+  "id": "Q052",
+  "name": "date_custom_format_timestamp3",
+  "query": "SELECT custom_date FROM dqe_test_all_types WHERE custom_date IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "custom_date",
+        "type": "TIMESTAMP(3)"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

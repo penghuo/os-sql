@@ -1,0 +1,31 @@
+{
+  "id": "Q005",
+  "name": "arithmetic_expression",
+  "query": "SELECT count_int + 1 AS incremented FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "incremented",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        43
+      ],
+      [
+        1
+      ],
+      [
+        105
+      ],
+      [
+        265
+      ],
+      [
+        404
+      ]
+    ]
+  },
+  "ignore_order": true
+}

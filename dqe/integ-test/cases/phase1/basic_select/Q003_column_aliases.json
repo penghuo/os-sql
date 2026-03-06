@@ -1,0 +1,40 @@
+{
+  "id": "Q003",
+  "name": "column_aliases",
+  "query": "SELECT id AS identifier, name AS label FROM dqe_test_all_types LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "identifier",
+        "type": "varchar"
+      },
+      {
+        "name": "label",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00001",
+        "test_name_1"
+      ],
+      [
+        "id_00002",
+        "exact match"
+      ],
+      [
+        "id_00003",
+        "test_name_1"
+      ],
+      [
+        "id_00004",
+        "long_name_for_testing_purposes"
+      ],
+      [
+        "id_00005",
+        null
+      ]
+    ]
+  },
+  "ignore_order": true
+}

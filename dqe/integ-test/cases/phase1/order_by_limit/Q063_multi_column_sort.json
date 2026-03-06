@@ -1,0 +1,73 @@
+{
+  "id": "Q063",
+  "name": "multi_column_sort",
+  "query": "SELECT id, status, count_int FROM dqe_test_all_types ORDER BY status ASC, count_int DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "status",
+        "type": "varchar"
+      },
+      {
+        "name": "count_int",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "id_00053",
+        "active",
+        423
+      ],
+      [
+        "id_00037",
+        "active",
+        386
+      ],
+      [
+        "id_00083",
+        "active",
+        293
+      ],
+      [
+        "id_00079",
+        "active",
+        275
+      ],
+      [
+        "id_00025",
+        "active",
+        265
+      ],
+      [
+        "id_00080",
+        "active",
+        195
+      ],
+      [
+        "id_00092",
+        "active",
+        133
+      ],
+      [
+        "id_00003",
+        "active",
+        104
+      ],
+      [
+        "id_00042",
+        "active",
+        65
+      ],
+      [
+        "id_00001",
+        "active",
+        42
+      ]
+    ]
+  }
+}

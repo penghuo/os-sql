@@ -1,0 +1,59 @@
+{
+  "id": "Q065",
+  "name": "nulls_last",
+  "query": "SELECT id, int_val FROM dqe_test_nulls ORDER BY int_val ASC NULLS LAST LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "int_val",
+        "type": "integer"
+      }
+    ],
+    "data": [
+      [
+        "null_0020",
+        -977
+      ],
+      [
+        "null_0008",
+        -949
+      ],
+      [
+        "null_0009",
+        -939
+      ],
+      [
+        "null_0046",
+        -919
+      ],
+      [
+        "null_0036",
+        -876
+      ],
+      [
+        "null_0019",
+        -687
+      ],
+      [
+        "null_0017",
+        -565
+      ],
+      [
+        "null_0011",
+        -311
+      ],
+      [
+        "null_0034",
+        -201
+      ],
+      [
+        "null_0030",
+        -133
+      ]
+    ]
+  }
+}

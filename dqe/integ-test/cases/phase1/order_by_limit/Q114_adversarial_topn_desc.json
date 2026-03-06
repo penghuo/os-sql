@@ -1,0 +1,40 @@
+{
+  "id": "Q114",
+  "name": "adversarial_topn_desc",
+  "query": "SELECT id, amount FROM dqe_test_sharded ORDER BY amount DESC LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      },
+      {
+        "name": "amount",
+        "type": "double"
+      }
+    ],
+    "data": [
+      [
+        "id_00500",
+        999.99
+      ],
+      [
+        "id_00499",
+        997.99
+      ],
+      [
+        "id_00498",
+        995.99
+      ],
+      [
+        "id_00497",
+        993.99
+      ],
+      [
+        "id_00496",
+        991.99
+      ]
+    ]
+  },
+  "float_tolerance": 0.01
+}

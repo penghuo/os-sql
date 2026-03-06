@@ -1,0 +1,30 @@
+{
+  "id": "Q118",
+  "name": "adversarial_topn_filter",
+  "query": "SELECT id FROM dqe_test_sharded WHERE category = 'cat_50' ORDER BY id DESC LIMIT 10",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "id_00450"
+      ],
+      [
+        "id_00350"
+      ],
+      [
+        "id_00250"
+      ],
+      [
+        "id_00150"
+      ],
+      [
+        "id_00050"
+      ]
+    ]
+  }
+}

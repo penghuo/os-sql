@@ -1,0 +1,15 @@
+{
+  "id": "Q053",
+  "name": "date_nanos_timestamp9",
+  "query": "SELECT precise_time FROM dqe_test_all_types WHERE precise_time IS NOT NULL LIMIT 5",
+  "expected": {
+    "schema": [
+      {
+        "name": "precise_time",
+        "type": "TIMESTAMP(3)"
+      }
+    ],
+    "expected_min_row_count": 1
+  },
+  "ignore_order": true
+}

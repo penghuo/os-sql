@@ -1,0 +1,43 @@
+{
+  "id": "Q037",
+  "name": "multiple_null_checks",
+  "query": "SELECT id FROM dqe_test_nulls WHERE int_val IS NULL AND str_val IS NOT NULL",
+  "expected": {
+    "schema": [
+      {
+        "name": "id",
+        "type": "varchar"
+      }
+    ],
+    "data": [
+      [
+        "null_0003"
+      ],
+      [
+        "null_0014"
+      ],
+      [
+        "null_0015"
+      ],
+      [
+        "null_0022"
+      ],
+      [
+        "null_0038"
+      ],
+      [
+        "null_0040"
+      ],
+      [
+        "null_0047"
+      ],
+      [
+        "null_0049"
+      ],
+      [
+        "null_0050"
+      ]
+    ]
+  },
+  "ignore_order": true
+}

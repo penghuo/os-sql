@@ -63,7 +63,8 @@ public class CoalesceBlockExpression implements BlockExpression {
     } else if (outputType instanceof BooleanType) {
       BooleanType.BOOLEAN.writeBoolean(builder, BooleanType.BOOLEAN.getBoolean(source, pos));
     } else {
-      throw new UnsupportedOperationException("Unsupported COALESCE type: " + outputType);
+      // For IntegerType, SmallintType, TinyintType, etc. — use getLong/writeLong
+      outputType.writeLong(builder, outputType.getLong(source, pos));
     }
   }
 }

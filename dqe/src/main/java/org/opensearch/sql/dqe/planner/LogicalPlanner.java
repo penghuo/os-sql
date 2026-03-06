@@ -93,7 +93,13 @@ public class LogicalPlanner {
     }
 
     // 5. Wrap with ProjectNode (SELECT columns)
-    List<String> outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
+    // If an EvalNode was inserted, use its output column names for projection
+    List<String> outputColumns;
+    if (current instanceof EvalNode evalNode) {
+      outputColumns = evalNode.getOutputColumnNames();
+    } else {
+      outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
+    }
     current = new ProjectNode(current, outputColumns);
 
     // 6. Wrap with SortNode if ORDER BY exists
@@ -179,7 +185,26 @@ public class LogicalPlanner {
     List<String> columns = new ArrayList<>();
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn singleColumn) {
-        // Use alias if present, otherwise use the expression string representation
+        // Use the expression's column name for internal projection mapping.
+        // Aliases are handled separately for display names in the response.
+        columns.add(expressionToColumnName(singleColumn.getExpression()));
+      } else {
+        // AllColumns (SELECT *) — expand to all table columns
+        columns.addAll(allTableColumns);
+      }
+    }
+    return columns;
+  }
+
+  /**
+   * Extract display column names for the response schema. Uses aliases when present, otherwise
+   * falls back to expression-derived names.
+   */
+  public static List<String> extractDisplayColumnNames(
+      QuerySpecification querySpec, List<String> allTableColumns) {
+    List<String> columns = new ArrayList<>();
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
         String columnName =
             singleColumn
                 .getAlias()
@@ -187,7 +212,6 @@ public class LogicalPlanner {
                 .orElseGet(() -> expressionToColumnName(singleColumn.getExpression()));
         columns.add(columnName);
       } else {
-        // AllColumns (SELECT *) — expand to all table columns
         columns.addAll(allTableColumns);
       }
     }

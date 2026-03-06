@@ -60,29 +60,50 @@ public final class PageBuilder {
       builder.appendNull();
       return;
     }
-    if (type instanceof VarcharType) {
-      VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(value.toString()));
-    } else if (type instanceof BigintType) {
-      BigintType.BIGINT.writeLong(builder, ((Number) value).longValue());
-    } else if (type instanceof IntegerType) {
-      IntegerType.INTEGER.writeLong(builder, ((Number) value).intValue());
-    } else if (type instanceof SmallintType) {
-      SmallintType.SMALLINT.writeLong(builder, ((Number) value).shortValue());
-    } else if (type instanceof TinyintType) {
-      TinyintType.TINYINT.writeLong(builder, ((Number) value).byteValue());
-    } else if (type instanceof DoubleType) {
-      DoubleType.DOUBLE.writeDouble(builder, ((Number) value).doubleValue());
-    } else if (type instanceof RealType) {
-      RealType.REAL.writeLong(builder, Float.floatToIntBits(((Number) value).floatValue()));
-    } else if (type instanceof BooleanType) {
-      BooleanType.BOOLEAN.writeBoolean(builder, (Boolean) value);
-    } else if (type instanceof TimestampType) {
-      long epochMillis = ((Number) value).longValue();
-      TimestampType.TIMESTAMP_MILLIS.writeLong(builder, epochMillis * 1000);
-    } else if (type instanceof VarbinaryType) {
-      VarbinaryType.VARBINARY.writeSlice(builder, Slices.wrappedBuffer((byte[]) value));
-    } else {
-      throw new UnsupportedOperationException("Unsupported Trino type: " + type.getDisplayName());
+    try {
+      if (type instanceof VarcharType) {
+        VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(value.toString()));
+      } else if (type instanceof BigintType) {
+        BigintType.BIGINT.writeLong(builder, toNumber(value).longValue());
+      } else if (type instanceof IntegerType) {
+        IntegerType.INTEGER.writeLong(builder, toNumber(value).intValue());
+      } else if (type instanceof SmallintType) {
+        SmallintType.SMALLINT.writeLong(builder, toNumber(value).shortValue());
+      } else if (type instanceof TinyintType) {
+        TinyintType.TINYINT.writeLong(builder, toNumber(value).byteValue());
+      } else if (type instanceof DoubleType) {
+        DoubleType.DOUBLE.writeDouble(builder, toNumber(value).doubleValue());
+      } else if (type instanceof RealType) {
+        RealType.REAL.writeLong(builder, Float.floatToIntBits(toNumber(value).floatValue()));
+      } else if (type instanceof BooleanType) {
+        boolean boolVal =
+            value instanceof Boolean ? (Boolean) value : Boolean.parseBoolean(value.toString());
+        BooleanType.BOOLEAN.writeBoolean(builder, boolVal);
+      } else if (type instanceof TimestampType) {
+        long epochMillis = toNumber(value).longValue();
+        TimestampType.TIMESTAMP_MILLIS.writeLong(builder, epochMillis * 1000);
+      } else if (type instanceof VarbinaryType) {
+        if (value instanceof byte[]) {
+          VarbinaryType.VARBINARY.writeSlice(builder, Slices.wrappedBuffer((byte[]) value));
+        } else {
+          // Base64-encoded string from OpenSearch
+          byte[] bytes = java.util.Base64.getDecoder().decode(value.toString());
+          VarbinaryType.VARBINARY.writeSlice(builder, Slices.wrappedBuffer(bytes));
+        }
+      } else {
+        // Fallback: write as VARCHAR
+        VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(value.toString()));
+      }
+    } catch (Exception e) {
+      // If conversion fails, write null rather than crash the whole query
+      builder.appendNull();
     }
+  }
+
+  private static Number toNumber(Object value) {
+    if (value instanceof Number) {
+      return (Number) value;
+    }
+    return Long.parseLong(value.toString());
   }
 }

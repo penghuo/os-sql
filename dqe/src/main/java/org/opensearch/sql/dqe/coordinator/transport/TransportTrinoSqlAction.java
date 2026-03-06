@@ -16,6 +16,8 @@ import io.trino.spi.type.SmallintType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
+import io.trino.sql.tree.Query;
+import io.trino.sql.tree.QuerySpecification;
 import io.trino.sql.tree.Statement;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -131,7 +133,16 @@ public class TransportTrinoSqlAction
               .collect(
                   Collectors.toMap(TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::trinoType));
 
-      List<String> columnNames = resolveColumnNames(optimizedPlan);
+      // Use display names (with aliases) for the response schema
+      List<String> columnNames;
+      if (stmt instanceof Query query
+          && query.getQueryBody() instanceof QuerySpecification querySpec) {
+        columnNames =
+            LogicalPlanner.extractDisplayColumnNames(
+                querySpec, tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList());
+      } else {
+        columnNames = resolveColumnNames(optimizedPlan);
+      }
       List<Type> columnTypes = new ArrayList<>();
       for (String col : columnNames) {
         columnTypes.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));

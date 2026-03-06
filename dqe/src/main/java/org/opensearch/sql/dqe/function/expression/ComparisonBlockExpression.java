@@ -66,6 +66,20 @@ public class ComparisonBlockExpression implements BlockExpression {
       return l.compareTo(r);
     }
 
+    // Both BOOLEAN
+    if (leftType instanceof BooleanType && rightType instanceof BooleanType) {
+      boolean l = BooleanType.BOOLEAN.getBoolean(leftBlock, pos);
+      boolean r = BooleanType.BOOLEAN.getBoolean(rightBlock, pos);
+      return Boolean.compare(l, r);
+    }
+
+    // Boolean vs literal (e.g., is_active = true)
+    if (leftType instanceof BooleanType || rightType instanceof BooleanType) {
+      boolean l = readBoolean(leftBlock, pos, leftType);
+      boolean r = readBoolean(rightBlock, pos, rightType);
+      return Boolean.compare(l, r);
+    }
+
     // Both numeric — promote to double if either is DOUBLE
     double l = readNumeric(leftBlock, pos, leftType);
     double r = readNumeric(rightBlock, pos, rightType);
@@ -77,6 +91,14 @@ public class ComparisonBlockExpression implements BlockExpression {
       return DoubleType.DOUBLE.getDouble(block, pos);
     }
     return type.getLong(block, pos);
+  }
+
+  private boolean readBoolean(Block block, int pos, Type type) {
+    if (type instanceof BooleanType) {
+      return BooleanType.BOOLEAN.getBoolean(block, pos);
+    }
+    // For numeric types, treat non-zero as true (for "is_active = true" where true is a literal)
+    return type.getLong(block, pos) != 0;
   }
 
   private boolean applyOperator(int cmp) {

@@ -14,16 +14,20 @@ fi
 log "Downloading $NUM_PARQUET_FILES parquet files to $DATA_DIR..."
 log "This is ~15GB and may take a while."
 
-seq 0 $((NUM_PARQUET_FILES - 1)) | xargs -P 10 -I{} bash -c '
-    FILE="hits_{}.parquet"
-    URL="'"$DATASET_BASE_URL"'/hits_{}.parquet"
+download_one() {
+    local i="$1"
+    local FILE="hits_${i}.parquet"
+    local URL="${DATASET_BASE_URL}/hits_${i}.parquet"
     if [ -f "$FILE" ]; then
         echo "  [skip] $FILE already exists"
     else
         echo "  [download] $FILE"
         wget --quiet --continue "$URL" -O "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
     fi
-'
+}
+export -f download_one
+export DATASET_BASE_URL
+seq 0 $((NUM_PARQUET_FILES - 1)) | xargs -P 10 -I{} bash -c 'download_one {}'
 
 FINAL_COUNT=$(ls hits_*.parquet 2>/dev/null | wc -l)
 log "Download complete. $FINAL_COUNT / $NUM_PARQUET_FILES files present."

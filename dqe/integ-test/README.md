@@ -1,77 +1,78 @@
 # DQE Phase 1 Integration Tests
 
-Standalone REST-based tests for `/_plugins/_trino_sql`. No Java framework — just `curl` and `jq`.
+REST-based tests for `/_plugins/_trino_sql` using Python validation against expected results.
 
 ## Structure
 
 ```
 dqe/integ-test/
-├── data/                        # Test datasets
-│   └── dqe_test_logs.json       #   Index mapping + 10 documents
-├── queries/                     # Numbered queries with expected results
-│   ├── Q1_simple_select.json
-│   ├── Q2_where_filter.json
-│   ├── Q3_group_by_count.json
-│   ├── Q4_order_by_limit.json
-│   ├── Q5_where_group_by.json
-│   ├── Q6_limit_only.json
-│   ├── Q7_order_by_asc.json
-│   └── Q8_explain.json
-├── reports/                     # Test reports (gitignored)
-├── run-tests.sh                 # Test runner
-└── README.md
+├── cases/phase1/                # 103 test cases across 6 categories
+│   ├── basic_select/            #   Q001-Q015
+│   ├── where_predicates/        #   Q016-Q040
+│   ├── type_specific/           #   Q041-Q060
+│   ├── order_by_limit/          #   Q061-Q075, Q114-Q118
+│   ├── multi_shard/             #   Q076-Q085, Q111-Q113
+│   └── expressions/             #   Q086-Q095
+├── data/
+│   ├── mappings/                # Index mapping definitions (7 indices)
+│   └── bulk/                    # Bulk data files (NDJSON)
+├── reports/                     # Test reports
+├── validate.py                  # Python test runner
+├── setup-data.sh                # Load test data into OpenSearch
+├── run-phase1-tests.sh          # Run all 103 phase1 tests
+├── start-opensearch.sh          # Start OpenSearch via Gradle
+├── stop-opensearch.sh           # Stop OpenSearch
+└── redeploy.sh                  # Build → restart → reload (TDD loop)
 ```
 
-## Run
+## Quick Start
 
 ```bash
-# Build plugin
-./gradlew :opensearch-sql-plugin:bundlePlugin
+# Start OpenSearch with the SQL plugin
+./dqe/integ-test/start-opensearch.sh --daemon
 
-# Start OpenSearch with plugin installed, then:
-./dqe/integ-test/run-tests.sh                        # localhost:9200
-./dqe/integ-test/run-tests.sh http://cluster:9200     # custom
+# Load test data
+./dqe/integ-test/setup-data.sh
+
+# Run all phase1 tests
+./dqe/integ-test/run-phase1-tests.sh
 ```
 
-## Query catalog
+## TDD Workflow
 
-| ID | SQL | Asserts |
-|----|-----|---------|
-| Q1 | `SELECT category, status FROM logs` | 10 rows, exact data |
-| Q2 | `SELECT ... WHERE status = 200` | 4 rows, all status=200 |
-| Q3 | `SELECT category, COUNT(*) ... GROUP BY` | 4 groups, counts match |
-| Q4 | `SELECT ... ORDER BY status DESC LIMIT 3` | 3 rows, descending, exact |
-| Q5 | `SELECT ... WHERE status=200 GROUP BY` | 2 groups after filter |
-| Q6 | `SELECT category ... LIMIT 5` | 5 rows, schema check |
-| Q7 | `SELECT ... ORDER BY status ASC LIMIT 4` | 4 rows, ascending, exact |
-| Q8 | `EXPLAIN SELECT ... WHERE` | Plan shows dslFilter pushdown |
+After making a code change to the DQE engine:
 
-## Assertions
+```bash
+# Rebuild plugin, restart OpenSearch, reload data, then run tests
+./dqe/integ-test/redeploy.sh
+./dqe/integ-test/run-phase1-tests.sh
 
-Each query file specifies expected results. The runner compares:
-- `status` — response status code
-- `total` — exact row count
-- `schema` — column names and types
-- `datarows` — exact row data (sorted if `sort_before_compare` is set)
-- `contains` — response body contains substrings (for EXPLAIN)
+# Or skip data reload if only code changed (faster):
+./dqe/integ-test/redeploy.sh --skip-data
+./dqe/integ-test/run-phase1-tests.sh
+```
 
-When `sort_before_compare` is set (e.g., `[0, 1]`), both actual and expected rows are sorted by those column indices before comparison. This handles non-deterministic row ordering from distributed execution.
+## Running Individual Tests
 
-## Adding queries
+```bash
+# Single test case
+python3 dqe/integ-test/validate.py --case dqe/integ-test/cases/phase1/basic_select/Q001_basic_column_selection.json --verbose
 
-Create `queries/Q9_your_test.json`:
+# All tests in a subdirectory
+python3 dqe/integ-test/validate.py --cases dqe/integ-test/cases/phase1/where_predicates/ --verbose
+```
+
+## Test Case Format
+
 ```json
 {
-  "id": "Q9",
-  "name": "Description",
-  "endpoint": "/_plugins/_trino_sql",
+  "name": "test_name",
   "query": "SELECT ...",
   "expected": {
-    "status": 200,
-    "schema": [{"name": "col", "type": "long"}],
-    "datarows": [[1], [2]],
-    "total": 2
+    "schema": [{"name": "col", "type": "VARCHAR"}],
+    "data": [["value1"], ["value2"]]
   },
-  "sort_before_compare": [0]
+  "ignore_order": false,
+  "float_tolerance": 0.001
 }
 ```

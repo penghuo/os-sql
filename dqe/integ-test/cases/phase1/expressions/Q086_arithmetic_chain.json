@@ -10,7 +10,7 @@
       },
       {
         "name": "computed",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

@@ -126,13 +126,14 @@ public class PlanOptimizer {
     @Override
     public DqePlanNode visitSort(SortNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new SortNode(optimizedChild, node.getSortKeys(), node.getAscending());
+      return new SortNode(
+          optimizedChild, node.getSortKeys(), node.getAscending(), node.getNullsFirst());
     }
 
     @Override
     public DqePlanNode visitLimit(LimitNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new LimitNode(optimizedChild, node.getCount());
+      return new LimitNode(optimizedChild, node.getCount(), node.getOffset());
     }
 
     @Override
@@ -203,13 +204,14 @@ public class PlanOptimizer {
       // Sort keys need to be available at the scan level
       ancestorRequiredColumns.addAll(node.getSortKeys());
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new SortNode(optimizedChild, node.getSortKeys(), node.getAscending());
+      return new SortNode(
+          optimizedChild, node.getSortKeys(), node.getAscending(), node.getNullsFirst());
     }
 
     @Override
     public DqePlanNode visitLimit(LimitNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new LimitNode(optimizedChild, node.getCount());
+      return new LimitNode(optimizedChild, node.getCount(), node.getOffset());
     }
 
     @Override
@@ -269,10 +271,11 @@ public class PlanOptimizer {
         return new FilterNode(prunedChild, filterNode.getPredicateString());
       } else if (node instanceof SortNode sortNode) {
         DqePlanNode prunedChild = pruneSubtree(sortNode.getChild(), requiredColumns);
-        return new SortNode(prunedChild, sortNode.getSortKeys(), sortNode.getAscending());
+        return new SortNode(
+            prunedChild, sortNode.getSortKeys(), sortNode.getAscending(), sortNode.getNullsFirst());
       } else if (node instanceof LimitNode limitNode) {
         DqePlanNode prunedChild = pruneSubtree(limitNode.getChild(), requiredColumns);
-        return new LimitNode(prunedChild, limitNode.getCount());
+        return new LimitNode(prunedChild, limitNode.getCount(), limitNode.getOffset());
       } else if (node instanceof EvalNode evalNode) {
         DqePlanNode prunedChild = pruneSubtree(evalNode.getChild(), requiredColumns);
         return new EvalNode(
@@ -368,13 +371,14 @@ public class PlanOptimizer {
     @Override
     public DqePlanNode visitSort(SortNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new SortNode(optimizedChild, node.getSortKeys(), node.getAscending());
+      return new SortNode(
+          optimizedChild, node.getSortKeys(), node.getAscending(), node.getNullsFirst());
     }
 
     @Override
     public DqePlanNode visitLimit(LimitNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      return new LimitNode(optimizedChild, node.getCount());
+      return new LimitNode(optimizedChild, node.getCount(), node.getOffset());
     }
 
     @Override

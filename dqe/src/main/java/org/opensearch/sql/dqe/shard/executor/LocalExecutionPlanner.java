@@ -94,7 +94,9 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
   @Override
   public Operator visitLimit(LimitNode node, Void context) {
     Operator child = node.getChild().accept(this, context);
-    return new LimitOperator(child, node.getCount());
+    // Each shard must return count + offset rows so the coordinator can apply the
+    // global offset across all shards and still have enough rows for the final limit.
+    return new LimitOperator(child, node.getCount() + node.getOffset());
   }
 
   @Override
@@ -156,7 +158,8 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
             .collect(Collectors.toList());
 
     List<Type> columnTypes = resolveColumnTypes(inputColumns);
-    return new SortOperator(child, sortColumnIndices, node.getAscending(), columnTypes);
+    return new SortOperator(
+        child, sortColumnIndices, node.getAscending(), node.getNullsFirst(), columnTypes);
   }
 
   @Override

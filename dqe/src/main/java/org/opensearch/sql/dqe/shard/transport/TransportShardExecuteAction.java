@@ -10,6 +10,7 @@ import io.trino.spi.type.BigintType;
 import io.trino.spi.type.Type;
 import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -33,14 +34,21 @@ import org.opensearch.sql.dqe.common.config.DqeSettings;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo.ColumnInfo;
+import org.opensearch.sql.dqe.function.BuiltinFunctions;
+import org.opensearch.sql.dqe.function.FunctionRegistry;
+import org.opensearch.sql.dqe.function.expression.BlockExpression;
+import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
 import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
+import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
 import org.opensearch.sql.dqe.shard.source.ColumnHandle;
 import org.opensearch.sql.dqe.shard.source.OpenSearchPageSource;
+import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
@@ -247,15 +255,118 @@ public class TransportShardExecuteAction
 
   /**
    * Resolve column types from the plan node by walking the tree to determine output column names
-   * and mapping them to types.
+   * and mapping them to types. For computed expression column names (e.g., arithmetic expressions
+   * like "(count_long * price_double)"), the result type is inferred by compiling the expression
+   * and checking the output type.
    */
   private List<Type> resolveColumnTypes(DqePlanNode node, Map<String, Type> typeMap) {
     List<String> columnNames = resolveColumnNames(node);
+
+    // Check if any column name is a computed expression (not in the type map)
+    boolean hasComputed = false;
+    for (String col : columnNames) {
+      if (!typeMap.containsKey(col)) {
+        hasComputed = true;
+        break;
+      }
+    }
+
+    if (!hasComputed) {
+      // Fast path: all columns are plain column references
+      List<Type> types = new ArrayList<>();
+      for (String col : columnNames) {
+        types.add(typeMap.getOrDefault(col, BigintType.BIGINT));
+      }
+      return types;
+    }
+
+    // Find the EvalNode in the plan to get expression strings and their output column names
+    EvalNode evalNode = findEvalNode(node);
+    Map<String, String> columnNameToExpression = new HashMap<>();
+    if (evalNode != null) {
+      List<String> evalOutputNames = evalNode.getOutputColumnNames();
+      List<String> evalExpressions = evalNode.getExpressions();
+      for (int i = 0; i < evalOutputNames.size(); i++) {
+        columnNameToExpression.put(evalOutputNames.get(i), evalExpressions.get(i));
+      }
+    }
+
+    // Build column index and type maps for expression compilation
+    TableScanNode scanNode = findTableScanNode(node);
+    List<String> tableColumns = scanNode != null ? scanNode.getColumns() : List.of();
+    Map<String, Integer> columnIndexMap = new HashMap<>();
+    for (int i = 0; i < tableColumns.size(); i++) {
+      columnIndexMap.put(tableColumns.get(i), i);
+    }
+
+    FunctionRegistry registry = BuiltinFunctions.createRegistry();
+    ExpressionCompiler compiler = new ExpressionCompiler(registry, columnIndexMap, typeMap);
+    DqeSqlParser exprParser = new DqeSqlParser();
+
     List<Type> types = new ArrayList<>();
     for (String col : columnNames) {
-      types.add(typeMap.getOrDefault(col, BigintType.BIGINT));
+      if (typeMap.containsKey(col)) {
+        types.add(typeMap.get(col));
+      } else {
+        // Try to infer the type by compiling the expression
+        String exprStr = columnNameToExpression.getOrDefault(col, col);
+        try {
+          io.trino.sql.tree.Expression expr = exprParser.parseExpression(exprStr);
+          BlockExpression blockExpr = compiler.compile(expr);
+          types.add(blockExpr.getType());
+        } catch (Exception e) {
+          // If parsing/compilation fails, fall back to BIGINT
+          types.add(BigintType.BIGINT);
+        }
+      }
     }
     return types;
+  }
+
+  /** Walk the plan tree to find the EvalNode. Returns null if none. */
+  private static EvalNode findEvalNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<EvalNode, Void>() {
+          @Override
+          public EvalNode visitEval(EvalNode node, Void context) {
+            return node;
+          }
+
+          @Override
+          public EvalNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              EvalNode result = child.accept(this, context);
+              if (result != null) {
+                return result;
+              }
+            }
+            return null;
+          }
+        },
+        null);
+  }
+
+  /** Walk the plan tree to find the TableScanNode. Returns null if none. */
+  private static TableScanNode findTableScanNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<TableScanNode, Void>() {
+          @Override
+          public TableScanNode visitTableScan(TableScanNode node, Void context) {
+            return node;
+          }
+
+          @Override
+          public TableScanNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              TableScanNode result = child.accept(this, context);
+              if (result != null) {
+                return result;
+              }
+            }
+            return null;
+          }
+        },
+        null);
   }
 
   /**

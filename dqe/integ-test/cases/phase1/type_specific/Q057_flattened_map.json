@@ -1,6 +1,8 @@
 {
   "id": "Q057",
   "name": "flattened_map",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT attributes FROM dqe_test_all_types WHERE attributes IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

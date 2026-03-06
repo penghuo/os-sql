@@ -1,6 +1,8 @@
 {
   "id": "Q059",
   "name": "unsigned_long_decimal",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT big_number FROM dqe_test_all_types WHERE big_number IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

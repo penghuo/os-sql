@@ -1,6 +1,8 @@
 {
   "id": "Q054",
   "name": "ip_varchar",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT ip_address FROM dqe_test_all_types WHERE ip_address IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

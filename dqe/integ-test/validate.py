@@ -332,6 +332,7 @@ def main():
 
     passed = 0
     failed = 0
+    skipped = 0
     total = len(test_cases)
 
     print(f"Running {total} test case(s) against {args.url}")
@@ -339,6 +340,12 @@ def main():
 
     for tc in test_cases:
         name = tc.get("name", "unnamed")
+        if tc.get("skip", False):
+            skipped += 1
+            if args.verbose:
+                reason = tc.get("skip_reason", "")
+                print(f"  SKIP: {name} ({reason})" if reason else f"  SKIP: {name}")
+            continue
         ok, errors = validate_test_case(args.url, tc)
         if ok:
             passed += 1
@@ -351,7 +358,8 @@ def main():
                 print(f"        {err}")
 
     print("=" * 60)
-    print(f"Results: {passed}/{total} passed, {failed} failed")
+    skip_msg = f", {skipped} skipped" if skipped else ""
+    print(f"Results: {passed}/{total - skipped} passed, {failed} failed{skip_msg}")
 
     sys.exit(0 if failed == 0 else 1)
 

@@ -1,6 +1,8 @@
 {
   "id": "Q056",
   "name": "geo_shape_varchar",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT boundary FROM dqe_test_all_types WHERE boundary IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

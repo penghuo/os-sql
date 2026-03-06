@@ -1,7 +1,7 @@
 {
   "id": "Q082",
   "name": "late_offset_across_shards",
-  "query": "SELECT id FROM dqe_test_sharded LIMIT 100 OFFSET 400",
+  "query": "SELECT id FROM dqe_test_sharded OFFSET 400 LIMIT 100",
   "expected": {
     "schema": [
       {

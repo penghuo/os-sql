@@ -8,7 +8,6 @@ package org.opensearch.sql.dqe.function.expression;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
-import io.trino.spi.type.BigintType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
@@ -35,7 +34,7 @@ public class NullIfBlockExpression implements BlockExpression {
     for (int pos = 0; pos < positionCount; pos++) {
       if (firstBlock.isNull(pos)) {
         builder.appendNull();
-      } else if (!secondBlock.isNull(pos) && valuesEqual(firstBlock, secondBlock, pos, type)) {
+      } else if (!secondBlock.isNull(pos) && valuesEqual(firstBlock, secondBlock, pos)) {
         builder.appendNull();
       } else {
         copyValue(firstBlock, pos, type, builder);
@@ -49,24 +48,40 @@ public class NullIfBlockExpression implements BlockExpression {
     return first.getType();
   }
 
-  private boolean valuesEqual(Block a, Block b, int pos, Type type) {
-    if (type instanceof BigintType) {
-      return BigintType.BIGINT.getLong(a, pos) == BigintType.BIGINT.getLong(b, pos);
-    } else if (type instanceof DoubleType) {
-      return DoubleType.DOUBLE.getDouble(a, pos) == DoubleType.DOUBLE.getDouble(b, pos);
-    } else if (type instanceof VarcharType) {
+  private boolean valuesEqual(Block a, Block b, int pos) {
+    Type firstType = first.getType();
+    Type secondType = second.getType();
+
+    if (firstType instanceof VarcharType && secondType instanceof VarcharType) {
       return VarcharType.VARCHAR.getSlice(a, pos).equals(VarcharType.VARCHAR.getSlice(b, pos));
     }
-    return false;
+
+    // Both numeric — promote to double if either side is DOUBLE
+    if (firstType instanceof DoubleType || secondType instanceof DoubleType) {
+      double lv = readNumeric(a, pos, firstType);
+      double rv = readNumeric(b, pos, secondType);
+      return Double.compare(lv, rv) == 0;
+    }
+
+    // Integer family (BigintType, IntegerType, SmallintType, TinyintType) — compare as long
+    return firstType.getLong(a, pos) == secondType.getLong(b, pos);
+  }
+
+  private double readNumeric(Block block, int pos, Type type) {
+    if (type instanceof DoubleType) {
+      return DoubleType.DOUBLE.getDouble(block, pos);
+    }
+    return type.getLong(block, pos);
   }
 
   private void copyValue(Block source, int pos, Type type, BlockBuilder builder) {
-    if (type instanceof BigintType) {
-      BigintType.BIGINT.writeLong(builder, BigintType.BIGINT.getLong(source, pos));
+    if (type instanceof VarcharType) {
+      VarcharType.VARCHAR.writeSlice(builder, VarcharType.VARCHAR.getSlice(source, pos));
     } else if (type instanceof DoubleType) {
       DoubleType.DOUBLE.writeDouble(builder, DoubleType.DOUBLE.getDouble(source, pos));
-    } else if (type instanceof VarcharType) {
-      VarcharType.VARCHAR.writeSlice(builder, VarcharType.VARCHAR.getSlice(source, pos));
+    } else {
+      // Integer family (BigintType, IntegerType, SmallintType, TinyintType)
+      type.writeLong(builder, type.getLong(source, pos));
     }
   }
 }

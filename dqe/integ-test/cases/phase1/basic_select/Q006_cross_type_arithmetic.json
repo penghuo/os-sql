@@ -5,7 +5,7 @@
   "expected": {
     "schema": [
       {
-        "name": "_col0",
+        "name": "(count_long * price_double)",
         "type": "double"
       }
     ],

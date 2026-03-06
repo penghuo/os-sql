@@ -10,7 +10,7 @@
       },
       {
         "name": "modulo",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

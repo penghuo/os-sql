@@ -124,12 +124,32 @@ public class ResultMerger {
   }
 
   /**
+   * Convenience overload that uses SQL-standard null ordering defaults: NULLS LAST for ASC, NULLS
+   * FIRST for DESC.
+   */
+  public List<Page> mergeSorted(
+      List<List<Page>> shardResults,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      List<Type> columnTypes,
+      long limit) {
+    return mergeSorted(
+        shardResults,
+        sortColumnIndices,
+        ascending,
+        defaultNullsFirst(ascending),
+        columnTypes,
+        limit);
+  }
+
+  /**
    * Merge-sort shard results for ORDER BY with limit. Combines all shard pages, sorts by the
    * specified sort column indices and directions, and returns the first {@code limit} rows.
    *
    * @param shardResults pages from each shard
    * @param sortColumnIndices column indices to sort by
    * @param ascending sort directions for each column
+   * @param nullsFirst true to place nulls before non-null values, false for nulls last (per column)
    * @param columnTypes Trino types for each column
    * @param limit maximum number of rows to return
    * @return sorted and limited result pages
@@ -138,6 +158,7 @@ public class ResultMerger {
       List<List<Page>> shardResults,
       List<Integer> sortColumnIndices,
       List<Boolean> ascending,
+      List<Boolean> nullsFirst,
       List<Type> columnTypes,
       long limit) {
 
@@ -158,7 +179,7 @@ public class ResultMerger {
     }
 
     // Sort
-    Comparator<Object[]> comparator = buildComparator(sortColumnIndices, ascending);
+    Comparator<Object[]> comparator = buildComparator(sortColumnIndices, ascending, nullsFirst);
     allRows.sort(comparator);
 
     // Apply limit
@@ -293,35 +314,36 @@ public class ResultMerger {
 
   /**
    * Build a composite comparator for sorting rows by multiple column indices with independent sort
-   * directions.
+   * directions and null orderings.
    */
   @SuppressWarnings("unchecked")
   private Comparator<Object[]> buildComparator(
-      List<Integer> sortColumnIndices, List<Boolean> ascending) {
+      List<Integer> sortColumnIndices, List<Boolean> ascending, List<Boolean> nullsFirst) {
 
     Comparator<Object[]> comparator = (a, b) -> 0;
 
     for (int i = 0; i < sortColumnIndices.size(); i++) {
       int colIdx = sortColumnIndices.get(i);
       boolean asc = ascending.get(i);
+      boolean nf = nullsFirst.get(i);
 
       Comparator<Object[]> keyComparator =
           (row1, row2) -> {
             Object v1 = row1[colIdx];
             Object v2 = row2[colIdx];
             if (v1 == null && v2 == null) return 0;
-            if (v1 == null) return 1;
-            if (v2 == null) return -1;
+            if (v1 == null) return nf ? -1 : 1;
+            if (v2 == null) return nf ? 1 : -1;
 
+            int cmp;
             if (v1 instanceof Comparable && v2 instanceof Comparable) {
-              return ((Comparable<Object>) v1).compareTo(v2);
+              cmp = ((Comparable<Object>) v1).compareTo(v2);
+            } else {
+              cmp = v1.toString().compareTo(v2.toString());
             }
-            return v1.toString().compareTo(v2.toString());
+            return asc ? cmp : -cmp;
           };
 
-      if (!asc) {
-        keyComparator = keyComparator.reversed();
-      }
       comparator = comparator.thenComparing(keyComparator);
     }
     return comparator;
@@ -367,5 +389,14 @@ public class ResultMerger {
       // Default: try writeLong for integer-like types
       type.writeLong(builder, ((Number) value).longValue());
     }
+  }
+
+  /** Derive Trino-compatible null ordering: NULLS LAST for both ASC and DESC. */
+  private static List<Boolean> defaultNullsFirst(List<Boolean> ascending) {
+    List<Boolean> defaults = new ArrayList<>(ascending.size());
+    for (int i = 0; i < ascending.size(); i++) {
+      defaults.add(false); // Trino defaults to NULLS LAST
+    }
+    return defaults;
   }
 }

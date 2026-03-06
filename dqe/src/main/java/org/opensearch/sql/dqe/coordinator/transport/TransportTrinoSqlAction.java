@@ -21,6 +21,7 @@ import io.trino.sql.tree.QuerySpecification;
 import io.trino.sql.tree.Statement;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -42,11 +43,16 @@ import org.opensearch.sql.dqe.coordinator.fragment.PlanFragmenter;
 import org.opensearch.sql.dqe.coordinator.merge.ResultMerger;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
+import org.opensearch.sql.dqe.function.BuiltinFunctions;
+import org.opensearch.sql.dqe.function.FunctionRegistry;
+import org.opensearch.sql.dqe.function.expression.BlockExpression;
+import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
 import org.opensearch.sql.dqe.planner.LogicalPlanner;
 import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
@@ -144,11 +150,12 @@ public class TransportTrinoSqlAction
       } else {
         columnNames = internalColumnNames;
       }
-      // Use internal names for type lookup (aliases don't exist in the type map)
-      List<Type> columnTypes = new ArrayList<>();
-      for (String col : internalColumnNames) {
-        columnTypes.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
-      }
+      // Use internal names for type lookup (aliases don't exist in the type map).
+      // For computed expressions (e.g., "(count_long * price_double)"), the column name
+      // won't exist in the type map. In that case, infer the result type by compiling
+      // the expression and checking its output type.
+      List<Type> columnTypes =
+          resolveColumnTypes(internalColumnNames, columnTypeMap, optimizedPlan);
 
       // 8. Dispatch to shards via transport
       List<PlanFragment> shardFragments = fragments.shardFragments();
@@ -175,19 +182,26 @@ public class TransportTrinoSqlAction
                         // Check if we need sorted merge
                         SortNode sortNode = findSortNode(optimizedPlan);
                         if (sortNode != null) {
+                          // Use internal column names (which include sort-only columns
+                          // appended by LogicalPlanner) to resolve sort key indices.
                           List<Integer> sortIndices =
                               sortNode.getSortKeys().stream()
-                                  .map(columnNames::indexOf)
+                                  .map(internalColumnNames::indexOf)
                                   .collect(Collectors.toList());
+                          // The sort limit must account for the global OFFSET so
+                          // that enough rows survive the merge-sort for the
+                          // subsequent applyGlobalOffset to skip correctly.
+                          long rawLimit = findGlobalLimit(optimizedPlan);
                           long sortLimit =
-                              findGlobalLimit(optimizedPlan) >= 0
-                                  ? findGlobalLimit(optimizedPlan)
+                              rawLimit >= 0
+                                  ? rawLimit + findGlobalOffset(optimizedPlan)
                                   : Long.MAX_VALUE;
                           mergedPages =
                               merger.mergeSorted(
                                   shardPages,
                                   sortIndices,
                                   sortNode.getAscending(),
+                                  sortNode.getNullsFirst(),
                                   columnTypes,
                                   sortLimit);
                         } else {
@@ -287,6 +301,132 @@ public class TransportTrinoSqlAction
     return List.of();
   }
 
+  /**
+   * Resolve Trino types for the given column names. For plain column names that exist in the type
+   * map, the mapped type is used directly. For computed expression column names (e.g., arithmetic
+   * expressions like "(count_long * price_double)"), the result type is inferred by compiling the
+   * expression and checking the output type of the resulting {@link BlockExpression}.
+   *
+   * @param columnNames the internal column names (may include expression strings)
+   * @param columnTypeMap mapping from physical column names to Trino types
+   * @param plan the optimized plan tree (used to find EvalNode expressions)
+   * @return list of resolved types, one per column name
+   */
+  static List<Type> resolveColumnTypes(
+      List<String> columnNames, Map<String, Type> columnTypeMap, DqePlanNode plan) {
+    // Check if any column name is a computed expression (not in the type map).
+    // If so, we need to compile those expressions to infer their output types.
+    boolean hasComputed = false;
+    for (String col : columnNames) {
+      if (!columnTypeMap.containsKey(col)) {
+        hasComputed = true;
+        break;
+      }
+    }
+
+    if (!hasComputed) {
+      // Fast path: all columns are plain column references
+      List<Type> types = new ArrayList<>();
+      for (String col : columnNames) {
+        types.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
+      }
+      return types;
+    }
+
+    // Find the EvalNode in the plan to get expression strings and their output column names
+    EvalNode evalNode = findEvalNode(plan);
+    Map<String, String> columnNameToExpression = new HashMap<>();
+    if (evalNode != null) {
+      List<String> evalOutputNames = evalNode.getOutputColumnNames();
+      List<String> evalExpressions = evalNode.getExpressions();
+      for (int i = 0; i < evalOutputNames.size(); i++) {
+        columnNameToExpression.put(evalOutputNames.get(i), evalExpressions.get(i));
+      }
+    }
+
+    // Build column index and type maps for expression compilation. The indices correspond
+    // to the TableScanNode columns (all physical columns of the table).
+    TableScanNode scanNode = findTableScanNode(plan);
+    List<String> tableColumns = scanNode != null ? scanNode.getColumns() : List.of();
+    Map<String, Integer> columnIndexMap = new HashMap<>();
+    for (int i = 0; i < tableColumns.size(); i++) {
+      columnIndexMap.put(tableColumns.get(i), i);
+    }
+
+    FunctionRegistry registry = BuiltinFunctions.createRegistry();
+    ExpressionCompiler compiler = new ExpressionCompiler(registry, columnIndexMap, columnTypeMap);
+    DqeSqlParser exprParser = new DqeSqlParser();
+
+    List<Type> types = new ArrayList<>();
+    for (String col : columnNames) {
+      if (columnTypeMap.containsKey(col)) {
+        types.add(columnTypeMap.get(col));
+      } else {
+        // Try to infer the type by compiling the expression
+        String exprStr = columnNameToExpression.getOrDefault(col, col);
+        try {
+          io.trino.sql.tree.Expression expr = exprParser.parseExpression(exprStr);
+          BlockExpression blockExpr = compiler.compile(expr);
+          types.add(blockExpr.getType());
+        } catch (Exception e) {
+          // If parsing/compilation fails, fall back to BIGINT
+          LOG.warn(
+              "Could not infer type for column '{}', defaulting to BIGINT: {}",
+              col,
+              e.getMessage());
+          types.add(BigintType.BIGINT);
+        }
+      }
+    }
+    return types;
+  }
+
+  /** Walk the plan tree to find the EvalNode. Returns null if none. */
+  static EvalNode findEvalNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<EvalNode, Void>() {
+          @Override
+          public EvalNode visitEval(EvalNode node, Void context) {
+            return node;
+          }
+
+          @Override
+          public EvalNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              EvalNode result = child.accept(this, context);
+              if (result != null) {
+                return result;
+              }
+            }
+            return null;
+          }
+        },
+        null);
+  }
+
+  /** Walk the plan tree to find the TableScanNode. Returns null if none. */
+  static TableScanNode findTableScanNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<TableScanNode, Void>() {
+          @Override
+          public TableScanNode visitTableScan(TableScanNode node, Void context) {
+            return node;
+          }
+
+          @Override
+          public TableScanNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              TableScanNode result = child.accept(this, context);
+              if (result != null) {
+                return result;
+              }
+            }
+            return null;
+          }
+        },
+        null);
+  }
+
   /** Walk the plan tree to find the TableScanNode and extract the index name. */
   private String findIndexName(DqePlanNode plan) {
     String indexName =
@@ -384,6 +524,7 @@ public class TransportTrinoSqlAction
     } else if (node instanceof SortNode sort) {
       sb.append(",\"sort_keys\":").append(toJsonArray(sort.getSortKeys()));
       sb.append(",\"ascending\":").append(sort.getAscending());
+      sb.append(",\"nulls_first\":").append(sort.getNullsFirst());
     } else if (node instanceof LimitNode limit) {
       sb.append(",\"count\":").append(limit.getCount());
     }

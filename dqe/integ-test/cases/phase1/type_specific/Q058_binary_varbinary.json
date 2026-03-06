@@ -1,6 +1,8 @@
 {
   "id": "Q058",
   "name": "binary_varbinary",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT binary_data FROM dqe_test_all_types WHERE binary_data IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

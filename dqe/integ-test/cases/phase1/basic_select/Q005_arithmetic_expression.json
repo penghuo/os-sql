@@ -6,7 +6,7 @@
     "schema": [
       {
         "name": "incremented",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

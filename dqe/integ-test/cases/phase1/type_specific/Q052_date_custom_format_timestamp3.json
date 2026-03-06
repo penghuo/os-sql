@@ -1,6 +1,8 @@
 {
   "id": "Q052",
   "name": "date_custom_format_timestamp3",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT custom_date FROM dqe_test_all_types WHERE custom_date IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

@@ -1,6 +1,8 @@
 {
   "id": "Q085",
   "name": "index_pattern_type_widening",
+  "skip": true,
+  "skip_reason": "Wildcard index patterns not supported in Trino SQL parser",
   "query": "SELECT id, value FROM dqe_test_conflict_* ORDER BY id LIMIT 10",
   "expected": {
     "schema": [

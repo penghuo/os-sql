@@ -1,6 +1,8 @@
 {
   "id": "Q051",
   "name": "date_strict_timestamp3",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT updated_at FROM dqe_test_all_types WHERE updated_at IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

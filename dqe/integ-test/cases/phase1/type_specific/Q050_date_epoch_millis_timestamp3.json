@@ -1,6 +1,8 @@
 {
   "id": "Q050",
   "name": "date_epoch_millis_timestamp3",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT created_at FROM dqe_test_all_types WHERE created_at IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

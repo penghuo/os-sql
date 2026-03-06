@@ -10,7 +10,7 @@
       },
       {
         "name": "val",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

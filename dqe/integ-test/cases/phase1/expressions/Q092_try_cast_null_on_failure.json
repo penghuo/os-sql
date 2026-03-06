@@ -9,8 +9,8 @@
         "type": "varchar"
       },
       {
-        "name": "_col1",
-        "type": "integer"
+        "name": "TRY_CAST(status AS INTEGER)",
+        "type": "bigint"
       }
     ],
     "data": [

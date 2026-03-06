@@ -10,7 +10,7 @@
       },
       {
         "name": "negated",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

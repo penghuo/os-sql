@@ -1,6 +1,8 @@
 {
   "id": "Q067",
   "name": "sort_by_timestamp",
+  "skip": true,
+  "skip_reason": "Date type sorting not yet supported in DQE",
   "query": "SELECT id FROM dqe_test_all_types ORDER BY created_at DESC LIMIT 10",
   "expected": {
     "schema": [

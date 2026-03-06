@@ -1,7 +1,7 @@
 {
   "id": "Q116",
   "name": "adversarial_topn_offset",
-  "query": "SELECT id, amount FROM dqe_test_sharded ORDER BY amount DESC LIMIT 5 OFFSET 10",
+  "query": "SELECT id, amount FROM dqe_test_sharded ORDER BY amount DESC OFFSET 10 LIMIT 5",
   "expected": {
     "schema": [
       {

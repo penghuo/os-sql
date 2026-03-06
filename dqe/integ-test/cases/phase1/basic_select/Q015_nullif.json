@@ -9,7 +9,7 @@
         "type": "varchar"
       },
       {
-        "name": "_col1",
+        "name": "NULLIF(int_val, 0)",
         "type": "integer"
       }
     ],

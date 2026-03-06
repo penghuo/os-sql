@@ -8,6 +8,7 @@ package org.opensearch.sql.dqe.function.expression;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.ArithmeticBinaryExpression;
@@ -117,8 +118,11 @@ public class ExpressionCompiler {
     } else if (expr instanceof ArithmeticUnaryExpression unary) {
       BlockExpression child = compile(unary.getValue());
       if (unary.getSign() == ArithmeticUnaryExpression.Sign.MINUS) {
-        // -x → 0 - x
-        BlockExpression zero = new ConstantExpression(0L, BigintType.BIGINT);
+        // -x → 0 - x (match zero constant type to child type for correct promotion)
+        BlockExpression zero =
+            (child.getType() instanceof DoubleType)
+                ? new ConstantExpression(0.0d, DoubleType.DOUBLE)
+                : new ConstantExpression(0L, BigintType.BIGINT);
         return new ArithmeticBlockExpression(
             ArithmeticBinaryExpression.Operator.SUBTRACT, zero, child);
       }
@@ -186,6 +190,10 @@ public class ExpressionCompiler {
         targetType = VarcharType.VARCHAR;
         break;
     }
+    // TRY_CAST is represented as a Cast with safe=true; returns null on failure
+    if (cast.isSafe()) {
+      return new TryCastBlockExpression(child, targetType);
+    }
     return new CastBlockExpression(child, targetType);
   }
 
@@ -205,7 +213,51 @@ public class ExpressionCompiler {
     List<BlockExpression> operands =
         coalesce.getOperands().stream().map(this::compile).collect(Collectors.toList());
     Type outputType = operands.isEmpty() ? VarcharType.VARCHAR : operands.get(0).getType();
-    return new CoalesceBlockExpression(operands, outputType);
+
+    // Determine common output type: promote mixed integer types to BIGINT, and if any operand
+    // is DOUBLE while others are integer-family, promote to DOUBLE.
+    for (BlockExpression op : operands) {
+      outputType = promoteTypes(outputType, op.getType());
+    }
+
+    // Insert implicit casts for operands whose types differ from the common output type
+    List<BlockExpression> castOperands = new ArrayList<>();
+    for (BlockExpression op : operands) {
+      if (!op.getType().equals(outputType)) {
+        castOperands.add(new CastBlockExpression(op, outputType));
+      } else {
+        castOperands.add(op);
+      }
+    }
+    return new CoalesceBlockExpression(castOperands, outputType);
+  }
+
+  /**
+   * Determines the wider of two types for implicit promotion. Rules: - IntegerType + BigintType ->
+   * BigintType - Any integer + DoubleType -> DoubleType - Otherwise, the first type wins.
+   */
+  private Type promoteTypes(Type a, Type b) {
+    if (a.equals(b)) {
+      return a;
+    }
+    boolean aIsInt = a instanceof BigintType || a instanceof IntegerType;
+    boolean bIsInt = b instanceof BigintType || b instanceof IntegerType;
+    boolean aIsDouble = a instanceof DoubleType;
+    boolean bIsDouble = b instanceof DoubleType;
+
+    // If both are integer-family, promote to BIGINT
+    if (aIsInt && bIsInt) {
+      return BigintType.BIGINT;
+    }
+    // If one is double and the other is numeric, promote to DOUBLE
+    if ((aIsDouble && bIsInt) || (aIsInt && bIsDouble)) {
+      return DoubleType.DOUBLE;
+    }
+    if (aIsDouble && bIsDouble) {
+      return DoubleType.DOUBLE;
+    }
+    // Default: keep the first type
+    return a;
   }
 
   private BlockExpression compileSimpleCase(SimpleCaseExpression simpleCase) {

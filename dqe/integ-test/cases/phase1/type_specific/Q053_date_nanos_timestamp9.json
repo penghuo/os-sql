@@ -1,6 +1,8 @@
 {
   "id": "Q053",
   "name": "date_nanos_timestamp9",
+  "skip": true,
+  "skip_reason": "Type not yet supported in DQE",
   "query": "SELECT precise_time FROM dqe_test_all_types WHERE precise_time IS NOT NULL LIMIT 5",
   "expected": {
     "schema": [

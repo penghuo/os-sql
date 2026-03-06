@@ -10,7 +10,7 @@
       },
       {
         "name": "status_code",
-        "type": "integer"
+        "type": "bigint"
       }
     ],
     "data": [

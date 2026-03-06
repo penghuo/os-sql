@@ -99,6 +99,10 @@ public class LogicalPlanner {
     }
 
     // 6. Wrap with ProjectNode (SELECT columns — after sort so sort keys are still available)
+    //    When ORDER BY references columns not in SELECT, include those columns in the
+    //    projection so the sort operator (and coordinator merge-sort) can access them.
+    //    Extra sort-only columns are appended after the SELECT columns and stripped
+    //    by the coordinator before building the response.
     List<String> outputColumns;
     if (current instanceof SortNode && current.getChildren().get(0) instanceof EvalNode evalNode) {
       outputColumns = evalNode.getOutputColumnNames();
@@ -106,6 +110,19 @@ public class LogicalPlanner {
       outputColumns = evalNode.getOutputColumnNames();
     } else {
       outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
+    }
+    if (orderBy.isPresent()) {
+      List<String> sortKeys = new ArrayList<>();
+      for (SortItem sortItem : orderBy.get().getSortItems()) {
+        sortKeys.add(sortItem.getSortKey().toString());
+      }
+      List<String> expandedColumns = new ArrayList<>(outputColumns);
+      for (String key : sortKeys) {
+        if (!expandedColumns.contains(key)) {
+          expandedColumns.add(key);
+        }
+      }
+      outputColumns = expandedColumns;
     }
     current = new ProjectNode(current, outputColumns);
 
@@ -261,13 +278,25 @@ public class LogicalPlanner {
   private static DqePlanNode buildSort(DqePlanNode child, OrderBy orderBy) {
     List<String> sortKeys = new ArrayList<>();
     List<Boolean> ascending = new ArrayList<>();
+    List<Boolean> nullsFirst = new ArrayList<>();
 
     for (SortItem sortItem : orderBy.getSortItems()) {
       sortKeys.add(sortItem.getSortKey().toString());
-      ascending.add(sortItem.getOrdering() == SortItem.Ordering.ASCENDING);
+      boolean asc = sortItem.getOrdering() == SortItem.Ordering.ASCENDING;
+      ascending.add(asc);
+
+      // Resolve null ordering: FIRST, LAST, or UNDEFINED.
+      // Trino default: NULLS LAST for both ASC and DESC.
+      SortItem.NullOrdering nullOrdering = sortItem.getNullOrdering();
+      if (nullOrdering == SortItem.NullOrdering.FIRST) {
+        nullsFirst.add(true);
+      } else {
+        // LAST or UNDEFINED: Trino defaults to NULLS LAST
+        nullsFirst.add(false);
+      }
     }
 
-    return new SortNode(child, sortKeys, ascending);
+    return new SortNode(child, sortKeys, ascending, nullsFirst);
   }
 
   private static DqePlanNode buildLimit(

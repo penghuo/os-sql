@@ -26,8 +26,21 @@ public class SortOperator implements Operator {
   private final Operator source;
   private final List<Integer> sortColumnIndices;
   private final List<Boolean> ascending;
+  private final List<Boolean> nullsFirst;
   private final List<Type> columnTypes;
   private boolean finished;
+
+  /**
+   * Convenience constructor that uses SQL-standard null ordering defaults: NULLS LAST for ASC,
+   * NULLS FIRST for DESC.
+   */
+  public SortOperator(
+      Operator source,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      List<Type> columnTypes) {
+    this(source, sortColumnIndices, ascending, defaultNullsFirst(ascending), columnTypes);
+  }
 
   /**
    * Create a SortOperator.
@@ -35,19 +48,27 @@ public class SortOperator implements Operator {
    * @param source child operator providing input pages
    * @param sortColumnIndices indices of columns to sort by (in priority order)
    * @param ascending true for ascending, false for descending (per sort column)
+   * @param nullsFirst true to sort nulls before non-null values, false for nulls last (per sort
+   *     column)
    * @param columnTypes types of all columns in the input pages
    */
   public SortOperator(
       Operator source,
       List<Integer> sortColumnIndices,
       List<Boolean> ascending,
+      List<Boolean> nullsFirst,
       List<Type> columnTypes) {
     if (sortColumnIndices.size() != ascending.size()) {
       throw new IllegalArgumentException("sortColumnIndices and ascending must have the same size");
     }
+    if (sortColumnIndices.size() != nullsFirst.size()) {
+      throw new IllegalArgumentException(
+          "sortColumnIndices and nullsFirst must have the same size");
+    }
     this.source = source;
     this.sortColumnIndices = sortColumnIndices;
     this.ascending = ascending;
+    this.nullsFirst = nullsFirst;
     this.columnTypes = columnTypes;
     this.finished = false;
   }
@@ -118,6 +139,7 @@ public class SortOperator implements Operator {
     for (int i = 0; i < sortColumnIndices.size(); i++) {
       int colIdx = sortColumnIndices.get(i);
       boolean asc = ascending.get(i);
+      boolean nf = nullsFirst.get(i);
       Type type = columnTypes.get(colIdx);
       Block block = page.getBlock(colIdx);
 
@@ -126,8 +148,8 @@ public class SortOperator implements Operator {
             boolean aNull = block.isNull(a);
             boolean bNull = block.isNull(b);
             if (aNull && bNull) return 0;
-            if (aNull) return 1; // nulls last
-            if (bNull) return -1;
+            if (aNull) return nf ? -1 : 1;
+            if (bNull) return nf ? 1 : -1;
 
             int cmp = compareValues(block, a, b, type);
             return asc ? cmp : -cmp;
@@ -158,5 +180,14 @@ public class SortOperator implements Operator {
   @Override
   public void close() {
     source.close();
+  }
+
+  /** Derive Trino-compatible null ordering: NULLS LAST for both ASC and DESC. */
+  private static List<Boolean> defaultNullsFirst(List<Boolean> ascending) {
+    List<Boolean> defaults = new ArrayList<>(ascending.size());
+    for (int i = 0; i < ascending.size(); i++) {
+      defaults.add(false); // Trino defaults to NULLS LAST
+    }
+    return defaults;
   }
 }

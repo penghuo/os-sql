@@ -35,28 +35,32 @@ for PARQUET_FILE in "$DATA_DIR"/hits_*.parquet; do
     FNAME=$(basename "$PARQUET_FILE")
     log "  Processing $FNAME..."
 
-    # Use clickhouse-local to read parquet and output JSONEachRow
-    # Pipe through a transformer that adds bulk action lines
+    # Use clickhouse-local to read parquet and output JSONEachRow.
+    # Use awk (much faster than bash while-loop) to prepend bulk action lines,
+    # then split into chunks and upload each immediately.
     clickhouse-local -q "SELECT * FROM file('$PARQUET_FILE', Parquet) FORMAT JSONEachRow" | \
-    while IFS= read -r line; do
-        echo '{"index":{"_index":"'"$INDEX_NAME"'"}}'
-        echo "$line"
-    done | \
+    awk -v idx="$INDEX_NAME" '{print "{\"index\":{\"_index\":\"" idx "\"}}"; print}' | \
     split -l $((BULK_SIZE * 2)) -a 4 - /tmp/os_bulk_chunk_
 
     for CHUNK in /tmp/os_bulk_chunk_*; do
-        RESPONSE=$(curl -sf -XPOST "${OS_URL}/_bulk" \
+        HTTP_CODE=$(curl -s -o /tmp/os_bulk_resp.json -w '%{http_code}' -XPOST "${OS_URL}/_bulk" \
             -H 'Content-Type: application/x-ndjson' \
             --data-binary @"$CHUNK")
-        ERRORS=$(echo "$RESPONSE" | jq -r '.errors')
-        if [ "$ERRORS" = "true" ]; then
-            log "    WARNING: Bulk request had errors in $CHUNK"
-            echo "$RESPONSE" | jq '.items[] | select(.index.error != null) | .index.error' | head -5
+        if [ "$HTTP_CODE" != "200" ]; then
+            log "    WARNING: Bulk request returned HTTP $HTTP_CODE for $CHUNK"
+        else
+            ERRORS=$(jq -r '.errors' /tmp/os_bulk_resp.json 2>/dev/null)
+            if [ "$ERRORS" = "true" ]; then
+                log "    WARNING: Bulk request had errors in $CHUNK"
+                jq '.items[] | select(.index.error != null) | .index.error' /tmp/os_bulk_resp.json | head -5
+            fi
         fi
         CHUNK_DOCS=$(wc -l < "$CHUNK")
         TOTAL_INDEXED=$((TOTAL_INDEXED + CHUNK_DOCS / 2))
         rm -f "$CHUNK"
     done
+    rm -f /tmp/os_bulk_resp.json
+    log "    $TOTAL_INDEXED docs indexed so far..."
 done
 
 # Re-enable refresh and force merge

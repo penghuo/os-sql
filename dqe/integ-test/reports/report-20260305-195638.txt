@@ -1,0 +1,27 @@
+============================================
+  DQE Phase 1 Integration Test Report
+  2026-03-05 19:56:40
+  Cluster: http://localhost:9200
+============================================
+
+  ID     Result Name
+  ------ ------ ----
+  Q1     PASS   Simple SELECT with two columns
+  Q2     PASS   SELECT with WHERE filter on status
+  Q3     FAIL   GROUP BY with COUNT aggregate
+               schema mismatch\n        expected: [{"name":"category","type":"keyword"},{"name":"COUNT(*)","type":"long"}]\n        actual:   [{"name":"category","type":"keyword"},{"name":"count(*)","type":"long"}]
+  Q4     FAIL   ORDER BY DESC with LIMIT
+               datarows[2] mismatch\n        expected: ["error",500]\n        actual:   ["info",200]
+  Q5     FAIL   WHERE filter combined with GROUP BY COUNT
+               schema mismatch\n        expected: [{"name":"category","type":"keyword"},{"name":"COUNT(*)","type":"long"}]\n        actual:   [{"name":"category","type":"keyword"},{"name":"count(*)","type":"long"}]
+  Q6     PASS   SELECT single column with LIMIT
+  Q7     FAIL   ORDER BY ASC with LIMIT
+               datarows[0] mismatch\n        expected: ["debug",200]\n        actual:   ["info",200]
+  Q8     FAIL   EXPLAIN shows logical plan, optimized plan, and shard fragments
+               Response missing 'dsl_filter'
+
+  Passed: 3/8
+  Failed: 5/8
+
+  SOME TESTS FAILED
+============================================

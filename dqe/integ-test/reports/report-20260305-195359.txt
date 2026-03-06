@@ -1,0 +1,30 @@
+============================================
+  DQE Phase 1 Integration Test Report
+  2026-03-05 19:54:01
+  Cluster: http://localhost:9200
+============================================
+
+  ID     Result Name
+  ------ ------ ----
+  Q1     FAIL   Simple SELECT with two columns
+               HTTP request failed
+  Q2     FAIL   SELECT with WHERE filter on status
+               HTTP request failed
+  Q3     FAIL   GROUP BY with COUNT aggregate
+               HTTP request failed
+  Q4     FAIL   ORDER BY DESC with LIMIT
+               HTTP request failed
+  Q5     FAIL   WHERE filter combined with GROUP BY COUNT
+               HTTP request failed
+  Q6     FAIL   SELECT single column with LIMIT
+               HTTP request failed
+  Q7     FAIL   ORDER BY ASC with LIMIT
+               HTTP request failed
+  Q8     FAIL   EXPLAIN shows logical plan, optimized plan, and shard fragments
+               HTTP request failed
+
+  Passed: 0/8
+  Failed: 8/8
+
+  SOME TESTS FAILED
+============================================

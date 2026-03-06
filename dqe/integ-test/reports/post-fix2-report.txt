@@ -1,0 +1,712 @@
+=== DQE Phase 1 Tests ===
+
+--- basic_select ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: basic_column_selection
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: star_expansion
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: column_aliases
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: multi_column_selection
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: arithmetic_expression
+        Column 0 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: cross_type_arithmetic
+        Column 0 name mismatch: expected '_col0', got '(count_long * price_double)'
+        Column 0 type mismatch: expected 'double' (DOUBLE), got 'long' (BIGINT)
+        Row 0, Col 0: expected -790806873.6042761, got -4483455059622012693
+        Row 2, Col 0: expected 4199.58, got 4648721847731657772
+        Row 3, Col 0: expected 4897143842.8367195, got 4661339501742868398
+        Row 4, Col 0: expected 626.486316, got 4751929034750649140
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: explicit_cast_bigint
+        Column 0 name mismatch: expected '_col0', got 'CAST(count_int AS BIGINT)'
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: cast_to_string
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: object_field_dot_notation
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: geo_point_row_access
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: limit_zero
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: offset
+        Row 0, Col 0: expected 'id_00004', got 'id_00001'
+        Row 1, Col 0: expected 'id_00005', got 'id_00002'
+        Row 2, Col 0: expected 'id_00006', got 'id_00003'
+        Row 3, Col 0: expected 'id_00007', got 'id_00004'
+        Row 4, Col 0: expected 'id_00008', got 'id_00005'
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: multiple_cast_targets
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: coalesce
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: nullif
+        Column 1 name mismatch: expected '_col1', got 'NULLIF(int_val, 0)'
+        Column 1 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+        Row 1, Col 1: expected 100, got None
+        Row 3, Col 1: expected 20, got None
+        Row 4, Col 1: expected 30, got None
+        Row 5, Col 1: expected 40, got None
+        Row 6, Col 1: expected 50, got None
+        Row 7, Col 1: expected -949, got None
+        Row 8, Col 1: expected -939, got None
+        Row 9, Col 1: expected -81, got None
+============================================================
+Results: 0/1 passed, 1 failed
+
+--- where_predicates ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: equality_term_pushdown
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: inequality
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: greater_than_range
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: greater_equal
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: less_than
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: less_equal
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: and_bool_must
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: or_bool_should
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: not_bool_must_not
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: in_terms_pushdown
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: between_range
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: like_prefix
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: like_contains
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: is_null
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: is_not_null
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: nested_boolean
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: cast_in_where
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: cross_column_expression
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: boolean_equality
+        Row count mismatch: expected 47, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: timestamp_comparison
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: ip_field_equality
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: multiple_null_checks
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: scaled_float_comparison
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: unsigned_long_exceeding_bigint
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: always_true_predicate
+============================================================
+Results: 1/1 passed, 0 failed
+
+--- type_specific ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: long_bigint
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: integer_int
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: short_smallint
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: byte_tinyint
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: double_double
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: float_real
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: half_float_real
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: scaled_float_decimal
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: boolean_boolean
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: date_epoch_millis_timestamp3
+        Column 0 type mismatch: expected 'BIGINT' (BIGINT), got 'keyword' (VARCHAR)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: date_strict_timestamp3
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: date_custom_format_timestamp3
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: date_nanos_timestamp9
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: ip_varchar
+        Column 0 type mismatch: expected 'ipaddress' (IP), got 'keyword' (VARCHAR)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: geo_point_row
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: geo_shape_varchar
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: flattened_map
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: binary_varbinary
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: unsigned_long_decimal
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: text_multifield_keyword
+============================================================
+Results: 1/1 passed, 0 failed
+
+--- order_by_limit ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: single_column_asc
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: single_column_desc
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: multi_column_sort
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: nulls_first
+        Row 0, Col 0: expected 'null_0021', got 'null_0020'
+        Row 0, Col 1: expected None, got -977
+        Row 1, Col 0: expected 'null_0038', got 'null_0008'
+        Row 1, Col 1: expected None, got -949
+        Row 2, Col 0: expected 'null_0015', got 'null_0009'
+        Row 2, Col 1: expected None, got -939
+        Row 3, Col 0: expected 'null_0003', got 'null_0046'
+        Row 3, Col 1: expected None, got -919
+        Row 4, Col 0: expected 'null_0013', got 'null_0036'
+        Row 4, Col 1: expected None, got -876
+        Row 5, Col 0: expected 'null_0001', got 'null_0019'
+        Row 5, Col 1: expected None, got -687
+        Row 6, Col 0: expected 'null_0022', got 'null_0017'
+        Row 6, Col 1: expected None, got -565
+        Row 7, Col 0: expected 'null_0014', got 'null_0011'
+        Row 7, Col 1: expected None, got -311
+        Row 8, Col 0: expected 'null_0045', got 'null_0034'
+        Row 8, Col 1: expected None, got -201
+        Row 9, Col 0: expected 'null_0040', got 'null_0030'
+        Row 9, Col 1: expected None, got -133
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: nulls_last
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: limit_with_offset
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: sort_by_timestamp
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: sort_by_double
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: filter_sort_limit
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: large_limit
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: limit_one_topn
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: sort_text_fielddata
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: sort_scaled_float
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: sort_unsigned_long
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: full_sort_sharded_no_limit
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: adversarial_topn_desc
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: adversarial_topn_asc
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: adversarial_topn_offset
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: adversarial_topn_single_row
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: adversarial_topn_filter
+============================================================
+Results: 1/1 passed, 0 failed
+
+--- multi_shard ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: range_scan_across_shards
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: full_scan_5_shards
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: filter_sort_across_shards
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: reverse_sort_across_shards
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: point_lookup_single_shard
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: limit_arbitrary_shard_order
+        Row 0, Col 0: expected 'id_00004', got 'id_00003'
+        Row 1, Col 0: expected 'id_00029', got 'id_00005'
+        Row 2, Col 0: expected 'id_00031', got 'id_00009'
+        Row 3, Col 0: expected 'id_00032', got 'id_00011'
+        Row 4, Col 0: expected 'id_00033', got 'id_00013'
+        Row 5, Col 0: expected 'id_00038', got 'id_00016'
+        Row 6, Col 0: expected 'id_00043', got 'id_00017'
+        Row 7, Col 0: expected 'id_00046', got 'id_00019'
+        Row 8, Col 0: expected 'id_00050', got 'id_00035'
+        Row 9, Col 0: expected 'id_00051', got 'id_00036'
+        Row 10, Col 0: expected 'id_00055', got 'id_00037'
+        Row 11, Col 0: expected 'id_00056', got 'id_00041'
+        Row 12, Col 0: expected 'id_00059', got 'id_00042'
+        Row 13, Col 0: expected 'id_00060', got 'id_00049'
+        Row 14, Col 0: expected 'id_00061', got 'id_00053'
+        Row 15, Col 0: expected 'id_00064', got 'id_00054'
+        Row 16, Col 0: expected 'id_00065', got 'id_00062'
+        Row 17, Col 0: expected 'id_00081', got 'id_00073'
+        Row 18, Col 0: expected 'id_00085', got 'id_00075'
+        Row 19, Col 0: expected 'id_00088', got 'id_00076'
+        Row 20, Col 0: expected 'id_00090', got 'id_00080'
+        Row 21, Col 0: expected 'id_00091', got 'id_00093'
+        Row 22, Col 0: expected 'id_00099', got 'id_00095'
+        Row 23, Col 0: expected 'id_00108', got 'id_00101'
+        Row 24, Col 0: expected 'id_00109', got 'id_00105'
+        Row 25, Col 0: expected 'id_00111', got 'id_00110'
+        Row 26, Col 0: expected 'id_00120', got 'id_00125'
+        Row 27, Col 0: expected 'id_00123', got 'id_00127'
+        Row 28, Col 0: expected 'id_00128', got 'id_00133'
+        Row 29, Col 0: expected 'id_00132', got 'id_00136'
+        Row 30, Col 0: expected 'id_00142', got 'id_00143'
+        Row 31, Col 0: expected 'id_00149', got 'id_00144'
+        Row 32, Col 0: expected 'id_00150', got 'id_00152'
+        Row 33, Col 0: expected 'id_00153', got 'id_00177'
+        Row 34, Col 0: expected 'id_00154', got 'id_00184'
+        Row 35, Col 0: expected 'id_00156', got 'id_00187'
+        Row 36, Col 0: expected 'id_00159', got 'id_00189'
+        Row 37, Col 0: expected 'id_00161', got 'id_00191'
+        Row 38, Col 0: expected 'id_00171', got 'id_00199'
+        Row 39, Col 0: expected 'id_00174', got 'id_00202'
+        Row 40, Col 0: expected 'id_00175', got 'id_00206'
+        Row 41, Col 0: expected 'id_00178', got 'id_00216'
+        Row 42, Col 0: expected 'id_00186', got 'id_00220'
+        Row 43, Col 0: expected 'id_00194', got 'id_00225'
+        Row 44, Col 0: expected 'id_00196', got 'id_00227'
+        Row 45, Col 0: expected 'id_00203', got 'id_00229'
+        Row 46, Col 0: expected 'id_00212', got 'id_00231'
+        Row 47, Col 0: expected 'id_00215', got 'id_00233'
+        Row 48, Col 0: expected 'id_00217', got 'id_00234'
+        Row 49, Col 0: expected 'id_00219', got 'id_00235'
+        Row 50, Col 0: expected 'id_00222', got 'id_00236'
+        Row 51, Col 0: expected 'id_00224', got 'id_00240'
+        Row 52, Col 0: expected 'id_00228', got 'id_00243'
+        Row 53, Col 0: expected 'id_00230', got 'id_00245'
+        Row 54, Col 0: expected 'id_00239', got 'id_00248'
+        Row 55, Col 0: expected 'id_00242', got 'id_00251'
+        Row 56, Col 0: expected 'id_00250', got 'id_00256'
+        Row 57, Col 0: expected 'id_00255', got 'id_00260'
+        Row 58, Col 0: expected 'id_00257', got 'id_00263'
+        Row 59, Col 0: expected 'id_00265', got 'id_00268'
+        Row 60, Col 0: expected 'id_00266', got 'id_00275'
+        Row 61, Col 0: expected 'id_00267', got 'id_00276'
+        Row 62, Col 0: expected 'id_00269', got 'id_00284'
+        Row 63, Col 0: expected 'id_00271', got 'id_00285'
+        Row 64, Col 0: expected 'id_00272', got 'id_00286'
+        Row 65, Col 0: expected 'id_00288', got 'id_00292'
+        Row 66, Col 0: expected 'id_00289', got 'id_00308'
+        Row 67, Col 0: expected 'id_00290', got 'id_00312'
+        Row 68, Col 0: expected 'id_00293', got 'id_00318'
+        Row 69, Col 0: expected 'id_00294', got 'id_00323'
+        Row 70, Col 0: expected 'id_00298', got 'id_00326'
+        Row 71, Col 0: expected 'id_00299', got 'id_00328'
+        Row 72, Col 0: expected 'id_00304', got 'id_00329'
+        Row 73, Col 0: expected 'id_00311', got 'id_00335'
+        Row 74, Col 0: expected 'id_00313', got 'id_00343'
+        Row 75, Col 0: expected 'id_00317', got 'id_00344'
+        Row 76, Col 0: expected 'id_00327', got 'id_00346'
+        Row 77, Col 0: expected 'id_00338', got 'id_00347'
+        Row 78, Col 0: expected 'id_00339', got 'id_00349'
+        Row 79, Col 0: expected 'id_00340', got 'id_00352'
+        Row 80, Col 0: expected 'id_00342', got 'id_00353'
+        Row 81, Col 0: expected 'id_00350', got 'id_00357'
+        Row 82, Col 0: expected 'id_00351', got 'id_00359'
+        Row 83, Col 0: expected 'id_00354', got 'id_00361'
+        Row 84, Col 0: expected 'id_00366', got 'id_00363'
+        Row 85, Col 0: expected 'id_00369', got 'id_00370'
+        Row 86, Col 0: expected 'id_00376', got 'id_00375'
+        Row 87, Col 0: expected 'id_00377', got 'id_00379'
+        Row 88, Col 0: expected 'id_00381', got 'id_00380'
+        Row 89, Col 0: expected 'id_00386', got 'id_00385'
+        Row 90, Col 0: expected 'id_00387', got 'id_00393'
+        Row 91, Col 0: expected 'id_00388', got 'id_00396'
+        Row 92, Col 0: expected 'id_00390', got 'id_00404'
+        Row 93, Col 0: expected 'id_00391', got 'id_00413'
+        Row 94, Col 0: expected 'id_00401', got 'id_00428'
+        Row 95, Col 0: expected 'id_00406', got 'id_00437'
+        Row 96, Col 0: expected 'id_00408', got 'id_00445'
+        Row 97, Col 0: expected 'id_00420', got 'id_00449'
+        Row 98, Col 0: expected 'id_00421', got 'id_00456'
+        Row 99, Col 0: expected 'id_00425', got 'id_00461'
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: late_offset_across_shards
+        Row count mismatch: expected 100, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: conflict_index_a
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: conflict_index_b
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: index_pattern_type_widening
+        Row count too low: expected at least 1, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: full_scan_uniqueness_assertion
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: uniqueness_completeness_multi_col
+============================================================
+Results: 1/1 passed, 0 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: filtered_uniqueness
+============================================================
+Results: 1/1 passed, 0 failed
+
+--- expressions ---
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: arithmetic_chain
+        Column 1 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: unary_negation
+        Column 1 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: modulo_operator
+        Column 1 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: searched_case_expression
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: simple_case_expression
+        Column 1 type mismatch: expected 'integer' (INTEGER), got 'long' (BIGINT)
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: case_as_conditional
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: try_cast_null_on_failure
+        Row count mismatch: expected 5, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: nullif_coalesce_combined
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  FAIL: coalesce_with_null
+        Row count mismatch: expected 10, got 0
+============================================================
+Results: 0/1 passed, 1 failed
+Running 1 test case(s) against http://localhost:9200
+============================================================
+  PASS: combined_predicates
+============================================================
+Results: 1/1 passed, 0 failed
+
+============================================================
+Phase 1 Total: 59/103 passed, 44 failed
+============================================================

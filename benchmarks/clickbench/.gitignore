@@ -1,0 +1,17 @@
+# Downloaded parquet files (~15GB)
+data/parquet/
+
+# Benchmark result JSONs (machine-specific)
+results/opensearch/*.json
+results/clickhouse/*.json
+
+# Correctness comparison outputs
+correctness/*.out
+correctness/*.txt
+correctness/summary.json
+
+# EBS snapshot config
+.snapshot_config
+
+# ClickBench viewer clone
+viewer/clickbench-website/

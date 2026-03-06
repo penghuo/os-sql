@@ -26,15 +26,13 @@
           "value": { "type": "integer" }
         }
       },
-      "flattened_field": { "type": "flattened" },
       "object_field": {
         "properties": {
           "inner_keyword": { "type": "keyword" },
           "inner_integer": { "type": "integer" }
         }
       },
-      "geo_shape_field": { "type": "geo_shape" },
-      "dense_vector_field": { "type": "knn_vector", "dimension": 3, "method": { "name": "hnsw", "space_type": "l2", "engine": "lucene" } }
+      "geo_shape_field": { "type": "geo_shape" }
     }
   }
 }

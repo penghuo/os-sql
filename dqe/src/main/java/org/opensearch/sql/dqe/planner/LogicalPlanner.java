@@ -25,8 +25,10 @@ import io.trino.sql.tree.SortItem;
 import io.trino.sql.tree.Statement;
 import io.trino.sql.tree.Table;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -100,10 +102,14 @@ public class LogicalPlanner {
       current = maybeInsertEvalNode(current, querySpec);
     }
 
+    // Build alias map for resolving ORDER BY references to internal column names.
+    // Maps SQL alias (e.g., "c") → internal column name (e.g., "count(*)").
+    Map<String, String> aliasToInternal = buildAliasMap(querySpec, scanNode.getColumns());
+
     // 5. Wrap with SortNode if ORDER BY exists (BEFORE Project, so sort keys are available)
     Optional<OrderBy> orderBy = querySpec.getOrderBy().or(query::getOrderBy);
     if (orderBy.isPresent()) {
-      current = buildSort(current, orderBy.get());
+      current = buildSort(current, orderBy.get(), aliasToInternal);
     }
 
     // 6. Wrap with ProjectNode (SELECT columns — after sort so sort keys are still available)
@@ -120,14 +126,11 @@ public class LogicalPlanner {
       outputColumns = extractOutputColumns(querySpec, scanNode.getColumns());
     }
     if (orderBy.isPresent()) {
-      List<String> sortKeys = new ArrayList<>();
-      for (SortItem sortItem : orderBy.get().getSortItems()) {
-        sortKeys.add(sortItem.getSortKey().toString());
-      }
       List<String> expandedColumns = new ArrayList<>(outputColumns);
-      for (String key : sortKeys) {
-        if (!expandedColumns.contains(key)) {
-          expandedColumns.add(key);
+      for (SortItem sortItem : orderBy.get().getSortItems()) {
+        String resolvedKey = resolveSortKey(sortItem.getSortKey(), aliasToInternal);
+        if (!expandedColumns.contains(resolvedKey)) {
+          expandedColumns.add(resolvedKey);
         }
       }
       outputColumns = expandedColumns;
@@ -414,13 +417,14 @@ public class LogicalPlanner {
         child, groupByKeys, aggregateFunctions, AggregationNode.Step.PARTIAL);
   }
 
-  private static DqePlanNode buildSort(DqePlanNode child, OrderBy orderBy) {
+  private static DqePlanNode buildSort(
+      DqePlanNode child, OrderBy orderBy, Map<String, String> aliasToInternal) {
     List<String> sortKeys = new ArrayList<>();
     List<Boolean> ascending = new ArrayList<>();
     List<Boolean> nullsFirst = new ArrayList<>();
 
     for (SortItem sortItem : orderBy.getSortItems()) {
-      sortKeys.add(sortItem.getSortKey().toString());
+      sortKeys.add(resolveSortKey(sortItem.getSortKey(), aliasToInternal));
       boolean asc = sortItem.getOrdering() == SortItem.Ordering.ASCENDING;
       ascending.add(asc);
 
@@ -436,6 +440,46 @@ public class LogicalPlanner {
     }
 
     return new SortNode(child, sortKeys, ascending, nullsFirst);
+  }
+
+  /**
+   * Resolve a sort key expression to an internal column name. Handles:
+   *
+   * <ul>
+   *   <li>SQL aliases (e.g., "c" → "count(*)" when SELECT ... AS c)
+   *   <li>Function call casing (e.g., "COUNT(*)" → "count(*)")
+   *   <li>Plain column references (passed through unchanged)
+   * </ul>
+   */
+  private static String resolveSortKey(Expression sortKey, Map<String, String> aliasToInternal) {
+    // 1. Check alias map first (e.g., ORDER BY c → count(*))
+    if (sortKey instanceof Identifier id) {
+      String aliasName = id.getValue();
+      if (aliasToInternal.containsKey(aliasName)) {
+        return aliasToInternal.get(aliasName);
+      }
+      return aliasName;
+    }
+    // 2. For expressions (e.g., COUNT(*), SUM(col)), use expressionToColumnName
+    //    which normalizes function name casing
+    return expressionToColumnName(sortKey);
+  }
+
+  /**
+   * Build a map from SQL aliases to internal column names. For each SELECT item that has an alias
+   * (e.g., {@code COUNT(*) AS c}), maps the alias to the internal name (e.g., "c" → "count(*)").
+   */
+  private static Map<String, String> buildAliasMap(
+      QuerySpecification querySpec, List<String> allTableColumns) {
+    Map<String, String> aliases = new HashMap<>();
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn && singleColumn.getAlias().isPresent()) {
+        String alias = singleColumn.getAlias().get().getValue();
+        String internalName = expressionToColumnName(singleColumn.getExpression());
+        aliases.put(alias, internalName);
+      }
+    }
+    return aliases;
   }
 
   private static DqePlanNode buildLimit(

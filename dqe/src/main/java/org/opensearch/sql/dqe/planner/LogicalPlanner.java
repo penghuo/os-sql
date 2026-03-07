@@ -26,6 +26,7 @@ import io.trino.sql.tree.Table;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -81,14 +82,19 @@ public class LogicalPlanner {
       current = new FilterNode(current, where.get().toString());
     }
 
-    // 3. Wrap with AggregationNode if GROUP BY exists
+    // 3. Wrap with AggregationNode if GROUP BY exists or SELECT has aggregate functions
     Optional<GroupBy> groupBy = querySpec.getGroupBy();
+    boolean hasAggregatesInSelect = hasAggregateFunctions(querySpec);
     if (groupBy.isPresent()) {
       current = buildAggregation(current, querySpec, groupBy.get());
+    } else if (hasAggregatesInSelect) {
+      // Global aggregation: no GROUP BY but SELECT has aggregate functions
+      // (e.g., SELECT COUNT(*) FROM hits)
+      current = buildGlobalAggregation(current, querySpec);
     }
 
-    // 4. Insert EvalNode for computed columns if needed (outside of GROUP BY)
-    if (groupBy.isEmpty()) {
+    // 4. Insert EvalNode for computed columns if needed (outside of aggregation)
+    if (groupBy.isEmpty() && !hasAggregatesInSelect) {
       current = maybeInsertEvalNode(current, querySpec);
     }
 
@@ -240,12 +246,67 @@ public class LogicalPlanner {
       return identifier.getValue();
     }
     if (expr instanceof FunctionCall functionCall) {
-      return functionCall.getName().toString()
-          + "("
-          + (functionCall.getArguments().isEmpty() ? "*" : functionCall.getArguments().toString())
-          + ")";
+      String args;
+      if (functionCall.getArguments().isEmpty()) {
+        args = "*";
+      } else {
+        args =
+            functionCall.getArguments().stream()
+                .map(Object::toString)
+                .collect(java.util.stream.Collectors.joining(", "));
+      }
+      return functionCall.getName().toString() + "(" + args + ")";
     }
     return expr.toString();
+  }
+
+  /** Known aggregate function names used to detect global aggregation queries. */
+  private static final Set<String> AGGREGATE_FUNCTION_NAMES =
+      Set.of("count", "sum", "avg", "min", "max", "stddev", "variance", "bool_and", "bool_or");
+
+  /** Check if any SELECT item contains an aggregate function call. */
+  private static boolean hasAggregateFunctions(QuerySpecification querySpec) {
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
+        if (containsAggregateFunction(singleColumn.getExpression())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Recursively check if an expression contains an aggregate function call. */
+  private static boolean containsAggregateFunction(Expression expr) {
+    if (expr instanceof FunctionCall functionCall) {
+      String name = functionCall.getName().toString().toLowerCase();
+      if (AGGREGATE_FUNCTION_NAMES.contains(name)) {
+        return true;
+      }
+    }
+    // Check child expressions
+    for (Node child : expr.getChildren()) {
+      if (child instanceof Expression childExpr && containsAggregateFunction(childExpr)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Build a global aggregation (no GROUP BY keys) for queries like SELECT COUNT(*) FROM table. */
+  private static DqePlanNode buildGlobalAggregation(
+      DqePlanNode child, QuerySpecification querySpec) {
+    List<String> aggregateFunctions = new ArrayList<>();
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
+        Expression expr = singleColumn.getExpression();
+        if (expr instanceof FunctionCall functionCall) {
+          aggregateFunctions.add(expressionToColumnName(functionCall));
+        }
+      }
+    }
+
+    return new AggregationNode(child, List.of(), aggregateFunctions, AggregationNode.Step.PARTIAL);
   }
 
   private static DqePlanNode buildAggregation(

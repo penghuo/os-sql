@@ -40,7 +40,7 @@ public class ResultMerger {
    * COUNT(*)}, {@code SUM(amount)}, {@code MIN(price)}, {@code MAX(salary)}.
    */
   private static final Pattern AGG_PATTERN =
-      Pattern.compile("^(COUNT|SUM|MIN|MAX)\\((.+)\\)$", Pattern.CASE_INSENSITIVE);
+      Pattern.compile("^(COUNT|SUM|MIN|MAX|AVG)\\((.+)\\)$", Pattern.CASE_INSENSITIVE);
 
   /** Merge shard results for a non-aggregate query. Simple concatenation of all pages. */
   public List<Page> mergePassthrough(List<List<Page>> shardResults) {
@@ -244,6 +244,8 @@ public class ResultMerger {
         return minValue(groupRows, colIdx);
       case "MAX":
         return maxValue(groupRows, colIdx);
+      case "AVG":
+        return avgValues(groupRows, colIdx);
       default:
         throw new UnsupportedOperationException("Unsupported aggregate function: " + funcName);
     }
@@ -310,6 +312,24 @@ public class ResultMerger {
       }
     }
     return hasDouble ? max : longMax;
+  }
+
+  /**
+   * Average numeric values for a given column across all rows. Note: this averages the partial
+   * averages from each shard, which is only correct for single-shard indices or when all shards
+   * have equal row counts.
+   */
+  private Number avgValues(List<Object[]> rows, int colIdx) {
+    double sum = 0.0;
+    int count = 0;
+    for (Object[] row : rows) {
+      Number val = (Number) row[colIdx];
+      if (val != null) {
+        sum += val.doubleValue();
+        count++;
+      }
+    }
+    return count > 0 ? sum / count : null;
   }
 
   /**

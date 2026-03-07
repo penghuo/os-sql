@@ -187,14 +187,16 @@ load_1m_data() {
         log "Creating ClickHouse '${CH_TABLE_1M}' table ..."
         # Derive the 1M CREATE TABLE from the full-dataset schema
         local create_sql
-        create_sql=$(sed "s/hits/${CH_TABLE_1M}/g" "$ch_schema_file")
+        create_sql=$(sed "s/\bhits\b/${CH_TABLE_1M}/g" "$ch_schema_file")
         clickhouse-client --host "$CH_HOST" --port "$CH_PORT" \
             -q "DROP TABLE IF EXISTS ${CH_TABLE_1M}"
         echo "$create_sql" | clickhouse-client --host "$CH_HOST" --port "$CH_PORT"
 
         log "Loading first parquet file into ${CH_TABLE_1M} (LIMIT 1000000) ..."
-        sudo cp "$first_parquet" /var/lib/clickhouse/user_files/
-        sudo chown clickhouse:clickhouse "/var/lib/clickhouse/user_files/$(basename "$first_parquet")"
+        local ch_user_files="${CH_DATA_DIR}/user_files"
+        sudo mkdir -p "$ch_user_files"
+        sudo cp "$first_parquet" "$ch_user_files/"
+        sudo chown clickhouse:clickhouse "${ch_user_files}/$(basename "$first_parquet")"
         clickhouse-client --host "$CH_HOST" --port "$CH_PORT" \
             -q "INSERT INTO ${CH_TABLE_1M}
                 SELECT * FROM file('$(basename "$first_parquet")', Parquet)

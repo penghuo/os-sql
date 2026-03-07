@@ -112,8 +112,8 @@ while IFS= read -r query; do
         query=$(echo "$query" | sed "s/\bhits\b/${TARGET_INDEX}/g")
     fi
 
-    # Escape the query for JSON payload
-    ESCAPED_QUERY=$(echo "$query" | jq -Rs '.')
+    # Escape the query for JSON payload (printf avoids trailing newline)
+    ESCAPED_QUERY=$(printf '%s' "$query" | jq -Rs '.')
 
     TIMES="[]"
     for i in $(seq 1 "$TRIES"); do

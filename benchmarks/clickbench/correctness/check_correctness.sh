@@ -149,9 +149,10 @@ for i in $(seq 0 $((TOTAL - 1))); do
 
     # ── Run OpenSearch query ─────────────────────────────────────────────
 
-    # Replace table name in the OpenSearch query
-    OS_Q_REPLACED=$(echo "$OS_Q" | sed "s/\bhits\b/${OS_INDEX}/g")
-    ESCAPED_Q=$(echo "$OS_Q_REPLACED" | jq -Rs '.')
+    # Strip trailing semicolons, replace table name in the OpenSearch query
+    OS_Q_REPLACED=$(echo "$OS_Q" | sed 's/;[[:space:]]*$//' | sed "s/\bhits\b/${OS_INDEX}/g")
+    # Use printf (not echo) to avoid trailing newline in jq input
+    ESCAPED_Q=$(printf '%s' "$OS_Q_REPLACED" | jq -Rs '.')
 
     CURL_ARGS=(-sf -XPOST "${OS_URL}/_plugins/_trino_sql"
         -H 'Content-Type: application/json'

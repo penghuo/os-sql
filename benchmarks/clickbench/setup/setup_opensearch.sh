@@ -35,11 +35,12 @@ install_opensearch() {
     rm -f "$tarball"
 
     # Configure for single-node benchmark (min distribution has no security plugin)
-    cat <<'YAML' | sudo tee "$OS_INSTALL_DIR/config/opensearch.yml" > /dev/null
+    cat <<YAML | sudo tee "$OS_INSTALL_DIR/config/opensearch.yml" > /dev/null
 cluster.name: clickbench
 node.name: node-1
 network.host: 0.0.0.0
 discovery.type: single-node
+path.repo: ["${BENCH_DIR}/snapshots"]
 YAML
 
     # Set heap to 50% of available memory (capped at 16g)

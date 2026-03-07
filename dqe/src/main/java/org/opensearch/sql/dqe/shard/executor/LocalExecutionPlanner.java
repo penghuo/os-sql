@@ -6,6 +6,7 @@
 package org.opensearch.sql.dqe.shard.executor;
 
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.sql.tree.Expression;
 import java.util.ArrayList;
@@ -271,14 +272,51 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
     return idx;
   }
 
+  /** Pattern for inferring aggregate output types from column names like "min(URL)". */
+  private static final Pattern AGG_TYPE_INFERENCE =
+      Pattern.compile(
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$", Pattern.CASE_INSENSITIVE);
+
   /**
-   * Resolve Trino types for the given column names using the column type map. Falls back to BIGINT
-   * if a column is not found in the type map.
+   * Resolve Trino types for the given column names using the column type map. Handles aggregate
+   * function output types (e.g., "min(URL)" → VarcharType). Falls back to BIGINT if a column is not
+   * found in the type map.
    */
   private List<Type> resolveColumnTypes(List<String> columns) {
     List<Type> types = new ArrayList<>(columns.size());
+    org.apache.logging.log4j.LogManager.getLogger()
+        .info("resolveColumnTypes: columns={}, typeMapKeys={}", columns, columnTypeMap.keySet());
     for (String col : columns) {
-      types.add(columnTypeMap.getOrDefault(col, BigintType.BIGINT));
+      if (columnTypeMap.containsKey(col)) {
+        types.add(columnTypeMap.get(col));
+      } else {
+        // Try aggregate output type inference
+        Matcher m = AGG_TYPE_INFERENCE.matcher(col);
+        if (m.matches()) {
+          String funcName = m.group(1).toUpperCase();
+          String arg = m.group(3).trim();
+          switch (funcName) {
+            case "COUNT":
+              types.add(BigintType.BIGINT);
+              break;
+            case "AVG":
+              types.add(DoubleType.DOUBLE);
+              break;
+            case "SUM":
+              Type sumInput = columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+              types.add(sumInput instanceof DoubleType ? DoubleType.DOUBLE : BigintType.BIGINT);
+              break;
+            case "MIN":
+            case "MAX":
+              types.add(columnTypeMap.getOrDefault(arg, BigintType.BIGINT));
+              break;
+            default:
+              types.add(BigintType.BIGINT);
+          }
+        } else {
+          types.add(BigintType.BIGINT);
+        }
+      }
     }
     return types;
   }

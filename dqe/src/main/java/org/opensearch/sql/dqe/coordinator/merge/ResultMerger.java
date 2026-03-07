@@ -230,7 +230,7 @@ public class ResultMerger {
   }
 
   /** Merge a single aggregate expression across all rows in a group. */
-  private Number mergeAggregate(String aggExpr, List<Object[]> groupRows, int colIdx) {
+  private Object mergeAggregate(String aggExpr, List<Object[]> groupRows, int colIdx) {
     Matcher matcher = AGG_PATTERN.matcher(aggExpr);
     if (!matcher.matches()) {
       throw new UnsupportedOperationException("Unsupported aggregate expression: " + aggExpr);
@@ -241,8 +241,6 @@ public class ResultMerger {
     switch (funcName) {
       case "COUNT":
         if (isDistinct) {
-          // COUNT(DISTINCT) across shards: for single-shard, just pass through the count.
-          // For multi-shard, this is an approximation (sum of shard-local distinct counts).
           return sumValues(groupRows, colIdx);
         }
         return sumValues(groupRows, colIdx);
@@ -280,46 +278,40 @@ public class ResultMerger {
     return hasDouble ? dSum : sum;
   }
 
-  /** Find the minimum numeric value for a given column across all rows. */
-  private Number minValue(List<Object[]> rows, int colIdx) {
-    double min = Double.MAX_VALUE;
-    boolean hasDouble = false;
-    long longMin = Long.MAX_VALUE;
-
+  /**
+   * Find the minimum value for a given column across all rows. Supports both numeric and string
+   * types.
+   */
+  @SuppressWarnings("unchecked")
+  private Object minValue(List<Object[]> rows, int colIdx) {
+    Object min = null;
     for (Object[] row : rows) {
-      Number val = (Number) row[colIdx];
+      Object val = row[colIdx];
       if (val != null) {
-        if (val instanceof Double || val instanceof Float) {
-          hasDouble = true;
-          min = Math.min(min, val.doubleValue());
-        } else {
-          longMin = Math.min(longMin, val.longValue());
-          min = Math.min(min, val.doubleValue());
+        if (min == null || ((Comparable<Object>) val).compareTo(min) < 0) {
+          min = val;
         }
       }
     }
-    return hasDouble ? min : longMin;
+    return min;
   }
 
-  /** Find the maximum numeric value for a given column across all rows. */
-  private Number maxValue(List<Object[]> rows, int colIdx) {
-    double max = -Double.MAX_VALUE;
-    boolean hasDouble = false;
-    long longMax = Long.MIN_VALUE;
-
+  /**
+   * Find the maximum value for a given column across all rows. Supports both numeric and string
+   * types.
+   */
+  @SuppressWarnings("unchecked")
+  private Object maxValue(List<Object[]> rows, int colIdx) {
+    Object max = null;
     for (Object[] row : rows) {
-      Number val = (Number) row[colIdx];
+      Object val = row[colIdx];
       if (val != null) {
-        if (val instanceof Double || val instanceof Float) {
-          hasDouble = true;
-          max = Math.max(max, val.doubleValue());
-        } else {
-          longMax = Math.max(longMax, val.longValue());
-          max = Math.max(max, val.doubleValue());
+        if (max == null || ((Comparable<Object>) val).compareTo(max) > 0) {
+          max = val;
         }
       }
     }
-    return hasDouble ? max : longMax;
+    return max;
   }
 
   /**

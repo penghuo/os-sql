@@ -7,6 +7,7 @@ package org.opensearch.sql.dqe.shard.transport;
 
 import io.trino.spi.Page;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
@@ -310,6 +311,12 @@ public class TransportShardExecuteAction
       if (typeMap.containsKey(col)) {
         types.add(typeMap.get(col));
       } else {
+        // Try aggregate output type inference first (e.g., MIN(URL) → VarcharType)
+        Type aggType = inferAggregateOutputType(col, typeMap);
+        if (aggType != null) {
+          types.add(aggType);
+          continue;
+        }
         // Try to infer the type by compiling the expression
         String exprStr = columnNameToExpression.getOrDefault(col, col);
         try {
@@ -323,6 +330,41 @@ public class TransportShardExecuteAction
       }
     }
     return types;
+  }
+
+  /**
+   * Infer the output type of an aggregate function expression like "count(*)", "min(URL)",
+   * "sum(amount)". Returns null if the column name is not an aggregate expression.
+   */
+  private static final java.util.regex.Pattern SHARD_AGG_TYPE_PATTERN =
+      java.util.regex.Pattern.compile(
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
+          java.util.regex.Pattern.CASE_INSENSITIVE);
+
+  private static Type inferAggregateOutputType(String colName, Map<String, Type> columnTypeMap) {
+    java.util.regex.Matcher m = SHARD_AGG_TYPE_PATTERN.matcher(colName);
+    if (!m.matches()) {
+      return null;
+    }
+    String funcName = m.group(1).toUpperCase(java.util.Locale.ROOT);
+    String arg = m.group(3).trim();
+
+    switch (funcName) {
+      case "COUNT":
+        return BigintType.BIGINT;
+      case "AVG":
+        return DoubleType.DOUBLE;
+      case "SUM":
+        {
+          Type inputType = columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+          return inputType instanceof DoubleType ? DoubleType.DOUBLE : BigintType.BIGINT;
+        }
+      case "MIN":
+      case "MAX":
+        return columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+      default:
+        return null;
+    }
   }
 
   /** Walk the plan tree to find the EvalNode. Returns null if none. */

@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.dqe.planner;
 
+import io.trino.sql.tree.AllColumns;
 import io.trino.sql.tree.Expression;
 import io.trino.sql.tree.FunctionCall;
 import io.trino.sql.tree.GroupBy;
@@ -24,6 +25,7 @@ import io.trino.sql.tree.SortItem;
 import io.trino.sql.tree.Statement;
 import io.trino.sql.tree.Table;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -72,8 +74,8 @@ public class LogicalPlanner {
           "Only simple query specifications are supported, got: " + query.getQueryBody());
     }
 
-    // 1. Build TableScanNode from FROM clause
-    TableScanNode scanNode = buildTableScan(querySpec, tableResolver);
+    // 1. Build TableScanNode from FROM clause (with column pruning)
+    TableScanNode scanNode = buildTableScan(querySpec, query, tableResolver);
     DqePlanNode current = scanNode;
 
     // 2. Wrap with FilterNode if WHERE exists
@@ -184,7 +186,7 @@ public class LogicalPlanner {
   }
 
   private static TableScanNode buildTableScan(
-      QuerySpecification querySpec, Function<String, TableInfo> tableResolver) {
+      QuerySpecification querySpec, Query query, Function<String, TableInfo> tableResolver) {
     Optional<Relation> from = querySpec.getFrom();
     if (from.isEmpty()) {
       throw new IllegalArgumentException("FROM clause is required");
@@ -200,7 +202,83 @@ public class LogicalPlanner {
     TableInfo tableInfo = tableResolver.apply(tableName);
     List<String> allColumns = tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList();
 
-    return new TableScanNode(tableName, allColumns);
+    // Column pruning: only scan columns that the query actually references.
+    // This avoids fetching all 100+ columns for queries like SELECT COUNT(*).
+    boolean needsAllColumns =
+        querySpec.getSelect().getSelectItems().stream()
+            .anyMatch(item -> item instanceof AllColumns);
+    if (needsAllColumns) {
+      return new TableScanNode(tableName, allColumns);
+    }
+
+    Set<String> allColumnSet = new LinkedHashSet<>(allColumns);
+    Set<String> referencedColumns = collectReferencedColumns(querySpec, query);
+    // Keep only columns that actually exist in the table (filter out aliases, functions, etc.)
+    List<String> prunedColumns = allColumns.stream().filter(referencedColumns::contains).toList();
+    return new TableScanNode(tableName, prunedColumns);
+  }
+
+  /**
+   * Collect all column names referenced in the query (SELECT expressions, WHERE, GROUP BY, ORDER
+   * BY, HAVING). Only physical column names are collected — aliases, function names, and literals
+   * are excluded by filtering against the table's column list at the call site.
+   */
+  private static Set<String> collectReferencedColumns(QuerySpecification querySpec, Query query) {
+    Set<String> refs = new LinkedHashSet<>();
+
+    // SELECT items: walk expressions to find column references
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn sc) {
+        collectColumnReferences(sc.getExpression(), refs);
+      }
+    }
+
+    // WHERE clause
+    querySpec.getWhere().ifPresent(expr -> collectColumnReferences(expr, refs));
+
+    // GROUP BY
+    querySpec
+        .getGroupBy()
+        .ifPresent(
+            gb -> {
+              for (var element : gb.getGroupingElements()) {
+                if (element instanceof SimpleGroupBy sgb) {
+                  for (Expression expr : sgb.getExpressions()) {
+                    collectColumnReferences(expr, refs);
+                  }
+                }
+              }
+            });
+
+    // ORDER BY (may be on querySpec or query level)
+    Optional<OrderBy> orderBy = querySpec.getOrderBy().or(query::getOrderBy);
+    orderBy.ifPresent(
+        ob -> {
+          for (SortItem si : ob.getSortItems()) {
+            collectColumnReferences(si.getSortKey(), refs);
+          }
+        });
+
+    // HAVING
+    querySpec.getHaving().ifPresent(expr -> collectColumnReferences(expr, refs));
+
+    return refs;
+  }
+
+  /**
+   * Recursively collect all {@link Identifier} names from an expression tree. This captures column
+   * references but may also include aliases and other identifiers; the caller filters against known
+   * table columns.
+   */
+  private static void collectColumnReferences(Expression expr, Set<String> refs) {
+    if (expr instanceof Identifier id) {
+      refs.add(id.getValue());
+    }
+    for (Node child : expr.getChildren()) {
+      if (child instanceof Expression childExpr) {
+        collectColumnReferences(childExpr, refs);
+      }
+    }
   }
 
   private static List<String> extractOutputColumns(

@@ -362,23 +362,60 @@ public class TransportTrinoSqlAction
       if (columnTypeMap.containsKey(col)) {
         types.add(columnTypeMap.get(col));
       } else {
-        // Try to infer the type by compiling the expression
-        String exprStr = columnNameToExpression.getOrDefault(col, col);
-        try {
-          io.trino.sql.tree.Expression expr = exprParser.parseExpression(exprStr);
-          BlockExpression blockExpr = compiler.compile(expr);
-          types.add(blockExpr.getType());
-        } catch (Exception e) {
-          // If parsing/compilation fails, fall back to BIGINT
-          LOG.warn(
-              "Could not infer type for column '{}', defaulting to BIGINT: {}",
-              col,
-              e.getMessage());
-          types.add(BigintType.BIGINT);
+        // Try aggregate function type inference first
+        Type aggType = inferAggregateOutputType(col, columnTypeMap);
+        if (aggType != null) {
+          types.add(aggType);
+        } else {
+          // Try to infer the type by compiling the expression
+          String exprStr = columnNameToExpression.getOrDefault(col, col);
+          try {
+            io.trino.sql.tree.Expression expr = exprParser.parseExpression(exprStr);
+            BlockExpression blockExpr = compiler.compile(expr);
+            types.add(blockExpr.getType());
+          } catch (Exception e) {
+            // If parsing/compilation fails, fall back to BIGINT
+            LOG.warn(
+                "Could not infer type for column '{}', defaulting to BIGINT: {}",
+                col,
+                e.getMessage());
+            types.add(BigintType.BIGINT);
+          }
         }
       }
     }
     return types;
+  }
+
+  private static final java.util.regex.Pattern AGG_TYPE_PATTERN =
+      java.util.regex.Pattern.compile(
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((.+)\\)$", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+  /**
+   * Infer the output type of an aggregate function expression like "COUNT(*)", "SUM(val)",
+   * "AVG(val)". Returns null if the column name is not an aggregate function expression.
+   */
+  private static Type inferAggregateOutputType(String colName, Map<String, Type> columnTypeMap) {
+    java.util.regex.Matcher m = AGG_TYPE_PATTERN.matcher(colName);
+    if (!m.matches()) {
+      return null;
+    }
+    String funcName = m.group(1).toUpperCase(java.util.Locale.ROOT);
+    String arg = m.group(2).trim();
+
+    switch (funcName) {
+      case "COUNT":
+        return BigintType.BIGINT;
+      case "AVG":
+        return DoubleType.DOUBLE;
+      case "SUM":
+      case "MIN":
+      case "MAX":
+        // Use the input column type if known, otherwise BIGINT
+        return columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+      default:
+        return null;
+    }
   }
 
   /** Walk the plan tree to find the EvalNode. Returns null if none. */

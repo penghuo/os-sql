@@ -112,6 +112,12 @@ public class OpenSearchPageSource implements Operator {
       return null;
     }
 
+    // Fast path: when no columns are needed (e.g., COUNT(*)), skip _source parsing
+    // and return a Page with the correct position count but no data blocks.
+    if (columns.isEmpty()) {
+      return new Page(hits.length);
+    }
+
     List<Map<String, Object>> rows = new ArrayList<>(hits.length);
     for (SearchHit hit : hits) {
       rows.add(hit.getSourceAsMap());

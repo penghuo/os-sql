@@ -22,7 +22,7 @@ public final class DqeSettings {
   public static final Setting<Integer> PAGE_BATCH_SIZE =
       Setting.intSetting(
           "plugins.dqe.page.batch_size",
-          1024,
+          10000,
           1,
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);

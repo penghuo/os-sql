@@ -228,7 +228,9 @@ public class TransportShardExecuteAction
       }
 
       // Apply _source filtering to only fetch needed columns
-      if (!node.getColumns().isEmpty()) {
+      if (node.getColumns().isEmpty()) {
+        dsl.fetchSource(false); // No columns needed (e.g., COUNT(*))
+      } else {
         dsl.fetchSource(node.getColumns().toArray(new String[0]), null);
       }
 

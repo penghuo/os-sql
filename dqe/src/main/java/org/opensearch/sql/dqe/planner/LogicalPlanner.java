@@ -217,8 +217,6 @@ public class LogicalPlanner {
     Set<String> referencedColumns = collectReferencedColumns(querySpec, query);
     // Keep only columns that actually exist in the table (filter out aliases, functions, etc.)
     List<String> prunedColumns = allColumns.stream().filter(referencedColumns::contains).toList();
-    org.apache.logging.log4j.LogManager.getLogger()
-        .info("Column pruning: referenced={}, pruned={}", referencedColumns, prunedColumns);
     return new TableScanNode(tableName, prunedColumns);
   }
 
@@ -428,12 +426,38 @@ public class LogicalPlanner {
 
   private static DqePlanNode buildAggregation(
       DqePlanNode child, QuerySpecification querySpec, GroupBy groupBy) {
-    // Extract group-by keys
+    // Build SELECT column list for resolving ordinal references (GROUP BY 1 → first SELECT column)
+    List<String> selectColumnNames = new ArrayList<>();
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn sc) {
+        selectColumnNames.add(expressionToColumnName(sc.getExpression()));
+      }
+    }
+
+    // Extract group-by keys, resolving ordinal references to column names
     List<String> groupByKeys = new ArrayList<>();
     for (var element : groupBy.getGroupingElements()) {
       if (element instanceof SimpleGroupBy simpleGroupBy) {
         for (Expression expr : simpleGroupBy.getExpressions()) {
-          groupByKeys.add(expr.toString());
+          if (expr instanceof LongLiteral ordinal) {
+            // GROUP BY ordinal: resolve to the Nth SELECT column (1-based)
+            int idx = (int) ordinal.getParsedValue() - 1;
+            if (idx >= 0 && idx < selectColumnNames.size()) {
+              String resolvedCol = selectColumnNames.get(idx);
+              // If the resolved column is a literal/constant (e.g., "1"), skip it
+              // since grouping by a constant has no effect
+              try {
+                Long.parseLong(resolvedCol);
+                // It's a numeric literal - skip
+              } catch (NumberFormatException e) {
+                groupByKeys.add(resolvedCol);
+              }
+            } else {
+              groupByKeys.add(expr.toString());
+            }
+          } else {
+            groupByKeys.add(expr.toString());
+          }
         }
       }
     }

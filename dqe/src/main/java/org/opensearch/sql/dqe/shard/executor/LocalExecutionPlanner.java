@@ -284,8 +284,6 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
    */
   private List<Type> resolveColumnTypes(List<String> columns) {
     List<Type> types = new ArrayList<>(columns.size());
-    org.apache.logging.log4j.LogManager.getLogger()
-        .info("resolveColumnTypes: columns={}, typeMapKeys={}", columns, columnTypeMap.keySet());
     for (String col : columns) {
       if (columnTypeMap.containsKey(col)) {
         types.add(columnTypeMap.get(col));

@@ -80,8 +80,27 @@ public final class PageBuilder {
             value instanceof Boolean ? (Boolean) value : Boolean.parseBoolean(value.toString());
         BooleanType.BOOLEAN.writeBoolean(builder, boolVal);
       } else if (type instanceof TimestampType) {
-        long epochMillis = toNumber(value).longValue();
-        TimestampType.TIMESTAMP_MILLIS.writeLong(builder, epochMillis * 1000);
+        long rawValue = toNumber(value).longValue();
+        // Detect date format by magnitude:
+        //   < 100_000            → days since epoch (ClickHouse Date type)
+        //   < 10_000_000_000     → seconds since epoch (ClickHouse DateTime type)
+        //   otherwise            → milliseconds since epoch
+        // Convert to Trino's timestamp format: microseconds since epoch.
+        long epochMicros;
+        if (rawValue < 100_000L) {
+          // Days since epoch → convert to micros
+          epochMicros = rawValue * 86_400_000_000L;
+        } else if (rawValue < 10_000_000_000L) {
+          // Seconds since epoch → convert to micros
+          epochMicros = rawValue * 1_000_000L;
+        } else if (rawValue < 10_000_000_000_000L) {
+          // Milliseconds since epoch → convert to micros
+          epochMicros = rawValue * 1_000L;
+        } else {
+          // Already in microseconds
+          epochMicros = rawValue;
+        }
+        TimestampType.TIMESTAMP_MILLIS.writeLong(builder, epochMicros);
       } else if (type instanceof VarbinaryType) {
         if (value instanceof byte[]) {
           VarbinaryType.VARBINARY.writeSlice(builder, Slices.wrappedBuffer((byte[]) value));

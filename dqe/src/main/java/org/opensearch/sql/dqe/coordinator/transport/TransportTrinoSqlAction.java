@@ -13,6 +13,7 @@ import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.RealType;
 import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
@@ -20,6 +21,9 @@ import io.trino.sql.tree.Query;
 import io.trino.sql.tree.QuerySpecification;
 import io.trino.sql.tree.Statement;
 import java.io.IOException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -668,7 +672,12 @@ public class TransportTrinoSqlAction
     } else if (type instanceof TinyintType) {
       return (byte) TinyintType.TINYINT.getLong(block, position);
     } else if (type instanceof DoubleType) {
-      return DoubleType.DOUBLE.getDouble(block, position);
+      double val = DoubleType.DOUBLE.getDouble(block, position);
+      // Format integer-valued doubles without decimal point (e.g., 1638 instead of 1638.0)
+      if (val == Math.floor(val) && !Double.isInfinite(val) && Math.abs(val) < 1e15) {
+        return (long) val;
+      }
+      return val;
     } else if (type instanceof RealType) {
       // RealType stores as int bits of float
       long bits = RealType.REAL.getLong(block, position);
@@ -677,6 +686,13 @@ public class TransportTrinoSqlAction
       return BooleanType.BOOLEAN.getBoolean(block, position);
     } else if (type instanceof VarcharType) {
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else if (type instanceof TimestampType) {
+      // Trino stores timestamps as microseconds since epoch.
+      // Format as date string (YYYY-MM-DD) for date-typed columns.
+      long microsSinceEpoch = type.getLong(block, position);
+      long millisSinceEpoch = microsSinceEpoch / 1000;
+      LocalDate date = Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDate();
+      return date.toString();
     } else {
       // Default: try getLong for other numeric types
       try {

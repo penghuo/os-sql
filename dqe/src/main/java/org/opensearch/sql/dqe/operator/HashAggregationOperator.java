@@ -393,16 +393,23 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
-  /** AVG accumulator. Produces a DOUBLE result. */
+  /**
+   * AVG accumulator. Produces a DOUBLE result. For integer input types, uses java.math.BigDecimal
+   * accumulation to maintain precision for large values (e.g., UserID averaging over millions of
+   * rows).
+   */
   public static class AvgAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
-    private double sum = 0;
+    private final boolean isIntegerType;
+    private double doubleSum = 0;
+    private java.math.BigDecimal bigDecimalSum = java.math.BigDecimal.ZERO;
     private long count = 0;
 
     public AvgAccumulator(int columnIndex, Type inputType) {
       this.columnIndex = columnIndex;
       this.inputType = inputType;
+      this.isIntegerType = !(inputType instanceof DoubleType);
     }
 
     @Override
@@ -410,11 +417,11 @@ public class HashAggregationOperator implements Operator {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
         count++;
-        if (inputType instanceof DoubleType) {
-          sum += DoubleType.DOUBLE.getDouble(block, position);
+        if (isIntegerType) {
+          bigDecimalSum =
+              bigDecimalSum.add(java.math.BigDecimal.valueOf(inputType.getLong(block, position)));
         } else {
-          // All integer types (BigintType, IntegerType, SmallintType, TinyintType)
-          sum += inputType.getLong(block, position);
+          doubleSum += DoubleType.DOUBLE.getDouble(block, position);
         }
       }
     }
@@ -423,8 +430,14 @@ public class HashAggregationOperator implements Operator {
     public void writeTo(BlockBuilder builder) {
       if (count == 0) {
         builder.appendNull();
+      } else if (isIntegerType) {
+        double avg =
+            bigDecimalSum
+                .divide(java.math.BigDecimal.valueOf(count), 10, java.math.RoundingMode.HALF_UP)
+                .doubleValue();
+        DoubleType.DOUBLE.writeDouble(builder, avg);
       } else {
-        DoubleType.DOUBLE.writeDouble(builder, sum / count);
+        DoubleType.DOUBLE.writeDouble(builder, doubleSum / count);
       }
     }
   }

@@ -9,8 +9,12 @@ import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
@@ -193,12 +197,25 @@ public class HashAggregationOperator implements Operator {
       return BigintType.BIGINT.getLong(block, position);
     } else if (type instanceof IntegerType) {
       return IntegerType.INTEGER.getLong(block, position);
+    } else if (type instanceof SmallintType) {
+      return (long) SmallintType.SMALLINT.getLong(block, position);
+    } else if (type instanceof TinyintType) {
+      return (long) TinyintType.TINYINT.getLong(block, position);
     } else if (type instanceof DoubleType) {
       return DoubleType.DOUBLE.getDouble(block, position);
     } else if (type instanceof VarcharType) {
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else if (type instanceof TimestampType) {
+      return type.getLong(block, position);
+    } else if (type instanceof BooleanType) {
+      return BooleanType.BOOLEAN.getBoolean(block, position) ? 1L : 0L;
     }
-    throw new UnsupportedOperationException("Unsupported type for aggregation: " + type);
+    // Fallback: try getLong for any other numeric types
+    try {
+      return type.getLong(block, position);
+    } catch (Exception e) {
+      throw new UnsupportedOperationException("Unsupported type for aggregation: " + type);
+    }
   }
 
   private static void writeValue(BlockBuilder builder, Type type, Object value) {
@@ -208,12 +225,23 @@ public class HashAggregationOperator implements Operator {
       BigintType.BIGINT.writeLong(builder, ((Number) value).longValue());
     } else if (type instanceof IntegerType) {
       IntegerType.INTEGER.writeLong(builder, ((Number) value).intValue());
+    } else if (type instanceof SmallintType) {
+      SmallintType.SMALLINT.writeLong(builder, ((Number) value).shortValue());
+    } else if (type instanceof TinyintType) {
+      TinyintType.TINYINT.writeLong(builder, ((Number) value).byteValue());
     } else if (type instanceof DoubleType) {
       DoubleType.DOUBLE.writeDouble(builder, ((Number) value).doubleValue());
     } else if (type instanceof VarcharType) {
       VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+    } else if (type instanceof TimestampType) {
+      type.writeLong(builder, ((Number) value).longValue());
     } else {
-      throw new UnsupportedOperationException("Unsupported type for aggregation: " + type);
+      // Fallback: try writeLong for other numeric types
+      try {
+        type.writeLong(builder, ((Number) value).longValue());
+      } catch (Exception e) {
+        throw new UnsupportedOperationException("Unsupported type for aggregation: " + type);
+      }
     }
   }
 
@@ -268,10 +296,11 @@ public class HashAggregationOperator implements Operator {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
         hasValue = true;
-        if (inputType instanceof BigintType || inputType instanceof IntegerType) {
-          sum += inputType.getLong(block, position);
-        } else if (inputType instanceof DoubleType) {
+        if (inputType instanceof DoubleType) {
           sum += DoubleType.DOUBLE.getDouble(block, position);
+        } else {
+          // All integer types (BigintType, IntegerType, SmallintType, TinyintType)
+          sum += inputType.getLong(block, position);
         }
       }
     }
@@ -280,10 +309,10 @@ public class HashAggregationOperator implements Operator {
     public void writeTo(BlockBuilder builder) {
       if (!hasValue) {
         builder.appendNull();
-      } else if (inputType instanceof BigintType || inputType instanceof IntegerType) {
-        BigintType.BIGINT.writeLong(builder, (long) sum);
-      } else {
+      } else if (inputType instanceof DoubleType) {
         DoubleType.DOUBLE.writeDouble(builder, sum);
+      } else {
+        BigintType.BIGINT.writeLong(builder, (long) sum);
       }
     }
   }
@@ -381,10 +410,11 @@ public class HashAggregationOperator implements Operator {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
         count++;
-        if (inputType instanceof BigintType || inputType instanceof IntegerType) {
-          sum += inputType.getLong(block, position);
-        } else if (inputType instanceof DoubleType) {
+        if (inputType instanceof DoubleType) {
           sum += DoubleType.DOUBLE.getDouble(block, position);
+        } else {
+          // All integer types (BigintType, IntegerType, SmallintType, TinyintType)
+          sum += inputType.getLong(block, position);
         }
       }
     }

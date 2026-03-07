@@ -409,6 +409,11 @@ public class TransportTrinoSqlAction
       case "AVG":
         return DoubleType.DOUBLE;
       case "SUM":
+        {
+          // SUM output type: DOUBLE for double input, BIGINT for all integer types
+          Type inputType = columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+          return inputType instanceof DoubleType ? DoubleType.DOUBLE : BigintType.BIGINT;
+        }
       case "MIN":
       case "MAX":
         // Use the input column type if known, otherwise BIGINT

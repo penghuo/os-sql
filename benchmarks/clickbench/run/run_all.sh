@@ -89,8 +89,10 @@ run_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# Parse global options (before the command)
+# Parse all arguments (options and command can be in any order)
 # ---------------------------------------------------------------------------
+COMMAND=""
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)
@@ -100,13 +102,17 @@ while [ $# -gt 0 ]; do
         -h|--help)
             usage ;;
         -*)
-            die "Unknown option: $1 (options must come before the command)" ;;
+            die "Unknown option: $1" ;;
         *)
-            break ;;   # first non-option is the command
+            if [ -z "$COMMAND" ]; then
+                COMMAND="$1"
+            else
+                die "Unexpected argument: $1 (command already set to '$COMMAND')"
+            fi
+            shift ;;
     esac
 done
 
-COMMAND="${1:-}"
 [ -z "$COMMAND" ] && usage
 
 # ---------------------------------------------------------------------------

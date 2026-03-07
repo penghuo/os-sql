@@ -315,13 +315,18 @@ public class PlanOptimizer {
       }
     }
 
-    /** Extract column references from an aggregate function like "SUM(amount)". */
+    /**
+     * Extract column references from an aggregate function like "SUM(amount)" or "COUNT(DISTINCT
+     * col)".
+     */
     private void extractAggregateColumnRefs(String funcStr, Set<String> columns) {
       Pattern aggPattern =
-          Pattern.compile("^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
+          Pattern.compile(
+              "^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)\\s*$",
+              Pattern.CASE_INSENSITIVE);
       Matcher matcher = aggPattern.matcher(funcStr);
       if (matcher.matches()) {
-        String arg = matcher.group(2).trim();
+        String arg = matcher.group(3).trim();
         if (!arg.equals("*")) {
           columns.add(arg);
         }

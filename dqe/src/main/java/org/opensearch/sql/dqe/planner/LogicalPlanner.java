@@ -214,10 +214,11 @@ public class LogicalPlanner {
       return new TableScanNode(tableName, allColumns);
     }
 
-    Set<String> allColumnSet = new LinkedHashSet<>(allColumns);
     Set<String> referencedColumns = collectReferencedColumns(querySpec, query);
     // Keep only columns that actually exist in the table (filter out aliases, functions, etc.)
     List<String> prunedColumns = allColumns.stream().filter(referencedColumns::contains).toList();
+    org.apache.logging.log4j.LogManager.getLogger()
+        .info("Column pruning: referenced={}, pruned={}", referencedColumns, prunedColumns);
     return new TableScanNode(tableName, prunedColumns);
   }
 
@@ -232,7 +233,19 @@ public class LogicalPlanner {
     // SELECT items: walk expressions to find column references
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn sc) {
-        collectColumnReferences(sc.getExpression(), refs);
+        Expression expr = sc.getExpression();
+        collectColumnReferences(expr, refs);
+        // Explicitly extract arguments from aggregate function calls.
+        // FunctionCall.getChildren() may not include arguments in all Trino versions.
+        if (expr instanceof FunctionCall fc) {
+          for (Expression arg : fc.getArguments()) {
+            if (arg instanceof Identifier argId) {
+              refs.add(argId.getValue());
+            } else {
+              collectColumnReferences(arg, refs);
+            }
+          }
+        }
       }
     }
 
@@ -271,15 +284,37 @@ public class LogicalPlanner {
   /**
    * Recursively collect all {@link Identifier} names from an expression tree. This captures column
    * references but may also include aliases and other identifiers; the caller filters against known
-   * table columns.
+   * table columns. Explicitly handles {@link FunctionCall} arguments which may not be returned by
+   * {@link Node#getChildren()} in all Trino versions.
    */
   private static void collectColumnReferences(Expression expr, Set<String> refs) {
     if (expr instanceof Identifier id) {
       refs.add(id.getValue());
     }
+    // Explicitly handle FunctionCall arguments (getChildren() may not include them)
+    if (expr instanceof FunctionCall functionCall) {
+      for (Expression arg : functionCall.getArguments()) {
+        collectColumnReferences(arg, refs);
+      }
+    }
+    // Also walk all Node children recursively
     for (Node child : expr.getChildren()) {
       if (child instanceof Expression childExpr) {
         collectColumnReferences(childExpr, refs);
+      } else if (child instanceof Node) {
+        // Walk non-Expression nodes too (some containers like OrderBy may wrap expressions)
+        walkNodeForColumns(child, refs);
+      }
+    }
+  }
+
+  /** Walk any Node tree looking for Expression children that contain column references. */
+  private static void walkNodeForColumns(Node node, Set<String> refs) {
+    for (Node child : node.getChildren()) {
+      if (child instanceof Expression childExpr) {
+        collectColumnReferences(childExpr, refs);
+      } else {
+        walkNodeForColumns(child, refs);
       }
     }
   }
@@ -336,7 +371,8 @@ public class LogicalPlanner {
                 .map(Object::toString)
                 .collect(java.util.stream.Collectors.joining(", "));
       }
-      return functionCall.getName().toString() + "(" + args + ")";
+      String distinct = functionCall.isDistinct() ? "DISTINCT " : "";
+      return functionCall.getName().toString() + "(" + distinct + args + ")";
     }
     return expr.toString();
   }

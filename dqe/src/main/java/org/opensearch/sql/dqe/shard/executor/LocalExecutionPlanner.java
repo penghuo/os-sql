@@ -53,9 +53,13 @@ import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
  */
 public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
-  /** Pattern for aggregate function expressions like "COUNT(*)", "SUM(column)". */
+  /**
+   * Pattern for aggregate function expressions like "COUNT(*)", "SUM(column)", "COUNT(DISTINCT
+   * col)".
+   */
   private static final Pattern AGG_FUNCTION =
-      Pattern.compile("^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
+      Pattern.compile(
+          "^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
 
   private final Function<TableScanNode, Operator> scanFactory;
   private final Map<String, Type> columnTypeMap;
@@ -218,10 +222,15 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
       throw new UnsupportedOperationException("Unsupported aggregate function: " + funcStr);
     }
     String funcName = matcher.group(1).toUpperCase();
-    String argument = matcher.group(2).trim();
+    boolean isDistinct = matcher.group(2) != null;
+    String argument = matcher.group(3).trim();
 
     switch (funcName) {
       case "COUNT":
+        if (isDistinct) {
+          int colIdx = resolveColumnIndex(argument, columns);
+          return HashAggregationOperator.countDistinct(colIdx, columnTypes.get(colIdx));
+        }
         return HashAggregationOperator.count();
       case "SUM":
         {

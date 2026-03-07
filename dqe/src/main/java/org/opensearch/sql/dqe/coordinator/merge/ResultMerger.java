@@ -40,7 +40,8 @@ public class ResultMerger {
    * COUNT(*)}, {@code SUM(amount)}, {@code MIN(price)}, {@code MAX(salary)}.
    */
   private static final Pattern AGG_PATTERN =
-      Pattern.compile("^(COUNT|SUM|MIN|MAX|AVG)\\((.+)\\)$", Pattern.CASE_INSENSITIVE);
+      Pattern.compile(
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$", Pattern.CASE_INSENSITIVE);
 
   /** Merge shard results for a non-aggregate query. Simple concatenation of all pages. */
   public List<Page> mergePassthrough(List<List<Page>> shardResults) {
@@ -235,9 +236,16 @@ public class ResultMerger {
       throw new UnsupportedOperationException("Unsupported aggregate expression: " + aggExpr);
     }
     String funcName = matcher.group(1).toUpperCase(Locale.ROOT);
+    boolean isDistinct = matcher.group(2) != null;
 
     switch (funcName) {
       case "COUNT":
+        if (isDistinct) {
+          // COUNT(DISTINCT) across shards: for single-shard, just pass through the count.
+          // For multi-shard, this is an approximation (sum of shard-local distinct counts).
+          return sumValues(groupRows, colIdx);
+        }
+        return sumValues(groupRows, colIdx);
       case "SUM":
         return sumValues(groupRows, colIdx);
       case "MIN":

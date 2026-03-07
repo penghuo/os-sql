@@ -393,7 +393,8 @@ public class TransportTrinoSqlAction
 
   private static final java.util.regex.Pattern AGG_TYPE_PATTERN =
       java.util.regex.Pattern.compile(
-          "^(COUNT|SUM|MIN|MAX|AVG)\\((.+)\\)$", java.util.regex.Pattern.CASE_INSENSITIVE);
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
+          java.util.regex.Pattern.CASE_INSENSITIVE);
 
   /**
    * Infer the output type of an aggregate function expression like "COUNT(*)", "SUM(val)",
@@ -405,7 +406,7 @@ public class TransportTrinoSqlAction
       return null;
     }
     String funcName = m.group(1).toUpperCase(java.util.Locale.ROOT);
-    String arg = m.group(2).trim();
+    String arg = m.group(3).trim();
 
     switch (funcName) {
       case "COUNT":

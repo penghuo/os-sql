@@ -279,6 +279,31 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
+  /** COUNT(DISTINCT column) accumulator. Counts distinct non-null values using a HashSet. */
+  public static class CountDistinctAccumulator implements Accumulator {
+    private final int columnIndex;
+    private final Type inputType;
+    private final java.util.HashSet<Object> distinctValues = new java.util.HashSet<>();
+
+    public CountDistinctAccumulator(int columnIndex, Type inputType) {
+      this.columnIndex = columnIndex;
+      this.inputType = inputType;
+    }
+
+    @Override
+    public void add(Page page, int position) {
+      Block block = page.getBlock(columnIndex);
+      if (!block.isNull(position)) {
+        distinctValues.add(readValue(block, position, inputType));
+      }
+    }
+
+    @Override
+    public void writeTo(BlockBuilder builder) {
+      BigintType.BIGINT.writeLong(builder, distinctValues.size());
+    }
+  }
+
   /** SUM accumulator for numeric columns. Produces a BIGINT result for integer types. */
   public static class SumAccumulator implements Accumulator {
     private final int columnIndex;
@@ -440,6 +465,21 @@ public class HashAggregationOperator implements Operator {
         DoubleType.DOUBLE.writeDouble(builder, doubleSum / count);
       }
     }
+  }
+
+  /** Factory for COUNT(DISTINCT column) aggregate. */
+  public static AggregateFunction countDistinct(int columnIndex, Type inputType) {
+    return new AggregateFunction() {
+      @Override
+      public Accumulator createAccumulator() {
+        return new CountDistinctAccumulator(columnIndex, inputType);
+      }
+
+      @Override
+      public Type getOutputType() {
+        return BigintType.BIGINT;
+      }
+    };
   }
 
   /** Factory for COUNT(*) aggregate. */

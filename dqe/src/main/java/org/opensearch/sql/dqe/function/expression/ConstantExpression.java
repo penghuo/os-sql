@@ -13,6 +13,8 @@ import io.trino.spi.block.RunLengthEncodedBlock;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import lombok.Getter;
@@ -51,8 +53,18 @@ public class ConstantExpression implements BlockExpression {
       VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(value.toString()));
     } else if (type instanceof BooleanType) {
       BooleanType.BOOLEAN.writeBoolean(builder, (Boolean) value);
+    } else if (type instanceof TimestampType) {
+      // Timestamp values are stored as long (microseconds since epoch)
+      type.writeLong(builder, ((Number) value).longValue());
+    } else if (type instanceof IntegerType) {
+      IntegerType.INTEGER.writeLong(builder, ((Number) value).intValue());
     } else {
-      throw new UnsupportedOperationException("Unsupported constant type: " + type);
+      // Fallback: try writeLong for numeric types
+      try {
+        type.writeLong(builder, ((Number) value).longValue());
+      } catch (Exception e) {
+        throw new UnsupportedOperationException("Unsupported constant type: " + type);
+      }
     }
     return builder.build();
   }

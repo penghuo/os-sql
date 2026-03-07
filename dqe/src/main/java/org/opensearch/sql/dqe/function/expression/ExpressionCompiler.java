@@ -9,6 +9,7 @@ import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.ArithmeticBinaryExpression;
@@ -22,6 +23,7 @@ import io.trino.sql.tree.DecimalLiteral;
 import io.trino.sql.tree.DoubleLiteral;
 import io.trino.sql.tree.Expression;
 import io.trino.sql.tree.FunctionCall;
+import io.trino.sql.tree.GenericLiteral;
 import io.trino.sql.tree.Identifier;
 import io.trino.sql.tree.InListExpression;
 import io.trino.sql.tree.InPredicate;
@@ -81,6 +83,8 @@ public class ExpressionCompiler {
       return new ConstantExpression(((BooleanLiteral) expr).getValue(), BooleanType.BOOLEAN);
     } else if (expr instanceof NullLiteral) {
       return new ConstantExpression(null, BigintType.BIGINT);
+    } else if (expr instanceof GenericLiteral generic) {
+      return compileGenericLiteral(generic);
     } else if (expr instanceof ComparisonExpression cmp) {
       return new ComparisonBlockExpression(
           cmp.getOperator(), compile(cmp.getLeft()), compile(cmp.getRight()));
@@ -138,6 +142,45 @@ public class ExpressionCompiler {
     }
     throw new UnsupportedOperationException(
         "Unsupported expression type: " + expr.getClass().getSimpleName());
+  }
+
+  /**
+   * Compile a GenericLiteral (e.g., DATE '2013-07-01', TIMESTAMP '2013-07-01 12:00:00'). Converts
+   * the literal value to the appropriate Trino internal representation.
+   */
+  private BlockExpression compileGenericLiteral(GenericLiteral literal) {
+    String typeName = literal.getType().toUpperCase(java.util.Locale.ROOT);
+    String value = literal.getValue();
+
+    switch (typeName) {
+      case "DATE":
+        {
+          // Parse date string and convert to Trino timestamp micros
+          java.time.LocalDate date = java.time.LocalDate.parse(value);
+          long epochMicros = date.toEpochDay() * 86_400_000_000L;
+          return new ConstantExpression(epochMicros, TimestampType.TIMESTAMP_MILLIS);
+        }
+      case "TIMESTAMP":
+        {
+          // Parse timestamp string and convert to Trino timestamp micros
+          java.time.LocalDateTime dt =
+              java.time.LocalDateTime.parse(
+                  value, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+          long epochMicros =
+              dt.toEpochSecond(java.time.ZoneOffset.UTC) * 1_000_000L + dt.getNano() / 1_000L;
+          return new ConstantExpression(epochMicros, TimestampType.TIMESTAMP_MILLIS);
+        }
+      case "INTEGER":
+      case "INT":
+        return new ConstantExpression(Long.parseLong(value), BigintType.BIGINT);
+      case "BIGINT":
+        return new ConstantExpression(Long.parseLong(value), BigintType.BIGINT);
+      case "DOUBLE":
+        return new ConstantExpression(Double.parseDouble(value), DoubleType.DOUBLE);
+      default:
+        // Treat as VARCHAR for unknown types
+        return new ConstantExpression(value, VarcharType.VARCHAR);
+    }
   }
 
   private BlockExpression compileIdentifier(Identifier identifier) {

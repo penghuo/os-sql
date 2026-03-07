@@ -9,8 +9,10 @@ import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
@@ -173,8 +175,19 @@ public class SortOperator implements Operator {
       return VarcharType.VARCHAR
           .getSlice(block, posA)
           .compareTo(VarcharType.VARCHAR.getSlice(block, posB));
+    } else if (type instanceof TimestampType) {
+      // TimestampType stores values as long (microseconds since epoch)
+      return Long.compare(type.getLong(block, posA), type.getLong(block, posB));
+    } else if (type instanceof BooleanType) {
+      return Boolean.compare(
+          BooleanType.BOOLEAN.getBoolean(block, posA), BooleanType.BOOLEAN.getBoolean(block, posB));
     }
-    throw new UnsupportedOperationException("Unsupported type for sorting: " + type);
+    // Fallback: try comparing as longs for any other numeric type
+    try {
+      return Long.compare(type.getLong(block, posA), type.getLong(block, posB));
+    } catch (Exception e) {
+      throw new UnsupportedOperationException("Unsupported type for sorting: " + type);
+    }
   }
 
   @Override

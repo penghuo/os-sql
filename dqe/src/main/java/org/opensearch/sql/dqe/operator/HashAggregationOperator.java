@@ -421,16 +421,15 @@ public class HashAggregationOperator implements Operator {
   }
 
   /**
-   * AVG accumulator. Produces a DOUBLE result. For integer input types, uses java.math.BigDecimal
-   * accumulation to maintain precision for large values (e.g., UserID averaging over millions of
-   * rows).
+   * AVG accumulator. Produces a DOUBLE result. Uses long accumulation for integer types to match
+   * ClickHouse/Trino overflow semantics (Int64 wrapping), then divides by count as double.
    */
   public static class AvgAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
     private final boolean isIntegerType;
+    private long longSum = 0;
     private double doubleSum = 0;
-    private java.math.BigDecimal bigDecimalSum = java.math.BigDecimal.ZERO;
     private long count = 0;
 
     public AvgAccumulator(int columnIndex, Type inputType) {
@@ -445,8 +444,7 @@ public class HashAggregationOperator implements Operator {
       if (!block.isNull(position)) {
         count++;
         if (isIntegerType) {
-          bigDecimalSum =
-              bigDecimalSum.add(java.math.BigDecimal.valueOf(inputType.getLong(block, position)));
+          longSum += inputType.getLong(block, position);
         } else {
           doubleSum += DoubleType.DOUBLE.getDouble(block, position);
         }
@@ -458,11 +456,7 @@ public class HashAggregationOperator implements Operator {
       if (count == 0) {
         builder.appendNull();
       } else if (isIntegerType) {
-        double avg =
-            bigDecimalSum
-                .divide(java.math.BigDecimal.valueOf(count), 10, java.math.RoundingMode.HALF_UP)
-                .doubleValue();
-        DoubleType.DOUBLE.writeDouble(builder, avg);
+        DoubleType.DOUBLE.writeDouble(builder, (double) longSum / count);
       } else {
         DoubleType.DOUBLE.writeDouble(builder, doubleSum / count);
       }

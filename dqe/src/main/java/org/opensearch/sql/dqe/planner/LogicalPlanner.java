@@ -625,11 +625,11 @@ public class LogicalPlanner {
       }
     }
 
-    // Add tiebreaker sort keys: all available columns from the child node that aren't
-    // already in the sort keys. This ensures deterministic ordering when the primary
-    // sort key has ties (e.g., ORDER BY COUNT(*) DESC with multiple groups having the
-    // same count). Sort tiebreakers ascending with NULLS LAST.
-    if (child instanceof AggregationNode aggChild) {
+    // Add tiebreaker sort keys: all available columns from the aggregation node that
+    // aren't already in the sort keys. This ensures deterministic ordering when the
+    // primary sort key has ties. Walk through FilterNode (HAVING) to find AggregationNode.
+    AggregationNode aggChild = findAggregationChild(child);
+    if (aggChild != null) {
       List<String> allCols = new ArrayList<>(aggChild.getGroupByKeys());
       allCols.addAll(aggChild.getAggregateFunctions());
       for (String col : allCols) {
@@ -642,6 +642,18 @@ public class LogicalPlanner {
     }
 
     return new SortNode(child, sortKeys, ascending, nullsFirst);
+  }
+
+  /** Walk through filter/eval nodes to find the AggregationNode child. */
+  private static AggregationNode findAggregationChild(DqePlanNode node) {
+    if (node instanceof AggregationNode agg) {
+      return agg;
+    } else if (node instanceof FilterNode f) {
+      return findAggregationChild(f.getChild());
+    } else if (node instanceof EvalNode e) {
+      return findAggregationChild(e.getChild());
+    }
+    return null;
   }
 
   /**

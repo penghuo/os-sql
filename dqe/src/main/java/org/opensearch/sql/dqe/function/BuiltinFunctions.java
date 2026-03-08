@@ -104,6 +104,12 @@ public final class BuiltinFunctions {
         List.of(VarcharType.VARCHAR),
         BigintType.BIGINT,
         StringFunctions.codepoint());
+    reg(
+        r,
+        "regexp_replace",
+        List.of(VarcharType.VARCHAR, VarcharType.VARCHAR, VarcharType.VARCHAR),
+        VarcharType.VARCHAR,
+        StringFunctions.regexpReplace());
   }
 
   private static void registerMathFunctions(FunctionRegistry r) {
@@ -217,6 +223,12 @@ public final class BuiltinFunctions {
         DateTimeFunctions.dayOfYear());
     reg(r, "now", List.of(), TimestampType.TIMESTAMP_MILLIS, DateTimeFunctions.now());
     reg(r, "current_timestamp", List.of(), TimestampType.TIMESTAMP_MILLIS, DateTimeFunctions.now());
+    reg(
+        r,
+        "date_trunc",
+        List.of(VarcharType.VARCHAR, TimestampType.TIMESTAMP_MILLIS),
+        TimestampType.TIMESTAMP_MILLIS,
+        DateTimeFunctions.dateTrunc());
     reg(
         r,
         "from_unixtime",

@@ -10,6 +10,7 @@ import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.VarcharType;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -214,5 +215,58 @@ public final class DateTimeFunctions {
       }
       return builder.build();
     };
+  }
+
+  /**
+   * DATE_TRUNC(unit, timestamp) — truncates a timestamp to the specified unit. The unit argument is
+   * a VARCHAR ('second', 'minute', 'hour', 'day', 'month', 'year'). Returns a timestamp.
+   */
+  public static ScalarFunctionImplementation dateTrunc() {
+    return (args, positionCount) -> {
+      Block unitBlock = args[0];
+      Block tsBlock = args[1];
+      BlockBuilder builder = TimestampType.TIMESTAMP_MILLIS.createBlockBuilder(null, positionCount);
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (tsBlock.isNull(pos) || unitBlock.isNull(pos)) {
+          builder.appendNull();
+        } else {
+          String unit = VarcharType.VARCHAR.getSlice(unitBlock, pos).toStringUtf8().toLowerCase();
+          long micros = TimestampType.TIMESTAMP_MILLIS.getLong(tsBlock, pos);
+          long truncatedMicros = truncateTimestamp(micros, unit);
+          TimestampType.TIMESTAMP_MILLIS.writeLong(builder, truncatedMicros);
+        }
+      }
+      return builder.build();
+    };
+  }
+
+  private static long truncateTimestamp(long micros, String unit) {
+    java.time.Instant instant = java.time.Instant.ofEpochSecond(0, micros * 1000L);
+    java.time.ZonedDateTime zdt = instant.atZone(java.time.ZoneOffset.UTC);
+    switch (unit) {
+      case "second":
+        zdt = zdt.withNano(0);
+        break;
+      case "minute":
+        zdt = zdt.withSecond(0).withNano(0);
+        break;
+      case "hour":
+        zdt = zdt.withMinute(0).withSecond(0).withNano(0);
+        break;
+      case "day":
+        zdt = zdt.toLocalDate().atStartOfDay(java.time.ZoneOffset.UTC);
+        break;
+      case "month":
+        zdt = zdt.withDayOfMonth(1).toLocalDate().atStartOfDay(java.time.ZoneOffset.UTC);
+        break;
+      case "year":
+        zdt =
+            zdt.withMonth(1).withDayOfMonth(1).toLocalDate().atStartOfDay(java.time.ZoneOffset.UTC);
+        break;
+      default:
+        // Return unchanged for unsupported units
+        return micros;
+    }
+    return zdt.toInstant().getEpochSecond() * 1_000_000L + zdt.toInstant().getNano() / 1_000L;
   }
 }

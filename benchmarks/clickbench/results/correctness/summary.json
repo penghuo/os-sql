@@ -1,0 +1,17 @@
+{
+  "date": "2026-03-08",
+  "dataset": "1m",
+  "total": 43,
+  "pass": 0,
+  "fail": 1,
+  "skip": 0,
+  "queries": [
+    {
+      "q": 43,
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
+    }
+  ]
+}

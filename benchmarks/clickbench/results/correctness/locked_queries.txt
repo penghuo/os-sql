@@ -1,0 +1,27 @@
+# Locked queries - once PASS, must always PASS
+# Format: Q{N}: PASS : {date} : {root cause}
+Q01: PASS : 2026-03-07 : column pruning + _source:false + batch size 10000
+Q02: PASS : 2026-03-07 : baseline
+Q03: PASS : 2026-03-07 : type promotion (short/byte→BIGINT, float→DOUBLE)
+Q05: PASS : 2026-03-07 : COUNT(DISTINCT) implementation
+Q06: PASS : 2026-03-07 : COUNT(DISTINCT) implementation
+Q07: PASS : 2026-03-07 : timestamp formatting (date format auto-detection)
+Q08: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q09: PASS : 2026-03-07 : COUNT(DISTINCT) + DISTINCT column pruning fix
+Q10: PASS : 2026-03-07 : COUNT(DISTINCT) + DISTINCT column pruning fix
+Q11: PASS : 2026-03-07 : COUNT(DISTINCT) + DISTINCT column pruning fix
+Q13: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q14: PASS : 2026-03-07 : COUNT(DISTINCT) + DISTINCT column pruning fix
+Q15: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q16: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q17: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q20: PASS : 2026-03-07 : baseline
+Q21: PASS : 2026-03-07 : baseline
+Q22: PASS : 2026-03-07 : aggregate type inference for VARCHAR MIN/MAX
+Q23: PASS : 2026-03-07 : aggregate type inference for VARCHAR MIN/MAX
+Q25: PASS : 2026-03-07 : TimestampType sort support
+Q27: PASS : 2026-03-07 : TimestampType sort support
+Q34: PASS : 2026-03-07 : alias resolution in ORDER BY
+Q37: PASS : 2026-03-07 : DATE literal support (GenericLiteral)
+Q38: PASS : 2026-03-07 : DATE literal support (GenericLiteral)
+Q42: PASS : 2026-03-07 : DATE literal support (GenericLiteral)

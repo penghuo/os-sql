@@ -90,11 +90,16 @@ public class LogicalPlanner {
     Optional<GroupBy> groupBy = querySpec.getGroupBy();
     boolean hasAggregatesInSelect = hasAggregateFunctions(querySpec);
     if (groupBy.isPresent()) {
-      current = buildAggregation(current, querySpec, groupBy.get());
+      current = buildAggregation(current, querySpec, groupBy.get(), scanNode.getColumns());
     } else if (hasAggregatesInSelect) {
       // Global aggregation: no GROUP BY but SELECT has aggregate functions
-      // (e.g., SELECT COUNT(*) FROM hits)
-      current = buildGlobalAggregation(current, querySpec);
+      current = buildGlobalAggregation(current, querySpec, scanNode.getColumns());
+    }
+
+    // 3b. Wrap with HAVING FilterNode if present
+    Optional<Expression> having = querySpec.getHaving();
+    if (having.isPresent()) {
+      current = new FilterNode(current, having.get().toString());
     }
 
     // 4. Insert EvalNode for computed columns if needed (outside of aggregation)
@@ -410,22 +415,48 @@ public class LogicalPlanner {
 
   /** Build a global aggregation (no GROUP BY keys) for queries like SELECT COUNT(*) FROM table. */
   private static DqePlanNode buildGlobalAggregation(
-      DqePlanNode child, QuerySpecification querySpec) {
+      DqePlanNode child, QuerySpecification querySpec, List<String> scanColumns) {
+    // Check if any aggregate function has a computed argument (e.g., SUM(col + 1))
+    List<String> evalExpressions = new ArrayList<>();
+    List<String> evalOutputNames = new ArrayList<>();
+    Set<String> scanColumnSet = new java.util.HashSet<>(scanColumns);
+
     List<String> aggregateFunctions = new ArrayList<>();
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn singleColumn) {
         Expression expr = singleColumn.getExpression();
-        if (expr instanceof FunctionCall functionCall) {
-          aggregateFunctions.add(expressionToColumnName(functionCall));
+        if (expr instanceof FunctionCall functionCall && containsAggregateFunction(functionCall)) {
+          // Check if aggregate arguments are computed expressions
+          String aggName =
+              rewriteAggregateArgs(functionCall, scanColumnSet, evalExpressions, evalOutputNames);
+          aggregateFunctions.add(aggName);
         }
       }
     }
 
-    return new AggregationNode(child, List.of(), aggregateFunctions, AggregationNode.Step.PARTIAL);
+    // Insert EvalNode if we have computed expressions
+    DqePlanNode current = child;
+    if (!evalExpressions.isEmpty()) {
+      // Build complete output: all scan columns + computed columns
+      List<String> allExprs = new ArrayList<>();
+      List<String> allNames = new ArrayList<>();
+      for (String col : scanColumns) {
+        allExprs.add(col);
+        allNames.add(col);
+      }
+      allExprs.addAll(evalExpressions);
+      allNames.addAll(evalOutputNames);
+      current = new EvalNode(current, allExprs, allNames);
+    }
+
+    return new AggregationNode(
+        current, List.of(), aggregateFunctions, AggregationNode.Step.PARTIAL);
   }
 
   private static DqePlanNode buildAggregation(
-      DqePlanNode child, QuerySpecification querySpec, GroupBy groupBy) {
+      DqePlanNode child, QuerySpecification querySpec, GroupBy groupBy, List<String> scanColumns) {
+    Set<String> scanColumnSet = new java.util.HashSet<>(scanColumns);
+
     // Build SELECT column list for resolving ordinal references (GROUP BY 1 → first SELECT column)
     List<String> selectColumnNames = new ArrayList<>();
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
@@ -434,47 +465,142 @@ public class LogicalPlanner {
       }
     }
 
-    // Extract group-by keys, resolving ordinal references to column names
+    // Collect computed expressions that need an EvalNode
+    List<String> evalExpressions = new ArrayList<>();
+    List<String> evalOutputNames = new ArrayList<>();
+
+    // Extract group-by keys, resolving ordinal references and computed expressions
     List<String> groupByKeys = new ArrayList<>();
     for (var element : groupBy.getGroupingElements()) {
       if (element instanceof SimpleGroupBy simpleGroupBy) {
         for (Expression expr : simpleGroupBy.getExpressions()) {
           if (expr instanceof LongLiteral ordinal) {
-            // GROUP BY ordinal: resolve to the Nth SELECT column (1-based)
             int idx = (int) ordinal.getParsedValue() - 1;
             if (idx >= 0 && idx < selectColumnNames.size()) {
               String resolvedCol = selectColumnNames.get(idx);
-              // If the resolved column is a literal/constant (e.g., "1"), skip it
-              // since grouping by a constant has no effect
               try {
                 Long.parseLong(resolvedCol);
-                // It's a numeric literal - skip
               } catch (NumberFormatException e) {
                 groupByKeys.add(resolvedCol);
               }
             } else {
               groupByKeys.add(expr.toString());
             }
-          } else {
+          } else if (expr instanceof Identifier) {
+            // Plain column reference — use directly
             groupByKeys.add(expr.toString());
+          } else {
+            // Computed expression in GROUP BY (e.g., extract(minute FROM EventTime),
+            // ClientIP - 1). Create an EvalNode column for it.
+            String exprName = expressionToColumnName(expr);
+            if (!scanColumnSet.contains(exprName)) {
+              evalExpressions.add(expr.toString());
+              evalOutputNames.add(exprName);
+            }
+            groupByKeys.add(exprName);
           }
         }
       }
     }
 
-    // Extract aggregate functions from SELECT items
+    // Extract aggregate functions from SELECT items, handling computed arguments
     List<String> aggregateFunctions = new ArrayList<>();
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn singleColumn) {
         Expression expr = singleColumn.getExpression();
-        if (expr instanceof FunctionCall functionCall) {
-          aggregateFunctions.add(expressionToColumnName(functionCall));
+        if (containsAggregateFunction(expr)) {
+          if (expr instanceof FunctionCall functionCall) {
+            String aggName =
+                rewriteAggregateArgs(functionCall, scanColumnSet, evalExpressions, evalOutputNames);
+            aggregateFunctions.add(aggName);
+          }
         }
       }
     }
 
+    // Also handle non-aggregate, non-groupby computed expressions in SELECT
+    // (e.g., CASE WHEN ... in a GROUP BY query that isn't an aggregate)
+    for (SelectItem item : querySpec.getSelect().getSelectItems()) {
+      if (item instanceof SingleColumn singleColumn) {
+        Expression expr = singleColumn.getExpression();
+        if (!containsAggregateFunction(expr) && !(expr instanceof Identifier)) {
+          String exprName = expressionToColumnName(expr);
+          if (!groupByKeys.contains(exprName) && !scanColumnSet.contains(exprName)) {
+            // This is a computed expression in SELECT that's not a GROUP BY key
+            // (e.g., CASE WHEN in SELECT alongside GROUP BY)
+            // Add it to the eval expressions so it's computed pre-aggregation
+            if (!evalOutputNames.contains(exprName)) {
+              evalExpressions.add(expr.toString());
+              evalOutputNames.add(exprName);
+            }
+            // Add to group by keys since it must pass through aggregation
+            groupByKeys.add(exprName);
+          }
+        }
+      }
+    }
+
+    // Insert EvalNode if we have computed expressions
+    DqePlanNode current = child;
+    if (!evalExpressions.isEmpty()) {
+      // Build complete output: all scan columns + computed columns
+      List<String> allExprs = new ArrayList<>();
+      List<String> allNames = new ArrayList<>();
+      for (String col : scanColumns) {
+        allExprs.add(col);
+        allNames.add(col);
+      }
+      // Deduplicate eval expressions
+      Set<String> addedExprs = new java.util.HashSet<>();
+      for (int i = 0; i < evalExpressions.size(); i++) {
+        String name = evalOutputNames.get(i);
+        if (!addedExprs.contains(name)) {
+          allExprs.add(evalExpressions.get(i));
+          allNames.add(name);
+          addedExprs.add(name);
+        }
+      }
+      current = new EvalNode(current, allExprs, allNames);
+    }
+
     return new AggregationNode(
-        child, groupByKeys, aggregateFunctions, AggregationNode.Step.PARTIAL);
+        current, groupByKeys, aggregateFunctions, AggregationNode.Step.PARTIAL);
+  }
+
+  /**
+   * Rewrite aggregate function arguments: if an argument is a computed expression (not a plain
+   * column), add it to the eval list and return the rewritten function name using the eval column.
+   */
+  private static String rewriteAggregateArgs(
+      FunctionCall functionCall,
+      Set<String> scanColumnSet,
+      List<String> evalExpressions,
+      List<String> evalOutputNames) {
+    String funcName = functionCall.getName().toString();
+    List<Expression> args = functionCall.getArguments();
+    String distinct = functionCall.isDistinct() ? "DISTINCT " : "";
+
+    if (args.isEmpty()) {
+      return funcName + "(*)";
+    }
+
+    List<String> rewrittenArgs = new ArrayList<>();
+    for (Expression arg : args) {
+      String argName = expressionToColumnName(arg);
+      if (arg instanceof Identifier || "*".equals(argName) || scanColumnSet.contains(argName)) {
+        // Plain column reference or wildcard — use directly
+        rewrittenArgs.add(argName);
+      } else {
+        // Computed argument (e.g., length(URL), col + 1)
+        // Add to eval list and use the eval column name
+        if (!evalOutputNames.contains(argName)) {
+          evalExpressions.add(arg.toString());
+          evalOutputNames.add(argName);
+        }
+        rewrittenArgs.add(argName);
+      }
+    }
+    return funcName + "(" + distinct + String.join(", ", rewrittenArgs) + ")";
   }
 
   private static DqePlanNode buildSort(

@@ -22,6 +22,7 @@ import io.trino.sql.tree.ComparisonExpression;
 import io.trino.sql.tree.DecimalLiteral;
 import io.trino.sql.tree.DoubleLiteral;
 import io.trino.sql.tree.Expression;
+import io.trino.sql.tree.Extract;
 import io.trino.sql.tree.FunctionCall;
 import io.trino.sql.tree.GenericLiteral;
 import io.trino.sql.tree.Identifier;
@@ -139,6 +140,12 @@ public class ExpressionCompiler {
       return compileIn(in);
     } else if (expr instanceof FunctionCall func) {
       return compileFunctionCall(func);
+    } else if (expr instanceof Extract extract) {
+      // EXTRACT(field FROM expr) → convert to the equivalent function call
+      // e.g., EXTRACT(MINUTE FROM EventTime) → minute(EventTime)
+      String funcName = extract.getField().name().toLowerCase(java.util.Locale.ROOT);
+      BlockExpression arg = compile(extract.getExpression());
+      return compileNamedFunction(funcName, List.of(arg));
     }
     throw new UnsupportedOperationException(
         "Unsupported expression type: " + expr.getClass().getSimpleName());
@@ -365,6 +372,34 @@ public class ExpressionCompiler {
       }
     }
 
+    return new ScalarFunctionExpression(
+        metadata.getScalarImplementation(), castArgs, metadata.getReturnType());
+  }
+
+  /**
+   * Compile a named function call with pre-compiled arguments. Used by EXTRACT and other expression
+   * transformations that don't start as FunctionCall AST nodes.
+   */
+  private BlockExpression compileNamedFunction(
+      String funcName, List<BlockExpression> compiledArgs) {
+    List<Type> argTypes =
+        compiledArgs.stream().map(BlockExpression::getType).collect(Collectors.toList());
+    ResolvedFunction resolved = registry.resolve(funcName, argTypes);
+    FunctionMetadata metadata = registry.getMetadata(resolved);
+    if (metadata.getScalarImplementation() == null) {
+      throw new UnsupportedOperationException(
+          "Function '" + funcName + "' has no scalar implementation");
+    }
+    List<Type> paramTypes = resolved.getArgumentTypes();
+    List<BlockExpression> castArgs = new ArrayList<>();
+    for (int i = 0; i < compiledArgs.size(); i++) {
+      BlockExpression arg = compiledArgs.get(i);
+      if (!arg.getType().equals(paramTypes.get(i))) {
+        castArgs.add(new CastBlockExpression(arg, paramTypes.get(i)));
+      } else {
+        castArgs.add(arg);
+      }
+    }
     return new ScalarFunctionExpression(
         metadata.getScalarImplementation(), castArgs, metadata.getReturnType());
   }

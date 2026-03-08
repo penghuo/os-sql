@@ -360,4 +360,31 @@ public final class StringFunctions {
     }
     return sb.substring(0, targetLength);
   }
+
+  /** REGEXP_REPLACE(string, pattern, replacement) — replaces all occurrences matching the regex. */
+  public static ScalarFunctionImplementation regexpReplace() {
+    return (args, positionCount) -> {
+      Block inputBlock = args[0];
+      Block patternBlock = args[1];
+      Block replacementBlock = args[2];
+      BlockBuilder builder = VarcharType.VARCHAR.createBlockBuilder(null, positionCount);
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (inputBlock.isNull(pos) || patternBlock.isNull(pos) || replacementBlock.isNull(pos)) {
+          builder.appendNull();
+        } else {
+          String input = VarcharType.VARCHAR.getSlice(inputBlock, pos).toStringUtf8();
+          String pattern = VarcharType.VARCHAR.getSlice(patternBlock, pos).toStringUtf8();
+          String replacement = VarcharType.VARCHAR.getSlice(replacementBlock, pos).toStringUtf8();
+          try {
+            String result = input.replaceAll(pattern, replacement);
+            VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(result));
+          } catch (Exception e) {
+            // If regex fails, return original string
+            VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(input));
+          }
+        }
+      }
+      return builder.build();
+    };
+  }
 }

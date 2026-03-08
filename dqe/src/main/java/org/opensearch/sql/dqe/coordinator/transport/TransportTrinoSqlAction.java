@@ -22,7 +22,6 @@ import io.trino.sql.tree.QuerySpecification;
 import io.trino.sql.tree.Statement;
 import java.io.IOException;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -689,11 +688,15 @@ public class TransportTrinoSqlAction
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
     } else if (type instanceof TimestampType) {
       // Trino stores timestamps as microseconds since epoch.
-      // Format as date string (YYYY-MM-DD) for date-typed columns.
+      // Format as date or datetime string depending on time components.
       long microsSinceEpoch = type.getLong(block, position);
       long millisSinceEpoch = microsSinceEpoch / 1000;
-      LocalDate date = Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDate();
-      return date.toString();
+      java.time.LocalDateTime ldt =
+          Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDateTime();
+      if (ldt.getHour() == 0 && ldt.getMinute() == 0 && ldt.getSecond() == 0) {
+        return ldt.toLocalDate().toString(); // YYYY-MM-DD
+      }
+      return ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
     } else {
       // Default: try getLong for other numeric types
       try {

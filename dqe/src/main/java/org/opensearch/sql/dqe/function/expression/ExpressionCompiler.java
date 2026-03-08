@@ -139,6 +139,13 @@ public class ExpressionCompiler {
     } else if (expr instanceof InPredicate in) {
       return compileIn(in);
     } else if (expr instanceof FunctionCall func) {
+      // Check if this function call matches a column name (e.g., COUNT(*) in HAVING
+      // references the aggregation output column "count(*)")
+      String funcColName = expressionToColumnName(func);
+      if (columnIndexMap.containsKey(funcColName)) {
+        Type colType = columnTypeMap.getOrDefault(funcColName, BigintType.BIGINT);
+        return new ColumnReference(columnIndexMap.get(funcColName), colType);
+      }
       return compileFunctionCall(func);
     } else if (expr instanceof Extract extract) {
       // EXTRACT(field FROM expr) → convert to the equivalent function call
@@ -374,6 +381,21 @@ public class ExpressionCompiler {
 
     return new ScalarFunctionExpression(
         metadata.getScalarImplementation(), castArgs, metadata.getReturnType());
+  }
+
+  /**
+   * Convert a FunctionCall expression to its column name form (matching LogicalPlanner's naming).
+   * E.g., COUNT(*) -> "count(*)", MIN(URL) -> "min(URL)".
+   */
+  private static String expressionToColumnName(FunctionCall func) {
+    String args;
+    if (func.getArguments().isEmpty()) {
+      args = "*";
+    } else {
+      args = func.getArguments().stream().map(Object::toString).collect(Collectors.joining(", "));
+    }
+    String distinct = func.isDistinct() ? "DISTINCT " : "";
+    return func.getName().toString() + "(" + distinct + args + ")";
   }
 
   /**

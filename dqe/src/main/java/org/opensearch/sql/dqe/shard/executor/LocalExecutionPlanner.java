@@ -312,10 +312,35 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
               types.add(BigintType.BIGINT);
           }
         } else {
-          types.add(BigintType.BIGINT);
+          // Try to infer type by compiling the expression
+          Type inferredType = inferExpressionType(col);
+          types.add(inferredType != null ? inferredType : BigintType.BIGINT);
         }
       }
     }
     return types;
+  }
+
+  /**
+   * Try to infer the output type of an expression string by compiling it. Returns null if inference
+   * fails.
+   */
+  private Type inferExpressionType(String exprStr) {
+    try {
+      // Build column index map from the physical columns
+      Map<String, Integer> colIdxMap = new HashMap<>();
+      List<String> physicalCols = new ArrayList<>(columnTypeMap.keySet());
+      for (int i = 0; i < physicalCols.size(); i++) {
+        colIdxMap.put(physicalCols.get(i), i);
+      }
+      FunctionRegistry registry = BuiltinFunctions.createRegistry();
+      ExpressionCompiler compiler = new ExpressionCompiler(registry, colIdxMap, columnTypeMap);
+      org.opensearch.sql.dqe.trino.parser.DqeSqlParser parser =
+          new org.opensearch.sql.dqe.trino.parser.DqeSqlParser();
+      io.trino.sql.tree.Expression expr = parser.parseExpression(exprStr);
+      return compiler.compile(expr).getType();
+    } catch (Exception e) {
+      return null;
+    }
   }
 }

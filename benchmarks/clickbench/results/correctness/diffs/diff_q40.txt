@@ -1,0 +1,22 @@
+1,10c1,10
+< -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert26463058/page/www-windows)&bL=ru-ru&cE=true	10
+< -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert26464378.html?1=1&cid=2420390ESKDObozname	10
+< -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert2679955768&wi=1024&lo=http:%2F%3Fbundle%3D0	10
+< -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert269295&op_product_id=9083104/women.aspx#location	10
+< -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert2740643&lb_id=0&matchenie.php?start=22238	10
+< -1	0	0	http://state=19945206/foto-4/login-browser-2919260815.Affl4hyimttjs%26src%3DРоссия	http://irr.ru/index.php?showalbum/login-footofile/oneassik/registerdamenogorsk.irr.ru/6504.html?1=1&cid=591&op	10
+< -1	0	0	http://state=19945206/foto-4/login.pl?y1=13&text=уличник	http://irr.ru/index.php?showalbum/login-lamia-2002_mk_ii/тюнинг_салона/?page2/#overpage=0&choosOgUXI	10
+< 0	0	0		http://irr.ru/index.php?showalbum/login-kapusta-advert26098-1.137335/858537&scid=4797.htm	10
+< 0	0	0		http://irr.ru/index.php?showalbum/login-malyshevchonknamo_Kiev.ua/?target%3D43%26bt	10
+< 5	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/advert/kavanga/choice/0709&numphoto	http://nizhnieiene/p17378705/currency=1&with_photo-ideapadeno	10
+---
+> -1	0	0	http://state=19945206/foto-4/login-2006/makum	http://irr.ru/index.php?showalbum/login/?do=ready-mansion%3D0%26url%3D%26bn%3D0%26ref%3D%26custom=0	15
+> -1	0	0	http://state=19945206/foto-4/login-2006/makumiroshoowbiz/down%2Fholodilnik.ru/76/~8/	http://irr.ru/index.php	11
+> -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/click.net/paged=696&lo=http://yandsearch	http://irr.ru/index.php?showalbum/login-leniya7777294,938303130	21
+> -1	0	0	http://state=19945206/foto-4/login-2006/metro=144&ved=0CEUQFjAB&url=http://bonprix.ru/advert/kavanga_728x90.htm	http://irr.ru/index.php?showalbum/login-kapustic/product_name	31
+> -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert264313331325_1100535	12
+> -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert2695&op_uid=1&bc=3&ct=1&price_do=&currency	14
+> -1	0	0	http://state=19945206/foto-4/login-2491724/?bundlers/search?text	http://irr.ru/index.php?showalbum/login-kapusta-advert2791954~43.877256&op_seo_entry=&op_style	69
+> 0	0	0		http://komme%2F1.7.1364.172	31
+> 5	0	0	http://state=19945206/foto-4/login-2006/make=ForeightEnd	http://ekburg.irr.ru%2Fpuloveplanet	35
+> 5	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/yandex.ru/real-estate/rent/sdam-darom	http://samara.irr.html5/v12/?from]=	12

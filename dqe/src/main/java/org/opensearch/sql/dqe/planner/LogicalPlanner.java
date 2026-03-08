@@ -625,6 +625,22 @@ public class LogicalPlanner {
       }
     }
 
+    // Add tiebreaker sort keys: all available columns from the child node that aren't
+    // already in the sort keys. This ensures deterministic ordering when the primary
+    // sort key has ties (e.g., ORDER BY COUNT(*) DESC with multiple groups having the
+    // same count). Sort tiebreakers ascending with NULLS LAST.
+    if (child instanceof AggregationNode aggChild) {
+      List<String> allCols = new ArrayList<>(aggChild.getGroupByKeys());
+      allCols.addAll(aggChild.getAggregateFunctions());
+      for (String col : allCols) {
+        if (!sortKeys.contains(col)) {
+          sortKeys.add(col);
+          ascending.add(true);
+          nullsFirst.add(false);
+        }
+      }
+    }
+
     return new SortNode(child, sortKeys, ascending, nullsFirst);
   }
 

@@ -55,6 +55,11 @@ public final class StringFunctions {
   }
 
   /** length(varchar) -> bigint: returns the character length of the string. */
+  /**
+   * Returns the byte length of a string (matching ClickHouse's length() which returns bytes, not
+   * characters). For UTF-8 encoded strings, this counts the number of bytes in the UTF-8
+   * representation.
+   */
   public static ScalarFunctionImplementation length() {
     return (arguments, positionCount) -> {
       Block input = arguments[0];
@@ -63,8 +68,9 @@ public final class StringFunctions {
         if (input.isNull(pos)) {
           builder.appendNull();
         } else {
-          String value = VarcharType.VARCHAR.getSlice(input, pos).toStringUtf8();
-          BigintType.BIGINT.writeLong(builder, value.length());
+          // Use byte length (UTF-8 bytes) to match ClickHouse's length() semantics
+          io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(input, pos);
+          BigintType.BIGINT.writeLong(builder, slice.length());
         }
       }
       return builder.build();

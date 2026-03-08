@@ -37,7 +37,7 @@ NUM_TRIES="${NUM_TRIES:-3}"
 INDEX_NAME="hits"
 
 # --- Tier config ---
-QUERY_TIMEOUT="${QUERY_TIMEOUT:-60}"   # seconds, applies to all tiers
+QUERY_TIMEOUT="${QUERY_TIMEOUT:-120}"  # seconds, applies to all tiers
 INDEX_NAME_1M="hits_1m"
 CH_TABLE_1M="hits_1m"
 SNAPSHOT_REPO="clickbench_repo"

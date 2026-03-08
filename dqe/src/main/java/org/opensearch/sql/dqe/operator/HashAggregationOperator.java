@@ -304,16 +304,19 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
-  /** SUM accumulator for numeric columns. Produces a BIGINT result for integer types. */
+  /** SUM accumulator for numeric columns. Uses long for integer types to avoid precision loss. */
   public static class SumAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
-    private double sum = 0;
+    private final boolean isIntegerType;
+    private long longSum = 0;
+    private double doubleSum = 0;
     private boolean hasValue = false;
 
     public SumAccumulator(int columnIndex, Type inputType) {
       this.columnIndex = columnIndex;
       this.inputType = inputType;
+      this.isIntegerType = !(inputType instanceof DoubleType);
     }
 
     @Override
@@ -321,11 +324,10 @@ public class HashAggregationOperator implements Operator {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
         hasValue = true;
-        if (inputType instanceof DoubleType) {
-          sum += DoubleType.DOUBLE.getDouble(block, position);
+        if (isIntegerType) {
+          longSum += inputType.getLong(block, position);
         } else {
-          // All integer types (BigintType, IntegerType, SmallintType, TinyintType)
-          sum += inputType.getLong(block, position);
+          doubleSum += DoubleType.DOUBLE.getDouble(block, position);
         }
       }
     }
@@ -334,10 +336,10 @@ public class HashAggregationOperator implements Operator {
     public void writeTo(BlockBuilder builder) {
       if (!hasValue) {
         builder.appendNull();
-      } else if (inputType instanceof DoubleType) {
-        DoubleType.DOUBLE.writeDouble(builder, sum);
+      } else if (isIntegerType) {
+        BigintType.BIGINT.writeLong(builder, longSum);
       } else {
-        BigintType.BIGINT.writeLong(builder, (long) sum);
+        DoubleType.DOUBLE.writeDouble(builder, doubleSum);
       }
     }
   }

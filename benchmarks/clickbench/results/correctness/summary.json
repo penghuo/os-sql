@@ -2,8 +2,8 @@
   "date": "2026-03-09",
   "dataset": "1m",
   "total": 43,
-  "pass": 34,
-  "fail": 9,
+  "pass": 42,
+  "fail": 1,
   "skip": 0,
   "queries": [
     {
@@ -38,10 +38,8 @@
     },
     {
       "q": 7,
-      "status": "FAIL",
-      "reason": "content mismatch (1 rows, diff saved)",
-      "expected_rows": 1,
-      "actual_rows": 1
+      "status": "PASS",
+      "rows": 1
     },
     {
       "q": 8,
@@ -100,10 +98,8 @@
     },
     {
       "q": 19,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 20,
@@ -194,38 +190,28 @@
     },
     {
       "q": 37,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 38,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 39,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 40,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 41,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 42,
@@ -234,10 +220,8 @@
     },
     {
       "q": 43,
-      "status": "FAIL",
-      "reason": "row count mismatch (expected: 10, actual: 0)",
-      "expected_rows": 10,
-      "actual_rows": 0
+      "status": "PASS",
+      "rows": 10
     }
   ]
 }

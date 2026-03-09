@@ -32,8 +32,7 @@ public final class DocValuesReader {
   private DocValuesReader() {}
 
   /**
-   * Read doc values for a column from the given leaf reader context and write them into the block
-   * builder.
+   * Read doc values for a column starting at offset 0.
    *
    * @param leaf the segment's leaf reader context
    * @param column column handle with name and Trino type
@@ -44,6 +43,28 @@ public final class DocValuesReader {
   public static void readColumn(
       LeafReaderContext leaf, ColumnHandle column, int[] docIds, int count, BlockBuilder builder)
       throws IOException {
+    readColumn(leaf, column, docIds, 0, count, builder);
+  }
+
+  /**
+   * Read doc values for a column from the given leaf reader context and write them into the block
+   * builder.
+   *
+   * @param leaf the segment's leaf reader context
+   * @param column column handle with name and Trino type
+   * @param docIds array of segment-relative doc IDs to read
+   * @param offset starting index in the docIds array
+   * @param count number of doc IDs to read starting from offset
+   * @param builder block builder to write values into
+   */
+  public static void readColumn(
+      LeafReaderContext leaf,
+      ColumnHandle column,
+      int[] docIds,
+      int offset,
+      int count,
+      BlockBuilder builder)
+      throws IOException {
     Type type = column.type();
     String field = column.name();
 
@@ -51,15 +72,15 @@ public final class DocValuesReader {
         || type instanceof IntegerType
         || type instanceof SmallintType
         || type instanceof TinyintType) {
-      readNumeric(leaf, field, type, docIds, count, builder);
+      readNumeric(leaf, field, type, docIds, offset, count, builder);
     } else if (type instanceof DoubleType) {
-      readDouble(leaf, field, docIds, count, builder);
+      readDouble(leaf, field, docIds, offset, count, builder);
     } else if (type instanceof TimestampType) {
-      readTimestamp(leaf, field, docIds, count, builder);
+      readTimestamp(leaf, field, docIds, offset, count, builder);
     } else if (type instanceof BooleanType) {
-      readBoolean(leaf, field, docIds, count, builder);
+      readBoolean(leaf, field, docIds, offset, count, builder);
     } else if (type instanceof VarcharType) {
-      readKeyword(leaf, field, docIds, count, builder);
+      readKeyword(leaf, field, docIds, offset, count, builder);
     } else {
       // Unsupported type: write nulls
       for (int i = 0; i < count; i++) {
@@ -73,11 +94,12 @@ public final class DocValuesReader {
       String field,
       Type type,
       int[] docIds,
+      int offset,
       int count,
       BlockBuilder builder)
       throws IOException {
     SortedNumericDocValues dv = leaf.reader().getSortedNumericDocValues(field);
-    for (int i = 0; i < count; i++) {
+    for (int i = offset; i < offset + count; i++) {
       if (dv != null && dv.advanceExact(docIds[i])) {
         type.writeLong(builder, dv.nextValue());
       } else {
@@ -87,10 +109,15 @@ public final class DocValuesReader {
   }
 
   private static void readDouble(
-      LeafReaderContext leaf, String field, int[] docIds, int count, BlockBuilder builder)
+      LeafReaderContext leaf,
+      String field,
+      int[] docIds,
+      int offset,
+      int count,
+      BlockBuilder builder)
       throws IOException {
     SortedNumericDocValues dv = leaf.reader().getSortedNumericDocValues(field);
-    for (int i = 0; i < count; i++) {
+    for (int i = offset; i < offset + count; i++) {
       if (dv != null && dv.advanceExact(docIds[i])) {
         DoubleType.DOUBLE.writeDouble(builder, Double.longBitsToDouble(dv.nextValue()));
       } else {
@@ -100,10 +127,15 @@ public final class DocValuesReader {
   }
 
   private static void readTimestamp(
-      LeafReaderContext leaf, String field, int[] docIds, int count, BlockBuilder builder)
+      LeafReaderContext leaf,
+      String field,
+      int[] docIds,
+      int offset,
+      int count,
+      BlockBuilder builder)
       throws IOException {
     SortedNumericDocValues dv = leaf.reader().getSortedNumericDocValues(field);
-    for (int i = 0; i < count; i++) {
+    for (int i = offset; i < offset + count; i++) {
       if (dv != null && dv.advanceExact(docIds[i])) {
         long epochMillis = dv.nextValue();
         // Convert to Trino microseconds
@@ -115,10 +147,15 @@ public final class DocValuesReader {
   }
 
   private static void readBoolean(
-      LeafReaderContext leaf, String field, int[] docIds, int count, BlockBuilder builder)
+      LeafReaderContext leaf,
+      String field,
+      int[] docIds,
+      int offset,
+      int count,
+      BlockBuilder builder)
       throws IOException {
     SortedNumericDocValues dv = leaf.reader().getSortedNumericDocValues(field);
-    for (int i = 0; i < count; i++) {
+    for (int i = offset; i < offset + count; i++) {
       if (dv != null && dv.advanceExact(docIds[i])) {
         BooleanType.BOOLEAN.writeBoolean(builder, dv.nextValue() == 1);
       } else {
@@ -128,10 +165,15 @@ public final class DocValuesReader {
   }
 
   private static void readKeyword(
-      LeafReaderContext leaf, String field, int[] docIds, int count, BlockBuilder builder)
+      LeafReaderContext leaf,
+      String field,
+      int[] docIds,
+      int offset,
+      int count,
+      BlockBuilder builder)
       throws IOException {
     SortedSetDocValues dv = leaf.reader().getSortedSetDocValues(field);
-    for (int i = 0; i < count; i++) {
+    for (int i = offset; i < offset + count; i++) {
       if (dv != null && dv.advanceExact(docIds[i])) {
         long ord = dv.nextOrd();
         BytesRef bytes = dv.lookupOrd(ord);

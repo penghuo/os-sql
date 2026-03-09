@@ -200,12 +200,36 @@ For queries with no columns (pure `COUNT(*)`), `LucenePageSource` uses `IndexSea
 ./run/run_all.sh performance
 ```
 
+## Where the Speedup Comes From
+
+The performance gain is from **eliminating I/O overhead**, not from faster compute:
+
+| Eliminated overhead | Why it's slow |
+|---|---|
+| 100× scroll API round-trips per shard | Serialization, thread dispatch, scroll context management |
+| 1M× `hit.getSourceAsMap()` | JSON parse + HashMap allocation per document |
+| 1M× `PageBuilder.appendValue()` | Object unboxing, type dispatch per cell |
+
+The `HashAggregationOperator` itself stays the same — Java hash-map accumulation. If profiling after Phase 1 shows aggregation is the bottleneck (not I/O), a follow-up phase can redesign the hash table with cache-friendly open-addressing and potentially Java Vector API (SIMD).
+
+## Velox Evaluation
+
+Evaluated and rejected for this phase:
+
+- **Prestissimo** integrates Velox with PrestoDB (Meta's fork), not Trino.
+- **Gluten** (Apache Incubator) bridges Spark→Velox via JNI + Substrait. Works because Velox has native Parquet/ORC connectors.
+- **Blocker**: Velox cannot read Lucene doc values from C++. Would require JNI callbacks from C++ back to Java, negating native execution benefit.
+- **Deployment**: 100-500MB platform-specific native `.so` library, complex dependency tree (Folly, Boost, Arrow, Protobuf).
+
+Velox becomes viable if OpenSearch adds a columnar storage format readable from C++ (outside Lucene).
+
 ## Success Criteria
 
 - 43/43 correctness PASS (no regression)
 - All 43 queries on 1M dataset complete within 5x ClickHouse timing
 - No DSL aggregation used — all aggregation in DQE operators
 - `OpenSearchPageSource` scroll path fully replaced by `LucenePageSource` for indexed fields
+- Perf-lite results measured and analyzed to identify next optimization targets
 
 ## Risks and Mitigations
 

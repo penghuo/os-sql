@@ -36,6 +36,9 @@ dependencies {
     // ANTLR runtime (Trino's grammar uses 4.13.2)
     implementation "org.antlr:antlr4-runtime:4.13.2"
 
+    // Jackson (provided by OpenSearch at runtime, needed for DSL JSON parsing)
+    compileOnly "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+
     // OpenSearch core
     compileOnly group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
     compileOnly group: 'org.opensearch', name: 'opensearch-x-content', version: "${opensearch_version}"

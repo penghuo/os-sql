@@ -16,21 +16,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.Query;
 import org.opensearch.action.ActionRequest;
-import org.opensearch.action.search.ClearScrollRequest;
-import org.opensearch.action.search.ClearScrollResponse;
-import org.opensearch.action.search.SearchRequest;
-import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.search.SearchScrollRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.InputStreamStreamInput;
-import org.opensearch.index.query.QueryBuilders;
-import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.index.shard.IndexShard;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.sql.dqe.common.config.DqeSettings;
 import org.opensearch.sql.dqe.coordinator.metadata.OpenSearchMetadata;
 import org.opensearch.sql.dqe.coordinator.metadata.TableInfo;
@@ -48,7 +46,8 @@ import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
 import org.opensearch.sql.dqe.shard.source.ColumnHandle;
-import org.opensearch.sql.dqe.shard.source.OpenSearchPageSource;
+import org.opensearch.sql.dqe.shard.source.LucenePageSource;
+import org.opensearch.sql.dqe.shard.source.LuceneQueryCompiler;
 import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
@@ -70,11 +69,11 @@ public class TransportShardExecuteAction
   /** Thread pool name for shard-level DQE execution. */
   public static final String DQE_THREAD_POOL_NAME = "dqe-shard-executor";
 
-  /** NodeClient for executing search requests on the local node (production path). */
-  private final NodeClient client;
-
   /** ClusterService for resolving index metadata (production path). */
   private final ClusterService clusterService;
+
+  /** IndicesService for resolving IndexShard (production path, Lucene native reader). */
+  private final IndicesService indicesService;
 
   /**
    * Scan factory supplied directly (test path only). When non-null, the action uses this factory
@@ -94,21 +93,23 @@ public class TransportShardExecuteAction
    * @param actionFilters action filters
    * @param client the node-local client for executing search requests
    * @param clusterService cluster service for resolving index metadata
+   * @param indicesService indices service for resolving IndexShard
    */
   @Inject
   public TransportShardExecuteAction(
       TransportService transportService,
       ActionFilters actionFilters,
       NodeClient client,
-      ClusterService clusterService) {
+      ClusterService clusterService,
+      IndicesService indicesService) {
     super(
         ShardExecuteAction.NAME,
         transportService,
         actionFilters,
         ShardExecuteRequest::new,
         DQE_THREAD_POOL_NAME);
-    this.client = client;
     this.clusterService = clusterService;
+    this.indicesService = indicesService;
     this.scanFactory = null;
     this.columnTypeMap = null;
   }
@@ -128,8 +129,8 @@ public class TransportShardExecuteAction
       Function<TableScanNode, Operator> scanFactory,
       Map<String, Type> columnTypeMap) {
     super(ShardExecuteAction.NAME, transportService, actionFilters, ShardExecuteRequest::new);
-    this.client = null;
     this.clusterService = null;
+    this.indicesService = null;
     this.scanFactory = scanFactory;
     this.columnTypeMap = columnTypeMap;
   }
@@ -163,7 +164,8 @@ public class TransportShardExecuteAction
 
         Settings nodeSettings = clusterService.getSettings();
         int batchSize = DqeSettings.PAGE_BATCH_SIZE.get(nodeSettings);
-        effectiveScanFactory = buildScanFactory(req, effectiveColumnTypeMap, batchSize);
+        effectiveScanFactory =
+            buildLuceneScanFactory(req, tableInfo, effectiveColumnTypeMap, batchSize);
       }
 
       // 3. Build operator pipeline
@@ -190,53 +192,42 @@ public class TransportShardExecuteAction
   }
 
   /**
-   * Build a scan factory that creates an {@link OpenSearchPageSource} for the given shard. The
-   * factory wraps the {@link NodeClient} in a {@link OpenSearchPageSource.SearchClient} adapter.
+   * Build a scan factory that creates a {@link LucenePageSource} for the given shard. Reads doc
+   * values directly from Lucene segments instead of using the scroll API.
    *
    * @param req the shard execute request
+   * @param tableInfo table metadata including OpenSearch field types
    * @param typeMap mapping from column name to Trino Type
-   * @param batchSize number of documents per scroll batch
+   * @param batchSize number of rows per page
    */
-  private Function<TableScanNode, Operator> buildScanFactory(
-      ShardExecuteRequest req, Map<String, Type> typeMap, int batchSize) {
-    OpenSearchPageSource.SearchClient searchClient =
-        new OpenSearchPageSource.SearchClient() {
-          @Override
-          public SearchResponse search(SearchRequest request) {
-            return client.search(request).actionGet();
-          }
-
-          @Override
-          public SearchResponse searchScroll(SearchScrollRequest request) {
-            return client.searchScroll(request).actionGet();
-          }
-
-          @Override
-          public ClearScrollResponse clearScroll(ClearScrollRequest request) {
-            return client.clearScroll(request).actionGet();
-          }
-        };
+  private Function<TableScanNode, Operator> buildLuceneScanFactory(
+      ShardExecuteRequest req, TableInfo tableInfo, Map<String, Type> typeMap, int batchSize) {
+    // Build field type map for LuceneQueryCompiler (field name → OS type string)
+    Map<String, String> fieldTypeMap =
+        tableInfo.columns().stream()
+            .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::openSearchType));
 
     return node -> {
+      // 1. Resolve IndexShard
+      IndexMetadata indexMeta = clusterService.state().metadata().index(node.getIndexName());
+      IndexShard shard =
+          indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+      // 2. Compile Lucene query from DSL filter
+      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(fieldTypeMap);
+      Query query =
+          (node.getDslFilter() != null)
+              ? queryCompiler.compile(node.getDslFilter())
+              : new MatchAllDocsQuery();
+
+      // 3. Build column handles
       List<ColumnHandle> columns =
           node.getColumns().stream()
               .map(col -> new ColumnHandle(col, typeMap.getOrDefault(col, BigintType.BIGINT)))
               .collect(Collectors.toList());
 
-      SearchSourceBuilder dsl = new SearchSourceBuilder();
-      if (node.getDslFilter() != null) {
-        dsl.query(QueryBuilders.wrapperQuery(node.getDslFilter()));
-      }
-
-      // Apply _source filtering to only fetch needed columns
-      if (node.getColumns().isEmpty()) {
-        dsl.fetchSource(false); // No columns needed (e.g., COUNT(*))
-      } else {
-        dsl.fetchSource(node.getColumns().toArray(new String[0]), null);
-      }
-
-      return new OpenSearchPageSource(
-          searchClient, node.getIndexName(), req.getShardId(), dsl, columns, batchSize);
+      // 4. Create LucenePageSource
+      return new LucenePageSource(shard, query, columns, batchSize);
     };
   }
 

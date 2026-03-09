@@ -1,15 +1,243 @@
 {
-  "date": "2026-03-08",
+  "date": "2026-03-09",
   "dataset": "1m",
   "total": 43,
-  "pass": 1,
-  "fail": 0,
+  "pass": 34,
+  "fail": 9,
   "skip": 0,
   "queries": [
+    {
+      "q": 1,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 2,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 3,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 4,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 5,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 6,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 7,
+      "status": "FAIL",
+      "reason": "content mismatch (1 rows, diff saved)",
+      "expected_rows": 1,
+      "actual_rows": 1
+    },
+    {
+      "q": 8,
+      "status": "PASS",
+      "rows": 5
+    },
+    {
+      "q": 9,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 10,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 11,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 12,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 13,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 14,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 15,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 16,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 17,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 18,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 19,
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
+    },
+    {
+      "q": 20,
+      "status": "PASS",
+      "rows": 0
+    },
+    {
+      "q": 21,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 22,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 23,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 24,
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
+    },
+    {
+      "q": 25,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 26,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 27,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 28,
+      "status": "PASS",
+      "rows": 2
+    },
     {
       "q": 29,
       "status": "PASS",
       "rows": 1
+    },
+    {
+      "q": 30,
+      "status": "PASS",
+      "rows": 1
+    },
+    {
+      "q": 31,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 32,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 33,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 34,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 35,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 36,
+      "status": "PASS",
+      "rows": 10
+    },
+    {
+      "q": 37,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
+    },
+    {
+      "q": 38,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
+    },
+    {
+      "q": 39,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
+    },
+    {
+      "q": 40,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
+    },
+    {
+      "q": 41,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
+    },
+    {
+      "q": 42,
+      "status": "PASS",
+      "rows": 0
+    },
+    {
+      "q": 43,
+      "status": "FAIL",
+      "reason": "row count mismatch (expected: 10, actual: 0)",
+      "expected_rows": 10,
+      "actual_rows": 0
     }
   ]
 }

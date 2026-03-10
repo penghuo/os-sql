@@ -114,7 +114,9 @@ public class ResultMerger {
       // Merge each aggregate function
       for (int a = 0; a < numAggCols; a++) {
         int colIdx = numGroupByCols + a;
-        mergedRow[colIdx] = mergeAggregate(aggregateFunctions.get(a), groupRows, colIdx);
+        mergedRow[colIdx] =
+            mergeAggregate(
+                aggregateFunctions.get(a), groupRows, colIdx, aggregateFunctions, numGroupByCols);
       }
 
       mergedRows.add(mergedRow);
@@ -229,20 +231,29 @@ public class ResultMerger {
     return sb.toString();
   }
 
-  /** Merge a single aggregate expression across all rows in a group. */
-  private Object mergeAggregate(String aggExpr, List<Object[]> groupRows, int colIdx) {
+  /**
+   * Merge a single aggregate expression across all rows in a group.
+   *
+   * @param aggExpr the aggregate expression string (e.g., "COUNT(*)", "AVG(col)")
+   * @param groupRows all rows for this group from all shards
+   * @param colIdx column index of this aggregate in the row array
+   * @param allAggExprs all aggregate expressions (for finding companion COUNT for AVG)
+   * @param numGroupByCols number of group-by columns (offset for agg column indices)
+   */
+  private Object mergeAggregate(
+      String aggExpr,
+      List<Object[]> groupRows,
+      int colIdx,
+      List<String> allAggExprs,
+      int numGroupByCols) {
     Matcher matcher = AGG_PATTERN.matcher(aggExpr);
     if (!matcher.matches()) {
       throw new UnsupportedOperationException("Unsupported aggregate expression: " + aggExpr);
     }
     String funcName = matcher.group(1).toUpperCase(Locale.ROOT);
-    boolean isDistinct = matcher.group(2) != null;
 
     switch (funcName) {
       case "COUNT":
-        if (isDistinct) {
-          return sumValues(groupRows, colIdx);
-        }
         return sumValues(groupRows, colIdx);
       case "SUM":
         return sumValues(groupRows, colIdx);
@@ -251,7 +262,7 @@ public class ResultMerger {
       case "MAX":
         return maxValue(groupRows, colIdx);
       case "AVG":
-        return avgValues(groupRows, colIdx);
+        return weightedAvgValues(groupRows, colIdx, allAggExprs, numGroupByCols);
       default:
         throw new UnsupportedOperationException("Unsupported aggregate function: " + funcName);
     }
@@ -315,21 +326,60 @@ public class ResultMerger {
   }
 
   /**
-   * Average numeric values for a given column across all rows. Note: this averages the partial
-   * averages from each shard, which is only correct for single-shard indices or when all shards
-   * have equal row counts.
+   * Compute a weighted average using the companion COUNT column for proper multi-shard merge. Each
+   * shard emits a partial average and a partial count. The correct merge is: sum(avg_i * count_i) /
+   * sum(count_i). If no COUNT column is found, falls back to simple averaging (correct for single
+   * shard).
    */
-  private Number avgValues(List<Object[]> rows, int colIdx) {
+  private Number weightedAvgValues(
+      List<Object[]> rows, int avgColIdx, List<String> allAggExprs, int numGroupByCols) {
+    // Find a companion COUNT(*) or COUNT(col) column for weighting
+    int countColIdx = findCountColumnIndex(allAggExprs, numGroupByCols);
+
+    if (countColIdx >= 0) {
+      // Weighted average: sum(avg * count) / sum(count)
+      double weightedSum = 0.0;
+      long totalCount = 0;
+      for (Object[] row : rows) {
+        Number avg = (Number) row[avgColIdx];
+        Number cnt = (Number) row[countColIdx];
+        if (avg != null && cnt != null) {
+          weightedSum += avg.doubleValue() * cnt.longValue();
+          totalCount += cnt.longValue();
+        }
+      }
+      return totalCount > 0 ? weightedSum / totalCount : null;
+    }
+
+    // Fallback: simple average (only correct for single shard)
     double sum = 0.0;
     int count = 0;
     for (Object[] row : rows) {
-      Number val = (Number) row[colIdx];
+      Number val = (Number) row[avgColIdx];
       if (val != null) {
         sum += val.doubleValue();
         count++;
       }
     }
     return count > 0 ? sum / count : null;
+  }
+
+  /**
+   * Find the column index of a COUNT(*) or non-distinct COUNT aggregate in the function list.
+   * Returns -1 if not found.
+   */
+  private int findCountColumnIndex(List<String> aggExprs, int numGroupByCols) {
+    for (int i = 0; i < aggExprs.size(); i++) {
+      Matcher m = AGG_PATTERN.matcher(aggExprs.get(i));
+      if (m.matches()) {
+        String func = m.group(1).toUpperCase(Locale.ROOT);
+        boolean isDistinct = m.group(2) != null;
+        if ("COUNT".equals(func) && !isDistinct) {
+          return numGroupByCols + i;
+        }
+      }
+    }
+    return -1;
   }
 
   /**

@@ -15,10 +15,11 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 @Getter
 public class AggregationNode extends DqePlanNode {
 
-  /** Whether this aggregation is a partial (shard-local) or final (coordinator) step. */
+  /** Whether this aggregation is a partial (shard-local), final (coordinator), or single step. */
   public enum Step {
     PARTIAL,
-    FINAL
+    FINAL,
+    SINGLE
   }
 
   private final DqePlanNode child;

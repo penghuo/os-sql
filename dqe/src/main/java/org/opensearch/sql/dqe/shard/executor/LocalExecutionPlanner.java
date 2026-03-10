@@ -209,6 +209,27 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
   }
 
   /**
+   * Build a HashAggregationOperator from an AggregationNode with an explicit source operator and
+   * input column names. Used by the coordinator to run full aggregation over concatenated shard
+   * results for queries that can't use PARTIAL/FINAL split (e.g., COUNT(DISTINCT)).
+   */
+  public Operator buildAggregationOperator(
+      Operator source, AggregationNode aggNode, List<String> inputColumns) {
+    List<Integer> groupByIndices =
+        aggNode.getGroupByKeys().stream()
+            .map(key -> resolveColumnIndex(key, inputColumns))
+            .collect(Collectors.toList());
+
+    List<Type> colTypes = resolveColumnTypes(inputColumns);
+    List<HashAggregationOperator.AggregateFunction> aggFunctions =
+        aggNode.getAggregateFunctions().stream()
+            .map(funcStr -> parseAggregateFunction(funcStr, inputColumns, colTypes))
+            .collect(Collectors.toList());
+
+    return new HashAggregationOperator(source, groupByIndices, aggFunctions, colTypes);
+  }
+
+  /**
    * Resolves the output column list for a given plan node. This determines the column order at a
    * given point in the plan tree by walking the node structure.
    */

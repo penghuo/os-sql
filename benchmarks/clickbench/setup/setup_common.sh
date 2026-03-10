@@ -261,10 +261,18 @@ load_1m_data() {
                 -H 'Content-Type: application/json' \
                 -d '{"index": {"refresh_interval": "-1", "number_of_replicas": 0}}'
 
-            # Convert first 1M rows of first parquet to NDJSON and bulk load
+            # Convert first 1M rows of first parquet to NDJSON and bulk load.
+            # Date/DateTime columns in the parquet are stored as epoch days (UInt16)
+            # and epoch seconds (UInt32) respectively, but OpenSearch expects epoch_millis
+            # or formatted date strings.  REPLACE converts them to ISO format strings.
             local bulk_size=10000
             clickhouse-local \
-                -q "SELECT * FROM file('$first_parquet', Parquet) LIMIT 1000000 FORMAT JSONEachRow" | \
+                -q "SELECT * REPLACE(
+                      toString(toDate(EventDate)) AS EventDate,
+                      formatDateTime(toDateTime(EventTime), '%Y-%m-%d %H:%i:%S') AS EventTime,
+                      formatDateTime(toDateTime(ClientEventTime), '%Y-%m-%d %H:%i:%S') AS ClientEventTime,
+                      formatDateTime(toDateTime(LocalEventTime), '%Y-%m-%d %H:%i:%S') AS LocalEventTime
+                    ) FROM file('$first_parquet', Parquet) LIMIT 1000000 FORMAT JSONEachRow" | \
             awk -v idx="$INDEX_NAME_1M" '{print "{\"index\":{\"_index\":\"" idx "\"}}"; print}' | \
             split -l $((bulk_size * 2)) -a 4 - /tmp/os_1m_bulk_
 

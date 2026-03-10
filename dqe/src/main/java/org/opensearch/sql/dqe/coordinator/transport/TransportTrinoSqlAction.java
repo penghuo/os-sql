@@ -50,6 +50,7 @@ import org.opensearch.sql.dqe.function.BuiltinFunctions;
 import org.opensearch.sql.dqe.function.FunctionRegistry;
 import org.opensearch.sql.dqe.function.expression.BlockExpression;
 import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
+import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.LogicalPlanner;
 import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -184,7 +185,18 @@ public class TransportTrinoSqlAction
 
                       ResultMerger merger = new ResultMerger();
                       List<Page> mergedPages;
-                      if (coordinatorPlan instanceof AggregationNode aggNode) {
+                      if (coordinatorPlan instanceof AggregationNode aggNode
+                          && aggNode.getStep() == AggregationNode.Step.SINGLE) {
+                        // SINGLE aggregation: shards sent raw data, coordinator aggregates
+                        // Shard columns are the scan output (child of aggregation in the
+                        // original plan), resolved from the shard fragment plan
+                        List<String> shardColumnNames =
+                            resolveColumnNames(shardFragments.get(0).shardPlan());
+                        List<Page> rawPages = merger.mergePassthrough(shardPages);
+                        mergedPages =
+                            runCoordinatorAggregation(
+                                aggNode, rawPages, shardColumnNames, columnTypeMap);
+                      } else if (coordinatorPlan instanceof AggregationNode aggNode) {
                         mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
                       } else {
                         // Check if we need sorted merge
@@ -883,6 +895,51 @@ public class TransportTrinoSqlAction
         result.add(page.getRegion(0, (int) remaining));
         remaining = 0;
       }
+    }
+    return result;
+  }
+
+  /**
+   * Run full aggregation at the coordinator for queries that can't use PARTIAL/FINAL split (e.g.,
+   * COUNT(DISTINCT)). Feeds raw shard pages through a HashAggregationOperator.
+   *
+   * @param aggNode the aggregation node (group-by keys + functions)
+   * @param rawPages concatenated raw pages from all shards
+   * @param rawColumnNames column names in the raw pages (from shard scan output)
+   * @param columnTypeMap field name → Trino Type mapping
+   */
+  private static List<Page> runCoordinatorAggregation(
+      AggregationNode aggNode,
+      List<Page> rawPages,
+      List<String> rawColumnNames,
+      Map<String, Type> columnTypeMap) {
+    if (rawPages.isEmpty()) {
+      return List.of();
+    }
+
+    org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner planner =
+        new org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner(
+            scan -> null, columnTypeMap);
+
+    Operator pageSource =
+        new Operator() {
+          private int pageIndex = 0;
+
+          @Override
+          public Page processNextBatch() {
+            return pageIndex < rawPages.size() ? rawPages.get(pageIndex++) : null;
+          }
+
+          @Override
+          public void close() {}
+        };
+
+    Operator aggOperator = planner.buildAggregationOperator(pageSource, aggNode, rawColumnNames);
+
+    List<Page> result = new ArrayList<>();
+    Page page;
+    while ((page = aggOperator.processNextBatch()) != null) {
+      result.add(page);
     }
     return result;
   }

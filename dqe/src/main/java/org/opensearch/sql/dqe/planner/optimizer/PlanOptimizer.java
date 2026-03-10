@@ -368,6 +368,12 @@ public class PlanOptimizer {
     @Override
     public DqePlanNode visitAggregation(AggregationNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
+      // Don't split to PARTIAL when COUNT(DISTINCT) is present — it can't be merged
+      // correctly by summing per-shard counts (double-counts values across shards)
+      if (hasCountDistinct(node.getAggregateFunctions())) {
+        return new AggregationNode(
+            optimizedChild, node.getGroupByKeys(), node.getAggregateFunctions(), node.getStep());
+      }
       // Ensure the aggregation step is PARTIAL for distributed execution
       if (node.getStep() != AggregationNode.Step.PARTIAL) {
         return new AggregationNode(
@@ -378,6 +384,15 @@ public class PlanOptimizer {
       }
       return new AggregationNode(
           optimizedChild, node.getGroupByKeys(), node.getAggregateFunctions(), node.getStep());
+    }
+
+    private boolean hasCountDistinct(List<String> aggFunctions) {
+      for (String func : aggFunctions) {
+        if (func.toUpperCase(java.util.Locale.ROOT).contains("COUNT(DISTINCT")) {
+          return true;
+        }
+      }
+      return false;
     }
 
     @Override

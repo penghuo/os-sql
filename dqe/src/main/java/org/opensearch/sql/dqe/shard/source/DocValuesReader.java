@@ -173,8 +173,16 @@ public final class DocValuesReader {
       BlockBuilder builder)
       throws IOException {
     SortedSetDocValues dv = leaf.reader().getSortedSetDocValues(field);
+    if (dv == null) {
+      // Field has no doc values at all (e.g., text type). Write empty strings to match
+      // the behavior of _source-based reading where missing text fields are empty strings.
+      for (int i = 0; i < count; i++) {
+        VarcharType.VARCHAR.writeSlice(builder, Slices.EMPTY_SLICE);
+      }
+      return;
+    }
     for (int i = offset; i < offset + count; i++) {
-      if (dv != null && dv.advanceExact(docIds[i])) {
+      if (dv.advanceExact(docIds[i])) {
         long ord = dv.nextOrd();
         BytesRef bytes = dv.lookupOrd(ord);
         VarcharType.VARCHAR.writeSlice(

@@ -186,6 +186,13 @@ public class TransportTrinoSqlAction
                       ResultMerger merger = new ResultMerger();
                       List<Page> mergedPages;
                       if (coordinatorPlan instanceof AggregationNode aggNode
+                          && isScalarPartialMerge(aggNode)) {
+                        // Fast path: scalar aggregation merge (no GROUP BY).
+                        // Just sum/merge the partial results from each shard directly,
+                        // bypassing HashAggregationOperator construction.
+                        mergedPages = mergeScalarAggregation(shardPages, aggNode, columnTypes);
+                        // No sort/having needed for scalar aggregation
+                      } else if (coordinatorPlan instanceof AggregationNode aggNode
                           && aggNode.getStep() == AggregationNode.Step.SINGLE) {
                         // SINGLE aggregation: shards sent raw data, coordinator aggregates
                         List<String> shardColumnNames =
@@ -1067,5 +1074,160 @@ public class TransportTrinoSqlAction
       result.add(page);
     }
     return result;
+  }
+
+  /**
+   * Check if the coordinator aggregation node is a scalar (no GROUP BY) FINAL merge that can use
+   * the fast merge path.
+   */
+  private static boolean isScalarPartialMerge(AggregationNode aggNode) {
+    return aggNode.getStep() == AggregationNode.Step.FINAL && aggNode.getGroupByKeys().isEmpty();
+  }
+
+  /**
+   * Fast path for merging scalar aggregation results from shards. Instead of constructing a
+   * HashAggregationOperator, directly iterates over shard Pages and merges values. Supports
+   * COUNT(*) (sum), SUM (sum), MIN (min), MAX (max), and AVG (weighted average).
+   *
+   * @param shardPages results from each shard (each shard returns a single-row Page)
+   * @param aggNode the FINAL aggregation node
+   * @param columnTypes types for the output columns
+   * @return single-row merged result
+   */
+  private static List<Page> mergeScalarAggregation(
+      List<List<Page>> shardPages, AggregationNode aggNode, List<Type> columnTypes) {
+    List<String> aggFunctions = aggNode.getAggregateFunctions();
+    int numAggs = aggFunctions.size();
+
+    // Initialize accumulators
+    double[] sumValues = new double[numAggs];
+    long[] longSumValues = new long[numAggs];
+    boolean[] isDouble = new boolean[numAggs];
+    boolean[] isMinMax = new boolean[numAggs];
+    boolean[] isMin = new boolean[numAggs];
+    boolean[] isAvg = new boolean[numAggs];
+    Object[] minMaxValues = new Object[numAggs];
+    // For AVG weighting: track companion COUNT column index
+    int countColIdx = -1;
+
+    java.util.regex.Pattern AGG_PAT =
+        java.util.regex.Pattern.compile(
+            "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    for (int a = 0; a < numAggs; a++) {
+      java.util.regex.Matcher m = AGG_PAT.matcher(aggFunctions.get(a));
+      String funcName = m.matches() ? m.group(1).toUpperCase(java.util.Locale.ROOT) : "SUM";
+      if ("MIN".equals(funcName) || "MAX".equals(funcName)) {
+        isMinMax[a] = true;
+        isMin[a] = "MIN".equals(funcName);
+      } else if ("AVG".equals(funcName)) {
+        isAvg[a] = true;
+        isDouble[a] = true;
+      } else {
+        // COUNT or SUM
+        isDouble[a] = columnTypes.get(a) instanceof DoubleType;
+      }
+      if ("COUNT".equals(funcName) && (m.group(2) == null)) {
+        countColIdx = a;
+      }
+    }
+
+    // Merge values from all shards
+    for (List<Page> pages : shardPages) {
+      for (Page page : pages) {
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          for (int a = 0; a < numAggs; a++) {
+            Block block = page.getBlock(a);
+            if (block.isNull(pos)) continue;
+
+            if (isMinMax[a]) {
+              Object val = extractValue(page, a, pos, columnTypes.get(a));
+              if (minMaxValues[a] == null) {
+                minMaxValues[a] = val;
+              } else {
+                @SuppressWarnings("unchecked")
+                int cmp = ((Comparable<Object>) val).compareTo(minMaxValues[a]);
+                if (isMin[a] ? cmp < 0 : cmp > 0) {
+                  minMaxValues[a] = val;
+                }
+              }
+            } else if (isAvg[a]) {
+              sumValues[a] += DoubleType.DOUBLE.getDouble(block, pos);
+            } else if (isDouble[a]) {
+              sumValues[a] += DoubleType.DOUBLE.getDouble(block, pos);
+            } else {
+              longSumValues[a] += BigintType.BIGINT.getLong(block, pos);
+            }
+          }
+        }
+      }
+    }
+
+    // Handle AVG weighting if we have a companion COUNT column
+    if (countColIdx >= 0) {
+      for (int a = 0; a < numAggs; a++) {
+        if (isAvg[a]) {
+          // Each shard sent (partial_avg, partial_count). Correct merge:
+          // sum(avg_i * count_i) / sum(count_i). But we already summed the
+          // avg values naively above. Re-compute using weighted approach.
+          double weightedSum = 0;
+          long totalCount = 0;
+          for (List<Page> pages : shardPages) {
+            for (Page page : pages) {
+              for (int pos = 0; pos < page.getPositionCount(); pos++) {
+                Block avgBlock = page.getBlock(a);
+                Block cntBlock = page.getBlock(countColIdx);
+                if (!avgBlock.isNull(pos) && !cntBlock.isNull(pos)) {
+                  double avg = DoubleType.DOUBLE.getDouble(avgBlock, pos);
+                  long cnt = BigintType.BIGINT.getLong(cntBlock, pos);
+                  weightedSum += avg * cnt;
+                  totalCount += cnt;
+                }
+              }
+            }
+          }
+          sumValues[a] = totalCount > 0 ? weightedSum / totalCount : 0.0;
+        }
+      }
+    }
+
+    // Build result Page
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numAggs];
+    for (int a = 0; a < numAggs; a++) {
+      builders[a] = columnTypes.get(a).createBlockBuilder(null, 1);
+      if (isMinMax[a]) {
+        if (minMaxValues[a] == null) {
+          builders[a].appendNull();
+        } else {
+          appendTypedValue(builders[a], columnTypes.get(a), minMaxValues[a]);
+        }
+      } else if (isDouble[a] || isAvg[a]) {
+        DoubleType.DOUBLE.writeDouble(builders[a], sumValues[a]);
+      } else {
+        BigintType.BIGINT.writeLong(builders[a], longSumValues[a]);
+      }
+    }
+    Block[] blocks = new Block[numAggs];
+    for (int a = 0; a < numAggs; a++) {
+      blocks[a] = builders[a].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /** Append a typed value to a BlockBuilder. */
+  private static void appendTypedValue(
+      io.trino.spi.block.BlockBuilder builder, Type type, Object value) {
+    if (type instanceof BigintType) {
+      BigintType.BIGINT.writeLong(builder, ((Number) value).longValue());
+    } else if (type instanceof DoubleType) {
+      DoubleType.DOUBLE.writeDouble(builder, ((Number) value).doubleValue());
+    } else if (type instanceof BooleanType) {
+      BooleanType.BOOLEAN.writeBoolean(builder, (Boolean) value);
+    } else if (type instanceof VarcharType) {
+      VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+    } else {
+      type.writeLong(builder, ((Number) value).longValue());
+    }
   }
 }

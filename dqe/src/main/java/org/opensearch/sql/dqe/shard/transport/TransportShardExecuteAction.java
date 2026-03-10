@@ -6,6 +6,8 @@
 package org.opensearch.sql.dqe.shard.transport;
 
 import io.trino.spi.Page;
+import io.trino.spi.block.Block;
+import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
@@ -13,6 +15,7 @@ import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -145,7 +148,15 @@ public class TransportShardExecuteAction
           DqePlanNode.readPlanNode(
               new InputStreamStreamInput(new ByteArrayInputStream(req.getSerializedFragment())));
 
-      // 2. Resolve scan factory and column types
+      // 2. Try short-circuit for scalar COUNT(*) — avoids pipeline construction entirely
+      if (scanFactory == null && isScalarCountStar(plan)) {
+        List<Page> pages = executeScalarCountStar(plan, req);
+        List<Type> columnTypes = List.of(BigintType.BIGINT);
+        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
+        return;
+      }
+
+      // 3. Resolve scan factory and column types
       final Function<TableScanNode, Operator> effectiveScanFactory;
       final Map<String, Type> effectiveColumnTypeMap;
 
@@ -168,12 +179,12 @@ public class TransportShardExecuteAction
             buildLuceneScanFactory(req, tableInfo, effectiveColumnTypeMap, batchSize);
       }
 
-      // 3. Build operator pipeline
+      // 4. Build operator pipeline
       LocalExecutionPlanner planner =
           new LocalExecutionPlanner(effectiveScanFactory, effectiveColumnTypeMap);
       Operator pipeline = plan.accept(planner, null);
 
-      // 4. Execute: drain pages
+      // 5. Execute: drain pages
       List<Page> pages = new ArrayList<>();
       Page page;
       while ((page = pipeline.processNextBatch()) != null) {
@@ -181,10 +192,10 @@ public class TransportShardExecuteAction
       }
       pipeline.close();
 
-      // 5. Resolve column types from the plan
+      // 6. Resolve column types from the plan
       List<Type> columnTypes = resolveColumnTypes(plan, effectiveColumnTypeMap);
 
-      // 6. Return Page-based response
+      // 7. Return Page-based response
       listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
     } catch (Exception e) {
       listener.onFailure(e);
@@ -229,6 +240,70 @@ public class TransportShardExecuteAction
       // 4. Create LucenePageSource
       return new LucenePageSource(shard, query, columns, batchSize);
     };
+  }
+
+  /**
+   * Check if the shard plan is a scalar COUNT(*) pattern: AggregationNode(PARTIAL, groupBy=[],
+   * aggs=["count(*)"]) -> TableScanNode with empty or no columns. This pattern can be
+   * short-circuited with a direct Lucene count.
+   */
+  static boolean isScalarCountStar(DqePlanNode plan) {
+    if (!(plan instanceof AggregationNode aggNode)) {
+      return false;
+    }
+    if (!aggNode.getGroupByKeys().isEmpty()) {
+      return false;
+    }
+    List<String> aggs = aggNode.getAggregateFunctions();
+    if (aggs.size() != 1) {
+      return false;
+    }
+    if (!"count(*)".equals(aggs.get(0).toLowerCase(Locale.ROOT))) {
+      return false;
+    }
+    return aggNode.getChild() instanceof TableScanNode;
+  }
+
+  /**
+   * Execute a scalar COUNT(*) by directly calling searcher.count(query), bypassing the full
+   * pipeline construction (FunctionRegistry, LocalExecutionPlanner, operator chain). Returns a
+   * single-row Page with the count value.
+   */
+  private List<Page> executeScalarCountStar(DqePlanNode plan, ShardExecuteRequest req)
+      throws Exception {
+    AggregationNode aggNode = (AggregationNode) plan;
+    TableScanNode scanNode = (TableScanNode) aggNode.getChild();
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(scanNode.getIndexName());
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query from DSL filter
+    Query luceneQuery;
+    if (scanNode.getDslFilter() != null) {
+      OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
+      TableInfo tableInfo = metadata.getTableInfo(scanNode.getIndexName());
+      Map<String, String> fieldTypeMap =
+          tableInfo.columns().stream()
+              .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::openSearchType));
+      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(fieldTypeMap);
+      luceneQuery = queryCompiler.compile(scanNode.getDslFilter());
+    } else {
+      luceneQuery = new MatchAllDocsQuery();
+    }
+
+    // Execute count directly
+    long count;
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-count-star")) {
+      count = engineSearcher.count(luceneQuery);
+    }
+
+    // Build single-row result Page with the count
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, count);
+    Block block = builder.build();
+    return List.of(new Page(block));
   }
 
   /**

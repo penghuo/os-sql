@@ -129,6 +129,22 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
         node.getOutputColumns().stream()
             .map(col -> resolveColumnIndex(col, inputColumns))
             .collect(Collectors.toList());
+
+    // Skip identity projections: if output columns are the same as input in the same order,
+    // the ProjectOperator would be a no-op. Bypass it to reduce per-page overhead.
+    if (columnIndices.size() == inputColumns.size()) {
+      boolean isIdentity = true;
+      for (int i = 0; i < columnIndices.size(); i++) {
+        if (columnIndices.get(i) != i) {
+          isIdentity = false;
+          break;
+        }
+      }
+      if (isIdentity) {
+        return child;
+      }
+    }
+
     return new ProjectOperator(child, columnIndices);
   }
 

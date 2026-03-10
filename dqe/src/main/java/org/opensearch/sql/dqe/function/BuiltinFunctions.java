@@ -28,10 +28,34 @@ import org.opensearch.sql.dqe.function.scalar.TrigFunctions;
 /** Creates and populates a {@link FunctionRegistry} with all built-in functions. */
 public final class BuiltinFunctions {
 
+  /**
+   * Cached singleton registry instance. Thread-safe via double-checked locking. The
+   * FunctionRegistry is effectively immutable once populated (only lookups after init).
+   */
+  private static volatile FunctionRegistry CACHED_REGISTRY;
+
   private BuiltinFunctions() {}
 
-  /** Create a new registry containing all built-in functions. */
+  /**
+   * Return the shared singleton registry containing all built-in functions. The registry is created
+   * once and reused across all subsequent calls, avoiding repeated allocation of function metadata
+   * objects on every query.
+   */
   public static FunctionRegistry createRegistry() {
+    FunctionRegistry reg = CACHED_REGISTRY;
+    if (reg == null) {
+      synchronized (BuiltinFunctions.class) {
+        reg = CACHED_REGISTRY;
+        if (reg == null) {
+          reg = buildRegistry();
+          CACHED_REGISTRY = reg;
+        }
+      }
+    }
+    return reg;
+  }
+
+  private static FunctionRegistry buildRegistry() {
     FunctionRegistry registry = new FunctionRegistry();
     registerStringFunctions(registry);
     registerMathFunctions(registry);

@@ -18,6 +18,7 @@ import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.PriorityQueue;
 
 /**
  * Physical operator that sorts all input rows by specified columns. Buffers all input from the
@@ -30,6 +31,7 @@ public class SortOperator implements Operator {
   private final List<Boolean> ascending;
   private final List<Boolean> nullsFirst;
   private final List<Type> columnTypes;
+  private final long topN;
   private boolean finished;
 
   /**
@@ -41,11 +43,11 @@ public class SortOperator implements Operator {
       List<Integer> sortColumnIndices,
       List<Boolean> ascending,
       List<Type> columnTypes) {
-    this(source, sortColumnIndices, ascending, defaultNullsFirst(ascending), columnTypes);
+    this(source, sortColumnIndices, ascending, defaultNullsFirst(ascending), columnTypes, -1);
   }
 
   /**
-   * Create a SortOperator.
+   * Create a SortOperator with optional Top-N optimization.
    *
    * @param source child operator providing input pages
    * @param sortColumnIndices indices of columns to sort by (in priority order)
@@ -53,13 +55,15 @@ public class SortOperator implements Operator {
    * @param nullsFirst true to sort nulls before non-null values, false for nulls last (per sort
    *     column)
    * @param columnTypes types of all columns in the input pages
+   * @param topN if positive, only keep the top N rows using a bounded heap instead of full sort
    */
   public SortOperator(
       Operator source,
       List<Integer> sortColumnIndices,
       List<Boolean> ascending,
       List<Boolean> nullsFirst,
-      List<Type> columnTypes) {
+      List<Type> columnTypes,
+      long topN) {
     if (sortColumnIndices.size() != ascending.size()) {
       throw new IllegalArgumentException("sortColumnIndices and ascending must have the same size");
     }
@@ -72,6 +76,7 @@ public class SortOperator implements Operator {
     this.ascending = ascending;
     this.nullsFirst = nullsFirst;
     this.columnTypes = columnTypes;
+    this.topN = topN;
     this.finished = false;
   }
 
@@ -93,9 +98,8 @@ public class SortOperator implements Operator {
       return null;
     }
 
-    // Count total rows
-    int totalRows = pages.stream().mapToInt(Page::getPositionCount).sum();
     int numColumns = pages.get(0).getChannelCount();
+    int totalRows = pages.stream().mapToInt(Page::getPositionCount).sum();
 
     // Materialize all rows into a combined page
     BlockBuilder[] builders = new BlockBuilder[numColumns];
@@ -117,22 +121,59 @@ public class SortOperator implements Operator {
     }
     Page combined = new Page(combinedBlocks);
 
-    // Create row index array and sort it
+    Comparator<Integer> comparator = buildComparator(combined);
+
+    if (topN > 0 && topN < totalRows) {
+      return topNSort(combined, comparator, totalRows);
+    }
+
+    return fullSort(combined, comparator, totalRows);
+  }
+
+  /** Full sort: sort all rows and return the complete sorted page. */
+  private Page fullSort(Page combined, Comparator<Integer> comparator, int totalRows) {
     Integer[] indices = new Integer[totalRows];
     for (int i = 0; i < totalRows; i++) {
       indices[i] = i;
     }
-
-    Comparator<Integer> comparator = buildComparator(combined);
     java.util.Arrays.sort(indices, comparator);
 
-    // Build sorted page using copyPositions
     int[] sortedPositions = new int[totalRows];
     for (int i = 0; i < totalRows; i++) {
       sortedPositions[i] = indices[i];
     }
-
     return combined.copyPositions(sortedPositions, 0, totalRows);
+  }
+
+  /**
+   * Top-N sort: maintain a bounded max-heap of size topN. For each row, if the heap is full and the
+   * row is better than the worst in the heap, replace it. O(n log k) where k = topN.
+   */
+  private Page topNSort(Page combined, Comparator<Integer> comparator, int totalRows) {
+    int k = (int) Math.min(topN, totalRows);
+    // Max-heap: the worst element (by sort order) is at the top so we can evict it
+    PriorityQueue<Integer> heap = new PriorityQueue<>(k + 1, comparator.reversed());
+
+    for (int i = 0; i < totalRows; i++) {
+      heap.offer(i);
+      if (heap.size() > k) {
+        heap.poll(); // Remove the worst element
+      }
+    }
+
+    // Extract elements from heap and sort them
+    int heapSize = heap.size();
+    Integer[] topIndices = new Integer[heapSize];
+    for (int i = heapSize - 1; i >= 0; i--) {
+      topIndices[i] = heap.poll();
+    }
+    java.util.Arrays.sort(topIndices, comparator);
+
+    int[] sortedPositions = new int[heapSize];
+    for (int i = 0; i < heapSize; i++) {
+      sortedPositions[i] = topIndices[i];
+    }
+    return combined.copyPositions(sortedPositions, 0, heapSize);
   }
 
   @SuppressWarnings("unchecked")

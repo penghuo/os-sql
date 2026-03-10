@@ -66,6 +66,9 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
   private final Map<String, Type> columnTypeMap;
   private final FunctionRegistry functionRegistry;
 
+  /** Limit from a parent LimitNode, propagated down to SortOperator for Top-N optimization. */
+  private long pendingTopN = -1;
+
   /**
    * Create a LocalExecutionPlanner with a scan factory and column type information.
    *
@@ -98,10 +101,24 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
   @Override
   public Operator visitLimit(LimitNode node, Void context) {
+    long effectiveLimit = node.getCount() + node.getOffset();
+    // Propagate limit to SortOperator for Top-N optimization
+    if (hasSortDescendant(node.getChild())) {
+      pendingTopN = effectiveLimit;
+    }
     Operator child = node.getChild().accept(this, context);
+    pendingTopN = -1;
     // Each shard must return count + offset rows so the coordinator can apply the
     // global offset across all shards and still have enough rows for the final limit.
-    return new LimitOperator(child, node.getCount() + node.getOffset());
+    return new LimitOperator(child, effectiveLimit);
+  }
+
+  /** Check if a plan node or its immediate children contain a SortNode. */
+  private static boolean hasSortDescendant(DqePlanNode node) {
+    if (node instanceof SortNode) return true;
+    // Check through Project nodes (Limit → Project → Sort is common)
+    if (node instanceof ProjectNode) return hasSortDescendant(((ProjectNode) node).getChild());
+    return false;
   }
 
   @Override
@@ -164,7 +181,12 @@ public class LocalExecutionPlanner extends DqePlanVisitor<Operator, Void> {
 
     List<Type> columnTypes = resolveColumnTypes(inputColumns);
     return new SortOperator(
-        child, sortColumnIndices, node.getAscending(), node.getNullsFirst(), columnTypes);
+        child,
+        sortColumnIndices,
+        node.getAscending(),
+        node.getNullsFirst(),
+        columnTypes,
+        pendingTopN);
   }
 
   @Override

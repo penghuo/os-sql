@@ -156,14 +156,16 @@ public class HashAggregationOperator implements Operator {
 
   /** Grouped aggregation: hash-based grouping with batch-oriented accumulator processing. */
   private Page processGroupedAggregation() {
-    // Drain all pages from source and group rows
-    Map<GroupKey, List<Accumulator>> groups = new LinkedHashMap<>();
+    // Drain all pages from source and group rows.
+    // Uses Accumulator[] instead of List<Accumulator> to eliminate ArrayList overhead per group.
+    Map<GroupKey, Accumulator[]> groups = new LinkedHashMap<>();
+    int numAggs = aggregateFunctions.size();
 
     Page page;
     while ((page = source.processNextBatch()) != null) {
       int positionCount = page.getPositionCount();
 
-      // Pre-fetch blocks for group-by columns and accumulator columns once per page
+      // Pre-fetch blocks for group-by columns once per page
       Block[] groupBlocks = new Block[groupByColumnIndices.size()];
       Type[] groupTypes = new Type[groupByColumnIndices.size()];
       for (int g = 0; g < groupByColumnIndices.size(); g++) {
@@ -175,19 +177,20 @@ public class HashAggregationOperator implements Operator {
       for (int pos = 0; pos < positionCount; pos++) {
         GroupKey groupKey = extractGroupKeyFast(groupBlocks, groupTypes, pos);
 
-        groups.computeIfAbsent(
-            groupKey,
-            k -> {
-              List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
-              for (AggregateFunction func : aggregateFunctions) {
-                accs.add(func.createAccumulator());
-              }
-              return accs;
-            });
+        // Single hash lookup: computeIfAbsent returns the existing or new value
+        Accumulator[] accumulators =
+            groups.computeIfAbsent(
+                groupKey,
+                k -> {
+                  Accumulator[] accs = new Accumulator[numAggs];
+                  for (int i = 0; i < numAggs; i++) {
+                    accs[i] = aggregateFunctions.get(i).createAccumulator();
+                  }
+                  return accs;
+                });
 
-        List<Accumulator> accumulators = groups.get(groupKey);
-        for (int i = 0; i < accumulators.size(); i++) {
-          accumulators.get(i).add(page, pos);
+        for (int i = 0; i < numAggs; i++) {
+          accumulators[i].add(page, pos);
         }
       }
     }
@@ -197,7 +200,7 @@ public class HashAggregationOperator implements Operator {
     }
 
     // Build result page: group-by columns + aggregate columns
-    int totalColumns = groupByColumnIndices.size() + aggregateFunctions.size();
+    int totalColumns = groupByColumnIndices.size() + numAggs;
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
 
     // Create builders for group-by columns
@@ -207,7 +210,7 @@ public class HashAggregationOperator implements Operator {
     }
 
     // Create builders for aggregate columns
-    for (int i = 0; i < aggregateFunctions.size(); i++) {
+    for (int i = 0; i < numAggs; i++) {
       Type outputType = aggregateFunctions.get(i).getOutputType();
       builders[groupByColumnIndices.size() + i] =
           outputType.createBlockBuilder(null, groups.size());
@@ -220,16 +223,16 @@ public class HashAggregationOperator implements Operator {
     }
 
     // Write results
-    for (Map.Entry<GroupKey, List<Accumulator>> entry : groups.entrySet()) {
+    for (Map.Entry<GroupKey, Accumulator[]> entry : groups.entrySet()) {
       GroupKey key = entry.getKey();
-      List<Accumulator> accumulators = entry.getValue();
+      Accumulator[] accumulators = entry.getValue();
 
       // Write group-by key values
       key.writeTo(builders, resultGroupTypes);
 
       // Write aggregate results
-      for (int i = 0; i < accumulators.size(); i++) {
-        accumulators.get(i).writeTo(builders[groupByColumnIndices.size() + i]);
+      for (int i = 0; i < numAggs; i++) {
+        accumulators[i].writeTo(builders[groupByColumnIndices.size() + i]);
       }
     }
 

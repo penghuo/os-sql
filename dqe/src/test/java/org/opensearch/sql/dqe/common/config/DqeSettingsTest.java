@@ -23,9 +23,9 @@ class DqeSettingsTest {
   }
 
   @Test
-  @DisplayName("PAGE_BATCH_SIZE defaults to 1024")
-  void batchSizeDefaults1024() {
-    assertEquals(1024, (int) DqeSettings.PAGE_BATCH_SIZE.getDefault(Settings.EMPTY));
+  @DisplayName("PAGE_BATCH_SIZE defaults to 1000000")
+  void batchSizeDefaults1000000() {
+    assertEquals(1000000, (int) DqeSettings.PAGE_BATCH_SIZE.getDefault(Settings.EMPTY));
   }
 
   @Test

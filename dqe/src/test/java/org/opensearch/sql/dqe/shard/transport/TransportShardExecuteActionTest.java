@@ -253,9 +253,9 @@ class TransportShardExecuteActionTest {
   @DisplayName("PAGE_BATCH_SIZE setting default matches expected value")
   void pageBatchSizeSettingDefault() {
     assertEquals(
-        1024,
+        1000000,
         (int) DqeSettings.PAGE_BATCH_SIZE.getDefault(Settings.EMPTY),
-        "Default PAGE_BATCH_SIZE should be 1024");
+        "Default PAGE_BATCH_SIZE should be 1000000");
   }
 
   /** Serialize a DqePlanNode to bytes using the standard writePlanNode mechanism. */

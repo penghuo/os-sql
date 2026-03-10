@@ -15,12 +15,11 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.opensearch.sql.dqe.operator.HashAggregationOperator;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 
 /**
@@ -77,53 +76,134 @@ public class ResultMerger {
     int numAggCols = aggregateFunctions.size();
     int totalCols = numGroupByCols + numAggCols;
 
-    // Flatten all pages into a combined list of rows represented as Object arrays
-    List<Object[]> allRows = new ArrayList<>();
-    for (List<Page> shardPages : shardResults) {
-      for (Page page : shardPages) {
-        for (int pos = 0; pos < page.getPositionCount(); pos++) {
-          Object[] row = new Object[totalCols];
-          for (int col = 0; col < totalCols; col++) {
-            row[col] = extractValue(page, col, pos, columnTypes.get(col));
+    // Build merge functions that operate on the partial aggregation output columns.
+    // The shard Pages have layout: [groupBy0, groupBy1, ..., agg0, agg1, ...].
+    // For FINAL merge: COUNT/SUM→sum, MIN→min, MAX→max, AVG→weighted_avg.
+    List<HashAggregationOperator.AggregateFunction> mergeFunctions = new ArrayList<>();
+    int countColIdx = -1; // companion COUNT column for AVG weighting
+    for (int a = 0; a < numAggCols; a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (m.matches()
+          && "COUNT".equals(m.group(1).toUpperCase(Locale.ROOT))
+          && m.group(2) == null) {
+        countColIdx = numGroupByCols + a;
+      }
+    }
+
+    for (int a = 0; a < numAggCols; a++) {
+      int colIdx = numGroupByCols + a;
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      String funcName = m.matches() ? m.group(1).toUpperCase(Locale.ROOT) : "SUM";
+      Type colType = columnTypes.get(colIdx);
+
+      switch (funcName) {
+        case "COUNT":
+        case "SUM":
+          mergeFunctions.add(HashAggregationOperator.sum(colIdx, colType));
+          break;
+        case "MIN":
+          mergeFunctions.add(HashAggregationOperator.min(colIdx, colType));
+          break;
+        case "MAX":
+          mergeFunctions.add(HashAggregationOperator.max(colIdx, colType));
+          break;
+        case "AVG":
+          // AVG merge: weighted average using companion COUNT column
+          // For now, use sum (accumulates avg values) and fix at the end
+          if (countColIdx >= 0) {
+            int finalCountColIdx = countColIdx;
+            int finalColIdx = colIdx;
+            mergeFunctions.add(
+                new HashAggregationOperator.AggregateFunction() {
+                  @Override
+                  public HashAggregationOperator.Accumulator createAccumulator() {
+                    return new WeightedAvgMergeAccumulator(finalColIdx, finalCountColIdx, colType);
+                  }
+
+                  @Override
+                  public Type getOutputType() {
+                    return DoubleType.DOUBLE;
+                  }
+                });
+          } else {
+            mergeFunctions.add(HashAggregationOperator.avg(colIdx, colType));
           }
-          allRows.add(row);
-        }
+          break;
+        default:
+          mergeFunctions.add(HashAggregationOperator.sum(colIdx, colType));
       }
     }
 
-    // Group by the group-by key values
-    Map<String, List<Object[]>> groups = new HashMap<>();
-    for (Object[] row : allRows) {
-      String key = buildGroupKey(row, numGroupByCols);
-      groups.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+    // Build group-by indices (0..numGroupBy-1)
+    List<Integer> groupByIndices = new ArrayList<>();
+    for (int i = 0; i < numGroupByCols; i++) {
+      groupByIndices.add(i);
     }
 
-    // Merge each group
-    List<Object[]> mergedRows = new ArrayList<>();
-    for (List<Object[]> groupRows : groups.values()) {
-      Object[] mergedRow = new Object[totalCols];
+    // Feed all shard pages into a HashAggregationOperator for efficient merge
+    List<Page> allPages = mergePassthrough(shardResults);
+    HashAggregationOperator mergeOp =
+        new HashAggregationOperator(
+            new org.opensearch.sql.dqe.operator.Operator() {
+              private int idx = 0;
 
-      // Copy group-by key values from the first row in the group
-      if (!groupRows.isEmpty()) {
-        Object[] firstRow = groupRows.get(0);
-        for (int i = 0; i < numGroupByCols; i++) {
-          mergedRow[i] = firstRow[i];
-        }
-      }
+              @Override
+              public Page processNextBatch() {
+                return idx < allPages.size() ? allPages.get(idx++) : null;
+              }
 
-      // Merge each aggregate function
-      for (int a = 0; a < numAggCols; a++) {
-        int colIdx = numGroupByCols + a;
-        mergedRow[colIdx] =
-            mergeAggregate(
-                aggregateFunctions.get(a), groupRows, colIdx, aggregateFunctions, numGroupByCols);
-      }
+              @Override
+              public void close() {}
+            },
+            groupByIndices,
+            mergeFunctions,
+            columnTypes);
 
-      mergedRows.add(mergedRow);
+    List<Page> result = new ArrayList<>();
+    Page page;
+    while ((page = mergeOp.processNextBatch()) != null) {
+      result.add(page);
+    }
+    return result;
+  }
+
+  /**
+   * Accumulator for merging AVG values using weighted averaging. Each input row has (partial_avg,
+   * partial_count). The merged result is sum(avg_i * count_i) / sum(count_i).
+   */
+  private static class WeightedAvgMergeAccumulator implements HashAggregationOperator.Accumulator {
+    private final int avgColIdx;
+    private final int countColIdx;
+    private final Type avgType;
+    private double weightedSum = 0;
+    private long totalCount = 0;
+
+    WeightedAvgMergeAccumulator(int avgColIdx, int countColIdx, Type avgType) {
+      this.avgColIdx = avgColIdx;
+      this.countColIdx = countColIdx;
+      this.avgType = avgType;
     }
 
-    // Build result page from merged rows
-    return List.of(buildPage(mergedRows, columnTypes));
+    @Override
+    public void add(Page page, int position) {
+      Block avgBlock = page.getBlock(avgColIdx);
+      Block countBlock = page.getBlock(countColIdx);
+      if (!avgBlock.isNull(position) && !countBlock.isNull(position)) {
+        double avg = DoubleType.DOUBLE.getDouble(avgBlock, position);
+        long count = BigintType.BIGINT.getLong(countBlock, position);
+        weightedSum += avg * count;
+        totalCount += count;
+      }
+    }
+
+    @Override
+    public void writeTo(BlockBuilder builder) {
+      if (totalCount == 0) {
+        builder.appendNull();
+      } else {
+        DoubleType.DOUBLE.writeDouble(builder, weightedSum / totalCount);
+      }
+    }
   }
 
   /**

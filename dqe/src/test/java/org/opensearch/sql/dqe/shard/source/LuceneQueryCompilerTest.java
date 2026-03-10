@@ -14,6 +14,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.WildcardQuery;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -90,6 +91,18 @@ class LuceneQueryCompilerTest {
     String dsl = "{\"terms\":{\"AdvEngineID\":[2,3,4]}}";
     Query q = compiler.compile(dsl);
     assertNotMatchAll(q);
+  }
+
+  @Test
+  @DisplayName("wildcard query compiles to WildcardQuery")
+  void wildcardQuery() {
+    LuceneQueryCompiler compiler = new LuceneQueryCompiler(fieldTypes);
+    String dsl = "{\"wildcard\":{\"URL\":{\"value\":\"*google*\"}}}";
+    Query q = compiler.compile(dsl);
+    assertInstanceOf(WildcardQuery.class, q);
+    WildcardQuery wq = (WildcardQuery) q;
+    assertEquals("URL", wq.getTerm().field());
+    assertEquals("*google*", wq.getTerm().text());
   }
 
   @Test

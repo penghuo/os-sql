@@ -19,6 +19,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.WildcardQuery;
 
 /**
  * Compiles OpenSearch DSL filter JSON strings into Lucene {@link Query} objects. Supports term,
@@ -73,6 +74,8 @@ public class LuceneQueryCompiler {
       return compileTerms(node.get("terms"));
     } else if (node.has("range")) {
       return compileRange(node.get("range"));
+    } else if (node.has("wildcard")) {
+      return compileWildcard(node.get("wildcard"));
     } else if (node.has("bool")) {
       return compileBool(node.get("bool"));
     } else if (node.has("match_all")) {
@@ -135,6 +138,15 @@ public class LuceneQueryCompiler {
       return bqb.build();
     }
     return new MatchAllDocsQuery();
+  }
+
+  private Query compileWildcard(JsonNode wildcardNode) {
+    Iterator<String> fields = wildcardNode.fieldNames();
+    if (!fields.hasNext()) return new MatchAllDocsQuery();
+    String field = fields.next();
+    JsonNode config = wildcardNode.get(field);
+    String pattern = config.has("value") ? config.get("value").asText() : config.asText();
+    return new WildcardQuery(new Term(field, pattern));
   }
 
   private Query compileRange(JsonNode rangeNode) {

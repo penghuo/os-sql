@@ -119,8 +119,15 @@ public class TransportTrinoSqlAction
       // 3. Plan
       DqePlanNode plan = LogicalPlanner.plan(stmt, metadata::getTableInfo);
 
-      // 4. Optimize
-      PlanOptimizer optimizer = new PlanOptimizer();
+      // 4. Optimize (resolve field types for predicate pushdown)
+      String indexName = findIndexName(plan);
+      TableInfo tableInfo = metadata.getTableInfo(indexName);
+      Map<String, String> fieldTypeMap =
+          tableInfo.columns().stream()
+              .collect(
+                  Collectors.toMap(
+                      TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::openSearchType));
+      PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
       DqePlanNode optimizedPlan = optimizer.optimize(plan);
 
       // 5. Fragment (needed for both explain and execute)
@@ -135,8 +142,6 @@ public class TransportTrinoSqlAction
       }
 
       // 7. Build column type information from metadata
-      String indexName = findIndexName(optimizedPlan);
-      TableInfo tableInfo = metadata.getTableInfo(indexName);
       Map<String, Type> columnTypeMap =
           tableInfo.columns().stream()
               .collect(

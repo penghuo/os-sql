@@ -9,8 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -109,6 +111,21 @@ class PlanOptimizerTest {
       assertInstanceOf(TableScanNode.class, result);
       TableScanNode optimizedScan = (TableScanNode) result;
       assertEquals("{\"term\":{\"category\":\"error\"}}", optimizedScan.getDslFilter());
+    }
+
+    @Test
+    @DisplayName("Pushes <> predicate as must_not term query")
+    void pushNotEqual() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("AdvEngineID", "integer"));
+      TableScanNode scan = new TableScanNode("hits", List.of("AdvEngineID"));
+      FilterNode filter = new FilterNode(scan, "AdvEngineID <> 0");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      TableScanNode optimized = (TableScanNode) result;
+      assertNotNull(optimized.getDslFilter());
+      assertTrue(optimized.getDslFilter().contains("must_not"));
     }
 
     @Test

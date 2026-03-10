@@ -10,6 +10,7 @@ import io.trino.sql.tree.Expression;
 import io.trino.sql.tree.Identifier;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -38,6 +39,16 @@ public class PlanOptimizer {
   /** Pattern for simple equality predicates like "column = value". */
   private static final Pattern EQUALITY_PREDICATE =
       Pattern.compile("^\\s*(\\w+)\\s*=\\s*(.+)\\s*$");
+
+  private final Map<String, String> fieldTypes;
+
+  public PlanOptimizer() {
+    this.fieldTypes = Map.of();
+  }
+
+  public PlanOptimizer(Map<String, String> fieldTypes) {
+    this.fieldTypes = fieldTypes;
+  }
 
   /**
    * Optimize a logical plan by applying rules in sequence.

@@ -106,22 +106,83 @@ public class HashAggregationOperator implements Operator {
     }
     finished = true;
 
+    // Fast path: no GROUP BY columns — scalar aggregation over all rows.
+    // Avoids per-row group key allocation, HashMap lookups, and virtual dispatch.
+    if (groupByColumnIndices.isEmpty()) {
+      return processScalarAggregation();
+    }
+
+    return processGroupedAggregation();
+  }
+
+  /**
+   * Scalar aggregation fast path: no GROUP BY columns. Creates accumulators once and feeds entire
+   * pages through them using batch-oriented addPage, eliminating per-row overhead.
+   */
+  private Page processScalarAggregation() {
+    List<Accumulator> accumulators = new ArrayList<>(aggregateFunctions.size());
+    for (AggregateFunction func : aggregateFunctions) {
+      accumulators.add(func.createAccumulator());
+    }
+
+    boolean hasData = false;
+    Page page;
+    while ((page = source.processNextBatch()) != null) {
+      hasData = true;
+      int positionCount = page.getPositionCount();
+      for (int i = 0; i < accumulators.size(); i++) {
+        accumulators.get(i).addPage(page, positionCount);
+      }
+    }
+
+    if (!hasData) {
+      return null;
+    }
+
+    // Build result page with just aggregate columns
+    int totalColumns = aggregateFunctions.size();
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      builders[i] = aggregateFunctions.get(i).getOutputType().createBlockBuilder(null, 1);
+      accumulators.get(i).writeTo(builders[i]);
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return new Page(blocks);
+  }
+
+  /** Grouped aggregation: hash-based grouping with batch-oriented accumulator processing. */
+  private Page processGroupedAggregation() {
     // Drain all pages from source and group rows
-    Map<List<Object>, List<Accumulator>> groups = new LinkedHashMap<>();
+    Map<GroupKey, List<Accumulator>> groups = new LinkedHashMap<>();
 
     Page page;
     while ((page = source.processNextBatch()) != null) {
-      for (int pos = 0; pos < page.getPositionCount(); pos++) {
-        List<Object> groupKey = extractGroupKey(page, pos);
+      int positionCount = page.getPositionCount();
+
+      // Pre-fetch blocks for group-by columns and accumulator columns once per page
+      Block[] groupBlocks = new Block[groupByColumnIndices.size()];
+      Type[] groupTypes = new Type[groupByColumnIndices.size()];
+      for (int g = 0; g < groupByColumnIndices.size(); g++) {
+        int colIdx = groupByColumnIndices.get(g);
+        groupBlocks[g] = page.getBlock(colIdx);
+        groupTypes[g] = columnTypes.get(colIdx);
+      }
+
+      for (int pos = 0; pos < positionCount; pos++) {
+        GroupKey groupKey = extractGroupKeyFast(groupBlocks, groupTypes, pos);
 
         groups.computeIfAbsent(
             groupKey,
             k -> {
-              List<Accumulator> accumulators = new ArrayList<>();
+              List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
               for (AggregateFunction func : aggregateFunctions) {
-                accumulators.add(func.createAccumulator());
+                accs.add(func.createAccumulator());
               }
-              return accumulators;
+              return accs;
             });
 
         List<Accumulator> accumulators = groups.get(groupKey);
@@ -152,16 +213,19 @@ public class HashAggregationOperator implements Operator {
           outputType.createBlockBuilder(null, groups.size());
     }
 
+    // Pre-compute group types once for result writing
+    Type[] resultGroupTypes = new Type[groupByColumnIndices.size()];
+    for (int i = 0; i < groupByColumnIndices.size(); i++) {
+      resultGroupTypes[i] = columnTypes.get(groupByColumnIndices.get(i));
+    }
+
     // Write results
-    for (Map.Entry<List<Object>, List<Accumulator>> entry : groups.entrySet()) {
-      List<Object> key = entry.getKey();
+    for (Map.Entry<GroupKey, List<Accumulator>> entry : groups.entrySet()) {
+      GroupKey key = entry.getKey();
       List<Accumulator> accumulators = entry.getValue();
 
       // Write group-by key values
-      for (int i = 0; i < key.size(); i++) {
-        Type type = columnTypes.get(groupByColumnIndices.get(i));
-        writeValue(builders[i], type, key.get(i));
-      }
+      key.writeTo(builders, resultGroupTypes);
 
       // Write aggregate results
       for (int i = 0; i < accumulators.size(); i++) {
@@ -176,17 +240,67 @@ public class HashAggregationOperator implements Operator {
     return new Page(blocks);
   }
 
-  private List<Object> extractGroupKey(Page page, int position) {
-    List<Object> key = new ArrayList<>(groupByColumnIndices.size());
-    for (int colIdx : groupByColumnIndices) {
-      Block block = page.getBlock(colIdx);
+  /**
+   * Extract a group key using pre-fetched blocks and types. Uses the compact GroupKey class instead
+   * of ArrayList&lt;Object&gt; to reduce allocation and improve hash/equals performance.
+   */
+  private GroupKey extractGroupKeyFast(Block[] groupBlocks, Type[] groupTypes, int position) {
+    Object[] values = new Object[groupBlocks.length];
+    for (int i = 0; i < groupBlocks.length; i++) {
+      Block block = groupBlocks[i];
       if (block.isNull(position)) {
-        key.add(null);
+        values[i] = null;
       } else {
-        key.add(readValue(block, position, columnTypes.get(colIdx)));
+        values[i] = readValue(block, position, groupTypes[i]);
       }
     }
-    return key;
+    return new GroupKey(values);
+  }
+
+  /**
+   * Compact group key using an Object array with pre-computed hash code. Avoids ArrayList
+   * allocation overhead and redundant hash computation on every map lookup.
+   */
+  static final class GroupKey {
+    final Object[] values;
+    private final int hash;
+
+    GroupKey(Object[] values) {
+      this.values = values;
+      int h = 1;
+      for (Object v : values) {
+        h = 31 * h + (v == null ? 0 : v.hashCode());
+      }
+      this.hash = h;
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (!(obj instanceof GroupKey)) return false;
+      GroupKey other = (GroupKey) obj;
+      if (this.hash != other.hash || this.values.length != other.values.length) return false;
+      for (int i = 0; i < values.length; i++) {
+        if (values[i] == null) {
+          if (other.values[i] != null) return false;
+        } else if (!values[i].equals(other.values[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /** Write group key values to block builders. */
+    void writeTo(BlockBuilder[] builders, Type[] types) {
+      for (int i = 0; i < values.length; i++) {
+        writeValue(builders[i], types[i], values[i]);
+      }
+    }
   }
 
   static Object readValue(Block block, int position, Type type) {
@@ -261,6 +375,16 @@ public class HashAggregationOperator implements Operator {
   public interface Accumulator {
     void add(Page page, int position);
 
+    /**
+     * Process all positions in a page in batch. Default implementation delegates to add() per row,
+     * but subclasses can override for better performance by fetching the block once.
+     */
+    default void addPage(Page page, int positionCount) {
+      for (int pos = 0; pos < positionCount; pos++) {
+        add(page, pos);
+      }
+    }
+
     void writeTo(BlockBuilder builder);
   }
 
@@ -271,6 +395,11 @@ public class HashAggregationOperator implements Operator {
     @Override
     public void add(Page page, int position) {
       count++;
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      count += positionCount;
     }
 
     @Override
@@ -295,6 +424,16 @@ public class HashAggregationOperator implements Operator {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
         distinctValues.add(readValue(block, position, inputType));
+      }
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      Block block = page.getBlock(columnIndex);
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (!block.isNull(pos)) {
+          distinctValues.add(readValue(block, pos, inputType));
+        }
       }
     }
 
@@ -328,6 +467,26 @@ public class HashAggregationOperator implements Operator {
           longSum += inputType.getLong(block, position);
         } else {
           doubleSum += DoubleType.DOUBLE.getDouble(block, position);
+        }
+      }
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      Block block = page.getBlock(columnIndex);
+      if (isIntegerType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            longSum += inputType.getLong(block, pos);
+          }
+        }
+      } else {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            doubleSum += DoubleType.DOUBLE.getDouble(block, pos);
+          }
         }
       }
     }
@@ -367,6 +526,19 @@ public class HashAggregationOperator implements Operator {
       }
     }
 
+    @Override
+    public void addPage(Page page, int positionCount) {
+      Block block = page.getBlock(columnIndex);
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (!block.isNull(pos)) {
+          Object value = readValue(block, pos, inputType);
+          if (min == null || compare(value, min) < 0) {
+            min = value;
+          }
+        }
+      }
+    }
+
     @SuppressWarnings("unchecked")
     private int compare(Object a, Object b) {
       return ((Comparable<Object>) a).compareTo(b);
@@ -402,6 +574,19 @@ public class HashAggregationOperator implements Operator {
       Object value = readValue(block, position, inputType);
       if (max == null || compare(value, max) > 0) {
         max = value;
+      }
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      Block block = page.getBlock(columnIndex);
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (!block.isNull(pos)) {
+          Object value = readValue(block, pos, inputType);
+          if (max == null || compare(value, max) > 0) {
+            max = value;
+          }
+        }
       }
     }
 
@@ -447,6 +632,26 @@ public class HashAggregationOperator implements Operator {
           longSum += inputType.getLong(block, position);
         } else {
           doubleSum += DoubleType.DOUBLE.getDouble(block, position);
+        }
+      }
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      Block block = page.getBlock(columnIndex);
+      if (isIntegerType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            count++;
+            longSum += inputType.getLong(block, pos);
+          }
+        }
+      } else {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            count++;
+            doubleSum += DoubleType.DOUBLE.getDouble(block, pos);
+          }
         }
       }
     }
@@ -582,6 +787,14 @@ public class HashAggregationOperator implements Operator {
       } else {
         delegate.addBlock(block.getSingleValueBlock(position), 1);
       }
+    }
+
+    @Override
+    public void addPage(Page page, int positionCount) {
+      // Batch path: pass the entire block to the delegate, avoiding per-row
+      // getSingleValueBlock allocation.
+      Block block = columnIndex >= 0 ? page.getBlock(columnIndex) : page.getBlock(0);
+      delegate.addBlock(block, positionCount);
     }
 
     @Override

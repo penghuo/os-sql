@@ -101,34 +101,25 @@ public class SortOperator implements Operator {
     int numColumns = pages.get(0).getChannelCount();
     int totalRows = pages.stream().mapToInt(Page::getPositionCount).sum();
 
-    Page combined;
-    if (pages.size() == 1) {
-      // Fast path: single page from source, no materialization needed.
-      // This is the common case when batch size >= segment size.
-      combined = pages.get(0);
-    } else {
-      // Multiple pages: merge column-at-a-time (avoids row-by-row cross-column copying)
-      BlockBuilder[] builders = new BlockBuilder[numColumns];
-      for (int col = 0; col < numColumns; col++) {
-        builders[col] = columnTypes.get(col).createBlockBuilder(null, totalRows);
-      }
+    // Materialize all rows into a combined page
+    BlockBuilder[] builders = new BlockBuilder[numColumns];
+    for (int col = 0; col < numColumns; col++) {
+      builders[col] = columnTypes.get(col).createBlockBuilder(null, totalRows);
+    }
 
-      for (int col = 0; col < numColumns; col++) {
-        for (Page p : pages) {
-          Block srcBlock = p.getBlock(col);
-          int posCount = p.getPositionCount();
-          for (int pos = 0; pos < posCount; pos++) {
-            columnTypes.get(col).appendTo(srcBlock, pos, builders[col]);
-          }
+    for (Page p : pages) {
+      for (int pos = 0; pos < p.getPositionCount(); pos++) {
+        for (int col = 0; col < numColumns; col++) {
+          columnTypes.get(col).appendTo(p.getBlock(col), pos, builders[col]);
         }
       }
-
-      Block[] combinedBlocks = new Block[numColumns];
-      for (int i = 0; i < numColumns; i++) {
-        combinedBlocks[i] = builders[i].build();
-      }
-      combined = new Page(combinedBlocks);
     }
+
+    Block[] combinedBlocks = new Block[numColumns];
+    for (int i = 0; i < numColumns; i++) {
+      combinedBlocks[i] = builders[i].build();
+    }
+    Page combined = new Page(combinedBlocks);
 
     Comparator<Integer> comparator = buildComparator(combined);
 

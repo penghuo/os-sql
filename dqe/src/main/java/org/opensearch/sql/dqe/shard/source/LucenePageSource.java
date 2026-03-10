@@ -7,6 +7,7 @@ package org.opensearch.sql.dqe.shard.source;
 
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
+import io.trino.spi.block.BlockBuilder;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -27,9 +28,8 @@ import org.opensearch.sql.dqe.operator.Operator;
  * OpenSearch scroll API. Acquires an {@link IndexSearcher}, collects matching doc IDs per segment,
  * and reads doc values via {@link DocValuesReader} to produce Trino {@link Page}s.
  *
- * <p>Uses a segment-streaming approach: processes one segment at a time, emitting each segment as a
- * single Page. For multi-column reads, uses interleaved DocValues reading to open each column's
- * iterator once per segment and advance all iterators together, avoiding repeated seek overhead.
+ * <p>Uses a segment-streaming approach: processes one segment at a time, yields batches from the
+ * current segment before moving to the next.
  */
 public class LucenePageSource implements Operator {
 
@@ -113,14 +113,22 @@ public class LucenePageSource implements Operator {
           return new Page(batchCount);
         }
 
-        // Use interleaved reading for multi-column reads: opens each column's
-        // DocValues iterator once and advances all together per doc ID.
-        // For single-column reads, interleaved is equivalent to column-at-a-time.
-        Block[] blocks =
-            DocValuesReader.readColumnsInterleaved(
-                seg.leaf, columns, seg.docIds, currentOffset, batchCount);
+        BlockBuilder[] builders = new BlockBuilder[columns.size()];
+        for (int c = 0; c < columns.size(); c++) {
+          builders[c] = columns.get(c).type().createBlockBuilder(null, batchCount);
+        }
+
+        for (int c = 0; c < columns.size(); c++) {
+          DocValuesReader.readColumn(
+              seg.leaf, columns.get(c), seg.docIds, currentOffset, batchCount, builders[c]);
+        }
 
         currentOffset += batchCount;
+
+        Block[] blocks = new Block[builders.length];
+        for (int i = 0; i < builders.length; i++) {
+          blocks[i] = builders[i].build();
+        }
         return new Page(blocks);
       }
 
@@ -148,37 +156,24 @@ public class LucenePageSource implements Operator {
         new Collector() {
           @Override
           public LeafCollector getLeafCollector(LeafReaderContext context) {
-            // Use a growable int array to avoid Integer boxing overhead.
-            // Start with a reasonable initial capacity based on segment size.
-            int initialCapacity = Math.min(context.reader().maxDoc(), 65536);
+            List<Integer> docIdList = new ArrayList<>();
             return new LeafCollector() {
-              private int[] docIds = new int[initialCapacity];
-              private int size = 0;
-
               @Override
               public void setScorer(Scorable scorer) {}
 
               @Override
               public void collect(int doc) {
-                if (size == docIds.length) {
-                  // Grow by 50%
-                  int[] newArray = new int[docIds.length + (docIds.length >> 1) + 1];
-                  System.arraycopy(docIds, 0, newArray, 0, size);
-                  docIds = newArray;
-                }
-                docIds[size++] = doc;
+                docIdList.add(doc);
               }
 
               @Override
               public void finish() {
-                if (size > 0) {
-                  // Trim to exact size if significantly oversized
-                  if (docIds.length > size + (size >> 2)) {
-                    int[] trimmed = new int[size];
-                    System.arraycopy(docIds, 0, trimmed, 0, size);
-                    docIds = trimmed;
+                if (!docIdList.isEmpty()) {
+                  int[] docIds = new int[docIdList.size()];
+                  for (int i = 0; i < docIdList.size(); i++) {
+                    docIds[i] = docIdList.get(i);
                   }
-                  segments.add(new SegmentDocs(context, docIds, size));
+                  segments.add(new SegmentDocs(context, docIds, docIds.length));
                 }
               }
             };

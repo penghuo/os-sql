@@ -463,6 +463,22 @@ public class PlanOptimizer {
     String value = extractLiteralValue(cmp.getRight());
     if (value == null) return null;
 
+    // For range operators on date fields with string values, convert to epoch millis
+    if (isRangeOperator(cmp.getOperator())
+        && cmp.getRight() instanceof StringLiteral stringLit
+        && "date".equals(fieldTypes.getOrDefault(column, ""))) {
+      try {
+        long epochMillis =
+            java.time.LocalDate.parse(stringLit.getValue())
+                .atStartOfDay(java.time.ZoneOffset.UTC)
+                .toInstant()
+                .toEpochMilli();
+        value = String.valueOf(epochMillis);
+      } catch (Exception e) {
+        return null;
+      }
+    }
+
     switch (cmp.getOperator()) {
       case EQUAL:
         return buildTermDsl(column, value);
@@ -481,6 +497,13 @@ public class PlanOptimizer {
       default:
         return null;
     }
+  }
+
+  private static boolean isRangeOperator(ComparisonExpression.Operator op) {
+    return op == ComparisonExpression.Operator.GREATER_THAN
+        || op == ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL
+        || op == ComparisonExpression.Operator.LESS_THAN
+        || op == ComparisonExpression.Operator.LESS_THAN_OR_EQUAL;
   }
 
   private String convertLogical(LogicalExpression logical) {

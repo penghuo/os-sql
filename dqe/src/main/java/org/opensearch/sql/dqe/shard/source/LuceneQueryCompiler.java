@@ -7,11 +7,10 @@ package org.opensearch.sql.dqe.shard.source;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.lucene.document.IntPoint;
 import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
@@ -31,6 +30,12 @@ import org.apache.lucene.search.WildcardQuery;
 public class LuceneQueryCompiler {
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
+
+  /** Types stored as LongPoint (8 bytes per dimension). */
+  private static final Set<String> LONG_TYPES = Set.of("long", "date");
+
+  /** Types stored as IntPoint (4 bytes per dimension). */
+  private static final Set<String> INT_TYPES = Set.of("integer", "short", "byte");
 
   private static final Set<String> NUMERIC_TYPES =
       Set.of("long", "integer", "short", "byte", "date");
@@ -97,7 +102,10 @@ public class LuceneQueryCompiler {
   private Query buildTermQuery(String field, JsonNode value) {
     String osType = fieldTypes.getOrDefault(field, "keyword");
 
-    if (NUMERIC_TYPES.contains(osType)) {
+    if (INT_TYPES.contains(osType)) {
+      int intVal = value.asInt();
+      return IntPoint.newExactQuery(field, intVal);
+    } else if (LONG_TYPES.contains(osType)) {
       long longVal = value.asLong();
       return LongPoint.newExactQuery(field, longVal);
     } else if (FLOAT_TYPES.contains(osType)) {
@@ -119,14 +127,16 @@ public class LuceneQueryCompiler {
     JsonNode values = termsNode.get(field);
     String osType = fieldTypes.getOrDefault(field, "keyword");
 
-    if (NUMERIC_TYPES.contains(osType) && values.isArray()) {
-      List<Long> longVals = new ArrayList<>();
-      for (JsonNode v : values) {
-        longVals.add(v.asLong());
+    if (INT_TYPES.contains(osType) && values.isArray()) {
+      int[] arr = new int[values.size()];
+      for (int i = 0; i < values.size(); i++) {
+        arr[i] = values.get(i).asInt();
       }
-      long[] arr = new long[longVals.size()];
-      for (int i = 0; i < longVals.size(); i++) {
-        arr[i] = longVals.get(i);
+      return IntPoint.newSetQuery(field, arr);
+    } else if (LONG_TYPES.contains(osType) && values.isArray()) {
+      long[] arr = new long[values.size()];
+      for (int i = 0; i < values.size(); i++) {
+        arr[i] = values.get(i).asLong();
       }
       return LongPoint.newSetQuery(field, arr);
     } else if (values.isArray()) {
@@ -158,7 +168,17 @@ public class LuceneQueryCompiler {
     JsonNode bounds = rangeNode.get(field);
     String osType = fieldTypes.getOrDefault(field, "keyword");
 
-    if (NUMERIC_TYPES.contains(osType)) {
+    if (INT_TYPES.contains(osType)) {
+      int lower = bounds.has("gte") ? bounds.get("gte").asInt() : Integer.MIN_VALUE;
+      int upper = bounds.has("lte") ? bounds.get("lte").asInt() : Integer.MAX_VALUE;
+      if (bounds.has("gt")) {
+        lower = bounds.get("gt").asInt() + 1;
+      }
+      if (bounds.has("lt")) {
+        upper = bounds.get("lt").asInt() - 1;
+      }
+      return IntPoint.newRangeQuery(field, lower, upper);
+    } else if (LONG_TYPES.contains(osType)) {
       long lower = bounds.has("gte") ? bounds.get("gte").asLong() : Long.MIN_VALUE;
       long upper = bounds.has("lte") ? bounds.get("lte").asLong() : Long.MAX_VALUE;
       if (bounds.has("gt")) {
@@ -175,15 +195,18 @@ public class LuceneQueryCompiler {
 
   private Query compileBool(JsonNode boolNode) {
     BooleanQuery.Builder builder = new BooleanQuery.Builder();
+    boolean hasPositive = false;
 
     if (boolNode.has("must")) {
       for (JsonNode clause : boolNode.get("must")) {
         builder.add(compileNode(clause), BooleanClause.Occur.MUST);
+        hasPositive = true;
       }
     }
     if (boolNode.has("should")) {
       for (JsonNode clause : boolNode.get("should")) {
         builder.add(compileNode(clause), BooleanClause.Occur.SHOULD);
+        hasPositive = true;
       }
     }
     if (boolNode.has("must_not")) {
@@ -194,7 +217,14 @@ public class LuceneQueryCompiler {
     if (boolNode.has("filter")) {
       for (JsonNode clause : boolNode.get("filter")) {
         builder.add(compileNode(clause), BooleanClause.Occur.FILTER);
+        hasPositive = true;
       }
+    }
+
+    // A BooleanQuery with only must_not clauses matches nothing in Lucene.
+    // Add MatchAllDocsQuery as a positive clause to match all docs except excluded.
+    if (!hasPositive && boolNode.has("must_not")) {
+      builder.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
     }
 
     return builder.build();

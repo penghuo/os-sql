@@ -7,6 +7,7 @@ package org.opensearch.sql.dqe.shard.source;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Map;
 import org.apache.lucene.search.BooleanClause;
@@ -91,6 +92,23 @@ class LuceneQueryCompilerTest {
     String dsl = "{\"terms\":{\"AdvEngineID\":[2,3,4]}}";
     Query q = compiler.compile(dsl);
     assertNotMatchAll(q);
+  }
+
+  @Test
+  @DisplayName("bool with only must_not includes MatchAllDocsQuery as positive clause")
+  void boolMustNotOnly() {
+    LuceneQueryCompiler compiler = new LuceneQueryCompiler(fieldTypes);
+    String dsl = "{\"bool\":{\"must_not\":[{\"term\":{\"AdvEngineID\":0}}]}}";
+    Query q = compiler.compile(dsl);
+    assertInstanceOf(BooleanQuery.class, q);
+    BooleanQuery bq = (BooleanQuery) q;
+    // Should have at least 2 clauses: MatchAllDocsQuery (MUST) + term (MUST_NOT)
+    assertEquals(2, bq.clauses().size());
+    boolean hasMust = bq.clauses().stream().anyMatch(c -> c.occur() == BooleanClause.Occur.MUST);
+    boolean hasMustNot =
+        bq.clauses().stream().anyMatch(c -> c.occur() == BooleanClause.Occur.MUST_NOT);
+    assertTrue(hasMust, "Should have a MUST clause (MatchAllDocsQuery)");
+    assertTrue(hasMustNot, "Should have a MUST_NOT clause");
   }
 
   @Test

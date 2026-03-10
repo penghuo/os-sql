@@ -46,8 +46,9 @@ public class PlanFragmenter {
     IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(indexName);
     Map<Integer, IndexShardRoutingTable> shards = indexRoutingTable.shards();
 
-    // 3. Build shard plan — strip non-PARTIAL aggregation (coordinator handles it)
-    DqePlanNode shardPlan = buildShardPlan(plan);
+    // 3. Build shard plan — only strip Sort/Limit/HAVING for multi-shard aggregation
+    boolean multiShard = shards.size() > 1;
+    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan) : plan;
 
     // 4. Create shard fragments
     List<PlanFragment> shardFragments = new ArrayList<>();
@@ -58,8 +59,8 @@ public class PlanFragmenter {
       shardFragments.add(new PlanFragment(shardPlan, indexName, shardId, nodeId));
     }
 
-    // 5. If AggregationNode present, create coordinator plan for merging
-    DqePlanNode coordinatorPlan = buildCoordinatorPlan(plan);
+    // 5. If multi-shard and AggregationNode present, create coordinator plan for merging
+    DqePlanNode coordinatorPlan = multiShard ? buildCoordinatorPlan(plan) : null;
 
     return new FragmentResult(shardFragments, coordinatorPlan);
   }

@@ -3,8 +3,8 @@
   "dataset": "1m",
   "total": 43,
   "pass": 42,
-  "fail": 0,
-  "skip": 1,
+  "fail": 1,
+  "skip": 0,
   "queries": [
     {
       "q": 1,
@@ -93,8 +93,10 @@
     },
     {
       "q": 18,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 19,
@@ -178,8 +180,8 @@
     },
     {
       "q": 35,
-      "status": "SKIP",
-      "reason": "OpenSearch query failed or timed out"
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 36,

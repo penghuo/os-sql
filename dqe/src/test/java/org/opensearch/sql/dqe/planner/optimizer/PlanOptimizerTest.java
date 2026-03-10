@@ -89,15 +89,19 @@ class PlanOptimizerTest {
     }
 
     @Test
-    @DisplayName("Retains FilterNode when predicate is not a simple equality")
-    void retainsNonPushablePredicate() {
+    @DisplayName("Pushes compound range predicate as bool must with range queries")
+    void pushCompoundRange() {
       TableScanNode scan = new TableScanNode("logs", List.of("status"));
       FilterNode filter = new FilterNode(scan, "status > 200 AND status < 500");
 
       DqePlanNode result = optimizer.optimize(filter);
 
-      // FilterNode should remain because predicate is complex
-      assertInstanceOf(FilterNode.class, result);
+      // Now pushable with AST-based conversion
+      assertInstanceOf(TableScanNode.class, result);
+      String dsl = ((TableScanNode) result).getDslFilter();
+      assertTrue(dsl.contains("bool"));
+      assertTrue(dsl.contains("must"));
+      assertTrue(dsl.contains("range"));
     }
 
     @Test
@@ -126,6 +130,87 @@ class PlanOptimizerTest {
       TableScanNode optimized = (TableScanNode) result;
       assertNotNull(optimized.getDslFilter());
       assertTrue(optimized.getDslFilter().contains("must_not"));
+    }
+
+    @Test
+    @DisplayName("Pushes >= range predicate")
+    void pushGreaterOrEqual() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("EventDate", "date"));
+      TableScanNode scan = new TableScanNode("hits", List.of("EventDate"));
+      FilterNode filter = new FilterNode(scan, "EventDate >= DATE '2013-07-01'");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      assertTrue(((TableScanNode) result).getDslFilter().contains("range"));
+      assertTrue(((TableScanNode) result).getDslFilter().contains("gte"));
+    }
+
+    @Test
+    @DisplayName("Pushes compound AND predicate as bool must")
+    void pushAnd() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("CounterID", "integer", "IsRefresh", "short"));
+      TableScanNode scan = new TableScanNode("hits", List.of("CounterID", "IsRefresh"));
+      FilterNode filter = new FilterNode(scan, "CounterID = 62 AND IsRefresh = 0");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      String dsl = ((TableScanNode) result).getDslFilter();
+      assertTrue(dsl.contains("bool"));
+      assertTrue(dsl.contains("must"));
+    }
+
+    @Test
+    @DisplayName("Pushes LIKE on keyword field as wildcard query")
+    void pushLikeKeyword() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("URL", "keyword"));
+      TableScanNode scan = new TableScanNode("hits", List.of("URL"));
+      FilterNode filter = new FilterNode(scan, "URL LIKE '%google%'");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      assertTrue(((TableScanNode) result).getDslFilter().contains("wildcard"));
+    }
+
+    @Test
+    @DisplayName("Does NOT push LIKE on text field")
+    void rejectLikeOnText() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("SocialAction", "text"));
+      TableScanNode scan = new TableScanNode("hits", List.of("SocialAction"));
+      FilterNode filter = new FilterNode(scan, "SocialAction LIKE '%test%'");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      // FilterNode should remain — LIKE on text is not pushable
+      assertInstanceOf(FilterNode.class, result);
+    }
+
+    @Test
+    @DisplayName("Pushes IN predicate as terms query")
+    void pushIn() {
+      PlanOptimizer typed = new PlanOptimizer(Map.of("TraficSourceID", "integer"));
+      TableScanNode scan = new TableScanNode("hits", List.of("TraficSourceID"));
+      FilterNode filter = new FilterNode(scan, "TraficSourceID IN (-1, 6)");
+
+      DqePlanNode result = typed.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      assertTrue(((TableScanNode) result).getDslFilter().contains("terms"));
+    }
+
+    @Test
+    @DisplayName("Existing equality tests still pass with no-arg constructor")
+    void backwardCompatEquality() {
+      PlanOptimizer noTypes = new PlanOptimizer();
+      TableScanNode scan = new TableScanNode("logs", List.of("status"));
+      FilterNode filter = new FilterNode(scan, "status = 200");
+
+      DqePlanNode result = noTypes.optimize(filter);
+
+      assertInstanceOf(TableScanNode.class, result);
+      assertEquals("{\"term\":{\"status\":200}}", ((TableScanNode) result).getDslFilter());
     }
 
     @Test
@@ -357,38 +442,44 @@ class PlanOptimizerTest {
     @Test
     @DisplayName("Converts integer equality to term query")
     void integerEquality() {
-      assertEquals("{\"term\":{\"status\":200}}", PlanOptimizer.tryConvertToDsl("status = 200"));
+      assertEquals("{\"term\":{\"status\":200}}", optimizer.tryConvertToDsl("status = 200"));
     }
 
     @Test
     @DisplayName("Converts negative integer equality")
     void negativeInteger() {
-      assertEquals("{\"term\":{\"code\":-1}}", PlanOptimizer.tryConvertToDsl("code = -1"));
+      assertEquals("{\"term\":{\"code\":-1}}", optimizer.tryConvertToDsl("code = -1"));
     }
 
     @Test
     @DisplayName("Converts string equality to term query")
     void stringEquality() {
       assertEquals(
-          "{\"term\":{\"level\":\"error\"}}", PlanOptimizer.tryConvertToDsl("level = 'error'"));
+          "{\"term\":{\"level\":\"error\"}}", optimizer.tryConvertToDsl("level = 'error'"));
     }
 
     @Test
-    @DisplayName("Returns null for non-equality predicate")
-    void nonEquality() {
-      assertNull(PlanOptimizer.tryConvertToDsl("status > 200"));
+    @DisplayName("Converts > predicate to range query")
+    void greaterThan() {
+      String dsl = optimizer.tryConvertToDsl("status > 200");
+      assertNotNull(dsl);
+      assertTrue(dsl.contains("range"));
+      assertTrue(dsl.contains("gt"));
     }
 
     @Test
-    @DisplayName("Returns null for complex predicate")
-    void complexPredicate() {
-      assertNull(PlanOptimizer.tryConvertToDsl("status = 200 AND level = 'error'"));
+    @DisplayName("Converts compound AND to bool must")
+    void compoundAnd() {
+      String dsl = optimizer.tryConvertToDsl("status = 200 AND level = 'error'");
+      assertNotNull(dsl);
+      assertTrue(dsl.contains("bool"));
+      assertTrue(dsl.contains("must"));
     }
 
     @Test
     @DisplayName("Converts double equality to term query")
     void doubleEquality() {
-      assertEquals("{\"term\":{\"price\":19.99}}", PlanOptimizer.tryConvertToDsl("price = 19.99"));
+      assertEquals("{\"term\":{\"price\":19.99}}", optimizer.tryConvertToDsl("price = 19.99"));
     }
   }
 }

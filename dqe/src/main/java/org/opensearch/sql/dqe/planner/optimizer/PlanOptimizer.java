@@ -5,9 +5,22 @@
 
 package org.opensearch.sql.dqe.planner.optimizer;
 
+import io.trino.sql.tree.BetweenPredicate;
+import io.trino.sql.tree.ComparisonExpression;
+import io.trino.sql.tree.DecimalLiteral;
 import io.trino.sql.tree.DefaultTraversalVisitor;
+import io.trino.sql.tree.DoubleLiteral;
 import io.trino.sql.tree.Expression;
+import io.trino.sql.tree.GenericLiteral;
 import io.trino.sql.tree.Identifier;
+import io.trino.sql.tree.InListExpression;
+import io.trino.sql.tree.InPredicate;
+import io.trino.sql.tree.LikePredicate;
+import io.trino.sql.tree.LogicalExpression;
+import io.trino.sql.tree.LongLiteral;
+import io.trino.sql.tree.NotExpression;
+import io.trino.sql.tree.StringLiteral;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -91,11 +104,11 @@ public class PlanOptimizer {
   }
 
   /**
-   * Visitor that pushes simple equality predicates from FilterNode down into TableScanNode as DSL
-   * filter queries. When the predicate is successfully pushed, the FilterNode is removed from the
-   * tree.
+   * Visitor that pushes predicates from FilterNode down into TableScanNode as DSL filter queries.
+   * Supports equality, inequality, range, AND/OR, LIKE (keyword only), IN, and BETWEEN. When the
+   * predicate is successfully pushed, the FilterNode is removed from the tree.
    */
-  private static class PredicatePushdownVisitor extends DqePlanVisitor<DqePlanNode, Void> {
+  private class PredicatePushdownVisitor extends DqePlanVisitor<DqePlanNode, Void> {
 
     @Override
     public DqePlanNode visitFilter(FilterNode node, Void context) {
@@ -405,48 +418,150 @@ public class PlanOptimizer {
   }
 
   /**
-   * Attempt to convert a simple predicate string to an OpenSearch DSL term query. Returns null if
-   * the predicate cannot be pushed down.
+   * Attempt to convert a predicate string to an OpenSearch DSL query. Parses the predicate into a
+   * Trino Expression AST and recursively converts each node to DSL JSON. Returns null if any
+   * sub-expression is not convertible.
    *
-   * <p>Currently supports simple equality predicates of the form "column = value" where value is a
-   * numeric literal (integer or decimal) or a single-quoted string.
+   * <p>Supports: equality, not-equal, comparisons ({@code <, <=, >, >=}), AND/OR, LIKE (keyword
+   * fields only), IN, and BETWEEN.
    *
    * @param predicateString the predicate string from the FilterNode
-   * @return a DSL JSON string representing the term query, or null if not pushable
+   * @return a DSL JSON string, or null if not pushable
    */
-  static String tryConvertToDsl(String predicateString) {
-    Matcher matcher = EQUALITY_PREDICATE.matcher(predicateString);
-    if (!matcher.matches()) {
+  String tryConvertToDsl(String predicateString) {
+    try {
+      DqeSqlParser parser = new DqeSqlParser();
+      Expression expr = parser.parseExpression(predicateString);
+      return convertExprToDsl(expr);
+    } catch (Exception e) {
       return null;
     }
+  }
 
-    String column = matcher.group(1);
-    String valueStr = matcher.group(2).trim();
-
-    // Try parsing as a long integer
-    try {
-      long longValue = Long.parseLong(valueStr);
-      return "{\"term\":{\"" + column + "\":" + longValue + "}}";
-    } catch (NumberFormatException e) {
-      // Not a long, try double
+  private String convertExprToDsl(Expression expr) {
+    if (expr instanceof ComparisonExpression cmp) {
+      return convertComparison(cmp);
+    } else if (expr instanceof LogicalExpression logical) {
+      return convertLogical(logical);
+    } else if (expr instanceof NotExpression not) {
+      String inner = convertExprToDsl(not.getValue());
+      if (inner == null) return null;
+      return "{\"bool\":{\"must_not\":[" + inner + "]}}";
+    } else if (expr instanceof LikePredicate like) {
+      return convertLike(like);
+    } else if (expr instanceof InPredicate in) {
+      return convertIn(in);
+    } else if (expr instanceof BetweenPredicate between) {
+      return convertBetween(between);
     }
-
-    // Try parsing as a double
-    try {
-      double doubleValue = Double.parseDouble(valueStr);
-      return "{\"term\":{\"" + column + "\":" + doubleValue + "}}";
-    } catch (NumberFormatException e) {
-      // Not a double, try quoted string
-    }
-
-    // Try parsing as a single-quoted string: 'value'
-    if (valueStr.startsWith("'") && valueStr.endsWith("'") && valueStr.length() >= 2) {
-      String stringValue = valueStr.substring(1, valueStr.length() - 1);
-      return "{\"term\":{\"" + column + "\":\"" + escapeJsonString(stringValue) + "\"}}";
-    }
-
-    // Cannot push down
     return null;
+  }
+
+  private String convertComparison(ComparisonExpression cmp) {
+    String column = extractColumnName(cmp.getLeft());
+    if (column == null) return null;
+    String value = extractLiteralValue(cmp.getRight());
+    if (value == null) return null;
+
+    switch (cmp.getOperator()) {
+      case EQUAL:
+        return buildTermDsl(column, value);
+      case NOT_EQUAL:
+        String term = buildTermDsl(column, value);
+        if (term == null) return null;
+        return "{\"bool\":{\"must_not\":[" + term + "]}}";
+      case GREATER_THAN:
+        return "{\"range\":{\"" + column + "\":{\"gt\":" + value + "}}}";
+      case GREATER_THAN_OR_EQUAL:
+        return "{\"range\":{\"" + column + "\":{\"gte\":" + value + "}}}";
+      case LESS_THAN:
+        return "{\"range\":{\"" + column + "\":{\"lt\":" + value + "}}}";
+      case LESS_THAN_OR_EQUAL:
+        return "{\"range\":{\"" + column + "\":{\"lte\":" + value + "}}}";
+      default:
+        return null;
+    }
+  }
+
+  private String convertLogical(LogicalExpression logical) {
+    List<String> clauses = new ArrayList<>();
+    for (Expression term : logical.getTerms()) {
+      String dsl = convertExprToDsl(term);
+      if (dsl == null) return null;
+      clauses.add(dsl);
+    }
+    String joined = String.join(",", clauses);
+    switch (logical.getOperator()) {
+      case AND:
+        return "{\"bool\":{\"must\":[" + joined + "]}}";
+      case OR:
+        return "{\"bool\":{\"should\":[" + joined + "]}}";
+      default:
+        return null;
+    }
+  }
+
+  private String convertLike(LikePredicate like) {
+    String column = extractColumnName(like.getValue());
+    if (column == null) return null;
+    // Only push LIKE on keyword fields
+    String osType = fieldTypes.getOrDefault(column, "keyword");
+    if ("text".equals(osType)) return null;
+    if (!(like.getPattern() instanceof StringLiteral pattern)) return null;
+    // Convert SQL LIKE pattern (% → *, _ → ?) to wildcard
+    String wildcardPattern = pattern.getValue().replace('%', '*').replace('_', '?');
+    return "{\"wildcard\":{\""
+        + column
+        + "\":{\"value\":\""
+        + escapeJsonString(wildcardPattern)
+        + "\"}}}";
+  }
+
+  private String convertIn(InPredicate in) {
+    String column = extractColumnName(in.getValue());
+    if (column == null) return null;
+    if (!(in.getValueList() instanceof InListExpression list)) return null;
+    List<String> values = new ArrayList<>();
+    for (Expression val : list.getValues()) {
+      String v = extractLiteralValue(val);
+      if (v == null) return null;
+      values.add(v);
+    }
+    return "{\"terms\":{\"" + column + "\":[" + String.join(",", values) + "]}}";
+  }
+
+  private String convertBetween(BetweenPredicate between) {
+    String column = extractColumnName(between.getValue());
+    if (column == null) return null;
+    String min = extractLiteralValue(between.getMin());
+    String max = extractLiteralValue(between.getMax());
+    if (min == null || max == null) return null;
+    return "{\"range\":{\"" + column + "\":{\"gte\":" + min + ",\"lte\":" + max + "}}}";
+  }
+
+  private static String extractColumnName(Expression expr) {
+    if (expr instanceof Identifier id) return id.getValue();
+    return null;
+  }
+
+  private static String extractLiteralValue(Expression expr) {
+    if (expr instanceof LongLiteral lit) return String.valueOf(lit.getParsedValue());
+    if (expr instanceof DoubleLiteral lit) return String.valueOf(lit.getValue());
+    if (expr instanceof DecimalLiteral lit) return lit.getValue();
+    if (expr instanceof StringLiteral lit) return "\"" + escapeJsonString(lit.getValue()) + "\"";
+    if (expr instanceof GenericLiteral lit && lit.getType().equalsIgnoreCase("DATE")) {
+      long epochMillis =
+          java.time.LocalDate.parse(lit.getValue())
+              .atStartOfDay(java.time.ZoneOffset.UTC)
+              .toInstant()
+              .toEpochMilli();
+      return String.valueOf(epochMillis);
+    }
+    return null;
+  }
+
+  private static String buildTermDsl(String column, String value) {
+    return "{\"term\":{\"" + column + "\":" + value + "}}";
   }
 
   /** Escape special characters in a JSON string value. */

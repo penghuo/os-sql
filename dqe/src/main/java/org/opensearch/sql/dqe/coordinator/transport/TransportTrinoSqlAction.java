@@ -188,16 +188,23 @@ public class TransportTrinoSqlAction
                       if (coordinatorPlan instanceof AggregationNode aggNode
                           && aggNode.getStep() == AggregationNode.Step.SINGLE) {
                         // SINGLE aggregation: shards sent raw data, coordinator aggregates
-                        // Shard columns are the scan output (child of aggregation in the
-                        // original plan), resolved from the shard fragment plan
                         List<String> shardColumnNames =
                             resolveColumnNames(shardFragments.get(0).shardPlan());
                         List<Page> rawPages = merger.mergePassthrough(shardPages);
                         mergedPages =
                             runCoordinatorAggregation(
                                 aggNode, rawPages, shardColumnNames, columnTypeMap);
+                        mergedPages =
+                            applyCoordinatorSort(
+                                mergedPages, aggNode, optimizedPlan, columnTypes, merger);
                       } else if (coordinatorPlan instanceof AggregationNode aggNode) {
                         mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
+                        mergedPages =
+                            applyCoordinatorHaving(
+                                mergedPages, optimizedPlan, aggNode, columnTypeMap);
+                        mergedPages =
+                            applyCoordinatorSort(
+                                mergedPages, aggNode, optimizedPlan, columnTypes, merger);
                       } else {
                         // Check if we need sorted merge
                         SortNode sortNode = findSortNode(optimizedPlan);
@@ -836,6 +843,124 @@ public class TransportTrinoSqlAction
           }
         },
         null);
+  }
+
+  /**
+   * Apply HAVING filter at the coordinator after merging aggregation results from shards. The
+   * HAVING (FilterNode above AggregationNode) was stripped from shard plans because per-shard
+   * partial counts would incorrectly filter groups.
+   */
+  private static List<Page> applyCoordinatorHaving(
+      List<Page> mergedPages,
+      DqePlanNode optimizedPlan,
+      AggregationNode aggNode,
+      Map<String, Type> columnTypeMap) {
+    // Find HAVING FilterNode in the original plan (above AggregationNode)
+    FilterNode havingNode = findHavingNode(optimizedPlan);
+    if (havingNode == null) {
+      return mergedPages;
+    }
+
+    // Build column index map for the aggregation output
+    List<String> aggOutputCols = new ArrayList<>(aggNode.getGroupByKeys());
+    aggOutputCols.addAll(aggNode.getAggregateFunctions());
+    Map<String, Integer> colIndexMap = new HashMap<>();
+    for (int i = 0; i < aggOutputCols.size(); i++) {
+      colIndexMap.put(aggOutputCols.get(i), i);
+    }
+
+    // Compile the HAVING predicate
+    FunctionRegistry registry = BuiltinFunctions.createRegistry();
+    ExpressionCompiler compiler = new ExpressionCompiler(registry, colIndexMap, columnTypeMap);
+    DqeSqlParser parser = new DqeSqlParser();
+    io.trino.sql.tree.Expression predExpr = parser.parseExpression(havingNode.getPredicateString());
+    org.opensearch.sql.dqe.function.expression.BlockExpression blockPred =
+        compiler.compile(predExpr);
+
+    // Apply filter to each page
+    List<Page> filtered = new ArrayList<>();
+    org.opensearch.sql.dqe.operator.FilterOperator filterOp =
+        new org.opensearch.sql.dqe.operator.FilterOperator(
+            new org.opensearch.sql.dqe.operator.Operator() {
+              private int idx = 0;
+
+              @Override
+              public Page processNextBatch() {
+                return idx < mergedPages.size() ? mergedPages.get(idx++) : null;
+              }
+
+              @Override
+              public void close() {}
+            },
+            blockPred);
+    Page page;
+    while ((page = filterOp.processNextBatch()) != null) {
+      if (page.getPositionCount() > 0) {
+        filtered.add(page);
+      }
+    }
+    return filtered;
+  }
+
+  /** Find a FilterNode directly above an AggregationNode (HAVING clause). */
+  private static FilterNode findHavingNode(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<FilterNode, Void>() {
+          @Override
+          public FilterNode visitFilter(FilterNode node, Void context) {
+            // Check if this filter's child (or child chain) leads to AggregationNode
+            if (hasAggregationChild(node.getChild())) {
+              return node;
+            }
+            return node.getChild().accept(this, context);
+          }
+
+          @Override
+          public FilterNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              FilterNode result = child.accept(this, context);
+              if (result != null) return result;
+            }
+            return null;
+          }
+
+          private boolean hasAggregationChild(DqePlanNode node) {
+            if (node instanceof AggregationNode) return true;
+            if (node instanceof EvalNode) return hasAggregationChild(((EvalNode) node).getChild());
+            return false;
+          }
+        },
+        null);
+  }
+
+  /**
+   * Apply Sort + Limit to merged aggregation results at the coordinator. The original plan's Sort
+   * and Limit were stripped from the shard plan, so the coordinator must apply them after merging.
+   */
+  private static List<Page> applyCoordinatorSort(
+      List<Page> mergedPages,
+      AggregationNode aggNode,
+      DqePlanNode optimizedPlan,
+      List<Type> columnTypes,
+      ResultMerger merger) {
+    SortNode sortNode = findSortNode(optimizedPlan);
+    if (sortNode == null) {
+      return mergedPages;
+    }
+    // Resolve sort key indices in the aggregation output columns
+    List<String> aggOutputCols = new ArrayList<>(aggNode.getGroupByKeys());
+    aggOutputCols.addAll(aggNode.getAggregateFunctions());
+    List<Integer> sortIndices =
+        sortNode.getSortKeys().stream().map(aggOutputCols::indexOf).collect(Collectors.toList());
+    long rawLimit = findGlobalLimit(optimizedPlan);
+    long sortLimit = rawLimit >= 0 ? rawLimit + findGlobalOffset(optimizedPlan) : Long.MAX_VALUE;
+    return merger.mergeSorted(
+        List.of(mergedPages),
+        sortIndices,
+        sortNode.getAscending(),
+        sortNode.getNullsFirst(),
+        columnTypes,
+        sortLimit);
   }
 
   /** Walk the plan tree to find a LimitNode and return its offset. Returns 0 if none. */

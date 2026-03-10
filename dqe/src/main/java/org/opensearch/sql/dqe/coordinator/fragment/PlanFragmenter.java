@@ -15,6 +15,11 @@ import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
+import org.opensearch.sql.dqe.planner.plan.FilterNode;
+import org.opensearch.sql.dqe.planner.plan.LimitNode;
+import org.opensearch.sql.dqe.planner.plan.ProjectNode;
+import org.opensearch.sql.dqe.planner.plan.SortNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 
 /**
@@ -60,20 +65,65 @@ public class PlanFragmenter {
   }
 
   /**
-   * Build the shard plan by stripping non-PARTIAL aggregation nodes (and any Sort/Limit above them)
-   * from the plan. When aggregation is SINGLE (e.g., COUNT(DISTINCT)), the coordinator will run the
-   * aggregation over concatenated shard scan results.
+   * Build the shard plan. For aggregation queries:
+   *
+   * <ul>
+   *   <li>PARTIAL: Strip Sort/Limit above aggregation (coordinator applies those after merge).
+   *       Shard runs: [EvalNode →] AggregationNode(PARTIAL) → Filter → Scan.
+   *   <li>SINGLE (COUNT DISTINCT): Strip aggregation and above. Shard runs: Filter → Scan.
+   * </ul>
+   *
+   * For non-aggregation queries: use the full plan.
    */
   private DqePlanNode buildShardPlan(DqePlanNode plan) {
     AggregationNode aggNode = findAggregationNode(plan);
-    // If no aggregation or aggregation is PARTIAL, use the full plan as-is
-    if (aggNode == null || aggNode.getStep() == AggregationNode.Step.PARTIAL) {
+    if (aggNode == null) {
       return plan;
     }
-    // For non-PARTIAL aggregation (e.g., SINGLE with COUNT(DISTINCT)):
-    // Strip the aggregation and everything above it. Shards only scan + filter.
-    // The shard plan is just the child of the AggregationNode.
+    if (aggNode.getStep() == AggregationNode.Step.PARTIAL) {
+      // Strip Sort, Limit, and Project above the aggregation.
+      // Walk up from the aggregation to find it in the tree and return it as the root.
+      return stripAboveAggregation(plan);
+    }
+    // SINGLE: strip aggregation and above, shards only scan+filter
     return aggNode.getChild();
+  }
+
+  /**
+   * Return the subtree rooted at the AggregationNode, stripping Sort/Limit/Project nodes above it.
+   * If the plan has structure like Limit(Sort(Project(Agg(...)))) or Limit(Sort(Agg(...))), returns
+   * the Agg subtree. Also handles EvalNode above aggregation.
+   */
+  private DqePlanNode stripAboveAggregation(DqePlanNode node) {
+    if (node instanceof AggregationNode) {
+      return node;
+    }
+    if (node instanceof LimitNode) {
+      return stripAboveAggregation(((LimitNode) node).getChild());
+    }
+    if (node instanceof SortNode) {
+      return stripAboveAggregation(((SortNode) node).getChild());
+    }
+    if (node instanceof ProjectNode) {
+      return stripAboveAggregation(((ProjectNode) node).getChild());
+    }
+    // FilterNode above aggregation = HAVING clause. Strip it — it must be
+    // applied at the coordinator after merging partial results from all shards.
+    if (node instanceof FilterNode) {
+      return stripAboveAggregation(((FilterNode) node).getChild());
+    }
+    if (node instanceof EvalNode) {
+      // EvalNode above aggregation may compute expressions on agg output.
+      // Keep it — it can run on the shard with partial results.
+      DqePlanNode child = stripAboveAggregation(((EvalNode) node).getChild());
+      if (child instanceof AggregationNode) {
+        return new EvalNode(
+            child, ((EvalNode) node).getExpressions(), ((EvalNode) node).getOutputColumnNames());
+      }
+      return child;
+    }
+    // For any other node type, return as-is
+    return node;
   }
 
   /**

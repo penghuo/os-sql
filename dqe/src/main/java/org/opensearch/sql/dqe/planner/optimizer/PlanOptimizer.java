@@ -368,11 +368,14 @@ public class PlanOptimizer {
     @Override
     public DqePlanNode visitAggregation(AggregationNode node, Void context) {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
-      // Don't split to PARTIAL when COUNT(DISTINCT) is present — it can't be merged
-      // correctly by summing per-shard counts (double-counts values across shards)
-      if (hasCountDistinct(node.getAggregateFunctions())) {
+      // For non-decomposable aggregates (COUNT(DISTINCT), AVG without COUNT),
+      // force SINGLE step — coordinator will run the full aggregation over raw shard data
+      if (hasNonDecomposableAgg(node.getAggregateFunctions())) {
         return new AggregationNode(
-            optimizedChild, node.getGroupByKeys(), node.getAggregateFunctions(), node.getStep());
+            optimizedChild,
+            node.getGroupByKeys(),
+            node.getAggregateFunctions(),
+            AggregationNode.Step.SINGLE);
       }
       // Ensure the aggregation step is PARTIAL for distributed execution
       if (node.getStep() != AggregationNode.Step.PARTIAL) {
@@ -386,12 +389,22 @@ public class PlanOptimizer {
           optimizedChild, node.getGroupByKeys(), node.getAggregateFunctions(), node.getStep());
     }
 
-    private boolean hasCountDistinct(List<String> aggFunctions) {
+    /**
+     * Check if the aggregate function list contains non-decomposable functions that can't be
+     * correctly merged with PARTIAL/FINAL: COUNT(DISTINCT) or AVG without a companion COUNT.
+     */
+    private boolean hasNonDecomposableAgg(List<String> aggFunctions) {
+      boolean hasAvg = false;
+      boolean hasCount = false;
+      boolean hasCountDistinct = false;
       for (String func : aggFunctions) {
-        if (func.toUpperCase(java.util.Locale.ROOT).contains("COUNT(DISTINCT")) {
-          return true;
-        }
+        String upper = func.toUpperCase(java.util.Locale.ROOT);
+        if (upper.contains("COUNT(DISTINCT")) hasCountDistinct = true;
+        else if (upper.startsWith("AVG(")) hasAvg = true;
+        else if (upper.startsWith("COUNT(")) hasCount = true;
       }
+      if (hasCountDistinct) return true;
+      if (hasAvg && !hasCount) return true;
       return false;
     }
 

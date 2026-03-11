@@ -84,6 +84,12 @@ public class ResultMerger {
       return mergeAggregationFastNumeric(shardResults, numGroupByCols, numAggCols, columnTypes);
     }
 
+    // Fast path: single VARCHAR key with COUNT/SUM-only aggregates (all BigintType output).
+    // Uses HashMap<String, long[]> directly, avoiding GroupKey allocation and Accumulator overhead.
+    if (canUseFastVarcharMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
+      return mergeAggregationFastVarchar(shardResults, numGroupByCols, numAggCols, columnTypes);
+    }
+
     // Build merge functions that operate on the partial aggregation output columns.
     // The shard Pages have layout: [groupBy0, groupBy1, ..., agg0, agg1, ...].
     // For FINAL merge: COUNT/SUM→sum, MIN→min, MAX→max, AVG→weighted_avg.
@@ -353,6 +359,105 @@ public class ResultMerger {
         for (int a = 0; a < numAggCols; a++) {
           BigintType.BIGINT.writeLong(builders[numGroupByCols + a], mapAggValues[s][a]);
         }
+      }
+    }
+
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Check if we can use the fast varchar merge path. Requirements:
+   *
+   * <ul>
+   *   <li>Single group-by key of VarcharType
+   *   <li>All aggregate functions are COUNT or SUM with BigintType output
+   * </ul>
+   */
+  private boolean canUseFastVarcharMerge(
+      int numGroupByCols, List<Type> columnTypes, List<String> aggregateFunctions) {
+    if (numGroupByCols != 1) return false;
+    if (!(columnTypes.get(0) instanceof VarcharType)) return false;
+    for (int a = 0; a < aggregateFunctions.size(); a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (!m.matches()) return false;
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      if (isDistinct) return false;
+      Type aggType = columnTypes.get(numGroupByCols + a);
+      if ("COUNT".equals(funcName) || "SUM".equals(funcName)) {
+        if (!(aggType instanceof BigintType)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Fast varchar merge: uses HashMap&lt;String, long[]&gt; to merge single-VARCHAR-key GROUP BY
+   * results with COUNT/SUM aggregates. Reads VARCHAR Slices directly from blocks and accumulates
+   * long values, avoiding GroupKey object allocation, Accumulator creation, and virtual dispatch
+   * per row.
+   */
+  private List<Page> mergeAggregationFastVarchar(
+      List<List<Page>> shardResults, int numGroupByCols, int numAggCols, List<Type> columnTypes) {
+
+    int totalCols = numGroupByCols + numAggCols;
+    java.util.HashMap<String, long[]> groups = new java.util.HashMap<>();
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(numGroupByCols + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (keyBlock.isNull(pos)) continue;
+          String key = VarcharType.VARCHAR.getSlice(keyBlock, pos).toStringUtf8();
+          long[] aggs = groups.get(key);
+          if (aggs == null) {
+            aggs = new long[numAggCols];
+            for (int a = 0; a < numAggCols; a++) {
+              if (!aggBlocks[a].isNull(pos)) {
+                aggs[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+            }
+            groups.put(key, aggs);
+          } else {
+            for (int a = 0; a < numAggCols; a++) {
+              if (!aggBlocks[a].isNull(pos)) {
+                aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (groups.isEmpty()) {
+      return List.of();
+    }
+
+    int groupCount = groups.size();
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+    for (int a = 0; a < numAggCols; a++) {
+      builders[numGroupByCols + a] = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+    }
+
+    for (java.util.Map.Entry<String, long[]> entry : groups.entrySet()) {
+      VarcharType.VARCHAR.writeSlice(
+          builders[0], io.airlift.slice.Slices.utf8Slice(entry.getKey()));
+      long[] aggs = entry.getValue();
+      for (int a = 0; a < numAggCols; a++) {
+        BigintType.BIGINT.writeLong(builders[numGroupByCols + a], aggs[a]);
       }
     }
 

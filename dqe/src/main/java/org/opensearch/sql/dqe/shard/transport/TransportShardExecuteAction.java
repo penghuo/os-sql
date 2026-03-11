@@ -408,7 +408,8 @@ public class TransportShardExecuteAction
    */
   private List<Page> executeFusedGroupByAggregate(AggregationNode aggNode, ShardExecuteRequest req)
       throws Exception {
-    TableScanNode scanNode = (TableScanNode) aggNode.getChild();
+    // Walk through optional EvalNode to find the TableScanNode
+    TableScanNode scanNode = findTableScanNode(aggNode);
     String indexName = scanNode.getIndexName();
     CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
 

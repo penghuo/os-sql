@@ -40,6 +40,8 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
+import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
+import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 
 /**
@@ -67,15 +69,40 @@ public final class FusedGroupByAggregate {
       Pattern.compile(
           "^\\s*(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)\\s*$", Pattern.CASE_INSENSITIVE);
 
+  /**
+   * Pattern to recognize DATE_TRUNC expressions in group-by keys. Matches expressions like
+   * "date_trunc('minute', EventTime)" and extracts the unit and source column name.
+   */
+  private static final Pattern DATE_TRUNC_PATTERN =
+      Pattern.compile(
+          "^date_trunc\\('(second|minute|hour|day|month|year)',\\s*(\\w+)\\)$",
+          Pattern.CASE_INSENSITIVE);
+
   private FusedGroupByAggregate() {}
+
+  /**
+   * Find the TableScanNode underneath an AggregationNode, looking through an optional EvalNode.
+   * Returns null if the child structure is not TableScanNode or EvalNode → TableScanNode.
+   */
+  private static TableScanNode findChildTableScan(AggregationNode aggNode) {
+    DqePlanNode child = aggNode.getChild();
+    if (child instanceof TableScanNode tsn) {
+      return tsn;
+    }
+    if (child instanceof EvalNode evalNode && evalNode.getChild() instanceof TableScanNode tsn) {
+      return tsn;
+    }
+    return null;
+  }
 
   /**
    * Check if the shard plan is a GROUP BY aggregation that can use the fused path. Requirements:
    *
    * <ul>
    *   <li>Plan is AggregationNode with non-empty groupByKeys
-   *   <li>Child is a TableScanNode (no intermediate filter/eval nodes)
-   *   <li>All group-by keys are VARCHAR, numeric, or timestamp types
+   *   <li>Child is a TableScanNode or EvalNode → TableScanNode
+   *   <li>All group-by keys are either plain columns with VARCHAR/numeric/timestamp types, or
+   *       supported expressions like DATE_TRUNC on a timestamp column
    *   <li>All aggregate functions are supported
    * </ul>
    */
@@ -83,17 +110,32 @@ public final class FusedGroupByAggregate {
     if (aggNode.getGroupByKeys().isEmpty()) {
       return false;
     }
-    if (!(aggNode.getChild() instanceof TableScanNode)) {
+    if (findChildTableScan(aggNode) == null) {
       return false;
     }
 
     // Check all group-by keys are supported types (VARCHAR, numeric, or timestamp)
+    // or recognized expression patterns (DATE_TRUNC)
     for (String key : aggNode.getGroupByKeys()) {
       Type type = columnTypeMap.get(key);
-      if (type == null) {
-        return false; // Unknown type, can't fuse
-      } else if (!(type instanceof VarcharType) && !isNumericOrTimestamp(type)) {
-        return false; // Unsupported group-by key type
+      if (type != null) {
+        // Plain column reference
+        if (!(type instanceof VarcharType) && !isNumericOrTimestamp(type)) {
+          return false; // Unsupported group-by key type
+        }
+      } else {
+        // Not a plain column — check if it's a supported expression
+        Matcher dtm = DATE_TRUNC_PATTERN.matcher(key);
+        if (dtm.matches()) {
+          // Verify the source column is a timestamp type
+          String sourceCol = dtm.group(2);
+          Type sourceType = columnTypeMap.get(sourceCol);
+          if (!(sourceType instanceof TimestampType)) {
+            return false;
+          }
+        } else {
+          return false; // Unknown expression, can't fuse
+        }
       }
     }
 
@@ -133,7 +175,7 @@ public final class FusedGroupByAggregate {
   public static List<Page> execute(
       AggregationNode aggNode, IndexShard shard, Query query, Map<String, Type> columnTypeMap)
       throws Exception {
-    TableScanNode scanNode = (TableScanNode) aggNode.getChild();
+    TableScanNode scanNode = findChildTableScan(aggNode);
     List<String> groupByKeys = aggNode.getGroupByKeys();
     List<String> aggFunctions = aggNode.getAggregateFunctions();
 
@@ -151,20 +193,45 @@ public final class FusedGroupByAggregate {
       specs.add(new AggSpec(funcName, isDistinct, arg, argType));
     }
 
-    // Classify group-by keys
+    // Classify group-by keys, detecting DATE_TRUNC expressions
     List<KeyInfo> keyInfos = new ArrayList<>();
     boolean hasVarchar = false;
     for (String key : groupByKeys) {
       Type type = columnTypeMap.get(key);
-      boolean isVarchar = type instanceof VarcharType;
-      keyInfos.add(new KeyInfo(key, type, isVarchar));
-      if (isVarchar) {
-        hasVarchar = true;
+      if (type != null) {
+        // Plain column reference
+        boolean isVarchar = type instanceof VarcharType;
+        keyInfos.add(new KeyInfo(key, type, isVarchar, null, null));
+        if (isVarchar) {
+          hasVarchar = true;
+        }
+      } else {
+        // Check for DATE_TRUNC expression
+        Matcher dtm = DATE_TRUNC_PATTERN.matcher(key);
+        if (dtm.matches()) {
+          String unit = dtm.group(1).toLowerCase(Locale.ROOT);
+          String sourceCol = dtm.group(2);
+          // Output type is TimestampType, source column is read from DocValues
+          keyInfos.add(
+              new KeyInfo(sourceCol, TimestampType.TIMESTAMP_MILLIS, false, "date_trunc", unit));
+        } else {
+          throw new IllegalArgumentException("Unsupported group-by expression: " + key);
+        }
       }
     }
 
     // Dispatch to specialized path based on key types
     if (hasVarchar) {
+      // Fast path: single VARCHAR key with COUNT(*) only — uses HashMap<String, long> directly,
+      // avoiding MergedGroupKey wrapper and AccumulatorGroup object allocation per group.
+      if (keyInfos.size() == 1
+          && keyInfos.get(0).isVarchar
+          && specs.size() == 1
+          && "COUNT".equals(specs.get(0).funcName)
+          && "*".equals(specs.get(0).arg)) {
+        return executeSingleVarcharCountStar(
+            shard, query, keyInfos.get(0).name, columnTypeMap, groupByKeys);
+      }
       return executeWithVarcharKeys(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
     } else {
       return executeNumericOnly(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
@@ -172,9 +239,161 @@ public final class FusedGroupByAggregate {
   }
 
   /**
+   * Apply DATE_TRUNC transformation to an epoch-millis value. Truncates to the specified unit
+   * boundary directly in millis, avoiding ZonedDateTime allocation for the common 'minute' case.
+   *
+   * @param millis epoch milliseconds from DocValues
+   * @param unit the truncation unit (second, minute, hour, day, month, year)
+   * @return truncated epoch milliseconds
+   */
+  private static long truncateMillis(long millis, String unit) {
+    switch (unit) {
+      case "second":
+        return millis / 1000 * 1000;
+      case "minute":
+        return millis / 60_000 * 60_000;
+      case "hour":
+        return millis / 3_600_000 * 3_600_000;
+      case "day":
+        return millis / 86_400_000 * 86_400_000;
+      case "month":
+      case "year":
+        // For month/year, fall through to calendar-based truncation
+        java.time.Instant instant = java.time.Instant.ofEpochMilli(millis);
+        java.time.ZonedDateTime zdt = instant.atZone(java.time.ZoneOffset.UTC);
+        if ("month".equals(unit)) {
+          zdt = zdt.withDayOfMonth(1).toLocalDate().atStartOfDay(java.time.ZoneOffset.UTC);
+        } else {
+          zdt =
+              zdt.withMonth(1)
+                  .withDayOfMonth(1)
+                  .toLocalDate()
+                  .atStartOfDay(java.time.ZoneOffset.UTC);
+        }
+        return zdt.toInstant().toEpochMilli();
+      default:
+        return millis;
+    }
+  }
+
+  /**
+   * Ultra-fast path for single VARCHAR key with COUNT(*). Avoids MergedGroupKey/AccumulatorGroup
+   * allocation by using per-segment ordinal arrays and a single global HashMap&lt;String, long&gt;.
+   * For each segment, counts per-ordinal in a long array, then resolves ordinals to strings and
+   * accumulates into the global map.
+   */
+  private static List<Page> executeSingleVarcharCountStar(
+      IndexShard shard,
+      Query query,
+      String columnName,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys)
+      throws Exception {
+
+    HashMap<String, long[]> globalCounts = new HashMap<>();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-varchar-count")) {
+
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              SortedSetDocValues dv = context.reader().getSortedSetDocValues(columnName);
+
+              // Use ordinal array for per-segment counting — avoids HashMap per doc
+              long ordCount = (dv != null) ? dv.getValueCount() : 0;
+              long[] ordCounts;
+              if (ordCount > 0 && ordCount <= 1_000_000) {
+                ordCounts = new long[(int) ordCount];
+              } else {
+                ordCounts = null; // Fallback to HashMap for very large ordinal spaces
+              }
+              HashMap<Long, long[]> ordMap = (ordCounts == null) ? new HashMap<>() : null;
+
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  if (dv != null && dv.advanceExact(doc)) {
+                    long ord = dv.nextOrd();
+                    if (ordCounts != null) {
+                      ordCounts[(int) ord]++;
+                    } else {
+                      ordMap.merge(
+                          ord,
+                          new long[] {1},
+                          (a, b) -> {
+                            a[0]++;
+                            return a;
+                          });
+                    }
+                  }
+                }
+
+                @Override
+                public void finish() throws IOException {
+                  if (dv == null) return;
+                  if (ordCounts != null) {
+                    for (int i = 0; i < ordCounts.length; i++) {
+                      if (ordCounts[i] > 0) {
+                        BytesRef bytes = dv.lookupOrd(i);
+                        String key = bytes.utf8ToString();
+                        long[] existing = globalCounts.get(key);
+                        if (existing == null) {
+                          globalCounts.put(key, new long[] {ordCounts[i]});
+                        } else {
+                          existing[0] += ordCounts[i];
+                        }
+                      }
+                    }
+                  } else {
+                    for (Map.Entry<Long, long[]> entry : ordMap.entrySet()) {
+                      BytesRef bytes = dv.lookupOrd(entry.getKey());
+                      String key = bytes.utf8ToString();
+                      long[] existing = globalCounts.get(key);
+                      if (existing == null) {
+                        globalCounts.put(key, new long[] {entry.getValue()[0]});
+                      } else {
+                        existing[0] += entry.getValue()[0];
+                      }
+                    }
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    if (globalCounts.isEmpty()) {
+      return List.of();
+    }
+
+    int groupCount = globalCounts.size();
+    BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+    BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+
+    for (Map.Entry<String, long[]> entry : globalCounts.entrySet()) {
+      VarcharType.VARCHAR.writeSlice(keyBuilder, Slices.utf8Slice(entry.getKey()));
+      BigintType.BIGINT.writeLong(countBuilder, entry.getValue()[0]);
+    }
+
+    return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+  }
+
+  /**
    * Fast path for numeric-only GROUP BY keys. Since all keys are raw long values (no segment-local
    * ordinals), we aggregate directly into a global map across all segments without
-   * per-segment/cross-segment merge overhead.
+   * per-segment/cross-segment merge overhead. Supports DATE_TRUNC expressions on timestamp columns
+   * by applying truncation during key value extraction.
    */
   private static List<Page> executeNumericOnly(
       IndexShard shard,
@@ -190,6 +409,15 @@ public final class FusedGroupByAggregate {
     // so we can accumulate directly without per-segment resolution.
     Map<SegmentGroupKey, AccumulatorGroup> globalGroups = new HashMap<>();
 
+    // Pre-compute which keys need DATE_TRUNC transformation and their units
+    final String[] truncUnits = new String[keyInfos.size()];
+    for (int i = 0; i < keyInfos.size(); i++) {
+      KeyInfo ki = keyInfos.get(i);
+      if ("date_trunc".equals(ki.exprFunc())) {
+        truncUnits[i] = ki.exprUnit();
+      }
+    }
+
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric")) {
 
@@ -201,7 +429,7 @@ public final class FusedGroupByAggregate {
               // Open doc values for group-by keys (all numeric)
               SortedNumericDocValues[] keyReaders = new SortedNumericDocValues[keyInfos.size()];
               for (int i = 0; i < keyInfos.size(); i++) {
-                keyReaders[i] = context.reader().getSortedNumericDocValues(keyInfos.get(i).name);
+                keyReaders[i] = context.reader().getSortedNumericDocValues(keyInfos.get(i).name());
               }
 
               // Open doc values for aggregate arguments
@@ -229,7 +457,12 @@ public final class FusedGroupByAggregate {
                   for (int k = 0; k < keyInfos.size(); k++) {
                     SortedNumericDocValues dv = keyReaders[k];
                     if (dv != null && dv.advanceExact(doc)) {
-                      keyValues[k] = dv.nextValue();
+                      long val = dv.nextValue();
+                      // Apply DATE_TRUNC transformation if needed
+                      if (truncUnits[k] != null) {
+                        val = truncateMillis(val, truncUnits[k]);
+                      }
+                      keyValues[k] = val;
                     } else {
                       keyNulls[k] = true;
                     }
@@ -312,6 +545,15 @@ public final class FusedGroupByAggregate {
 
     Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
 
+    // Pre-compute DATE_TRUNC units for numeric keys in the varchar path
+    final String[] truncUnits = new String[keyInfos.size()];
+    for (int i = 0; i < keyInfos.size(); i++) {
+      KeyInfo ki = keyInfos.get(i);
+      if ("date_trunc".equals(ki.exprFunc)) {
+        truncUnits[i] = ki.exprUnit;
+      }
+    }
+
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby")) {
 
@@ -367,7 +609,12 @@ public final class FusedGroupByAggregate {
                     } else {
                       SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
                       if (dv != null && dv.advanceExact(doc)) {
-                        keyValues[k] = dv.nextValue();
+                        long val = dv.nextValue();
+                        // Apply DATE_TRUNC transformation if needed
+                        if (truncUnits[k] != null) {
+                          val = truncateMillis(val, truncUnits[k]);
+                        }
+                        keyValues[k] = val;
                       } else {
                         keyNulls[k] = true;
                       }
@@ -470,7 +717,18 @@ public final class FusedGroupByAggregate {
 
     // Group-by key types
     for (String key : aggNode.getGroupByKeys()) {
-      types.add(columnTypeMap.getOrDefault(key, BigintType.BIGINT));
+      Type type = columnTypeMap.get(key);
+      if (type != null) {
+        types.add(type);
+      } else {
+        // Check for DATE_TRUNC expression — output type is timestamp
+        Matcher dtm = DATE_TRUNC_PATTERN.matcher(key);
+        if (dtm.matches()) {
+          types.add(TimestampType.TIMESTAMP_MILLIS);
+        } else {
+          types.add(BigintType.BIGINT);
+        }
+      }
     }
 
     // Aggregate output types
@@ -510,7 +768,19 @@ public final class FusedGroupByAggregate {
 
   private record AggSpec(String funcName, boolean isDistinct, String arg, Type argType) {}
 
-  private record KeyInfo(String name, Type type, boolean isVarchar) {}
+  /**
+   * Metadata for a single GROUP BY key.
+   *
+   * @param name the column name to read from DocValues (for DATE_TRUNC, this is the source column)
+   * @param type the output type of this key
+   * @param isVarchar whether this key uses SortedSetDocValues (VARCHAR)
+   * @param exprFunc the expression function name, or null for plain column references. Currently
+   *     supports "date_trunc".
+   * @param exprUnit the unit parameter for expression functions (e.g., "minute" for date_trunc), or
+   *     null for plain column references.
+   */
+  private record KeyInfo(
+      String name, Type type, boolean isVarchar, String exprFunc, String exprUnit) {}
 
   /**
    * Segment-local group key using ordinals for VARCHAR and raw values for numerics. Uses long

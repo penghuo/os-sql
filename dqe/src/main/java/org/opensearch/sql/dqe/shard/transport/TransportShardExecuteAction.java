@@ -188,6 +188,18 @@ public class TransportShardExecuteAction
         return;
       }
 
+      // 2b2. Try fused eval-aggregate for SUM(col + constant) patterns —
+      // uses algebraic identity SUM(col + k) = SUM(col) + k * COUNT(*) to avoid
+      // per-row expression evaluation, reading each column only once
+      if (scanFactory == null
+          && plan instanceof AggregationNode aggEvalNode
+          && FusedScanAggregate.canFuseWithEval(aggEvalNode)) {
+        List<Page> pages = executeFusedEvalAggregate(aggEvalNode, req);
+        List<Type> columnTypes = FusedScanAggregate.resolveEvalAggOutputTypes(aggEvalNode);
+        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
+        return;
+      }
+
       // 2c. Try fused ordinal-based GROUP BY for aggregations with string group keys —
       // uses SortedSetDocValues ordinals as hash keys, deferring string resolution to output
       if (scanFactory == null
@@ -399,6 +411,34 @@ public class TransportShardExecuteAction
             : new MatchAllDocsQuery();
 
     return FusedScanAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+  }
+
+  /**
+   * Execute a fused eval-aggregate using the algebraic shortcut for SUM(col + constant) patterns.
+   * Reads each unique physical column once from DocValues and derives all results using the
+   * identity: SUM(col + k) = SUM(col) + k * COUNT(*).
+   */
+  private List<Page> executeFusedEvalAggregate(AggregationNode aggNode, ShardExecuteRequest req)
+      throws Exception {
+    // Walk through EvalNode to find the TableScanNode
+    EvalNode evalNode = (EvalNode) aggNode.getChild();
+    TableScanNode scanNode = (TableScanNode) evalNode.getChild();
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query
+    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    Query luceneQuery =
+        (scanNode.getDslFilter() != null)
+            ? queryCompiler.compile(scanNode.getDslFilter())
+            : new MatchAllDocsQuery();
+
+    return FusedScanAggregate.executeWithEval(
+        aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
 
   /**

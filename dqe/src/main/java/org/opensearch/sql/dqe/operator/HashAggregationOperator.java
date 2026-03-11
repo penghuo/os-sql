@@ -549,7 +549,12 @@ public class HashAggregationOperator implements Operator {
     } else if (type instanceof DoubleType) {
       DoubleType.DOUBLE.writeDouble(builder, ((Number) value).doubleValue());
     } else if (type instanceof VarcharType) {
-      VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+      if (value instanceof io.airlift.slice.Slice slice) {
+        VarcharType.VARCHAR.writeSlice(builder, slice);
+      } else {
+        VarcharType.VARCHAR.writeSlice(
+            builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+      }
     } else if (type instanceof TimestampType) {
       type.writeLong(builder, ((Number) value).longValue());
     } else {

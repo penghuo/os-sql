@@ -277,10 +277,12 @@ public final class FusedGroupByAggregate {
   }
 
   /**
-   * Ultra-fast path for single VARCHAR key with COUNT(*). Avoids MergedGroupKey/AccumulatorGroup
-   * allocation by using per-segment ordinal arrays and a single global HashMap&lt;String, long&gt;.
-   * For each segment, counts per-ordinal in a long array, then resolves ordinals to strings and
-   * accumulates into the global map.
+   * Ultra-fast path for single VARCHAR key with COUNT(*). Uses per-segment ordinal arrays for
+   * counting. When the index has a single segment (common for small-to-medium indices), the ordinal
+   * array IS the final result — ordinals are resolved to strings only when building the output
+   * Page, completely avoiding the intermediate HashMap&lt;String, long&gt; and all String
+   * allocations during aggregation. For multi-segment indices, falls back to a byte[]-based HashMap
+   * that avoids the expensive UTF-8 to Java char[] round-trip.
    */
   private static List<Page> executeSingleVarcharCountStar(
       IndexShard shard,
@@ -290,10 +292,92 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys)
       throws Exception {
 
-    HashMap<String, long[]> globalCounts = new HashMap<>();
-
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-varchar-count")) {
+
+      // Check if we have a single segment — enables the zero-string-allocation fast path
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+
+      if (leaves.size() == 1) {
+        // === Single-segment fast path ===
+        // Count per-ordinal in a long array, then build output Page directly from ordinals.
+        // No HashMap, no String allocation during aggregation.
+        // Use 10M ordinal limit (80MB memory) — covers all practical single-segment indices.
+        final long[][] ordCountsHolder = new long[1][];
+        final SortedSetDocValues[] dvHolder = new SortedSetDocValues[1];
+        final boolean[] usedOrdArray = {false};
+
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedSetDocValues dv = context.reader().getSortedSetDocValues(columnName);
+                dvHolder[0] = dv;
+                long ordCount = (dv != null) ? dv.getValueCount() : 0;
+                if (ordCount > 0 && ordCount <= 10_000_000) {
+                  long[] ordCounts = new long[(int) ordCount];
+                  ordCountsHolder[0] = ordCounts;
+                  usedOrdArray[0] = true;
+                  return new LeafCollector() {
+                    @Override
+                    public void setScorer(Scorable scorer) {}
+
+                    @Override
+                    public void collect(int doc) throws IOException {
+                      if (dv.advanceExact(doc)) {
+                        ordCounts[(int) dv.nextOrd()]++;
+                      }
+                    }
+                  };
+                }
+                // Fallback: won't benefit from single-segment path
+                usedOrdArray[0] = false;
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) {}
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+
+        if (usedOrdArray[0] && dvHolder[0] != null) {
+          SortedSetDocValues dv = dvHolder[0];
+          long[] ordCounts = ordCountsHolder[0];
+
+          // Count non-zero entries first to size builders correctly
+          int groupCount = 0;
+          for (int i = 0; i < ordCounts.length; i++) {
+            if (ordCounts[i] > 0) groupCount++;
+          }
+          if (groupCount == 0) return List.of();
+
+          BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+          BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+          for (int i = 0; i < ordCounts.length; i++) {
+            if (ordCounts[i] > 0) {
+              BytesRef bytes = dv.lookupOrd(i);
+              // wrappedBuffer is safe: writeSlice copies bytes into BlockBuilder's buffer
+              VarcharType.VARCHAR.writeSlice(
+                  keyBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              BigintType.BIGINT.writeLong(countBuilder, ordCounts[i]);
+            }
+          }
+          return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+        }
+        // Fall through to multi-segment path for very large ordinal spaces
+      }
+
+      // === Multi-segment path ===
+      // Use HashMap<BytesRefKey, long[]> to avoid String allocation during cross-segment merge.
+      HashMap<BytesRefKey, long[]> globalCounts = new HashMap<>();
 
       engineSearcher.search(
           query,
@@ -301,15 +385,9 @@ public final class FusedGroupByAggregate {
             @Override
             public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
               SortedSetDocValues dv = context.reader().getSortedSetDocValues(columnName);
-
-              // Use ordinal array for per-segment counting — avoids HashMap per doc
               long ordCount = (dv != null) ? dv.getValueCount() : 0;
-              long[] ordCounts;
-              if (ordCount > 0 && ordCount <= 1_000_000) {
-                ordCounts = new long[(int) ordCount];
-              } else {
-                ordCounts = null; // Fallback to HashMap for very large ordinal spaces
-              }
+              long[] ordCounts =
+                  (ordCount > 0 && ordCount <= 1_000_000) ? new long[(int) ordCount] : null;
               HashMap<Long, long[]> ordMap = (ordCounts == null) ? new HashMap<>() : null;
 
               return new LeafCollector() {
@@ -341,7 +419,7 @@ public final class FusedGroupByAggregate {
                     for (int i = 0; i < ordCounts.length; i++) {
                       if (ordCounts[i] > 0) {
                         BytesRef bytes = dv.lookupOrd(i);
-                        String key = bytes.utf8ToString();
+                        BytesRefKey key = new BytesRefKey(bytes);
                         long[] existing = globalCounts.get(key);
                         if (existing == null) {
                           globalCounts.put(key, new long[] {ordCounts[i]});
@@ -353,7 +431,7 @@ public final class FusedGroupByAggregate {
                   } else {
                     for (Map.Entry<Long, long[]> entry : ordMap.entrySet()) {
                       BytesRef bytes = dv.lookupOrd(entry.getKey());
-                      String key = bytes.utf8ToString();
+                      BytesRefKey key = new BytesRefKey(bytes);
                       long[] existing = globalCounts.get(key);
                       if (existing == null) {
                         globalCounts.put(key, new long[] {entry.getValue()[0]});
@@ -371,22 +449,22 @@ public final class FusedGroupByAggregate {
               return ScoreMode.COMPLETE_NO_SCORES;
             }
           });
+
+      if (globalCounts.isEmpty()) {
+        return List.of();
+      }
+
+      int groupCount = globalCounts.size();
+      BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+      BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+
+      for (Map.Entry<BytesRefKey, long[]> entry : globalCounts.entrySet()) {
+        VarcharType.VARCHAR.writeSlice(keyBuilder, Slices.wrappedBuffer(entry.getKey().bytes));
+        BigintType.BIGINT.writeLong(countBuilder, entry.getValue()[0]);
+      }
+
+      return List.of(new Page(keyBuilder.build(), countBuilder.build()));
     }
-
-    if (globalCounts.isEmpty()) {
-      return List.of();
-    }
-
-    int groupCount = globalCounts.size();
-    BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
-    BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
-
-    for (Map.Entry<String, long[]> entry : globalCounts.entrySet()) {
-      VarcharType.VARCHAR.writeSlice(keyBuilder, Slices.utf8Slice(entry.getKey()));
-      BigintType.BIGINT.writeLong(countBuilder, entry.getValue()[0]);
-    }
-
-    return List.of(new Page(keyBuilder.build(), countBuilder.build()));
   }
 
   /**
@@ -549,8 +627,11 @@ public final class FusedGroupByAggregate {
 
   /**
    * Path for GROUP BY keys that include at least one VARCHAR column. Uses SortedSetDocValues
-   * ordinals as hash keys during per-segment aggregation, then resolves ordinals to strings across
-   * segments.
+   * ordinals as hash keys during per-segment aggregation. For single-segment indices (common), the
+   * segment-local ordinals ARE the final result — ordinals are resolved to raw UTF-8 bytes only at
+   * Page output time, completely bypassing MergedGroupKey and String allocation. For multi-segment
+   * indices, resolves ordinals to BytesRefKey (raw UTF-8) for cross-segment merge, still avoiding
+   * the expensive UTF-8 to Java char[] round-trip.
    */
   private static List<Page> executeWithVarcharKeys(
       IndexShard shard,
@@ -560,8 +641,6 @@ public final class FusedGroupByAggregate {
       Map<String, Type> columnTypeMap,
       List<String> groupByKeys)
       throws Exception {
-
-    Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
 
     // Pre-compute DATE_TRUNC units for numeric keys in the varchar path
     final String[] truncUnits = new String[keyInfos.size()];
@@ -575,12 +654,160 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby")) {
 
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      boolean singleSegment = (leaves.size() == 1);
+
+      if (singleSegment) {
+        // === Single-segment fast path ===
+        // Aggregate into SegmentGroupKey map using ordinals, then build Page directly
+        // by resolving ordinals to UTF-8 bytes only at output time. No MergedGroupKey,
+        // no String allocation, no cross-segment merge overhead.
+        Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
+        // Hold references to the segment's DocValues for ordinal resolution at output time
+        final Object[][] keyReadersHolder = new Object[1][];
+
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                Object[] keyReaders = new Object[keyInfos.size()];
+                for (int i = 0; i < keyInfos.size(); i++) {
+                  KeyInfo ki = keyInfos.get(i);
+                  if (ki.isVarchar) {
+                    keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
+                  } else {
+                    keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+                  }
+                }
+                keyReadersHolder[0] = keyReaders;
+
+                Object[] aggReaders = new Object[specs.size()];
+                for (int i = 0; i < specs.size(); i++) {
+                  AggSpec spec = specs.get(i);
+                  if ("*".equals(spec.arg)) {
+                    aggReaders[i] = null;
+                  } else if (spec.argType instanceof VarcharType) {
+                    aggReaders[i] = context.reader().getSortedSetDocValues(spec.arg);
+                  } else {
+                    aggReaders[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                  }
+                }
+
+                final int numKeys = keyInfos.size();
+                final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    probeKey.reset();
+                    for (int k = 0; k < numKeys; k++) {
+                      KeyInfo ki = keyInfos.get(k);
+                      if (ki.isVarchar) {
+                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                        if (dv != null && dv.advanceExact(doc)) {
+                          probeKey.set(k, dv.nextOrd());
+                        } else {
+                          probeKey.setNull(k);
+                        }
+                      } else {
+                        SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
+                        if (dv != null && dv.advanceExact(doc)) {
+                          long val = dv.nextValue();
+                          if (truncUnits[k] != null) {
+                            val = truncateMillis(val, truncUnits[k]);
+                          }
+                          probeKey.set(k, val);
+                        } else {
+                          probeKey.setNull(k);
+                        }
+                      }
+                    }
+                    probeKey.computeHash();
+
+                    AccumulatorGroup accGroup = segmentGroups.get(probeKey);
+                    if (accGroup == null) {
+                      SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                      accGroup = createAccumulatorGroup(specs);
+                      segmentGroups.put(immutableKey, accGroup);
+                    }
+                    accumulateDoc(doc, accGroup, specs, aggReaders);
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+
+        if (segmentGroups.isEmpty()) {
+          return List.of();
+        }
+
+        // Build output Page directly from segment ordinals — no String allocation
+        Object[] keyReaders = keyReadersHolder[0];
+        int numGroupKeys = groupByKeys.size();
+        int numAggs = specs.size();
+        int totalColumns = numGroupKeys + numAggs;
+        int groupCount = segmentGroups.size();
+
+        BlockBuilder[] builders = new BlockBuilder[totalColumns];
+        for (int i = 0; i < numGroupKeys; i++) {
+          builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+        }
+        for (int i = 0; i < numAggs; i++) {
+          builders[numGroupKeys + i] =
+              resolveAggOutputType(specs.get(i), columnTypeMap)
+                  .createBlockBuilder(null, groupCount);
+        }
+
+        for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : segmentGroups.entrySet()) {
+          SegmentGroupKey sgk = entry.getKey();
+          AccumulatorGroup accGroup = entry.getValue();
+
+          for (int k = 0; k < numGroupKeys; k++) {
+            if (sgk.nulls[k]) {
+              builders[k].appendNull();
+            } else if (keyInfos.get(k).isVarchar) {
+              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+              if (dv != null) {
+                BytesRef bytes = dv.lookupOrd(sgk.values[k]);
+                VarcharType.VARCHAR.writeSlice(
+                    builders[k], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              } else {
+                VarcharType.VARCHAR.writeSlice(builders[k], Slices.EMPTY_SLICE);
+              }
+            } else {
+              writeNumericKeyValue(builders[k], keyInfos.get(k), sgk.values[k]);
+            }
+          }
+
+          for (int a = 0; a < numAggs; a++) {
+            accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+          }
+        }
+
+        Block[] blocks = new Block[totalColumns];
+        for (int i = 0; i < totalColumns; i++) {
+          blocks[i] = builders[i].build();
+        }
+        return List.of(new Page(blocks));
+      }
+
+      // === Multi-segment path ===
+      // Uses BytesRefKey (raw UTF-8 bytes) for cross-segment merge to avoid String allocation
+      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
+
       engineSearcher.search(
           query,
           new Collector() {
             @Override
             public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              // Open doc values for group-by keys
               Object[] keyReaders = new Object[keyInfos.size()];
               for (int i = 0; i < keyInfos.size(); i++) {
                 KeyInfo ki = keyInfos.get(i);
@@ -591,12 +818,11 @@ public final class FusedGroupByAggregate {
                 }
               }
 
-              // Open doc values for aggregate arguments
               Object[] aggReaders = new Object[specs.size()];
               for (int i = 0; i < specs.size(); i++) {
                 AggSpec spec = specs.get(i);
                 if ("*".equals(spec.arg)) {
-                  aggReaders[i] = null; // COUNT(*)
+                  aggReaders[i] = null;
                 } else if (spec.argType instanceof VarcharType) {
                   aggReaders[i] = context.reader().getSortedSetDocValues(spec.arg);
                 } else {
@@ -606,8 +832,6 @@ public final class FusedGroupByAggregate {
 
               Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
               final int numKeys = keyInfos.size();
-
-              // Pre-allocate reusable probe key to avoid per-doc allocation
               final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
 
               return new LeafCollector() {
@@ -641,7 +865,6 @@ public final class FusedGroupByAggregate {
                   }
                   probeKey.computeHash();
 
-                  // Fast path: probe with reusable key (no allocation for existing groups)
                   AccumulatorGroup accGroup = segmentGroups.get(probeKey);
                   if (accGroup == null) {
                     SegmentGroupKey immutableKey = probeKey.toImmutableKey();
@@ -666,9 +889,9 @@ public final class FusedGroupByAggregate {
                         SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
                         if (dv != null) {
                           BytesRef bytes = dv.lookupOrd(sgk.values[k]);
-                          resolvedKeys[k] = bytes.utf8ToString();
+                          resolvedKeys[k] = new BytesRefKey(bytes);
                         } else {
-                          resolvedKeys[k] = "";
+                          resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
                         }
                       } else {
                         resolvedKeys[k] = sgk.values[k];
@@ -692,46 +915,44 @@ public final class FusedGroupByAggregate {
               return ScoreMode.COMPLETE_NO_SCORES;
             }
           });
-    }
 
-    if (globalGroups.isEmpty()) {
-      return List.of();
-    }
-
-    // Build result Page
-    int numGroupKeys = groupByKeys.size();
-    int numAggs = specs.size();
-    int totalColumns = numGroupKeys + numAggs;
-    int groupCount = globalGroups.size();
-
-    BlockBuilder[] builders = new BlockBuilder[totalColumns];
-    for (int i = 0; i < numGroupKeys; i++) {
-      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
-    }
-    for (int i = 0; i < numAggs; i++) {
-      builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
-    }
-
-    for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
-      MergedGroupKey key = entry.getKey();
-      AccumulatorGroup accGroup = entry.getValue();
-
-      for (int k = 0; k < numGroupKeys; k++) {
-        writeKeyValue(builders[k], keyInfos.get(k), key.values[k]);
+      if (globalGroups.isEmpty()) {
+        return List.of();
       }
 
-      for (int a = 0; a < numAggs; a++) {
-        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+      int numGroupKeys = groupByKeys.size();
+      int numAggs = specs.size();
+      int totalColumns = numGroupKeys + numAggs;
+      int groupCount = globalGroups.size();
+
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      for (int i = 0; i < numGroupKeys; i++) {
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
       }
-    }
+      for (int i = 0; i < numAggs; i++) {
+        builders[numGroupKeys + i] =
+            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+      }
 
-    Block[] blocks = new Block[totalColumns];
-    for (int i = 0; i < totalColumns; i++) {
-      blocks[i] = builders[i].build();
-    }
+      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        MergedGroupKey key = entry.getKey();
+        AccumulatorGroup accGroup = entry.getValue();
 
-    return List.of(new Page(blocks));
+        for (int k = 0; k < numGroupKeys; k++) {
+          writeKeyValueForMerged(builders[k], keyInfos.get(k), key.values[k]);
+        }
+
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+        }
+      }
+
+      Block[] blocks = new Block[totalColumns];
+      for (int i = 0; i < totalColumns; i++) {
+        blocks[i] = builders[i].build();
+      }
+      return List.of(new Page(blocks));
+    }
   }
 
   /** Resolve output types for the fused GROUP BY aggregate. */
@@ -908,8 +1129,8 @@ public final class FusedGroupByAggregate {
   }
 
   /**
-   * Cross-segment merged group key using resolved string values. VARCHAR keys are stored as String,
-   * numeric keys as Long or Double.
+   * Cross-segment merged group key using resolved values. VARCHAR keys are stored as BytesRefKey
+   * (raw UTF-8 bytes, avoiding String allocation), numeric keys as Long or Double.
    */
   private static final class MergedGroupKey {
     final Object[] values;
@@ -942,6 +1163,36 @@ public final class FusedGroupByAggregate {
         }
       }
       return true;
+    }
+  }
+
+  /**
+   * Immutable byte-array based key for use in HashMaps, avoiding String allocation. Created from
+   * Lucene's BytesRef (which is a reference into a shared buffer), this class copies the bytes and
+   * pre-computes hashCode. Used as a replacement for String keys in varchar GROUP BY to eliminate
+   * the UTF-8-to-Java-char[] round-trip during aggregation.
+   */
+  private static final class BytesRefKey {
+    final byte[] bytes;
+    private final int hash;
+
+    BytesRefKey(BytesRef ref) {
+      // Copy bytes since BytesRef points into shared Lucene buffer
+      this.bytes = new byte[ref.length];
+      System.arraycopy(ref.bytes, ref.offset, this.bytes, 0, ref.length);
+      this.hash = java.util.Arrays.hashCode(this.bytes);
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (!(obj instanceof BytesRefKey other)) return false;
+      return this.hash == other.hash && java.util.Arrays.equals(this.bytes, other.bytes);
     }
   }
 
@@ -1299,15 +1550,22 @@ public final class FusedGroupByAggregate {
     }
   }
 
-  /** Write a group-by key value to a block builder. */
-  private static void writeKeyValue(BlockBuilder builder, KeyInfo keyInfo, Object value) {
+  /**
+   * Write a group-by key value to a block builder for the multi-segment merged path. VARCHAR keys
+   * are stored as BytesRefKey (raw UTF-8 bytes), numeric keys as Long.
+   */
+  private static void writeKeyValueForMerged(BlockBuilder builder, KeyInfo keyInfo, Object value) {
     if (value == null) {
       builder.appendNull();
       return;
     }
     Type type = keyInfo.type;
     if (type instanceof VarcharType) {
-      VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice((String) value));
+      if (value instanceof BytesRefKey brk) {
+        VarcharType.VARCHAR.writeSlice(builder, Slices.wrappedBuffer(brk.bytes));
+      } else {
+        VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice((String) value));
+      }
     } else if (type instanceof DoubleType) {
       DoubleType.DOUBLE.writeDouble(builder, Double.longBitsToDouble((Long) value));
     } else if (type instanceof TimestampType) {

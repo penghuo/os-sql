@@ -250,12 +250,10 @@ public class TransportShardExecuteAction
           && FusedGroupByAggregate.canFuse(
               innerAgg, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
         Map<String, Type> colTypeMap = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
-        List<Page> aggPages = executeFusedGroupByAggregate(innerAgg, req);
-        List<Type> aggColumnTypes = FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
         // Apply sort+limit using SortOperator on the fused result
         SortNode sortNode = extractSortNode(plan);
         LimitNode limitNode = extractLimitNode(plan);
-        if (sortNode != null && limitNode != null && !aggPages.isEmpty()) {
+        if (sortNode != null && limitNode != null) {
           // Resolve sort column indices against the aggregation output columns
           List<String> aggOutputColumns = new ArrayList<>();
           aggOutputColumns.addAll(innerAgg.getGroupByKeys());
@@ -264,7 +262,6 @@ public class TransportShardExecuteAction
           for (String sortKey : sortNode.getSortKeys()) {
             int idx = aggOutputColumns.indexOf(sortKey);
             if (idx < 0) {
-              // Sort key not found in output — fall through to generic pipeline
               sortIndices = null;
               break;
             }
@@ -272,60 +269,126 @@ public class TransportShardExecuteAction
           }
           if (sortIndices != null) {
             long topN = limitNode.getCount() + limitNode.getOffset();
-            org.opensearch.sql.dqe.operator.SortOperator sortOp =
-                new org.opensearch.sql.dqe.operator.SortOperator(
-                    new org.opensearch.sql.dqe.operator.Operator() {
-                      int idx = 0;
+            int numGroupByCols = innerAgg.getGroupByKeys().size();
 
-                      @Override
-                      public Page processNextBatch() {
-                        return idx < aggPages.size() ? aggPages.get(idx++) : null;
-                      }
-
-                      @Override
-                      public void close() {}
-                    },
-                    sortIndices,
-                    sortNode.getAscending(),
-                    sortNode.getNullsFirst(),
-                    aggColumnTypes,
-                    topN);
-            List<Page> sortedPages = new ArrayList<>();
-            Page p;
-            while ((p = sortOp.processNextBatch()) != null) {
-              sortedPages.add(p);
-            }
-            // Apply project if present (reorder/select columns to match coordinator expectation)
-            ProjectNode projNode = extractProjectNode(plan);
-            if (projNode != null) {
-              List<String> projColumns = projNode.getOutputColumns();
-              // Check if project just selects the same columns in the same order
-              if (!projColumns.equals(aggOutputColumns)) {
-                // Need to reorder columns
-                List<Integer> projIndices = new ArrayList<>();
-                for (String col : projColumns) {
-                  int idx = aggOutputColumns.indexOf(col);
-                  projIndices.add(idx >= 0 ? idx : 0);
-                }
-                List<Page> projectedPages = new ArrayList<>();
-                for (Page sp : sortedPages) {
-                  Block[] newBlocks = new Block[projIndices.size()];
-                  for (int i = 0; i < projIndices.size(); i++) {
-                    newBlocks[i] = sp.getBlock(projIndices.get(i));
+            // Try fused top-N: when sorting by a single aggregate column (BigintType),
+            // the top-N selection can be done directly on the flat accData array inside
+            // FusedGroupByAggregate, avoiding full ordinal resolution and Page construction
+            // for all groups. This is critical for high-cardinality GROUP BY with small LIMIT.
+            if (sortIndices.size() == 1 && sortIndices.get(0) >= numGroupByCols) {
+              int sortAggIndex = sortIndices.get(0) - numGroupByCols;
+              boolean sortAsc = sortNode.getAscending().get(0);
+              List<Page> aggPages =
+                  executeFusedGroupByAggregateWithTopN(innerAgg, req, sortAggIndex, sortAsc, topN);
+              List<Type> aggColumnTypes =
+                  FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
+              // The pages are already sorted by the fused path — apply project if needed
+              List<Page> sortedPages = aggPages;
+              ProjectNode projNode = extractProjectNode(plan);
+              if (projNode != null) {
+                List<String> projColumns = projNode.getOutputColumns();
+                if (!projColumns.equals(aggOutputColumns)) {
+                  List<Integer> projIndices = new ArrayList<>();
+                  for (String col : projColumns) {
+                    int idx = aggOutputColumns.indexOf(col);
+                    projIndices.add(idx >= 0 ? idx : 0);
                   }
-                  projectedPages.add(new Page(newBlocks));
+                  List<Page> projectedPages = new ArrayList<>();
+                  for (Page sp : sortedPages) {
+                    Block[] newBlocks = new Block[projIndices.size()];
+                    for (int i = 0; i < projIndices.size(); i++) {
+                      newBlocks[i] = sp.getBlock(projIndices.get(i));
+                    }
+                    projectedPages.add(new Page(newBlocks));
+                  }
+                  sortedPages = projectedPages;
+                  List<Type> projTypes = new ArrayList<>();
+                  for (int idx : projIndices) {
+                    projTypes.add(aggColumnTypes.get(idx));
+                  }
+                  aggColumnTypes = projTypes;
                 }
-                sortedPages = projectedPages;
-                // Reorder column types to match projection
-                List<Type> projTypes = new ArrayList<>();
-                for (int idx : projIndices) {
-                  projTypes.add(aggColumnTypes.get(idx));
-                }
-                aggColumnTypes = projTypes;
               }
+              return new ShardExecuteResponse(sortedPages, aggColumnTypes);
             }
-            return new ShardExecuteResponse(sortedPages, aggColumnTypes);
+
+            // Fallback: full aggregation + SortOperator
+            List<Page> aggPages = executeFusedGroupByAggregate(innerAgg, req);
+            List<Type> aggColumnTypes =
+                FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
+            if (!aggPages.isEmpty()) {
+              org.opensearch.sql.dqe.operator.SortOperator sortOp =
+                  new org.opensearch.sql.dqe.operator.SortOperator(
+                      new org.opensearch.sql.dqe.operator.Operator() {
+                        int idx = 0;
+
+                        @Override
+                        public Page processNextBatch() {
+                          return idx < aggPages.size() ? aggPages.get(idx++) : null;
+                        }
+
+                        @Override
+                        public void close() {}
+                      },
+                      sortIndices,
+                      sortNode.getAscending(),
+                      sortNode.getNullsFirst(),
+                      aggColumnTypes,
+                      topN);
+              List<Page> sortedPages = new ArrayList<>();
+              Page p;
+              while ((p = sortOp.processNextBatch()) != null) {
+                sortedPages.add(p);
+              }
+              ProjectNode projNode = extractProjectNode(plan);
+              if (projNode != null) {
+                List<String> projColumns = projNode.getOutputColumns();
+                if (!projColumns.equals(aggOutputColumns)) {
+                  List<Integer> projIndices = new ArrayList<>();
+                  for (String col : projColumns) {
+                    int idx = aggOutputColumns.indexOf(col);
+                    projIndices.add(idx >= 0 ? idx : 0);
+                  }
+                  List<Page> projectedPages = new ArrayList<>();
+                  for (Page sp : sortedPages) {
+                    Block[] newBlocks = new Block[projIndices.size()];
+                    for (int i = 0; i < projIndices.size(); i++) {
+                      newBlocks[i] = sp.getBlock(projIndices.get(i));
+                    }
+                    projectedPages.add(new Page(newBlocks));
+                  }
+                  sortedPages = projectedPages;
+                  List<Type> projTypes = new ArrayList<>();
+                  for (int idx : projIndices) {
+                    projTypes.add(aggColumnTypes.get(idx));
+                  }
+                  aggColumnTypes = projTypes;
+                }
+              }
+              return new ShardExecuteResponse(sortedPages, aggColumnTypes);
+            }
           }
+        }
+      }
+    }
+
+    // Fast path: LimitNode -> AggregationNode (no Sort) with FusedGroupByAggregate.
+    // For queries like Q18 (GROUP BY UserID, SearchPhrase LIMIT 10), this avoids building
+    // the full output Page for all groups and instead returns just the first N groups.
+    if (scanFactory == null) {
+      AggregationNode limitedAgg = extractAggFromLimit(plan);
+      if (limitedAgg != null
+          && FusedGroupByAggregate.canFuse(
+              limitedAgg, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+        LimitNode limitNode = extractLimitNode(plan);
+        if (limitNode != null) {
+          long topN = limitNode.getCount() + limitNode.getOffset();
+          List<Page> aggPages =
+              executeFusedGroupByAggregateWithTopN(limitedAgg, req, -1, false, topN);
+          Map<String, Type> colTypeMap = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+          List<Type> aggColumnTypes =
+              FusedGroupByAggregate.resolveOutputTypes(limitedAgg, colTypeMap);
+          return new ShardExecuteResponse(aggPages, aggColumnTypes);
         }
       }
     }
@@ -596,6 +659,34 @@ public class TransportShardExecuteAction
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+  }
+
+  /**
+   * Execute fused GROUP BY aggregation with an inline top-N selection. Instead of building a full
+   * Page for all groups and then sorting, the top-N selection happens directly on the flat
+   * accumulator data inside FusedGroupByAggregate. This avoids ordinal resolution and Page
+   * construction for groups outside the top-N, critical for high-cardinality GROUP BY with small
+   * LIMIT (e.g., Q17: ~98K groups with LIMIT 10).
+   */
+  private List<Page> executeFusedGroupByAggregateWithTopN(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
+      throws Exception {
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    return FusedGroupByAggregate.executeWithTopN(
+        aggNode, shard, luceneQuery, cachedMeta.columnTypeMap(), sortAggIndex, sortAscending, topN);
   }
 
   /**
@@ -874,6 +965,18 @@ public class TransportShardExecuteAction
   private static ProjectNode extractProjectNode(DqePlanNode plan) {
     if (!(plan instanceof LimitNode limit)) return null;
     if (limit.getChild() instanceof ProjectNode proj) return proj;
+    return null;
+  }
+
+  /**
+   * Extract AggregationNode from a LimitNode -> [ProjectNode ->] AggregationNode pattern (no
+   * SortNode). This handles queries like Q18: GROUP BY ... LIMIT N without ORDER BY.
+   */
+  private static AggregationNode extractAggFromLimit(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    DqePlanNode child = limit.getChild();
+    if (child instanceof ProjectNode proj) child = proj.getChild();
+    if (child instanceof AggregationNode agg) return agg;
     return null;
   }
 }

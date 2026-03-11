@@ -184,6 +184,33 @@ public final class FusedGroupByAggregate {
   }
 
   /**
+   * Execute the fused GROUP BY aggregation with a top-N selection. After aggregation, selects only
+   * the top-N groups by the specified aggregate column value, avoiding full ordinal resolution and
+   * Page construction for high-cardinality GROUP BY queries with ORDER BY + LIMIT (e.g., Q17/Q18).
+   *
+   * @param aggNode the aggregation plan node
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @param columnTypeMap type mapping for columns
+   * @param sortAggIndex index of the aggregate column to sort by (0-based within agg columns), or
+   *     -1 to disable top-N
+   * @param sortAscending true for ASC, false for DESC sort direction
+   * @param topN number of top groups to return, or 0 to return all
+   * @return a list containing a single Page with the top-N aggregated results
+   */
+  public static List<Page> executeWithTopN(
+      AggregationNode aggNode,
+      IndexShard shard,
+      Query query,
+      Map<String, Type> columnTypeMap,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
+      throws Exception {
+    return executeInternal(aggNode, shard, query, columnTypeMap, sortAggIndex, sortAscending, topN);
+  }
+
+  /**
    * Execute the fused GROUP BY aggregation directly from Lucene DocValues. For keys that include
    * VARCHAR columns, uses SortedSetDocValues ordinals as hash keys during per-segment aggregation,
    * then resolves ordinals to strings across segments. For numeric-only keys, aggregates directly
@@ -197,6 +224,19 @@ public final class FusedGroupByAggregate {
    */
   public static List<Page> execute(
       AggregationNode aggNode, IndexShard shard, Query query, Map<String, Type> columnTypeMap)
+      throws Exception {
+    return executeInternal(aggNode, shard, query, columnTypeMap, -1, false, 0);
+  }
+
+  /** Internal implementation shared by execute() and executeWithTopN(). */
+  private static List<Page> executeInternal(
+      AggregationNode aggNode,
+      IndexShard shard,
+      Query query,
+      Map<String, Type> columnTypeMap,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
     TableScanNode scanNode = findChildTableScan(aggNode);
     List<String> groupByKeys = aggNode.getGroupByKeys();
@@ -273,7 +313,16 @@ public final class FusedGroupByAggregate {
         return executeSingleVarcharGeneric(
             shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
       }
-      return executeWithVarcharKeys(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+      return executeWithVarcharKeys(
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN);
     } else {
       return executeNumericOnly(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
     }
@@ -2639,7 +2688,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     // Pre-compute DATE_TRUNC and arithmetic units for numeric keys in the varchar path
@@ -2841,71 +2893,188 @@ public final class FusedGroupByAggregate {
 
           if (flatMap.size == 0) return List.of();
 
-          // Build output Page from FlatTwoKeyMap, resolving varchar ordinals to UTF-8
+          // Build output Page from FlatTwoKeyMap, resolving varchar ordinals to UTF-8.
+          // When top-N is requested, use a min-heap to select only the top-N slots,
+          // avoiding ordinal resolution and Page construction for the remaining groups.
           Object[] keyReaders = keyReadersHolder[0];
           int numGroupKeys = groupByKeys.size();
           int totalColumns = numGroupKeys + numAggs;
-          int groupCount = flatMap.size;
+
+          // Determine which slots to output
+          int[] outputSlots;
+          int outputCount;
+
+          if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+            // Top-N selection using a min-heap (for DESC) or max-heap (for ASC)
+            // on the sort aggregate value from the flat accData array.
+            int sortAccOff = flatAccOffset[sortAggIndex];
+            int n = (int) Math.min(topN, flatMap.size);
+            // Use an int[] heap storing slot indices, ordered by sort value
+            int[] heap = new int[n];
+            int heapSize = 0;
+
+            for (int slot = 0; slot < flatMap.capacity; slot++) {
+              if (!flatMap.occupied[slot]) continue;
+              long val = flatMap.accData[slot * flatSlotsPerGroup + sortAccOff];
+              if (heapSize < n) {
+                heap[heapSize] = slot;
+                heapSize++;
+                // Sift up
+                int k = heapSize - 1;
+                while (k > 0) {
+                  int parent = (k - 1) >>> 1;
+                  long pVal = flatMap.accData[heap[parent] * flatSlotsPerGroup + sortAccOff];
+                  long kVal = flatMap.accData[heap[k] * flatSlotsPerGroup + sortAccOff];
+                  boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+                  if (swap) {
+                    int tmp = heap[parent];
+                    heap[parent] = heap[k];
+                    heap[k] = tmp;
+                    k = parent;
+                  } else {
+                    break;
+                  }
+                }
+              } else {
+                // Compare with heap root (the worst element in our top-N)
+                long rootVal = flatMap.accData[heap[0] * flatSlotsPerGroup + sortAccOff];
+                boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+                if (better) {
+                  heap[0] = slot;
+                  // Sift down
+                  int k = 0;
+                  while (true) {
+                    int left = 2 * k + 1;
+                    if (left >= heapSize) break;
+                    int right = left + 1;
+                    int target = left;
+                    if (right < heapSize) {
+                      long lv = flatMap.accData[heap[left] * flatSlotsPerGroup + sortAccOff];
+                      long rv = flatMap.accData[heap[right] * flatSlotsPerGroup + sortAccOff];
+                      boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                      if (pickRight) target = right;
+                    }
+                    long kVal = flatMap.accData[heap[k] * flatSlotsPerGroup + sortAccOff];
+                    long tVal = flatMap.accData[heap[target] * flatSlotsPerGroup + sortAccOff];
+                    boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+                    if (swap) {
+                      int tmp = heap[k];
+                      heap[k] = heap[target];
+                      heap[target] = tmp;
+                      k = target;
+                    } else {
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            // Sort the heap slots by value in the desired order for output
+            // (for DESC: highest first; for ASC: lowest first)
+            final int sOff = sortAccOff;
+            final int spg = flatSlotsPerGroup;
+            java.util.Arrays.sort(heap, 0, heapSize);
+            // Re-sort by actual value (Arrays.sort on int[] doesn't take comparator)
+            // Use a simple insertion sort for small N
+            for (int i = 1; i < heapSize; i++) {
+              int key = heap[i];
+              long keyVal = flatMap.accData[key * spg + sOff];
+              int j = i - 1;
+              while (j >= 0) {
+                long jVal = flatMap.accData[heap[j] * spg + sOff];
+                boolean needsSwap = sortAscending ? (jVal > keyVal) : (jVal < keyVal);
+                if (needsSwap) {
+                  heap[j + 1] = heap[j];
+                  j--;
+                } else {
+                  break;
+                }
+              }
+              heap[j + 1] = key;
+            }
+            outputSlots = heap;
+            outputCount = heapSize;
+          } else if (topN > 0 && topN < flatMap.size) {
+            // Limit without sort: just take the first topN occupied slots
+            int n = (int) Math.min(topN, flatMap.size);
+            outputSlots = new int[n];
+            int idx = 0;
+            for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+              if (flatMap.occupied[slot]) {
+                outputSlots[idx++] = slot;
+              }
+            }
+            outputCount = idx;
+          } else {
+            // No top-N: output all slots
+            outputSlots = new int[flatMap.size];
+            int idx = 0;
+            for (int slot = 0; slot < flatMap.capacity; slot++) {
+              if (flatMap.occupied[slot]) {
+                outputSlots[idx++] = slot;
+              }
+            }
+            outputCount = idx;
+          }
 
           BlockBuilder[] builders = new BlockBuilder[totalColumns];
           for (int i = 0; i < numGroupKeys; i++) {
-            builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+            builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
           }
           for (int i = 0; i < numAggs; i++) {
             builders[numGroupKeys + i] =
                 resolveAggOutputType(specs.get(i), columnTypeMap)
-                    .createBlockBuilder(null, groupCount);
+                    .createBlockBuilder(null, outputCount);
           }
 
-          for (int slot = 0; slot < flatMap.capacity; slot++) {
-            if (flatMap.occupied[slot]) {
-              // Write key 0
-              long kv0 = flatMap.keys0[slot];
-              if (keyInfos.get(0).isVarchar) {
-                SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
-                if (dv != null) {
-                  BytesRef bytes = dv.lookupOrd(kv0);
-                  VarcharType.VARCHAR.writeSlice(
-                      builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
-                } else {
-                  VarcharType.VARCHAR.writeSlice(builders[0], Slices.EMPTY_SLICE);
-                }
+          for (int si = 0; si < outputCount; si++) {
+            int slot = outputSlots[si];
+            // Write key 0
+            long kv0 = flatMap.keys0[slot];
+            if (keyInfos.get(0).isVarchar) {
+              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+              if (dv != null) {
+                BytesRef bytes = dv.lookupOrd(kv0);
+                VarcharType.VARCHAR.writeSlice(
+                    builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
               } else {
-                writeNumericKeyValue(builders[0], keyInfos.get(0), kv0);
+                VarcharType.VARCHAR.writeSlice(builders[0], Slices.EMPTY_SLICE);
               }
-              // Write key 1
-              long kv1 = flatMap.keys1[slot];
-              if (keyInfos.get(1).isVarchar) {
-                SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
-                if (dv != null) {
-                  BytesRef bytes = dv.lookupOrd(kv1);
-                  VarcharType.VARCHAR.writeSlice(
-                      builders[1], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
-                } else {
-                  VarcharType.VARCHAR.writeSlice(builders[1], Slices.EMPTY_SLICE);
-                }
+            } else {
+              writeNumericKeyValue(builders[0], keyInfos.get(0), kv0);
+            }
+            // Write key 1
+            long kv1 = flatMap.keys1[slot];
+            if (keyInfos.get(1).isVarchar) {
+              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+              if (dv != null) {
+                BytesRef bytes = dv.lookupOrd(kv1);
+                VarcharType.VARCHAR.writeSlice(
+                    builders[1], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
               } else {
-                writeNumericKeyValue(builders[1], keyInfos.get(1), kv1);
+                VarcharType.VARCHAR.writeSlice(builders[1], Slices.EMPTY_SLICE);
               }
-              // Write aggregates from flat storage
-              int base = slot * flatSlotsPerGroup;
-              for (int a = 0; a < numAggs; a++) {
-                int off = base + flatAccOffset[a];
-                switch (accType[a]) {
-                  case 0: // COUNT
-                  case 1: // SUM long
-                    BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
-                    break;
-                  case 2: // AVG long
-                    long sum = flatMap.accData[off];
-                    long cnt = flatMap.accData[off + 1];
-                    if (cnt == 0) {
-                      builders[numGroupKeys + a].appendNull();
-                    } else {
-                      DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
-                    }
-                    break;
-                }
+            } else {
+              writeNumericKeyValue(builders[1], keyInfos.get(1), kv1);
+            }
+            // Write aggregates from flat storage
+            int base = slot * flatSlotsPerGroup;
+            for (int a = 0; a < numAggs; a++) {
+              int off = base + flatAccOffset[a];
+              switch (accType[a]) {
+                case 0: // COUNT
+                case 1: // SUM long
+                  BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+                  break;
+                case 2: // AVG long
+                  long sum = flatMap.accData[off];
+                  long cnt = flatMap.accData[off + 1];
+                  if (cnt == 0) {
+                    builders[numGroupKeys + a].appendNull();
+                  } else {
+                    DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+                  }
+                  break;
               }
             }
           }

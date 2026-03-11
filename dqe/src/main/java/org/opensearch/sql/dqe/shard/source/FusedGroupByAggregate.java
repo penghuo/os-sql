@@ -82,6 +82,15 @@ public final class FusedGroupByAggregate {
           "^date_trunc\\('(second|minute|hour|day|month|year)',\\s*(\\w+)\\)$",
           Pattern.CASE_INSENSITIVE);
 
+  /**
+   * Pattern to recognize arithmetic expressions in group-by keys. Matches expressions like
+   * "(ClientIP - 1)", "(col + 42)", "(col * 2)", "(col / 10)". Extracts the column name, operator,
+   * and integer constant. These are handled by reading the source column from DocValues and
+   * applying the arithmetic inline during key extraction.
+   */
+  private static final Pattern ARITH_EXPR_PATTERN =
+      Pattern.compile("^\\(?(\\w+)\\s*([+\\-*/])\\s*(\\d+)\\)?$", Pattern.CASE_INSENSITIVE);
+
   private FusedGroupByAggregate() {}
 
   /**
@@ -138,7 +147,17 @@ public final class FusedGroupByAggregate {
             return false;
           }
         } else {
-          return false; // Unknown expression, can't fuse
+          // Check for arithmetic expression: (col OP constant)
+          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+          if (am.matches()) {
+            String sourceCol = am.group(1);
+            Type sourceType = columnTypeMap.get(sourceCol);
+            if (sourceType == null || !isNumericOrTimestamp(sourceType)) {
+              return false;
+            }
+          } else {
+            return false; // Unknown expression, can't fuse
+          }
         }
       }
     }
@@ -219,7 +238,19 @@ public final class FusedGroupByAggregate {
           keyInfos.add(
               new KeyInfo(sourceCol, TimestampType.TIMESTAMP_MILLIS, false, "date_trunc", unit));
         } else {
-          throw new IllegalArgumentException("Unsupported group-by expression: " + key);
+          // Check for arithmetic expression: (col OP constant)
+          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+          if (am.matches()) {
+            String sourceCol = am.group(1);
+            String op = am.group(2);
+            String constant = am.group(3);
+            // Use BigintType for arithmetic output to match Trino's expectations
+            // (arithmetic on integers produces long in the Trino execution model)
+            keyInfos.add(
+                new KeyInfo(sourceCol, BigintType.BIGINT, false, "arith", op + ":" + constant));
+          } else {
+            throw new IllegalArgumentException("Unsupported group-by expression: " + key);
+          }
         }
       }
     }
@@ -283,6 +314,32 @@ public final class FusedGroupByAggregate {
         return zdt.toInstant().toEpochMilli();
       default:
         return millis;
+    }
+  }
+
+  /**
+   * Apply an arithmetic transformation to a long value from DocValues. The exprUnit encodes the
+   * operator and constant as "op:constant" (e.g., "-:1" for "col - 1").
+   *
+   * @param value raw long value from DocValues
+   * @param exprUnit the encoded operator and constant (format: "op:constant")
+   * @return transformed value
+   */
+  private static long applyArith(long value, String exprUnit) {
+    int colonIdx = exprUnit.indexOf(':');
+    char op = exprUnit.charAt(0);
+    long constant = Long.parseLong(exprUnit.substring(colonIdx + 1));
+    switch (op) {
+      case '-':
+        return value - constant;
+      case '+':
+        return value + constant;
+      case '*':
+        return value * constant;
+      case '/':
+        return constant != 0 ? value / constant : 0;
+      default:
+        return value;
     }
   }
 
@@ -956,30 +1013,60 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys)
       throws Exception {
 
-    // Pre-compute which keys need DATE_TRUNC transformation and their units
+    // Pre-compute which keys need DATE_TRUNC or arithmetic transformation
     final String[] truncUnits = new String[keyInfos.size()];
-    boolean hasTrunc = false;
+    final String[] arithUnits = new String[keyInfos.size()];
+    boolean hasExpr = false;
     for (int i = 0; i < keyInfos.size(); i++) {
       KeyInfo ki = keyInfos.get(i);
       if ("date_trunc".equals(ki.exprFunc())) {
         truncUnits[i] = ki.exprUnit();
-        hasTrunc = true;
+        hasExpr = true;
+      } else if ("arith".equals(ki.exprFunc())) {
+        arithUnits[i] = ki.exprUnit();
+        hasExpr = true;
       }
     }
-    final boolean anyTrunc = hasTrunc;
+    final boolean anyTrunc = hasExpr;
 
-    // Fast path: single numeric key with no DATE_TRUNC — uses open-addressing hash map
+    // Fast path: single numeric key with no expressions — uses open-addressing hash map
     // with single long key array, eliminating SegmentGroupKey, NumericProbeKey, and HashMap.Entry
     // allocation per group. Particularly effective for COUNT(DISTINCT) per group (Q9).
     if (keyInfos.size() == 1 && !anyTrunc) {
       return executeSingleKeyNumeric(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
     }
 
-    // Fast path: two numeric keys with no DATE_TRUNC — uses open-addressing hash map
+    // Fast path: two numeric keys with no expressions — uses open-addressing hash map
     // with parallel arrays, eliminating SegmentGroupKey, AccumulatorGroup, and HashMap.Entry
     // allocation per group. This is ~2x faster for high-cardinality two-key GROUP BY (Q31/Q32).
     if (keyInfos.size() == 2 && !anyTrunc) {
       return executeTwoKeyNumeric(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+    }
+
+    // Fast path: all keys derive from the same single column (e.g., Q36:
+    // GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3). Since the derived keys
+    // are deterministic functions of the source column, this is really a single-key GROUP BY.
+    // We GROUP BY only the source column and compute derived keys at output time.
+    if (anyTrunc && keyInfos.size() > 1) {
+      String sharedCol = keyInfos.get(0).name();
+      boolean allSameCol = true;
+      boolean allArithOrPlain = true;
+      for (int i = 0; i < keyInfos.size(); i++) {
+        KeyInfo ki = keyInfos.get(i);
+        if (!sharedCol.equals(ki.name())) {
+          allSameCol = false;
+          break;
+        }
+        // Each key must be either plain (no expression) or arith
+        if (ki.exprFunc() != null && !"arith".equals(ki.exprFunc())) {
+          allArithOrPlain = false;
+          break;
+        }
+      }
+      if (allSameCol && allArithOrPlain) {
+        return executeDerivedSingleKeyNumeric(
+            shard, query, keyInfos, specs, columnTypeMap, groupByKeys, arithUnits);
+      }
     }
 
     // Global map: SegmentGroupKey (long[]) -> AccumulatorGroup
@@ -1033,8 +1120,12 @@ public final class FusedGroupByAggregate {
                     SortedNumericDocValues dv = keyReaders[k];
                     if (dv != null && dv.advanceExact(doc)) {
                       long val = dv.nextValue();
-                      if (anyTrunc && truncUnits[k] != null) {
-                        val = truncateMillis(val, truncUnits[k]);
+                      if (anyTrunc) {
+                        if (truncUnits[k] != null) {
+                          val = truncateMillis(val, truncUnits[k]);
+                        } else if (arithUnits[k] != null) {
+                          val = applyArith(val, arithUnits[k]);
+                        }
                       }
                       probeKey.set(k, val);
                     } else {
@@ -1464,6 +1555,405 @@ public final class FusedGroupByAggregate {
         }
       }
     }
+  }
+
+  /**
+   * Specialized fast path for GROUP BY with multiple numeric keys that all derive from the same
+   * single source column via arithmetic expressions (e.g., Q36: GROUP BY ClientIP, ClientIP-1,
+   * ClientIP-2, ClientIP-3). Since the derived keys are deterministic functions of the source
+   * column, this reduces to a single-key GROUP BY on the source column. Derived keys are computed
+   * at output time only, eliminating the multi-key hash map overhead.
+   *
+   * <p>Uses the flat single-key map (FlatSingleKeyMap) for maximum performance, avoiding all
+   * per-group object allocation. For Q36, this reduces the GROUP BY from 4 keys to 1 key, cutting
+   * hash computation and comparison cost by ~4x.
+   */
+  private static List<Page> executeDerivedSingleKeyNumeric(
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys,
+      String[] arithUnits)
+      throws Exception {
+
+    final int numAggs = specs.size();
+    final boolean[] isCountStar = new boolean[numAggs];
+    final int[] accType = new int[numAggs];
+    boolean canUseFlat = true;
+
+    for (int i = 0; i < numAggs; i++) {
+      AggSpec spec = specs.get(i);
+      isCountStar[i] = "*".equals(spec.arg);
+      if (isCountStar[i]) {
+        accType[i] = 0;
+      } else {
+        boolean isDoubleArg = spec.argType instanceof DoubleType;
+        switch (spec.funcName) {
+          case "COUNT":
+            accType[i] = spec.isDistinct ? 5 : 0;
+            if (spec.isDistinct) canUseFlat = false;
+            break;
+          case "SUM":
+            accType[i] = isDoubleArg ? 6 : 1;
+            if (isDoubleArg) canUseFlat = false;
+            break;
+          case "AVG":
+            accType[i] = isDoubleArg ? 7 : 2;
+            if (isDoubleArg) canUseFlat = false;
+            break;
+          case "MIN":
+            accType[i] = 3;
+            canUseFlat = false;
+            break;
+          case "MAX":
+            accType[i] = 4;
+            canUseFlat = false;
+            break;
+        }
+        if (spec.argType instanceof VarcharType) canUseFlat = false;
+      }
+    }
+
+    if (!canUseFlat) {
+      // Fall back to single-key with AccumulatorGroup
+      final SingleKeyHashMap singleKeyMap = new SingleKeyHashMap(specs);
+      final String sourceCol = keyInfos.get(0).name();
+
+      try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+          shard.acquireSearcher("dqe-fused-groupby-derived-1key")) {
+
+        if (query instanceof MatchAllDocsQuery) {
+          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+            LeafReader reader = leafCtx.reader();
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+            SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(sourceCol);
+
+            if (liveDocs == null) {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                long key0 = 0;
+                if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+                for (int i = 0; i < numAggs; i++) {
+                  if (isCountStar[i]) ((CountStarAccum) accGroup.accumulators[i]).count++;
+                }
+              }
+            } else {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (liveDocs.get(doc)) {
+                  long key0 = 0;
+                  if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                  AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+                  for (int i = 0; i < numAggs; i++) {
+                    if (isCountStar[i]) ((CountStarAccum) accGroup.accumulators[i]).count++;
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          engineSearcher.search(
+              query,
+              new Collector() {
+                @Override
+                public LeafCollector getLeafCollector(LeafReaderContext context)
+                    throws IOException {
+                  SortedNumericDocValues dv0 =
+                      context.reader().getSortedNumericDocValues(sourceCol);
+                  return new LeafCollector() {
+                    @Override
+                    public void setScorer(Scorable scorer) {}
+
+                    @Override
+                    public void collect(int doc) throws IOException {
+                      long key0 = 0;
+                      if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                      AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+                      for (int i = 0; i < numAggs; i++) {
+                        if (isCountStar[i]) ((CountStarAccum) accGroup.accumulators[i]).count++;
+                      }
+                    }
+                  };
+                }
+
+                @Override
+                public ScoreMode scoreMode() {
+                  return ScoreMode.COMPLETE_NO_SCORES;
+                }
+              });
+        }
+      }
+
+      if (singleKeyMap.size == 0) return List.of();
+
+      return buildDerivedKeyResult(
+          singleKeyMap, keyInfos, specs, columnTypeMap, groupByKeys, arithUnits);
+    }
+
+    // === Flat path (COUNT/SUM long/AVG long only) ===
+    final int[] accOffset = new int[numAggs];
+    int totalSlots = 0;
+    for (int i = 0; i < numAggs; i++) {
+      accOffset[i] = totalSlots;
+      switch (accType[i]) {
+        case 0:
+        case 1:
+          totalSlots += 1;
+          break;
+        case 2:
+          totalSlots += 2;
+          break;
+        default:
+          throw new IllegalStateException("Flat path used with unsupported accType: " + accType[i]);
+      }
+    }
+
+    final int slotsPerGroup = totalSlots;
+    final FlatSingleKeyMap flatMap = new FlatSingleKeyMap(slotsPerGroup);
+    final String sourceCol = keyInfos.get(0).name();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-derived-1key-flat")) {
+
+      if (query instanceof MatchAllDocsQuery) {
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(sourceCol);
+
+          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+            }
+          }
+
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              long key0 = 0;
+              if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+              int slot = flatMap.findOrInsert(key0);
+              int base = slot * slotsPerGroup;
+              for (int i = 0; i < numAggs; i++) {
+                int off = base + accOffset[i];
+                if (isCountStar[i]) {
+                  flatMap.accData[off]++;
+                  continue;
+                }
+                SortedNumericDocValues aggDv = numericAggDvs[i];
+                if (aggDv != null && aggDv.advanceExact(doc)) {
+                  long rawVal = aggDv.nextValue();
+                  switch (accType[i]) {
+                    case 0:
+                      flatMap.accData[off]++;
+                      break;
+                    case 1:
+                      flatMap.accData[off] += rawVal;
+                      break;
+                    case 2:
+                      flatMap.accData[off] += rawVal;
+                      flatMap.accData[off + 1]++;
+                      break;
+                  }
+                }
+              }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                long key0 = 0;
+                if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                int slot = flatMap.findOrInsert(key0);
+                int base = slot * slotsPerGroup;
+                for (int i = 0; i < numAggs; i++) {
+                  int off = base + accOffset[i];
+                  if (isCountStar[i]) {
+                    flatMap.accData[off]++;
+                    continue;
+                  }
+                  SortedNumericDocValues aggDv = numericAggDvs[i];
+                  if (aggDv != null && aggDv.advanceExact(doc)) {
+                    long rawVal = aggDv.nextValue();
+                    switch (accType[i]) {
+                      case 0:
+                        flatMap.accData[off]++;
+                        break;
+                      case 1:
+                        flatMap.accData[off] += rawVal;
+                        break;
+                      case 2:
+                        flatMap.accData[off] += rawVal;
+                        flatMap.accData[off + 1]++;
+                        break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv0 = context.reader().getSortedNumericDocValues(sourceCol);
+
+                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                  }
+                }
+
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    long key0 = 0;
+                    if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                    int slot = flatMap.findOrInsert(key0);
+                    int base = slot * slotsPerGroup;
+                    for (int i = 0; i < numAggs; i++) {
+                      int off = base + accOffset[i];
+                      if (isCountStar[i]) {
+                        flatMap.accData[off]++;
+                        continue;
+                      }
+                      SortedNumericDocValues aggDv = numericAggDvs[i];
+                      if (aggDv != null && aggDv.advanceExact(doc)) {
+                        long rawVal = aggDv.nextValue();
+                        switch (accType[i]) {
+                          case 0:
+                            flatMap.accData[off]++;
+                            break;
+                          case 1:
+                            flatMap.accData[off] += rawVal;
+                            break;
+                          case 2:
+                            flatMap.accData[off] += rawVal;
+                            flatMap.accData[off + 1]++;
+                            break;
+                        }
+                      }
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
+    }
+
+    if (flatMap.size == 0) return List.of();
+
+    // Build output: expand single source key to all derived keys.
+    // Plain source keys use their original type; derived (arith) keys use BigintType.
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int groupCount = flatMap.size;
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      Type keyType = (arithUnits[i] != null) ? BigintType.BIGINT : keyInfos.get(i).type;
+      builders[i] = keyType.createBlockBuilder(null, groupCount);
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+    }
+    for (int slot = 0; slot < flatMap.capacity; slot++) {
+      if (flatMap.occupied[slot]) {
+        long sourceVal = flatMap.keys[slot];
+        // Write all group-by keys from the single source value
+        for (int k = 0; k < numGroupKeys; k++) {
+          long keyVal = sourceVal;
+          if (arithUnits[k] != null) {
+            keyVal = applyArith(sourceVal, arithUnits[k]);
+            BigintType.BIGINT.writeLong(builders[k], keyVal);
+          } else {
+            writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
+          }
+        }
+        // Write aggregate results
+        int base = slot * slotsPerGroup;
+        for (int a = 0; a < numAggs; a++) {
+          int off = base + accOffset[a];
+          switch (accType[a]) {
+            case 0:
+            case 1:
+              BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+              break;
+            case 2:
+              long sum = flatMap.accData[off];
+              long cnt = flatMap.accData[off + 1];
+              if (cnt == 0) {
+                builders[numGroupKeys + a].appendNull();
+              } else {
+                DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+              }
+              break;
+          }
+        }
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+    return List.of(new Page(blocks));
+  }
+
+  /** Build the result Page from a SingleKeyHashMap for derived-key GROUP BY. */
+  private static List<Page> buildDerivedKeyResult(
+      SingleKeyHashMap singleKeyMap,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys,
+      String[] arithUnits) {
+    if (singleKeyMap.size == 0) return List.of();
+    int numAggs = specs.size();
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int groupCount = singleKeyMap.size;
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      Type keyType = (arithUnits[i] != null) ? BigintType.BIGINT : keyInfos.get(i).type;
+      builders[i] = keyType.createBlockBuilder(null, groupCount);
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+    }
+    for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+      if (singleKeyMap.occupied[slot]) {
+        long sourceVal = singleKeyMap.keys[slot];
+        for (int k = 0; k < numGroupKeys; k++) {
+          long keyVal = sourceVal;
+          if (arithUnits[k] != null) {
+            keyVal = applyArith(sourceVal, arithUnits[k]);
+            BigintType.BIGINT.writeLong(builders[k], keyVal);
+          } else {
+            writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
+          }
+        }
+        AccumulatorGroup accGroup = singleKeyMap.groups[slot];
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+        }
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+    return List.of(new Page(blocks));
   }
 
   /**
@@ -2152,12 +2642,15 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys)
       throws Exception {
 
-    // Pre-compute DATE_TRUNC units for numeric keys in the varchar path
+    // Pre-compute DATE_TRUNC and arithmetic units for numeric keys in the varchar path
     final String[] truncUnits = new String[keyInfos.size()];
+    final String[] arithUnits = new String[keyInfos.size()];
     for (int i = 0; i < keyInfos.size(); i++) {
       KeyInfo ki = keyInfos.get(i);
       if ("date_trunc".equals(ki.exprFunc)) {
         truncUnits[i] = ki.exprUnit;
+      } else if ("arith".equals(ki.exprFunc)) {
+        arithUnits[i] = ki.exprUnit;
       }
     }
 
@@ -2296,6 +2789,7 @@ public final class FusedGroupByAggregate {
                         if (dv != null && dv.advanceExact(doc)) {
                           k0 = dv.nextValue();
                           if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                          else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
                         }
                       }
                       if (key1Varchar) {
@@ -2306,6 +2800,7 @@ public final class FusedGroupByAggregate {
                         if (dv != null && dv.advanceExact(doc)) {
                           k1 = dv.nextValue();
                           if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                          else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                         }
                       }
                       int slot = flatMap.findOrInsert(k0, k1);
@@ -2710,6 +3205,8 @@ public final class FusedGroupByAggregate {
                           long val = dv.nextValue();
                           if (truncUnits[k] != null) {
                             val = truncateMillis(val, truncUnits[k]);
+                          } else if (arithUnits[k] != null) {
+                            val = applyArith(val, arithUnits[k]);
                           }
                           probeKey.set(k, val);
                         } else {
@@ -2937,6 +3434,8 @@ public final class FusedGroupByAggregate {
                         long val = dv.nextValue();
                         if (truncUnits[k] != null) {
                           val = truncateMillis(val, truncUnits[k]);
+                        } else if (arithUnits[k] != null) {
+                          val = applyArith(val, arithUnits[k]);
                         }
                         probeKey.set(k, val);
                       } else {
@@ -3140,7 +3639,13 @@ public final class FusedGroupByAggregate {
         if (dtm.matches()) {
           types.add(TimestampType.TIMESTAMP_MILLIS);
         } else {
-          types.add(BigintType.BIGINT);
+          // Check for arithmetic expression — output type is BigintType
+          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+          if (am.matches()) {
+            types.add(BigintType.BIGINT);
+          } else {
+            types.add(BigintType.BIGINT);
+          }
         }
       }
     }

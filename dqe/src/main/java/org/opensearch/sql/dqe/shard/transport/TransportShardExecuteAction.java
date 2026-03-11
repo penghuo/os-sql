@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -71,6 +72,22 @@ public class TransportShardExecuteAction
 
   /** Thread pool name for shard-level DQE execution. */
   public static final String DQE_THREAD_POOL_NAME = "dqe-shard-executor";
+
+  /**
+   * Cached resolved metadata per index. When 8 shards of the same index execute concurrently, the
+   * first one resolves TableInfo / type maps / field type maps and the rest reuse the cached
+   * result. The cache is small (typically one entry per active query) and entries are evicted on
+   * each new query via metadata version check.
+   */
+  private static final ConcurrentHashMap<String, CachedIndexMeta> INDEX_META_CACHE =
+      new ConcurrentHashMap<>();
+
+  /** Holder for pre-computed index metadata used by shard execution. */
+  private record CachedIndexMeta(
+      TableInfo tableInfo,
+      Map<String, Type> columnTypeMap,
+      Map<String, String> fieldTypeMap,
+      long metadataVersion) {}
 
   /** ClusterService for resolving index metadata (production path). */
   private final ClusterService clusterService;
@@ -165,18 +182,21 @@ public class TransportShardExecuteAction
         effectiveScanFactory = scanFactory;
         effectiveColumnTypeMap = columnTypeMap != null ? columnTypeMap : Map.of();
       } else {
-        // Production path: build from cluster metadata and NodeClient
+        // Production path: use cached metadata to avoid redundant resolution
+        // across concurrent shard executions for the same index.
         String indexName = findIndexName(plan);
-        OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
-        TableInfo tableInfo = metadata.getTableInfo(indexName);
-        effectiveColumnTypeMap =
-            tableInfo.columns().stream()
-                .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::trinoType));
+        CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+        effectiveColumnTypeMap = cachedMeta.columnTypeMap();
 
         Settings nodeSettings = clusterService.getSettings();
         int batchSize = DqeSettings.PAGE_BATCH_SIZE.get(nodeSettings);
         effectiveScanFactory =
-            buildLuceneScanFactory(req, tableInfo, effectiveColumnTypeMap, batchSize);
+            buildLuceneScanFactory(
+                req,
+                cachedMeta.tableInfo(),
+                effectiveColumnTypeMap,
+                cachedMeta.fieldTypeMap(),
+                batchSize);
       }
 
       // 4. Build operator pipeline
@@ -209,15 +229,15 @@ public class TransportShardExecuteAction
    * @param req the shard execute request
    * @param tableInfo table metadata including OpenSearch field types
    * @param typeMap mapping from column name to Trino Type
+   * @param fieldTypeMap pre-computed field name to OS type string mapping
    * @param batchSize number of rows per page
    */
   private Function<TableScanNode, Operator> buildLuceneScanFactory(
-      ShardExecuteRequest req, TableInfo tableInfo, Map<String, Type> typeMap, int batchSize) {
-    // Build field type map for LuceneQueryCompiler (field name → OS type string)
-    Map<String, String> fieldTypeMap =
-        tableInfo.columns().stream()
-            .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::openSearchType));
-
+      ShardExecuteRequest req,
+      TableInfo tableInfo,
+      Map<String, Type> typeMap,
+      Map<String, String> fieldTypeMap,
+      int batchSize) {
     return node -> {
       // 1. Resolve IndexShard
       IndexMetadata indexMeta = clusterService.state().metadata().index(node.getIndexName());
@@ -240,6 +260,31 @@ public class TransportShardExecuteAction
       // 4. Create LucenePageSource
       return new LucenePageSource(shard, query, columns, batchSize);
     };
+  }
+
+  /**
+   * Get or build cached index metadata. When multiple shards of the same index execute
+   * concurrently, only the first one resolves TableInfo and builds type maps; the rest reuse the
+   * cached result. The cache is invalidated when the cluster metadata version changes.
+   */
+  private CachedIndexMeta getOrBuildIndexMeta(String indexName) {
+    long currentVersion = clusterService.state().metadata().version();
+    CachedIndexMeta cached = INDEX_META_CACHE.get(indexName);
+    if (cached != null && cached.metadataVersion() == currentVersion) {
+      return cached;
+    }
+    // Build fresh metadata
+    OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
+    TableInfo tableInfo = metadata.getTableInfo(indexName);
+    Map<String, Type> typeMap =
+        tableInfo.columns().stream()
+            .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::trinoType));
+    Map<String, String> fieldTypeMap =
+        tableInfo.columns().stream()
+            .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::openSearchType));
+    CachedIndexMeta fresh = new CachedIndexMeta(tableInfo, typeMap, fieldTypeMap, currentVersion);
+    INDEX_META_CACHE.put(indexName, fresh);
+    return fresh;
   }
 
   /**
@@ -281,12 +326,8 @@ public class TransportShardExecuteAction
     // Compile Lucene query from DSL filter
     Query luceneQuery;
     if (scanNode.getDslFilter() != null) {
-      OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
-      TableInfo tableInfo = metadata.getTableInfo(scanNode.getIndexName());
-      Map<String, String> fieldTypeMap =
-          tableInfo.columns().stream()
-              .collect(Collectors.toMap(ColumnInfo::name, ColumnInfo::openSearchType));
-      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(fieldTypeMap);
+      CachedIndexMeta cachedMeta = getOrBuildIndexMeta(scanNode.getIndexName());
+      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
       luceneQuery = queryCompiler.compile(scanNode.getDslFilter());
     } else {
       luceneQuery = new MatchAllDocsQuery();

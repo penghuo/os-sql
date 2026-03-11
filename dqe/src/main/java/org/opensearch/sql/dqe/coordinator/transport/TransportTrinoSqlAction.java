@@ -114,20 +114,29 @@ public class TransportTrinoSqlAction
       DqeSqlParser parser = new DqeSqlParser();
       Statement stmt = parser.parse(sqlReq.getQuery());
 
-      // 2. Resolve metadata
+      // 2. Resolve metadata (cache TableInfo to avoid redundant resolution)
       OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
+      // Use a caching wrapper so LogicalPlanner.plan() and our later lookup share the result.
+      Map<String, TableInfo> tableInfoCache = new HashMap<>();
+      java.util.function.Function<String, TableInfo> cachingResolver =
+          name -> tableInfoCache.computeIfAbsent(name, metadata::getTableInfo);
 
       // 3. Plan
-      DqePlanNode plan = LogicalPlanner.plan(stmt, metadata::getTableInfo);
+      DqePlanNode plan = LogicalPlanner.plan(stmt, cachingResolver);
 
       // 4. Optimize (resolve field types for predicate pushdown)
       String indexName = findIndexName(plan);
-      TableInfo tableInfo = metadata.getTableInfo(indexName);
-      Map<String, String> fieldTypeMap =
-          tableInfo.columns().stream()
-              .collect(
-                  Collectors.toMap(
-                      TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::openSearchType));
+      TableInfo tableInfo = cachingResolver.apply(indexName); // cache hit
+      // Pre-compute type maps once from the column list (avoid repeated stream operations)
+      List<TableInfo.ColumnInfo> columnInfoList = tableInfo.columns();
+      Map<String, String> fieldTypeMap = new HashMap<>(columnInfoList.size());
+      Map<String, Type> columnTypeMap = new HashMap<>(columnInfoList.size());
+      List<String> allColumnNames = new ArrayList<>(columnInfoList.size());
+      for (TableInfo.ColumnInfo col : columnInfoList) {
+        fieldTypeMap.put(col.name(), col.openSearchType());
+        columnTypeMap.put(col.name(), col.trinoType());
+        allColumnNames.add(col.name());
+      }
       PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
       DqePlanNode optimizedPlan = optimizer.optimize(plan);
 
@@ -142,20 +151,12 @@ public class TransportTrinoSqlAction
         return;
       }
 
-      // 7. Build column type information from metadata
-      Map<String, Type> columnTypeMap =
-          tableInfo.columns().stream()
-              .collect(
-                  Collectors.toMap(TableInfo.ColumnInfo::name, TableInfo.ColumnInfo::trinoType));
-
       // Internal column names (for type lookup) vs display names (for response schema)
       List<String> internalColumnNames = resolveColumnNames(optimizedPlan);
       List<String> columnNames;
       if (stmt instanceof Query query2
           && query2.getQueryBody() instanceof QuerySpecification querySpec2) {
-        columnNames =
-            LogicalPlanner.extractDisplayColumnNames(
-                querySpec2, tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList());
+        columnNames = LogicalPlanner.extractDisplayColumnNames(querySpec2, allColumnNames);
       } else {
         columnNames = internalColumnNames;
       }
@@ -263,12 +264,17 @@ public class TransportTrinoSqlAction
                   listener::onFailure),
               shardFragments.size());
 
+      // Serialize the shard plan once and reuse for all shards (all fragments share the
+      // same plan object; only shardId and nodeId differ).
+      byte[] serializedPlan;
+      {
+        BytesStreamOutput planOut = new BytesStreamOutput();
+        DqePlanNode.writePlanNode(planOut, shardFragments.get(0).shardPlan());
+        serializedPlan = planOut.bytes().toBytesRef().bytes;
+      }
+
       // Dispatch each fragment to its target node
       for (PlanFragment frag : shardFragments) {
-        BytesStreamOutput planOut = new BytesStreamOutput();
-        DqePlanNode.writePlanNode(planOut, frag.shardPlan());
-        byte[] serializedPlan = planOut.bytes().toBytesRef().bytes;
-
         ShardExecuteRequest shardReq =
             new ShardExecuteRequest(
                 serializedPlan, frag.indexName(), frag.shardId(), timeoutMillis);
@@ -639,46 +645,61 @@ public class TransportTrinoSqlAction
    * @return JSON response string
    */
   static String formatResponse(List<Page> pages, List<String> columnNames, List<Type> columnTypes) {
-    StringBuilder sb = new StringBuilder();
+    // Pre-compute total row count for StringBuilder sizing
+    int totalRows = 0;
+    for (Page page : pages) {
+      totalRows += page.getPositionCount();
+    }
+    // Estimate ~40 bytes per cell for initial capacity
+    int numCols = columnNames.size();
+    StringBuilder sb = new StringBuilder(Math.max(256, totalRows * numCols * 40));
     sb.append("{\"schema\":[");
 
     // Build schema from column names and types
-    for (int i = 0; i < columnNames.size(); i++) {
+    // Pre-resolve type strings to avoid repeated instanceof checks
+    String[] typeStrings = new String[numCols];
+    for (int i = 0; i < numCols; i++) {
+      typeStrings[i] = trinoTypeToOpenSearchType(columnTypes.get(i));
       if (i > 0) {
         sb.append(",");
       }
-      String colName = columnNames.get(i);
-      String type = trinoTypeToOpenSearchType(columnTypes.get(i));
       sb.append("{\"name\":\"")
-          .append(escapeJson(colName))
+          .append(escapeJson(columnNames.get(i)))
           .append("\",\"type\":\"")
-          .append(type)
+          .append(typeStrings[i])
           .append("\"}");
     }
     sb.append("],\"datarows\":[");
 
     // Build data rows from Pages
-    int totalRows = 0;
+    // Pre-fetch column types into array for fast indexed access
+    Type[] types = columnTypes.toArray(new Type[0]);
     boolean firstRow = true;
     for (Page page : pages) {
-      for (int pos = 0; pos < page.getPositionCount(); pos++) {
+      int channelCount = page.getChannelCount();
+      int positionCount = page.getPositionCount();
+      // Pre-fetch blocks for this page to avoid repeated getBlock calls
+      Block[] blocks = new Block[Math.min(numCols, channelCount)];
+      for (int col = 0; col < blocks.length; col++) {
+        blocks[col] = page.getBlock(col);
+      }
+      for (int pos = 0; pos < positionCount; pos++) {
         if (!firstRow) {
           sb.append(",");
         }
         firstRow = false;
         sb.append("[");
-        for (int col = 0; col < columnNames.size(); col++) {
+        for (int col = 0; col < numCols; col++) {
           if (col > 0) {
             sb.append(",");
           }
-          if (col < page.getChannelCount()) {
-            appendJsonValue(sb, extractValue(page, col, pos, columnTypes.get(col)));
+          if (col < channelCount) {
+            appendExtractedValue(sb, blocks[col], pos, types[col]);
           } else {
             sb.append("null");
           }
         }
         sb.append("]");
-        totalRows++;
       }
     }
 
@@ -686,6 +707,57 @@ public class TransportTrinoSqlAction
     sb.append(",\"size\":").append(totalRows);
     sb.append(",\"status\":200}");
     return sb.toString();
+  }
+
+  /**
+   * Extract a value from a block and append directly to the StringBuilder, avoiding intermediate
+   * Object boxing for numeric types.
+   */
+  private static void appendExtractedValue(StringBuilder sb, Block block, int position, Type type) {
+    if (block.isNull(position)) {
+      sb.append("null");
+      return;
+    }
+    if (type instanceof BigintType) {
+      sb.append(BigintType.BIGINT.getLong(block, position));
+    } else if (type instanceof IntegerType) {
+      sb.append((int) IntegerType.INTEGER.getLong(block, position));
+    } else if (type instanceof DoubleType) {
+      double val = DoubleType.DOUBLE.getDouble(block, position);
+      if (val == Math.floor(val) && !Double.isInfinite(val) && Math.abs(val) < 1e15) {
+        sb.append((long) val);
+      } else {
+        sb.append(val);
+      }
+    } else if (type instanceof VarcharType) {
+      sb.append("\"")
+          .append(escapeJson(VarcharType.VARCHAR.getSlice(block, position).toStringUtf8()))
+          .append("\"");
+    } else if (type instanceof BooleanType) {
+      sb.append(BooleanType.BOOLEAN.getBoolean(block, position));
+    } else if (type instanceof TimestampType) {
+      long microsSinceEpoch = type.getLong(block, position);
+      long millisSinceEpoch = microsSinceEpoch / 1000;
+      java.time.LocalDateTime ldt =
+          Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDateTime();
+      sb.append("\"");
+      if (ldt.getHour() == 0 && ldt.getMinute() == 0 && ldt.getSecond() == 0) {
+        sb.append(ldt.toLocalDate());
+      } else {
+        sb.append(ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+      }
+      sb.append("\"");
+    } else if (type instanceof SmallintType) {
+      sb.append((short) SmallintType.SMALLINT.getLong(block, position));
+    } else if (type instanceof TinyintType) {
+      sb.append((byte) TinyintType.TINYINT.getLong(block, position));
+    } else if (type instanceof RealType) {
+      long bits = RealType.REAL.getLong(block, position);
+      sb.append((double) Float.intBitsToFloat((int) bits));
+    } else {
+      // Fallback: use extractValue + appendJsonValue
+      appendJsonValue(sb, extractValue(new Page(block), 0, position, type));
+    }
   }
 
   /** Extract a typed value from a Page at the given column and row position. */

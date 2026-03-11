@@ -78,9 +78,20 @@ public class ResultMerger {
     // Fast numeric path with fused top-N
     if (canUseFastNumericMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
       // Ultra-fast single-key path: avoids ALL per-row allocation during merge
-      if (numGroupByCols == 1 && numAggCols == 1 && !hasAvgAgg(aggregateFunctions)) {
-        return mergeSingleKeyNumericCountWithSort(
-            shardResults, columnTypes, sortColumnIndices, ascending, limit);
+      if (numGroupByCols == 1 && !hasAvgAgg(aggregateFunctions)) {
+        if (numAggCols == 1) {
+          return mergeSingleKeyNumericCountWithSort(
+              shardResults, columnTypes, sortColumnIndices, ascending, limit);
+        }
+        return mergeSingleKeyMultiAggNumericWithSort(
+            shardResults,
+            numAggCols,
+            columnTypes,
+            aggregateFunctions,
+            sortColumnIndices,
+            ascending,
+            nullsFirst,
+            limit);
       }
       return mergeAggregationFastNumericWithSort(
           shardResults,
@@ -153,8 +164,11 @@ public class ResultMerger {
     // boxing, and HashMap overhead that dominates merge time for multi-key GROUP BY.
     if (canUseFastNumericMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
       // Ultra-fast single-key path: avoids ALL per-row allocation during merge
-      if (numGroupByCols == 1 && numAggCols == 1 && !hasAvgAgg(aggregateFunctions)) {
-        return mergeSingleKeyNumericCount(shardResults, columnTypes);
+      if (numGroupByCols == 1 && !hasAvgAgg(aggregateFunctions)) {
+        if (numAggCols == 1) {
+          return mergeSingleKeyNumericCount(shardResults, columnTypes);
+        }
+        return mergeSingleKeyMultiAggNumeric(shardResults, numAggCols, columnTypes);
       }
       return mergeAggregationFastNumeric(
           shardResults, numGroupByCols, numAggCols, columnTypes, aggregateFunctions);
@@ -362,6 +376,10 @@ public class ResultMerger {
     double[][] mapDoubleAggs = new double[capacity][];
     boolean[] mapOccupied = new boolean[capacity];
 
+    // Reusable temporary key array - avoids per-row allocation for key extraction.
+    // Only cloned to a new array when inserting a new group.
+    long[] tmpKey = new long[numGroupByCols];
+
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
         int positionCount = page.getPositionCount();
@@ -377,16 +395,15 @@ public class ResultMerger {
         }
 
         for (int pos = 0; pos < positionCount; pos++) {
-          // Extract key values as longs
-          long[] keyValues = new long[numGroupByCols];
+          // Extract key values into reusable array
           for (int k = 0; k < numGroupByCols; k++) {
-            keyValues[k] = columnTypes.get(k).getLong(keyBlocks[k], pos);
+            tmpKey[k] = columnTypes.get(k).getLong(keyBlocks[k], pos);
           }
 
           // Hash the key
           int hash = 1;
           for (int k = 0; k < numGroupByCols; k++) {
-            hash = hash * 31 + Long.hashCode(keyValues[k]);
+            hash = hash * 31 + Long.hashCode(tmpKey[k]);
           }
 
           // Probe the map
@@ -394,8 +411,8 @@ public class ResultMerger {
           int slot = hash & mask;
           while (true) {
             if (!mapOccupied[slot]) {
-              // New group
-              mapKeys[slot] = keyValues;
+              // New group - clone the reusable key array for storage
+              mapKeys[slot] = tmpKey.clone();
               long[] longAggs = new long[numAggCols];
               double[] doubleAggs = new double[numAggCols];
               // Read COUNT value first (needed for AVG weighting)
@@ -453,11 +470,11 @@ public class ResultMerger {
               break;
             }
 
-            // Check if key matches
+            // Check if key matches using tmpKey (avoids allocation)
             long[] existing = mapKeys[slot];
             boolean match = true;
             for (int k = 0; k < numGroupByCols; k++) {
-              if (existing[k] != keyValues[k]) {
+              if (existing[k] != tmpKey[k]) {
                 match = false;
                 break;
               }
@@ -579,6 +596,9 @@ public class ResultMerger {
     double[][] mapDoubleAggs = new double[capacity][];
     boolean[] mapOccupied = new boolean[capacity];
 
+    // Reusable temporary key array - avoids per-row allocation for key extraction
+    long[] tmpKey = new long[numGroupByCols];
+
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
         int positionCount = page.getPositionCount();
@@ -592,19 +612,18 @@ public class ResultMerger {
         }
 
         for (int pos = 0; pos < positionCount; pos++) {
-          long[] keyValues = new long[numGroupByCols];
           for (int k = 0; k < numGroupByCols; k++) {
-            keyValues[k] = columnTypes.get(k).getLong(keyBlocks[k], pos);
+            tmpKey[k] = columnTypes.get(k).getLong(keyBlocks[k], pos);
           }
           int hash = 1;
           for (int k = 0; k < numGroupByCols; k++) {
-            hash = hash * 31 + Long.hashCode(keyValues[k]);
+            hash = hash * 31 + Long.hashCode(tmpKey[k]);
           }
           int mask = capacity - 1;
           int slot = hash & mask;
           while (true) {
             if (!mapOccupied[slot]) {
-              mapKeys[slot] = keyValues;
+              mapKeys[slot] = tmpKey.clone();
               long[] longAggs = new long[numAggCols];
               double[] doubleAggs = new double[numAggCols];
               long countVal = 0;
@@ -660,7 +679,7 @@ public class ResultMerger {
             long[] existing = mapKeys[slot];
             boolean match = true;
             for (int k = 0; k < numGroupByCols; k++) {
-              if (existing[k] != keyValues[k]) {
+              if (existing[k] != tmpKey[k]) {
                 match = false;
                 break;
               }
@@ -1092,6 +1111,313 @@ public class ResultMerger {
   }
 
   /**
+   * Flat merge for single numeric key + multiple COUNT/SUM aggregates (no sort). Uses a flat
+   * open-addressing hash map with primitive long keys and interleaved long[] agg values (stride =
+   * numAggCols), eliminating ALL per-row object allocation. For queries like GROUP BY UserID with
+   * COUNT(*), SUM(col), this merges ~200K+ partial rows with zero GC pressure.
+   */
+  private List<Page> mergeSingleKeyMultiAggNumeric(
+      List<List<Page>> shardResults, int numAggCols, List<Type> columnTypes) {
+
+    int totalCols = 1 + numAggCols;
+    int capacity = 4096;
+    float loadFactor = 0.7f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKeys = new long[capacity];
+    // Interleaved agg values: mapAggs[slot * numAggCols + aggIdx]
+    long[] mapAggs = new long[capacity * numAggCols];
+    boolean[] mapOccupied = new boolean[capacity];
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(1 + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long key = columnTypes.get(0).getLong(keyBlock, pos);
+
+          // Murmur3 finalizer
+          long h = key;
+          h ^= h >>> 33;
+          h *= 0xff51afd7ed558ccdL;
+          h ^= h >>> 33;
+          h *= 0xc4ceb9fe1a85ec53L;
+          h ^= h >>> 33;
+
+          int mask = capacity - 1;
+          int slot = (int) h & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKeys[slot] = key;
+              int base = slot * numAggCols;
+              for (int a = 0; a < numAggCols; a++) {
+                mapAggs[base + a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                // Resize
+                int newCap = capacity * 2;
+                long[] nk = new long[newCap];
+                long[] na = new long[newCap * numAggCols];
+                boolean[] nocc = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    long rh = mapKeys[s];
+                    rh ^= rh >>> 33;
+                    rh *= 0xff51afd7ed558ccdL;
+                    rh ^= rh >>> 33;
+                    rh *= 0xc4ceb9fe1a85ec53L;
+                    rh ^= rh >>> 33;
+                    int ns = (int) rh & nm;
+                    while (nocc[ns]) ns = (ns + 1) & nm;
+                    nk[ns] = mapKeys[s];
+                    int oldBase = s * numAggCols;
+                    int newBase = ns * numAggCols;
+                    System.arraycopy(mapAggs, oldBase, na, newBase, numAggCols);
+                    nocc[ns] = true;
+                  }
+                }
+                capacity = newCap;
+                mask = newCap - 1;
+                threshold = (int) (newCap * loadFactor);
+                mapKeys = nk;
+                mapAggs = na;
+                mapOccupied = nocc;
+                // Re-find slot after resize
+                slot = (int) h & mask;
+                while (mapOccupied[slot]) {
+                  if (mapKeys[slot] == key) break;
+                  slot = (slot + 1) & mask;
+                }
+              }
+              break;
+            }
+            if (mapKeys[slot] == key) {
+              int base = slot * numAggCols;
+              for (int a = 0; a < numAggCols; a++) {
+                mapAggs[base + a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+              break;
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) return List.of();
+
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    builders[0] = columnTypes.get(0).createBlockBuilder(null, size);
+    for (int a = 0; a < numAggCols; a++) {
+      builders[1 + a] = BigintType.BIGINT.createBlockBuilder(null, size);
+    }
+    for (int s = 0; s < capacity; s++) {
+      if (mapOccupied[s]) {
+        columnTypes.get(0).writeLong(builders[0], mapKeys[s]);
+        int base = s * numAggCols;
+        for (int a = 0; a < numAggCols; a++) {
+          BigintType.BIGINT.writeLong(builders[1 + a], mapAggs[base + a]);
+        }
+      }
+    }
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Flat merge + top-N sort for single numeric key + multiple COUNT/SUM aggregates. Uses a flat
+   * open-addressing hash map with interleaved agg values, then performs top-N selection directly on
+   * the flat arrays. Eliminates ALL per-row object allocation during both merge and sort phases.
+   *
+   * <p>For queries like GROUP BY UserID COUNT(*), SUM(col) ORDER BY COUNT(*) DESC LIMIT 10, this:
+   *
+   * <ul>
+   *   <li>Merges ~200K partial rows into groups with zero allocation per row
+   *   <li>Selects top-N using bounded heap on slot indices
+   *   <li>Builds only N output rows
+   * </ul>
+   */
+  private List<Page> mergeSingleKeyMultiAggNumericWithSort(
+      List<List<Page>> shardResults,
+      int numAggCols,
+      List<Type> columnTypes,
+      List<String> aggregateFunctions,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      List<Boolean> nullsFirst,
+      long limit) {
+
+    int totalCols = 1 + numAggCols;
+    int capacity = 4096;
+    float loadFactor = 0.7f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKeys = new long[capacity];
+    long[] mapAggs = new long[capacity * numAggCols];
+    boolean[] mapOccupied = new boolean[capacity];
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(1 + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long key = columnTypes.get(0).getLong(keyBlock, pos);
+
+          // Murmur3 finalizer
+          long h = key;
+          h ^= h >>> 33;
+          h *= 0xff51afd7ed558ccdL;
+          h ^= h >>> 33;
+          h *= 0xc4ceb9fe1a85ec53L;
+          h ^= h >>> 33;
+
+          int mask = capacity - 1;
+          int slot = (int) h & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKeys[slot] = key;
+              int base = slot * numAggCols;
+              for (int a = 0; a < numAggCols; a++) {
+                mapAggs[base + a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                int newCap = capacity * 2;
+                long[] nk = new long[newCap];
+                long[] na = new long[newCap * numAggCols];
+                boolean[] nocc = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    long rh = mapKeys[s];
+                    rh ^= rh >>> 33;
+                    rh *= 0xff51afd7ed558ccdL;
+                    rh ^= rh >>> 33;
+                    rh *= 0xc4ceb9fe1a85ec53L;
+                    rh ^= rh >>> 33;
+                    int ns = (int) rh & nm;
+                    while (nocc[ns]) ns = (ns + 1) & nm;
+                    nk[ns] = mapKeys[s];
+                    System.arraycopy(mapAggs, s * numAggCols, na, ns * numAggCols, numAggCols);
+                    nocc[ns] = true;
+                  }
+                }
+                capacity = newCap;
+                mask = newCap - 1;
+                threshold = (int) (newCap * loadFactor);
+                mapKeys = nk;
+                mapAggs = na;
+                mapOccupied = nocc;
+                slot = (int) h & mask;
+                while (mapOccupied[slot]) {
+                  if (mapKeys[slot] == key) break;
+                  slot = (slot + 1) & mask;
+                }
+              }
+              break;
+            }
+            if (mapKeys[slot] == key) {
+              int base = slot * numAggCols;
+              for (int a = 0; a < numAggCols; a++) {
+                mapAggs[base + a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+              break;
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) return List.of();
+
+    // Top-N selection
+    int k = (int) Math.min(limit, size);
+    final int numSortKeys = sortColumnIndices.size();
+
+    // Capture final references for comparator
+    final long[] fKeys = mapKeys;
+    final long[] fAggs = mapAggs;
+    final boolean[] fOccupied = mapOccupied;
+    final int fCapacity = capacity;
+    final int fNumAggCols = numAggCols;
+
+    // Comparator for slot indices
+    Comparator<Integer> slotCmp =
+        (s1, s2) -> {
+          for (int i = 0; i < numSortKeys; i++) {
+            int colIdx = sortColumnIndices.get(i);
+            boolean asc = ascending.get(i);
+            long v1, v2;
+            if (colIdx == 0) {
+              v1 = fKeys[s1];
+              v2 = fKeys[s2];
+            } else {
+              int aggIdx = colIdx - 1;
+              v1 = fAggs[s1 * fNumAggCols + aggIdx];
+              v2 = fAggs[s2 * fNumAggCols + aggIdx];
+            }
+            int cmp = Long.compare(v1, v2);
+            if (cmp != 0) return asc ? cmp : -cmp;
+          }
+          return 0;
+        };
+
+    // Bounded max-heap for O(n log k) top-N selection
+    PriorityQueue<Integer> heap = new PriorityQueue<>(k + 1, slotCmp.reversed());
+    for (int s = 0; s < fCapacity; s++) {
+      if (fOccupied[s]) {
+        heap.offer(s);
+        if (heap.size() > k) heap.poll();
+      }
+    }
+
+    // Extract in sorted order
+    int heapSize = heap.size();
+    Integer[] topSlots = new Integer[heapSize];
+    for (int i = heapSize - 1; i >= 0; i--) {
+      topSlots[i] = heap.poll();
+    }
+    java.util.Arrays.sort(topSlots, slotCmp);
+
+    // Build output Page for top-k only
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    builders[0] = columnTypes.get(0).createBlockBuilder(null, heapSize);
+    for (int a = 0; a < numAggCols; a++) {
+      builders[1 + a] = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+    }
+    for (int slot : topSlots) {
+      columnTypes.get(0).writeLong(builders[0], fKeys[slot]);
+      int base = slot * fNumAggCols;
+      for (int a = 0; a < numAggCols; a++) {
+        BigintType.BIGINT.writeLong(builders[1 + a], fAggs[base + a]);
+      }
+    }
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
    * Fused fast mixed-key merge with top-N sort. Same hash map building as {@link
    * #mergeAggregationFastMixed}, but performs top-N selection directly on the hash map entries and
    * only builds a Page with the top-N rows.
@@ -1150,6 +1476,11 @@ public class ResultMerger {
         hasAvg ? new java.util.HashMap<>() : null;
     final int fCountAggIdx = countAggIdx;
 
+    // Reusable probe key - avoids per-row array allocation for existing groups.
+    // Only clones the backing arrays when inserting a new group.
+    long[] tmpNumericKeys = new long[numGroupByCols];
+    io.airlift.slice.Slice[] tmpSliceKeys = new io.airlift.slice.Slice[numGroupByCols];
+
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
         int positionCount = page.getPositionCount();
@@ -1162,27 +1493,30 @@ public class ResultMerger {
           aggBlocks[a] = page.getBlock(numGroupByCols + a);
         }
         for (int pos = 0; pos < positionCount; pos++) {
-          long[] numericKeys = new long[numGroupByCols];
-          io.airlift.slice.Slice[] sliceKeys = new io.airlift.slice.Slice[numGroupByCols];
           int hash = 1;
           for (int k = 0; k < numGroupByCols; k++) {
             if (isVarcharKey[k]) {
               io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(keyBlocks[k], pos);
-              sliceKeys[k] = slice;
+              tmpSliceKeys[k] = slice;
               hash = hash * 31 + slice.hashCode();
             } else {
               long val = columnTypes.get(k).getLong(keyBlocks[k], pos);
-              numericKeys[k] = val;
+              tmpNumericKeys[k] = val;
               hash = hash * 31 + Long.hashCode(val);
             }
           }
-          MixedMergeKey key = new MixedMergeKey(numericKeys, sliceKeys, isVarcharKey, hash);
-          long[] aggs = groups.get(key);
+          // Probe with reusable key to avoid allocation on lookup hit
+          MixedMergeKey probeKey =
+              new MixedMergeKey(tmpNumericKeys, tmpSliceKeys, isVarcharKey, hash);
+          long[] aggs = groups.get(probeKey);
           if (aggs == null) {
+            // New group - create permanent key with cloned arrays
+            MixedMergeKey permanentKey =
+                new MixedMergeKey(tmpNumericKeys.clone(), tmpSliceKeys.clone(), isVarcharKey, hash);
             aggs = new long[numAggCols];
-            groups.put(key, aggs);
+            groups.put(permanentKey, aggs);
             if (hasAvg) {
-              doubleGroups.put(key, new double[numAggCols]);
+              doubleGroups.put(permanentKey, new double[numAggCols]);
             }
           }
           for (int a = 0; a < numAggCols; a++) {
@@ -1190,7 +1524,8 @@ public class ResultMerger {
               double avg = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
               long count =
                   fCountAggIdx >= 0 ? BigintType.BIGINT.getLong(aggBlocks[fCountAggIdx], pos) : 1;
-              doubleGroups.get(key)[a] += avg * count;
+              // Use aggs key from map (already stored under permanent key)
+              doubleGroups.get(probeKey)[a] += avg * count;
             } else {
               aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
             }
@@ -1528,6 +1863,10 @@ public class ResultMerger {
     java.util.HashMap<MixedMergeKey, double[]> doubleGroups =
         hasAvg ? new java.util.HashMap<>() : null;
 
+    // Reusable probe key arrays - avoids per-row allocation for existing groups
+    long[] tmpNumericKeys = new long[numGroupByCols];
+    io.airlift.slice.Slice[] tmpSliceKeys = new io.airlift.slice.Slice[numGroupByCols];
+
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
         int positionCount = page.getPositionCount();
@@ -1542,30 +1881,33 @@ public class ResultMerger {
         }
 
         for (int pos = 0; pos < positionCount; pos++) {
-          // Build compound key
-          long[] numericKeys = new long[numGroupByCols];
-          io.airlift.slice.Slice[] sliceKeys = new io.airlift.slice.Slice[numGroupByCols];
+          // Extract key values into reusable arrays
           int hash = 1;
           for (int k = 0; k < numGroupByCols; k++) {
             if (isVarcharKey[k]) {
               io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(keyBlocks[k], pos);
-              sliceKeys[k] = slice;
+              tmpSliceKeys[k] = slice;
               hash = hash * 31 + slice.hashCode();
             } else {
               long val = columnTypes.get(k).getLong(keyBlocks[k], pos);
-              numericKeys[k] = val;
+              tmpNumericKeys[k] = val;
               hash = hash * 31 + Long.hashCode(val);
             }
           }
 
-          MixedMergeKey key = new MixedMergeKey(numericKeys, sliceKeys, isVarcharKey, hash);
+          // Probe with reusable key to avoid allocation on lookup hit
+          MixedMergeKey probeKey =
+              new MixedMergeKey(tmpNumericKeys, tmpSliceKeys, isVarcharKey, hash);
 
-          long[] aggs = groups.get(key);
+          long[] aggs = groups.get(probeKey);
           if (aggs == null) {
+            // New group - create permanent key with cloned arrays
+            MixedMergeKey permanentKey =
+                new MixedMergeKey(tmpNumericKeys.clone(), tmpSliceKeys.clone(), isVarcharKey, hash);
             aggs = new long[numAggCols];
-            groups.put(key, aggs);
+            groups.put(permanentKey, aggs);
             if (hasAvg) {
-              doubleGroups.put(key, new double[numAggCols]);
+              doubleGroups.put(permanentKey, new double[numAggCols]);
             }
           }
 
@@ -1576,7 +1918,7 @@ public class ResultMerger {
               double avg = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
               long count =
                   countAggIdx >= 0 ? BigintType.BIGINT.getLong(aggBlocks[countAggIdx], pos) : 1;
-              double[] dAggs = doubleGroups.get(key);
+              double[] dAggs = doubleGroups.get(probeKey);
               dAggs[a] += avg * count;
             } else {
               aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);

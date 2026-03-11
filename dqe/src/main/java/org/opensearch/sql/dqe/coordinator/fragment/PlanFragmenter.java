@@ -5,9 +5,20 @@
 
 package org.opensearch.sql.dqe.coordinator.fragment;
 
+import io.trino.spi.type.BigintType;
+import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TinyintType;
+import io.trino.spi.type.Type;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
@@ -28,6 +39,14 @@ import org.opensearch.sql.dqe.planner.plan.TableScanNode;
  */
 public class PlanFragmenter {
 
+  /**
+   * Pattern to extract aggregate function name, DISTINCT flag, and argument from expressions like
+   * {@code COUNT(DISTINCT UserID)}, {@code SUM(amount)}, etc.
+   */
+  private static final Pattern AGG_PATTERN =
+      Pattern.compile(
+          "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$", Pattern.CASE_INSENSITIVE);
+
   /** Result of fragmenting a plan: per-shard fragments and an optional coordinator plan. */
   public record FragmentResult(List<PlanFragment> shardFragments, DqePlanNode coordinatorPlan) {}
 
@@ -39,6 +58,20 @@ public class PlanFragmenter {
    * @return fragment result with per-shard plans and optional coordinator plan
    */
   public FragmentResult fragment(DqePlanNode plan, ClusterState clusterState) {
+    return fragment(plan, clusterState, Map.of());
+  }
+
+  /**
+   * Fragment the given plan across shards of the target index, with column type information for
+   * optimized shard plan generation (e.g., shard-level dedup for COUNT(DISTINCT) on numeric cols).
+   *
+   * @param plan the logical plan to fragment
+   * @param clusterState the current cluster state for shard routing
+   * @param columnTypeMap mapping from column names to Trino types
+   * @return fragment result with per-shard plans and optional coordinator plan
+   */
+  public FragmentResult fragment(
+      DqePlanNode plan, ClusterState clusterState, Map<String, Type> columnTypeMap) {
     // 1. Walk plan to find TableScanNode -> get index name
     String indexName = findIndexName(plan);
 
@@ -48,7 +81,7 @@ public class PlanFragmenter {
 
     // 3. Build shard plan — only strip Sort/Limit/HAVING for multi-shard aggregation
     boolean multiShard = shards.size() > 1;
-    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan) : plan;
+    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan, columnTypeMap) : plan;
 
     // 4. Create shard fragments
     List<PlanFragment> shardFragments = new ArrayList<>();
@@ -71,13 +104,15 @@ public class PlanFragmenter {
    * <ul>
    *   <li>PARTIAL: Strip Sort/Limit above aggregation (coordinator applies those after merge).
    *       Shard runs: [EvalNode →] AggregationNode(PARTIAL) → Filter → Scan.
-   *   <li>SINGLE (COUNT DISTINCT): Strip aggregation and above. Shard runs: Filter → Scan. The
-   *       shard may detect scalar COUNT(DISTINCT) on numeric columns and pre-dedup values.
+   *   <li>SINGLE (COUNT DISTINCT) with GROUP BY and only COUNT(DISTINCT) aggregates: Dedup at shard
+   *       level by creating a GROUP BY (original_keys + distinct_columns) with COUNT(*)
+   *       aggregation. This reduces data sent to coordinator by deduplicating per shard.
+   *   <li>SINGLE (other): Strip aggregation and above. Shard runs: Filter → Scan.
    * </ul>
    *
    * For non-aggregation queries: use the full plan.
    */
-  private DqePlanNode buildShardPlan(DqePlanNode plan) {
+  private DqePlanNode buildShardPlan(DqePlanNode plan, Map<String, Type> columnTypeMap) {
     AggregationNode aggNode = findAggregationNode(plan);
     if (aggNode == null) {
       return plan;
@@ -87,8 +122,73 @@ public class PlanFragmenter {
       // Walk up from the aggregation to find it in the tree and return it as the root.
       return stripAboveAggregation(plan);
     }
+    // SINGLE with GROUP BY: try shard-level dedup for COUNT(DISTINCT)-only queries
+    // where all group-by keys AND distinct columns are numeric types. This ensures
+    // the fast fused numeric path is used at the shard level. VARCHAR keys are excluded
+    // because high-cardinality string GROUP BY can produce more overhead than it saves.
+    if (!aggNode.getGroupByKeys().isEmpty() && !columnTypeMap.isEmpty()) {
+      List<String> distinctColumns = extractCountDistinctColumns(aggNode.getAggregateFunctions());
+      if (distinctColumns != null
+          && allNumericColumns(aggNode.getGroupByKeys(), columnTypeMap)
+          && allNumericColumns(distinctColumns, columnTypeMap)) {
+        // Build dedup GROUP BY: original keys + distinct columns, with COUNT(*)
+        List<String> dedupKeys = new ArrayList<>(aggNode.getGroupByKeys());
+        dedupKeys.addAll(distinctColumns);
+        return new AggregationNode(
+            aggNode.getChild(), dedupKeys, List.of("COUNT(*)"), AggregationNode.Step.PARTIAL);
+      }
+    }
     // SINGLE: strip aggregation and above, shards only scan+filter
     return aggNode.getChild();
+  }
+
+  /**
+   * Check if all specified columns are numeric (long-representable) types suitable for the fast
+   * fused GROUP BY path. Returns false if any column type is unknown or non-numeric (e.g.,
+   * VARCHAR).
+   */
+  private static boolean allNumericColumns(List<String> columns, Map<String, Type> columnTypeMap) {
+    for (String col : columns) {
+      Type type = columnTypeMap.get(col);
+      if (type == null) {
+        return false;
+      }
+      if (!(type instanceof BigintType
+          || type instanceof IntegerType
+          || type instanceof SmallintType
+          || type instanceof TinyintType
+          || type instanceof DoubleType
+          || type instanceof TimestampType
+          || type instanceof BooleanType)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Check if all aggregate functions are COUNT(DISTINCT col) and extract the distinct column names.
+   * Returns the list of distinct column names if eligible, or null if any aggregate is not
+   * COUNT(DISTINCT).
+   */
+  private static List<String> extractCountDistinctColumns(List<String> aggregateFunctions) {
+    if (aggregateFunctions.isEmpty()) {
+      return null;
+    }
+    List<String> distinctCols = new ArrayList<>();
+    for (String func : aggregateFunctions) {
+      Matcher m = AGG_PATTERN.matcher(func);
+      if (!m.matches()) {
+        return null;
+      }
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      if (!"COUNT".equals(funcName) || !isDistinct) {
+        return null;
+      }
+      distinctCols.add(m.group(3).trim());
+    }
+    return distinctCols;
   }
 
   /**

@@ -190,10 +190,11 @@ public class TransportTrinoSqlAction
         PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
         DqePlanNode compiledOptimizedPlan = optimizer.optimize(plan);
 
-        // 5. Fragment
+        // 5. Fragment (pass column type map for shard-level dedup optimization)
         PlanFragmenter fragmenter = new PlanFragmenter();
         PlanFragmenter.FragmentResult compiledFragments =
-            fragmenter.fragment(compiledOptimizedPlan, clusterService.state());
+            fragmenter.fragment(
+                compiledOptimizedPlan, clusterService.state(), compiledColumnTypeMap);
 
         // 6. Explain mode: return logical plan, optimized plan, and fragments
         if (sqlReq.isExplain()) {

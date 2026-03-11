@@ -103,6 +103,28 @@ public class TestPageSource implements Operator {
   }
 
   /**
+   * Build a Page with two BIGINT columns from paired data.
+   *
+   * @param entries pairs of (long key, long value)
+   * @return page with [BIGINT, BIGINT] columns
+   */
+  public static Page buildLongKeyValuePage(long... entries) {
+    if (entries.length % 2 != 0) {
+      throw new IllegalArgumentException("Entries must be pairs of (long key, long value)");
+    }
+    int numRows = entries.length / 2;
+    BlockBuilder keyBuilder = BigintType.BIGINT.createBlockBuilder(null, numRows);
+    BlockBuilder valueBuilder = BigintType.BIGINT.createBlockBuilder(null, numRows);
+
+    for (int i = 0; i < entries.length; i += 2) {
+      BigintType.BIGINT.writeLong(keyBuilder, entries[i]);
+      BigintType.BIGINT.writeLong(valueBuilder, entries[i + 1]);
+    }
+
+    return new Page(keyBuilder.build(), valueBuilder.build());
+  }
+
+  /**
    * Drain all pages from an operator into a list.
    *
    * @param op the operator to drain

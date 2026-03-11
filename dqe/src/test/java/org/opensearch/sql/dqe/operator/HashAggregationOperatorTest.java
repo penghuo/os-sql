@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.opensearch.sql.dqe.operator.TestPageSource.buildCategoryValuePage;
+import static org.opensearch.sql.dqe.operator.TestPageSource.buildLongKeyValuePage;
 
 import io.trino.spi.Page;
 import io.trino.spi.type.BigintType;
@@ -265,5 +266,145 @@ class HashAggregationOperatorTest {
     assertEquals(1L, counts.get("b"));
     assertEquals(40L, sums.get("a"));
     assertEquals(20L, sums.get("b"));
+  }
+
+  @Test
+  @DisplayName("Single long key: COUNT and SUM via specialized path")
+  void singleLongKeyCountAndSum() {
+    // Rows: [(1, 10), (2, 20), (1, 30)] — group by column 0 (BIGINT)
+    Page input = buildLongKeyValuePage(1L, 10L, 2L, 20L, 1L, 30L);
+    Operator source = new TestPageSource(List.of(input));
+    List<Type> columnTypes = List.of(BigintType.BIGINT, BigintType.BIGINT);
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(
+            source,
+            List.of(0),
+            List.of(
+                HashAggregationOperator.count(), HashAggregationOperator.sum(1, BigintType.BIGINT)),
+            columnTypes);
+
+    Page result = agg.processNextBatch();
+    assertNotNull(result);
+    assertEquals(2, result.getPositionCount()); // 2 groups: 1 and 2
+    assertEquals(3, result.getChannelCount()); // key + count + sum
+
+    Map<Long, Long> counts = new HashMap<>();
+    Map<Long, Long> sums = new HashMap<>();
+    for (int i = 0; i < result.getPositionCount(); i++) {
+      long key = BigintType.BIGINT.getLong(result.getBlock(0), i);
+      counts.put(key, BigintType.BIGINT.getLong(result.getBlock(1), i));
+      sums.put(key, BigintType.BIGINT.getLong(result.getBlock(2), i));
+    }
+    assertEquals(2L, counts.get(1L));
+    assertEquals(1L, counts.get(2L));
+    assertEquals(40L, sums.get(1L));
+    assertEquals(20L, sums.get(2L));
+
+    assertNull(agg.processNextBatch());
+  }
+
+  @Test
+  @DisplayName("Single long key: AVG via specialized path")
+  void singleLongKeyAvg() {
+    Page input = buildLongKeyValuePage(1L, 10L, 2L, 20L, 1L, 30L);
+    Operator source = new TestPageSource(List.of(input));
+    List<Type> columnTypes = List.of(BigintType.BIGINT, BigintType.BIGINT);
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(
+            source,
+            List.of(0),
+            List.of(HashAggregationOperator.avg(1, BigintType.BIGINT)),
+            columnTypes);
+
+    Page result = agg.processNextBatch();
+    assertNotNull(result);
+    assertEquals(2, result.getPositionCount());
+
+    Map<Long, Double> avgs = new HashMap<>();
+    for (int i = 0; i < result.getPositionCount(); i++) {
+      long key = BigintType.BIGINT.getLong(result.getBlock(0), i);
+      avgs.put(key, DoubleType.DOUBLE.getDouble(result.getBlock(1), i));
+    }
+    assertEquals(20.0, avgs.get(1L), 0.001);
+    assertEquals(20.0, avgs.get(2L), 0.001);
+  }
+
+  @Test
+  @DisplayName("Single long key: across multiple pages")
+  void singleLongKeyAcrossPages() {
+    Page page1 = buildLongKeyValuePage(1L, 10L, 2L, 20L);
+    Page page2 = buildLongKeyValuePage(1L, 30L, 2L, 40L);
+    Operator source = new TestPageSource(List.of(page1, page2));
+    List<Type> columnTypes = List.of(BigintType.BIGINT, BigintType.BIGINT);
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(
+            source,
+            List.of(0),
+            List.of(HashAggregationOperator.sum(1, BigintType.BIGINT)),
+            columnTypes);
+
+    Page result = agg.processNextBatch();
+    assertNotNull(result);
+
+    Map<Long, Long> sums = new HashMap<>();
+    for (int i = 0; i < result.getPositionCount(); i++) {
+      long key = BigintType.BIGINT.getLong(result.getBlock(0), i);
+      sums.put(key, BigintType.BIGINT.getLong(result.getBlock(1), i));
+    }
+    assertEquals(40L, sums.get(1L));
+    assertEquals(60L, sums.get(2L));
+  }
+
+  @Test
+  @DisplayName("Single long key: empty source returns null")
+  void singleLongKeyEmptySource() {
+    Operator source = new TestPageSource(List.of());
+    List<Type> columnTypes = List.of(BigintType.BIGINT, BigintType.BIGINT);
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(
+            source, List.of(0), List.of(HashAggregationOperator.count()), columnTypes);
+
+    assertNull(agg.processNextBatch());
+  }
+
+  @Test
+  @DisplayName("Single long key: many distinct groups triggers resize")
+  void singleLongKeyManyGroups() {
+    // Create 2000 distinct groups to trigger hash map resize (initial capacity 1024)
+    int numGroups = 2000;
+    long[] entries = new long[numGroups * 2];
+    for (int i = 0; i < numGroups; i++) {
+      entries[i * 2] = i;
+      entries[i * 2 + 1] = i * 10L;
+    }
+    Page input = buildLongKeyValuePage(entries);
+    Operator source = new TestPageSource(List.of(input));
+    List<Type> columnTypes = List.of(BigintType.BIGINT, BigintType.BIGINT);
+
+    HashAggregationOperator agg =
+        new HashAggregationOperator(
+            source,
+            List.of(0),
+            List.of(
+                HashAggregationOperator.count(), HashAggregationOperator.sum(1, BigintType.BIGINT)),
+            columnTypes);
+
+    Page result = agg.processNextBatch();
+    assertNotNull(result);
+    assertEquals(numGroups, result.getPositionCount());
+
+    // Verify a few specific groups
+    Map<Long, Long> sums = new HashMap<>();
+    for (int i = 0; i < result.getPositionCount(); i++) {
+      long key = BigintType.BIGINT.getLong(result.getBlock(0), i);
+      sums.put(key, BigintType.BIGINT.getLong(result.getBlock(2), i));
+    }
+    assertEquals(0L, sums.get(0L));
+    assertEquals(10L, sums.get(1L));
+    assertEquals(19990L, sums.get(1999L));
   }
 }

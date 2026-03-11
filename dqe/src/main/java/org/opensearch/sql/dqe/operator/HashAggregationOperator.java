@@ -156,6 +156,209 @@ public class HashAggregationOperator implements Operator {
 
   /** Grouped aggregation: hash-based grouping with batch-oriented accumulator processing. */
   private Page processGroupedAggregation() {
+    // Fast path: single long/integer group-by key uses a specialized open-addressing hash map
+    // that avoids GroupKey object allocation, Object[] arrays, and Long boxing per row.
+    if (groupByColumnIndices.size() == 1) {
+      Type keyType = columnTypes.get(groupByColumnIndices.get(0));
+      if (isLongKeyType(keyType)) {
+        return processSingleLongKeyAggregation();
+      }
+    }
+
+    return processGenericGroupedAggregation();
+  }
+
+  /** Check if a type can be represented as a long key for the specialized aggregation path. */
+  private static boolean isLongKeyType(Type type) {
+    return type instanceof BigintType
+        || type instanceof IntegerType
+        || type instanceof SmallintType
+        || type instanceof TinyintType
+        || type instanceof TimestampType;
+  }
+
+  /**
+   * Specialized aggregation for single long/integer group-by key. Uses an open-addressing hash map
+   * with primitive long keys to eliminate GroupKey allocation, Object[] creation, Long boxing, and
+   * polymorphic hashCode/equals per row.
+   */
+  private Page processSingleLongKeyAggregation() {
+    int keyColIdx = groupByColumnIndices.get(0);
+    Type keyType = columnTypes.get(keyColIdx);
+    LongKeyHashMap longMap = new LongKeyHashMap();
+
+    Page page;
+    while ((page = source.processNextBatch()) != null) {
+      int positionCount = page.getPositionCount();
+      Block keyBlock = page.getBlock(keyColIdx);
+
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (keyBlock.isNull(pos)) {
+          // Null keys go into a special null-key group
+          List<Accumulator> accumulators = longMap.getOrCreateNullGroup(aggregateFunctions);
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
+          }
+        } else {
+          long key = keyType.getLong(keyBlock, pos);
+          List<Accumulator> accumulators = longMap.getOrCreate(key, aggregateFunctions);
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
+          }
+        }
+      }
+    }
+
+    int groupCount = longMap.size;
+    boolean hasNullGroup = longMap.nullGroupAccumulators != null;
+    if (hasNullGroup) {
+      groupCount++;
+    }
+
+    if (groupCount == 0) {
+      return null;
+    }
+
+    // Build result page
+    int totalColumns = 1 + aggregateFunctions.size();
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    builders[0] = keyType.createBlockBuilder(null, groupCount);
+    for (int i = 0; i < aggregateFunctions.size(); i++) {
+      builders[1 + i] =
+          aggregateFunctions.get(i).getOutputType().createBlockBuilder(null, groupCount);
+    }
+
+    // Write non-null groups
+    for (int slot = 0; slot < longMap.capacity; slot++) {
+      if (longMap.occupied[slot]) {
+        writeValue(builders[0], keyType, longMap.keys[slot]);
+        List<Accumulator> accumulators = longMap.values[slot];
+        for (int i = 0; i < accumulators.size(); i++) {
+          accumulators.get(i).writeTo(builders[1 + i]);
+        }
+      }
+    }
+
+    // Write null group if present
+    if (hasNullGroup) {
+      builders[0].appendNull();
+      for (int i = 0; i < longMap.nullGroupAccumulators.size(); i++) {
+        longMap.nullGroupAccumulators.get(i).writeTo(builders[1 + i]);
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return new Page(blocks);
+  }
+
+  /**
+   * Open-addressing hash map with primitive long keys. Uses linear probing with power-of-two
+   * capacity for fast modulo via bitmask. Eliminates object allocation per group key lookup.
+   */
+  static final class LongKeyHashMap {
+    private static final int INITIAL_CAPACITY = 1024;
+    private static final float LOAD_FACTOR = 0.7f;
+
+    long[] keys;
+
+    @SuppressWarnings("unchecked")
+    List<Accumulator>[] values;
+
+    boolean[] occupied;
+    int size;
+    int capacity;
+    private int threshold;
+
+    /** Accumulator list for null group key (handled separately from the long-key map). */
+    List<Accumulator> nullGroupAccumulators;
+
+    @SuppressWarnings("unchecked")
+    LongKeyHashMap() {
+      this.capacity = INITIAL_CAPACITY;
+      this.keys = new long[capacity];
+      this.values = new List[capacity];
+      this.occupied = new boolean[capacity];
+      this.size = 0;
+      this.threshold = (int) (capacity * LOAD_FACTOR);
+    }
+
+    List<Accumulator> getOrCreate(long key, List<AggregateFunction> aggregateFunctions) {
+      int slot = findSlot(key);
+      if (occupied[slot] && keys[slot] == key) {
+        return values[slot];
+      }
+      // New entry
+      List<Accumulator> accs = createAccumulators(aggregateFunctions);
+      keys[slot] = key;
+      values[slot] = accs;
+      occupied[slot] = true;
+      size++;
+      if (size > threshold) {
+        resize();
+        // After resize, return from the new slot location
+        return values[findSlot(key)];
+      }
+      return accs;
+    }
+
+    List<Accumulator> getOrCreateNullGroup(List<AggregateFunction> aggregateFunctions) {
+      if (nullGroupAccumulators == null) {
+        nullGroupAccumulators = createAccumulators(aggregateFunctions);
+      }
+      return nullGroupAccumulators;
+    }
+
+    private int findSlot(long key) {
+      int mask = capacity - 1;
+      int slot = Long.hashCode(key) & mask;
+      while (occupied[slot] && keys[slot] != key) {
+        slot = (slot + 1) & mask;
+      }
+      return slot;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void resize() {
+      int newCapacity = capacity * 2;
+      long[] newKeys = new long[newCapacity];
+      List<Accumulator>[] newValues = new List[newCapacity];
+      boolean[] newOccupied = new boolean[newCapacity];
+      int newMask = newCapacity - 1;
+
+      for (int i = 0; i < capacity; i++) {
+        if (occupied[i]) {
+          int slot = Long.hashCode(keys[i]) & newMask;
+          while (newOccupied[slot]) {
+            slot = (slot + 1) & newMask;
+          }
+          newKeys[slot] = keys[i];
+          newValues[slot] = values[i];
+          newOccupied[slot] = true;
+        }
+      }
+
+      this.keys = newKeys;
+      this.values = newValues;
+      this.occupied = newOccupied;
+      this.capacity = newCapacity;
+      this.threshold = (int) (newCapacity * LOAD_FACTOR);
+    }
+
+    private static List<Accumulator> createAccumulators(
+        List<AggregateFunction> aggregateFunctions) {
+      List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
+      for (AggregateFunction func : aggregateFunctions) {
+        accs.add(func.createAccumulator());
+      }
+      return accs;
+    }
+  }
+
+  /** Generic grouped aggregation for multi-key or non-long-key GROUP BY. */
+  private Page processGenericGroupedAggregation() {
     // Drain all pages from source and group rows
     Map<GroupKey, List<Accumulator>> groups = new LinkedHashMap<>();
 

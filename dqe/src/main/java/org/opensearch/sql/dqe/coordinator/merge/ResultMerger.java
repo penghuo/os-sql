@@ -91,6 +91,13 @@ public class ResultMerger {
       return mergeAggregationFastVarchar(shardResults, numGroupByCols, numAggCols, columnTypes);
     }
 
+    // Fast path: mixed numeric+varchar keys with COUNT/SUM-only aggregates (Q15, Q31, etc.).
+    // Uses HashMap with a compound MixedKey that avoids GroupKey/Accumulator overhead.
+    if (canUseFastMixedMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
+      return mergeAggregationFastMixed(
+          shardResults, numGroupByCols, numAggCols, columnTypes, aggregateFunctions);
+    }
+
     // Build merge functions that operate on the partial aggregation output columns.
     // The shard Pages have layout: [groupBy0, groupBy1, ..., agg0, agg1, ...].
     // For FINAL merge: COUNT/SUM→sum, MIN→min, MAX→max, AVG→weighted_avg.
@@ -557,6 +564,266 @@ public class ResultMerger {
       blocks[i] = builders[i].build();
     }
     return List.of(new Page(blocks));
+  }
+
+  /**
+   * Check if we can use the fast mixed-key merge path. Requirements:
+   *
+   * <ul>
+   *   <li>All group-by key types are either long-representable or VarcharType
+   *   <li>At least one key is VarcharType (otherwise the fast numeric path handles it)
+   *   <li>All aggregate functions are COUNT or SUM with BigintType output, or AVG with a companion
+   *       COUNT
+   * </ul>
+   */
+  private boolean canUseFastMixedMerge(
+      int numGroupByCols, List<Type> columnTypes, List<String> aggregateFunctions) {
+    if (numGroupByCols < 1) return false;
+    boolean hasVarchar = false;
+    for (int i = 0; i < numGroupByCols; i++) {
+      Type t = columnTypes.get(i);
+      if (t instanceof VarcharType) {
+        hasVarchar = true;
+      } else if (!(t instanceof BigintType
+          || t instanceof io.trino.spi.type.IntegerType
+          || t instanceof io.trino.spi.type.TimestampType
+          || t instanceof io.trino.spi.type.SmallintType
+          || t instanceof io.trino.spi.type.TinyintType
+          || t instanceof BooleanType)) {
+        return false;
+      }
+    }
+    if (!hasVarchar) return false; // Use fast numeric path instead
+    // Check all aggregates are COUNT, SUM (BigintType), or AVG (DoubleType)
+    boolean hasAvg = false;
+    boolean hasCount = false;
+    for (int a = 0; a < aggregateFunctions.size(); a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (!m.matches()) return false;
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      if (isDistinct) return false;
+      Type aggType = columnTypes.get(numGroupByCols + a);
+      if ("COUNT".equals(funcName)) {
+        if (!(aggType instanceof BigintType)) return false;
+        hasCount = true;
+      } else if ("SUM".equals(funcName)) {
+        if (!(aggType instanceof BigintType)) return false;
+      } else if ("AVG".equals(funcName)) {
+        if (!(aggType instanceof DoubleType)) return false;
+        hasAvg = true;
+      } else {
+        return false; // MIN, MAX not supported on fast path
+      }
+    }
+    if (hasAvg && !hasCount) return false;
+    return true;
+  }
+
+  /**
+   * Fast mixed-key merge: handles GROUP BY with any combination of numeric and varchar keys, with
+   * COUNT/SUM/AVG aggregates. Uses a compound key (MixedMergeKey) that stores numeric keys as longs
+   * and varchar keys as Slices, with pre-computed hash. This avoids the overhead of the generic
+   * HashAggregationOperator (GroupKey allocation, Accumulator interface dispatch, Object-based key
+   * extraction).
+   *
+   * <p>For AVG aggregates, accumulates (avg * count) as weightedSum in the double[] array and
+   * divides by total count at output time, similar to the fast numeric merge path.
+   */
+  private List<Page> mergeAggregationFastMixed(
+      List<List<Page>> shardResults,
+      int numGroupByCols,
+      int numAggCols,
+      List<Type> columnTypes,
+      List<String> aggregateFunctions) {
+
+    int totalCols = numGroupByCols + numAggCols;
+
+    // Classify keys: which are varchar, which are numeric
+    boolean[] isVarcharKey = new boolean[numGroupByCols];
+    for (int k = 0; k < numGroupByCols; k++) {
+      isVarcharKey[k] = columnTypes.get(k) instanceof VarcharType;
+    }
+
+    // Classify aggregates: identify AVG columns and their companion COUNT column
+    boolean[] isAvgAgg = new boolean[numAggCols];
+    int countAggIdx = -1;
+    for (int a = 0; a < numAggCols; a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (m.matches()) {
+        String funcName = m.group(1).toUpperCase(Locale.ROOT);
+        if ("AVG".equals(funcName)) {
+          isAvgAgg[a] = true;
+        } else if ("COUNT".equals(funcName) && m.group(2) == null) {
+          countAggIdx = a;
+        }
+      }
+    }
+    boolean hasAvg = false;
+    for (boolean b : isAvgAgg) {
+      if (b) {
+        hasAvg = true;
+        break;
+      }
+    }
+
+    // Estimate initial capacity
+    int estimatedGroups = 0;
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        estimatedGroups += page.getPositionCount();
+      }
+    }
+
+    // HashMap with compound key -> long[] aggs (+ double[] for AVG)
+    java.util.HashMap<MixedMergeKey, long[]> groups =
+        new java.util.HashMap<>(Math.max(estimatedGroups * 3 / 4, 16));
+    // Parallel double map for AVG weighted sums (only allocated if needed)
+    java.util.HashMap<MixedMergeKey, double[]> doubleGroups =
+        hasAvg ? new java.util.HashMap<>() : null;
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+
+        Block[] keyBlocks = new Block[numGroupByCols];
+        for (int k = 0; k < numGroupByCols; k++) {
+          keyBlocks[k] = page.getBlock(k);
+        }
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(numGroupByCols + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          // Build compound key
+          long[] numericKeys = new long[numGroupByCols];
+          io.airlift.slice.Slice[] sliceKeys = new io.airlift.slice.Slice[numGroupByCols];
+          int hash = 1;
+          for (int k = 0; k < numGroupByCols; k++) {
+            if (isVarcharKey[k]) {
+              io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(keyBlocks[k], pos);
+              sliceKeys[k] = slice;
+              hash = hash * 31 + slice.hashCode();
+            } else {
+              long val = columnTypes.get(k).getLong(keyBlocks[k], pos);
+              numericKeys[k] = val;
+              hash = hash * 31 + Long.hashCode(val);
+            }
+          }
+
+          MixedMergeKey key = new MixedMergeKey(numericKeys, sliceKeys, isVarcharKey, hash);
+
+          long[] aggs = groups.get(key);
+          if (aggs == null) {
+            aggs = new long[numAggCols];
+            groups.put(key, aggs);
+            if (hasAvg) {
+              doubleGroups.put(key, new double[numAggCols]);
+            }
+          }
+
+          // Accumulate
+          for (int a = 0; a < numAggCols; a++) {
+            if (isAvgAgg[a]) {
+              // AVG: weighted accumulation
+              double avg = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+              long count =
+                  countAggIdx >= 0 ? BigintType.BIGINT.getLong(aggBlocks[countAggIdx], pos) : 1;
+              double[] dAggs = doubleGroups.get(key);
+              dAggs[a] += avg * count;
+            } else {
+              aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+            }
+          }
+        }
+      }
+    }
+
+    if (groups.isEmpty()) return List.of();
+
+    // Build output Page
+    int groupCount = groups.size();
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    for (int k = 0; k < numGroupByCols; k++) {
+      builders[k] = columnTypes.get(k).createBlockBuilder(null, groupCount);
+    }
+    for (int a = 0; a < numAggCols; a++) {
+      Type outType = isAvgAgg[a] ? DoubleType.DOUBLE : BigintType.BIGINT;
+      builders[numGroupByCols + a] = outType.createBlockBuilder(null, groupCount);
+    }
+
+    for (java.util.Map.Entry<MixedMergeKey, long[]> entry : groups.entrySet()) {
+      MixedMergeKey key = entry.getKey();
+      long[] aggs = entry.getValue();
+
+      // Write keys
+      for (int k = 0; k < numGroupByCols; k++) {
+        if (isVarcharKey[k]) {
+          VarcharType.VARCHAR.writeSlice(builders[k], key.sliceKeys[k]);
+        } else {
+          columnTypes.get(k).writeLong(builders[k], key.numericKeys[k]);
+        }
+      }
+
+      // Write aggregates
+      for (int a = 0; a < numAggCols; a++) {
+        if (isAvgAgg[a]) {
+          double[] dAggs = doubleGroups.get(key);
+          // Get total count from the companion COUNT column
+          long totalCount = countAggIdx >= 0 ? aggs[countAggIdx] : 1;
+          double avg = totalCount > 0 ? dAggs[a] / totalCount : 0.0;
+          DoubleType.DOUBLE.writeDouble(builders[numGroupByCols + a], avg);
+        } else {
+          BigintType.BIGINT.writeLong(builders[numGroupByCols + a], aggs[a]);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Compound key for mixed numeric+varchar GROUP BY merge. Stores numeric keys as longs and varchar
+   * keys as Slices (avoiding String allocation). Pre-computes hashCode for fast HashMap lookups.
+   */
+  private static final class MixedMergeKey {
+    final long[] numericKeys;
+    final io.airlift.slice.Slice[] sliceKeys;
+    final boolean[] isVarchar;
+    private final int hash;
+
+    MixedMergeKey(
+        long[] numericKeys, io.airlift.slice.Slice[] sliceKeys, boolean[] isVarchar, int hash) {
+      this.numericKeys = numericKeys;
+      this.sliceKeys = sliceKeys;
+      this.isVarchar = isVarchar;
+      this.hash = hash;
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (!(obj instanceof MixedMergeKey other)) return false;
+      if (this.hash != other.hash) return false;
+      for (int i = 0; i < isVarchar.length; i++) {
+        if (isVarchar[i]) {
+          if (!sliceKeys[i].equals(other.sliceKeys[i])) return false;
+        } else {
+          if (numericKeys[i] != other.numericKeys[i]) return false;
+        }
+      }
+      return true;
+    }
   }
 
   /**

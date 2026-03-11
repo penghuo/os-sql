@@ -502,6 +502,13 @@ public final class FusedGroupByAggregate {
     }
     final boolean anyTrunc = hasTrunc;
 
+    // Fast path: single numeric key with no DATE_TRUNC — uses open-addressing hash map
+    // with single long key array, eliminating SegmentGroupKey, NumericProbeKey, and HashMap.Entry
+    // allocation per group. Particularly effective for COUNT(DISTINCT) per group (Q9).
+    if (keyInfos.size() == 1 && !anyTrunc) {
+      return executeSingleKeyNumeric(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+    }
+
     // Fast path: two numeric keys with no DATE_TRUNC — uses open-addressing hash map
     // with parallel arrays, eliminating SegmentGroupKey, AccumulatorGroup, and HashMap.Entry
     // allocation per group. This is ~2x faster for high-cardinality two-key GROUP BY (Q31/Q32).
@@ -633,6 +640,220 @@ public final class FusedGroupByAggregate {
       blocks[i] = builders[i].build();
     }
 
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Specialized fast path for GROUP BY with exactly one numeric key. Uses an open-addressing hash
+   * map with a single long key array and AccumulatorGroup array, eliminating SegmentGroupKey,
+   * NumericProbeKey, and HashMap.Entry overhead.
+   *
+   * <p>For single-key GROUP BY with COUNT(DISTINCT) (Q9: GROUP BY RegionID, COUNT(DISTINCT
+   * UserID)), this avoids:
+   *
+   * <ul>
+   *   <li>NumericProbeKey allocation + reset + computeHash per document
+   *   <li>SegmentGroupKey wrapping (long[] + boolean[] + hash) per new group
+   *   <li>HashMap.Entry per group
+   * </ul>
+   *
+   * <p>The hash function uses the Murmur3 finalizer for good distribution of correlated long keys
+   * (e.g., RegionID values that are sequential integers).
+   */
+  private static List<Page> executeSingleKeyNumeric(
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys)
+      throws Exception {
+
+    final int numAggs = specs.size();
+    final boolean[] isCountStar = new boolean[numAggs];
+    final boolean[] isDoubleArg = new boolean[numAggs];
+    final int[] accType = new int[numAggs];
+
+    for (int i = 0; i < numAggs; i++) {
+      AggSpec spec = specs.get(i);
+      isCountStar[i] = "*".equals(spec.arg);
+      isDoubleArg[i] = spec.argType instanceof DoubleType;
+      if (isCountStar[i]) {
+        accType[i] = 0;
+      } else {
+        switch (spec.funcName) {
+          case "COUNT":
+            accType[i] = spec.isDistinct ? 5 : 0;
+            break;
+          case "SUM":
+            accType[i] = isDoubleArg[i] ? 6 : 1;
+            break;
+          case "AVG":
+            accType[i] = isDoubleArg[i] ? 7 : 2;
+            break;
+          case "MIN":
+            accType[i] = 3;
+            break;
+          case "MAX":
+            accType[i] = 4;
+            break;
+        }
+      }
+    }
+
+    final SingleKeyHashMap singleKeyMap = new SingleKeyHashMap(specs);
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-numeric-1key")) {
+
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              SortedNumericDocValues dv0 =
+                  context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
+
+              final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+              final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i]) {
+                  AggSpec spec = specs.get(i);
+                  if (spec.argType instanceof VarcharType) {
+                    varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
+                  } else {
+                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                  }
+                }
+              }
+
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  long key0 = 0;
+                  if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+                  AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+
+                  // Inline accumulation with pre-computed dispatch flags
+                  for (int i = 0; i < numAggs; i++) {
+                    MergeableAccumulator acc = accGroup.accumulators[i];
+                    if (isCountStar[i]) {
+                      ((CountStarAccum) acc).count++;
+                      continue;
+                    }
+                    // Handle varchar aggregate args (e.g., MIN(Referer))
+                    if (varcharAggDvs[i] != null) {
+                      SortedSetDocValues varcharDv = varcharAggDvs[i];
+                      if (varcharDv.advanceExact(doc)) {
+                        BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+                        String val = bytes.utf8ToString();
+                        if (acc instanceof CountDistinctAccum cda) {
+                          cda.objectDistinctValues.add(val);
+                        } else if (acc instanceof MinAccum ma) {
+                          if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                            ma.objectVal = val;
+                            ma.hasValue = true;
+                          }
+                        } else if (acc instanceof MaxAccum xa) {
+                          if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                            xa.objectVal = val;
+                            xa.hasValue = true;
+                          }
+                        }
+                      }
+                      continue;
+                    }
+                    SortedNumericDocValues aggDv = numericAggDvs[i];
+                    if (aggDv != null && aggDv.advanceExact(doc)) {
+                      long rawVal = aggDv.nextValue();
+                      switch (accType[i]) {
+                        case 0:
+                          ((CountStarAccum) acc).count++;
+                          break;
+                        case 1: // SUM long
+                          SumAccum sa = (SumAccum) acc;
+                          sa.hasValue = true;
+                          sa.longSum += rawVal;
+                          break;
+                        case 2: // AVG long
+                          AvgAccum aa = (AvgAccum) acc;
+                          aa.count++;
+                          aa.longSum += rawVal;
+                          break;
+                        case 3: // MIN
+                          MinAccum ma = (MinAccum) acc;
+                          ma.hasValue = true;
+                          if (isDoubleArg[i]) {
+                            double d = Double.longBitsToDouble(rawVal);
+                            if (d < ma.doubleVal) ma.doubleVal = d;
+                          } else {
+                            if (rawVal < ma.longVal) ma.longVal = rawVal;
+                          }
+                          break;
+                        case 4: // MAX
+                          MaxAccum xa = (MaxAccum) acc;
+                          xa.hasValue = true;
+                          if (isDoubleArg[i]) {
+                            double d = Double.longBitsToDouble(rawVal);
+                            if (d > xa.doubleVal) xa.doubleVal = d;
+                          } else {
+                            if (rawVal > xa.longVal) xa.longVal = rawVal;
+                          }
+                          break;
+                        case 5: // COUNT(DISTINCT)
+                          CountDistinctAccum cda = (CountDistinctAccum) acc;
+                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                          else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                          break;
+                        case 6: // SUM double
+                          SumAccum sad = (SumAccum) acc;
+                          sad.hasValue = true;
+                          sad.doubleSum += Double.longBitsToDouble(rawVal);
+                          break;
+                        case 7: // AVG double
+                          AvgAccum aad = (AvgAccum) acc;
+                          aad.count++;
+                          aad.doubleSum += Double.longBitsToDouble(rawVal);
+                          break;
+                      }
+                    }
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    if (singleKeyMap.size == 0) return List.of();
+
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int groupCount = singleKeyMap.size;
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, groupCount);
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+    }
+    for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+      if (singleKeyMap.occupied[slot]) {
+        writeNumericKeyValue(builders[0], keyInfos.get(0), singleKeyMap.keys[slot]);
+        AccumulatorGroup accGroup = singleKeyMap.groups[slot];
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+        }
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
     return List.of(new Page(blocks));
   }
 
@@ -1535,6 +1756,106 @@ public final class FusedGroupByAggregate {
       h *= 0xff51afd7ed558ccdL;
       h ^= h >>> 33;
       return (int) h;
+    }
+  }
+
+  /**
+   * Open-addressing hash map with a single primitive long key. Uses linear probing with
+   * power-of-two capacity for fast modulo via bitmask. Stores keys in a long array and
+   * AccumulatorGroups in a parallel array, eliminating HashMap.Entry, SegmentGroupKey, and
+   * NumericProbeKey allocation per group. Hash function uses Murmur3 finalizer for good
+   * distribution of sequential integer keys (e.g., RegionID).
+   */
+  private static final class SingleKeyHashMap {
+    private static final int INITIAL_CAPACITY = 4096;
+    private static final float LOAD_FACTOR = 0.7f;
+
+    long[] keys;
+    AccumulatorGroup[] groups;
+    boolean[] occupied;
+    int size;
+    int capacity;
+    private int threshold;
+    private final List<AggSpec> specs;
+
+    SingleKeyHashMap(List<AggSpec> specs) {
+      this.specs = specs;
+      this.capacity = INITIAL_CAPACITY;
+      this.keys = new long[capacity];
+      this.groups = new AccumulatorGroup[capacity];
+      this.occupied = new boolean[capacity];
+      this.size = 0;
+      this.threshold = (int) (capacity * LOAD_FACTOR);
+    }
+
+    AccumulatorGroup getOrCreate(long key) {
+      int mask = capacity - 1;
+      int slot = hash1(key) & mask;
+      while (occupied[slot]) {
+        if (keys[slot] == key) {
+          return groups[slot];
+        }
+        slot = (slot + 1) & mask;
+      }
+      // New entry
+      AccumulatorGroup accGroup = createAccumulatorGroup(specs);
+      keys[slot] = key;
+      groups[slot] = accGroup;
+      occupied[slot] = true;
+      size++;
+      if (size > threshold) {
+        resize();
+        return getExisting(key);
+      }
+      return accGroup;
+    }
+
+    private AccumulatorGroup getExisting(long key) {
+      int mask = capacity - 1;
+      int slot = hash1(key) & mask;
+      while (occupied[slot]) {
+        if (keys[slot] == key) {
+          return groups[slot];
+        }
+        slot = (slot + 1) & mask;
+      }
+      throw new IllegalStateException("Key not found after resize");
+    }
+
+    private void resize() {
+      int newCapacity = capacity * 2;
+      long[] newKeys = new long[newCapacity];
+      AccumulatorGroup[] newGroups = new AccumulatorGroup[newCapacity];
+      boolean[] newOccupied = new boolean[newCapacity];
+      int newMask = newCapacity - 1;
+
+      for (int i = 0; i < capacity; i++) {
+        if (occupied[i]) {
+          int slot = hash1(keys[i]) & newMask;
+          while (newOccupied[slot]) {
+            slot = (slot + 1) & newMask;
+          }
+          newKeys[slot] = keys[i];
+          newGroups[slot] = groups[i];
+          newOccupied[slot] = true;
+        }
+      }
+
+      this.keys = newKeys;
+      this.groups = newGroups;
+      this.occupied = newOccupied;
+      this.capacity = newCapacity;
+      this.threshold = (int) (newCapacity * LOAD_FACTOR);
+    }
+
+    /** Hash a single long key using Murmur3 finalizer for good distribution. */
+    private static int hash1(long key) {
+      key ^= key >>> 33;
+      key *= 0xff51afd7ed558ccdL;
+      key ^= key >>> 33;
+      key *= 0xc4ceb9fe1a85ec53L;
+      key ^= key >>> 33;
+      return (int) key;
     }
   }
 

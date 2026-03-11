@@ -7,16 +7,22 @@ package org.opensearch.sql.dqe.function.expression;
 
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
-import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.ByteArrayBlock;
+import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.ComparisonExpression;
+import java.util.Optional;
 
 /**
  * Vectorized comparison expression. Evaluates two child expressions and compares them position by
  * position, producing a BOOLEAN output Block. Supports NULL propagation.
+ *
+ * <p>Uses direct {@link ByteArrayBlock} construction instead of {@code BlockBuilder} for reduced
+ * overhead. Includes specialized fast paths for BIGINT-only comparisons (the most common case in
+ * ClickBench filter predicates).
  */
 public class ComparisonBlockExpression implements BlockExpression {
 
@@ -24,11 +30,28 @@ public class ComparisonBlockExpression implements BlockExpression {
   private final BlockExpression left;
   private final BlockExpression right;
 
+  /** Pre-computed flags for fast-path selection (avoid repeated instanceof checks). */
+  private final boolean bothLong;
+
+  private final boolean bothDouble;
+  private final boolean eitherDouble;
+
   public ComparisonBlockExpression(
       ComparisonExpression.Operator operator, BlockExpression left, BlockExpression right) {
     this.operator = operator;
     this.left = left;
     this.right = right;
+
+    Type leftType = left.getType();
+    Type rightType = right.getType();
+    boolean leftIsLong = isLongType(leftType);
+    boolean rightIsLong = isLongType(rightType);
+    boolean leftIsDouble = leftType instanceof DoubleType;
+    boolean rightIsDouble = rightType instanceof DoubleType;
+
+    this.bothLong = leftIsLong && rightIsLong;
+    this.bothDouble = leftIsDouble && rightIsDouble;
+    this.eitherDouble = leftIsDouble || rightIsDouble;
   }
 
   @Override
@@ -36,18 +59,239 @@ public class ComparisonBlockExpression implements BlockExpression {
     Block leftBlock = left.evaluate(page);
     Block rightBlock = right.evaluate(page);
     int positionCount = page.getPositionCount();
-    BlockBuilder builder = BooleanType.BOOLEAN.createBlockBuilder(null, positionCount);
+
+    // Fast path: both sides are long-backed types (BIGINT, INTEGER, TIMESTAMP, etc.)
+    if (bothLong) {
+      return evaluateLongLong(leftBlock, rightBlock, positionCount);
+    }
+
+    // Fast path: both sides are DOUBLE
+    if (bothDouble) {
+      return evaluateDoubleDouble(leftBlock, rightBlock, positionCount);
+    }
+
+    // Fast path: numeric with at least one DOUBLE (promote to double)
+    if (eitherDouble) {
+      return evaluateNumericDouble(leftBlock, rightBlock, positionCount);
+    }
+
+    // General path for VARCHAR, BOOLEAN, and mixed types
+    return evaluateGeneral(leftBlock, rightBlock, positionCount);
+  }
+
+  /** Fast path for BIGINT vs BIGINT (or any long-backed type pair). No type dispatch per row. */
+  private Block evaluateLongLong(Block leftBlock, Block rightBlock, int positionCount) {
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNulls = leftBlock.mayHaveNull() || rightBlock.mayHaveNull();
+
+    if (hasNulls) {
+      nulls = new boolean[positionCount];
+      switch (operator) {
+        case EQUAL:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l == r ? 1 : 0);
+            }
+          }
+          break;
+        case NOT_EQUAL:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l != r ? 1 : 0);
+            }
+          }
+          break;
+        case LESS_THAN:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l < r ? 1 : 0);
+            }
+          }
+          break;
+        case LESS_THAN_OR_EQUAL:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l <= r ? 1 : 0);
+            }
+          }
+          break;
+        case GREATER_THAN:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l > r ? 1 : 0);
+            }
+          }
+          break;
+        case GREATER_THAN_OR_EQUAL:
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+              nulls[pos] = true;
+            } else {
+              long l = left.getType().getLong(leftBlock, pos);
+              long r = right.getType().getLong(rightBlock, pos);
+              values[pos] = (byte) (l >= r ? 1 : 0);
+            }
+          }
+          break;
+        default:
+          throw new UnsupportedOperationException("Unsupported comparison operator: " + operator);
+      }
+      return new ByteArrayBlock(positionCount, Optional.of(nulls), values);
+    }
+
+    // No nulls possible: tight loop without null checks
+    switch (operator) {
+      case EQUAL:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l == r ? 1 : 0);
+        }
+        break;
+      case NOT_EQUAL:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l != r ? 1 : 0);
+        }
+        break;
+      case LESS_THAN:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l < r ? 1 : 0);
+        }
+        break;
+      case LESS_THAN_OR_EQUAL:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l <= r ? 1 : 0);
+        }
+        break;
+      case GREATER_THAN:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l > r ? 1 : 0);
+        }
+        break;
+      case GREATER_THAN_OR_EQUAL:
+        for (int pos = 0; pos < positionCount; pos++) {
+          long l = left.getType().getLong(leftBlock, pos);
+          long r = right.getType().getLong(rightBlock, pos);
+          values[pos] = (byte) (l >= r ? 1 : 0);
+        }
+        break;
+      default:
+        throw new UnsupportedOperationException("Unsupported comparison operator: " + operator);
+    }
+    return new ByteArrayBlock(positionCount, Optional.empty(), values);
+  }
+
+  /** Fast path for DOUBLE vs DOUBLE. */
+  private Block evaluateDoubleDouble(Block leftBlock, Block rightBlock, int positionCount) {
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNulls = leftBlock.mayHaveNull() || rightBlock.mayHaveNull();
+
+    if (hasNulls) {
+      nulls = new boolean[positionCount];
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+          nulls[pos] = true;
+        } else {
+          double l = DoubleType.DOUBLE.getDouble(leftBlock, pos);
+          double r = DoubleType.DOUBLE.getDouble(rightBlock, pos);
+          values[pos] = (byte) (applyOperator(Double.compare(l, r)) ? 1 : 0);
+        }
+      }
+      return new ByteArrayBlock(positionCount, Optional.of(nulls), values);
+    }
 
     for (int pos = 0; pos < positionCount; pos++) {
-      if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
-        builder.appendNull();
-      } else {
-        int cmp = compareAt(leftBlock, rightBlock, pos);
-        boolean result = applyOperator(cmp);
-        BooleanType.BOOLEAN.writeBoolean(builder, result);
-      }
+      double l = DoubleType.DOUBLE.getDouble(leftBlock, pos);
+      double r = DoubleType.DOUBLE.getDouble(rightBlock, pos);
+      values[pos] = (byte) (applyOperator(Double.compare(l, r)) ? 1 : 0);
     }
-    return builder.build();
+    return new ByteArrayBlock(positionCount, Optional.empty(), values);
+  }
+
+  /** Numeric path with DOUBLE promotion (one side is DOUBLE). */
+  private Block evaluateNumericDouble(Block leftBlock, Block rightBlock, int positionCount) {
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNulls = leftBlock.mayHaveNull() || rightBlock.mayHaveNull();
+    Type leftType = left.getType();
+    Type rightType = right.getType();
+
+    if (hasNulls) {
+      nulls = new boolean[positionCount];
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+          nulls[pos] = true;
+        } else {
+          double l = readNumeric(leftBlock, pos, leftType);
+          double r = readNumeric(rightBlock, pos, rightType);
+          values[pos] = (byte) (applyOperator(Double.compare(l, r)) ? 1 : 0);
+        }
+      }
+      return new ByteArrayBlock(positionCount, Optional.of(nulls), values);
+    }
+
+    for (int pos = 0; pos < positionCount; pos++) {
+      double l = readNumeric(leftBlock, pos, leftType);
+      double r = readNumeric(rightBlock, pos, rightType);
+      values[pos] = (byte) (applyOperator(Double.compare(l, r)) ? 1 : 0);
+    }
+    return new ByteArrayBlock(positionCount, Optional.empty(), values);
+  }
+
+  /** General path for VARCHAR, BOOLEAN, and mixed types. */
+  private Block evaluateGeneral(Block leftBlock, Block rightBlock, int positionCount) {
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNulls = leftBlock.mayHaveNull() || rightBlock.mayHaveNull();
+
+    if (hasNulls) {
+      nulls = new boolean[positionCount];
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (leftBlock.isNull(pos) || rightBlock.isNull(pos)) {
+          nulls[pos] = true;
+        } else {
+          int cmp = compareAt(leftBlock, rightBlock, pos);
+          values[pos] = (byte) (applyOperator(cmp) ? 1 : 0);
+        }
+      }
+      return new ByteArrayBlock(positionCount, Optional.of(nulls), values);
+    }
+
+    for (int pos = 0; pos < positionCount; pos++) {
+      int cmp = compareAt(leftBlock, rightBlock, pos);
+      values[pos] = (byte) (applyOperator(cmp) ? 1 : 0);
+    }
+    return new ByteArrayBlock(positionCount, Optional.empty(), values);
   }
 
   @Override
@@ -80,7 +324,7 @@ public class ComparisonBlockExpression implements BlockExpression {
       return Boolean.compare(l, r);
     }
 
-    // Both numeric — promote to double if either is DOUBLE
+    // Both numeric -- promote to double if either is DOUBLE
     double l = readNumeric(leftBlock, pos, leftType);
     double r = readNumeric(rightBlock, pos, rightType);
     return Double.compare(l, r);
@@ -118,5 +362,15 @@ public class ComparisonBlockExpression implements BlockExpression {
       default:
         throw new UnsupportedOperationException("Unsupported comparison operator: " + operator);
     }
+  }
+
+  /** Check if a type stores values as long (BIGINT, INTEGER, TIMESTAMP, etc.). */
+  private static boolean isLongType(Type type) {
+    return type instanceof BigintType
+        || type instanceof io.trino.spi.type.IntegerType
+        || type instanceof io.trino.spi.type.SmallintType
+        || type instanceof io.trino.spi.type.TinyintType
+        || type instanceof io.trino.spi.type.TimestampType
+        || type instanceof io.trino.spi.type.DateType;
   }
 }

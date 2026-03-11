@@ -7,15 +7,21 @@ package org.opensearch.sql.dqe.function.expression;
 
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
-import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.ByteArrayBlock;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.List;
+import java.util.Optional;
 
-/** Vectorized IN expression. Checks if a value is a member of a set of values. */
+/**
+ * Vectorized IN expression. Checks if a value is a member of a set of values.
+ *
+ * <p>Uses direct {@link ByteArrayBlock} construction instead of {@code BlockBuilder} for reduced
+ * overhead.
+ */
 public class InBlockExpression implements BlockExpression {
 
   private final BlockExpression value;
@@ -32,11 +38,17 @@ public class InBlockExpression implements BlockExpression {
     Block[] listBlocks = inList.stream().map(e -> e.evaluate(page)).toArray(Block[]::new);
     int positionCount = page.getPositionCount();
     Type type = value.getType();
-    BlockBuilder builder = BooleanType.BOOLEAN.createBlockBuilder(null, positionCount);
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNulls = false;
 
     for (int pos = 0; pos < positionCount; pos++) {
       if (valueBlock.isNull(pos)) {
-        builder.appendNull();
+        if (nulls == null) {
+          nulls = new boolean[positionCount];
+        }
+        nulls[pos] = true;
+        hasNulls = true;
         continue;
       }
       boolean found = false;
@@ -52,14 +64,18 @@ public class InBlockExpression implements BlockExpression {
         }
       }
       if (found) {
-        BooleanType.BOOLEAN.writeBoolean(builder, true);
+        values[pos] = 1;
       } else if (hasNull) {
-        builder.appendNull();
-      } else {
-        BooleanType.BOOLEAN.writeBoolean(builder, false);
+        if (nulls == null) {
+          nulls = new boolean[positionCount];
+        }
+        nulls[pos] = true;
+        hasNulls = true;
       }
+      // else values[pos] stays 0 (false)
     }
-    return builder.build();
+    return new ByteArrayBlock(
+        positionCount, hasNulls ? Optional.of(nulls) : Optional.empty(), values);
   }
 
   @Override

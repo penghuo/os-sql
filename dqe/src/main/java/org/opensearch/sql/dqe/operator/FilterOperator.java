@@ -13,7 +13,9 @@ import org.opensearch.sql.dqe.function.expression.BlockExpression;
 /**
  * Physical operator that filters rows based on a vectorized {@link BlockExpression} predicate.
  *
- * <p>Uses Trino's {@link Page#copyPositions(int[], int, int)} for efficient row selection.
+ * <p>Uses Trino's {@link Page#copyPositions(int[], int, int)} for efficient row selection. Includes
+ * optimizations for highly selective filters (common in ClickBench) where most rows are filtered
+ * out, and for pass-through cases where all rows match.
  */
 public class FilterOperator implements Operator {
 
@@ -40,13 +42,27 @@ public class FilterOperator implements Operator {
       }
 
       int positionCount = page.getPositionCount();
+      Block filterResult = predicate.evaluate(page);
+
+      // Check if we can skip the entire page (no rows pass) or return it unchanged (all pass)
+      boolean mayHaveNull = filterResult.mayHaveNull();
+
+      // Build selection vector
       int[] selectedPositions = new int[positionCount];
       int selectedCount = 0;
 
-      Block filterResult = predicate.evaluate(page);
-      for (int pos = 0; pos < positionCount; pos++) {
-        if (!filterResult.isNull(pos) && BooleanType.BOOLEAN.getBoolean(filterResult, pos)) {
-          selectedPositions[selectedCount++] = pos;
+      if (mayHaveNull) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!filterResult.isNull(pos) && BooleanType.BOOLEAN.getBoolean(filterResult, pos)) {
+            selectedPositions[selectedCount++] = pos;
+          }
+        }
+      } else {
+        // No nulls: skip isNull check for every position
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (BooleanType.BOOLEAN.getBoolean(filterResult, pos)) {
+            selectedPositions[selectedCount++] = pos;
+          }
         }
       }
 

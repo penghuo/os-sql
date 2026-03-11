@@ -7,13 +7,17 @@ package org.opensearch.sql.dqe.function.expression;
 
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
-import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.ByteArrayBlock;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.Type;
+import java.util.Optional;
 
 /**
  * Vectorized AND expression with SQL three-valued NULL logic: true AND null = null, false AND null
  * = false.
+ *
+ * <p>Uses direct {@link ByteArrayBlock} construction instead of {@code BlockBuilder} for reduced
+ * overhead.
  */
 public class LogicalAndExpression implements BlockExpression {
 
@@ -30,29 +34,48 @@ public class LogicalAndExpression implements BlockExpression {
     Block leftBlock = left.evaluate(page);
     Block rightBlock = right.evaluate(page);
     int positionCount = page.getPositionCount();
-    BlockBuilder builder = BooleanType.BOOLEAN.createBlockBuilder(null, positionCount);
+    byte[] values = new byte[positionCount];
+    boolean[] nulls = null;
+    boolean hasNullOutput = false;
 
+    boolean leftMayHaveNull = leftBlock.mayHaveNull();
+    boolean rightMayHaveNull = rightBlock.mayHaveNull();
+
+    if (!leftMayHaveNull && !rightMayHaveNull) {
+      // Fast path: no nulls possible, pure boolean AND
+      for (int pos = 0; pos < positionCount; pos++) {
+        boolean leftVal = BooleanType.BOOLEAN.getBoolean(leftBlock, pos);
+        boolean rightVal = BooleanType.BOOLEAN.getBoolean(rightBlock, pos);
+        values[pos] = (byte) (leftVal && rightVal ? 1 : 0);
+      }
+      return new ByteArrayBlock(positionCount, Optional.empty(), values);
+    }
+
+    // General path with null handling
+    nulls = new boolean[positionCount];
     for (int pos = 0; pos < positionCount; pos++) {
-      boolean leftNull = leftBlock.isNull(pos);
-      boolean rightNull = rightBlock.isNull(pos);
+      boolean leftNull = leftMayHaveNull && leftBlock.isNull(pos);
+      boolean rightNull = rightMayHaveNull && rightBlock.isNull(pos);
       boolean leftVal = !leftNull && BooleanType.BOOLEAN.getBoolean(leftBlock, pos);
       boolean rightVal = !rightNull && BooleanType.BOOLEAN.getBoolean(rightBlock, pos);
 
       if (!leftNull && !leftVal) {
         // false AND anything = false
-        BooleanType.BOOLEAN.writeBoolean(builder, false);
+        values[pos] = 0;
       } else if (!rightNull && !rightVal) {
         // anything AND false = false
-        BooleanType.BOOLEAN.writeBoolean(builder, false);
+        values[pos] = 0;
       } else if (leftNull || rightNull) {
         // at least one null and neither is false -> null
-        builder.appendNull();
+        nulls[pos] = true;
+        hasNullOutput = true;
       } else {
         // both true
-        BooleanType.BOOLEAN.writeBoolean(builder, true);
+        values[pos] = 1;
       }
     }
-    return builder.build();
+    return new ByteArrayBlock(
+        positionCount, hasNullOutput ? Optional.of(nulls) : Optional.empty(), values);
   }
 
   @Override

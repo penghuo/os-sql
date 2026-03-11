@@ -50,6 +50,7 @@ import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
 import org.opensearch.sql.dqe.shard.source.ColumnHandle;
+import org.opensearch.sql.dqe.shard.source.FusedScanAggregate;
 import org.opensearch.sql.dqe.shard.source.LucenePageSource;
 import org.opensearch.sql.dqe.shard.source.LuceneQueryCompiler;
 import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
@@ -169,6 +170,19 @@ public class TransportShardExecuteAction
       if (scanFactory == null && isScalarCountStar(plan)) {
         List<Page> pages = executeScalarCountStar(plan, req);
         List<Type> columnTypes = List.of(BigintType.BIGINT);
+        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
+        return;
+      }
+
+      // 2b. Try fused scan-aggregate for scalar aggregations (no GROUP BY) —
+      // aggregates directly from DocValues without building intermediate Pages
+      if (scanFactory == null
+          && plan instanceof AggregationNode aggNode
+          && FusedScanAggregate.canFuse(aggNode)) {
+        List<Page> pages = executeFusedScanAggregate(aggNode, req);
+        List<Type> columnTypes =
+            FusedScanAggregate.resolveOutputTypes(
+                aggNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
         listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
         return;
       }
@@ -345,6 +359,31 @@ public class TransportShardExecuteAction
     BigintType.BIGINT.writeLong(builder, count);
     Block block = builder.build();
     return List.of(new Page(block));
+  }
+
+  /**
+   * Execute a fused scan-aggregate by aggregating directly from Lucene DocValues without building
+   * intermediate Trino Pages. This is used for scalar aggregations (no GROUP BY) like SUM(col),
+   * AVG(col), MIN(col), MAX(col), COUNT(DISTINCT col), and combinations thereof.
+   */
+  private List<Page> executeFusedScanAggregate(AggregationNode aggNode, ShardExecuteRequest req)
+      throws Exception {
+    TableScanNode scanNode = (TableScanNode) aggNode.getChild();
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query
+    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    Query luceneQuery =
+        (scanNode.getDslFilter() != null)
+            ? queryCompiler.compile(scanNode.getDslFilter())
+            : new MatchAllDocsQuery();
+
+    return FusedScanAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
 
   /**

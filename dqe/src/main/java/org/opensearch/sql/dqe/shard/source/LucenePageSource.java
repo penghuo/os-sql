@@ -46,6 +46,9 @@ public class LucenePageSource implements Operator {
   private int currentOffset;
   private boolean initialized;
 
+  /** Cached per-segment doc values reader, reused across batches within the same segment. */
+  private SegmentDocValuesReader currentSegmentReader;
+
   /**
    * Test constructor: accepts an IndexReader directly.
    *
@@ -101,6 +104,7 @@ public class LucenePageSource implements Operator {
         if (currentOffset >= seg.count) {
           currentSegment++;
           currentOffset = 0;
+          currentSegmentReader = null; // Invalidate cached reader for new segment
           continue;
         }
 
@@ -113,15 +117,17 @@ public class LucenePageSource implements Operator {
           return new Page(batchCount);
         }
 
+        // Lazily create or reuse the per-segment reader (caches iterators)
+        if (currentSegmentReader == null) {
+          currentSegmentReader = new SegmentDocValuesReader(seg.leaf, columns);
+        }
+
         BlockBuilder[] builders = new BlockBuilder[columns.size()];
         for (int c = 0; c < columns.size(); c++) {
           builders[c] = columns.get(c).type().createBlockBuilder(null, batchCount);
         }
 
-        for (int c = 0; c < columns.size(); c++) {
-          DocValuesReader.readColumn(
-              seg.leaf, columns.get(c), seg.docIds, currentOffset, batchCount, builders[c]);
-        }
+        currentSegmentReader.readBatch(seg.docIds, currentOffset, batchCount, builders);
 
         currentOffset += batchCount;
 

@@ -507,11 +507,23 @@ public class HashAggregationOperator implements Operator {
   public static class MinAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
-    private Object min = null;
+    private final boolean isLongType;
+    private final boolean isDoubleType;
+    private long longMin = Long.MAX_VALUE;
+    private double doubleMin = Double.MAX_VALUE;
+    private Object objectMin = null;
+    private boolean hasValue = false;
 
     public MinAccumulator(int columnIndex, Type inputType) {
       this.columnIndex = columnIndex;
       this.inputType = inputType;
+      this.isLongType =
+          inputType instanceof BigintType
+              || inputType instanceof IntegerType
+              || inputType instanceof SmallintType
+              || inputType instanceof TinyintType
+              || inputType instanceof TimestampType;
+      this.isDoubleType = inputType instanceof DoubleType;
     }
 
     @Override
@@ -520,20 +532,48 @@ public class HashAggregationOperator implements Operator {
       if (block.isNull(position)) {
         return;
       }
-      Object value = readValue(block, position, inputType);
-      if (min == null || compare(value, min) < 0) {
-        min = value;
+      hasValue = true;
+      if (isLongType) {
+        long val = inputType.getLong(block, position);
+        if (val < longMin) longMin = val;
+      } else if (isDoubleType) {
+        double val = DoubleType.DOUBLE.getDouble(block, position);
+        if (val < doubleMin) doubleMin = val;
+      } else {
+        Object value = readValue(block, position, inputType);
+        if (objectMin == null || compare(value, objectMin) < 0) {
+          objectMin = value;
+        }
       }
     }
 
     @Override
     public void addPage(Page page, int positionCount) {
       Block block = page.getBlock(columnIndex);
-      for (int pos = 0; pos < positionCount; pos++) {
-        if (!block.isNull(pos)) {
-          Object value = readValue(block, pos, inputType);
-          if (min == null || compare(value, min) < 0) {
-            min = value;
+      if (isLongType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            long val = inputType.getLong(block, pos);
+            if (val < longMin) longMin = val;
+          }
+        }
+      } else if (isDoubleType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            double val = DoubleType.DOUBLE.getDouble(block, pos);
+            if (val < doubleMin) doubleMin = val;
+          }
+        }
+      } else {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            Object value = readValue(block, pos, inputType);
+            if (objectMin == null || compare(value, objectMin) < 0) {
+              objectMin = value;
+            }
           }
         }
       }
@@ -546,10 +586,14 @@ public class HashAggregationOperator implements Operator {
 
     @Override
     public void writeTo(BlockBuilder builder) {
-      if (min == null) {
+      if (!hasValue) {
         builder.appendNull();
+      } else if (isLongType) {
+        writeValue(builder, inputType, longMin);
+      } else if (isDoubleType) {
+        DoubleType.DOUBLE.writeDouble(builder, doubleMin);
       } else {
-        writeValue(builder, inputType, min);
+        writeValue(builder, inputType, objectMin);
       }
     }
   }
@@ -558,11 +602,23 @@ public class HashAggregationOperator implements Operator {
   public static class MaxAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
-    private Object max = null;
+    private final boolean isLongType;
+    private final boolean isDoubleType;
+    private long longMax = Long.MIN_VALUE;
+    private double doubleMax = -Double.MAX_VALUE;
+    private Object objectMax = null;
+    private boolean hasValue = false;
 
     public MaxAccumulator(int columnIndex, Type inputType) {
       this.columnIndex = columnIndex;
       this.inputType = inputType;
+      this.isLongType =
+          inputType instanceof BigintType
+              || inputType instanceof IntegerType
+              || inputType instanceof SmallintType
+              || inputType instanceof TinyintType
+              || inputType instanceof TimestampType;
+      this.isDoubleType = inputType instanceof DoubleType;
     }
 
     @Override
@@ -571,20 +627,48 @@ public class HashAggregationOperator implements Operator {
       if (block.isNull(position)) {
         return;
       }
-      Object value = readValue(block, position, inputType);
-      if (max == null || compare(value, max) > 0) {
-        max = value;
+      hasValue = true;
+      if (isLongType) {
+        long val = inputType.getLong(block, position);
+        if (val > longMax) longMax = val;
+      } else if (isDoubleType) {
+        double val = DoubleType.DOUBLE.getDouble(block, position);
+        if (val > doubleMax) doubleMax = val;
+      } else {
+        Object value = readValue(block, position, inputType);
+        if (objectMax == null || compare(value, objectMax) > 0) {
+          objectMax = value;
+        }
       }
     }
 
     @Override
     public void addPage(Page page, int positionCount) {
       Block block = page.getBlock(columnIndex);
-      for (int pos = 0; pos < positionCount; pos++) {
-        if (!block.isNull(pos)) {
-          Object value = readValue(block, pos, inputType);
-          if (max == null || compare(value, max) > 0) {
-            max = value;
+      if (isLongType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            long val = inputType.getLong(block, pos);
+            if (val > longMax) longMax = val;
+          }
+        }
+      } else if (isDoubleType) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            double val = DoubleType.DOUBLE.getDouble(block, pos);
+            if (val > doubleMax) doubleMax = val;
+          }
+        }
+      } else {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            hasValue = true;
+            Object value = readValue(block, pos, inputType);
+            if (objectMax == null || compare(value, objectMax) > 0) {
+              objectMax = value;
+            }
           }
         }
       }
@@ -597,10 +681,14 @@ public class HashAggregationOperator implements Operator {
 
     @Override
     public void writeTo(BlockBuilder builder) {
-      if (max == null) {
+      if (!hasValue) {
         builder.appendNull();
+      } else if (isLongType) {
+        writeValue(builder, inputType, longMax);
+      } else if (isDoubleType) {
+        DoubleType.DOUBLE.writeDouble(builder, doubleMax);
       } else {
-        writeValue(builder, inputType, max);
+        writeValue(builder, inputType, objectMax);
       }
     }
   }

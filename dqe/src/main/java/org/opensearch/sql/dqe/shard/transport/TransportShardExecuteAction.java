@@ -46,7 +46,9 @@ import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
 import org.opensearch.sql.dqe.planner.plan.EvalNode;
+import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
+import org.opensearch.sql.dqe.planner.plan.SortNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
 import org.opensearch.sql.dqe.shard.source.ColumnHandle;
@@ -236,6 +238,96 @@ public class TransportShardExecuteAction
           FusedGroupByAggregate.resolveOutputTypes(
               aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
       return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Try fused GROUP BY with sort+limit: detect LimitNode -> [ProjectNode] -> SortNode ->
+    // AggregationNode pattern and use FusedGroupByAggregate for the aggregation, then apply
+    // sort+limit in-process. This avoids the generic operator pipeline (ScanOperator ->
+    // HashAggregationOperator) which is much slower than the fused DocValues path.
+    if (scanFactory == null) {
+      AggregationNode innerAgg = extractAggFromSortedLimit(plan);
+      if (innerAgg != null
+          && FusedGroupByAggregate.canFuse(
+              innerAgg, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+        Map<String, Type> colTypeMap = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+        List<Page> aggPages = executeFusedGroupByAggregate(innerAgg, req);
+        List<Type> aggColumnTypes = FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
+        // Apply sort+limit using SortOperator on the fused result
+        SortNode sortNode = extractSortNode(plan);
+        LimitNode limitNode = extractLimitNode(plan);
+        if (sortNode != null && limitNode != null && !aggPages.isEmpty()) {
+          // Resolve sort column indices against the aggregation output columns
+          List<String> aggOutputColumns = new ArrayList<>();
+          aggOutputColumns.addAll(innerAgg.getGroupByKeys());
+          aggOutputColumns.addAll(innerAgg.getAggregateFunctions());
+          List<Integer> sortIndices = new ArrayList<>();
+          for (String sortKey : sortNode.getSortKeys()) {
+            int idx = aggOutputColumns.indexOf(sortKey);
+            if (idx < 0) {
+              // Sort key not found in output — fall through to generic pipeline
+              sortIndices = null;
+              break;
+            }
+            sortIndices.add(idx);
+          }
+          if (sortIndices != null) {
+            long topN = limitNode.getCount() + limitNode.getOffset();
+            org.opensearch.sql.dqe.operator.SortOperator sortOp =
+                new org.opensearch.sql.dqe.operator.SortOperator(
+                    new org.opensearch.sql.dqe.operator.Operator() {
+                      int idx = 0;
+
+                      @Override
+                      public Page processNextBatch() {
+                        return idx < aggPages.size() ? aggPages.get(idx++) : null;
+                      }
+
+                      @Override
+                      public void close() {}
+                    },
+                    sortIndices,
+                    sortNode.getAscending(),
+                    sortNode.getNullsFirst(),
+                    aggColumnTypes,
+                    topN);
+            List<Page> sortedPages = new ArrayList<>();
+            Page p;
+            while ((p = sortOp.processNextBatch()) != null) {
+              sortedPages.add(p);
+            }
+            // Apply project if present (reorder/select columns to match coordinator expectation)
+            ProjectNode projNode = extractProjectNode(plan);
+            if (projNode != null) {
+              List<String> projColumns = projNode.getOutputColumns();
+              // Check if project just selects the same columns in the same order
+              if (!projColumns.equals(aggOutputColumns)) {
+                // Need to reorder columns
+                List<Integer> projIndices = new ArrayList<>();
+                for (String col : projColumns) {
+                  int idx = aggOutputColumns.indexOf(col);
+                  projIndices.add(idx >= 0 ? idx : 0);
+                }
+                List<Page> projectedPages = new ArrayList<>();
+                for (Page sp : sortedPages) {
+                  Block[] newBlocks = new Block[projIndices.size()];
+                  for (int i = 0; i < projIndices.size(); i++) {
+                    newBlocks[i] = sp.getBlock(projIndices.get(i));
+                  }
+                  projectedPages.add(new Page(newBlocks));
+                }
+                sortedPages = projectedPages;
+                // Reorder column types to match projection
+                List<Type> projTypes = new ArrayList<>();
+                for (int idx : projIndices) {
+                  projTypes.add(aggColumnTypes.get(idx));
+                }
+                aggColumnTypes = projTypes;
+              }
+            }
+            return new ShardExecuteResponse(sortedPages, aggColumnTypes);
+          }
+        }
+      }
     }
 
     // Resolve scan factory and column types
@@ -748,5 +840,40 @@ public class TransportShardExecuteAction
       return resolveColumnNames(children.get(0));
     }
     return List.of();
+  }
+
+  /**
+   * Extract the inner AggregationNode from a LimitNode -> [ProjectNode] -> SortNode ->
+   * AggregationNode pattern. Returns null if the plan doesn't match this pattern.
+   */
+  private static AggregationNode extractAggFromSortedLimit(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    DqePlanNode child = limit.getChild();
+    if (child instanceof ProjectNode proj) child = proj.getChild();
+    if (!(child instanceof SortNode sort)) return null;
+    DqePlanNode sortChild = sort.getChild();
+    if (sortChild instanceof AggregationNode agg) return agg;
+    return null;
+  }
+
+  /** Extract the SortNode from a LimitNode -> [ProjectNode] -> SortNode -> ... pattern. */
+  private static SortNode extractSortNode(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    DqePlanNode child = limit.getChild();
+    if (child instanceof ProjectNode proj) child = proj.getChild();
+    if (child instanceof SortNode sort) return sort;
+    return null;
+  }
+
+  /** Extract the LimitNode if the plan root is a LimitNode. */
+  private static LimitNode extractLimitNode(DqePlanNode plan) {
+    return plan instanceof LimitNode limit ? limit : null;
+  }
+
+  /** Extract the ProjectNode from a LimitNode -> ProjectNode -> ... pattern. */
+  private static ProjectNode extractProjectNode(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    if (limit.getChild() instanceof ProjectNode proj) return proj;
+    return null;
   }
 }

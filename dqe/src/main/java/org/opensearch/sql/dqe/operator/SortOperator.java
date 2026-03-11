@@ -98,28 +98,37 @@ public class SortOperator implements Operator {
       return null;
     }
 
-    int numColumns = pages.get(0).getChannelCount();
     int totalRows = pages.stream().mapToInt(Page::getPositionCount).sum();
 
-    // Materialize all rows into a combined page
-    BlockBuilder[] builders = new BlockBuilder[numColumns];
-    for (int col = 0; col < numColumns; col++) {
-      builders[col] = columnTypes.get(col).createBlockBuilder(null, totalRows);
-    }
+    // Fast path: single input page — skip the expensive copy into new BlockBuilders.
+    // This is the common case when the source is FusedGroupByAggregate (returns one Page)
+    // or any single-batch operator. For 100K+ groups this avoids 100K * numCols block
+    // append operations and the associated memory allocation.
+    Page combined;
+    if (pages.size() == 1) {
+      combined = pages.get(0);
+    } else {
+      int numColumns = pages.get(0).getChannelCount();
+      // Materialize all rows into a combined page
+      BlockBuilder[] builders = new BlockBuilder[numColumns];
+      for (int col = 0; col < numColumns; col++) {
+        builders[col] = columnTypes.get(col).createBlockBuilder(null, totalRows);
+      }
 
-    for (Page p : pages) {
-      for (int pos = 0; pos < p.getPositionCount(); pos++) {
-        for (int col = 0; col < numColumns; col++) {
-          columnTypes.get(col).appendTo(p.getBlock(col), pos, builders[col]);
+      for (Page p : pages) {
+        for (int pos = 0; pos < p.getPositionCount(); pos++) {
+          for (int col = 0; col < numColumns; col++) {
+            columnTypes.get(col).appendTo(p.getBlock(col), pos, builders[col]);
+          }
         }
       }
-    }
 
-    Block[] combinedBlocks = new Block[numColumns];
-    for (int i = 0; i < numColumns; i++) {
-      combinedBlocks[i] = builders[i].build();
+      Block[] combinedBlocks = new Block[numColumns];
+      for (int i = 0; i < numColumns; i++) {
+        combinedBlocks[i] = builders[i].build();
+      }
+      combined = new Page(combinedBlocks);
     }
-    Page combined = new Page(combinedBlocks);
 
     Comparator<Integer> comparator = buildComparator(combined);
 
@@ -176,30 +185,41 @@ public class SortOperator implements Operator {
     return combined.copyPositions(sortedPositions, 0, heapSize);
   }
 
+  /**
+   * Build a flat comparator that checks all sort keys in a single lambda, avoiding the overhead of
+   * chained thenComparing wrappers. Pre-fetches blocks and types into arrays for fast access.
+   */
   @SuppressWarnings("unchecked")
   private Comparator<Integer> buildComparator(Page page) {
-    Comparator<Integer> comparator = (a, b) -> 0;
-    for (int i = 0; i < sortColumnIndices.size(); i++) {
+    int numKeys = sortColumnIndices.size();
+    Block[] sortBlocks = new Block[numKeys];
+    Type[] sortTypes = new Type[numKeys];
+    boolean[] ascArr = new boolean[numKeys];
+    boolean[] nfArr = new boolean[numKeys];
+    for (int i = 0; i < numKeys; i++) {
       int colIdx = sortColumnIndices.get(i);
-      boolean asc = ascending.get(i);
-      boolean nf = nullsFirst.get(i);
-      Type type = columnTypes.get(colIdx);
-      Block block = page.getBlock(colIdx);
-
-      Comparator<Integer> colComparator =
-          (a, b) -> {
-            boolean aNull = block.isNull(a);
-            boolean bNull = block.isNull(b);
-            if (aNull && bNull) return 0;
-            if (aNull) return nf ? -1 : 1;
-            if (bNull) return nf ? 1 : -1;
-
-            int cmp = compareValues(block, a, b, type);
-            return asc ? cmp : -cmp;
-          };
-      comparator = comparator.thenComparing(colComparator);
+      sortBlocks[i] = page.getBlock(colIdx);
+      sortTypes[i] = columnTypes.get(colIdx);
+      ascArr[i] = ascending.get(i);
+      nfArr[i] = nullsFirst.get(i);
     }
-    return comparator;
+
+    return (a, b) -> {
+      for (int i = 0; i < numKeys; i++) {
+        Block blk = sortBlocks[i];
+        boolean aNull = blk.isNull(a);
+        boolean bNull = blk.isNull(b);
+        if (aNull && bNull) continue;
+        if (aNull) return nfArr[i] ? -1 : 1;
+        if (bNull) return nfArr[i] ? 1 : -1;
+
+        int cmp = compareValues(blk, a, b, sortTypes[i]);
+        if (cmp != 0) {
+          return ascArr[i] ? cmp : -cmp;
+        }
+      }
+      return 0;
+    };
   }
 
   private static int compareValues(Block block, int posA, int posB, Type type) {

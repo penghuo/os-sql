@@ -620,6 +620,11 @@ public class ResultMerger {
    * rows), uses a bounded max-heap (O(n log k)) instead of full sort (O(n log n)). For larger
    * limits, falls back to full sort.
    *
+   * <p>When the input is a single Page (common for post-aggregation sort), uses a zero-allocation
+   * block-level sort that compares values directly from Block objects using an index array,
+   * avoiding the expensive per-row Object[] extraction and boxing that dominates sort time for
+   * large result sets.
+   *
    * @param shardResults pages from each shard
    * @param sortColumnIndices column indices to sort by
    * @param ascending sort directions for each column
@@ -635,6 +640,14 @@ public class ResultMerger {
       List<Boolean> nullsFirst,
       List<Type> columnTypes,
       long limit) {
+
+    // Fast path: if all input is in a single Page, use block-level sort (no Object[] extraction).
+    // This is the common case for post-aggregation sort where mergeAggregation returns one Page.
+    Page singlePage = extractSinglePage(shardResults);
+    if (singlePage != null && singlePage.getPositionCount() > 0) {
+      return sortSinglePage(
+          singlePage, sortColumnIndices, ascending, nullsFirst, columnTypes, limit);
+    }
 
     int numCols = columnTypes.size();
 
@@ -684,6 +697,179 @@ public class ResultMerger {
     }
 
     return List.of(buildPage(limited, columnTypes));
+  }
+
+  /**
+   * Extract a single Page if the shard results contain exactly one non-empty page. Returns null if
+   * there are multiple non-empty pages or no pages at all.
+   */
+  private static Page extractSinglePage(List<List<Page>> shardResults) {
+    Page found = null;
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        if (page.getPositionCount() > 0) {
+          if (found != null) {
+            return null; // Multiple non-empty pages
+          }
+          found = page;
+        }
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Sort a single Page using block-level comparisons with an index array, avoiding per-row Object[]
+   * extraction. For small limits (LIMIT N with N much smaller than total rows), uses a bounded heap
+   * on position indices for O(n log k) selection. Otherwise, sorts all indices and takes top-k.
+   *
+   * <p>This avoids the dominant cost of the generic mergeSorted path: N * numCols Object
+   * allocations, N boxing operations for numeric types, and N String allocations for VARCHAR
+   * columns. Instead, comparisons are performed directly on Block data (getLong, getDouble,
+   * getSlice) and only the final k rows are materialized to the output Page.
+   */
+  private List<Page> sortSinglePage(
+      Page page,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      List<Boolean> nullsFirst,
+      List<Type> columnTypes,
+      long limit) {
+
+    int totalRows = page.getPositionCount();
+    int k = (int) Math.min(limit, totalRows);
+    if (k <= 0) {
+      return List.of();
+    }
+
+    // Pre-fetch sort column blocks and types for fast access
+    int numSortKeys = sortColumnIndices.size();
+    Block[] sortBlocks = new Block[numSortKeys];
+    Type[] sortTypes = new Type[numSortKeys];
+    boolean[] asc = new boolean[numSortKeys];
+    boolean[] nf = new boolean[numSortKeys];
+    for (int i = 0; i < numSortKeys; i++) {
+      int colIdx = sortColumnIndices.get(i);
+      sortBlocks[i] = page.getBlock(colIdx);
+      sortTypes[i] = columnTypes.get(colIdx);
+      asc[i] = ascending.get(i);
+      nf[i] = nullsFirst.get(i);
+    }
+
+    // Build a comparator on position indices that reads directly from blocks
+    java.util.Comparator<Integer> posComparator =
+        (pos1, pos2) -> {
+          for (int s = 0; s < numSortKeys; s++) {
+            Block blk = sortBlocks[s];
+            boolean null1 = blk.isNull(pos1);
+            boolean null2 = blk.isNull(pos2);
+            if (null1 && null2) continue;
+            if (null1) return nf[s] ? -1 : 1;
+            if (null2) return nf[s] ? 1 : -1;
+
+            int cmp;
+            Type t = sortTypes[s];
+            if (t instanceof BigintType
+                || t instanceof io.trino.spi.type.IntegerType
+                || t instanceof io.trino.spi.type.SmallintType
+                || t instanceof io.trino.spi.type.TinyintType
+                || t instanceof io.trino.spi.type.TimestampType) {
+              long v1 = t.getLong(blk, pos1);
+              long v2 = t.getLong(blk, pos2);
+              cmp = Long.compare(v1, v2);
+            } else if (t instanceof DoubleType) {
+              double v1 = DoubleType.DOUBLE.getDouble(blk, pos1);
+              double v2 = DoubleType.DOUBLE.getDouble(blk, pos2);
+              cmp = Double.compare(v1, v2);
+            } else if (t instanceof VarcharType) {
+              io.airlift.slice.Slice s1 = VarcharType.VARCHAR.getSlice(blk, pos1);
+              io.airlift.slice.Slice s2 = VarcharType.VARCHAR.getSlice(blk, pos2);
+              cmp = s1.compareTo(s2);
+            } else if (t instanceof BooleanType) {
+              boolean b1 = BooleanType.BOOLEAN.getBoolean(blk, pos1);
+              boolean b2 = BooleanType.BOOLEAN.getBoolean(blk, pos2);
+              cmp = Boolean.compare(b1, b2);
+            } else {
+              // Fallback: compare as longs
+              long v1 = t.getLong(blk, pos1);
+              long v2 = t.getLong(blk, pos2);
+              cmp = Long.compare(v1, v2);
+            }
+            if (cmp != 0) {
+              return asc[s] ? cmp : -cmp;
+            }
+          }
+          return 0;
+        };
+
+    // Select top-k positions
+    int[] selectedPositions;
+    if (k < totalRows / 2 && k < 10000) {
+      // Bounded heap on position indices: O(n log k)
+      PriorityQueue<Integer> heap = new PriorityQueue<>(k + 1, posComparator.reversed());
+      for (int pos = 0; pos < totalRows; pos++) {
+        heap.offer(pos);
+        if (heap.size() > k) {
+          heap.poll();
+        }
+      }
+      selectedPositions = new int[heap.size()];
+      int idx = heap.size() - 1;
+      while (!heap.isEmpty()) {
+        selectedPositions[idx--] = heap.poll();
+      }
+      // The heap gives us top-k in reverse order; sort the selected positions
+      Integer[] boxed = new Integer[selectedPositions.length];
+      for (int i = 0; i < selectedPositions.length; i++) boxed[i] = selectedPositions[i];
+      java.util.Arrays.sort(boxed, posComparator);
+      for (int i = 0; i < boxed.length; i++) selectedPositions[i] = boxed[i];
+    } else {
+      // Full sort: create index array and sort
+      Integer[] indices = new Integer[totalRows];
+      for (int i = 0; i < totalRows; i++) indices[i] = i;
+      java.util.Arrays.sort(indices, posComparator);
+      selectedPositions = new int[k];
+      for (int i = 0; i < k; i++) selectedPositions[i] = indices[i];
+    }
+
+    // Build output Page by copying selected positions from the source blocks
+    int numCols = columnTypes.size();
+    BlockBuilder[] builders = new BlockBuilder[numCols];
+    for (int col = 0; col < numCols; col++) {
+      builders[col] = columnTypes.get(col).createBlockBuilder(null, selectedPositions.length);
+    }
+
+    for (int pos : selectedPositions) {
+      for (int col = 0; col < numCols; col++) {
+        Block srcBlock = page.getBlock(col);
+        if (srcBlock.isNull(pos)) {
+          builders[col].appendNull();
+        } else {
+          Type t = columnTypes.get(col);
+          if (t instanceof BigintType) {
+            BigintType.BIGINT.writeLong(builders[col], BigintType.BIGINT.getLong(srcBlock, pos));
+          } else if (t instanceof DoubleType) {
+            DoubleType.DOUBLE.writeDouble(
+                builders[col], DoubleType.DOUBLE.getDouble(srcBlock, pos));
+          } else if (t instanceof VarcharType) {
+            VarcharType.VARCHAR.writeSlice(
+                builders[col], VarcharType.VARCHAR.getSlice(srcBlock, pos));
+          } else if (t instanceof BooleanType) {
+            BooleanType.BOOLEAN.writeBoolean(
+                builders[col], BooleanType.BOOLEAN.getBoolean(srcBlock, pos));
+          } else {
+            // Fallback for other types (integer, smallint, tinyint, timestamp)
+            t.writeLong(builders[col], t.getLong(srcBlock, pos));
+          }
+        }
+      }
+    }
+
+    Block[] blocks = new Block[numCols];
+    for (int i = 0; i < numCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
   }
 
   /** Extract a typed value from a Page at the given column and row position. */

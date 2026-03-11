@@ -84,6 +84,15 @@ public class TransportShardExecuteAction
   private static final ConcurrentHashMap<String, CachedIndexMeta> INDEX_META_CACHE =
       new ConcurrentHashMap<>();
 
+  /**
+   * Cache for compiled Lucene queries. When 8 shards of the same index execute concurrently with
+   * the same DSL filter, only the first shard compiles the filter; the rest reuse the compiled
+   * Query. The cache is small (typically one entry) and is cleared after each batch of queries by
+   * reusing the same key. Thread-safe via ConcurrentHashMap.
+   */
+  private static final ConcurrentHashMap<String, Query> LUCENE_QUERY_CACHE =
+      new ConcurrentHashMap<>();
+
   /** Holder for pre-computed index metadata used by shard execution. */
   private record CachedIndexMeta(
       TableInfo tableInfo,
@@ -311,12 +320,8 @@ public class TransportShardExecuteAction
       IndexShard shard =
           indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-      // 2. Compile Lucene query from DSL filter
-      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(fieldTypeMap);
-      Query query =
-          (node.getDslFilter() != null)
-              ? queryCompiler.compile(node.getDslFilter())
-              : new MatchAllDocsQuery();
+      // 2. Compile Lucene query from DSL filter (cached across concurrent shard executions)
+      Query query = compileOrCacheLuceneQuery(node.getDslFilter(), fieldTypeMap);
 
       // 3. Build column handles
       List<ColumnHandle> columns =
@@ -355,6 +360,28 @@ public class TransportShardExecuteAction
   }
 
   /**
+   * Compile a Lucene query from a DSL filter string, caching the result so that concurrent shard
+   * executions on the same node reuse the compiled query. The DSL filter string itself is used as
+   * the cache key. The cache is bounded (size 1 effectively) since all concurrent shards share the
+   * same filter. Thread-safe via ConcurrentHashMap.computeIfAbsent.
+   *
+   * @param dslFilter the OpenSearch DSL filter JSON string, or null for match-all
+   * @param fieldTypeMap field name to OS type string mapping for query compilation
+   * @return compiled Lucene Query
+   */
+  private Query compileOrCacheLuceneQuery(String dslFilter, Map<String, String> fieldTypeMap) {
+    if (dslFilter == null) {
+      return new MatchAllDocsQuery();
+    }
+    // Evict stale entries when cache grows beyond a reasonable size (one per unique query)
+    if (LUCENE_QUERY_CACHE.size() > 100) {
+      LUCENE_QUERY_CACHE.clear();
+    }
+    return LUCENE_QUERY_CACHE.computeIfAbsent(
+        dslFilter, filter -> new LuceneQueryCompiler(fieldTypeMap).compile(filter));
+  }
+
+  /**
    * Check if the shard plan is a scalar COUNT(*) pattern: AggregationNode(PARTIAL, groupBy=[],
    * aggs=["count(*)"]) -> TableScanNode with empty or no columns. This pattern can be
    * short-circuited with a direct Lucene count.
@@ -390,15 +417,10 @@ public class TransportShardExecuteAction
     IndexMetadata indexMeta = clusterService.state().metadata().index(scanNode.getIndexName());
     IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-    // Compile Lucene query from DSL filter
-    Query luceneQuery;
-    if (scanNode.getDslFilter() != null) {
-      CachedIndexMeta cachedMeta = getOrBuildIndexMeta(scanNode.getIndexName());
-      LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
-      luceneQuery = queryCompiler.compile(scanNode.getDslFilter());
-    } else {
-      luceneQuery = new MatchAllDocsQuery();
-    }
+    // Compile Lucene query from DSL filter (cached across concurrent shard executions)
+    CachedIndexMeta cachedMeta2 = getOrBuildIndexMeta(scanNode.getIndexName());
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta2.fieldTypeMap());
 
     // Execute count directly
     long count;
@@ -429,12 +451,9 @@ public class TransportShardExecuteAction
     IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
     IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-    // Compile Lucene query
-    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    // Compile Lucene query (cached across concurrent shard executions)
     Query luceneQuery =
-        (scanNode.getDslFilter() != null)
-            ? queryCompiler.compile(scanNode.getDslFilter())
-            : new MatchAllDocsQuery();
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedScanAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
@@ -456,12 +475,9 @@ public class TransportShardExecuteAction
     IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
     IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-    // Compile Lucene query
-    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    // Compile Lucene query (cached across concurrent shard executions)
     Query luceneQuery =
-        (scanNode.getDslFilter() != null)
-            ? queryCompiler.compile(scanNode.getDslFilter())
-            : new MatchAllDocsQuery();
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedScanAggregate.executeWithEval(
         aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
@@ -483,12 +499,9 @@ public class TransportShardExecuteAction
     IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
     IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-    // Compile Lucene query
-    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    // Compile Lucene query (cached across concurrent shard executions)
     Query luceneQuery =
-        (scanNode.getDslFilter() != null)
-            ? queryCompiler.compile(scanNode.getDslFilter())
-            : new MatchAllDocsQuery();
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
@@ -532,12 +545,9 @@ public class TransportShardExecuteAction
     IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
     IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
 
-    // Compile Lucene query
-    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    // Compile Lucene query (cached across concurrent shard executions)
     Query luceneQuery =
-        (scanNode.getDslFilter() != null)
-            ? queryCompiler.compile(scanNode.getDslFilter())
-            : new MatchAllDocsQuery();
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedScanAggregate.executeDistinctValues(columnName, shard, luceneQuery);
   }

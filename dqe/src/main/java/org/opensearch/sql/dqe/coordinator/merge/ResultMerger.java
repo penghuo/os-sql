@@ -473,16 +473,26 @@ public class ResultMerger {
   }
 
   /**
-   * Fast varchar merge: uses HashMap&lt;String, long[]&gt; to merge single-VARCHAR-key GROUP BY
-   * results with COUNT/SUM aggregates. Reads VARCHAR Slices directly from blocks and accumulates
-   * long values, avoiding GroupKey object allocation, Accumulator creation, and virtual dispatch
-   * per row.
+   * Fast varchar merge: uses HashMap&lt;Slice, long[]&gt; to merge single-VARCHAR-key GROUP BY
+   * results with COUNT/SUM aggregates. Uses Slice keys directly from blocks to avoid String
+   * intermediate allocation. Slices provide proper hashCode/equals and are written directly to
+   * BlockBuilder on output, eliminating double String-to-Slice conversion.
    */
   private List<Page> mergeAggregationFastVarchar(
       List<List<Page>> shardResults, int numGroupByCols, int numAggCols, List<Type> columnTypes) {
 
     int totalCols = numGroupByCols + numAggCols;
-    java.util.HashMap<String, long[]> groups = new java.util.HashMap<>();
+
+    // Estimate initial capacity from total rows across all shards
+    int estimatedGroups = 0;
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        estimatedGroups += page.getPositionCount();
+      }
+    }
+    // Groups <= total rows; use 75% as heuristic (many groups overlap across shards)
+    java.util.HashMap<io.airlift.slice.Slice, long[]> groups =
+        new java.util.HashMap<>(Math.max(estimatedGroups * 3 / 4, 16));
 
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
@@ -495,8 +505,11 @@ public class ResultMerger {
 
         for (int pos = 0; pos < positionCount; pos++) {
           if (keyBlock.isNull(pos)) continue;
-          String key = VarcharType.VARCHAR.getSlice(keyBlock, pos).toStringUtf8();
-          long[] aggs = groups.get(key);
+          // Use Slice directly as key — avoids String allocation and double conversion.
+          // Slice.copy() creates an independent copy since the block's backing array may
+          // be shared across positions.
+          io.airlift.slice.Slice keySlice = VarcharType.VARCHAR.getSlice(keyBlock, pos);
+          long[] aggs = groups.get(keySlice);
           if (aggs == null) {
             aggs = new long[numAggCols];
             for (int a = 0; a < numAggCols; a++) {
@@ -504,7 +517,8 @@ public class ResultMerger {
                 aggs[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
               }
             }
-            groups.put(key, aggs);
+            // Must copy the Slice since the source block may reuse memory
+            groups.put(keySlice.copy(), aggs);
           } else {
             for (int a = 0; a < numAggCols; a++) {
               if (!aggBlocks[a].isNull(pos)) {
@@ -527,9 +541,9 @@ public class ResultMerger {
       builders[numGroupByCols + a] = BigintType.BIGINT.createBlockBuilder(null, groupCount);
     }
 
-    for (java.util.Map.Entry<String, long[]> entry : groups.entrySet()) {
-      VarcharType.VARCHAR.writeSlice(
-          builders[0], io.airlift.slice.Slices.utf8Slice(entry.getKey()));
+    for (java.util.Map.Entry<io.airlift.slice.Slice, long[]> entry : groups.entrySet()) {
+      // Write Slice directly — no String intermediate needed
+      VarcharType.VARCHAR.writeSlice(builders[0], entry.getKey());
       long[] aggs = entry.getValue();
       for (int a = 0; a < numAggCols; a++) {
         BigintType.BIGINT.writeLong(builders[numGroupByCols + a], aggs[a]);

@@ -71,7 +71,8 @@ public class PlanFragmenter {
    * <ul>
    *   <li>PARTIAL: Strip Sort/Limit above aggregation (coordinator applies those after merge).
    *       Shard runs: [EvalNode →] AggregationNode(PARTIAL) → Filter → Scan.
-   *   <li>SINGLE (COUNT DISTINCT): Strip aggregation and above. Shard runs: Filter → Scan.
+   *   <li>SINGLE (COUNT DISTINCT): Strip aggregation and above. Shard runs: Filter → Scan. The
+   *       shard may detect scalar COUNT(DISTINCT) on numeric columns and pre-dedup values.
    * </ul>
    *
    * For non-aggregation queries: use the full plan.

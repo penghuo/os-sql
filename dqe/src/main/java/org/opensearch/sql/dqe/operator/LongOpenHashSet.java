@@ -32,7 +32,19 @@ public final class LongOpenHashSet {
   private boolean hasZero;
 
   public LongOpenHashSet() {
-    this.capacity = INITIAL_CAPACITY;
+    this(INITIAL_CAPACITY);
+  }
+
+  /**
+   * Create a set with the given initial capacity (rounded up to power of two). Use this when the
+   * expected number of elements is known to avoid resizing overhead.
+   *
+   * @param expectedElements expected number of distinct elements
+   */
+  public LongOpenHashSet(int expectedElements) {
+    int rawCapacity = Math.max(INITIAL_CAPACITY, (int) (expectedElements / LOAD_FACTOR) + 1);
+    // Round up to next power of two
+    this.capacity = Integer.highestOneBit(rawCapacity - 1) << 1;
     this.keys = new long[capacity];
     this.occupied = new boolean[capacity];
     this.size = 0;
@@ -79,6 +91,21 @@ public final class LongOpenHashSet {
   /** Return the number of distinct values in the set. */
   public int size() {
     return size;
+  }
+
+  /** Return the underlying keys array (for iteration). Non-null only at occupied positions. */
+  public long[] keys() {
+    return keys;
+  }
+
+  /** Return the occupied flags array (for iteration). */
+  public boolean[] occupied() {
+    return occupied;
+  }
+
+  /** Return whether the value 0 is in the set. */
+  public boolean hasZeroValue() {
+    return hasZero;
   }
 
   /**

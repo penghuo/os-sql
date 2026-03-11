@@ -690,6 +690,70 @@ public final class FusedScanAggregate {
   }
 
   /**
+   * Execute a fused scan to collect distinct values for a single numeric column, returning the
+   * distinct values themselves (not the count) as a single-column Page. This is used by the SINGLE
+   * COUNT(DISTINCT) coordinator merge: each shard returns its ~25K distinct values instead of all
+   * ~125K raw values, and the coordinator merges the much smaller distinct sets.
+   *
+   * @param columnName the column to collect distinct values from
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @return a list containing a single Page with the distinct values as a BigintType column
+   */
+  public static List<Page> executeDistinctValues(String columnName, IndexShard shard, Query query)
+      throws Exception {
+    LongOpenHashSet distinctSet = new LongOpenHashSet();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-values")) {
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              SortedNumericDocValues dv = context.reader().getSortedNumericDocValues(columnName);
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  if (dv != null && dv.advanceExact(doc)) {
+                    distinctSet.add(dv.nextValue());
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    // Build a Page with the distinct values
+    int distinctCount = distinctSet.size();
+    if (distinctCount == 0) {
+      return List.of();
+    }
+
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, distinctCount);
+    // Iterate through the LongOpenHashSet and write values
+    if (distinctSet.hasZeroValue()) {
+      BigintType.BIGINT.writeLong(builder, 0L);
+    }
+    long[] keys = distinctSet.keys();
+    boolean[] occupied = distinctSet.occupied();
+    for (int i = 0; i < keys.length; i++) {
+      if (occupied[i]) {
+        BigintType.BIGINT.writeLong(builder, keys[i]);
+      }
+    }
+    return List.of(new Page(builder.build()));
+  }
+
+  /**
    * COUNT(DISTINCT col) accumulator. Uses primitive LongOpenHashSet for numeric columns to avoid
    * Long boxing overhead (~200K boxing operations per shard for high-cardinality columns like
    * UserID). Falls back to HashSet&lt;Object&gt; for varchar and double types.

@@ -197,18 +197,24 @@ public class TransportTrinoSqlAction
                         // bypassing HashAggregationOperator construction.
                         mergedPages = mergeScalarAggregation(shardPages, aggNode, columnTypes);
                         // No sort/having needed for scalar aggregation
-                      } else if (coordinatorPlan instanceof AggregationNode aggNode
-                          && aggNode.getStep() == AggregationNode.Step.SINGLE) {
+                      } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
+                          && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
+                          && isScalarCountDistinctLong(singleCdAgg)) {
+                        // Fast path: scalar COUNT(DISTINCT numericCol) — shards already pre-deduped
+                        // values. Merge distinct value sets using LongOpenHashSet and count.
+                        mergedPages = mergeCountDistinctValues(shardPages);
+                      } else if (coordinatorPlan instanceof AggregationNode singleAgg
+                          && singleAgg.getStep() == AggregationNode.Step.SINGLE) {
                         // SINGLE aggregation: shards sent raw data, coordinator aggregates
                         List<String> shardColumnNames =
                             resolveColumnNames(shardFragments.get(0).shardPlan());
                         List<Page> rawPages = merger.mergePassthrough(shardPages);
                         mergedPages =
                             runCoordinatorAggregation(
-                                aggNode, rawPages, shardColumnNames, columnTypeMap);
+                                singleAgg, rawPages, shardColumnNames, columnTypeMap);
                         mergedPages =
                             applyCoordinatorSort(
-                                mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+                                mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
                       } else if (coordinatorPlan instanceof AggregationNode aggNode) {
                         mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
                         mergedPages =
@@ -1204,6 +1210,58 @@ public class TransportTrinoSqlAction
    */
   private static boolean isScalarPartialMerge(AggregationNode aggNode) {
     return aggNode.getStep() == AggregationNode.Step.FINAL && aggNode.getGroupByKeys().isEmpty();
+  }
+
+  /**
+   * Check if the coordinator aggregation node is a scalar COUNT(DISTINCT numericCol) in SINGLE
+   * mode. Shards have already pre-deduped values, so the coordinator can merge with
+   * LongOpenHashSet.
+   */
+  private static boolean isScalarCountDistinctLong(AggregationNode aggNode) {
+    if (!aggNode.getGroupByKeys().isEmpty()) {
+      return false;
+    }
+    List<String> aggs = aggNode.getAggregateFunctions();
+    if (aggs.size() != 1) {
+      return false;
+    }
+    String agg = aggs.get(0).toUpperCase(java.util.Locale.ROOT);
+    return agg.startsWith("COUNT(DISTINCT ");
+  }
+
+  /**
+   * Merge pre-deduplicated distinct value pages from all shards into a single COUNT(DISTINCT)
+   * result. Each shard sends a page of unique long values; the coordinator unions them via
+   * LongOpenHashSet and returns the count.
+   *
+   * @param shardPages pages from each shard, each containing distinct values as a BigintType column
+   * @return single-row page with the global distinct count
+   */
+  private static List<Page> mergeCountDistinctValues(List<List<Page>> shardPages) {
+    // Pre-compute total row count across all shards to pre-size the hash set.
+    // This avoids expensive resizing when inserting ~200K values.
+    int totalValues = 0;
+    for (List<Page> pages : shardPages) {
+      for (Page page : pages) {
+        totalValues += page.getPositionCount();
+      }
+    }
+    org.opensearch.sql.dqe.operator.LongOpenHashSet globalSet =
+        new org.opensearch.sql.dqe.operator.LongOpenHashSet(totalValues);
+    for (List<Page> pages : shardPages) {
+      for (Page page : pages) {
+        Block block = page.getBlock(0);
+        int positionCount = page.getPositionCount();
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            globalSet.add(BigintType.BIGINT.getLong(block, pos));
+          }
+        }
+      }
+    }
+    io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, globalSet.size());
+    return List.of(new Page(builder.build()));
   }
 
   /**

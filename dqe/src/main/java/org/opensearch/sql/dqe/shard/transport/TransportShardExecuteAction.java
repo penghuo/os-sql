@@ -198,6 +198,16 @@ public class TransportShardExecuteAction
       return new ShardExecuteResponse(pages, columnTypes);
     }
 
+    // Fast path: bare TableScanNode with single numeric column — pre-dedup for COUNT(DISTINCT).
+    // In the SINGLE aggregation path, the PlanFragmenter strips the AggregationNode, leaving a
+    // bare TableScanNode. For scalar COUNT(DISTINCT numericCol), the shard deduplicates locally
+    // (~25K distinct values instead of ~125K raw rows), reducing coordinator merge work by ~5x.
+    if (scanFactory == null && isBareSingleNumericColumnScan(plan)) {
+      List<Page> pages = executeDistinctValuesScan(plan, req);
+      List<Type> columnTypes = List.of(BigintType.BIGINT);
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
     // Try fused eval-aggregate for SUM(col + constant) patterns
     if (scanFactory == null
         && plan instanceof AggregationNode aggEvalNode
@@ -481,6 +491,55 @@ public class TransportShardExecuteAction
             : new MatchAllDocsQuery();
 
     return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+  }
+
+  /**
+   * Check if the shard plan is a bare TableScanNode with exactly one numeric (long-representable)
+   * column. This pattern results from the PlanFragmenter stripping a SINGLE COUNT(DISTINCT col)
+   * aggregation. In this case, the shard pre-deduplicates values locally to reduce coordinator
+   * merge work.
+   */
+  private boolean isBareSingleNumericColumnScan(DqePlanNode plan) {
+    if (!(plan instanceof TableScanNode scanNode)) {
+      return false;
+    }
+    List<String> columns = scanNode.getColumns();
+    if (columns.size() != 1) {
+      return false;
+    }
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(scanNode.getIndexName());
+    Type colType = cachedMeta.columnTypeMap().get(columns.get(0));
+    return colType instanceof BigintType
+        || colType instanceof io.trino.spi.type.IntegerType
+        || colType instanceof io.trino.spi.type.SmallintType
+        || colType instanceof io.trino.spi.type.TinyintType
+        || colType instanceof io.trino.spi.type.TimestampType;
+  }
+
+  /**
+   * Execute a fused distinct-values scan: read DocValues for the single column in the TableScanNode
+   * and return only the distinct values as a Page. This drastically reduces the data sent to the
+   * coordinator by pre-deduplicating at the shard level.
+   */
+  private List<Page> executeDistinctValuesScan(DqePlanNode plan, ShardExecuteRequest req)
+      throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query
+    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    Query luceneQuery =
+        (scanNode.getDslFilter() != null)
+            ? queryCompiler.compile(scanNode.getDslFilter())
+            : new MatchAllDocsQuery();
+
+    return FusedScanAggregate.executeDistinctValues(columnName, shard, luceneQuery);
   }
 
   /**

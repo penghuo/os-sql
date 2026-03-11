@@ -38,6 +38,7 @@ INDEX_NAME="hits"
 
 # --- Tier config ---
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-120}"  # seconds, applies to all tiers
+NUM_SHARDS_1M="${NUM_SHARDS_1M:-8}"    # primary shards for 1M index (8 is sweet spot)
 INDEX_NAME_1M="hits_1m"
 CH_TABLE_1M="hits_1m"
 SNAPSHOT_REPO="clickbench_repo"
@@ -249,11 +250,16 @@ load_1m_data() {
             log "OpenSearch '${INDEX_NAME_1M}' restored from snapshot."
         else
             log "Loading 1M rows into OpenSearch via bulk API ..."
-            # Create index
+            # Create index with configured shard count
             if ! curl -sf "${OS_URL}/${INDEX_NAME_1M}" >/dev/null 2>&1; then
+                # Merge shard count into the mapping JSON
+                local merged_mapping
+                merged_mapping=$(jq --argjson shards "$NUM_SHARDS_1M" \
+                    '.settings.index.number_of_shards = $shards' \
+                    "$mapping_file")
                 curl -sf -XPUT "${OS_URL}/${INDEX_NAME_1M}" \
                     -H 'Content-Type: application/json' \
-                    -d @"$mapping_file" | jq .
+                    -d "$merged_mapping" | jq .
             fi
 
             # Disable refresh during load

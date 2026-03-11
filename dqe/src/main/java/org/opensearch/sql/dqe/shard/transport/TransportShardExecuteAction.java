@@ -50,6 +50,7 @@ import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.executor.LocalExecutionPlanner;
 import org.opensearch.sql.dqe.shard.source.ColumnHandle;
+import org.opensearch.sql.dqe.shard.source.FusedGroupByAggregate;
 import org.opensearch.sql.dqe.shard.source.FusedScanAggregate;
 import org.opensearch.sql.dqe.shard.source.LucenePageSource;
 import org.opensearch.sql.dqe.shard.source.LuceneQueryCompiler;
@@ -183,6 +184,20 @@ public class TransportShardExecuteAction
         List<Type> columnTypes =
             FusedScanAggregate.resolveOutputTypes(
                 aggNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
+        return;
+      }
+
+      // 2c. Try fused ordinal-based GROUP BY for aggregations with string group keys —
+      // uses SortedSetDocValues ordinals as hash keys, deferring string resolution to output
+      if (scanFactory == null
+          && plan instanceof AggregationNode aggGroupNode
+          && FusedGroupByAggregate.canFuse(
+              aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+        List<Page> pages = executeFusedGroupByAggregate(aggGroupNode, req);
+        List<Type> columnTypes =
+            FusedGroupByAggregate.resolveOutputTypes(
+                aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
         listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
         return;
       }
@@ -384,6 +399,31 @@ public class TransportShardExecuteAction
             : new MatchAllDocsQuery();
 
     return FusedScanAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+  }
+
+  /**
+   * Execute a fused ordinal-based GROUP BY aggregation using SortedSetDocValues ordinals as hash
+   * keys during grouping. This avoids the expensive lookupOrd() per row, deferring string
+   * resolution to the final output phase.
+   */
+  private List<Page> executeFusedGroupByAggregate(AggregationNode aggNode, ShardExecuteRequest req)
+      throws Exception {
+    TableScanNode scanNode = (TableScanNode) aggNode.getChild();
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query
+    LuceneQueryCompiler queryCompiler = new LuceneQueryCompiler(cachedMeta.fieldTypeMap());
+    Query luceneQuery =
+        (scanNode.getDslFilter() != null)
+            ? queryCompiler.compile(scanNode.getDslFilter())
+            : new MatchAllDocsQuery();
+
+    return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
 
   /**

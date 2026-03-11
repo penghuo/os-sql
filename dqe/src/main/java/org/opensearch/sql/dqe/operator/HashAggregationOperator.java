@@ -175,17 +175,17 @@ public class HashAggregationOperator implements Operator {
       for (int pos = 0; pos < positionCount; pos++) {
         GroupKey groupKey = extractGroupKeyFast(groupBlocks, groupTypes, pos);
 
-        groups.computeIfAbsent(
-            groupKey,
-            k -> {
-              List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
-              for (AggregateFunction func : aggregateFunctions) {
-                accs.add(func.createAccumulator());
-              }
-              return accs;
-            });
+        List<Accumulator> accumulators =
+            groups.computeIfAbsent(
+                groupKey,
+                k -> {
+                  List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
+                  for (AggregateFunction func : aggregateFunctions) {
+                    accs.add(func.createAccumulator());
+                  }
+                  return accs;
+                });
 
-        List<Accumulator> accumulators = groups.get(groupKey);
         for (int i = 0; i < accumulators.size(); i++) {
           accumulators.get(i).add(page, pos);
         }

@@ -1106,7 +1106,6 @@ public class TransportTrinoSqlAction
     boolean[] isMinMax = new boolean[numAggs];
     boolean[] isMin = new boolean[numAggs];
     boolean[] isAvg = new boolean[numAggs];
-    Object[] minMaxValues = new Object[numAggs];
     // For AVG weighting: track companion COUNT column index
     int countColIdx = -1;
 
@@ -1133,6 +1132,26 @@ public class TransportTrinoSqlAction
       }
     }
 
+    // For MIN/MAX, track raw values to avoid type conversion issues.
+    // Long types (integers, timestamps) use long comparison.
+    // Double types use double comparison.
+    // VarcharType uses Slice-based comparison.
+    long[] minMaxLongValues = new long[numAggs];
+    double[] minMaxDoubleValues = new double[numAggs];
+    io.airlift.slice.Slice[] minMaxSliceValues = new io.airlift.slice.Slice[numAggs];
+    boolean[] minMaxInitialized = new boolean[numAggs];
+    boolean[] minMaxIsVarchar = new boolean[numAggs];
+    boolean[] minMaxIsDouble = new boolean[numAggs];
+    for (int a = 0; a < numAggs; a++) {
+      if (isMinMax[a]) {
+        if (columnTypes.get(a) instanceof VarcharType) {
+          minMaxIsVarchar[a] = true;
+        } else if (columnTypes.get(a) instanceof DoubleType) {
+          minMaxIsDouble[a] = true;
+        }
+      }
+    }
+
     // Merge values from all shards
     for (List<Page> pages : shardPages) {
       for (Page page : pages) {
@@ -1142,14 +1161,39 @@ public class TransportTrinoSqlAction
             if (block.isNull(pos)) continue;
 
             if (isMinMax[a]) {
-              Object val = extractValue(page, a, pos, columnTypes.get(a));
-              if (minMaxValues[a] == null) {
-                minMaxValues[a] = val;
+              if (minMaxIsVarchar[a]) {
+                // VARCHAR: compare Slices
+                io.airlift.slice.Slice val = VarcharType.VARCHAR.getSlice(block, pos);
+                if (!minMaxInitialized[a]) {
+                  minMaxSliceValues[a] = val;
+                  minMaxInitialized[a] = true;
+                } else {
+                  int cmp = val.compareTo(minMaxSliceValues[a]);
+                  if (isMin[a] ? cmp < 0 : cmp > 0) {
+                    minMaxSliceValues[a] = val;
+                  }
+                }
+              } else if (minMaxIsDouble[a]) {
+                // DOUBLE: compare doubles
+                double val = DoubleType.DOUBLE.getDouble(block, pos);
+                if (!minMaxInitialized[a]) {
+                  minMaxDoubleValues[a] = val;
+                  minMaxInitialized[a] = true;
+                } else {
+                  if (isMin[a] ? val < minMaxDoubleValues[a] : val > minMaxDoubleValues[a]) {
+                    minMaxDoubleValues[a] = val;
+                  }
+                }
               } else {
-                @SuppressWarnings("unchecked")
-                int cmp = ((Comparable<Object>) val).compareTo(minMaxValues[a]);
-                if (isMin[a] ? cmp < 0 : cmp > 0) {
-                  minMaxValues[a] = val;
+                // Long types (including TimestampType): compare raw longs
+                long val = columnTypes.get(a).getLong(block, pos);
+                if (!minMaxInitialized[a]) {
+                  minMaxLongValues[a] = val;
+                  minMaxInitialized[a] = true;
+                } else {
+                  if (isMin[a] ? val < minMaxLongValues[a] : val > minMaxLongValues[a]) {
+                    minMaxLongValues[a] = val;
+                  }
                 }
               }
             } else if (isAvg[a]) {
@@ -1197,10 +1241,14 @@ public class TransportTrinoSqlAction
     for (int a = 0; a < numAggs; a++) {
       builders[a] = columnTypes.get(a).createBlockBuilder(null, 1);
       if (isMinMax[a]) {
-        if (minMaxValues[a] == null) {
+        if (!minMaxInitialized[a]) {
           builders[a].appendNull();
+        } else if (minMaxIsVarchar[a]) {
+          VarcharType.VARCHAR.writeSlice(builders[a], minMaxSliceValues[a]);
+        } else if (minMaxIsDouble[a]) {
+          DoubleType.DOUBLE.writeDouble(builders[a], minMaxDoubleValues[a]);
         } else {
-          appendTypedValue(builders[a], columnTypes.get(a), minMaxValues[a]);
+          columnTypes.get(a).writeLong(builders[a], minMaxLongValues[a]);
         }
       } else if (isDouble[a] || isAvg[a]) {
         DoubleType.DOUBLE.writeDouble(builders[a], sumValues[a]);

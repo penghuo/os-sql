@@ -156,24 +156,35 @@ public class LucenePageSource implements Operator {
         new Collector() {
           @Override
           public LeafCollector getLeafCollector(LeafReaderContext context) {
-            List<Integer> docIdList = new ArrayList<>();
+            // Use a growable primitive int array to avoid Integer boxing overhead
             return new LeafCollector() {
+              private int[] docIdBuf = new int[1024];
+              private int docCount = 0;
+
               @Override
               public void setScorer(Scorable scorer) {}
 
               @Override
               public void collect(int doc) {
-                docIdList.add(doc);
+                if (docCount == docIdBuf.length) {
+                  int[] newBuf = new int[docIdBuf.length * 2];
+                  System.arraycopy(docIdBuf, 0, newBuf, 0, docCount);
+                  docIdBuf = newBuf;
+                }
+                docIdBuf[docCount++] = doc;
               }
 
               @Override
               public void finish() {
-                if (!docIdList.isEmpty()) {
-                  int[] docIds = new int[docIdList.size()];
-                  for (int i = 0; i < docIdList.size(); i++) {
-                    docIds[i] = docIdList.get(i);
+                if (docCount > 0) {
+                  int[] docIds;
+                  if (docCount == docIdBuf.length) {
+                    docIds = docIdBuf;
+                  } else {
+                    docIds = new int[docCount];
+                    System.arraycopy(docIdBuf, 0, docIds, 0, docCount);
                   }
-                  segments.add(new SegmentDocs(context, docIds, docIds.length));
+                  segments.add(new SegmentDocs(context, docIds, docCount));
                 }
               }
             };

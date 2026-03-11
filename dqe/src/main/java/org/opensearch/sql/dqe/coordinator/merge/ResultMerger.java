@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.PriorityQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.opensearch.sql.dqe.operator.HashAggregationOperator;
@@ -226,8 +227,9 @@ public class ResultMerger {
   }
 
   /**
-   * Merge-sort shard results for ORDER BY with limit. Combines all shard pages, sorts by the
-   * specified sort column indices and directions, and returns the first {@code limit} rows.
+   * Merge-sort shard results for ORDER BY with limit. For small limits (less than half the total
+   * rows), uses a bounded max-heap (O(n log k)) instead of full sort (O(n log n)). For larger
+   * limits, falls back to full sort.
    *
    * @param shardResults pages from each shard
    * @param sortColumnIndices column indices to sort by
@@ -247,7 +249,7 @@ public class ResultMerger {
 
     int numCols = columnTypes.size();
 
-    // Flatten all pages
+    // Flatten all pages into rows
     List<Object[]> allRows = new ArrayList<>();
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
@@ -261,17 +263,37 @@ public class ResultMerger {
       }
     }
 
-    // Sort
-    Comparator<Object[]> comparator = buildComparator(sortColumnIndices, ascending, nullsFirst);
-    allRows.sort(comparator);
-
-    // Apply limit
-    List<Object[]> limited = allRows.subList(0, (int) Math.min(limit, allRows.size()));
-
-    // Build result page
-    if (limited.isEmpty()) {
+    if (allRows.isEmpty()) {
       return List.of();
     }
+
+    Comparator<Object[]> comparator = buildComparator(sortColumnIndices, ascending, nullsFirst);
+    int k = (int) Math.min(limit, allRows.size());
+
+    List<Object[]> limited;
+    if (k < allRows.size() / 2 && k < 10000) {
+      // Bounded heap path: O(n log k) — efficient for small limits
+      PriorityQueue<Object[]> heap = new PriorityQueue<>(k + 1, comparator.reversed());
+      for (Object[] row : allRows) {
+        heap.offer(row);
+        if (heap.size() > k) {
+          heap.poll();
+        }
+      }
+      // Extract and sort the top-k elements
+      Object[] topRows = heap.toArray(new Object[0]);
+      Object[][] typedRows = new Object[topRows.length][];
+      for (int i = 0; i < topRows.length; i++) {
+        typedRows[i] = (Object[]) topRows[i];
+      }
+      java.util.Arrays.sort(typedRows, comparator);
+      limited = java.util.Arrays.asList(typedRows);
+    } else {
+      // Full sort path
+      allRows.sort(comparator);
+      limited = allRows.subList(0, k);
+    }
+
     return List.of(buildPage(limited, columnTypes));
   }
 

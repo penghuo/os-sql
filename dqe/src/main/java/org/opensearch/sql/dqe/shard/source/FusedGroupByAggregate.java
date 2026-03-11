@@ -70,13 +70,12 @@ public final class FusedGroupByAggregate {
   private FusedGroupByAggregate() {}
 
   /**
-   * Check if the shard plan is a GROUP BY aggregation that can use the fused ordinal path.
-   * Requirements:
+   * Check if the shard plan is a GROUP BY aggregation that can use the fused path. Requirements:
    *
    * <ul>
    *   <li>Plan is AggregationNode with non-empty groupByKeys
    *   <li>Child is a TableScanNode (no intermediate filter/eval nodes)
-   *   <li>At least one group-by key is a VARCHAR type
+   *   <li>All group-by keys are VARCHAR, numeric, or timestamp types
    *   <li>All aggregate functions are supported
    * </ul>
    */
@@ -88,20 +87,14 @@ public final class FusedGroupByAggregate {
       return false;
     }
 
-    // Check that at least one group-by key is VARCHAR
-    boolean hasVarchar = false;
+    // Check all group-by keys are supported types (VARCHAR, numeric, or timestamp)
     for (String key : aggNode.getGroupByKeys()) {
       Type type = columnTypeMap.get(key);
-      if (type instanceof VarcharType) {
-        hasVarchar = true;
-      } else if (type == null) {
+      if (type == null) {
         return false; // Unknown type, can't fuse
-      } else if (!isNumericOrTimestamp(type)) {
+      } else if (!(type instanceof VarcharType) && !isNumericOrTimestamp(type)) {
         return false; // Unsupported group-by key type
       }
-    }
-    if (!hasVarchar) {
-      return false;
     }
 
     // Check all aggregate functions are supported
@@ -126,7 +119,10 @@ public final class FusedGroupByAggregate {
   }
 
   /**
-   * Execute the fused ordinal-based GROUP BY aggregation.
+   * Execute the fused GROUP BY aggregation directly from Lucene DocValues. For keys that include
+   * VARCHAR columns, uses SortedSetDocValues ordinals as hash keys during per-segment aggregation,
+   * then resolves ordinals to strings across segments. For numeric-only keys, aggregates directly
+   * into a global map without ordinal resolution.
    *
    * @param aggNode the aggregation plan node
    * @param shard the index shard
@@ -157,22 +153,163 @@ public final class FusedGroupByAggregate {
 
     // Classify group-by keys
     List<KeyInfo> keyInfos = new ArrayList<>();
+    boolean hasVarchar = false;
     for (String key : groupByKeys) {
       Type type = columnTypeMap.get(key);
-      keyInfos.add(new KeyInfo(key, type, type instanceof VarcharType));
-    }
-
-    // Count varchar keys to decide path
-    int varcharKeyCount = 0;
-    int singleVarcharIdx = -1;
-    for (int i = 0; i < keyInfos.size(); i++) {
-      if (keyInfos.get(i).isVarchar) {
-        varcharKeyCount++;
-        singleVarcharIdx = i;
+      boolean isVarchar = type instanceof VarcharType;
+      keyInfos.add(new KeyInfo(key, type, isVarchar));
+      if (isVarchar) {
+        hasVarchar = true;
       }
     }
 
-    // Execute using global merged approach: per-segment ordinal aggregation, cross-segment merge
+    // Dispatch to specialized path based on key types
+    if (hasVarchar) {
+      return executeWithVarcharKeys(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+    } else {
+      return executeNumericOnly(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+    }
+  }
+
+  /**
+   * Fast path for numeric-only GROUP BY keys. Since all keys are raw long values (no segment-local
+   * ordinals), we aggregate directly into a global map across all segments without
+   * per-segment/cross-segment merge overhead.
+   */
+  private static List<Page> executeNumericOnly(
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys)
+      throws Exception {
+
+    // Global map: SegmentGroupKey (long[]) -> AccumulatorGroup
+    // For numeric-only keys, long values are globally unique (not ordinals),
+    // so we can accumulate directly without per-segment resolution.
+    Map<SegmentGroupKey, AccumulatorGroup> globalGroups = new HashMap<>();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-numeric")) {
+
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              // Open doc values for group-by keys (all numeric)
+              SortedNumericDocValues[] keyReaders = new SortedNumericDocValues[keyInfos.size()];
+              for (int i = 0; i < keyInfos.size(); i++) {
+                keyReaders[i] = context.reader().getSortedNumericDocValues(keyInfos.get(i).name);
+              }
+
+              // Open doc values for aggregate arguments
+              Object[] aggReaders = new Object[specs.size()];
+              for (int i = 0; i < specs.size(); i++) {
+                AggSpec spec = specs.get(i);
+                if ("*".equals(spec.arg)) {
+                  aggReaders[i] = null;
+                } else if (spec.argType instanceof VarcharType) {
+                  aggReaders[i] = context.reader().getSortedSetDocValues(spec.arg);
+                } else {
+                  aggReaders[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                }
+              }
+
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  long[] keyValues = new long[keyInfos.size()];
+                  boolean[] keyNulls = new boolean[keyInfos.size()];
+
+                  for (int k = 0; k < keyInfos.size(); k++) {
+                    SortedNumericDocValues dv = keyReaders[k];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      keyValues[k] = dv.nextValue();
+                    } else {
+                      keyNulls[k] = true;
+                    }
+                  }
+
+                  SegmentGroupKey sgk = new SegmentGroupKey(keyValues, keyNulls);
+                  AccumulatorGroup accGroup =
+                      globalGroups.computeIfAbsent(sgk, ignored -> createAccumulatorGroup(specs));
+                  accumulateDoc(doc, accGroup, specs, aggReaders);
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    if (globalGroups.isEmpty()) {
+      return List.of();
+    }
+
+    // Build result Page directly from SegmentGroupKey (no ordinal resolution needed)
+    int numGroupKeys = groupByKeys.size();
+    int numAggs = specs.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int groupCount = globalGroups.size();
+
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+    }
+
+    for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+      SegmentGroupKey key = entry.getKey();
+      AccumulatorGroup accGroup = entry.getValue();
+
+      // Write group-by keys (all numeric)
+      for (int k = 0; k < numGroupKeys; k++) {
+        if (key.nulls[k]) {
+          builders[k].appendNull();
+        } else {
+          writeNumericKeyValue(builders[k], keyInfos.get(k), key.values[k]);
+        }
+      }
+
+      // Write aggregate results
+      for (int a = 0; a < numAggs; a++) {
+        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Path for GROUP BY keys that include at least one VARCHAR column. Uses SortedSetDocValues
+   * ordinals as hash keys during per-segment aggregation, then resolves ordinals to strings across
+   * segments.
+   */
+  private static List<Page> executeWithVarcharKeys(
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys)
+      throws Exception {
+
     Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
@@ -207,9 +344,6 @@ public final class FusedGroupByAggregate {
                 }
               }
 
-              // Per-segment accumulation using ordinals for VARCHAR keys.
-              // We use a HashMap with a lightweight segment key that stores ordinals for
-              // VARCHAR columns and raw values for numeric columns.
               Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
 
               return new LeafCollector() {
@@ -218,7 +352,6 @@ public final class FusedGroupByAggregate {
 
                 @Override
                 public void collect(int doc) throws IOException {
-                  // Build segment-local key
                   long[] keyValues = new long[keyInfos.size()];
                   boolean[] keyNulls = new boolean[keyInfos.size()];
 
@@ -227,7 +360,7 @@ public final class FusedGroupByAggregate {
                     if (ki.isVarchar) {
                       SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
                       if (dv != null && dv.advanceExact(doc)) {
-                        keyValues[k] = dv.nextOrd(); // ordinal - cheap!
+                        keyValues[k] = dv.nextOrd();
                       } else {
                         keyNulls[k] = true;
                       }
@@ -244,20 +377,16 @@ public final class FusedGroupByAggregate {
                   SegmentGroupKey sgk = new SegmentGroupKey(keyValues, keyNulls);
                   AccumulatorGroup accGroup =
                       segmentGroups.computeIfAbsent(sgk, ignored -> createAccumulatorGroup(specs));
-
-                  // Feed aggregate values
                   accumulateDoc(doc, accGroup, specs, aggReaders);
                 }
 
                 @Override
                 public void finish() throws IOException {
-                  // Merge segment results into global groups by resolving ordinals
                   for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry :
                       segmentGroups.entrySet()) {
                     SegmentGroupKey sgk = entry.getKey();
                     AccumulatorGroup segAccs = entry.getValue();
 
-                    // Resolve ordinals to actual strings for VARCHAR keys
                     Object[] resolvedKeys = new Object[keyInfos.size()];
                     for (int k = 0; k < keyInfos.size(); k++) {
                       if (sgk.nulls[k]) {
@@ -280,7 +409,6 @@ public final class FusedGroupByAggregate {
                     if (existing == null) {
                       globalGroups.put(mgk, segAccs);
                     } else {
-                      // Merge accumulators
                       existing.merge(segAccs);
                     }
                   }
@@ -318,12 +446,10 @@ public final class FusedGroupByAggregate {
       MergedGroupKey key = entry.getKey();
       AccumulatorGroup accGroup = entry.getValue();
 
-      // Write group-by keys
       for (int k = 0; k < numGroupKeys; k++) {
         writeKeyValue(builders[k], keyInfos.get(k), key.values[k]);
       }
 
-      // Write aggregate results
       for (int a = 0; a < numAggs; a++) {
         accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
       }
@@ -838,6 +964,21 @@ public final class FusedGroupByAggregate {
     } else {
       // BigintType, IntegerType, SmallintType, TinyintType
       type.writeLong(builder, (Long) value);
+    }
+  }
+
+  /** Write a numeric group-by key value (raw long) to a block builder. */
+  private static void writeNumericKeyValue(BlockBuilder builder, KeyInfo keyInfo, long value) {
+    Type type = keyInfo.type;
+    if (type instanceof DoubleType) {
+      DoubleType.DOUBLE.writeDouble(builder, Double.longBitsToDouble(value));
+    } else if (type instanceof TimestampType) {
+      TimestampType.TIMESTAMP_MILLIS.writeLong(builder, value * 1000L);
+    } else if (type instanceof BooleanType) {
+      BooleanType.BOOLEAN.writeBoolean(builder, value == 1);
+    } else {
+      // BigintType, IntegerType, SmallintType, TinyintType
+      type.writeLong(builder, value);
     }
   }
 }

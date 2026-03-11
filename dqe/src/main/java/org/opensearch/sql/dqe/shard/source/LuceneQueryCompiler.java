@@ -196,13 +196,103 @@ public class LuceneQueryCompiler {
   private Query compileBool(JsonNode boolNode) {
     BooleanQuery.Builder builder = new BooleanQuery.Builder();
     boolean hasPositive = false;
+    boolean hasMustNot = false;
+
+    // Collect range queries on the same field for merging.
+    // When two separate range clauses target the same field (e.g., gte and lte on EventDate),
+    // merging them into a single LongPoint/IntPoint range query is more efficient for Lucene
+    // because it uses a single BKD tree traversal instead of intersecting two.
+    java.util.Map<String, long[]> longRangeBounds = null;
+    java.util.Map<String, int[]> intRangeBounds = null;
+    java.util.List<JsonNode> nonRangeMustClauses = null;
 
     if (boolNode.has("must")) {
+      // First pass: separate range clauses (for merging) from non-range clauses
       for (JsonNode clause : boolNode.get("must")) {
-        builder.add(compileNode(clause), BooleanClause.Occur.MUST);
-        hasPositive = true;
+        if (clause.has("range")) {
+          JsonNode rangeNode = clause.get("range");
+          Iterator<String> fields = rangeNode.fieldNames();
+          if (fields.hasNext()) {
+            String field = fields.next();
+            String osType = fieldTypes.getOrDefault(field, "keyword");
+            if (LONG_TYPES.contains(osType)) {
+              if (longRangeBounds == null) longRangeBounds = new java.util.HashMap<>();
+              long[] existing =
+                  longRangeBounds.computeIfAbsent(
+                      field, k -> new long[] {Long.MIN_VALUE, Long.MAX_VALUE});
+              JsonNode bounds = rangeNode.get(field);
+              if (bounds.has("gte"))
+                existing[0] = Math.max(existing[0], bounds.get("gte").asLong());
+              if (bounds.has("gt"))
+                existing[0] = Math.max(existing[0], bounds.get("gt").asLong() + 1);
+              if (bounds.has("lte"))
+                existing[1] = Math.min(existing[1], bounds.get("lte").asLong());
+              if (bounds.has("lt"))
+                existing[1] = Math.min(existing[1], bounds.get("lt").asLong() - 1);
+              continue;
+            } else if (INT_TYPES.contains(osType)) {
+              if (intRangeBounds == null) intRangeBounds = new java.util.HashMap<>();
+              int[] existing =
+                  intRangeBounds.computeIfAbsent(
+                      field, k -> new int[] {Integer.MIN_VALUE, Integer.MAX_VALUE});
+              JsonNode bounds = rangeNode.get(field);
+              if (bounds.has("gte")) existing[0] = Math.max(existing[0], bounds.get("gte").asInt());
+              if (bounds.has("gt"))
+                existing[0] = Math.max(existing[0], bounds.get("gt").asInt() + 1);
+              if (bounds.has("lte")) existing[1] = Math.min(existing[1], bounds.get("lte").asInt());
+              if (bounds.has("lt"))
+                existing[1] = Math.min(existing[1], bounds.get("lt").asInt() - 1);
+              continue;
+            }
+          }
+        }
+        if (nonRangeMustClauses == null) nonRangeMustClauses = new java.util.ArrayList<>();
+        nonRangeMustClauses.add(clause);
+      }
+
+      // Add merged range queries (one BKD traversal per field instead of per-bound)
+      if (longRangeBounds != null) {
+        for (java.util.Map.Entry<String, long[]> entry : longRangeBounds.entrySet()) {
+          builder.add(
+              LongPoint.newRangeQuery(entry.getKey(), entry.getValue()[0], entry.getValue()[1]),
+              BooleanClause.Occur.MUST);
+          hasPositive = true;
+        }
+      }
+      if (intRangeBounds != null) {
+        for (java.util.Map.Entry<String, int[]> entry : intRangeBounds.entrySet()) {
+          builder.add(
+              IntPoint.newRangeQuery(entry.getKey(), entry.getValue()[0], entry.getValue()[1]),
+              BooleanClause.Occur.MUST);
+          hasPositive = true;
+        }
+      }
+
+      // Add non-range must clauses, flattening nested bool(must_not-only) patterns.
+      // When a MUST clause is a bool with only must_not (e.g., from NOT_EQUAL like URL <> ''),
+      // promote the must_not clauses directly to avoid a redundant nested BooleanQuery
+      // with MatchAllDocsQuery.
+      java.util.List<JsonNode> mustClauses =
+          nonRangeMustClauses != null ? nonRangeMustClauses : new java.util.ArrayList<>();
+      if (nonRangeMustClauses == null && longRangeBounds == null && intRangeBounds == null) {
+        for (JsonNode clause : boolNode.get("must")) {
+          mustClauses.add(clause);
+        }
+      }
+
+      for (JsonNode clause : mustClauses) {
+        if (clause.has("bool") && isOnlyMustNot(clause.get("bool"))) {
+          for (JsonNode innerMustNot : clause.get("bool").get("must_not")) {
+            builder.add(compileNode(innerMustNot), BooleanClause.Occur.MUST_NOT);
+            hasMustNot = true;
+          }
+        } else {
+          builder.add(compileNode(clause), BooleanClause.Occur.MUST);
+          hasPositive = true;
+        }
       }
     }
+
     if (boolNode.has("should")) {
       for (JsonNode clause : boolNode.get("should")) {
         builder.add(compileNode(clause), BooleanClause.Occur.SHOULD);
@@ -212,6 +302,7 @@ public class LuceneQueryCompiler {
     if (boolNode.has("must_not")) {
       for (JsonNode clause : boolNode.get("must_not")) {
         builder.add(compileNode(clause), BooleanClause.Occur.MUST_NOT);
+        hasMustNot = true;
       }
     }
     if (boolNode.has("filter")) {
@@ -223,10 +314,22 @@ public class LuceneQueryCompiler {
 
     // A BooleanQuery with only must_not clauses matches nothing in Lucene.
     // Add MatchAllDocsQuery as a positive clause to match all docs except excluded.
-    if (!hasPositive && boolNode.has("must_not")) {
+    if (!hasPositive && hasMustNot) {
       builder.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
     }
 
     return builder.build();
+  }
+
+  /**
+   * Check if a bool node contains only must_not clauses (no must, should, or filter). This pattern
+   * arises from NOT_EQUAL comparisons like {@code URL <> ''} and can be flattened into the parent
+   * bool to eliminate a redundant nested BooleanQuery with MatchAllDocsQuery.
+   */
+  private static boolean isOnlyMustNot(JsonNode boolNode) {
+    return boolNode.has("must_not")
+        && !boolNode.has("must")
+        && !boolNode.has("should")
+        && !boolNode.has("filter");
   }
 }

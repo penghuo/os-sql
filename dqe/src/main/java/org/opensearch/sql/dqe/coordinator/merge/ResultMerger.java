@@ -506,8 +506,11 @@ public class ResultMerger {
         for (int pos = 0; pos < positionCount; pos++) {
           if (keyBlock.isNull(pos)) continue;
           // Use Slice directly as key — avoids String allocation and double conversion.
-          // Slice.copy() creates an independent copy since the block's backing array may
-          // be shared across positions.
+          // The Slice view is safe to use as a HashMap key without copying because
+          // all source pages (and their backing blocks) are kept alive via the
+          // shardResults parameter on the call stack throughout the merge + output
+          // building. The Slice's hashCode/equals correctly reference the underlying
+          // block bytes.
           io.airlift.slice.Slice keySlice = VarcharType.VARCHAR.getSlice(keyBlock, pos);
           long[] aggs = groups.get(keySlice);
           if (aggs == null) {
@@ -517,8 +520,7 @@ public class ResultMerger {
                 aggs[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
               }
             }
-            // Must copy the Slice since the source block may reuse memory
-            groups.put(keySlice.copy(), aggs);
+            groups.put(keySlice, aggs);
           } else {
             for (int a = 0; a < numAggCols; a++) {
               if (!aggBlocks[a].isNull(pos)) {

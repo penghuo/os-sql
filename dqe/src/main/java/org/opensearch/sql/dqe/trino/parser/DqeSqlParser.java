@@ -17,7 +17,13 @@ import java.util.Set;
 
 public class DqeSqlParser {
 
-  private final SqlParser parser = new SqlParser();
+  /**
+   * Shared SqlParser instance. SqlParser is thread-safe (stateless, uses ANTLR per-call context).
+   * Sharing a single instance avoids re-creating ANTLR grammar infrastructure per DqeSqlParser.
+   */
+  private static final SqlParser SHARED_PARSER = new SqlParser();
+
+  private final SqlParser parser = SHARED_PARSER;
 
   public Statement parse(String sql) {
     return parser.createStatement(sql);

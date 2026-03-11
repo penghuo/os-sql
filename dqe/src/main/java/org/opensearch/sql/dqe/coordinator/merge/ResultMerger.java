@@ -81,7 +81,8 @@ public class ResultMerger {
     // Directly merges shard Pages using primitive long arrays, avoiding Object allocation,
     // boxing, and HashMap overhead that dominates merge time for multi-key GROUP BY.
     if (canUseFastNumericMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
-      return mergeAggregationFastNumeric(shardResults, numGroupByCols, numAggCols, columnTypes);
+      return mergeAggregationFastNumeric(
+          shardResults, numGroupByCols, numAggCols, columnTypes, aggregateFunctions);
     }
 
     // Fast path: single VARCHAR key with COUNT/SUM-only aggregates (all BigintType output).
@@ -187,8 +188,8 @@ public class ResultMerger {
    * <ul>
    *   <li>All group-by key types are long-representable (BigintType, IntegerType, TimestampType,
    *       SmallintType, TinyintType, BooleanType)
-   *   <li>All aggregate functions are COUNT or SUM (produce BigintType output, can be summed as
-   *       longs)
+   *   <li>All aggregate functions are COUNT, SUM, or AVG with BigintType or DoubleType output
+   *   <li>AVG requires a companion non-distinct COUNT column for weighted merge
    * </ul>
    */
   private boolean canUseFastNumericMerge(
@@ -205,7 +206,9 @@ public class ResultMerger {
         return false;
       }
     }
-    // Check all aggregates are COUNT or SUM with BigintType output
+    // Check all aggregates are COUNT, SUM (BigintType), or AVG (DoubleType)
+    boolean hasAvg = false;
+    boolean hasCount = false;
     for (int a = 0; a < aggregateFunctions.size(); a++) {
       Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
       if (!m.matches()) return false;
@@ -213,34 +216,68 @@ public class ResultMerger {
       boolean isDistinct = m.group(2) != null;
       if (isDistinct) return false;
       Type aggType = columnTypes.get(numGroupByCols + a);
-      if ("COUNT".equals(funcName) || "SUM".equals(funcName)) {
-        // COUNT always produces BIGINT; SUM on integer types produces BIGINT
+      if ("COUNT".equals(funcName)) {
         if (!(aggType instanceof BigintType)) return false;
+        hasCount = true;
+      } else if ("SUM".equals(funcName)) {
+        if (!(aggType instanceof BigintType)) return false;
+      } else if ("AVG".equals(funcName)) {
+        if (!(aggType instanceof DoubleType)) return false;
+        hasAvg = true;
       } else {
-        return false; // MIN, MAX, AVG not supported on fast path
+        return false; // MIN, MAX not supported on fast path
       }
     }
+    // AVG requires a companion COUNT for weighted merge
+    if (hasAvg && !hasCount) return false;
     return true;
   }
 
   /**
-   * Fast numeric merge: directly iterates over shard Pages using primitive long operations. Uses an
-   * open-addressing hash map with long[] keys to avoid Object allocation per row. This is 5-10x
-   * faster than the generic HashAggregationOperator path for numeric GROUP BY with COUNT/SUM
-   * aggregates.
+   * Fast numeric merge: directly iterates over shard Pages using primitive long/double operations.
+   * Uses an open-addressing hash map with long[] keys to avoid Object allocation per row. Supports
+   * COUNT (long sum), SUM (long sum), and AVG (weighted average using companion COUNT column).
    */
   private List<Page> mergeAggregationFastNumeric(
-      List<List<Page>> shardResults, int numGroupByCols, int numAggCols, List<Type> columnTypes) {
+      List<List<Page>> shardResults,
+      int numGroupByCols,
+      int numAggCols,
+      List<Type> columnTypes,
+      List<String> aggregateFunctions) {
 
     int totalCols = numGroupByCols + numAggCols;
 
-    // Open-addressing hash map: long[] key -> long[] aggValues
+    // Classify aggregates: identify AVG columns and their companion COUNT column
+    boolean[] isDoubleAgg = new boolean[numAggCols];
+    boolean[] isAvgAgg = new boolean[numAggCols];
+    int countAggIdx = -1; // index within the agg columns (not absolute column index)
+    for (int a = 0; a < numAggCols; a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (m.matches()) {
+        String funcName = m.group(1).toUpperCase(Locale.ROOT);
+        if ("AVG".equals(funcName)) {
+          isAvgAgg[a] = true;
+          isDoubleAgg[a] = true;
+        } else if ("COUNT".equals(funcName) && m.group(2) == null) {
+          countAggIdx = a;
+        }
+      }
+      if (!isAvgAgg[a]) {
+        isDoubleAgg[a] = columnTypes.get(numGroupByCols + a) instanceof DoubleType;
+      }
+    }
+    // For AVG weighted merge: we accumulate (avg * count) as weightedSum, then divide by count
+    // at the end. Use the double[] array for both AVG weighted sums and regular double sums.
+    final int finalCountAggIdx = countAggIdx;
+
+    // Open-addressing hash map: long[] key -> long[] longAggValues + double[] doubleAggValues
     int capacity = 1024;
     float loadFactor = 0.7f;
     int threshold = (int) (capacity * loadFactor);
     int size = 0;
     long[][] mapKeys = new long[capacity][];
-    long[][] mapAggValues = new long[capacity][];
+    long[][] mapLongAggs = new long[capacity][];
+    double[][] mapDoubleAggs = new double[capacity][];
     boolean[] mapOccupied = new boolean[capacity];
 
     for (List<Page> shardPages : shardResults) {
@@ -277,13 +314,27 @@ public class ResultMerger {
             if (!mapOccupied[slot]) {
               // New group
               mapKeys[slot] = keyValues;
-              long[] aggValues = new long[numAggCols];
+              long[] longAggs = new long[numAggCols];
+              double[] doubleAggs = new double[numAggCols];
+              // Read COUNT value first (needed for AVG weighting)
+              long countVal = 0;
+              if (finalCountAggIdx >= 0 && !aggBlocks[finalCountAggIdx].isNull(pos)) {
+                countVal = BigintType.BIGINT.getLong(aggBlocks[finalCountAggIdx], pos);
+              }
               for (int a = 0; a < numAggCols; a++) {
                 if (!aggBlocks[a].isNull(pos)) {
-                  aggValues[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                  if (isAvgAgg[a]) {
+                    // Store weighted sum (avg * count) for proper cross-shard merge
+                    doubleAggs[a] = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos) * countVal;
+                  } else if (isDoubleAgg[a]) {
+                    doubleAggs[a] = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                  } else {
+                    longAggs[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                  }
                 }
               }
-              mapAggValues[slot] = aggValues;
+              mapLongAggs[slot] = longAggs;
+              mapDoubleAggs[slot] = doubleAggs;
               mapOccupied[slot] = true;
               size++;
 
@@ -291,7 +342,8 @@ public class ResultMerger {
               if (size > threshold) {
                 int newCapacity = capacity * 2;
                 long[][] newKeys = new long[newCapacity][];
-                long[][] newAggValues = new long[newCapacity][];
+                long[][] newLongAggs = new long[newCapacity][];
+                double[][] newDoubleAggs = new double[newCapacity][];
                 boolean[] newOccupied = new boolean[newCapacity];
                 int newMask = newCapacity - 1;
                 for (int s = 0; s < capacity; s++) {
@@ -303,7 +355,8 @@ public class ResultMerger {
                     int ns = h & newMask;
                     while (newOccupied[ns]) ns = (ns + 1) & newMask;
                     newKeys[ns] = mapKeys[s];
-                    newAggValues[ns] = mapAggValues[s];
+                    newLongAggs[ns] = mapLongAggs[s];
+                    newDoubleAggs[ns] = mapDoubleAggs[s];
                     newOccupied[ns] = true;
                   }
                 }
@@ -311,7 +364,8 @@ public class ResultMerger {
                 mask = newCapacity - 1;
                 threshold = (int) (newCapacity * loadFactor);
                 mapKeys = newKeys;
-                mapAggValues = newAggValues;
+                mapLongAggs = newLongAggs;
+                mapDoubleAggs = newDoubleAggs;
                 mapOccupied = newOccupied;
               }
               break;
@@ -328,10 +382,22 @@ public class ResultMerger {
             }
             if (match) {
               // Existing group: accumulate
-              long[] aggValues = mapAggValues[slot];
+              // Read COUNT value first (needed for AVG weighting)
+              long countVal2 = 0;
+              if (finalCountAggIdx >= 0 && !aggBlocks[finalCountAggIdx].isNull(pos)) {
+                countVal2 = BigintType.BIGINT.getLong(aggBlocks[finalCountAggIdx], pos);
+              }
               for (int a = 0; a < numAggCols; a++) {
                 if (!aggBlocks[a].isNull(pos)) {
-                  aggValues[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                  if (isAvgAgg[a]) {
+                    // Accumulate weighted sum (avg * count)
+                    mapDoubleAggs[slot][a] +=
+                        DoubleType.DOUBLE.getDouble(aggBlocks[a], pos) * countVal2;
+                  } else if (isDoubleAgg[a]) {
+                    mapDoubleAggs[slot][a] += DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                  } else {
+                    mapLongAggs[slot][a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                  }
                 }
               }
               break;
@@ -346,7 +412,7 @@ public class ResultMerger {
       return List.of();
     }
 
-    // Build result Page
+    // Build result Page. For AVG columns, divide accumulated weighted sum by total count.
     BlockBuilder[] builders = new BlockBuilder[totalCols];
     for (int i = 0; i < totalCols; i++) {
       builders[i] = columnTypes.get(i).createBlockBuilder(null, size);
@@ -357,7 +423,16 @@ public class ResultMerger {
           columnTypes.get(k).writeLong(builders[k], mapKeys[s][k]);
         }
         for (int a = 0; a < numAggCols; a++) {
-          BigintType.BIGINT.writeLong(builders[numGroupByCols + a], mapAggValues[s][a]);
+          if (isAvgAgg[a]) {
+            // Divide weighted sum by total count to get correct merged AVG
+            long totalCount = (finalCountAggIdx >= 0) ? mapLongAggs[s][finalCountAggIdx] : 1;
+            double avgValue = totalCount > 0 ? mapDoubleAggs[s][a] / totalCount : 0.0;
+            DoubleType.DOUBLE.writeDouble(builders[numGroupByCols + a], avgValue);
+          } else if (isDoubleAgg[a]) {
+            DoubleType.DOUBLE.writeDouble(builders[numGroupByCols + a], mapDoubleAggs[s][a]);
+          } else {
+            BigintType.BIGINT.writeLong(builders[numGroupByCols + a], mapLongAggs[s][a]);
+          }
         }
       }
     }

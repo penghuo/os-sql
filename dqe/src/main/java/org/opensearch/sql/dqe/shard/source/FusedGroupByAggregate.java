@@ -394,6 +394,10 @@ public final class FusedGroupByAggregate {
    * ordinals), we aggregate directly into a global map across all segments without
    * per-segment/cross-segment merge overhead. Supports DATE_TRUNC expressions on timestamp columns
    * by applying truncation during key value extraction.
+   *
+   * <p>Uses a reusable {@link NumericProbeKey} for HashMap lookups to avoid per-doc allocation. An
+   * immutable {@link SegmentGroupKey} is only created when inserting a new group (cache miss),
+   * eliminating ~4 array allocations per doc for the common case where the group already exists.
    */
   private static List<Page> executeNumericOnly(
       IndexShard shard,
@@ -411,12 +415,15 @@ public final class FusedGroupByAggregate {
 
     // Pre-compute which keys need DATE_TRUNC transformation and their units
     final String[] truncUnits = new String[keyInfos.size()];
+    boolean hasTrunc = false;
     for (int i = 0; i < keyInfos.size(); i++) {
       KeyInfo ki = keyInfos.get(i);
       if ("date_trunc".equals(ki.exprFunc())) {
         truncUnits[i] = ki.exprUnit();
+        hasTrunc = true;
       }
     }
+    final boolean anyTrunc = hasTrunc;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric")) {
@@ -426,9 +433,11 @@ public final class FusedGroupByAggregate {
           new Collector() {
             @Override
             public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              final int numKeys = keyInfos.size();
+
               // Open doc values for group-by keys (all numeric)
-              SortedNumericDocValues[] keyReaders = new SortedNumericDocValues[keyInfos.size()];
-              for (int i = 0; i < keyInfos.size(); i++) {
+              SortedNumericDocValues[] keyReaders = new SortedNumericDocValues[numKeys];
+              for (int i = 0; i < numKeys; i++) {
                 keyReaders[i] = context.reader().getSortedNumericDocValues(keyInfos.get(i).name());
               }
 
@@ -445,32 +454,41 @@ public final class FusedGroupByAggregate {
                 }
               }
 
+              // Pre-allocate a reusable probe key to avoid per-doc allocation.
+              // The probe key is mutated in-place for each doc and used for HashMap.get().
+              // An immutable SegmentGroupKey is only created on cache miss (new group).
+              final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+
               return new LeafCollector() {
                 @Override
                 public void setScorer(Scorable scorer) {}
 
                 @Override
                 public void collect(int doc) throws IOException {
-                  long[] keyValues = new long[keyInfos.size()];
-                  boolean[] keyNulls = new boolean[keyInfos.size()];
-
-                  for (int k = 0; k < keyInfos.size(); k++) {
+                  // Reset and populate the reusable probe key
+                  probeKey.reset();
+                  for (int k = 0; k < numKeys; k++) {
                     SortedNumericDocValues dv = keyReaders[k];
                     if (dv != null && dv.advanceExact(doc)) {
                       long val = dv.nextValue();
-                      // Apply DATE_TRUNC transformation if needed
-                      if (truncUnits[k] != null) {
+                      if (anyTrunc && truncUnits[k] != null) {
                         val = truncateMillis(val, truncUnits[k]);
                       }
-                      keyValues[k] = val;
+                      probeKey.set(k, val);
                     } else {
-                      keyNulls[k] = true;
+                      probeKey.setNull(k);
                     }
                   }
+                  probeKey.computeHash();
 
-                  SegmentGroupKey sgk = new SegmentGroupKey(keyValues, keyNulls);
-                  AccumulatorGroup accGroup =
-                      globalGroups.computeIfAbsent(sgk, ignored -> createAccumulatorGroup(specs));
+                  // Fast path: probe with reusable key (no allocation for existing groups)
+                  AccumulatorGroup accGroup = globalGroups.get(probeKey);
+                  if (accGroup == null) {
+                    // Cache miss: create an immutable key copy and new accumulator group
+                    SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                    accGroup = createAccumulatorGroup(specs);
+                    globalGroups.put(immutableKey, accGroup);
+                  }
                   accumulateDoc(doc, accGroup, specs, aggReaders);
                 }
               };
@@ -587,6 +605,10 @@ public final class FusedGroupByAggregate {
               }
 
               Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
+              final int numKeys = keyInfos.size();
+
+              // Pre-allocate reusable probe key to avoid per-doc allocation
+              final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
 
               return new LeafCollector() {
                 @Override
@@ -594,36 +616,38 @@ public final class FusedGroupByAggregate {
 
                 @Override
                 public void collect(int doc) throws IOException {
-                  long[] keyValues = new long[keyInfos.size()];
-                  boolean[] keyNulls = new boolean[keyInfos.size()];
-
-                  for (int k = 0; k < keyInfos.size(); k++) {
+                  probeKey.reset();
+                  for (int k = 0; k < numKeys; k++) {
                     KeyInfo ki = keyInfos.get(k);
                     if (ki.isVarchar) {
                       SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
                       if (dv != null && dv.advanceExact(doc)) {
-                        keyValues[k] = dv.nextOrd();
+                        probeKey.set(k, dv.nextOrd());
                       } else {
-                        keyNulls[k] = true;
+                        probeKey.setNull(k);
                       }
                     } else {
                       SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
                       if (dv != null && dv.advanceExact(doc)) {
                         long val = dv.nextValue();
-                        // Apply DATE_TRUNC transformation if needed
                         if (truncUnits[k] != null) {
                           val = truncateMillis(val, truncUnits[k]);
                         }
-                        keyValues[k] = val;
+                        probeKey.set(k, val);
                       } else {
-                        keyNulls[k] = true;
+                        probeKey.setNull(k);
                       }
                     }
                   }
+                  probeKey.computeHash();
 
-                  SegmentGroupKey sgk = new SegmentGroupKey(keyValues, keyNulls);
-                  AccumulatorGroup accGroup =
-                      segmentGroups.computeIfAbsent(sgk, ignored -> createAccumulatorGroup(specs));
+                  // Fast path: probe with reusable key (no allocation for existing groups)
+                  AccumulatorGroup accGroup = segmentGroups.get(probeKey);
+                  if (accGroup == null) {
+                    SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                    accGroup = createAccumulatorGroup(specs);
+                    segmentGroups.put(immutableKey, accGroup);
+                  }
                   accumulateDoc(doc, accGroup, specs, aggReaders);
                 }
 
@@ -784,15 +808,16 @@ public final class FusedGroupByAggregate {
 
   /**
    * Segment-local group key using ordinals for VARCHAR and raw values for numerics. Uses long
-   * arrays for minimal allocation and fast hashing.
+   * arrays for minimal allocation and fast hashing. Also serves as the base class for {@link
+   * NumericProbeKey} to share the hashCode/equals contract.
    */
-  private static final class SegmentGroupKey {
+  private static class SegmentGroupKey {
     final long[] values;
     final boolean[] nulls;
-    private final int hash;
+    int hash;
 
+    /** Standard constructor: copies arrays to ensure immutability. */
     SegmentGroupKey(long[] values, boolean[] nulls) {
-      // Copy to ensure immutability
       this.values = values.clone();
       this.nulls = nulls.clone();
       int h = 1;
@@ -804,6 +829,13 @@ public final class FusedGroupByAggregate {
         }
       }
       this.hash = h;
+    }
+
+    /** Pre-allocation constructor for mutable probe keys (no cloning). */
+    SegmentGroupKey(int size) {
+      this.values = new long[size];
+      this.nulls = new boolean[size];
+      this.hash = 0;
     }
 
     @Override
@@ -821,6 +853,57 @@ public final class FusedGroupByAggregate {
         if (!nulls[i] && values[i] != other.values[i]) return false;
       }
       return true;
+    }
+  }
+
+  /**
+   * Mutable probe key for HashMap lookups in the numeric-only GROUP BY path. Reused across
+   * documents to avoid per-doc array allocation. The key is populated via {@link #set}/{@link
+   * #setNull}, then {@link #computeHash()} is called before using it for HashMap.get().
+   *
+   * <p>This class intentionally shares the same hashCode/equals contract as {@link SegmentGroupKey}
+   * so it can be used to probe a {@code HashMap<SegmentGroupKey, ...>} without creating an
+   * immutable key for every document. An immutable copy is only created via {@link
+   * #toImmutableKey()} when a new group needs to be inserted.
+   */
+  private static final class NumericProbeKey extends SegmentGroupKey {
+
+    NumericProbeKey(int size) {
+      // Initialize with pre-allocated arrays (no cloning needed for mutable probe)
+      super(size);
+    }
+
+    /** Reset all nulls flags to false for reuse. Values are overwritten by set(). */
+    void reset() {
+      // Only need to clear nulls; values will be overwritten
+      for (int i = 0; i < nulls.length; i++) {
+        nulls[i] = false;
+      }
+    }
+
+    void set(int index, long value) {
+      values[index] = value;
+    }
+
+    void setNull(int index) {
+      nulls[index] = true;
+    }
+
+    void computeHash() {
+      int h = 1;
+      for (int i = 0; i < values.length; i++) {
+        if (nulls[i]) {
+          h = h * 31;
+        } else {
+          h = h * 31 + Long.hashCode(values[i]);
+        }
+      }
+      this.hash = h;
+    }
+
+    /** Create an immutable copy for insertion into the HashMap. */
+    SegmentGroupKey toImmutableKey() {
+      return new SegmentGroupKey(values, nulls);
     }
   }
 

@@ -39,6 +39,7 @@ import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.EvalNode;
@@ -1272,7 +1273,7 @@ public final class FusedGroupByAggregate {
           BytesRef bytes = dv.lookupOrd(dv.nextOrd());
           String val = bytes.utf8ToString();
           if (acc instanceof CountDistinctAccum cda) {
-            cda.distinctValues.add(val);
+            cda.objectDistinctValues.add(val);
           } else if (acc instanceof MinAccum ma) {
             if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
               ma.objectVal = val;
@@ -1293,7 +1294,11 @@ public final class FusedGroupByAggregate {
           boolean isTimestamp = spec.argType instanceof TimestampType;
 
           if (spec.isDistinct && acc instanceof CountDistinctAccum cda) {
-            cda.distinctValues.add(isDouble ? Double.longBitsToDouble(rawVal) : rawVal);
+            if (cda.usePrimitiveLong) {
+              cda.longDistinctValues.add(rawVal);
+            } else {
+              cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+            }
           } else if (acc instanceof CountStarAccum csa) {
             csa.count++;
           } else if (acc instanceof SumAccum sa) {
@@ -1510,22 +1515,42 @@ public final class FusedGroupByAggregate {
     }
   }
 
+  /**
+   * COUNT(DISTINCT) accumulator for grouped aggregation. Uses primitive LongOpenHashSet for numeric
+   * non-double columns to avoid Long boxing overhead. Falls back to HashSet&lt;Object&gt; for
+   * varchar and double types.
+   */
   private static class CountDistinctAccum implements MergeableAccumulator {
     final Type argType;
-    final Set<Object> distinctValues = new HashSet<>();
+    final boolean usePrimitiveLong;
+
+    /** Primitive long set for numeric non-double columns (avoids Long boxing). */
+    final LongOpenHashSet longDistinctValues;
+
+    /** Fallback set for varchar and double types. */
+    final Set<Object> objectDistinctValues;
 
     CountDistinctAccum(Type argType) {
       this.argType = argType;
+      this.usePrimitiveLong = !(argType instanceof VarcharType) && !(argType instanceof DoubleType);
+      this.longDistinctValues = usePrimitiveLong ? new LongOpenHashSet() : null;
+      this.objectDistinctValues = usePrimitiveLong ? null : new HashSet<>();
     }
 
     @Override
     public void merge(MergeableAccumulator other) {
-      distinctValues.addAll(((CountDistinctAccum) other).distinctValues);
+      CountDistinctAccum o = (CountDistinctAccum) other;
+      if (usePrimitiveLong) {
+        longDistinctValues.addAll(o.longDistinctValues);
+      } else {
+        objectDistinctValues.addAll(o.objectDistinctValues);
+      }
     }
 
     @Override
     public void writeTo(BlockBuilder builder) {
-      BigintType.BIGINT.writeLong(builder, distinctValues.size());
+      long count = usePrimitiveLong ? longDistinctValues.size() : objectDistinctValues.size();
+      BigintType.BIGINT.writeLong(builder, count);
     }
   }
 

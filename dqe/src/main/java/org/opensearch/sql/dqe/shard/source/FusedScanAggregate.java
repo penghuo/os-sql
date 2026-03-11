@@ -33,6 +33,7 @@ import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.EvalNode;
 import org.opensearch.sql.dqe.planner.plan.TableScanNode;
@@ -688,21 +689,34 @@ public final class FusedScanAggregate {
     }
   }
 
-  /** COUNT(DISTINCT col) accumulator. */
+  /**
+   * COUNT(DISTINCT col) accumulator. Uses primitive LongOpenHashSet for numeric columns to avoid
+   * Long boxing overhead (~200K boxing operations per shard for high-cardinality columns like
+   * UserID). Falls back to HashSet&lt;Object&gt; for varchar and double types.
+   */
   private static class CountDistinctDirectAccumulator implements DirectAccumulator {
     private final String field;
     private final Type argType;
     private final boolean isVarchar;
     private final boolean isDoubleType;
+    private final boolean usePrimitiveLong;
     private SortedNumericDocValues numericDv;
     private SortedSetDocValues stringDv;
-    private final Set<Object> distinctValues = new HashSet<>();
+
+    /** Primitive long set for numeric non-double columns (avoids Long boxing). */
+    private final LongOpenHashSet longDistinctValues;
+
+    /** Fallback set for varchar and double types. */
+    private final Set<Object> objectDistinctValues;
 
     CountDistinctDirectAccumulator(String field, Type argType) {
       this.field = field;
       this.argType = argType;
       this.isVarchar = argType instanceof VarcharType;
       this.isDoubleType = argType instanceof DoubleType;
+      this.usePrimitiveLong = !isVarchar && !isDoubleType;
+      this.longDistinctValues = usePrimitiveLong ? new LongOpenHashSet() : null;
+      this.objectDistinctValues = usePrimitiveLong ? null : new HashSet<>();
     }
 
     @Override
@@ -719,15 +733,15 @@ public final class FusedScanAggregate {
       if (isVarchar) {
         if (stringDv != null && stringDv.advanceExact(doc)) {
           BytesRef bytes = stringDv.lookupOrd(stringDv.nextOrd());
-          distinctValues.add(bytes.utf8ToString());
+          objectDistinctValues.add(bytes.utf8ToString());
         }
       } else if (isDoubleType) {
         if (numericDv != null && numericDv.advanceExact(doc)) {
-          distinctValues.add(Double.longBitsToDouble(numericDv.nextValue()));
+          objectDistinctValues.add(Double.longBitsToDouble(numericDv.nextValue()));
         }
       } else {
         if (numericDv != null && numericDv.advanceExact(doc)) {
-          distinctValues.add(numericDv.nextValue());
+          longDistinctValues.add(numericDv.nextValue());
         }
       }
     }
@@ -739,7 +753,8 @@ public final class FusedScanAggregate {
 
     @Override
     public void writeTo(BlockBuilder builder) {
-      BigintType.BIGINT.writeLong(builder, distinctValues.size());
+      long count = usePrimitiveLong ? longDistinctValues.size() : objectDistinctValues.size();
+      BigintType.BIGINT.writeLong(builder, count);
     }
   }
 }

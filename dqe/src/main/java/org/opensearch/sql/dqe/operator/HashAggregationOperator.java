@@ -616,38 +616,65 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
-  /** COUNT(DISTINCT column) accumulator. Counts distinct non-null values using a HashSet. */
+  /**
+   * COUNT(DISTINCT column) accumulator. Uses primitive LongOpenHashSet for numeric non-double
+   * columns to avoid Long boxing overhead. Falls back to HashSet&lt;Object&gt; for varchar and
+   * double types.
+   */
   public static class CountDistinctAccumulator implements Accumulator {
     private final int columnIndex;
     private final Type inputType;
-    private final java.util.HashSet<Object> distinctValues = new java.util.HashSet<>();
+    private final boolean usePrimitiveLong;
+
+    /** Primitive long set for numeric non-double columns (avoids Long boxing). */
+    private final LongOpenHashSet longDistinctValues;
+
+    /** Fallback set for varchar and double types. */
+    private final java.util.HashSet<Object> objectDistinctValues;
 
     public CountDistinctAccumulator(int columnIndex, Type inputType) {
       this.columnIndex = columnIndex;
       this.inputType = inputType;
+      this.usePrimitiveLong =
+          !(inputType instanceof VarcharType) && !(inputType instanceof DoubleType);
+      this.longDistinctValues = usePrimitiveLong ? new LongOpenHashSet() : null;
+      this.objectDistinctValues = usePrimitiveLong ? null : new java.util.HashSet<>();
     }
 
     @Override
     public void add(Page page, int position) {
       Block block = page.getBlock(columnIndex);
       if (!block.isNull(position)) {
-        distinctValues.add(readValue(block, position, inputType));
+        if (usePrimitiveLong) {
+          longDistinctValues.add(inputType.getLong(block, position));
+        } else {
+          objectDistinctValues.add(readValue(block, position, inputType));
+        }
       }
     }
 
     @Override
     public void addPage(Page page, int positionCount) {
       Block block = page.getBlock(columnIndex);
-      for (int pos = 0; pos < positionCount; pos++) {
-        if (!block.isNull(pos)) {
-          distinctValues.add(readValue(block, pos, inputType));
+      if (usePrimitiveLong) {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            longDistinctValues.add(inputType.getLong(block, pos));
+          }
+        }
+      } else {
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            objectDistinctValues.add(readValue(block, pos, inputType));
+          }
         }
       }
     }
 
     @Override
     public void writeTo(BlockBuilder builder) {
-      BigintType.BIGINT.writeLong(builder, distinctValues.size());
+      long count = usePrimitiveLong ? longDistinctValues.size() : objectDistinctValues.size();
+      BigintType.BIGINT.writeLong(builder, count);
     }
   }
 

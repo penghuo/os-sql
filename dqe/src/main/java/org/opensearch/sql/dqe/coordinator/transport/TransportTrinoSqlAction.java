@@ -216,13 +216,41 @@ public class TransportTrinoSqlAction
                             applyCoordinatorSort(
                                 mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
                       } else if (coordinatorPlan instanceof AggregationNode aggNode) {
-                        mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
-                        mergedPages =
-                            applyCoordinatorHaving(
-                                mergedPages, optimizedPlan, aggNode, columnTypeMap);
-                        mergedPages =
-                            applyCoordinatorSort(
-                                mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+                        // Check if we can use the fused merge+sort path (no HAVING clause)
+                        FilterNode havingNode = findHavingNode(optimizedPlan);
+                        SortNode sortNodeForFuse = findSortNode(optimizedPlan);
+                        long fusedLimit = findGlobalLimit(optimizedPlan);
+                        if (havingNode == null
+                            && sortNodeForFuse != null
+                            && fusedLimit > 0
+                            && aggNode.getStep() == AggregationNode.Step.FINAL) {
+                          // Fused merge+sort: avoids building full Page for all groups
+                          List<String> aggOutputCols = new ArrayList<>(aggNode.getGroupByKeys());
+                          aggOutputCols.addAll(aggNode.getAggregateFunctions());
+                          List<Integer> sortIndicesForFuse =
+                              sortNodeForFuse.getSortKeys().stream()
+                                  .map(aggOutputCols::indexOf)
+                                  .collect(Collectors.toList());
+                          long sortLimitForFuse = fusedLimit + findGlobalOffset(optimizedPlan);
+                          mergedPages =
+                              merger.mergeAggregationAndSort(
+                                  shardPages,
+                                  aggNode,
+                                  columnTypes,
+                                  sortIndicesForFuse,
+                                  sortNodeForFuse.getAscending(),
+                                  sortNodeForFuse.getNullsFirst(),
+                                  sortLimitForFuse);
+                        } else {
+                          // Fallback: separate merge + HAVING + sort
+                          mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
+                          mergedPages =
+                              applyCoordinatorHaving(
+                                  mergedPages, optimizedPlan, aggNode, columnTypeMap);
+                          mergedPages =
+                              applyCoordinatorSort(
+                                  mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+                        }
                       } else {
                         // Check if we need sorted merge
                         SortNode sortNode = findSortNode(optimizedPlan);

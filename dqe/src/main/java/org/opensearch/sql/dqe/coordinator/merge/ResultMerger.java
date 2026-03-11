@@ -77,6 +77,11 @@ public class ResultMerger {
 
     // Fast numeric path with fused top-N
     if (canUseFastNumericMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
+      // Ultra-fast single-key path: avoids ALL per-row allocation during merge
+      if (numGroupByCols == 1 && numAggCols == 1 && !hasAvgAgg(aggregateFunctions)) {
+        return mergeSingleKeyNumericCountWithSort(
+            shardResults, columnTypes, sortColumnIndices, ascending, limit);
+      }
       return mergeAggregationFastNumericWithSort(
           shardResults,
           numGroupByCols,
@@ -147,6 +152,10 @@ public class ResultMerger {
     // Directly merges shard Pages using primitive long arrays, avoiding Object allocation,
     // boxing, and HashMap overhead that dominates merge time for multi-key GROUP BY.
     if (canUseFastNumericMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
+      // Ultra-fast single-key path: avoids ALL per-row allocation during merge
+      if (numGroupByCols == 1 && numAggCols == 1 && !hasAvgAgg(aggregateFunctions)) {
+        return mergeSingleKeyNumericCount(shardResults, columnTypes);
+      }
       return mergeAggregationFastNumeric(
           shardResults, numGroupByCols, numAggCols, columnTypes, aggregateFunctions);
     }
@@ -804,6 +813,282 @@ public class ResultMerger {
       blocks[i] = builders[i].build();
     }
     return List.of(new Page(blocks));
+  }
+
+  /** Check if any aggregate function is AVG. */
+  private static boolean hasAvgAgg(List<String> aggregateFunctions) {
+    for (String func : aggregateFunctions) {
+      Matcher m = AGG_PATTERN.matcher(func);
+      if (m.matches() && "AVG".equals(m.group(1).toUpperCase(Locale.ROOT))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Ultra-fast merge for single numeric key + single COUNT/SUM aggregate (no sort). Uses a flat
+   * open-addressing hash map with primitive long keys and long values, eliminating ALL per-row
+   * object allocation. For Q16 (GROUP BY UserID COUNT(*)), this merges ~200K rows across 8 shards
+   * into ~25K groups with zero GC pressure.
+   */
+  private List<Page> mergeSingleKeyNumericCount(
+      List<List<Page>> shardResults, List<Type> columnTypes) {
+
+    // Open-addressing hash map: parallel arrays for keys and values
+    int capacity = 4096;
+    float loadFactor = 0.7f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKeys = new long[capacity];
+    long[] mapValues = new long[capacity];
+    boolean[] mapOccupied = new boolean[capacity];
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block aggBlock = page.getBlock(1);
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long key = columnTypes.get(0).getLong(keyBlock, pos);
+          long val = BigintType.BIGINT.getLong(aggBlock, pos);
+
+          // Murmur3 finalizer for good distribution
+          long h = key;
+          h ^= h >>> 33;
+          h *= 0xff51afd7ed558ccdL;
+          h ^= h >>> 33;
+          h *= 0xc4ceb9fe1a85ec53L;
+          h ^= h >>> 33;
+
+          int mask = capacity - 1;
+          int slot = (int) h & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKeys[slot] = key;
+              mapValues[slot] = val;
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                // Resize
+                int newCap = capacity * 2;
+                long[] nk = new long[newCap];
+                long[] nv = new long[newCap];
+                boolean[] nocc = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    long rh = mapKeys[s];
+                    rh ^= rh >>> 33;
+                    rh *= 0xff51afd7ed558ccdL;
+                    rh ^= rh >>> 33;
+                    rh *= 0xc4ceb9fe1a85ec53L;
+                    rh ^= rh >>> 33;
+                    int ns = (int) rh & nm;
+                    while (nocc[ns]) ns = (ns + 1) & nm;
+                    nk[ns] = mapKeys[s];
+                    nv[ns] = mapValues[s];
+                    nocc[ns] = true;
+                  }
+                }
+                capacity = newCap;
+                mask = newCap - 1;
+                threshold = (int) (newCap * loadFactor);
+                mapKeys = nk;
+                mapValues = nv;
+                mapOccupied = nocc;
+                // Re-find the slot for the just-inserted key after resize
+                slot = (int) h & mask;
+                while (mapOccupied[slot]) {
+                  if (mapKeys[slot] == key) break;
+                  slot = (slot + 1) & mask;
+                }
+              }
+              break;
+            }
+            if (mapKeys[slot] == key) {
+              mapValues[slot] += val;
+              break;
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) return List.of();
+
+    BlockBuilder keyBuilder = columnTypes.get(0).createBlockBuilder(null, size);
+    BlockBuilder valBuilder = BigintType.BIGINT.createBlockBuilder(null, size);
+    for (int s = 0; s < capacity; s++) {
+      if (mapOccupied[s]) {
+        columnTypes.get(0).writeLong(keyBuilder, mapKeys[s]);
+        BigintType.BIGINT.writeLong(valBuilder, mapValues[s]);
+      }
+    }
+    return List.of(new Page(keyBuilder.build(), valBuilder.build()));
+  }
+
+  /**
+   * Ultra-fast merge + top-N sort for single numeric key + single COUNT/SUM aggregate. Uses a flat
+   * open-addressing hash map with primitive long keys and long values, then performs top-N
+   * selection directly on the flat arrays. Eliminates ALL per-row object allocation during both
+   * merge and sort phases.
+   *
+   * <p>For Q16 (GROUP BY UserID COUNT(*) ORDER BY COUNT(*) DESC LIMIT 10), this:
+   *
+   * <ul>
+   *   <li>Merges ~200K partial rows into ~25K groups with zero allocation per row
+   *   <li>Selects top-10 using bounded heap on slot indices (not boxed Integer objects)
+   *   <li>Builds only 10 output rows (not 25K)
+   * </ul>
+   */
+  private List<Page> mergeSingleKeyNumericCountWithSort(
+      List<List<Page>> shardResults,
+      List<Type> columnTypes,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      long limit) {
+
+    // Open-addressing hash map: parallel arrays for keys and values
+    int capacity = 4096;
+    float loadFactor = 0.7f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKeys = new long[capacity];
+    long[] mapValues = new long[capacity];
+    boolean[] mapOccupied = new boolean[capacity];
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block aggBlock = page.getBlock(1);
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long key = columnTypes.get(0).getLong(keyBlock, pos);
+          long val = BigintType.BIGINT.getLong(aggBlock, pos);
+
+          // Murmur3 finalizer for good distribution
+          long h = key;
+          h ^= h >>> 33;
+          h *= 0xff51afd7ed558ccdL;
+          h ^= h >>> 33;
+          h *= 0xc4ceb9fe1a85ec53L;
+          h ^= h >>> 33;
+
+          int mask = capacity - 1;
+          int slot = (int) h & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKeys[slot] = key;
+              mapValues[slot] = val;
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                // Resize
+                int newCap = capacity * 2;
+                long[] nk = new long[newCap];
+                long[] nv = new long[newCap];
+                boolean[] nocc = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    long rh = mapKeys[s];
+                    rh ^= rh >>> 33;
+                    rh *= 0xff51afd7ed558ccdL;
+                    rh ^= rh >>> 33;
+                    rh *= 0xc4ceb9fe1a85ec53L;
+                    rh ^= rh >>> 33;
+                    int ns = (int) rh & nm;
+                    while (nocc[ns]) ns = (ns + 1) & nm;
+                    nk[ns] = mapKeys[s];
+                    nv[ns] = mapValues[s];
+                    nocc[ns] = true;
+                  }
+                }
+                capacity = newCap;
+                mask = newCap - 1;
+                threshold = (int) (newCap * loadFactor);
+                mapKeys = nk;
+                mapValues = nv;
+                mapOccupied = nocc;
+                // Re-find the slot for the just-inserted key after resize
+                slot = (int) h & mask;
+                while (mapOccupied[slot]) {
+                  if (mapKeys[slot] == key) break;
+                  slot = (slot + 1) & mask;
+                }
+              }
+              break;
+            }
+            if (mapKeys[slot] == key) {
+              mapValues[slot] += val;
+              break;
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) return List.of();
+
+    // Top-N selection on the flat hash map
+    int k = (int) Math.min(limit, size);
+
+    // Determine sort order: which column (0=key, 1=value) and direction
+    int sortCol = sortColumnIndices.get(0);
+    boolean sortAsc = ascending.get(0);
+
+    // Capture final arrays for comparator
+    final long[] fKeys = mapKeys;
+    final long[] fValues = mapValues;
+    final boolean[] fOccupied = mapOccupied;
+    final int fCapacity = capacity;
+
+    // Comparator for slot indices
+    Comparator<Integer> slotCmp;
+    if (sortCol == 0) {
+      // Sort by key
+      slotCmp =
+          sortAsc
+              ? (s1, s2) -> Long.compare(fKeys[s1], fKeys[s2])
+              : (s1, s2) -> Long.compare(fKeys[s2], fKeys[s1]);
+    } else {
+      // Sort by value (aggregate)
+      slotCmp =
+          sortAsc
+              ? (s1, s2) -> Long.compare(fValues[s1], fValues[s2])
+              : (s1, s2) -> Long.compare(fValues[s2], fValues[s1]);
+    }
+
+    // Bounded max-heap for O(n log k) top-N selection
+    PriorityQueue<Integer> heap = new PriorityQueue<>(k + 1, slotCmp.reversed());
+    for (int s = 0; s < fCapacity; s++) {
+      if (fOccupied[s]) {
+        heap.offer(s);
+        if (heap.size() > k) heap.poll();
+      }
+    }
+
+    // Extract in sorted order
+    int heapSize = heap.size();
+    Integer[] topSlots = new Integer[heapSize];
+    for (int i = heapSize - 1; i >= 0; i--) {
+      topSlots[i] = heap.poll();
+    }
+    java.util.Arrays.sort(topSlots, slotCmp);
+
+    // Build output Page for top-k only
+    BlockBuilder keyBuilder = columnTypes.get(0).createBlockBuilder(null, heapSize);
+    BlockBuilder valBuilder = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+    for (int slot : topSlots) {
+      columnTypes.get(0).writeLong(keyBuilder, fKeys[slot]);
+      BigintType.BIGINT.writeLong(valBuilder, fValues[slot]);
+    }
+    return List.of(new Page(keyBuilder.build(), valBuilder.build()));
   }
 
   /**

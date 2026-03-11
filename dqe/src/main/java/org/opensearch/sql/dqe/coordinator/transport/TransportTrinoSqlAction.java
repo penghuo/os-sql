@@ -527,7 +527,6 @@ public class TransportTrinoSqlAction
           if (globalLimit >= 0) {
             mergedPages = applyGlobalLimit(mergedPages, globalLimit);
           }
-
           String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
           listener.onResponse(new TrinoSqlResponse(responseJson));
         } catch (Exception e) {

@@ -199,7 +199,7 @@ public class TransportTrinoSqlAction
                         // No sort/having needed for scalar aggregation
                       } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
                           && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
-                          && isScalarCountDistinctLong(singleCdAgg)) {
+                          && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
                         // Fast path: scalar COUNT(DISTINCT numericCol) — shards already pre-deduped
                         // values. Merge distinct value sets using LongOpenHashSet and count.
                         mergedPages = mergeCountDistinctValues(shardPages);
@@ -1213,11 +1213,14 @@ public class TransportTrinoSqlAction
   }
 
   /**
-   * Check if the coordinator aggregation node is a scalar COUNT(DISTINCT numericCol) in SINGLE
-   * mode. Shards have already pre-deduped values, so the coordinator can merge with
-   * LongOpenHashSet.
+   * Check if the coordinator aggregation node is a scalar COUNT(DISTINCT numericCol) in SINGLE mode
+   * where the column is a numeric (long-representable) type. Shards have already pre-deduped values
+   * as longs, so the coordinator can merge with LongOpenHashSet. Returns false for non-numeric
+   * columns (e.g., VARCHAR) to avoid ClassCastException when reading VariableWidthBlock as
+   * LongArrayBlock.
    */
-  private static boolean isScalarCountDistinctLong(AggregationNode aggNode) {
+  private static boolean isScalarCountDistinctLong(
+      AggregationNode aggNode, Map<String, Type> columnTypeMap) {
     if (!aggNode.getGroupByKeys().isEmpty()) {
       return false;
     }
@@ -1225,8 +1228,24 @@ public class TransportTrinoSqlAction
     if (aggs.size() != 1) {
       return false;
     }
-    String agg = aggs.get(0).toUpperCase(java.util.Locale.ROOT);
-    return agg.startsWith("COUNT(DISTINCT ");
+    String originalAgg = aggs.get(0);
+    String aggUpper = originalAgg.toUpperCase(java.util.Locale.ROOT);
+    if (!aggUpper.startsWith("COUNT(DISTINCT ")) {
+      return false;
+    }
+    // Extract the column name from the original aggregate string using the known
+    // prefix length. The prefix "COUNT(DISTINCT " is 15 chars regardless of case.
+    String colName = originalAgg.substring(15, originalAgg.length() - 1).trim();
+    // Verify the column is a numeric (long-representable) type.
+    // VARCHAR columns (like SearchPhrase) must NOT use this fast path — the shards
+    // will not have pre-deduped them as longs, so mergeCountDistinctValues() would
+    // throw ClassCastException (VariableWidthBlock cannot be cast to LongArrayBlock).
+    Type colType = columnTypeMap.get(colName);
+    return colType instanceof BigintType
+        || colType instanceof IntegerType
+        || colType instanceof SmallintType
+        || colType instanceof TinyintType
+        || colType instanceof TimestampType;
   }
 
   /**

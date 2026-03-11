@@ -94,7 +94,7 @@ class TransportTrinoSqlActionTest {
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
+            transportService, new ActionFilters(Collections.emptySet()), clusterService, null);
 
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
     TrinoSqlResponse response = executeSync(action, request);
@@ -138,7 +138,7 @@ class TransportTrinoSqlActionTest {
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
+            transportService, new ActionFilters(Collections.emptySet()), clusterService, null);
 
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
     executeSync(action, request);
@@ -160,7 +160,7 @@ class TransportTrinoSqlActionTest {
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
+            transportService, new ActionFilters(Collections.emptySet()), clusterService, null);
 
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", true);
     TrinoSqlResponse response = executeSync(action, request);
@@ -196,7 +196,7 @@ class TransportTrinoSqlActionTest {
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
+            transportService, new ActionFilters(Collections.emptySet()), clusterService, null);
 
     TrinoSqlRequest request = new TrinoSqlRequest("NOT VALID SQL AT ALL", false);
 
@@ -332,7 +332,7 @@ class TransportTrinoSqlActionTest {
 
     TransportTrinoSqlAction action =
         new TransportTrinoSqlAction(
-            transportService, new ActionFilters(Collections.emptySet()), clusterService);
+            transportService, new ActionFilters(Collections.emptySet()), clusterService, null);
 
     TrinoSqlRequest request = new TrinoSqlRequest("SELECT status FROM logs", false);
     executeSync(action, request);

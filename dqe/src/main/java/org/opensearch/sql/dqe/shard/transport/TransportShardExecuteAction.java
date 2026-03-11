@@ -157,6 +157,110 @@ public class TransportShardExecuteAction
     this.columnTypeMap = columnTypeMap;
   }
 
+  /**
+   * Execute a shard plan fragment locally without serialization/deserialization overhead. This is
+   * called by the coordinator when all shards are on the same node, bypassing the transport layer
+   * entirely. The plan node is passed directly (not serialized), and the response Pages are
+   * returned as-is (not serialized to bytes and back).
+   *
+   * @param plan the deserialized plan fragment (already constructed, no need to deserialize)
+   * @param req the shard execute request (contains index name, shard ID, timeout)
+   * @return the shard execution result with pages and column types
+   * @throws Exception if execution fails
+   */
+  public ShardExecuteResponse executeLocal(DqePlanNode plan, ShardExecuteRequest req)
+      throws Exception {
+    return executePlan(plan, req);
+  }
+
+  /**
+   * Core plan execution logic shared by both the transport path ({@link #doExecute}) and the
+   * local-node shortcut ({@link #executeLocal}). Handles all fused paths, pipeline construction,
+   * and result collection.
+   */
+  private ShardExecuteResponse executePlan(DqePlanNode plan, ShardExecuteRequest req)
+      throws Exception {
+    // Try short-circuit for scalar COUNT(*) — avoids pipeline construction entirely
+    if (scanFactory == null && isScalarCountStar(plan)) {
+      List<Page> pages = executeScalarCountStar(plan, req);
+      List<Type> columnTypes = List.of(BigintType.BIGINT);
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Try fused scan-aggregate for scalar aggregations (no GROUP BY)
+    if (scanFactory == null
+        && plan instanceof AggregationNode aggNode
+        && FusedScanAggregate.canFuse(aggNode)) {
+      List<Page> pages = executeFusedScanAggregate(aggNode, req);
+      List<Type> columnTypes =
+          FusedScanAggregate.resolveOutputTypes(
+              aggNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Try fused eval-aggregate for SUM(col + constant) patterns
+    if (scanFactory == null
+        && plan instanceof AggregationNode aggEvalNode
+        && FusedScanAggregate.canFuseWithEval(aggEvalNode)) {
+      List<Page> pages = executeFusedEvalAggregate(aggEvalNode, req);
+      List<Type> columnTypes = FusedScanAggregate.resolveEvalAggOutputTypes(aggEvalNode);
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Try fused ordinal-based GROUP BY for aggregations with string group keys
+    if (scanFactory == null
+        && plan instanceof AggregationNode aggGroupNode
+        && FusedGroupByAggregate.canFuse(
+            aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+      List<Page> pages = executeFusedGroupByAggregate(aggGroupNode, req);
+      List<Type> columnTypes =
+          FusedGroupByAggregate.resolveOutputTypes(
+              aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Resolve scan factory and column types
+    final Function<TableScanNode, Operator> effectiveScanFactory;
+    final Map<String, Type> effectiveColumnTypeMap;
+
+    if (scanFactory != null) {
+      effectiveScanFactory = scanFactory;
+      effectiveColumnTypeMap = columnTypeMap != null ? columnTypeMap : Map.of();
+    } else {
+      String indexName = findIndexName(plan);
+      CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+      effectiveColumnTypeMap = cachedMeta.columnTypeMap();
+
+      Settings nodeSettings = clusterService.getSettings();
+      int batchSize = DqeSettings.PAGE_BATCH_SIZE.get(nodeSettings);
+      effectiveScanFactory =
+          buildLuceneScanFactory(
+              req,
+              cachedMeta.tableInfo(),
+              effectiveColumnTypeMap,
+              cachedMeta.fieldTypeMap(),
+              batchSize);
+    }
+
+    // Build operator pipeline
+    LocalExecutionPlanner planner =
+        new LocalExecutionPlanner(effectiveScanFactory, effectiveColumnTypeMap);
+    Operator pipeline = plan.accept(planner, null);
+
+    // Execute: drain pages
+    List<Page> pages = new ArrayList<>();
+    Page page;
+    while ((page = pipeline.processNextBatch()) != null) {
+      pages.add(page);
+    }
+    pipeline.close();
+
+    // Resolve column types from the plan
+    List<Type> columnTypes = resolveColumnTypes(plan, effectiveColumnTypeMap);
+
+    return new ShardExecuteResponse(pages, columnTypes);
+  }
+
   @Override
   protected void doExecute(
       Task task, ActionRequest request, ActionListener<ShardExecuteResponse> listener) {
@@ -167,97 +271,9 @@ public class TransportShardExecuteAction
           DqePlanNode.readPlanNode(
               new InputStreamStreamInput(new ByteArrayInputStream(req.getSerializedFragment())));
 
-      // 2. Try short-circuit for scalar COUNT(*) — avoids pipeline construction entirely
-      if (scanFactory == null && isScalarCountStar(plan)) {
-        List<Page> pages = executeScalarCountStar(plan, req);
-        List<Type> columnTypes = List.of(BigintType.BIGINT);
-        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
-        return;
-      }
-
-      // 2b. Try fused scan-aggregate for scalar aggregations (no GROUP BY) —
-      // aggregates directly from DocValues without building intermediate Pages
-      if (scanFactory == null
-          && plan instanceof AggregationNode aggNode
-          && FusedScanAggregate.canFuse(aggNode)) {
-        List<Page> pages = executeFusedScanAggregate(aggNode, req);
-        List<Type> columnTypes =
-            FusedScanAggregate.resolveOutputTypes(
-                aggNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
-        return;
-      }
-
-      // 2b2. Try fused eval-aggregate for SUM(col + constant) patterns —
-      // uses algebraic identity SUM(col + k) = SUM(col) + k * COUNT(*) to avoid
-      // per-row expression evaluation, reading each column only once
-      if (scanFactory == null
-          && plan instanceof AggregationNode aggEvalNode
-          && FusedScanAggregate.canFuseWithEval(aggEvalNode)) {
-        List<Page> pages = executeFusedEvalAggregate(aggEvalNode, req);
-        List<Type> columnTypes = FusedScanAggregate.resolveEvalAggOutputTypes(aggEvalNode);
-        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
-        return;
-      }
-
-      // 2c. Try fused ordinal-based GROUP BY for aggregations with string group keys —
-      // uses SortedSetDocValues ordinals as hash keys, deferring string resolution to output
-      if (scanFactory == null
-          && plan instanceof AggregationNode aggGroupNode
-          && FusedGroupByAggregate.canFuse(
-              aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
-        List<Page> pages = executeFusedGroupByAggregate(aggGroupNode, req);
-        List<Type> columnTypes =
-            FusedGroupByAggregate.resolveOutputTypes(
-                aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-        listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
-        return;
-      }
-
-      // 3. Resolve scan factory and column types
-      final Function<TableScanNode, Operator> effectiveScanFactory;
-      final Map<String, Type> effectiveColumnTypeMap;
-
-      if (scanFactory != null) {
-        // Test path: use directly injected factory and type map
-        effectiveScanFactory = scanFactory;
-        effectiveColumnTypeMap = columnTypeMap != null ? columnTypeMap : Map.of();
-      } else {
-        // Production path: use cached metadata to avoid redundant resolution
-        // across concurrent shard executions for the same index.
-        String indexName = findIndexName(plan);
-        CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
-        effectiveColumnTypeMap = cachedMeta.columnTypeMap();
-
-        Settings nodeSettings = clusterService.getSettings();
-        int batchSize = DqeSettings.PAGE_BATCH_SIZE.get(nodeSettings);
-        effectiveScanFactory =
-            buildLuceneScanFactory(
-                req,
-                cachedMeta.tableInfo(),
-                effectiveColumnTypeMap,
-                cachedMeta.fieldTypeMap(),
-                batchSize);
-      }
-
-      // 4. Build operator pipeline
-      LocalExecutionPlanner planner =
-          new LocalExecutionPlanner(effectiveScanFactory, effectiveColumnTypeMap);
-      Operator pipeline = plan.accept(planner, null);
-
-      // 5. Execute: drain pages
-      List<Page> pages = new ArrayList<>();
-      Page page;
-      while ((page = pipeline.processNextBatch()) != null) {
-        pages.add(page);
-      }
-      pipeline.close();
-
-      // 6. Resolve column types from the plan
-      List<Type> columnTypes = resolveColumnTypes(plan, effectiveColumnTypeMap);
-
-      // 7. Return Page-based response
-      listener.onResponse(new ShardExecuteResponse(pages, columnTypes));
+      // 2. Execute the plan using shared logic
+      ShardExecuteResponse response = executePlan(plan, req);
+      listener.onResponse(response);
     } catch (Exception e) {
       listener.onFailure(e);
     }

@@ -87,6 +87,7 @@ public class TransportTrinoSqlAction
 
   private final ClusterService clusterService;
   private final TransportService transportService;
+  private final org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction;
 
   /**
    * Constructor for plugin wiring with dependency injection.
@@ -94,15 +95,18 @@ public class TransportTrinoSqlAction
    * @param transportService the transport service for dispatching shard requests
    * @param actionFilters action filters
    * @param clusterService the cluster service for metadata and routing
+   * @param shardAction the shard execute action for local-node execution shortcut
    */
   @Inject
   public TransportTrinoSqlAction(
       TransportService transportService,
       ActionFilters actionFilters,
-      ClusterService clusterService) {
+      ClusterService clusterService,
+      org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction) {
     super(TrinoSqlAction.NAME, transportService, actionFilters, TrinoSqlRequest::new);
     this.clusterService = clusterService;
     this.transportService = transportService;
+    this.shardAction = shardAction;
   }
 
   @Override
@@ -264,50 +268,96 @@ public class TransportTrinoSqlAction
                   listener::onFailure),
               shardFragments.size());
 
-      // Serialize the shard plan once and reuse for all shards (all fragments share the
-      // same plan object; only shardId and nodeId differ).
-      byte[] serializedPlan;
-      {
-        BytesStreamOutput planOut = new BytesStreamOutput();
-        DqePlanNode.writePlanNode(planOut, shardFragments.get(0).shardPlan());
-        serializedPlan = planOut.bytes().toBytesRef().bytes;
+      // Check if all shards are on the local node for direct execution shortcut.
+      // This bypasses plan serialization, transport layer, and response serialization
+      // for every shard — a significant overhead reduction for single-node deployments.
+      DiscoveryNode localNode = clusterService.localNode();
+      String localNodeId = (localNode != null) ? localNode.getId() : null;
+      boolean allLocal = localNodeId != null;
+      if (allLocal) {
+        for (PlanFragment frag : shardFragments) {
+          if (!localNodeId.equals(frag.nodeId())) {
+            allLocal = false;
+            break;
+          }
+        }
       }
 
-      // Dispatch each fragment to its target node
-      for (PlanFragment frag : shardFragments) {
-        ShardExecuteRequest shardReq =
-            new ShardExecuteRequest(
-                serializedPlan, frag.indexName(), frag.shardId(), timeoutMillis);
+      if (allLocal && shardAction != null) {
+        // === Local-node fast path ===
+        // Execute all shard plans directly without transport serialization.
+        // Dispatches each shard execution to the dqe-shard-executor thread pool
+        // for parallel execution, matching the concurrency of the transport path.
+        LOG.debug("DQE: Using local-node fast path for {} shard fragments", shardFragments.size());
+        DqePlanNode shardPlan = shardFragments.get(0).shardPlan();
+        java.util.concurrent.ExecutorService executor =
+            transportService
+                .getThreadPool()
+                .executor(
+                    org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction
+                        .DQE_THREAD_POOL_NAME);
+        for (PlanFragment frag : shardFragments) {
+          final int fragShardId = frag.shardId();
+          final String fragIndexName = frag.indexName();
+          executor.execute(
+              () -> {
+                ShardExecuteRequest shardReq =
+                    new ShardExecuteRequest(new byte[0], fragIndexName, fragShardId, timeoutMillis);
+                try {
+                  ShardExecuteResponse response = shardAction.executeLocal(shardPlan, shardReq);
+                  groupedListener.onResponse(response);
+                } catch (Exception e) {
+                  groupedListener.onFailure(e);
+                }
+              });
+        }
+      } else {
+        // === Transport path ===
+        // Serialize the shard plan once and reuse for all shards (all fragments share the
+        // same plan object; only shardId and nodeId differ).
+        byte[] serializedPlan;
+        {
+          BytesStreamOutput planOut = new BytesStreamOutput();
+          DqePlanNode.writePlanNode(planOut, shardFragments.get(0).shardPlan());
+          serializedPlan = planOut.bytes().toBytesRef().bytes;
+        }
 
-        // Resolve target node
-        DiscoveryNode targetNode = clusterService.state().nodes().get(frag.nodeId());
+        // Dispatch each fragment to its target node
+        for (PlanFragment frag : shardFragments) {
+          ShardExecuteRequest shardReq =
+              new ShardExecuteRequest(
+                  serializedPlan, frag.indexName(), frag.shardId(), timeoutMillis);
 
-        // Send via transport
-        transportService.sendRequest(
-            targetNode,
-            ShardExecuteAction.NAME,
-            shardReq,
-            new TransportResponseHandler<ShardExecuteResponse>() {
-              @Override
-              public ShardExecuteResponse read(StreamInput in) throws IOException {
-                return new ShardExecuteResponse(in);
-              }
+          // Resolve target node
+          DiscoveryNode targetNode = clusterService.state().nodes().get(frag.nodeId());
 
-              @Override
-              public void handleResponse(ShardExecuteResponse response) {
-                groupedListener.onResponse(response);
-              }
+          // Send via transport
+          transportService.sendRequest(
+              targetNode,
+              ShardExecuteAction.NAME,
+              shardReq,
+              new TransportResponseHandler<ShardExecuteResponse>() {
+                @Override
+                public ShardExecuteResponse read(StreamInput in) throws IOException {
+                  return new ShardExecuteResponse(in);
+                }
 
-              @Override
-              public void handleException(TransportException exp) {
-                groupedListener.onFailure(exp);
-              }
+                @Override
+                public void handleResponse(ShardExecuteResponse response) {
+                  groupedListener.onResponse(response);
+                }
 
-              @Override
-              public String executor() {
-                return ThreadPool.Names.SAME;
-              }
-            });
+                @Override
+                public void handleException(TransportException exp) {
+                  groupedListener.onFailure(exp);
+                }
+
+                @Override
+                public String executor() {
+                  return ThreadPool.Names.SAME;
+                }
+              });
+        }
       }
 
     } catch (Exception e) {

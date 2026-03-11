@@ -85,6 +85,26 @@ public class TransportTrinoSqlAction
 
   private static final Logger LOG = LogManager.getLogger();
 
+  /**
+   * Cache for compiled SQL query plans. Eliminates the parse-plan-optimize-fragment overhead for
+   * repeated queries. Keyed by (SQL string, cluster metadata version) so that schema changes
+   * automatically invalidate the cache. Bounded to 128 entries to limit memory usage.
+   */
+  private static final java.util.concurrent.ConcurrentHashMap<String, CachedQueryPlan>
+      QUERY_PLAN_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+  /** Holder for a compiled query plan cached across repeated executions of the same SQL. */
+  private record CachedQueryPlan(
+      PlanFragmenter.FragmentResult fragments,
+      DqePlanNode optimizedPlan,
+      DqePlanNode shardPlan,
+      DqePlanNode coordinatorPlan,
+      List<String> columnNames,
+      List<String> internalColumnNames,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap,
+      long metadataVersion) {}
+
   private final ClusterService clusterService;
   private final TransportService transportService;
   private final org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction;
@@ -114,62 +134,115 @@ public class TransportTrinoSqlAction
       Task task, ActionRequest request, ActionListener<TrinoSqlResponse> listener) {
     TrinoSqlRequest sqlReq = TrinoSqlRequest.fromActionRequest(request);
     try {
-      // 1. Parse
-      DqeSqlParser parser = new DqeSqlParser();
-      Statement stmt = parser.parse(sqlReq.getQuery());
+      // Check query plan cache first (skips parse/plan/optimize/fragment for repeated queries)
+      long currentMetaVersion = clusterService.state().metadata().version();
+      String queryStr = sqlReq.getQuery();
 
-      // 2. Resolve metadata (cache TableInfo to avoid redundant resolution)
-      OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
-      // Use a caching wrapper so LogicalPlanner.plan() and our later lookup share the result.
-      Map<String, TableInfo> tableInfoCache = new HashMap<>();
-      java.util.function.Function<String, TableInfo> cachingResolver =
-          name -> tableInfoCache.computeIfAbsent(name, metadata::getTableInfo);
-
-      // 3. Plan
-      DqePlanNode plan = LogicalPlanner.plan(stmt, cachingResolver);
-
-      // 4. Optimize (resolve field types for predicate pushdown)
-      String indexName = findIndexName(plan);
-      TableInfo tableInfo = cachingResolver.apply(indexName); // cache hit
-      // Pre-compute type maps once from the column list (avoid repeated stream operations)
-      List<TableInfo.ColumnInfo> columnInfoList = tableInfo.columns();
-      Map<String, String> fieldTypeMap = new HashMap<>(columnInfoList.size());
-      Map<String, Type> columnTypeMap = new HashMap<>(columnInfoList.size());
-      List<String> allColumnNames = new ArrayList<>(columnInfoList.size());
-      for (TableInfo.ColumnInfo col : columnInfoList) {
-        fieldTypeMap.put(col.name(), col.openSearchType());
-        columnTypeMap.put(col.name(), col.trinoType());
-        allColumnNames.add(col.name());
-      }
-      PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
-      DqePlanNode optimizedPlan = optimizer.optimize(plan);
-
-      // 5. Fragment (needed for both explain and execute)
-      PlanFragmenter fragmenter = new PlanFragmenter();
-      PlanFragmenter.FragmentResult fragments =
-          fragmenter.fragment(optimizedPlan, clusterService.state());
-
-      // 6. Explain mode: return logical plan, optimized plan, and fragments
-      if (sqlReq.isExplain()) {
-        listener.onResponse(new TrinoSqlResponse(formatExplain(plan, optimizedPlan, fragments)));
-        return;
+      // Explain mode cannot use the cache (needs the unoptimized plan for display)
+      CachedQueryPlan cached = sqlReq.isExplain() ? null : QUERY_PLAN_CACHE.get(queryStr);
+      if (cached != null && cached.metadataVersion() != currentMetaVersion) {
+        cached = null; // Stale cache entry — schema may have changed
       }
 
-      // Internal column names (for type lookup) vs display names (for response schema)
-      List<String> internalColumnNames = resolveColumnNames(optimizedPlan);
-      List<String> columnNames;
-      if (stmt instanceof Query query2
-          && query2.getQueryBody() instanceof QuerySpecification querySpec2) {
-        columnNames = LogicalPlanner.extractDisplayColumnNames(querySpec2, allColumnNames);
+      final PlanFragmenter.FragmentResult fragments;
+      final DqePlanNode optimizedPlan;
+      final List<String> columnNames;
+      final List<String> internalColumnNames;
+      final List<Type> columnTypes;
+      final Map<String, Type> columnTypeMap;
+
+      if (cached != null) {
+        // === Cache hit: reuse pre-compiled plan ===
+        fragments = cached.fragments();
+        optimizedPlan = cached.optimizedPlan();
+        columnNames = cached.columnNames();
+        internalColumnNames = cached.internalColumnNames();
+        columnTypes = cached.columnTypes();
+        columnTypeMap = cached.columnTypeMap();
       } else {
-        columnNames = internalColumnNames;
+        // === Cache miss: full compilation pipeline ===
+
+        // 1. Parse
+        DqeSqlParser parser = new DqeSqlParser();
+        Statement stmt = parser.parse(queryStr);
+
+        // 2. Resolve metadata (cache TableInfo to avoid redundant resolution)
+        OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
+        Map<String, TableInfo> tableInfoCache = new HashMap<>();
+        java.util.function.Function<String, TableInfo> cachingResolver =
+            name -> tableInfoCache.computeIfAbsent(name, metadata::getTableInfo);
+
+        // 3. Plan
+        DqePlanNode plan = LogicalPlanner.plan(stmt, cachingResolver);
+
+        // 4. Optimize (resolve field types for predicate pushdown)
+        String indexName = findIndexName(plan);
+        TableInfo tableInfo = cachingResolver.apply(indexName);
+        List<TableInfo.ColumnInfo> columnInfoList = tableInfo.columns();
+        Map<String, String> fieldTypeMap = new HashMap<>(columnInfoList.size());
+        Map<String, Type> compiledColumnTypeMap = new HashMap<>(columnInfoList.size());
+        List<String> allColumnNames = new ArrayList<>(columnInfoList.size());
+        for (TableInfo.ColumnInfo col : columnInfoList) {
+          fieldTypeMap.put(col.name(), col.openSearchType());
+          compiledColumnTypeMap.put(col.name(), col.trinoType());
+          allColumnNames.add(col.name());
+        }
+        PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
+        DqePlanNode compiledOptimizedPlan = optimizer.optimize(plan);
+
+        // 5. Fragment
+        PlanFragmenter fragmenter = new PlanFragmenter();
+        PlanFragmenter.FragmentResult compiledFragments =
+            fragmenter.fragment(compiledOptimizedPlan, clusterService.state());
+
+        // 6. Explain mode: return logical plan, optimized plan, and fragments
+        if (sqlReq.isExplain()) {
+          listener.onResponse(
+              new TrinoSqlResponse(formatExplain(plan, compiledOptimizedPlan, compiledFragments)));
+          return;
+        }
+
+        // Resolve column names and types
+        List<String> compiledInternalColumnNames = resolveColumnNames(compiledOptimizedPlan);
+        List<String> compiledColumnNames;
+        if (stmt instanceof Query query2
+            && query2.getQueryBody() instanceof QuerySpecification querySpec2) {
+          compiledColumnNames =
+              LogicalPlanner.extractDisplayColumnNames(querySpec2, allColumnNames);
+        } else {
+          compiledColumnNames = compiledInternalColumnNames;
+        }
+        List<Type> compiledColumnTypes =
+            resolveColumnTypes(
+                compiledInternalColumnNames, compiledColumnTypeMap, compiledOptimizedPlan);
+
+        // Store in cache (bounded to 128 entries to limit memory)
+        if (QUERY_PLAN_CACHE.size() > 128) {
+          QUERY_PLAN_CACHE.clear();
+        }
+        List<PlanFragment> shardFrags = compiledFragments.shardFragments();
+        DqePlanNode cachedShardPlan = shardFrags.isEmpty() ? null : shardFrags.get(0).shardPlan();
+        QUERY_PLAN_CACHE.put(
+            queryStr,
+            new CachedQueryPlan(
+                compiledFragments,
+                compiledOptimizedPlan,
+                cachedShardPlan,
+                compiledFragments.coordinatorPlan(),
+                compiledColumnNames,
+                compiledInternalColumnNames,
+                compiledColumnTypes,
+                compiledColumnTypeMap,
+                currentMetaVersion));
+
+        // Assign to final variables for the execution phase
+        fragments = compiledFragments;
+        optimizedPlan = compiledOptimizedPlan;
+        columnNames = compiledColumnNames;
+        internalColumnNames = compiledInternalColumnNames;
+        columnTypes = compiledColumnTypes;
+        columnTypeMap = compiledColumnTypeMap;
       }
-      // Use internal names for type lookup (aliases don't exist in the type map).
-      // For computed expressions (e.g., "(count_long * price_double)"), the column name
-      // won't exist in the type map. In that case, infer the result type by compiling
-      // the expression and checking its output type.
-      List<Type> columnTypes =
-          resolveColumnTypes(internalColumnNames, columnTypeMap, optimizedPlan);
 
       // 8. Dispatch to shards via transport
       List<PlanFragment> shardFragments = fragments.shardFragments();

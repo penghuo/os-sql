@@ -29,14 +29,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.LeafCollector;
+import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
@@ -1200,130 +1203,107 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key")) {
 
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              SortedNumericDocValues dv0 =
-                  context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly without Collector/Scorer overhead.
+        // This eliminates the Lucene search framework cost (~2-4ms for 100M docs).
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
 
-              final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-              final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
-              for (int i = 0; i < numAggs; i++) {
-                if (!isCountStar[i]) {
-                  AggSpec spec = specs.get(i);
-                  if (spec.argType instanceof VarcharType) {
-                    varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
-                  } else {
-                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
+          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              AggSpec spec = specs.get(i);
+              if (spec.argType instanceof VarcharType) {
+                varcharAggDvs[i] = reader.getSortedSetDocValues(spec.arg);
+              } else {
+                numericAggDvs[i] = reader.getSortedNumericDocValues(spec.arg);
+              }
+            }
+          }
+
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              collectSingleKeyNumericDoc(
+                  doc,
+                  dv0,
+                  singleKeyMap,
+                  numAggs,
+                  isCountStar,
+                  isDoubleArg,
+                  accType,
+                  numericAggDvs,
+                  varcharAggDvs);
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                collectSingleKeyNumericDoc(
+                    doc,
+                    dv0,
+                    singleKeyMap,
+                    numAggs,
+                    isCountStar,
+                    isDoubleArg,
+                    accType,
+                    numericAggDvs,
+                    varcharAggDvs);
+              }
+            }
+          }
+        }
+      } else {
+        // General path: use Lucene's search framework with Collector
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv0 =
+                    context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
+
+                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    AggSpec spec = specs.get(i);
+                    if (spec.argType instanceof VarcharType) {
+                      varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
+                    } else {
+                      numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                    }
                   }
                 }
+
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    collectSingleKeyNumericDoc(
+                        doc,
+                        dv0,
+                        singleKeyMap,
+                        numAggs,
+                        isCountStar,
+                        isDoubleArg,
+                        accType,
+                        numericAggDvs,
+                        varcharAggDvs);
+                  }
+                };
               }
 
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
-
-                @Override
-                public void collect(int doc) throws IOException {
-                  long key0 = 0;
-                  if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
-                  AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
-
-                  // Inline accumulation with pre-computed dispatch flags
-                  for (int i = 0; i < numAggs; i++) {
-                    MergeableAccumulator acc = accGroup.accumulators[i];
-                    if (isCountStar[i]) {
-                      ((CountStarAccum) acc).count++;
-                      continue;
-                    }
-                    // Handle varchar aggregate args (e.g., MIN(Referer))
-                    if (varcharAggDvs[i] != null) {
-                      SortedSetDocValues varcharDv = varcharAggDvs[i];
-                      if (varcharDv.advanceExact(doc)) {
-                        BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
-                        String val = bytes.utf8ToString();
-                        if (acc instanceof CountDistinctAccum cda) {
-                          cda.objectDistinctValues.add(val);
-                        } else if (acc instanceof MinAccum ma) {
-                          if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
-                            ma.objectVal = val;
-                            ma.hasValue = true;
-                          }
-                        } else if (acc instanceof MaxAccum xa) {
-                          if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
-                            xa.objectVal = val;
-                            xa.hasValue = true;
-                          }
-                        }
-                      }
-                      continue;
-                    }
-                    SortedNumericDocValues aggDv = numericAggDvs[i];
-                    if (aggDv != null && aggDv.advanceExact(doc)) {
-                      long rawVal = aggDv.nextValue();
-                      switch (accType[i]) {
-                        case 0:
-                          ((CountStarAccum) acc).count++;
-                          break;
-                        case 1: // SUM long
-                          SumAccum sa = (SumAccum) acc;
-                          sa.hasValue = true;
-                          sa.longSum += rawVal;
-                          break;
-                        case 2: // AVG long
-                          AvgAccum aa = (AvgAccum) acc;
-                          aa.count++;
-                          aa.longSum += rawVal;
-                          break;
-                        case 3: // MIN
-                          MinAccum ma = (MinAccum) acc;
-                          ma.hasValue = true;
-                          if (isDoubleArg[i]) {
-                            double d = Double.longBitsToDouble(rawVal);
-                            if (d < ma.doubleVal) ma.doubleVal = d;
-                          } else {
-                            if (rawVal < ma.longVal) ma.longVal = rawVal;
-                          }
-                          break;
-                        case 4: // MAX
-                          MaxAccum xa = (MaxAccum) acc;
-                          xa.hasValue = true;
-                          if (isDoubleArg[i]) {
-                            double d = Double.longBitsToDouble(rawVal);
-                            if (d > xa.doubleVal) xa.doubleVal = d;
-                          } else {
-                            if (rawVal > xa.longVal) xa.longVal = rawVal;
-                          }
-                          break;
-                        case 5: // COUNT(DISTINCT)
-                          CountDistinctAccum cda = (CountDistinctAccum) acc;
-                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                          else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                          break;
-                        case 6: // SUM double
-                          SumAccum sad = (SumAccum) acc;
-                          sad.hasValue = true;
-                          sad.doubleSum += Double.longBitsToDouble(rawVal);
-                          break;
-                        case 7: // AVG double
-                          AvgAccum aad = (AvgAccum) acc;
-                          aad.count++;
-                          aad.doubleSum += Double.longBitsToDouble(rawVal);
-                          break;
-                      }
-                    }
-                  }
-                }
-              };
-            }
-
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     if (singleKeyMap.size == 0) return List.of();
@@ -1349,6 +1329,141 @@ public final class FusedGroupByAggregate {
     Block[] blocks = new Block[totalColumns];
     for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
     return List.of(new Page(blocks));
+  }
+
+  /** Build the result Page from a SingleKeyHashMap after aggregation. */
+  private static List<Page> buildSingleKeyResult(
+      SingleKeyHashMap singleKeyMap,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys) {
+    if (singleKeyMap.size == 0) return List.of();
+    int numAggs = specs.size();
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int groupCount = singleKeyMap.size;
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, groupCount);
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+    }
+    for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+      if (singleKeyMap.occupied[slot]) {
+        writeNumericKeyValue(builders[0], keyInfos.get(0), singleKeyMap.keys[slot]);
+        AccumulatorGroup accGroup = singleKeyMap.groups[slot];
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+        }
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Process a single document for the single-key numeric GROUP BY path. Extracted as a helper to
+   * share between the MatchAllDocsQuery fast path and the Collector-based general path.
+   */
+  private static void collectSingleKeyNumericDoc(
+      int doc,
+      SortedNumericDocValues dv0,
+      SingleKeyHashMap singleKeyMap,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isDoubleArg,
+      int[] accType,
+      SortedNumericDocValues[] numericAggDvs,
+      SortedSetDocValues[] varcharAggDvs)
+      throws IOException {
+    long key0 = 0;
+    if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+    AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+
+    for (int i = 0; i < numAggs; i++) {
+      MergeableAccumulator acc = accGroup.accumulators[i];
+      if (isCountStar[i]) {
+        ((CountStarAccum) acc).count++;
+        continue;
+      }
+      if (varcharAggDvs[i] != null) {
+        SortedSetDocValues varcharDv = varcharAggDvs[i];
+        if (varcharDv.advanceExact(doc)) {
+          BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+          String val = bytes.utf8ToString();
+          if (acc instanceof CountDistinctAccum cda) {
+            cda.objectDistinctValues.add(val);
+          } else if (acc instanceof MinAccum ma) {
+            if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+              ma.objectVal = val;
+              ma.hasValue = true;
+            }
+          } else if (acc instanceof MaxAccum xa) {
+            if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+              xa.objectVal = val;
+              xa.hasValue = true;
+            }
+          }
+        }
+        continue;
+      }
+      SortedNumericDocValues aggDv = numericAggDvs[i];
+      if (aggDv != null && aggDv.advanceExact(doc)) {
+        long rawVal = aggDv.nextValue();
+        switch (accType[i]) {
+          case 0:
+            ((CountStarAccum) acc).count++;
+            break;
+          case 1: // SUM long
+            SumAccum sa = (SumAccum) acc;
+            sa.hasValue = true;
+            sa.longSum += rawVal;
+            break;
+          case 2: // AVG long
+            AvgAccum aa = (AvgAccum) acc;
+            aa.count++;
+            aa.longSum += rawVal;
+            break;
+          case 3: // MIN
+            MinAccum ma = (MinAccum) acc;
+            ma.hasValue = true;
+            if (isDoubleArg[i]) {
+              double d = Double.longBitsToDouble(rawVal);
+              if (d < ma.doubleVal) ma.doubleVal = d;
+            } else {
+              if (rawVal < ma.longVal) ma.longVal = rawVal;
+            }
+            break;
+          case 4: // MAX
+            MaxAccum xa = (MaxAccum) acc;
+            xa.hasValue = true;
+            if (isDoubleArg[i]) {
+              double d = Double.longBitsToDouble(rawVal);
+              if (d > xa.doubleVal) xa.doubleVal = d;
+            } else {
+              if (rawVal > xa.longVal) xa.longVal = rawVal;
+            }
+            break;
+          case 5: // COUNT(DISTINCT)
+            CountDistinctAccum cda = (CountDistinctAccum) acc;
+            if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+            else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+            break;
+          case 6: // SUM double
+            SumAccum sad = (SumAccum) acc;
+            sad.hasValue = true;
+            sad.doubleSum += Double.longBitsToDouble(rawVal);
+            break;
+          case 7: // AVG double
+            AvgAccum aad = (AvgAccum) acc;
+            aad.count++;
+            aad.doubleSum += Double.longBitsToDouble(rawVal);
+            break;
+        }
+      }
+    }
   }
 
   /**
@@ -1401,64 +1516,94 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat")) {
 
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              SortedNumericDocValues dv0 =
-                  context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly without Collector/Scorer overhead.
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
 
-              final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-              for (int i = 0; i < numAggs; i++) {
-                if (!isCountStar[i]) {
-                  numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
-                }
+          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+            }
+          }
+
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              collectFlatSingleKeyDoc(
+                  doc,
+                  dv0,
+                  flatMap,
+                  slotsPerGroup,
+                  numAggs,
+                  isCountStar,
+                  accType,
+                  accOffset,
+                  numericAggDvs);
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                collectFlatSingleKeyDoc(
+                    doc,
+                    dv0,
+                    flatMap,
+                    slotsPerGroup,
+                    numAggs,
+                    isCountStar,
+                    accType,
+                    accOffset,
+                    numericAggDvs);
               }
+            }
+          }
+        }
+      } else {
+        // General path: use Lucene's search framework with Collector
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv0 =
+                    context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
 
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
-
-                @Override
-                public void collect(int doc) throws IOException {
-                  long key0 = 0;
-                  if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
-                  int slot = flatMap.findOrInsert(key0);
-                  int base = slot * slotsPerGroup;
-
-                  for (int i = 0; i < numAggs; i++) {
-                    int off = base + accOffset[i];
-                    if (isCountStar[i]) {
-                      flatMap.accData[off]++;
-                      continue;
-                    }
-                    SortedNumericDocValues aggDv = numericAggDvs[i];
-                    if (aggDv != null && aggDv.advanceExact(doc)) {
-                      long rawVal = aggDv.nextValue();
-                      switch (accType[i]) {
-                        case 0: // COUNT (non-star, non-distinct)
-                          flatMap.accData[off]++;
-                          break;
-                        case 1: // SUM long
-                          flatMap.accData[off] += rawVal;
-                          break;
-                        case 2: // AVG long (sum, count)
-                          flatMap.accData[off] += rawVal;
-                          flatMap.accData[off + 1]++;
-                          break;
-                      }
-                    }
+                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
                   }
                 }
-              };
-            }
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    collectFlatSingleKeyDoc(
+                        doc,
+                        dv0,
+                        flatMap,
+                        slotsPerGroup,
+                        numAggs,
+                        isCountStar,
+                        accType,
+                        accOffset,
+                        numericAggDvs);
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     if (flatMap.size == 0) return List.of();
@@ -1499,6 +1644,48 @@ public final class FusedGroupByAggregate {
     Block[] blocks = new Block[totalColumns];
     for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
     return List.of(new Page(blocks));
+  }
+
+  /** Process a single document for the flat single-key numeric GROUP BY path. */
+  private static void collectFlatSingleKeyDoc(
+      int doc,
+      SortedNumericDocValues dv0,
+      FlatSingleKeyMap flatMap,
+      int slotsPerGroup,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      SortedNumericDocValues[] numericAggDvs)
+      throws IOException {
+    long key0 = 0;
+    if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+    int slot = flatMap.findOrInsert(key0);
+    int base = slot * slotsPerGroup;
+
+    for (int i = 0; i < numAggs; i++) {
+      int off = base + accOffset[i];
+      if (isCountStar[i]) {
+        flatMap.accData[off]++;
+        continue;
+      }
+      SortedNumericDocValues aggDv = numericAggDvs[i];
+      if (aggDv != null && aggDv.advanceExact(doc)) {
+        long rawVal = aggDv.nextValue();
+        switch (accType[i]) {
+          case 0: // COUNT (non-star, non-distinct)
+            flatMap.accData[off]++;
+            break;
+          case 1: // SUM long
+            flatMap.accData[off] += rawVal;
+            break;
+          case 2: // AVG long (sum, count)
+            flatMap.accData[off] += rawVal;
+            flatMap.accData[off + 1]++;
+            break;
+        }
+      }
+    }
   }
 
   /**
@@ -1765,67 +1952,100 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-2key-flat")) {
 
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              SortedNumericDocValues dv0 =
-                  context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
-              SortedNumericDocValues dv1 =
-                  context.reader().getSortedNumericDocValues(keyInfos.get(1).name());
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly without Collector/Scorer overhead.
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
+          SortedNumericDocValues dv1 = reader.getSortedNumericDocValues(keyInfos.get(1).name());
 
-              final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-              for (int i = 0; i < numAggs; i++) {
-                if (!isCountStar[i]) {
-                  numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
-                }
+          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+            }
+          }
+
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              collectFlatTwoKeyDoc(
+                  doc,
+                  dv0,
+                  dv1,
+                  flatMap,
+                  slotsPerGroup,
+                  numAggs,
+                  isCountStar,
+                  accType,
+                  accOffset,
+                  numericAggDvs);
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                collectFlatTwoKeyDoc(
+                    doc,
+                    dv0,
+                    dv1,
+                    flatMap,
+                    slotsPerGroup,
+                    numAggs,
+                    isCountStar,
+                    accType,
+                    accOffset,
+                    numericAggDvs);
               }
+            }
+          }
+        }
+      } else {
+        // General path: use Lucene's search framework with Collector
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv0 =
+                    context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
+                SortedNumericDocValues dv1 =
+                    context.reader().getSortedNumericDocValues(keyInfos.get(1).name());
 
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
-
-                @Override
-                public void collect(int doc) throws IOException {
-                  long key0 = 0, key1 = 0;
-                  if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
-                  if (dv1 != null && dv1.advanceExact(doc)) key1 = dv1.nextValue();
-                  int slot = flatMap.findOrInsert(key0, key1);
-                  int base = slot * slotsPerGroup;
-
-                  for (int i = 0; i < numAggs; i++) {
-                    int off = base + accOffset[i];
-                    if (isCountStar[i]) {
-                      flatMap.accData[off]++;
-                      continue;
-                    }
-                    SortedNumericDocValues aggDv = numericAggDvs[i];
-                    if (aggDv != null && aggDv.advanceExact(doc)) {
-                      long rawVal = aggDv.nextValue();
-                      switch (accType[i]) {
-                        case 0: // COUNT
-                          flatMap.accData[off]++;
-                          break;
-                        case 1: // SUM long
-                          flatMap.accData[off] += rawVal;
-                          break;
-                        case 2: // AVG long
-                          flatMap.accData[off] += rawVal;
-                          flatMap.accData[off + 1]++;
-                          break;
-                      }
-                    }
+                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
                   }
                 }
-              };
-            }
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    collectFlatTwoKeyDoc(
+                        doc,
+                        dv0,
+                        dv1,
+                        flatMap,
+                        slotsPerGroup,
+                        numAggs,
+                        isCountStar,
+                        accType,
+                        accOffset,
+                        numericAggDvs);
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     if (flatMap.size == 0) return List.of();
@@ -1871,11 +2091,49 @@ public final class FusedGroupByAggregate {
     return List.of(new Page(blocks));
   }
 
-  // Unused flat accumulator path removed — the TwoKeyHashMap with AccumulatorGroup
-  // objects provides equivalent performance with simpler code that avoids JVM class
-  // loading issues with UseCompactObjectHeaders on JDK 25.
-  @SuppressWarnings("unused")
-  private static void _unusedFlatAccumulatorsPlaceholder() {}
+  /** Process a single document for the flat two-key numeric GROUP BY path. */
+  private static void collectFlatTwoKeyDoc(
+      int doc,
+      SortedNumericDocValues dv0,
+      SortedNumericDocValues dv1,
+      FlatTwoKeyMap flatMap,
+      int slotsPerGroup,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      SortedNumericDocValues[] numericAggDvs)
+      throws IOException {
+    long key0 = 0, key1 = 0;
+    if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+    if (dv1 != null && dv1.advanceExact(doc)) key1 = dv1.nextValue();
+    int slot = flatMap.findOrInsert(key0, key1);
+    int base = slot * slotsPerGroup;
+
+    for (int i = 0; i < numAggs; i++) {
+      int off = base + accOffset[i];
+      if (isCountStar[i]) {
+        flatMap.accData[off]++;
+        continue;
+      }
+      SortedNumericDocValues aggDv = numericAggDvs[i];
+      if (aggDv != null && aggDv.advanceExact(doc)) {
+        long rawVal = aggDv.nextValue();
+        switch (accType[i]) {
+          case 0: // COUNT
+            flatMap.accData[off]++;
+            break;
+          case 1: // SUM long
+            flatMap.accData[off] += rawVal;
+            break;
+          case 2: // AVG long
+            flatMap.accData[off] += rawVal;
+            flatMap.accData[off + 1]++;
+            break;
+        }
+      }
+    }
+  }
 
   /**
    * Path for GROUP BY keys that include at least one VARCHAR column. Uses SortedSetDocValues

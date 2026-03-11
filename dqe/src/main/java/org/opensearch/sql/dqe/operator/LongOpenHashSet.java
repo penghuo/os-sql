@@ -69,7 +69,7 @@ public final class LongOpenHashSet {
     }
 
     int mask = capacity - 1;
-    int slot = Long.hashCode(value) & mask;
+    int slot = (int) (value ^ (value >>> 32)) & mask;
     while (occupied[slot]) {
       if (keys[slot] == value) {
         return false; // Already present
@@ -135,7 +135,7 @@ public final class LongOpenHashSet {
     for (int i = 0; i < capacity; i++) {
       if (occupied[i]) {
         long key = keys[i];
-        int slot = Long.hashCode(key) & newMask;
+        int slot = (int) (key ^ (key >>> 32)) & newMask;
         while (newOccupied[slot]) {
           slot = (slot + 1) & newMask;
         }

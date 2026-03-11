@@ -35,6 +35,13 @@ import org.opensearch.sql.dqe.planner.plan.AggregationNode;
  */
 public class ResultMerger {
 
+  /** Reusable buffers for the single-key numeric hash map to avoid per-query allocation. */
+  private static final ThreadLocal<long[]> TL_MAP_KEYS = new ThreadLocal<>();
+
+  private static final ThreadLocal<long[]> TL_MAP_VALUES = new ThreadLocal<>();
+  private static final ThreadLocal<boolean[]> TL_MAP_OCCUPIED = new ThreadLocal<>();
+  private static final ThreadLocal<int[]> TL_OCCUPIED_SLOTS = new ThreadLocal<>();
+
   /**
    * Pattern to extract the aggregate function name and optional column from expressions like {@code
    * COUNT(*)}, {@code SUM(amount)}, {@code MIN(price)}, {@code MAX(salary)}.
@@ -970,14 +977,41 @@ public class ResultMerger {
       List<Boolean> ascending,
       long limit) {
 
-    // Open-addressing hash map: parallel arrays for keys and values
-    int capacity = 4096;
+    // Estimate total rows to pre-size hash map and avoid resizes
+    int estimatedRows = 0;
+    for (List<Page> sp : shardResults) {
+      for (Page p : sp) estimatedRows += p.getPositionCount();
+    }
+
+    // Open-addressing hash map with compact slot tracking.
+    // Estimate unique groups: rows/numShards since groups overlap across shards.
+    int numShards = shardResults.size();
+    int estimatedGroups = Math.max(estimatedRows / Math.max(numShards, 1), 4096);
+    int capacity = Integer.highestOneBit(Math.max(4096, (int) (estimatedGroups / 0.5f))) << 1;
     float loadFactor = 0.7f;
     int threshold = (int) (capacity * loadFactor);
     int size = 0;
-    long[] mapKeys = new long[capacity];
-    long[] mapValues = new long[capacity];
-    boolean[] mapOccupied = new boolean[capacity];
+
+    // Reuse thread-local buffers when possible to avoid per-query allocation (3.4MB)
+    long[] mapKeys = TL_MAP_KEYS.get();
+    long[] mapValues = TL_MAP_VALUES.get();
+    boolean[] mapOccupied = TL_MAP_OCCUPIED.get();
+    int[] occupiedSlots = TL_OCCUPIED_SLOTS.get();
+    if (mapKeys == null || mapKeys.length < capacity) {
+      mapKeys = new long[capacity];
+      mapValues = new long[capacity];
+      mapOccupied = new boolean[capacity];
+      TL_MAP_KEYS.set(mapKeys);
+      TL_MAP_VALUES.set(mapValues);
+      TL_MAP_OCCUPIED.set(mapOccupied);
+    } else {
+      // Clear the occupied flags from previous use
+      java.util.Arrays.fill(mapOccupied, 0, capacity, false);
+    }
+    if (occupiedSlots == null || occupiedSlots.length < Math.min(estimatedRows, capacity)) {
+      occupiedSlots = new int[Math.min(estimatedRows, capacity)];
+      TL_OCCUPIED_SLOTS.set(occupiedSlots);
+    }
 
     for (List<Page> shardPages : shardResults) {
       for (Page page : shardPages) {
@@ -1004,6 +1038,7 @@ public class ResultMerger {
               mapKeys[slot] = key;
               mapValues[slot] = val;
               mapOccupied[slot] = true;
+              occupiedSlots[size] = slot;
               size++;
               if (size > threshold) {
                 // Resize
@@ -1012,20 +1047,30 @@ public class ResultMerger {
                 long[] nv = new long[newCap];
                 boolean[] nocc = new boolean[newCap];
                 int nm = newCap - 1;
-                for (int s = 0; s < capacity; s++) {
-                  if (mapOccupied[s]) {
-                    long rh = mapKeys[s];
-                    rh ^= rh >>> 33;
-                    rh *= 0xff51afd7ed558ccdL;
-                    rh ^= rh >>> 33;
-                    rh *= 0xc4ceb9fe1a85ec53L;
-                    rh ^= rh >>> 33;
-                    int ns = (int) rh & nm;
-                    while (nocc[ns]) ns = (ns + 1) & nm;
-                    nk[ns] = mapKeys[s];
-                    nv[ns] = mapValues[s];
-                    nocc[ns] = true;
-                  }
+                // Rebuild occupied slots using compact tracking array
+                for (int i = 0; i < size - 1; i++) {
+                  int oldSlot = occupiedSlots[i];
+                  long rh = mapKeys[oldSlot];
+                  rh ^= rh >>> 33;
+                  rh *= 0xff51afd7ed558ccdL;
+                  rh ^= rh >>> 33;
+                  rh *= 0xc4ceb9fe1a85ec53L;
+                  rh ^= rh >>> 33;
+                  int ns = (int) rh & nm;
+                  while (nocc[ns]) ns = (ns + 1) & nm;
+                  nk[ns] = mapKeys[oldSlot];
+                  nv[ns] = mapValues[oldSlot];
+                  nocc[ns] = true;
+                  occupiedSlots[i] = ns;
+                }
+                // Also rehash the just-inserted entry (at index size-1)
+                {
+                  int ns = (int) h & nm;
+                  while (nocc[ns]) ns = (ns + 1) & nm;
+                  nk[ns] = key;
+                  nv[ns] = val;
+                  nocc[ns] = true;
+                  occupiedSlots[size - 1] = ns;
                 }
                 capacity = newCap;
                 mask = newCap - 1;
@@ -1033,11 +1078,10 @@ public class ResultMerger {
                 mapKeys = nk;
                 mapValues = nv;
                 mapOccupied = nocc;
-                // Re-find the slot for the just-inserted key after resize
-                slot = (int) h & mask;
-                while (mapOccupied[slot]) {
-                  if (mapKeys[slot] == key) break;
-                  slot = (slot + 1) & mask;
+                if (size > occupiedSlots.length) {
+                  int[] newOcc = new int[Math.min(estimatedRows, newCap)];
+                  System.arraycopy(occupiedSlots, 0, newOcc, 0, size);
+                  occupiedSlots = newOcc;
                 }
               }
               break;
@@ -1052,60 +1096,107 @@ public class ResultMerger {
       }
     }
 
+    // Update thread-local references in case resize occurred
+    TL_MAP_KEYS.set(mapKeys);
+    TL_MAP_VALUES.set(mapValues);
+    TL_MAP_OCCUPIED.set(mapOccupied);
+    TL_OCCUPIED_SLOTS.set(occupiedSlots);
+
     if (size == 0) return List.of();
 
-    // Top-N selection on the flat hash map
+    // Top-N selection using primitive int[] bounded heap.
+    // Operates only on the compact occupiedSlots[0..size) array,
+    // avoiding the scan of all 'capacity' hash map slots.
     int k = (int) Math.min(limit, size);
-
-    // Determine sort order: which column (0=key, 1=value) and direction
     int sortCol = sortColumnIndices.get(0);
     boolean sortAsc = ascending.get(0);
 
-    // Capture final arrays for comparator
-    final long[] fKeys = mapKeys;
-    final long[] fValues = mapValues;
-    final boolean[] fOccupied = mapOccupied;
-    final int fCapacity = capacity;
+    // Choose sort values: keys or aggregate values
+    final long[] sortArr = (sortCol == 0) ? mapKeys : mapValues;
 
-    // Comparator for slot indices
-    Comparator<Integer> slotCmp;
-    if (sortCol == 0) {
-      // Sort by key
-      slotCmp =
-          sortAsc
-              ? (s1, s2) -> Long.compare(fKeys[s1], fKeys[s2])
-              : (s1, s2) -> Long.compare(fKeys[s2], fKeys[s1]);
-    } else {
-      // Sort by value (aggregate)
-      slotCmp =
-          sortAsc
-              ? (s1, s2) -> Long.compare(fValues[s1], fValues[s2])
-              : (s1, s2) -> Long.compare(fValues[s2], fValues[s1]);
-    }
+    // Primitive int[] bounded min/max heap for top-K (no autoboxing)
+    // For DESC (sortAsc=false): we want largest K, so maintain a min-heap (evict smallest)
+    // For ASC (sortAsc=true): we want smallest K, so maintain a max-heap (evict largest)
+    int[] heap = new int[k];
+    int heapSize = 0;
 
-    // Bounded max-heap for O(n log k) top-N selection
-    PriorityQueue<Integer> heap = new PriorityQueue<>(k + 1, slotCmp.reversed());
-    for (int s = 0; s < fCapacity; s++) {
-      if (fOccupied[s]) {
-        heap.offer(s);
-        if (heap.size() > k) heap.poll();
+    for (int i = 0; i < size; i++) {
+      int slot = occupiedSlots[i];
+      if (heapSize < k) {
+        // Add to heap
+        heap[heapSize] = slot;
+        heapSize++;
+        // Sift up
+        int child = heapSize - 1;
+        while (child > 0) {
+          int parent = (child - 1) >>> 1;
+          if (sortAsc
+              ? sortArr[heap[child]] > sortArr[heap[parent]]
+              : sortArr[heap[child]] < sortArr[heap[parent]]) {
+            int tmp = heap[child];
+            heap[child] = heap[parent];
+            heap[parent] = tmp;
+            child = parent;
+          } else {
+            break;
+          }
+        }
+      } else {
+        // Compare with heap root (the element to evict)
+        long slotVal = sortArr[slot];
+        long rootVal = sortArr[heap[0]];
+        boolean replace = sortAsc ? slotVal < rootVal : slotVal > rootVal;
+        if (replace) {
+          heap[0] = slot;
+          // Sift down
+          int parent = 0;
+          while (true) {
+            int left = 2 * parent + 1;
+            if (left >= heapSize) break;
+            int right = left + 1;
+            int target = left;
+            if (right < heapSize) {
+              if (sortAsc
+                  ? sortArr[heap[right]] > sortArr[heap[left]]
+                  : sortArr[heap[right]] < sortArr[heap[left]]) {
+                target = right;
+              }
+            }
+            if (sortAsc
+                ? sortArr[heap[target]] > sortArr[heap[parent]]
+                : sortArr[heap[target]] < sortArr[heap[parent]]) {
+              int tmp = heap[parent];
+              heap[parent] = heap[target];
+              heap[target] = tmp;
+              parent = target;
+            } else {
+              break;
+            }
+          }
+        }
       }
     }
 
-    // Extract in sorted order
-    int heapSize = heap.size();
-    Integer[] topSlots = new Integer[heapSize];
-    for (int i = heapSize - 1; i >= 0; i--) {
-      topSlots[i] = heap.poll();
+    // Sort the top-K slots by sort value
+    // Simple insertion sort for small k (typically 10-100)
+    for (int i = 1; i < heapSize; i++) {
+      int tmp = heap[i];
+      long tmpVal = sortArr[tmp];
+      int j = i - 1;
+      while (j >= 0 && (sortAsc ? sortArr[heap[j]] > tmpVal : sortArr[heap[j]] < tmpVal)) {
+        heap[j + 1] = heap[j];
+        j--;
+      }
+      heap[j + 1] = tmp;
     }
-    java.util.Arrays.sort(topSlots, slotCmp);
 
     // Build output Page for top-k only
     BlockBuilder keyBuilder = columnTypes.get(0).createBlockBuilder(null, heapSize);
     BlockBuilder valBuilder = BigintType.BIGINT.createBlockBuilder(null, heapSize);
-    for (int slot : topSlots) {
-      columnTypes.get(0).writeLong(keyBuilder, fKeys[slot]);
-      BigintType.BIGINT.writeLong(valBuilder, fValues[slot]);
+    for (int i = 0; i < heapSize; i++) {
+      int slot = heap[i];
+      columnTypes.get(0).writeLong(keyBuilder, mapKeys[slot]);
+      BigintType.BIGINT.writeLong(valBuilder, mapValues[slot]);
     }
     return List.of(new Page(keyBuilder.build(), valBuilder.build()));
   }

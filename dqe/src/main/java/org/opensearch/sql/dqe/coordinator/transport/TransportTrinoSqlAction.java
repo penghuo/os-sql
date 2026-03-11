@@ -393,17 +393,25 @@ public class TransportTrinoSqlAction
       if (allLocal && shardAction != null) {
         // === Local-node fast path ===
         // Execute all shard plans directly without transport serialization.
-        // Dispatches each shard execution to the dqe-shard-executor thread pool
-        // for parallel execution, matching the concurrency of the transport path.
+        // Uses CountDownLatch + shared array for lighter synchronization than
+        // GroupedActionListener (avoids CopyOnWriteArrayList + ActionListener chain).
         LOG.debug("DQE: Using local-node fast path for {} shard fragments", shardFragments.size());
         DqePlanNode shardPlan = shardFragments.get(0).shardPlan();
+        int numShards = shardFragments.size();
+        ShardExecuteResponse[] shardResults = new ShardExecuteResponse[numShards];
+        Exception[] shardErrors = new Exception[1]; // first error wins
+        java.util.concurrent.CountDownLatch latch =
+            new java.util.concurrent.CountDownLatch(numShards);
+
         java.util.concurrent.ExecutorService executor =
             transportService
                 .getThreadPool()
                 .executor(
                     org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction
                         .DQE_THREAD_POOL_NAME);
-        for (PlanFragment frag : shardFragments) {
+        for (int i = 0; i < numShards; i++) {
+          PlanFragment frag = shardFragments.get(i);
+          final int fragIdx = i;
           final int fragShardId = frag.shardId();
           final String fragIndexName = frag.indexName();
           executor.execute(
@@ -411,13 +419,121 @@ public class TransportTrinoSqlAction
                 ShardExecuteRequest shardReq =
                     new ShardExecuteRequest(new byte[0], fragIndexName, fragShardId, timeoutMillis);
                 try {
-                  ShardExecuteResponse response = shardAction.executeLocal(shardPlan, shardReq);
-                  groupedListener.onResponse(response);
+                  shardResults[fragIdx] = shardAction.executeLocal(shardPlan, shardReq);
                 } catch (Exception e) {
-                  groupedListener.onFailure(e);
+                  shardErrors[0] = e;
                 }
+                latch.countDown();
               });
         }
+
+        // Wait for all shards and process results synchronously
+        try {
+          latch.await(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          listener.onFailure(ie);
+          return;
+        }
+
+        if (shardErrors[0] != null) {
+          listener.onFailure(shardErrors[0]);
+          return;
+        }
+
+        // Process results synchronously — avoids the GroupedActionListener callback chain
+        try {
+          // Build shardPages directly from the shared array (no stream/collect)
+          List<List<Page>> shardPages = new ArrayList<>(numShards);
+          for (ShardExecuteResponse resp : shardResults) {
+            shardPages.add(resp.getPages());
+          }
+
+          ResultMerger merger = new ResultMerger();
+          List<Page> mergedPages;
+          if (coordinatorPlan instanceof AggregationNode aggNode && isScalarPartialMerge(aggNode)) {
+            mergedPages = mergeScalarAggregation(shardPages, aggNode, columnTypes);
+          } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
+              && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
+              && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
+            mergedPages = mergeCountDistinctValues(shardPages);
+          } else if (coordinatorPlan instanceof AggregationNode singleAgg
+              && singleAgg.getStep() == AggregationNode.Step.SINGLE) {
+            List<String> shardColumnNames = resolveColumnNames(shardFragments.get(0).shardPlan());
+            List<Page> rawPages = merger.mergePassthrough(shardPages);
+            mergedPages =
+                runCoordinatorAggregation(singleAgg, rawPages, shardColumnNames, columnTypeMap);
+            mergedPages =
+                applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+          } else if (coordinatorPlan instanceof AggregationNode aggNode) {
+            FilterNode havingNode = findHavingNode(optimizedPlan);
+            SortNode sortNodeForFuse = findSortNode(optimizedPlan);
+            long fusedLimit = findGlobalLimit(optimizedPlan);
+            if (havingNode == null
+                && sortNodeForFuse != null
+                && fusedLimit > 0
+                && aggNode.getStep() == AggregationNode.Step.FINAL) {
+              List<String> aggOutputCols = new ArrayList<>(aggNode.getGroupByKeys());
+              aggOutputCols.addAll(aggNode.getAggregateFunctions());
+              List<Integer> sortIndicesForFuse =
+                  sortNodeForFuse.getSortKeys().stream()
+                      .map(aggOutputCols::indexOf)
+                      .collect(Collectors.toList());
+              long sortLimitForFuse = fusedLimit + findGlobalOffset(optimizedPlan);
+              mergedPages =
+                  merger.mergeAggregationAndSort(
+                      shardPages,
+                      aggNode,
+                      columnTypes,
+                      sortIndicesForFuse,
+                      sortNodeForFuse.getAscending(),
+                      sortNodeForFuse.getNullsFirst(),
+                      sortLimitForFuse);
+            } else {
+              mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
+              mergedPages =
+                  applyCoordinatorHaving(mergedPages, optimizedPlan, aggNode, columnTypeMap);
+              mergedPages =
+                  applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+            }
+          } else {
+            SortNode sortNode = findSortNode(optimizedPlan);
+            if (sortNode != null) {
+              List<Integer> sortIndices =
+                  sortNode.getSortKeys().stream()
+                      .map(internalColumnNames::indexOf)
+                      .collect(Collectors.toList());
+              long rawLimit = findGlobalLimit(optimizedPlan);
+              long sortLimit =
+                  rawLimit >= 0 ? rawLimit + findGlobalOffset(optimizedPlan) : Long.MAX_VALUE;
+              mergedPages =
+                  merger.mergeSorted(
+                      shardPages,
+                      sortIndices,
+                      sortNode.getAscending(),
+                      sortNode.getNullsFirst(),
+                      columnTypes,
+                      sortLimit);
+            } else {
+              mergedPages = merger.mergePassthrough(shardPages);
+            }
+          }
+
+          long globalOffset = findGlobalOffset(optimizedPlan);
+          if (globalOffset > 0) {
+            mergedPages = applyGlobalOffset(mergedPages, globalOffset);
+          }
+          long globalLimit = findGlobalLimit(optimizedPlan);
+          if (globalLimit >= 0) {
+            mergedPages = applyGlobalLimit(mergedPages, globalLimit);
+          }
+
+          String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
+          listener.onResponse(new TrinoSqlResponse(responseJson));
+        } catch (Exception e) {
+          listener.onFailure(e);
+        }
+        return; // skip the GroupedActionListener path below
       } else {
         // === Transport path ===
         // Serialize the shard plan once and reuse for all shards (all fragments share the

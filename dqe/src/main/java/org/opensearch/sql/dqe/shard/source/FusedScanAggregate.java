@@ -23,14 +23,17 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.LeafCollector;
+import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
@@ -183,38 +186,77 @@ public final class FusedScanAggregate {
         shard.acquireSearcher("dqe-fused-eval-agg")) {
       String[] colArray = uniquePhysicalColumns.toArray(new String[0]);
 
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              SortedNumericDocValues[] dvs = new SortedNumericDocValues[colArray.length];
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly without Scorer/Collector overhead
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues[] dvs = new SortedNumericDocValues[colArray.length];
+          for (int i = 0; i < colArray.length; i++) {
+            dvs[i] = reader.getSortedNumericDocValues(colArray[i]);
+          }
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
               for (int i = 0; i < colArray.length; i++) {
-                dvs[i] = context.reader().getSortedNumericDocValues(colArray[i]);
+                SortedNumericDocValues dv = dvs[i];
+                if (dv != null && dv.advanceExact(doc)) {
+                  long[] sc = colSumCount.get(colArray[i]);
+                  sc[0] += dv.nextValue();
+                  sc[1]++;
+                }
               }
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
-
-                @Override
-                public void collect(int doc) throws IOException {
-                  for (int i = 0; i < colArray.length; i++) {
-                    SortedNumericDocValues dv = dvs[i];
-                    if (dv != null && dv.advanceExact(doc)) {
-                      long[] sc = colSumCount.get(colArray[i]);
-                      sc[0] += dv.nextValue();
-                      sc[1]++;
-                    }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                for (int i = 0; i < colArray.length; i++) {
+                  SortedNumericDocValues dv = dvs[i];
+                  if (dv != null && dv.advanceExact(doc)) {
+                    long[] sc = colSumCount.get(colArray[i]);
+                    sc[0] += dv.nextValue();
+                    sc[1]++;
                   }
                 }
-              };
+              }
             }
+          }
+        }
+      } else {
+        // General path: use Lucene's search framework
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues[] dvs = new SortedNumericDocValues[colArray.length];
+                for (int i = 0; i < colArray.length; i++) {
+                  dvs[i] = context.reader().getSortedNumericDocValues(colArray[i]);
+                }
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    for (int i = 0; i < colArray.length; i++) {
+                      SortedNumericDocValues dv = dvs[i];
+                      if (dv != null && dv.advanceExact(doc)) {
+                        long[] sc = colSumCount.get(colArray[i]);
+                        sc[0] += dv.nextValue();
+                        sc[1]++;
+                      }
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     // Derive results: SUM(col + k) = SUM(col) + k * COUNT(col)
@@ -292,33 +334,64 @@ public final class FusedScanAggregate {
     // Execute search and aggregate directly from doc values
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-agg")) {
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              // Open doc values iterators for each accumulator in this segment
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly without Scorer/Collector overhead.
+        // For MatchAllDocsQuery, we skip the query evaluation framework entirely
+        // and iterate docs 0..maxDoc-1 per segment, checking liveDocs for deletes.
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          for (DirectAccumulator acc : accumulators) {
+            acc.initSegment(leafCtx);
+          }
+          if (liveDocs == null) {
+            // No deleted docs — tight inner loop without liveDocs check
+            for (int doc = 0; doc < maxDoc; doc++) {
               for (DirectAccumulator acc : accumulators) {
-                acc.initSegment(context);
+                acc.accumulate(doc);
               }
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
-
-                @Override
-                public void collect(int doc) throws IOException {
-                  for (DirectAccumulator acc : accumulators) {
-                    acc.accumulate(doc);
-                  }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc)) {
+                for (DirectAccumulator acc : accumulators) {
+                  acc.accumulate(doc);
                 }
-              };
+              }
             }
+          }
+        }
+      } else {
+        // General path: use Lucene's search framework with Collector
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                // Open doc values iterators for each accumulator in this segment
+                for (DirectAccumulator acc : accumulators) {
+                  acc.initSegment(context);
+                }
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    for (DirectAccumulator acc : accumulators) {
+                      acc.accumulate(doc);
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     // Build result Page
@@ -706,30 +779,54 @@ public final class FusedScanAggregate {
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values")) {
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              SortedNumericDocValues dv = context.reader().getSortedNumericDocValues(columnName);
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
+      if (query instanceof MatchAllDocsQuery) {
+        // Fast path: iterate all docs directly
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
+          if (dv == null) continue;
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (dv.advanceExact(doc)) {
+                distinctSet.add(dv.nextValue());
+              }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                distinctSet.add(dv.nextValue());
+              }
+            }
+          }
+        }
+      } else {
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv = context.reader().getSortedNumericDocValues(columnName);
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
 
-                @Override
-                public void collect(int doc) throws IOException {
-                  if (dv != null && dv.advanceExact(doc)) {
-                    distinctSet.add(dv.nextValue());
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    if (dv != null && dv.advanceExact(doc)) {
+                      distinctSet.add(dv.nextValue());
+                    }
                   }
-                }
-              };
-            }
+                };
+              }
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
     }
 
     // Build a Page with the distinct values

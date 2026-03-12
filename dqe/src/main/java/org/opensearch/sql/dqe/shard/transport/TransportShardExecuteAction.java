@@ -339,8 +339,22 @@ public class TransportShardExecuteAction
               return new ShardExecuteResponse(sortedPages, aggColumnTypes);
             }
 
-            // Fallback: full aggregation + SortOperator
-            List<Page> aggPages = executeFusedGroupByAggregate(innerAgg, req);
+            // Fallback: aggregation (with optional shard-level top-N pre-filter) + SortOperator.
+            // When the primary sort key is an aggregate column, use top-N to reduce the
+            // output size before the SortOperator applies the full multi-key sort. This is
+            // critical for high-cardinality GROUP BY with small LIMIT (e.g., Q33 with ~100M
+            // groups where only the top-10 by COUNT(*) matter). The SortOperator will then
+            // apply the full multi-key sort on the reduced set for correct output ordering.
+            List<Page> aggPages;
+            if (sortIndices.get(0) >= numGroupByCols) {
+              int primarySortAggIndex = sortIndices.get(0) - numGroupByCols;
+              boolean primarySortAsc = sortNode.getAscending().get(0);
+              aggPages =
+                  executeFusedGroupByAggregateWithTopN(
+                      innerAgg, req, primarySortAggIndex, primarySortAsc, topN);
+            } else {
+              aggPages = executeFusedGroupByAggregate(innerAgg, req);
+            }
             List<Type> aggColumnTypes =
                 FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
             if (!aggPages.isEmpty()) {

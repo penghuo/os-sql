@@ -324,7 +324,16 @@ public final class FusedGroupByAggregate {
           sortAscending,
           topN);
     } else {
-      return executeNumericOnly(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+      return executeNumericOnly(
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
   }
 
@@ -1059,7 +1068,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     // Pre-compute which keys need DATE_TRUNC or arithmetic transformation
@@ -1082,14 +1094,32 @@ public final class FusedGroupByAggregate {
     // with single long key array, eliminating SegmentGroupKey, NumericProbeKey, and HashMap.Entry
     // allocation per group. Particularly effective for COUNT(DISTINCT) per group (Q9).
     if (keyInfos.size() == 1 && !anyTrunc) {
-      return executeSingleKeyNumeric(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+      return executeSingleKeyNumeric(
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
 
     // Fast path: two numeric keys with no expressions — uses open-addressing hash map
     // with parallel arrays, eliminating SegmentGroupKey, AccumulatorGroup, and HashMap.Entry
     // allocation per group. This is ~2x faster for high-cardinality two-key GROUP BY (Q31/Q32).
     if (keyInfos.size() == 2 && !anyTrunc) {
-      return executeTwoKeyNumeric(shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+      return executeTwoKeyNumeric(
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
 
     // Fast path: all keys derive from the same single column (e.g., Q36:
@@ -1211,18 +1241,78 @@ public final class FusedGroupByAggregate {
     int numGroupKeys = groupByKeys.size();
     int numAggs = specs.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = globalGroups.size();
 
+    // If top-N is requested and fewer than total groups, select top-N entries
+    java.util.Collection<Map.Entry<SegmentGroupKey, AccumulatorGroup>> outputEntries;
+    if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+      int n = (int) Math.min(topN, globalGroups.size());
+      // Use a min-heap (for DESC) of map entries
+      @SuppressWarnings("unchecked")
+      Map.Entry<SegmentGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+      int heapSize = 0;
+      for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+        if (heapSize < n) {
+          heap[heapSize++] = entry;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+            long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              var tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = entry;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+              long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                var tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
+    } else {
+      outputEntries = globalGroups.entrySet();
+    }
+
+    int outputCount = outputEntries.size();
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
     for (int i = 0; i < numGroupKeys; i++) {
-      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
     }
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
 
-    for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+    for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : outputEntries) {
       SegmentGroupKey key = entry.getKey();
       AccumulatorGroup accGroup = entry.getValue();
 
@@ -1272,7 +1362,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     final int numAggs = specs.size();
@@ -1335,7 +1428,18 @@ public final class FusedGroupByAggregate {
     // This is critical for high-cardinality GROUP BY (Q16: ~25K groups per shard).
     if (canUseFlatAccumulators) {
       return executeSingleKeyNumericFlat(
-          shard, query, keyInfos, specs, columnTypeMap, groupByKeys, numAggs, isCountStar, accType);
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          numAggs,
+          isCountStar,
+          accType,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
 
     final SingleKeyHashMap singleKeyMap = new SingleKeyHashMap(specs);
@@ -1450,20 +1554,95 @@ public final class FusedGroupByAggregate {
 
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = singleKeyMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+    if (sortAggIndex >= 0 && topN > 0 && topN < singleKeyMap.size) {
+      int n = (int) Math.min(topN, singleKeyMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+        if (!singleKeyMap.occupied[slot]) continue;
+        long val = singleKeyMap.groups[slot].accumulators[sortAggIndex].getSortValue();
+        if (heapSize < n) {
+          heap[heapSize++] = slot;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = singleKeyMap.groups[heap[parent]].accumulators[sortAggIndex].getSortValue();
+            long kVal = singleKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = singleKeyMap.groups[heap[0]].accumulators[sortAggIndex].getSortValue();
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = singleKeyMap.groups[heap[left]].accumulators[sortAggIndex].getSortValue();
+                long rv =
+                    singleKeyMap.groups[heap[right]].accumulators[sortAggIndex].getSortValue();
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = singleKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+              long tVal =
+                  singleKeyMap.groups[heap[target]].accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < singleKeyMap.size) {
+      int n = (int) Math.min(topN, singleKeyMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity && idx < n; slot++) {
+        if (singleKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[singleKeyMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+        if (singleKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
-    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, groupCount);
+    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, outputCount);
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
-      if (singleKeyMap.occupied[slot]) {
-        writeNumericKeyValue(builders[0], keyInfos.get(0), singleKeyMap.keys[slot]);
-        AccumulatorGroup accGroup = singleKeyMap.groups[slot];
-        for (int a = 0; a < numAggs; a++) {
-          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
-        }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      writeNumericKeyValue(builders[0], keyInfos.get(0), singleKeyMap.keys[slot]);
+      AccumulatorGroup accGroup = singleKeyMap.groups[slot];
+      for (int a = 0; a < numAggs; a++) {
+        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
       }
     }
     Block[] blocks = new Block[totalColumns];
@@ -2028,7 +2207,10 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys,
       int numAggs,
       boolean[] isCountStar,
-      int[] accType)
+      int[] accType,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     // Compute flat layout: offset and slots per aggregate
@@ -2149,34 +2331,110 @@ public final class FusedGroupByAggregate {
 
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = flatMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+      int sortAccOff = accOffset[sortAggIndex];
+      int n = (int) Math.min(topN, flatMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (!flatMap.occupied[slot]) continue;
+        long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = flatMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
+            long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = flatMap.accData[heap[0] * slotsPerGroup + sortAccOff];
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = flatMap.accData[heap[left] * slotsPerGroup + sortAccOff];
+                long rv = flatMap.accData[heap[right] * slotsPerGroup + sortAccOff];
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+              long tVal = flatMap.accData[heap[target] * slotsPerGroup + sortAccOff];
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < flatMap.size) {
+      int n = (int) Math.min(topN, flatMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[flatMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
-    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, groupCount);
+    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, outputCount);
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < flatMap.capacity; slot++) {
-      if (flatMap.occupied[slot]) {
-        writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys[slot]);
-        int base = slot * slotsPerGroup;
-        for (int a = 0; a < numAggs; a++) {
-          int off = base + accOffset[a];
-          switch (accType[a]) {
-            case 0: // COUNT
-            case 1: // SUM long
-              BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
-              break;
-            case 2: // AVG long
-              long sum = flatMap.accData[off];
-              long cnt = flatMap.accData[off + 1];
-              if (cnt == 0) {
-                builders[numGroupKeys + a].appendNull();
-              } else {
-                DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
-              }
-              break;
-          }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys[slot]);
+      int base = slot * slotsPerGroup;
+      for (int a = 0; a < numAggs; a++) {
+        int off = base + accOffset[a];
+        switch (accType[a]) {
+          case 0: // COUNT
+          case 1: // SUM long
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            break;
+          case 2: // AVG long
+            long sum = flatMap.accData[off];
+            long cnt = flatMap.accData[off + 1];
+            if (cnt == 0) {
+              builders[numGroupKeys + a].appendNull();
+            } else {
+              DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+            }
+            break;
         }
       }
     }
@@ -2254,7 +2512,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     // Pre-compute per-aggregate dispatch flags
@@ -2317,7 +2578,18 @@ public final class FusedGroupByAggregate {
     // === Flat accumulator path for two-key numeric ===
     if (canUseFlatAccumulators) {
       return executeTwoKeyNumericFlat(
-          shard, query, keyInfos, specs, columnTypeMap, groupByKeys, numAggs, isCountStar, accType);
+          shard,
+          query,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          numAggs,
+          isCountStar,
+          accType,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
 
     // Use TwoKeyHashMap with AccumulatorGroup objects and pre-computed dispatch
@@ -2428,23 +2700,97 @@ public final class FusedGroupByAggregate {
 
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = twoKeyMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+    if (sortAggIndex >= 0 && topN > 0 && topN < twoKeyMap.size) {
+      // Top-N using MergeableAccumulator.getSortValue() on the sort aggregate
+      int n = (int) Math.min(topN, twoKeyMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < twoKeyMap.capacity; slot++) {
+        if (!twoKeyMap.occupied[slot]) continue;
+        long val = twoKeyMap.groups[slot].accumulators[sortAggIndex].getSortValue();
+        if (heapSize < n) {
+          heap[heapSize++] = slot;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = twoKeyMap.groups[heap[parent]].accumulators[sortAggIndex].getSortValue();
+            long kVal = twoKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = twoKeyMap.groups[heap[0]].accumulators[sortAggIndex].getSortValue();
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = twoKeyMap.groups[heap[left]].accumulators[sortAggIndex].getSortValue();
+                long rv = twoKeyMap.groups[heap[right]].accumulators[sortAggIndex].getSortValue();
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = twoKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+              long tVal = twoKeyMap.groups[heap[target]].accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < twoKeyMap.size) {
+      int n = (int) Math.min(topN, twoKeyMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < twoKeyMap.capacity && idx < n; slot++) {
+        if (twoKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[twoKeyMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < twoKeyMap.capacity; slot++) {
+        if (twoKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
     for (int i = 0; i < numGroupKeys; i++) {
-      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
     }
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < twoKeyMap.capacity; slot++) {
-      if (twoKeyMap.occupied[slot]) {
-        writeNumericKeyValue(builders[0], keyInfos.get(0), twoKeyMap.keys0[slot]);
-        writeNumericKeyValue(builders[1], keyInfos.get(1), twoKeyMap.keys1[slot]);
-        AccumulatorGroup accGroup = twoKeyMap.groups[slot];
-        for (int a = 0; a < numAggs; a++) {
-          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
-        }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      writeNumericKeyValue(builders[0], keyInfos.get(0), twoKeyMap.keys0[slot]);
+      writeNumericKeyValue(builders[1], keyInfos.get(1), twoKeyMap.keys1[slot]);
+      AccumulatorGroup accGroup = twoKeyMap.groups[slot];
+      for (int a = 0; a < numAggs; a++) {
+        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
       }
     }
     Block[] blocks = new Block[totalColumns];
@@ -2465,7 +2811,10 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys,
       int numAggs,
       boolean[] isCountStar,
-      int[] accType)
+      int[] accType,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     final int[] accOffset = new int[numAggs];
@@ -2591,37 +2940,120 @@ public final class FusedGroupByAggregate {
 
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = flatMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+      // Top-N selection using a min-heap (for DESC) or max-heap (for ASC)
+      // on the sort aggregate value from the flat accData array.
+      int sortAccOff = accOffset[sortAggIndex];
+      int n = (int) Math.min(topN, flatMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (!flatMap.occupied[slot]) continue;
+        long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = flatMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
+            long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else {
+              break;
+            }
+          }
+        } else {
+          long rootVal = flatMap.accData[heap[0] * slotsPerGroup + sortAccOff];
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = flatMap.accData[heap[left] * slotsPerGroup + sortAccOff];
+                long rv = flatMap.accData[heap[right] * slotsPerGroup + sortAccOff];
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+              long tVal = flatMap.accData[heap[target] * slotsPerGroup + sortAccOff];
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else {
+                break;
+              }
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < flatMap.size) {
+      int n = (int) Math.min(topN, flatMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[flatMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
     for (int i = 0; i < numGroupKeys; i++) {
-      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
     }
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < flatMap.capacity; slot++) {
-      if (flatMap.occupied[slot]) {
-        writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys0[slot]);
-        writeNumericKeyValue(builders[1], keyInfos.get(1), flatMap.keys1[slot]);
-        int base = slot * slotsPerGroup;
-        for (int a = 0; a < numAggs; a++) {
-          int off = base + accOffset[a];
-          switch (accType[a]) {
-            case 0: // COUNT
-            case 1: // SUM long
-              BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
-              break;
-            case 2: // AVG long
-              long sum = flatMap.accData[off];
-              long cnt = flatMap.accData[off + 1];
-              if (cnt == 0) {
-                builders[numGroupKeys + a].appendNull();
-              } else {
-                DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
-              }
-              break;
-          }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys0[slot]);
+      writeNumericKeyValue(builders[1], keyInfos.get(1), flatMap.keys1[slot]);
+      int base = slot * slotsPerGroup;
+      for (int a = 0; a < numAggs; a++) {
+        int off = base + accOffset[a];
+        switch (accType[a]) {
+          case 0: // COUNT
+          case 1: // SUM long
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            break;
+          case 2: // AVG long
+            long sum = flatMap.accData[off];
+            long cnt = flatMap.accData[off + 1];
+            if (cnt == 0) {
+              builders[numGroupKeys + a].appendNull();
+            } else {
+              DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+            }
+            break;
         }
       }
     }
@@ -4990,6 +5422,14 @@ public final class FusedGroupByAggregate {
     void merge(MergeableAccumulator other);
 
     void writeTo(BlockBuilder builder);
+
+    /**
+     * Return a long value suitable for top-N sorting. For COUNT/SUM this is the accumulated value.
+     * For AVG this is the count (as a proxy for significance). Default returns 0.
+     */
+    default long getSortValue() {
+      return 0;
+    }
   }
 
   /** Group of accumulators for a single group key. */
@@ -5137,6 +5577,11 @@ public final class FusedGroupByAggregate {
     public void writeTo(BlockBuilder builder) {
       BigintType.BIGINT.writeLong(builder, count);
     }
+
+    @Override
+    public long getSortValue() {
+      return count;
+    }
   }
 
   private static class SumAccum implements MergeableAccumulator {
@@ -5168,6 +5613,11 @@ public final class FusedGroupByAggregate {
       } else {
         BigintType.BIGINT.writeLong(builder, longSum);
       }
+    }
+
+    @Override
+    public long getSortValue() {
+      return isDouble ? Double.doubleToRawLongBits(doubleSum) : longSum;
     }
   }
 
@@ -5218,6 +5668,11 @@ public final class FusedGroupByAggregate {
         argType.writeLong(builder, longVal);
       }
     }
+
+    @Override
+    public long getSortValue() {
+      return isDouble ? Double.doubleToRawLongBits(doubleVal) : longVal;
+    }
   }
 
   private static class MaxAccum implements MergeableAccumulator {
@@ -5267,6 +5722,11 @@ public final class FusedGroupByAggregate {
         argType.writeLong(builder, longVal);
       }
     }
+
+    @Override
+    public long getSortValue() {
+      return isDouble ? Double.doubleToRawLongBits(doubleVal) : longVal;
+    }
   }
 
   private static class AvgAccum implements MergeableAccumulator {
@@ -5296,6 +5756,12 @@ public final class FusedGroupByAggregate {
       } else {
         DoubleType.DOUBLE.writeDouble(builder, (double) longSum / count);
       }
+    }
+
+    @Override
+    public long getSortValue() {
+      // For AVG, use the count as a sort proxy (most useful for top-N by count)
+      return count;
     }
   }
 
@@ -5335,6 +5801,11 @@ public final class FusedGroupByAggregate {
     public void writeTo(BlockBuilder builder) {
       long count = usePrimitiveLong ? longDistinctValues.size() : objectDistinctValues.size();
       BigintType.BIGINT.writeLong(builder, count);
+    }
+
+    @Override
+    public long getSortValue() {
+      return usePrimitiveLong ? longDistinctValues.size() : objectDistinctValues.size();
     }
   }
 

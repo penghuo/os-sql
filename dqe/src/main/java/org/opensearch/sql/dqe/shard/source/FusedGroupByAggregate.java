@@ -5730,300 +5730,63 @@ public final class FusedGroupByAggregate {
         return List.of(new Page(blocks));
       }
 
-      if (singleSegment) {
-        // === Single-segment N-key path (3+ keys) ===
-        // Uses SegmentGroupKey map with ordinals for varchar keys.
-        Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
-        final Object[][] keyReadersHolder = new Object[1][];
+      // === N-key path (3+ keys or multi-segment fallback) ===
+      // Extracted to a separate method to keep executeWithVarcharKeys below the JIT
+      // HugeMethodLimit (8000 bytecodes). Without this extraction, the JVM's C2 compiler
+      // skips optimization of the entire method, causing 5-10x regression on 2-key queries.
+      return executeNKeyVarcharPath(
+          engineSearcher,
+          query,
+          singleSegment,
+          keyInfos,
+          specs,
+          numAggs,
+          isCountStar,
+          isDoubleArg,
+          isVarcharArg,
+          accType,
+          truncUnits,
+          arithUnits,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN,
+          columnTypeMap);
+    }
+  }
 
-        engineSearcher.search(
-            query,
-            new Collector() {
-              @Override
-              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-                Object[] keyReaders = new Object[keyInfos.size()];
-                for (int i = 0; i < keyInfos.size(); i++) {
-                  KeyInfo ki = keyInfos.get(i);
-                  if (ki.isVarchar) {
-                    keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
-                  } else {
-                    keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
-                  }
-                }
-                keyReadersHolder[0] = keyReaders;
+  /**
+   * N-key varchar GROUP BY path, extracted from executeWithVarcharKeys to keep that method below
+   * the JVM's HugeMethodLimit (8000 bytecodes) for C2 JIT compilation.
+   *
+   * <p>Handles both single-segment (3+ keys) and multi-segment cases with SegmentGroupKey /
+   * MergedGroupKey maps. Includes optional top-N pre-filtering via min-heap.
+   */
+  private static List<Page> executeNKeyVarcharPath(
+      org.opensearch.index.engine.Engine.Searcher engineSearcher,
+      Query query,
+      boolean singleSegment,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isDoubleArg,
+      boolean[] isVarcharArg,
+      int[] accType,
+      String[] truncUnits,
+      String[] arithUnits,
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      Map<String, Type> columnTypeMap)
+      throws Exception {
 
-                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-                final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
-                for (int i = 0; i < numAggs; i++) {
-                  if (!isCountStar[i]) {
-                    AggSpec spec = specs.get(i);
-                    if (isVarcharArg[i]) {
-                      varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
-                    } else {
-                      numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
-                    }
-                  }
-                }
-
-                final int numKeys = keyInfos.size();
-                final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
-
-                return new LeafCollector() {
-                  @Override
-                  public void setScorer(Scorable scorer) {}
-
-                  @Override
-                  public void collect(int doc) throws IOException {
-                    probeKey.reset();
-                    for (int k = 0; k < numKeys; k++) {
-                      KeyInfo ki = keyInfos.get(k);
-                      if (ki.isVarchar) {
-                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-                        if (dv != null && dv.advanceExact(doc)) {
-                          probeKey.set(k, dv.nextOrd());
-                        } else {
-                          probeKey.setNull(k);
-                        }
-                      } else {
-                        SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
-                        if (dv != null && dv.advanceExact(doc)) {
-                          long val = dv.nextValue();
-                          if (truncUnits[k] != null) {
-                            val = truncateMillis(val, truncUnits[k]);
-                          } else if (arithUnits[k] != null) {
-                            val = applyArith(val, arithUnits[k]);
-                          }
-                          probeKey.set(k, val);
-                        } else {
-                          probeKey.setNull(k);
-                        }
-                      }
-                    }
-                    probeKey.computeHash();
-
-                    AccumulatorGroup accGroup = segmentGroups.get(probeKey);
-                    if (accGroup == null) {
-                      SegmentGroupKey immutableKey = probeKey.toImmutableKey();
-                      accGroup = createAccumulatorGroup(specs);
-                      segmentGroups.put(immutableKey, accGroup);
-                    }
-
-                    // Inline accumulation with pre-computed dispatch flags
-                    for (int i = 0; i < numAggs; i++) {
-                      MergeableAccumulator acc = accGroup.accumulators[i];
-                      if (isCountStar[i]) {
-                        ((CountStarAccum) acc).count++;
-                        continue;
-                      }
-                      if (isVarcharArg[i]) {
-                        SortedSetDocValues varcharDv = varcharAggDvs[i];
-                        if (varcharDv != null && varcharDv.advanceExact(doc)) {
-                          BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
-                          String val = bytes.utf8ToString();
-                          switch (accType[i]) {
-                            case 5:
-                              ((CountDistinctAccum) acc).objectDistinctValues.add(val);
-                              break;
-                            case 3:
-                              MinAccum ma = (MinAccum) acc;
-                              if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
-                                ma.objectVal = val;
-                                ma.hasValue = true;
-                              }
-                              break;
-                            case 4:
-                              MaxAccum xa = (MaxAccum) acc;
-                              if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
-                                xa.objectVal = val;
-                                xa.hasValue = true;
-                              }
-                              break;
-                          }
-                        }
-                        continue;
-                      }
-                      SortedNumericDocValues aggDv = numericAggDvs[i];
-                      if (aggDv != null && aggDv.advanceExact(doc)) {
-                        long rawVal = aggDv.nextValue();
-                        switch (accType[i]) {
-                          case 0:
-                            ((CountStarAccum) acc).count++;
-                            break;
-                          case 1:
-                            SumAccum sa = (SumAccum) acc;
-                            sa.hasValue = true;
-                            sa.longSum += rawVal;
-                            break;
-                          case 2:
-                            AvgAccum aa = (AvgAccum) acc;
-                            aa.count++;
-                            aa.longSum += rawVal;
-                            break;
-                          case 3:
-                            MinAccum mna = (MinAccum) acc;
-                            mna.hasValue = true;
-                            if (isDoubleArg[i]) {
-                              double d = Double.longBitsToDouble(rawVal);
-                              if (d < mna.doubleVal) mna.doubleVal = d;
-                            } else {
-                              if (rawVal < mna.longVal) mna.longVal = rawVal;
-                            }
-                            break;
-                          case 4:
-                            MaxAccum mxa = (MaxAccum) acc;
-                            mxa.hasValue = true;
-                            if (isDoubleArg[i]) {
-                              double d = Double.longBitsToDouble(rawVal);
-                              if (d > mxa.doubleVal) mxa.doubleVal = d;
-                            } else {
-                              if (rawVal > mxa.longVal) mxa.longVal = rawVal;
-                            }
-                            break;
-                          case 5:
-                            CountDistinctAccum cda = (CountDistinctAccum) acc;
-                            if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                            else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                            break;
-                          case 6:
-                            SumAccum sad = (SumAccum) acc;
-                            sad.hasValue = true;
-                            sad.doubleSum += Double.longBitsToDouble(rawVal);
-                            break;
-                          case 7:
-                            AvgAccum aad = (AvgAccum) acc;
-                            aad.count++;
-                            aad.doubleSum += Double.longBitsToDouble(rawVal);
-                            break;
-                        }
-                      }
-                    }
-                  }
-                };
-              }
-
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-              }
-            });
-
-        if (segmentGroups.isEmpty()) {
-          return List.of();
-        }
-
-        // Build output Page directly from segment ordinals
-        Object[] keyReaders = keyReadersHolder[0];
-        int numGroupKeys = groupByKeys.size();
-        int totalColumns = numGroupKeys + numAggs;
-
-        // If top-N is requested and fewer than total groups, select top-N entries via min-heap.
-        // This avoids constructing a full Page with all groups and dramatically reduces the
-        // number of rows sent to the coordinator (e.g., Q19 with 30K+ groups -> 1000 groups).
-        java.util.Collection<Map.Entry<SegmentGroupKey, AccumulatorGroup>> outputEntries;
-        if (sortAggIndex >= 0 && topN > 0 && topN < segmentGroups.size()) {
-          int n = (int) Math.min(topN, segmentGroups.size());
-          @SuppressWarnings("unchecked")
-          Map.Entry<SegmentGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
-          int heapSize = 0;
-          for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : segmentGroups.entrySet()) {
-            long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
-            if (heapSize < n) {
-              heap[heapSize++] = entry;
-              int ki = heapSize - 1;
-              while (ki > 0) {
-                int parent = (ki - 1) >>> 1;
-                long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
-                long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
-                boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
-                if (swap) {
-                  var tmp = heap[parent];
-                  heap[parent] = heap[ki];
-                  heap[ki] = tmp;
-                  ki = parent;
-                } else break;
-              }
-            } else {
-              long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
-              boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
-              if (better) {
-                heap[0] = entry;
-                int ki = 0;
-                while (true) {
-                  int left = 2 * ki + 1;
-                  if (left >= heapSize) break;
-                  int right = left + 1;
-                  int target = left;
-                  if (right < heapSize) {
-                    long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
-                    long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
-                    boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
-                    if (pickRight) target = right;
-                  }
-                  long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
-                  long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
-                  boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
-                  if (swap) {
-                    var tmp = heap[ki];
-                    heap[ki] = heap[target];
-                    heap[target] = tmp;
-                    ki = target;
-                  } else break;
-                }
-              }
-            }
-          }
-          outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
-        } else {
-          outputEntries = segmentGroups.entrySet();
-        }
-
-        int outputCount = outputEntries.size();
-        BlockBuilder[] builders = new BlockBuilder[totalColumns];
-        for (int i = 0; i < numGroupKeys; i++) {
-          builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
-        }
-        for (int i = 0; i < numAggs; i++) {
-          builders[numGroupKeys + i] =
-              resolveAggOutputType(specs.get(i), columnTypeMap)
-                  .createBlockBuilder(null, outputCount);
-        }
-
-        for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : outputEntries) {
-          SegmentGroupKey sgk = entry.getKey();
-          AccumulatorGroup accGroup = entry.getValue();
-
-          for (int k = 0; k < numGroupKeys; k++) {
-            if (sgk.nulls[k]) {
-              builders[k].appendNull();
-            } else if (keyInfos.get(k).isVarchar) {
-              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-              if (dv != null) {
-                BytesRef bytes = dv.lookupOrd(sgk.values[k]);
-                VarcharType.VARCHAR.writeSlice(
-                    builders[k], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
-              } else {
-                VarcharType.VARCHAR.writeSlice(builders[k], Slices.EMPTY_SLICE);
-              }
-            } else {
-              writeNumericKeyValue(builders[k], keyInfos.get(k), sgk.values[k]);
-            }
-          }
-
-          for (int a = 0; a < numAggs; a++) {
-            accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
-          }
-        }
-
-        Block[] blocks = new Block[totalColumns];
-        for (int i = 0; i < totalColumns; i++) {
-          blocks[i] = builders[i].build();
-        }
-        return List.of(new Page(blocks));
-      }
-
-      // === Multi-segment path ===
-      // Uses BytesRefKey (raw UTF-8 bytes) for cross-segment merge to avoid String allocation
-      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
+    if (singleSegment) {
+      // === Single-segment N-key path (3+ keys) ===
+      // Uses SegmentGroupKey map with ordinals for varchar keys.
+      Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
+      final Object[][] keyReadersHolder = new Object[1][];
 
       engineSearcher.search(
           query,
@@ -6039,8 +5802,8 @@ public final class FusedGroupByAggregate {
                   keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
                 }
               }
+              keyReadersHolder[0] = keyReaders;
 
-              // Open agg doc values with typed arrays to avoid per-doc casting
               final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
               final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
               for (int i = 0; i < numAggs; i++) {
@@ -6054,7 +5817,6 @@ public final class FusedGroupByAggregate {
                 }
               }
 
-              Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
               final int numKeys = keyInfos.size();
               final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
 
@@ -6188,40 +5950,6 @@ public final class FusedGroupByAggregate {
                     }
                   }
                 }
-
-                @Override
-                public void finish() throws IOException {
-                  for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry :
-                      segmentGroups.entrySet()) {
-                    SegmentGroupKey sgk = entry.getKey();
-                    AccumulatorGroup segAccs = entry.getValue();
-
-                    Object[] resolvedKeys = new Object[keyInfos.size()];
-                    for (int k = 0; k < keyInfos.size(); k++) {
-                      if (sgk.nulls[k]) {
-                        resolvedKeys[k] = null;
-                      } else if (keyInfos.get(k).isVarchar) {
-                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-                        if (dv != null) {
-                          BytesRef bytes = dv.lookupOrd(sgk.values[k]);
-                          resolvedKeys[k] = new BytesRefKey(bytes);
-                        } else {
-                          resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
-                        }
-                      } else {
-                        resolvedKeys[k] = sgk.values[k];
-                      }
-                    }
-
-                    MergedGroupKey mgk = new MergedGroupKey(resolvedKeys, keyInfos);
-                    AccumulatorGroup existing = globalGroups.get(mgk);
-                    if (existing == null) {
-                      globalGroups.put(mgk, segAccs);
-                    } else {
-                      existing.merge(segAccs);
-                    }
-                  }
-                }
               };
             }
 
@@ -6231,21 +5959,25 @@ public final class FusedGroupByAggregate {
             }
           });
 
-      if (globalGroups.isEmpty()) {
+      if (segmentGroups.isEmpty()) {
         return List.of();
       }
 
+      // Build output Page directly from segment ordinals
+      Object[] keyReaders = keyReadersHolder[0];
       int numGroupKeys = groupByKeys.size();
       int totalColumns = numGroupKeys + numAggs;
 
       // If top-N is requested and fewer than total groups, select top-N entries via min-heap.
-      java.util.Collection<Map.Entry<MergedGroupKey, AccumulatorGroup>> outputEntries;
-      if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
-        int n = (int) Math.min(topN, globalGroups.size());
+      // This avoids constructing a full Page with all groups and dramatically reduces the
+      // number of rows sent to the coordinator (e.g., Q19 with 30K+ groups -> 1000 groups).
+      java.util.Collection<Map.Entry<SegmentGroupKey, AccumulatorGroup>> outputEntries;
+      if (sortAggIndex >= 0 && topN > 0 && topN < segmentGroups.size()) {
+        int n = (int) Math.min(topN, segmentGroups.size());
         @SuppressWarnings("unchecked")
-        Map.Entry<MergedGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+        Map.Entry<SegmentGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
         int heapSize = 0;
-        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : segmentGroups.entrySet()) {
           long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
           if (heapSize < n) {
             heap[heapSize++] = entry;
@@ -6294,7 +6026,7 @@ public final class FusedGroupByAggregate {
         }
         outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
       } else {
-        outputEntries = globalGroups.entrySet();
+        outputEntries = segmentGroups.entrySet();
       }
 
       int outputCount = outputEntries.size();
@@ -6307,12 +6039,25 @@ public final class FusedGroupByAggregate {
             resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
       }
 
-      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : outputEntries) {
-        MergedGroupKey key = entry.getKey();
+      for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : outputEntries) {
+        SegmentGroupKey sgk = entry.getKey();
         AccumulatorGroup accGroup = entry.getValue();
 
         for (int k = 0; k < numGroupKeys; k++) {
-          writeKeyValueForMerged(builders[k], keyInfos.get(k), key.values[k]);
+          if (sgk.nulls[k]) {
+            builders[k].appendNull();
+          } else if (keyInfos.get(k).isVarchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+            if (dv != null) {
+              BytesRef bytes = dv.lookupOrd(sgk.values[k]);
+              VarcharType.VARCHAR.writeSlice(
+                  builders[k], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+            } else {
+              VarcharType.VARCHAR.writeSlice(builders[k], Slices.EMPTY_SLICE);
+            }
+          } else {
+            writeNumericKeyValue(builders[k], keyInfos.get(k), sgk.values[k]);
+          }
         }
 
         for (int a = 0; a < numAggs; a++) {
@@ -6326,6 +6071,311 @@ public final class FusedGroupByAggregate {
       }
       return List.of(new Page(blocks));
     }
+
+    // === Multi-segment path ===
+    // Uses BytesRefKey (raw UTF-8 bytes) for cross-segment merge to avoid String allocation
+    Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
+
+    engineSearcher.search(
+        query,
+        new Collector() {
+          @Override
+          public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+            Object[] keyReaders = new Object[keyInfos.size()];
+            for (int i = 0; i < keyInfos.size(); i++) {
+              KeyInfo ki = keyInfos.get(i);
+              if (ki.isVarchar) {
+                keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
+              } else {
+                keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+              }
+            }
+
+            // Open agg doc values with typed arrays to avoid per-doc casting
+            final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+            final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              if (!isCountStar[i]) {
+                AggSpec spec = specs.get(i);
+                if (isVarcharArg[i]) {
+                  varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
+                } else {
+                  numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                }
+              }
+            }
+
+            Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
+            final int numKeys = keyInfos.size();
+            final NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+
+            return new LeafCollector() {
+              @Override
+              public void setScorer(Scorable scorer) {}
+
+              @Override
+              public void collect(int doc) throws IOException {
+                probeKey.reset();
+                for (int k = 0; k < numKeys; k++) {
+                  KeyInfo ki = keyInfos.get(k);
+                  if (ki.isVarchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      probeKey.set(k, dv.nextOrd());
+                    } else {
+                      probeKey.setNull(k);
+                    }
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      long val = dv.nextValue();
+                      if (truncUnits[k] != null) {
+                        val = truncateMillis(val, truncUnits[k]);
+                      } else if (arithUnits[k] != null) {
+                        val = applyArith(val, arithUnits[k]);
+                      }
+                      probeKey.set(k, val);
+                    } else {
+                      probeKey.setNull(k);
+                    }
+                  }
+                }
+                probeKey.computeHash();
+
+                AccumulatorGroup accGroup = segmentGroups.get(probeKey);
+                if (accGroup == null) {
+                  SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                  accGroup = createAccumulatorGroup(specs);
+                  segmentGroups.put(immutableKey, accGroup);
+                }
+
+                // Inline accumulation with pre-computed dispatch flags
+                for (int i = 0; i < numAggs; i++) {
+                  MergeableAccumulator acc = accGroup.accumulators[i];
+                  if (isCountStar[i]) {
+                    ((CountStarAccum) acc).count++;
+                    continue;
+                  }
+                  if (isVarcharArg[i]) {
+                    SortedSetDocValues varcharDv = varcharAggDvs[i];
+                    if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                      BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+                      String val = bytes.utf8ToString();
+                      switch (accType[i]) {
+                        case 5:
+                          ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                          break;
+                        case 3:
+                          MinAccum ma = (MinAccum) acc;
+                          if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                            ma.objectVal = val;
+                            ma.hasValue = true;
+                          }
+                          break;
+                        case 4:
+                          MaxAccum xa = (MaxAccum) acc;
+                          if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                            xa.objectVal = val;
+                            xa.hasValue = true;
+                          }
+                          break;
+                      }
+                    }
+                    continue;
+                  }
+                  SortedNumericDocValues aggDv = numericAggDvs[i];
+                  if (aggDv != null && aggDv.advanceExact(doc)) {
+                    long rawVal = aggDv.nextValue();
+                    switch (accType[i]) {
+                      case 0:
+                        ((CountStarAccum) acc).count++;
+                        break;
+                      case 1:
+                        SumAccum sa = (SumAccum) acc;
+                        sa.hasValue = true;
+                        sa.longSum += rawVal;
+                        break;
+                      case 2:
+                        AvgAccum aa = (AvgAccum) acc;
+                        aa.count++;
+                        aa.longSum += rawVal;
+                        break;
+                      case 3:
+                        MinAccum mna = (MinAccum) acc;
+                        mna.hasValue = true;
+                        if (isDoubleArg[i]) {
+                          double d = Double.longBitsToDouble(rawVal);
+                          if (d < mna.doubleVal) mna.doubleVal = d;
+                        } else {
+                          if (rawVal < mna.longVal) mna.longVal = rawVal;
+                        }
+                        break;
+                      case 4:
+                        MaxAccum mxa = (MaxAccum) acc;
+                        mxa.hasValue = true;
+                        if (isDoubleArg[i]) {
+                          double d = Double.longBitsToDouble(rawVal);
+                          if (d > mxa.doubleVal) mxa.doubleVal = d;
+                        } else {
+                          if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+                        }
+                        break;
+                      case 5:
+                        CountDistinctAccum cda = (CountDistinctAccum) acc;
+                        if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                        else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                        break;
+                      case 6:
+                        SumAccum sad = (SumAccum) acc;
+                        sad.hasValue = true;
+                        sad.doubleSum += Double.longBitsToDouble(rawVal);
+                        break;
+                      case 7:
+                        AvgAccum aad = (AvgAccum) acc;
+                        aad.count++;
+                        aad.doubleSum += Double.longBitsToDouble(rawVal);
+                        break;
+                    }
+                  }
+                }
+              }
+
+              @Override
+              public void finish() throws IOException {
+                for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry :
+                    segmentGroups.entrySet()) {
+                  SegmentGroupKey sgk = entry.getKey();
+                  AccumulatorGroup segAccs = entry.getValue();
+
+                  Object[] resolvedKeys = new Object[keyInfos.size()];
+                  for (int k = 0; k < keyInfos.size(); k++) {
+                    if (sgk.nulls[k]) {
+                      resolvedKeys[k] = null;
+                    } else if (keyInfos.get(k).isVarchar) {
+                      SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                      if (dv != null) {
+                        BytesRef bytes = dv.lookupOrd(sgk.values[k]);
+                        resolvedKeys[k] = new BytesRefKey(bytes);
+                      } else {
+                        resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
+                      }
+                    } else {
+                      resolvedKeys[k] = sgk.values[k];
+                    }
+                  }
+
+                  MergedGroupKey mgk = new MergedGroupKey(resolvedKeys, keyInfos);
+                  AccumulatorGroup existing = globalGroups.get(mgk);
+                  if (existing == null) {
+                    globalGroups.put(mgk, segAccs);
+                  } else {
+                    existing.merge(segAccs);
+                  }
+                }
+              }
+            };
+          }
+
+          @Override
+          public ScoreMode scoreMode() {
+            return ScoreMode.COMPLETE_NO_SCORES;
+          }
+        });
+
+    if (globalGroups.isEmpty()) {
+      return List.of();
+    }
+
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+
+    // If top-N is requested and fewer than total groups, select top-N entries via min-heap.
+    java.util.Collection<Map.Entry<MergedGroupKey, AccumulatorGroup>> outputEntries;
+    if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+      int n = (int) Math.min(topN, globalGroups.size());
+      @SuppressWarnings("unchecked")
+      Map.Entry<MergedGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+      int heapSize = 0;
+      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+        if (heapSize < n) {
+          heap[heapSize++] = entry;
+          int ki = heapSize - 1;
+          while (ki > 0) {
+            int parent = (ki - 1) >>> 1;
+            long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+            long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              var tmp = heap[parent];
+              heap[parent] = heap[ki];
+              heap[ki] = tmp;
+              ki = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = entry;
+            int ki = 0;
+            while (true) {
+              int left = 2 * ki + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+              long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                var tmp = heap[ki];
+                heap[ki] = heap[target];
+                heap[target] = tmp;
+                ki = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
+    } else {
+      outputEntries = globalGroups.entrySet();
+    }
+
+    int outputCount = outputEntries.size();
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
+    }
+
+    for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : outputEntries) {
+      MergedGroupKey key = entry.getKey();
+      AccumulatorGroup accGroup = entry.getValue();
+
+      for (int k = 0; k < numGroupKeys; k++) {
+        writeKeyValueForMerged(builders[k], keyInfos.get(k), key.values[k]);
+      }
+
+      for (int a = 0; a < numAggs; a++) {
+        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
   }
 
   /** Resolve output types for the fused GROUP BY aggregate. */

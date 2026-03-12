@@ -335,6 +335,39 @@ public final class FusedScanAggregate {
     // Execute search and aggregate directly from doc values
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-agg")) {
+
+      // Ultra-fast path: COUNT(*) only with MatchAllDocsQuery — no per-doc iteration needed.
+      // Just read numDocs from the index reader, which is O(1).
+      if (query instanceof MatchAllDocsQuery) {
+        boolean allCountStar = true;
+        for (AggSpec spec : specs) {
+          if (!"COUNT".equals(spec.funcName) || !"*".equals(spec.arg)) {
+            allCountStar = false;
+            break;
+          }
+        }
+        if (allCountStar) {
+          long totalDocs = engineSearcher.getIndexReader().numDocs();
+          for (DirectAccumulator acc : accumulators) {
+            if (acc instanceof CountStarDirectAccumulator csa) {
+              csa.addCount(totalDocs);
+            }
+          }
+          // Build result directly
+          int numAggs = accumulators.size();
+          BlockBuilder[] builders = new BlockBuilder[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            builders[i] = accumulators.get(i).getOutputType().createBlockBuilder(null, 1);
+            accumulators.get(i).writeTo(builders[i]);
+          }
+          Block[] blocks = new Block[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            blocks[i] = builders[i].build();
+          }
+          return List.of(new Page(blocks));
+        }
+      }
+
       if (query instanceof MatchAllDocsQuery) {
         // Fast path: iterate all docs directly without Scorer/Collector overhead.
         // For MatchAllDocsQuery, we skip the query evaluation framework entirely
@@ -485,6 +518,11 @@ public final class FusedScanAggregate {
   /** COUNT(*) accumulator. */
   private static class CountStarDirectAccumulator implements DirectAccumulator {
     private long count = 0;
+
+    /** Add a bulk count (for O(1) COUNT(*) with MatchAllDocsQuery). */
+    void addCount(long n) {
+      count += n;
+    }
 
     @Override
     public void initSegment(LeafReaderContext leaf) {}

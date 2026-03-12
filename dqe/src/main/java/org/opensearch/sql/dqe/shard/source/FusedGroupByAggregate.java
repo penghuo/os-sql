@@ -889,13 +889,28 @@ public final class FusedGroupByAggregate {
           && "COUNT".equals(specs.get(0).funcName)
           && "*".equals(specs.get(0).arg)) {
         return executeSingleVarcharCountStar(
-            shard, query, keyInfos.get(0).name, columnTypeMap, groupByKeys);
+            shard,
+            query,
+            keyInfos.get(0).name,
+            columnTypeMap,
+            groupByKeys,
+            sortAggIndex,
+            sortAscending,
+            topN);
       }
       // Fast path: single VARCHAR key with general aggregates — uses ordinal-indexed
       // AccumulatorGroup array, eliminating HashMap lookups for single-segment case.
       if (keyInfos.size() == 1 && keyInfos.get(0).isVarchar) {
         return executeSingleVarcharGeneric(
-            shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+            shard,
+            query,
+            keyInfos,
+            specs,
+            columnTypeMap,
+            groupByKeys,
+            sortAggIndex,
+            sortAscending,
+            topN);
       }
       return executeWithVarcharKeys(
           shard,
@@ -992,13 +1007,20 @@ public final class FusedGroupByAggregate {
    * Page, completely avoiding the intermediate HashMap&lt;String, long&gt; and all String
    * allocations during aggregation. For multi-segment indices, falls back to a byte[]-based HashMap
    * that avoids the expensive UTF-8 to Java char[] round-trip.
+   *
+   * <p>When sortAggIndex >= 0 and topN > 0, applies top-N selection directly on the ordinal count
+   * array, avoiding BlockBuilder construction for all groups. Critical for high-cardinality VARCHAR
+   * GROUP BY with small LIMIT (e.g., Q34: ~700K URL groups with LIMIT 10).
    */
   private static List<Page> executeSingleVarcharCountStar(
       IndexShard shard,
       Query query,
       String columnName,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
@@ -1012,54 +1034,58 @@ public final class FusedGroupByAggregate {
         // Count per-ordinal in a long array, then build output Page directly from ordinals.
         // No HashMap, no String allocation during aggregation.
         // Use 10M ordinal limit (80MB memory) — covers all practical single-segment indices.
-        final long[][] ordCountsHolder = new long[1][];
-        final SortedSetDocValues[] dvHolder = new SortedSetDocValues[1];
-        final boolean[] usedOrdArray = {false};
+        LeafReaderContext leafCtx = leaves.get(0);
+        LeafReader reader = leafCtx.reader();
+        SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+        long ordCount = (dv != null) ? dv.getValueCount() : 0;
 
-        engineSearcher.search(
-            query,
-            new Collector() {
-              @Override
-              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-                SortedSetDocValues dv = context.reader().getSortedSetDocValues(columnName);
-                dvHolder[0] = dv;
-                long ordCount = (dv != null) ? dv.getValueCount() : 0;
-                if (ordCount > 0 && ordCount <= 10_000_000) {
-                  long[] ordCounts = new long[(int) ordCount];
-                  ordCountsHolder[0] = ordCounts;
-                  usedOrdArray[0] = true;
-                  return new LeafCollector() {
-                    @Override
-                    public void setScorer(Scorable scorer) {}
+        if (ordCount > 0 && ordCount <= 10_000_000) {
+          long[] ordCounts = new long[(int) ordCount];
 
-                    @Override
-                    public void collect(int doc) throws IOException {
-                      if (dv.advanceExact(doc)) {
-                        ordCounts[(int) dv.nextOrd()]++;
-                      }
-                    }
-                  };
+          // === MatchAllDocsQuery fast path: iterate docs directly ===
+          if (query instanceof MatchAllDocsQuery) {
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+            if (liveDocs == null) {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (dv.advanceExact(doc)) {
+                  ordCounts[(int) dv.nextOrd()]++;
                 }
-                // Fallback: won't benefit from single-segment path
-                usedOrdArray[0] = false;
-                return new LeafCollector() {
-                  @Override
-                  public void setScorer(Scorable scorer) {}
-
-                  @Override
-                  public void collect(int doc) {}
-                };
               }
-
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
+            } else {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                  ordCounts[(int) dv.nextOrd()]++;
+                }
               }
-            });
+            }
+          } else {
+            // General path: use Lucene's search framework with Collector
+            engineSearcher.search(
+                query,
+                new Collector() {
+                  @Override
+                  public LeafCollector getLeafCollector(LeafReaderContext context)
+                      throws IOException {
+                    return new LeafCollector() {
+                      @Override
+                      public void setScorer(Scorable scorer) {}
 
-        if (usedOrdArray[0] && dvHolder[0] != null) {
-          SortedSetDocValues dv = dvHolder[0];
-          long[] ordCounts = ordCountsHolder[0];
+                      @Override
+                      public void collect(int doc) throws IOException {
+                        if (dv.advanceExact(doc)) {
+                          ordCounts[(int) dv.nextOrd()]++;
+                        }
+                      }
+                    };
+                  }
+
+                  @Override
+                  public ScoreMode scoreMode() {
+                    return ScoreMode.COMPLETE_NO_SCORES;
+                  }
+                });
+          }
 
           // Count non-zero entries first to size builders correctly
           int groupCount = 0;
@@ -1068,6 +1094,89 @@ public final class FusedGroupByAggregate {
           }
           if (groupCount == 0) return List.of();
 
+          // === Top-N selection: build only top-N entries instead of all groups ===
+          if (sortAggIndex >= 0 && topN > 0 && topN < groupCount) {
+            int n = (int) Math.min(topN, groupCount);
+            // Min-heap (for DESC) or max-heap (for ASC) of ordinal indices
+            int[] heap = new int[n];
+            long[] heapVals = new long[n];
+            int heapSize = 0;
+
+            for (int i = 0; i < ordCounts.length; i++) {
+              if (ordCounts[i] == 0) continue;
+              long cnt = ordCounts[i];
+              if (heapSize < n) {
+                heap[heapSize] = i;
+                heapVals[heapSize] = cnt;
+                heapSize++;
+                // Sift up
+                int k = heapSize - 1;
+                while (k > 0) {
+                  int parent = (k - 1) >>> 1;
+                  boolean swap =
+                      sortAscending
+                          ? (heapVals[k] > heapVals[parent])
+                          : (heapVals[k] < heapVals[parent]);
+                  if (swap) {
+                    int tmpI = heap[parent];
+                    heap[parent] = heap[k];
+                    heap[k] = tmpI;
+                    long tmpV = heapVals[parent];
+                    heapVals[parent] = heapVals[k];
+                    heapVals[k] = tmpV;
+                    k = parent;
+                  } else break;
+                }
+              } else {
+                boolean better = sortAscending ? (cnt < heapVals[0]) : (cnt > heapVals[0]);
+                if (better) {
+                  heap[0] = i;
+                  heapVals[0] = cnt;
+                  // Sift down
+                  int k = 0;
+                  while (true) {
+                    int left = 2 * k + 1;
+                    if (left >= heapSize) break;
+                    int right = left + 1;
+                    int target = left;
+                    if (right < heapSize) {
+                      boolean pickRight =
+                          sortAscending
+                              ? (heapVals[right] > heapVals[left])
+                              : (heapVals[right] < heapVals[left]);
+                      if (pickRight) target = right;
+                    }
+                    boolean swap =
+                        sortAscending
+                            ? (heapVals[target] > heapVals[k])
+                            : (heapVals[target] < heapVals[k]);
+                    if (swap) {
+                      int tmpI = heap[k];
+                      heap[k] = heap[target];
+                      heap[target] = tmpI;
+                      long tmpV = heapVals[k];
+                      heapVals[k] = heapVals[target];
+                      heapVals[target] = tmpV;
+                      k = target;
+                    } else break;
+                  }
+                }
+              }
+            }
+
+            BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+            BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+            for (int h = 0; h < heapSize; h++) {
+              int ord = heap[h];
+              BytesRef bytes = dv.lookupOrd(ord);
+              VarcharType.VARCHAR.writeSlice(
+                  keyBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              BigintType.BIGINT.writeLong(countBuilder, ordCounts[ord]);
+            }
+            return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+          }
+
+          // No top-N: output all groups
           BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
           BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
           for (int i = 0; i < ordCounts.length; i++) {
@@ -1196,7 +1305,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     final String columnName = keyInfos.get(0).name();
@@ -1243,163 +1355,115 @@ public final class FusedGroupByAggregate {
       if (leaves.size() == 1) {
         // === Single-segment fast path ===
         // Use ordinal-indexed AccumulatorGroup array — no HashMap, no hash computation.
-        final AccumulatorGroup[][] ordGroupsHolder = new AccumulatorGroup[1][];
-        final SortedSetDocValues[] dvHolder = new SortedSetDocValues[1];
-        final boolean[] usedOrdArray = {false};
+        LeafReaderContext leafCtx = leaves.get(0);
+        LeafReader reader = leafCtx.reader();
+        SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+        long ordCountLong = (dv != null) ? dv.getValueCount() : 0;
 
-        engineSearcher.search(
-            query,
-            new Collector() {
-              @Override
-              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-                SortedSetDocValues dv = context.reader().getSortedSetDocValues(columnName);
-                dvHolder[0] = dv;
-                long ordCount = (dv != null) ? dv.getValueCount() : 0;
-                if (ordCount <= 0 || ordCount > 10_000_000) {
-                  usedOrdArray[0] = false;
-                  return new LeafCollector() {
-                    @Override
-                    public void setScorer(Scorable scorer) {}
+        if (ordCountLong > 0 && ordCountLong <= 10_000_000) {
+          AccumulatorGroup[] ordGroups = new AccumulatorGroup[(int) ordCountLong];
 
-                    @Override
-                    public void collect(int doc) {}
-                  };
-                }
-
-                AccumulatorGroup[] ordGroups = new AccumulatorGroup[(int) ordCount];
-                ordGroupsHolder[0] = ordGroups;
-                usedOrdArray[0] = true;
-
-                // Open agg doc values with typed arrays
-                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-                final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
-                for (int i = 0; i < numAggs; i++) {
-                  if (!isCountStar[i]) {
-                    AggSpec spec = specs.get(i);
-                    if (isVarcharArg[i]) {
-                      varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
-                    } else {
-                      numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
-                    }
-                  }
-                }
-
-                return new LeafCollector() {
-                  @Override
-                  public void setScorer(Scorable scorer) {}
-
-                  @Override
-                  public void collect(int doc) throws IOException {
-                    if (dv == null || !dv.advanceExact(doc)) return;
-                    int ord = (int) dv.nextOrd();
-                    AccumulatorGroup accGroup = ordGroups[ord];
-                    if (accGroup == null) {
-                      accGroup = createAccumulatorGroup(specs);
-                      ordGroups[ord] = accGroup;
-                    }
-
-                    // Inline accumulation with pre-computed dispatch
-                    for (int i = 0; i < numAggs; i++) {
-                      MergeableAccumulator acc = accGroup.accumulators[i];
-                      if (isCountStar[i]) {
-                        ((CountStarAccum) acc).count++;
-                        continue;
-                      }
-                      if (isVarcharArg[i]) {
-                        SortedSetDocValues varcharDv = varcharAggDvs[i];
-                        if (varcharDv != null && varcharDv.advanceExact(doc)) {
-                          BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
-                          String val = bytes.utf8ToString();
-                          switch (accType[i]) {
-                            case 5:
-                              ((CountDistinctAccum) acc).objectDistinctValues.add(val);
-                              break;
-                            case 3:
-                              MinAccum ma = (MinAccum) acc;
-                              if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
-                                ma.objectVal = val;
-                                ma.hasValue = true;
-                              }
-                              break;
-                            case 4:
-                              MaxAccum xa = (MaxAccum) acc;
-                              if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
-                                xa.objectVal = val;
-                                xa.hasValue = true;
-                              }
-                              break;
-                          }
-                        }
-                        continue;
-                      }
-                      SortedNumericDocValues aggDv = numericAggDvs[i];
-                      if (aggDv != null && aggDv.advanceExact(doc)) {
-                        long rawVal = aggDv.nextValue();
-                        switch (accType[i]) {
-                          case 0:
-                            ((CountStarAccum) acc).count++;
-                            break;
-                          case 1:
-                            SumAccum sa = (SumAccum) acc;
-                            sa.hasValue = true;
-                            sa.longSum += rawVal;
-                            break;
-                          case 2:
-                            AvgAccum aa = (AvgAccum) acc;
-                            aa.count++;
-                            aa.longSum += rawVal;
-                            break;
-                          case 3:
-                            MinAccum mna = (MinAccum) acc;
-                            mna.hasValue = true;
-                            if (isDoubleArg[i]) {
-                              double d = Double.longBitsToDouble(rawVal);
-                              if (d < mna.doubleVal) mna.doubleVal = d;
-                            } else {
-                              if (rawVal < mna.longVal) mna.longVal = rawVal;
-                            }
-                            break;
-                          case 4:
-                            MaxAccum mxa = (MaxAccum) acc;
-                            mxa.hasValue = true;
-                            if (isDoubleArg[i]) {
-                              double d = Double.longBitsToDouble(rawVal);
-                              if (d > mxa.doubleVal) mxa.doubleVal = d;
-                            } else {
-                              if (rawVal > mxa.longVal) mxa.longVal = rawVal;
-                            }
-                            break;
-                          case 5:
-                            CountDistinctAccum cda = (CountDistinctAccum) acc;
-                            if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                            else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                            break;
-                          case 6:
-                            SumAccum sad = (SumAccum) acc;
-                            sad.hasValue = true;
-                            sad.doubleSum += Double.longBitsToDouble(rawVal);
-                            break;
-                          case 7:
-                            AvgAccum aad = (AvgAccum) acc;
-                            aad.count++;
-                            aad.doubleSum += Double.longBitsToDouble(rawVal);
-                            break;
-                        }
-                      }
-                    }
-                  }
-                };
+          // Open agg doc values with typed arrays
+          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          final SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              AggSpec spec = specs.get(i);
+              if (isVarcharArg[i]) {
+                varcharAggDvs[i] = reader.getSortedSetDocValues(spec.arg);
+              } else {
+                numericAggDvs[i] = reader.getSortedNumericDocValues(spec.arg);
               }
+            }
+          }
 
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
+          // === MatchAllDocsQuery fast path: iterate docs directly ===
+          if (query instanceof MatchAllDocsQuery) {
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+            if (liveDocs == null) {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (dv == null || !dv.advanceExact(doc)) continue;
+                int ord = (int) dv.nextOrd();
+                AccumulatorGroup accGroup = ordGroups[ord];
+                if (accGroup == null) {
+                  accGroup = createAccumulatorGroup(specs);
+                  ordGroups[ord] = accGroup;
+                }
+                collectVarcharGenericAccumulate(
+                    doc,
+                    accGroup,
+                    numAggs,
+                    isCountStar,
+                    isVarcharArg,
+                    isDoubleArg,
+                    accType,
+                    numericAggDvs,
+                    varcharAggDvs);
               }
-            });
+            } else {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (!liveDocs.get(doc)) continue;
+                if (dv == null || !dv.advanceExact(doc)) continue;
+                int ord = (int) dv.nextOrd();
+                AccumulatorGroup accGroup = ordGroups[ord];
+                if (accGroup == null) {
+                  accGroup = createAccumulatorGroup(specs);
+                  ordGroups[ord] = accGroup;
+                }
+                collectVarcharGenericAccumulate(
+                    doc,
+                    accGroup,
+                    numAggs,
+                    isCountStar,
+                    isVarcharArg,
+                    isDoubleArg,
+                    accType,
+                    numericAggDvs,
+                    varcharAggDvs);
+              }
+            }
+          } else {
+            // General path: use Lucene's search framework with Collector
+            engineSearcher.search(
+                query,
+                new Collector() {
+                  @Override
+                  public LeafCollector getLeafCollector(LeafReaderContext context)
+                      throws IOException {
+                    return new LeafCollector() {
+                      @Override
+                      public void setScorer(Scorable scorer) {}
 
-        if (usedOrdArray[0] && dvHolder[0] != null) {
-          SortedSetDocValues dv = dvHolder[0];
-          AccumulatorGroup[] ordGroups = ordGroupsHolder[0];
+                      @Override
+                      public void collect(int doc) throws IOException {
+                        if (dv == null || !dv.advanceExact(doc)) return;
+                        int ord = (int) dv.nextOrd();
+                        AccumulatorGroup accGroup = ordGroups[ord];
+                        if (accGroup == null) {
+                          accGroup = createAccumulatorGroup(specs);
+                          ordGroups[ord] = accGroup;
+                        }
+                        collectVarcharGenericAccumulate(
+                            doc,
+                            accGroup,
+                            numAggs,
+                            isCountStar,
+                            isVarcharArg,
+                            isDoubleArg,
+                            accType,
+                            numericAggDvs,
+                            varcharAggDvs);
+                      }
+                    };
+                  }
+
+                  @Override
+                  public ScoreMode scoreMode() {
+                    return ScoreMode.COMPLETE_NO_SCORES;
+                  }
+                });
+          }
 
           // Count non-null entries
           int groupCount = 0;
@@ -1410,6 +1474,97 @@ public final class FusedGroupByAggregate {
 
           int numGroupKeys = groupByKeys.size();
           int totalColumns = numGroupKeys + numAggs;
+
+          // === Top-N selection: build only top-N entries ===
+          if (sortAggIndex >= 0 && topN > 0 && topN < groupCount) {
+            int n = (int) Math.min(topN, groupCount);
+            int[] heap = new int[n];
+            long[] heapVals = new long[n];
+            int heapSize = 0;
+
+            for (int i = 0; i < ordGroups.length; i++) {
+              if (ordGroups[i] == null) continue;
+              long val = ordGroups[i].accumulators[sortAggIndex].getSortValue();
+              if (heapSize < n) {
+                heap[heapSize] = i;
+                heapVals[heapSize] = val;
+                heapSize++;
+                int k = heapSize - 1;
+                while (k > 0) {
+                  int parent = (k - 1) >>> 1;
+                  boolean swap =
+                      sortAscending
+                          ? (heapVals[k] > heapVals[parent])
+                          : (heapVals[k] < heapVals[parent]);
+                  if (swap) {
+                    int tmpI = heap[parent];
+                    heap[parent] = heap[k];
+                    heap[k] = tmpI;
+                    long tmpV = heapVals[parent];
+                    heapVals[parent] = heapVals[k];
+                    heapVals[k] = tmpV;
+                    k = parent;
+                  } else break;
+                }
+              } else {
+                boolean better = sortAscending ? (val < heapVals[0]) : (val > heapVals[0]);
+                if (better) {
+                  heap[0] = i;
+                  heapVals[0] = val;
+                  int k = 0;
+                  while (true) {
+                    int left = 2 * k + 1;
+                    if (left >= heapSize) break;
+                    int right = left + 1;
+                    int target = left;
+                    if (right < heapSize) {
+                      boolean pickRight =
+                          sortAscending
+                              ? (heapVals[right] > heapVals[left])
+                              : (heapVals[right] < heapVals[left]);
+                      if (pickRight) target = right;
+                    }
+                    boolean swap =
+                        sortAscending
+                            ? (heapVals[target] > heapVals[k])
+                            : (heapVals[target] < heapVals[k]);
+                    if (swap) {
+                      int tmpI = heap[k];
+                      heap[k] = heap[target];
+                      heap[target] = tmpI;
+                      long tmpV = heapVals[k];
+                      heapVals[k] = heapVals[target];
+                      heapVals[target] = tmpV;
+                      k = target;
+                    } else break;
+                  }
+                }
+              }
+            }
+
+            BlockBuilder[] builders = new BlockBuilder[totalColumns];
+            builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+            for (int i = 0; i < numAggs; i++) {
+              builders[numGroupKeys + i] =
+                  resolveAggOutputType(specs.get(i), columnTypeMap)
+                      .createBlockBuilder(null, heapSize);
+            }
+            for (int h = 0; h < heapSize; h++) {
+              int ord = heap[h];
+              BytesRef bytes = dv.lookupOrd(ord);
+              VarcharType.VARCHAR.writeSlice(
+                  builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              AccumulatorGroup accGroup = ordGroups[ord];
+              for (int a = 0; a < numAggs; a++) {
+                accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+              }
+            }
+            Block[] blocks = new Block[totalColumns];
+            for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+            return List.of(new Page(blocks));
+          }
+
+          // No top-N: output all groups
           BlockBuilder[] builders = new BlockBuilder[totalColumns];
           builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
           for (int i = 0; i < numAggs; i++) {
@@ -1486,96 +1641,16 @@ public final class FusedGroupByAggregate {
                     // Fallback for very large ordinal spaces - should not happen in practice
                     return;
                   }
-
-                  // Inline accumulation with pre-computed dispatch
-                  for (int i = 0; i < numAggs; i++) {
-                    MergeableAccumulator acc = accGroup.accumulators[i];
-                    if (isCountStar[i]) {
-                      ((CountStarAccum) acc).count++;
-                      continue;
-                    }
-                    if (isVarcharArg[i]) {
-                      SortedSetDocValues varcharDv = varcharAggDvs[i];
-                      if (varcharDv != null && varcharDv.advanceExact(doc)) {
-                        BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
-                        String val = bytes.utf8ToString();
-                        switch (accType[i]) {
-                          case 5:
-                            ((CountDistinctAccum) acc).objectDistinctValues.add(val);
-                            break;
-                          case 3:
-                            MinAccum ma = (MinAccum) acc;
-                            if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
-                              ma.objectVal = val;
-                              ma.hasValue = true;
-                            }
-                            break;
-                          case 4:
-                            MaxAccum xa = (MaxAccum) acc;
-                            if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
-                              xa.objectVal = val;
-                              xa.hasValue = true;
-                            }
-                            break;
-                        }
-                      }
-                      continue;
-                    }
-                    SortedNumericDocValues aggDv = numericAggDvs[i];
-                    if (aggDv != null && aggDv.advanceExact(doc)) {
-                      long rawVal = aggDv.nextValue();
-                      switch (accType[i]) {
-                        case 0:
-                          ((CountStarAccum) acc).count++;
-                          break;
-                        case 1:
-                          SumAccum sa = (SumAccum) acc;
-                          sa.hasValue = true;
-                          sa.longSum += rawVal;
-                          break;
-                        case 2:
-                          AvgAccum aa = (AvgAccum) acc;
-                          aa.count++;
-                          aa.longSum += rawVal;
-                          break;
-                        case 3:
-                          MinAccum mna = (MinAccum) acc;
-                          mna.hasValue = true;
-                          if (isDoubleArg[i]) {
-                            double d = Double.longBitsToDouble(rawVal);
-                            if (d < mna.doubleVal) mna.doubleVal = d;
-                          } else {
-                            if (rawVal < mna.longVal) mna.longVal = rawVal;
-                          }
-                          break;
-                        case 4:
-                          MaxAccum mxa = (MaxAccum) acc;
-                          mxa.hasValue = true;
-                          if (isDoubleArg[i]) {
-                            double d = Double.longBitsToDouble(rawVal);
-                            if (d > mxa.doubleVal) mxa.doubleVal = d;
-                          } else {
-                            if (rawVal > mxa.longVal) mxa.longVal = rawVal;
-                          }
-                          break;
-                        case 5:
-                          CountDistinctAccum cda = (CountDistinctAccum) acc;
-                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                          else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                          break;
-                        case 6:
-                          SumAccum sad = (SumAccum) acc;
-                          sad.hasValue = true;
-                          sad.doubleSum += Double.longBitsToDouble(rawVal);
-                          break;
-                        case 7:
-                          AvgAccum aad = (AvgAccum) acc;
-                          aad.count++;
-                          aad.doubleSum += Double.longBitsToDouble(rawVal);
-                          break;
-                      }
-                    }
-                  }
+                  collectVarcharGenericAccumulate(
+                      doc,
+                      accGroup,
+                      numAggs,
+                      isCountStar,
+                      isVarcharArg,
+                      isDoubleArg,
+                      accType,
+                      numericAggDvs,
+                      varcharAggDvs);
                 }
 
                 @Override
@@ -6059,6 +6134,112 @@ public final class FusedGroupByAggregate {
         return new AvgAccum(spec.argType);
       default:
         throw new UnsupportedOperationException("Unsupported aggregate: " + spec.funcName);
+    }
+  }
+
+  /**
+   * Inline accumulation for single VARCHAR generic path. Uses pre-computed dispatch flags (accType,
+   * isCountStar, isVarcharArg, isDoubleArg) for switch-based accumulation, eliminating instanceof
+   * chains in the hot loop.
+   */
+  private static void collectVarcharGenericAccumulate(
+      int doc,
+      AccumulatorGroup accGroup,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isVarcharArg,
+      boolean[] isDoubleArg,
+      int[] accType,
+      SortedNumericDocValues[] numericAggDvs,
+      SortedSetDocValues[] varcharAggDvs)
+      throws IOException {
+    for (int i = 0; i < numAggs; i++) {
+      MergeableAccumulator acc = accGroup.accumulators[i];
+      if (isCountStar[i]) {
+        ((CountStarAccum) acc).count++;
+        continue;
+      }
+      if (isVarcharArg[i]) {
+        SortedSetDocValues varcharDv = varcharAggDvs[i];
+        if (varcharDv != null && varcharDv.advanceExact(doc)) {
+          BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+          String val = bytes.utf8ToString();
+          switch (accType[i]) {
+            case 5:
+              ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+              break;
+            case 3:
+              MinAccum ma = (MinAccum) acc;
+              if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                ma.objectVal = val;
+                ma.hasValue = true;
+              }
+              break;
+            case 4:
+              MaxAccum xa = (MaxAccum) acc;
+              if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                xa.objectVal = val;
+                xa.hasValue = true;
+              }
+              break;
+          }
+        }
+        continue;
+      }
+      SortedNumericDocValues aggDv = numericAggDvs[i];
+      if (aggDv != null && aggDv.advanceExact(doc)) {
+        long rawVal = aggDv.nextValue();
+        switch (accType[i]) {
+          case 0:
+            ((CountStarAccum) acc).count++;
+            break;
+          case 1:
+            SumAccum sa = (SumAccum) acc;
+            sa.hasValue = true;
+            sa.longSum += rawVal;
+            break;
+          case 2:
+            AvgAccum aa = (AvgAccum) acc;
+            aa.count++;
+            aa.longSum += rawVal;
+            break;
+          case 3:
+            MinAccum mna = (MinAccum) acc;
+            mna.hasValue = true;
+            if (isDoubleArg[i]) {
+              double d = Double.longBitsToDouble(rawVal);
+              if (d < mna.doubleVal) mna.doubleVal = d;
+            } else {
+              if (rawVal < mna.longVal) mna.longVal = rawVal;
+            }
+            break;
+          case 4:
+            MaxAccum mxa = (MaxAccum) acc;
+            mxa.hasValue = true;
+            if (isDoubleArg[i]) {
+              double d = Double.longBitsToDouble(rawVal);
+              if (d > mxa.doubleVal) mxa.doubleVal = d;
+            } else {
+              if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+            }
+            break;
+          case 5:
+            CountDistinctAccum cda = (CountDistinctAccum) acc;
+            if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+            else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+            break;
+          case 6:
+            SumAccum sad = (SumAccum) acc;
+            sad.hasValue = true;
+            sad.doubleSum += Double.longBitsToDouble(rawVal);
+            break;
+          case 7:
+            AvgAccum aad = (AvgAccum) acc;
+            aad.count++;
+            aad.doubleSum += Double.longBitsToDouble(rawVal);
+            break;
+        }
+      }
     }
   }
 

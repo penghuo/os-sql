@@ -25,6 +25,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.PointValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
@@ -36,6 +37,7 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.NumericUtils;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -365,6 +367,88 @@ public final class FusedScanAggregate {
             blocks[i] = builders[i].build();
           }
           return List.of(new Page(blocks));
+        }
+      }
+
+      // Ultra-fast path: MIN/MAX only on numeric/date fields with MatchAllDocsQuery and no
+      // deleted docs. Uses PointValues.getMinPackedValue/getMaxPackedValue which is O(1) per
+      // segment, avoiding all per-doc iteration. Critical for Q7: MIN(EventDate), MAX(EventDate).
+      if (query instanceof MatchAllDocsQuery) {
+        boolean allMinMax = true;
+        boolean noDeletedDocs = true;
+        for (AggSpec spec : specs) {
+          if (!("MIN".equals(spec.funcName) || "MAX".equals(spec.funcName))
+              || spec.isDistinct
+              || spec.argType instanceof VarcharType) {
+            allMinMax = false;
+            break;
+          }
+        }
+        // Check no deleted docs (PointValues min/max only valid for entire segment)
+        if (allMinMax) {
+          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+            if (leafCtx.reader().getLiveDocs() != null) {
+              noDeletedDocs = false;
+              break;
+            }
+          }
+        }
+        if (allMinMax && noDeletedDocs && engineSearcher.getIndexReader().numDocs() > 0) {
+          boolean canUsePointValues = true;
+          long[] results = new long[specs.size()];
+          for (int i = 0; i < specs.size(); i++) {
+            results[i] = "MIN".equals(specs.get(i).funcName) ? Long.MAX_VALUE : Long.MIN_VALUE;
+          }
+          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+            LeafReader reader = leafCtx.reader();
+            for (int i = 0; i < specs.size(); i++) {
+              AggSpec spec = specs.get(i);
+              PointValues pointValues = reader.getPointValues(spec.arg);
+              if (pointValues == null || pointValues.size() == 0) {
+                continue;
+              }
+              byte[] packed;
+              if ("MIN".equals(spec.funcName)) {
+                packed = pointValues.getMinPackedValue();
+              } else {
+                packed = pointValues.getMaxPackedValue();
+              }
+              if (packed == null || packed.length < Long.BYTES) {
+                canUsePointValues = false;
+                break;
+              }
+              // Decode using Lucene's standard sortable encoding
+              long val = NumericUtils.sortableBytesToLong(packed, 0);
+              if ("MIN".equals(spec.funcName)) {
+                results[i] = Math.min(results[i], val);
+              } else {
+                results[i] = Math.max(results[i], val);
+              }
+            }
+            if (!canUsePointValues) break;
+          }
+          if (canUsePointValues) {
+            int numAggs = specs.size();
+            BlockBuilder[] builders = new BlockBuilder[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              AggSpec spec = specs.get(i);
+              Type outputType = accumulators.get(i).getOutputType();
+              builders[i] = outputType.createBlockBuilder(null, 1);
+              if (spec.argType instanceof TimestampType) {
+                // Date fields: PointValues stores epoch millis, output as micros
+                TimestampType.TIMESTAMP_MILLIS.writeLong(builders[i], results[i] * 1000L);
+              } else if (spec.argType instanceof DoubleType) {
+                DoubleType.DOUBLE.writeDouble(builders[i], Double.longBitsToDouble(results[i]));
+              } else {
+                outputType.writeLong(builders[i], results[i]);
+              }
+            }
+            Block[] blocks = new Block[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              blocks[i] = builders[i].build();
+            }
+            return List.of(new Page(blocks));
+          }
         }
       }
 

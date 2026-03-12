@@ -130,9 +130,96 @@ public class PlanFragmenter {
         return new AggregationNode(
             aggNode.getChild(), dedupKeys, List.of("COUNT(*)"), AggregationNode.Step.PARTIAL);
       }
+      // Mixed aggregate dedup: queries with both COUNT(DISTINCT) and decomposable aggregates.
+      // Instead of sending all raw rows, shards GROUP BY (original_keys + distinct_columns)
+      // with partial aggregates for decomposable functions. This reduces data volume by the
+      // dedup factor (e.g., 1M rows → ~80K deduped rows for Q10).
+      DqePlanNode mixedDedupPlan = buildMixedDedupShardPlan(aggNode);
+      if (mixedDedupPlan != null) {
+        return mixedDedupPlan;
+      }
     }
     // SINGLE: strip aggregation and above, shards only scan+filter
     return aggNode.getChild();
+  }
+
+  /**
+   * Build a shard plan for mixed-aggregate queries containing both COUNT(DISTINCT) and decomposable
+   * aggregates (SUM, COUNT(*), AVG, MIN, MAX). The shard plan groups by (original_keys +
+   * distinct_columns) with partial aggregates for the decomposable functions. This deduplicates the
+   * distinct column values at the shard level while preserving enough information for the
+   * coordinator to compute all aggregate results.
+   *
+   * <p>For Q10: GROUP BY RegionID with SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth),
+   * COUNT(DISTINCT UserID) becomes shard plan: GROUP BY (RegionID, UserID) with SUM(AdvEngineID),
+   * COUNT(*), SUM(ResolutionWidth), COUNT(ResolutionWidth)
+   *
+   * @return the shard plan node, or null if the query is not eligible
+   */
+  private static DqePlanNode buildMixedDedupShardPlan(AggregationNode aggNode) {
+    List<String> aggFunctions = aggNode.getAggregateFunctions();
+    List<String> distinctCols = new ArrayList<>();
+    boolean hasCountDistinct = false;
+    boolean hasDecomposable = false;
+
+    for (String func : aggFunctions) {
+      Matcher m = AGG_PATTERN.matcher(func);
+      if (!m.matches()) {
+        return null; // Unsupported aggregate
+      }
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      String arg = m.group(3).trim();
+
+      if (isDistinct) {
+        if (!"COUNT".equals(funcName)) {
+          return null; // Only COUNT(DISTINCT) supported
+        }
+        hasCountDistinct = true;
+        if (!distinctCols.contains(arg)) {
+          distinctCols.add(arg);
+        }
+      } else {
+        hasDecomposable = true;
+      }
+    }
+
+    // Only apply when both COUNT(DISTINCT) and decomposable aggregates are present
+    if (!hasCountDistinct || !hasDecomposable) {
+      return null;
+    }
+
+    // Build dedup GROUP BY keys: original keys + distinct columns
+    List<String> dedupKeys = new ArrayList<>(aggNode.getGroupByKeys());
+    dedupKeys.addAll(distinctCols);
+
+    // Build partial aggregates for decomposable functions.
+    // AVG(col) is decomposed into SUM(col) + COUNT(col) for correct weighted merge.
+    // COUNT(DISTINCT col) is omitted — it becomes COUNT(*) at the coordinator level.
+    List<String> shardAggs = new ArrayList<>();
+    for (String func : aggFunctions) {
+      Matcher m = AGG_PATTERN.matcher(func);
+      if (!m.matches()) continue;
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      String arg = m.group(3).trim();
+
+      if (isDistinct) {
+        // COUNT(DISTINCT) handled by dedup GROUP BY — no shard aggregate needed
+        continue;
+      }
+      if ("AVG".equals(funcName)) {
+        // Decompose AVG into SUM + COUNT for weighted merge at coordinator
+        shardAggs.add("SUM(" + arg + ")");
+        shardAggs.add("COUNT(" + arg + ")");
+      } else {
+        // COUNT(*), SUM, MIN, MAX — pass through as-is
+        shardAggs.add(func);
+      }
+    }
+
+    return new AggregationNode(
+        aggNode.getChild(), dedupKeys, shardAggs, AggregationNode.Step.PARTIAL);
   }
 
   /**

@@ -300,6 +300,23 @@ public class TransportTrinoSqlAction
                         mergedPages =
                             applyCoordinatorSort(
                                 mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+                      } else if (coordinatorPlan instanceof AggregationNode singleMixed
+                          && singleMixed.getStep() == AggregationNode.Step.SINGLE
+                          && isShardMixedDedup(shardFragments.get(0).shardPlan(), singleMixed)) {
+                        // Fast path: mixed-aggregate dedup (e.g., Q10).
+                        // Shards did GROUP BY (original_keys + distinct_cols) with partial aggs.
+                        // Coordinator merges partials then re-aggregates to final result.
+                        mergedPages =
+                            mergeMixedDedup(
+                                shardPages,
+                                singleMixed,
+                                shardFragments.get(0).shardPlan(),
+                                columnTypes,
+                                columnTypeMap,
+                                merger);
+                        mergedPages =
+                            applyCoordinatorSort(
+                                mergedPages, singleMixed, optimizedPlan, columnTypes, merger);
                       } else if (coordinatorPlan instanceof AggregationNode singleAgg2
                           && singleAgg2.getStep() == AggregationNode.Step.SINGLE) {
                         // SINGLE aggregation: shards sent raw data, coordinator aggregates
@@ -500,6 +517,19 @@ public class TransportTrinoSqlAction
                     merger);
             mergedPages =
                 applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+          } else if (coordinatorPlan instanceof AggregationNode singleMixed2
+              && singleMixed2.getStep() == AggregationNode.Step.SINGLE
+              && isShardMixedDedup(shardFragments.get(0).shardPlan(), singleMixed2)) {
+            mergedPages =
+                mergeMixedDedup(
+                    shardPages,
+                    singleMixed2,
+                    shardFragments.get(0).shardPlan(),
+                    columnTypes,
+                    columnTypeMap,
+                    merger);
+            mergedPages =
+                applyCoordinatorSort(mergedPages, singleMixed2, optimizedPlan, columnTypes, merger);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg2
               && singleAgg2.getStep() == AggregationNode.Step.SINGLE) {
             List<String> shardColumnNames = resolveColumnNames(shardFragments.get(0).shardPlan());
@@ -1723,6 +1753,427 @@ public class TransportTrinoSqlAction
         }
       }
       BigintType.BIGINT.writeLong(builders[numOriginalKeys], entry.getValue());
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Check if the shard plan uses mixed-aggregate dedup. Returns true when the shard plan is a
+   * PARTIAL AggregationNode whose GROUP BY keys are a superset of the original SINGLE aggregation's
+   * GROUP BY keys, AND the shard has more aggregate functions than just COUNT(*) (distinguishing
+   * from the COUNT-DISTINCT-only dedup path).
+   */
+  private static boolean isShardMixedDedup(DqePlanNode shardPlan, AggregationNode singleAgg) {
+    if (!(shardPlan instanceof AggregationNode shardAgg)) {
+      return false;
+    }
+    if (shardAgg.getStep() != AggregationNode.Step.PARTIAL) {
+      return false;
+    }
+    if (singleAgg.getGroupByKeys().isEmpty()) {
+      return false;
+    }
+    // Mixed dedup has more group-by keys than the original (original keys + distinct columns)
+    // and has MORE than just COUNT(*) as shard aggregates (unlike the COUNT-DISTINCT-only path)
+    if (shardAgg.getGroupByKeys().size() <= singleAgg.getGroupByKeys().size()) {
+      return false;
+    }
+    // Distinguish from COUNT-DISTINCT-only dedup: that path has exactly 1 shard agg (COUNT(*))
+    if (shardAgg.getAggregateFunctions().size() <= 1) {
+      return false;
+    }
+    // Verify original aggregate functions contain COUNT(DISTINCT)
+    java.util.regex.Pattern aggPat =
+        java.util.regex.Pattern.compile(
+            "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+    boolean hasCountDistinct = false;
+    for (String func : singleAgg.getAggregateFunctions()) {
+      java.util.regex.Matcher m = aggPat.matcher(func);
+      if (m.matches()
+          && "COUNT".equals(m.group(1).toUpperCase(java.util.Locale.ROOT))
+          && m.group(2) != null) {
+        hasCountDistinct = true;
+        break;
+      }
+    }
+    return hasCountDistinct;
+  }
+
+  /**
+   * Three-stage merge for mixed-aggregate dedup queries (e.g., Q10). Shards produce pre-deduped
+   * (original_keys + distinct_cols, partial_agg0, partial_agg1, ...) tuples. The coordinator:
+   *
+   * <ol>
+   *   <li>Stage 1: FINAL merge for dedup keys to remove cross-shard duplicates and merge partial
+   *       aggregates (SUM→sum, COUNT→sum, MIN→min, MAX→max)
+   *   <li>Stage 2: Re-aggregate by original keys: SUM the partial sums, SUM the partial counts,
+   *       compute weighted AVG, COUNT rows for COUNT(DISTINCT)
+   * </ol>
+   */
+  private static List<Page> mergeMixedDedup(
+      List<List<Page>> shardPages,
+      AggregationNode singleAgg,
+      DqePlanNode shardPlan,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap,
+      ResultMerger merger) {
+
+    AggregationNode shardAgg = (AggregationNode) shardPlan;
+    List<String> dedupKeys = shardAgg.getGroupByKeys();
+    List<String> shardAggs = shardAgg.getAggregateFunctions();
+    List<String> originalKeys = singleAgg.getGroupByKeys();
+    List<String> originalAggs = singleAgg.getAggregateFunctions();
+    int numOriginalKeys = originalKeys.size();
+
+    // Stage 1: FINAL merge for dedup keys (merges partial aggregates across shards)
+    // Build types for the dedup output: [dedupKey types..., shardAgg types...]
+    List<Type> dedupTypes = new ArrayList<>();
+    for (String key : dedupKeys) {
+      dedupTypes.add(columnTypeMap.getOrDefault(key, BigintType.BIGINT));
+    }
+    // Determine types for shard aggregates
+    java.util.regex.Pattern aggPat =
+        java.util.regex.Pattern.compile(
+            "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+    for (String func : shardAggs) {
+      java.util.regex.Matcher m = aggPat.matcher(func);
+      if (m.matches()) {
+        String funcName = m.group(1).toUpperCase(java.util.Locale.ROOT);
+        String arg = m.group(3).trim();
+        if ("COUNT".equals(funcName)) {
+          dedupTypes.add(BigintType.BIGINT);
+        } else if ("SUM".equals(funcName)) {
+          Type argType = columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+          dedupTypes.add(argType instanceof DoubleType ? DoubleType.DOUBLE : BigintType.BIGINT);
+        } else if ("MIN".equals(funcName) || "MAX".equals(funcName)) {
+          dedupTypes.add(columnTypeMap.getOrDefault(arg, BigintType.BIGINT));
+        } else {
+          dedupTypes.add(BigintType.BIGINT);
+        }
+      } else {
+        dedupTypes.add(BigintType.BIGINT);
+      }
+    }
+
+    AggregationNode finalDedupNode =
+        new AggregationNode(null, dedupKeys, shardAggs, AggregationNode.Step.FINAL);
+    List<Page> dedupedPages = merger.mergeAggregation(shardPages, finalDedupNode, dedupTypes);
+
+    if (dedupedPages.isEmpty()) {
+      return List.of();
+    }
+
+    // Stage 2: Re-aggregate by original keys
+    // Map from shard agg columns to original aggregate output
+    // Build a mapping: for each original aggregate, identify which shard agg column(s) to use
+    int numDedupKeys = dedupKeys.size();
+
+    // Use HashMap to group by original keys and accumulate final results
+    java.util.LinkedHashMap<Object, double[]> longGroups = new java.util.LinkedHashMap<>();
+    // Track: for each original agg, store intermediate values
+    // We need to know the layout: [SUM(AdvEngineID), COUNT(*), SUM(ResWidth), COUNT(ResWidth)]
+    // maps to original: [SUM(AdvEngineID), COUNT(*), AVG(ResWidth), COUNT(DISTINCT UserID)]
+
+    // Parse original aggregates to know what to produce
+    int numOrigAggs = originalAggs.size();
+    // For each original agg, track how to compute from shard agg columns
+    // shardAggIdx[i] = index of shard agg column for original agg i (-1 for COUNT(DISTINCT))
+    int[] shardAggIdx = new int[numOrigAggs];
+    int[] shardCountIdx = new int[numOrigAggs]; // companion COUNT index for AVG
+    boolean[] isCountDistinct = new boolean[numOrigAggs];
+    boolean[] isAvg = new boolean[numOrigAggs];
+    boolean[] isMin = new boolean[numOrigAggs];
+    boolean[] isMax = new boolean[numOrigAggs];
+    boolean[] isOutputDouble = new boolean[numOrigAggs];
+    java.util.Arrays.fill(shardAggIdx, -1);
+    java.util.Arrays.fill(shardCountIdx, -1);
+
+    int shardAggOffset = 0; // tracks position in shard agg list
+    for (int i = 0; i < numOrigAggs; i++) {
+      java.util.regex.Matcher m = aggPat.matcher(originalAggs.get(i));
+      if (!m.matches()) continue;
+      String funcName = m.group(1).toUpperCase(java.util.Locale.ROOT);
+      boolean distinct = m.group(2) != null;
+
+      if (distinct && "COUNT".equals(funcName)) {
+        isCountDistinct[i] = true;
+        // No shard agg column — COUNT(DISTINCT) = count of rows per group
+      } else if ("AVG".equals(funcName)) {
+        isAvg[i] = true;
+        isOutputDouble[i] = true;
+        // AVG was decomposed into SUM + COUNT in shard plan
+        shardAggIdx[i] = shardAggOffset; // SUM column
+        shardCountIdx[i] = shardAggOffset + 1; // COUNT column
+        shardAggOffset += 2;
+      } else if ("MIN".equals(funcName)) {
+        isMin[i] = true;
+        shardAggIdx[i] = shardAggOffset;
+        Type aggType = dedupTypes.get(numDedupKeys + shardAggOffset);
+        isOutputDouble[i] = aggType instanceof DoubleType;
+        shardAggOffset++;
+      } else if ("MAX".equals(funcName)) {
+        isMax[i] = true;
+        shardAggIdx[i] = shardAggOffset;
+        Type aggType = dedupTypes.get(numDedupKeys + shardAggOffset);
+        isOutputDouble[i] = aggType instanceof DoubleType;
+        shardAggOffset++;
+      } else {
+        // SUM, COUNT(*)
+        shardAggIdx[i] = shardAggOffset;
+        Type aggType = dedupTypes.get(numDedupKeys + shardAggOffset);
+        isOutputDouble[i] = aggType instanceof DoubleType;
+        shardAggOffset++;
+      }
+    }
+
+    // Accumulate per original group key
+    // Use long key for single numeric key (common case)
+    if (numOriginalKeys == 1
+        && !(dedupTypes.get(0) instanceof VarcharType)
+        && !(dedupTypes.get(0) instanceof DoubleType)) {
+      // Single numeric key fast path
+      Type keyType = dedupTypes.get(0);
+      // longGroups: key → [agg values as doubles]
+      // For COUNT(DISTINCT): just count rows. For others: accumulate from shard agg columns.
+      // Need: long→(long countDistinct, double[] aggValues)
+      java.util.HashMap<Long, long[]> longAccums = new java.util.HashMap<>();
+      java.util.HashMap<Long, double[]> doubleAccums = new java.util.HashMap<>();
+      // long accums: [countDistinct, longAgg0, longAgg1, ...]
+      // double accums: [doubleAgg0, doubleAgg1, ...]
+      // Simplified: use a single double[] for everything
+
+      // Count columns needed: numOrigAggs values + 1 for count_distinct + extra for AVG
+      // Use a simple structure: for each group, store values in fixed-size array
+      int numValues = numOrigAggs * 2; // space for sum + count for AVG, value for others
+      java.util.HashMap<Long, double[]> groups = new java.util.HashMap<>();
+
+      for (Page page : dedupedPages) {
+        Block keyBlock = page.getBlock(0);
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          long key = keyType.getLong(keyBlock, pos);
+          double[] vals = groups.get(key);
+          if (vals == null) {
+            vals = new double[numValues];
+            groups.put(key, vals);
+          }
+
+          for (int a = 0; a < numOrigAggs; a++) {
+            if (isCountDistinct[a]) {
+              vals[a * 2]++;
+            } else if (isAvg[a]) {
+              int sumCol = numDedupKeys + shardAggIdx[a];
+              int cntCol = numDedupKeys + shardCountIdx[a];
+              Block sumBlock = page.getBlock(sumCol);
+              Block cntBlock = page.getBlock(cntCol);
+              if (!sumBlock.isNull(pos) && !cntBlock.isNull(pos)) {
+                Type sumType = dedupTypes.get(sumCol);
+                if (sumType instanceof DoubleType) {
+                  vals[a * 2] += DoubleType.DOUBLE.getDouble(sumBlock, pos);
+                } else {
+                  vals[a * 2] += sumType.getLong(sumBlock, pos);
+                }
+                vals[a * 2 + 1] += BigintType.BIGINT.getLong(cntBlock, pos);
+              }
+            } else if (isMin[a] || isMax[a]) {
+              int col = numDedupKeys + shardAggIdx[a];
+              Block valBlock = page.getBlock(col);
+              if (!valBlock.isNull(pos)) {
+                Type valType = dedupTypes.get(col);
+                double v =
+                    isOutputDouble[a]
+                        ? DoubleType.DOUBLE.getDouble(valBlock, pos)
+                        : valType.getLong(valBlock, pos);
+                // vals[a*2+1] used as hasValue flag (0=no, 1=yes)
+                if (vals[a * 2 + 1] == 0) {
+                  vals[a * 2] = v;
+                  vals[a * 2 + 1] = 1;
+                } else if (isMin[a] ? v < vals[a * 2] : v > vals[a * 2]) {
+                  vals[a * 2] = v;
+                }
+              }
+            } else {
+              // SUM, COUNT(*)
+              int col = numDedupKeys + shardAggIdx[a];
+              Block valBlock = page.getBlock(col);
+              if (!valBlock.isNull(pos)) {
+                Type valType = dedupTypes.get(col);
+                if (isOutputDouble[a]) {
+                  vals[a * 2] += DoubleType.DOUBLE.getDouble(valBlock, pos);
+                } else {
+                  vals[a * 2] += valType.getLong(valBlock, pos);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Build result page
+      int numOutputCols = numOriginalKeys + numOrigAggs;
+      io.trino.spi.block.BlockBuilder[] builders =
+          new io.trino.spi.block.BlockBuilder[numOutputCols];
+      builders[0] = dedupTypes.get(0).createBlockBuilder(null, groups.size());
+      for (int i = 0; i < numOrigAggs; i++) {
+        Type outType = columnTypes.get(numOriginalKeys + i);
+        builders[numOriginalKeys + i] = outType.createBlockBuilder(null, groups.size());
+      }
+
+      for (var entry : groups.entrySet()) {
+        long key = entry.getKey();
+        double[] vals = entry.getValue();
+        // Write key
+        Type kt = dedupTypes.get(0);
+        if (kt instanceof IntegerType) {
+          IntegerType.INTEGER.writeLong(builders[0], (int) key);
+        } else {
+          kt.writeLong(builders[0], key);
+        }
+        // Write aggregate values
+        for (int a = 0; a < numOrigAggs; a++) {
+          Type outType = columnTypes.get(numOriginalKeys + a);
+          if (isCountDistinct[a]) {
+            BigintType.BIGINT.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+          } else if (isAvg[a]) {
+            double sum = vals[a * 2];
+            double count = vals[a * 2 + 1];
+            DoubleType.DOUBLE.writeDouble(
+                builders[numOriginalKeys + a], count > 0 ? sum / count : 0.0);
+          } else if (outType instanceof DoubleType) {
+            DoubleType.DOUBLE.writeDouble(builders[numOriginalKeys + a], vals[a * 2]);
+          } else {
+            outType.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+          }
+        }
+      }
+
+      Block[] blocks = new Block[numOutputCols];
+      for (int i = 0; i < numOutputCols; i++) {
+        blocks[i] = builders[i].build();
+      }
+      return List.of(new Page(blocks));
+    }
+
+    // Generic fallback: use Object keys
+    // Build types for original keys
+    Type[] keyTypes = new Type[numOriginalKeys];
+    for (int i = 0; i < numOriginalKeys; i++) {
+      keyTypes[i] = dedupTypes.get(i);
+    }
+
+    int numValues = numOrigAggs * 2;
+    java.util.LinkedHashMap<Object, double[]> groups = new java.util.LinkedHashMap<>();
+
+    for (Page page : dedupedPages) {
+      for (int pos = 0; pos < page.getPositionCount(); pos++) {
+        Object key;
+        if (numOriginalKeys == 1) {
+          key = extractValue(page, 0, pos, keyTypes[0]);
+        } else {
+          List<Object> multiKey = new ArrayList<>(numOriginalKeys);
+          for (int i = 0; i < numOriginalKeys; i++) {
+            multiKey.add(extractValue(page, i, pos, keyTypes[i]));
+          }
+          key = multiKey;
+        }
+        double[] vals = groups.computeIfAbsent(key, k -> new double[numValues]);
+
+        for (int a = 0; a < numOrigAggs; a++) {
+          if (isCountDistinct[a]) {
+            vals[a * 2]++;
+          } else if (isAvg[a]) {
+            int sumCol = numDedupKeys + shardAggIdx[a];
+            int cntCol = numDedupKeys + shardCountIdx[a];
+            Block sumBlock = page.getBlock(sumCol);
+            Block cntBlock = page.getBlock(cntCol);
+            if (!sumBlock.isNull(pos) && !cntBlock.isNull(pos)) {
+              Type sumType = dedupTypes.get(sumCol);
+              if (sumType instanceof DoubleType) {
+                vals[a * 2] += DoubleType.DOUBLE.getDouble(sumBlock, pos);
+              } else {
+                vals[a * 2] += sumType.getLong(sumBlock, pos);
+              }
+              vals[a * 2 + 1] += BigintType.BIGINT.getLong(cntBlock, pos);
+            }
+          } else if (isMin[a] || isMax[a]) {
+            int col = numDedupKeys + shardAggIdx[a];
+            Block valBlock = page.getBlock(col);
+            if (!valBlock.isNull(pos)) {
+              Type valType = dedupTypes.get(col);
+              double v =
+                  isOutputDouble[a]
+                      ? DoubleType.DOUBLE.getDouble(valBlock, pos)
+                      : valType.getLong(valBlock, pos);
+              if (vals[a * 2 + 1] == 0) {
+                vals[a * 2] = v;
+                vals[a * 2 + 1] = 1;
+              } else if (isMin[a] ? v < vals[a * 2] : v > vals[a * 2]) {
+                vals[a * 2] = v;
+              }
+            }
+          } else {
+            int col = numDedupKeys + shardAggIdx[a];
+            Block valBlock = page.getBlock(col);
+            if (!valBlock.isNull(pos)) {
+              Type valType = dedupTypes.get(col);
+              if (isOutputDouble[a]) {
+                vals[a * 2] += DoubleType.DOUBLE.getDouble(valBlock, pos);
+              } else {
+                vals[a * 2] += valType.getLong(valBlock, pos);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (groups.isEmpty()) {
+      return List.of();
+    }
+
+    int numOutputCols = numOriginalKeys + numOrigAggs;
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    for (int i = 0; i < numOriginalKeys; i++) {
+      builders[i] = keyTypes[i].createBlockBuilder(null, groups.size());
+    }
+    for (int i = 0; i < numOrigAggs; i++) {
+      Type outType = columnTypes.get(numOriginalKeys + i);
+      builders[numOriginalKeys + i] = outType.createBlockBuilder(null, groups.size());
+    }
+
+    for (var entry : groups.entrySet()) {
+      Object key = entry.getKey();
+      double[] vals = entry.getValue();
+      if (numOriginalKeys == 1) {
+        appendTypedValue(builders[0], keyTypes[0], key);
+      } else {
+        @SuppressWarnings("unchecked")
+        List<Object> multiKey = (List<Object>) key;
+        for (int i = 0; i < numOriginalKeys; i++) {
+          appendTypedValue(builders[i], keyTypes[i], multiKey.get(i));
+        }
+      }
+      for (int a = 0; a < numOrigAggs; a++) {
+        Type outType = columnTypes.get(numOriginalKeys + a);
+        if (isCountDistinct[a]) {
+          BigintType.BIGINT.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+        } else if (isAvg[a]) {
+          double sum = vals[a * 2];
+          double count = vals[a * 2 + 1];
+          DoubleType.DOUBLE.writeDouble(
+              builders[numOriginalKeys + a], count > 0 ? sum / count : 0.0);
+        } else if (outType instanceof DoubleType) {
+          DoubleType.DOUBLE.writeDouble(builders[numOriginalKeys + a], vals[a * 2]);
+        } else {
+          outType.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+        }
+      }
     }
 
     Block[] blocks = new Block[numOutputCols];

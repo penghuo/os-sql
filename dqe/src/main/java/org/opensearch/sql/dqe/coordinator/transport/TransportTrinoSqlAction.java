@@ -2050,10 +2050,10 @@ public class TransportTrinoSqlAction
    * Ultra-fast 2-key fused merge for COUNT(DISTINCT) with exactly 2 numeric dedup keys and 1
    * numeric original key. Uses two flat long[] arrays instead of long[][] to eliminate all
    * per-entry array allocation. For Q9-style queries (GROUP BY RegionID, COUNT(DISTINCT UserID)),
-   * this processes ~327K shard rows with zero allocation in the inner loop.
+   * this processes ~80K shard rows with zero allocation in the inner loop.
    *
-   * <p>Stage 1: Build open-addressing hash map from (key0, key1) pairs, summing COUNT(*) values.
-   * Stage 2: Count entries per original key (key0) to get COUNT(DISTINCT).
+   * <p>Stage 1: Build open-addressing hash map from (key0, key1) pairs (set insertion, ignoring
+   * counts). Stage 2: Count entries per original key (key0) to get COUNT(DISTINCT).
    */
   private static List<Page> mergeDedupCountDistinct2Key(
       List<List<Page>> shardPages,

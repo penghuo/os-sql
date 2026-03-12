@@ -163,6 +163,12 @@ public class HashAggregationOperator implements Operator {
       if (isLongKeyType(keyType)) {
         return processSingleLongKeyAggregation();
       }
+      // Fast path: single VARCHAR group-by key uses HashMap<String, Accumulators> directly,
+      // avoiding GroupKey/Object[] allocation per row. Common for GROUP BY on computed
+      // string expressions like REGEXP_REPLACE.
+      if (keyType instanceof VarcharType) {
+        return processSingleVarcharKeyAggregation();
+      }
     }
 
     return processGenericGroupedAggregation();
@@ -244,6 +250,94 @@ public class HashAggregationOperator implements Operator {
       builders[0].appendNull();
       for (int i = 0; i < longMap.nullGroupAccumulators.size(); i++) {
         longMap.nullGroupAccumulators.get(i).writeTo(builders[1 + i]);
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return new Page(blocks);
+  }
+
+  /**
+   * Specialized aggregation for single VARCHAR group-by key. Uses HashMap&lt;String,
+   * List&lt;Accumulator&gt;&gt; directly, avoiding the GroupKey/Object[] allocation per row that
+   * the generic path requires. For queries like GROUP BY REGEXP_REPLACE(...) with ~20K distinct
+   * groups from 125K rows, this eliminates ~105K GroupKey objects and ~105K Object[] arrays (only
+   * ~20K unique entries in the map vs 125K lookups with generic GroupKey).
+   */
+  private Page processSingleVarcharKeyAggregation() {
+    int keyColIdx = groupByColumnIndices.get(0);
+    Map<String, List<Accumulator>> groups = new LinkedHashMap<>();
+    List<Accumulator> nullGroupAccumulators = null;
+
+    Page page;
+    while ((page = source.processNextBatch()) != null) {
+      int positionCount = page.getPositionCount();
+      Block keyBlock = page.getBlock(keyColIdx);
+
+      for (int pos = 0; pos < positionCount; pos++) {
+        if (keyBlock.isNull(pos)) {
+          if (nullGroupAccumulators == null) {
+            nullGroupAccumulators = new ArrayList<>(aggregateFunctions.size());
+            for (AggregateFunction func : aggregateFunctions) {
+              nullGroupAccumulators.add(func.createAccumulator());
+            }
+          }
+          for (int i = 0; i < nullGroupAccumulators.size(); i++) {
+            nullGroupAccumulators.get(i).add(page, pos);
+          }
+        } else {
+          String key = VarcharType.VARCHAR.getSlice(keyBlock, pos).toStringUtf8();
+          List<Accumulator> accumulators =
+              groups.computeIfAbsent(
+                  key,
+                  k -> {
+                    List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
+                    for (AggregateFunction func : aggregateFunctions) {
+                      accs.add(func.createAccumulator());
+                    }
+                    return accs;
+                  });
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
+          }
+        }
+      }
+    }
+
+    int groupCount = groups.size();
+    boolean hasNullGroup = nullGroupAccumulators != null;
+    if (hasNullGroup) {
+      groupCount++;
+    }
+    if (groupCount == 0) {
+      return null;
+    }
+
+    // Build result page
+    int totalColumns = 1 + aggregateFunctions.size();
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+    for (int i = 0; i < aggregateFunctions.size(); i++) {
+      builders[1 + i] =
+          aggregateFunctions.get(i).getOutputType().createBlockBuilder(null, groupCount);
+    }
+
+    for (Map.Entry<String, List<Accumulator>> entry : groups.entrySet()) {
+      VarcharType.VARCHAR.writeSlice(
+          builders[0], io.airlift.slice.Slices.utf8Slice(entry.getKey()));
+      List<Accumulator> accumulators = entry.getValue();
+      for (int i = 0; i < accumulators.size(); i++) {
+        accumulators.get(i).writeTo(builders[1 + i]);
+      }
+    }
+
+    if (hasNullGroup) {
+      builders[0].appendNull();
+      for (int i = 0; i < nullGroupAccumulators.size(); i++) {
+        nullGroupAccumulators.get(i).writeTo(builders[1 + i]);
       }
     }
 

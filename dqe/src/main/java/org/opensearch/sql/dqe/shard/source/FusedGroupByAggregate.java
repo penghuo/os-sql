@@ -94,6 +94,18 @@ public final class FusedGroupByAggregate {
   private static final Pattern ARITH_EXPR_PATTERN =
       Pattern.compile("^\\(?(\\w+)\\s*([+\\-*/])\\s*(\\d+)\\)?$", Pattern.CASE_INSENSITIVE);
 
+  /**
+   * Pattern to recognize EXTRACT expressions in group-by keys. Matches expressions like
+   * "EXTRACT(MINUTE FROM EventTime)" and extracts the field name and source column. These are
+   * handled by reading the source timestamp column from DocValues (epoch millis) and computing the
+   * extracted field inline during key extraction. Supports YEAR, MONTH, DAY, HOUR, MINUTE, SECOND,
+   * DOW (day of week), DOY (day of year), and WEEK fields.
+   */
+  private static final Pattern EXTRACT_PATTERN =
+      Pattern.compile(
+          "^EXTRACT\\((YEAR|QUARTER|MONTH|WEEK|DAY|DAY_OF_MONTH|DAY_OF_WEEK|DOW|DAY_OF_YEAR|DOY|HOUR|MINUTE|SECOND)\\s+FROM\\s+(\\w+)\\)$",
+          Pattern.CASE_INSENSITIVE);
+
   private FusedGroupByAggregate() {}
 
   /**
@@ -150,16 +162,26 @@ public final class FusedGroupByAggregate {
             return false;
           }
         } else {
-          // Check for arithmetic expression: (col OP constant)
-          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
-          if (am.matches()) {
-            String sourceCol = am.group(1);
+          // Check for EXTRACT expression: EXTRACT(FIELD FROM col)
+          Matcher em = EXTRACT_PATTERN.matcher(key);
+          if (em.matches()) {
+            String sourceCol = em.group(2);
             Type sourceType = columnTypeMap.get(sourceCol);
-            if (sourceType == null || !isNumericOrTimestamp(sourceType)) {
+            if (!(sourceType instanceof TimestampType)) {
               return false;
             }
           } else {
-            return false; // Unknown expression, can't fuse
+            // Check for arithmetic expression: (col OP constant)
+            Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+            if (am.matches()) {
+              String sourceCol = am.group(1);
+              Type sourceType = columnTypeMap.get(sourceCol);
+              if (sourceType == null || !isNumericOrTimestamp(sourceType)) {
+                return false;
+              }
+            } else {
+              return false; // Unknown expression, can't fuse
+            }
           }
         }
       }
@@ -865,18 +887,27 @@ public final class FusedGroupByAggregate {
           keyInfos.add(
               new KeyInfo(sourceCol, TimestampType.TIMESTAMP_MILLIS, false, "date_trunc", unit));
         } else {
-          // Check for arithmetic expression: (col OP constant)
-          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
-          if (am.matches()) {
-            String sourceCol = am.group(1);
-            String op = am.group(2);
-            String constant = am.group(3);
-            // Use BigintType for arithmetic output to match Trino's expectations
-            // (arithmetic on integers produces long in the Trino execution model)
-            keyInfos.add(
-                new KeyInfo(sourceCol, BigintType.BIGINT, false, "arith", op + ":" + constant));
+          // Check for EXTRACT expression: EXTRACT(FIELD FROM col)
+          Matcher em = EXTRACT_PATTERN.matcher(key);
+          if (em.matches()) {
+            String field = em.group(1).toUpperCase(Locale.ROOT);
+            String sourceCol = em.group(2);
+            // Output type is BigintType (extract returns an integer)
+            keyInfos.add(new KeyInfo(sourceCol, BigintType.BIGINT, false, "extract", field));
           } else {
-            throw new IllegalArgumentException("Unsupported group-by expression: " + key);
+            // Check for arithmetic expression: (col OP constant)
+            Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+            if (am.matches()) {
+              String sourceCol = am.group(1);
+              String op = am.group(2);
+              String constant = am.group(3);
+              // Use BigintType for arithmetic output to match Trino's expectations
+              // (arithmetic on integers produces long in the Trino execution model)
+              keyInfos.add(
+                  new KeyInfo(sourceCol, BigintType.BIGINT, false, "arith", op + ":" + constant));
+            } else {
+              throw new IllegalArgumentException("Unsupported group-by expression: " + key);
+            }
           }
         }
       }
@@ -986,6 +1017,10 @@ public final class FusedGroupByAggregate {
    * @return transformed value
    */
   private static long applyArith(long value, String exprUnit) {
+    // Check for EXTRACT encoding: "E:FIELD_NAME"
+    if (exprUnit.charAt(0) == 'E' && exprUnit.charAt(1) == ':') {
+      return applyExtract(value, exprUnit.substring(2));
+    }
     int colonIdx = exprUnit.indexOf(':');
     char op = exprUnit.charAt(0);
     long constant = Long.parseLong(exprUnit.substring(colonIdx + 1));
@@ -1000,6 +1035,58 @@ public final class FusedGroupByAggregate {
         return constant != 0 ? value / constant : 0;
       default:
         return value;
+    }
+  }
+
+  /**
+   * Extract a date/time field from a timestamp value stored as epoch milliseconds (OpenSearch
+   * DocValues format for date fields). Uses arithmetic on epoch millis to avoid object allocation
+   * in the hot aggregation loop. For common fields (MINUTE, HOUR, SECOND), the computation is pure
+   * arithmetic. For calendar-aware fields (MONTH, YEAR, DOW, WEEK), falls back to java.time
+   * conversion.
+   *
+   * @param epochMillis the timestamp value in milliseconds since epoch (DocValues format)
+   * @param field the field name to extract (e.g., "MINUTE", "HOUR", "YEAR")
+   * @return the extracted field value as a long
+   */
+  private static long applyExtract(long epochMillis, String field) {
+    // Fast arithmetic path for common time-of-day fields
+    long epochSeconds = epochMillis / 1000;
+    switch (field) {
+      case "SECOND":
+        // Seconds within the minute (0-59)
+        return ((epochSeconds % 60) + 60) % 60;
+      case "MINUTE":
+        // Minutes within the hour (0-59)
+        return (((epochSeconds / 60) % 60) + 60) % 60;
+      case "HOUR":
+        // Hour within the day (0-23)
+        return (((epochSeconds / 3600) % 24) + 24) % 24;
+      default:
+        // Fall back to java.time for calendar-aware fields
+        java.time.Instant instant = java.time.Instant.ofEpochMilli(epochMillis);
+        java.time.ZonedDateTime zdt = instant.atZone(java.time.ZoneOffset.UTC);
+        switch (field) {
+          case "YEAR":
+            return zdt.getYear();
+          case "QUARTER":
+            return (zdt.getMonthValue() - 1) / 3 + 1;
+          case "MONTH":
+            return zdt.getMonthValue();
+          case "WEEK":
+            return zdt.get(java.time.temporal.IsoFields.WEEK_OF_WEEK_BASED_YEAR);
+          case "DAY":
+          case "DAY_OF_MONTH":
+            return zdt.getDayOfMonth();
+          case "DAY_OF_WEEK":
+          case "DOW":
+            return zdt.getDayOfWeek().getValue();
+          case "DAY_OF_YEAR":
+          case "DOY":
+            return zdt.getDayOfYear();
+          default:
+            return 0;
+        }
     }
   }
 
@@ -1771,7 +1858,7 @@ public final class FusedGroupByAggregate {
       long topN)
       throws Exception {
 
-    // Pre-compute which keys need DATE_TRUNC or arithmetic transformation
+    // Pre-compute which keys need DATE_TRUNC, arithmetic, or EXTRACT transformation
     final String[] truncUnits = new String[keyInfos.size()];
     final String[] arithUnits = new String[keyInfos.size()];
     boolean hasExpr = false;
@@ -1782,6 +1869,11 @@ public final class FusedGroupByAggregate {
         hasExpr = true;
       } else if ("arith".equals(ki.exprFunc())) {
         arithUnits[i] = ki.exprUnit();
+        hasExpr = true;
+      } else if ("extract".equals(ki.exprFunc())) {
+        // Encode EXTRACT as arithmetic with "E:" prefix for the field name.
+        // applyArith detects this prefix and delegates to applyExtract.
+        arithUnits[i] = "E:" + ki.exprUnit();
         hasExpr = true;
       }
     }
@@ -3823,7 +3915,7 @@ public final class FusedGroupByAggregate {
       long topN)
       throws Exception {
 
-    // Pre-compute DATE_TRUNC and arithmetic units for numeric keys in the varchar path
+    // Pre-compute DATE_TRUNC, arithmetic, and EXTRACT units for numeric keys in the varchar path
     final String[] truncUnits = new String[keyInfos.size()];
     final String[] arithUnits = new String[keyInfos.size()];
     for (int i = 0; i < keyInfos.size(); i++) {
@@ -3832,6 +3924,8 @@ public final class FusedGroupByAggregate {
         truncUnits[i] = ki.exprUnit;
       } else if ("arith".equals(ki.exprFunc)) {
         arithUnits[i] = ki.exprUnit;
+      } else if ("extract".equals(ki.exprFunc)) {
+        arithUnits[i] = "E:" + ki.exprUnit;
       }
     }
 
@@ -5518,12 +5612,18 @@ public final class FusedGroupByAggregate {
         if (dtm.matches()) {
           types.add(TimestampType.TIMESTAMP_MILLIS);
         } else {
-          // Check for arithmetic expression — output type is BigintType
-          Matcher am = ARITH_EXPR_PATTERN.matcher(key);
-          if (am.matches()) {
+          // Check for EXTRACT expression — output type is BigintType
+          Matcher em = EXTRACT_PATTERN.matcher(key);
+          if (em.matches()) {
             types.add(BigintType.BIGINT);
           } else {
-            types.add(BigintType.BIGINT);
+            // Check for arithmetic expression — output type is BigintType
+            Matcher am = ARITH_EXPR_PATTERN.matcher(key);
+            if (am.matches()) {
+              types.add(BigintType.BIGINT);
+            } else {
+              types.add(BigintType.BIGINT);
+            }
           }
         }
       }

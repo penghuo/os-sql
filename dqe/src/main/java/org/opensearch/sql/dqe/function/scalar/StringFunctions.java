@@ -376,6 +376,11 @@ public final class StringFunctions {
    * This avoids the enormous overhead of {@code Pattern.compile()} per row — for 125K rows with a
    * complex regex like Q29's URL extraction pattern, this reduces the per-batch cost from ~100ms to
    * ~5ms.
+   *
+   * <p>Additional optimization: for anchored patterns ({@code ^...$}) with constant replacement (no
+   * {@code $N} group references), the replacement is pre-resolved and {@code replaceAll()} is
+   * replaced with a simple {@code matches()} check. This avoids StringBuffer allocation and
+   * replacement string processing per row.
    */
   public static ScalarFunctionImplementation regexpReplace() {
     // Cache: pre-compiled pattern from the previous batch. Since the pattern is almost always a
@@ -416,7 +421,7 @@ public final class StringFunctions {
       }
 
       if (compiledPattern != null) {
-        // Ultra-fast path: when the replacement is a simple back-reference (\1 or $1)
+        // Ultra-fast path: when the replacement is a simple back-reference ($1)
         // and the pattern is full-string anchored (^...$), we can use matcher.group()
         // directly instead of replaceAll(), which avoids building a replacement string.
         // This is the common pattern for URL domain extraction (Q29).
@@ -446,6 +451,47 @@ public final class StringFunctions {
                 }
               } catch (Exception e) {
                 VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(input));
+              }
+            }
+          }
+        } else if (isAnchored) {
+          // Constant-replacement fast path: when the pattern is anchored and the replacement
+          // resolves to a constant (no $N group references), skip replaceAll() entirely.
+          // For anchored patterns, replaceAll either replaces the entire input (if it matches)
+          // with the resolved constant, or returns the original string (if it doesn't match).
+          // This avoids StringBuffer allocation and replacement string parsing per row.
+          // Example: REGEXP_REPLACE(col, '^pattern$', '\1') where \1 is literal '1' in Java.
+          String resolvedConstant = resolveReplacementLiteral(replacementStr);
+          if (resolvedConstant != null) {
+            io.airlift.slice.Slice constantSlice = Slices.utf8Slice(resolvedConstant);
+            for (int pos = 0; pos < positionCount; pos++) {
+              if (inputBlock.isNull(pos)) {
+                builder.appendNull();
+              } else {
+                io.airlift.slice.Slice inputSlice = VarcharType.VARCHAR.getSlice(inputBlock, pos);
+                String input = inputSlice.toStringUtf8();
+                matcher.reset(input);
+                if (matcher.matches()) {
+                  VarcharType.VARCHAR.writeSlice(builder, constantSlice);
+                } else {
+                  VarcharType.VARCHAR.writeSlice(builder, inputSlice);
+                }
+              }
+            }
+          } else {
+            // Anchored with group references — use replaceAll
+            for (int pos = 0; pos < positionCount; pos++) {
+              if (inputBlock.isNull(pos)) {
+                builder.appendNull();
+              } else {
+                String input = VarcharType.VARCHAR.getSlice(inputBlock, pos).toStringUtf8();
+                try {
+                  matcher.reset(input);
+                  String result = matcher.replaceAll(replacementStr);
+                  VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(result));
+                } catch (Exception e) {
+                  VarcharType.VARCHAR.writeSlice(builder, Slices.utf8Slice(input));
+                }
               }
             }
           }
@@ -507,5 +553,45 @@ public final class StringFunctions {
       return second - '0';
     }
     return -1;
+  }
+
+  /**
+   * Resolve a Java regex replacement string to its literal value, if the replacement contains no
+   * {@code $N} group references. In Java regex replacement strings:
+   *
+   * <ul>
+   *   <li>{@code $N} — group reference (makes the result non-constant)
+   *   <li>{@code \X} — escape: produces literal character X (e.g., {@code \1} → {@code 1})
+   *   <li>Any other character — literal
+   * </ul>
+   *
+   * <p>Returns the resolved literal string, or {@code null} if the replacement contains any {@code
+   * $N} group references (meaning the result depends on the match and is not constant).
+   *
+   * <p>Example: {@code "\1"} (Java string: backslash + '1') resolves to {@code "1"} because in Java
+   * regex replacement, {@code \1} escapes the digit, producing literal '1'.
+   */
+  static String resolveReplacementLiteral(String replacement) {
+    if (replacement == null) {
+      return null;
+    }
+    StringBuilder sb = new StringBuilder(replacement.length());
+    for (int i = 0; i < replacement.length(); i++) {
+      char c = replacement.charAt(i);
+      if (c == '$') {
+        // Group reference — result depends on match, not constant
+        return null;
+      } else if (c == '\\') {
+        // Escape: next character is literal
+        if (i + 1 < replacement.length()) {
+          sb.append(replacement.charAt(i + 1));
+          i++; // skip escaped char
+        }
+        // Trailing backslash: technically invalid, but treat as literal backslash
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
   }
 }

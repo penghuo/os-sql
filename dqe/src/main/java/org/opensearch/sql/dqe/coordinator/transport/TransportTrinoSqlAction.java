@@ -277,6 +277,12 @@ public class TransportTrinoSqlAction
                         // Fast path: scalar COUNT(DISTINCT numericCol) — shards already pre-deduped
                         // values. Merge distinct value sets using LongOpenHashSet and count.
                         mergedPages = mergeCountDistinctValues(shardPages);
+                      } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg
+                          && singleCdVarcharAgg.getStep() == AggregationNode.Step.SINGLE
+                          && isScalarCountDistinctVarchar(singleCdVarcharAgg, columnTypeMap)) {
+                        // Fast path: scalar COUNT(DISTINCT varcharCol) — shards already pre-deduped
+                        // values using ordinal-based collection. Merge by unioning string sets.
+                        mergedPages = mergeCountDistinctVarcharValues(shardPages);
                       } else if (coordinatorPlan instanceof AggregationNode singleAgg
                           && singleAgg.getStep() == AggregationNode.Step.SINGLE
                           && isShardDedupCountDistinct(
@@ -475,6 +481,10 @@ public class TransportTrinoSqlAction
               && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
             mergedPages = mergeCountDistinctValues(shardPages);
+          } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg2
+              && singleCdVarcharAgg2.getStep() == AggregationNode.Step.SINGLE
+              && isScalarCountDistinctVarchar(singleCdVarcharAgg2, columnTypeMap)) {
+            mergedPages = mergeCountDistinctVarcharValues(shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg
               && singleAgg.getStep() == AggregationNode.Step.SINGLE
               && isShardDedupCountDistinct(
@@ -1495,6 +1505,57 @@ public class TransportTrinoSqlAction
         || colType instanceof SmallintType
         || colType instanceof TinyintType
         || colType instanceof TimestampType;
+  }
+
+  /**
+   * Check if the coordinator aggregation node is a scalar COUNT(DISTINCT varcharCol) in SINGLE mode
+   * where the column is a VARCHAR type. Shards have already pre-deduped values as strings, so the
+   * coordinator can merge distinct string sets.
+   */
+  private static boolean isScalarCountDistinctVarchar(
+      AggregationNode aggNode, Map<String, Type> columnTypeMap) {
+    if (!aggNode.getGroupByKeys().isEmpty()) {
+      return false;
+    }
+    List<String> aggs = aggNode.getAggregateFunctions();
+    if (aggs.size() != 1) {
+      return false;
+    }
+    String originalAgg = aggs.get(0);
+    String aggUpper = originalAgg.toUpperCase(java.util.Locale.ROOT);
+    if (!aggUpper.startsWith("COUNT(DISTINCT ")) {
+      return false;
+    }
+    String colName = originalAgg.substring(15, originalAgg.length() - 1).trim();
+    Type colType = columnTypeMap.get(colName);
+    return colType instanceof VarcharType;
+  }
+
+  /**
+   * Merge pre-deduplicated distinct VARCHAR value pages from all shards into a single
+   * COUNT(DISTINCT) result. Each shard sends a page of unique string values; the coordinator unions
+   * them via HashSet&lt;String&gt; and returns the count.
+   *
+   * @param shardPages pages from each shard, each containing distinct values as a VarcharType
+   *     column
+   * @return single-row page with the global distinct count
+   */
+  private static List<Page> mergeCountDistinctVarcharValues(List<List<Page>> shardPages) {
+    java.util.HashSet<String> globalSet = new java.util.HashSet<>();
+    for (List<Page> pages : shardPages) {
+      for (Page page : pages) {
+        Block block = page.getBlock(0);
+        int positionCount = page.getPositionCount();
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (!block.isNull(pos)) {
+            globalSet.add(VarcharType.VARCHAR.getSlice(block, pos).toStringUtf8());
+          }
+        }
+      }
+    }
+    io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, globalSet.size());
+    return List.of(new Page(builder.build()));
   }
 
   /**

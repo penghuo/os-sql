@@ -237,6 +237,15 @@ public class TransportShardExecuteAction
       return new ShardExecuteResponse(pages, columnTypes);
     }
 
+    // Fast path: bare TableScanNode with single VARCHAR column — pre-dedup for COUNT(DISTINCT).
+    // Uses ordinal-based dedup via FixedBitSet for fast ordinal collection, then resolves strings
+    // in bulk from the term dictionary. Sends ~50K unique strings instead of ~125K raw rows.
+    if (scanFactory == null && isBareSingleVarcharColumnScan(plan)) {
+      List<Page> pages = executeDistinctValuesScanVarchar(plan, req);
+      List<Type> columnTypes = List.of(io.trino.spi.type.VarcharType.VARCHAR);
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
     // Try fused eval-aggregate for SUM(col + constant) patterns
     if (scanFactory == null
         && plan instanceof AggregationNode aggEvalNode
@@ -728,6 +737,47 @@ public class TransportShardExecuteAction
         || colType instanceof io.trino.spi.type.SmallintType
         || colType instanceof io.trino.spi.type.TinyintType
         || colType instanceof io.trino.spi.type.TimestampType;
+  }
+
+  /**
+   * Check if the shard plan is a bare TableScanNode with exactly one VARCHAR column. This pattern
+   * results from the PlanFragmenter stripping a SINGLE COUNT(DISTINCT col) aggregation for varchar
+   * columns. In this case, the shard pre-deduplicates values using ordinal-based dedup.
+   */
+  private boolean isBareSingleVarcharColumnScan(DqePlanNode plan) {
+    if (!(plan instanceof TableScanNode scanNode)) {
+      return false;
+    }
+    List<String> columns = scanNode.getColumns();
+    if (columns.size() != 1) {
+      return false;
+    }
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(scanNode.getIndexName());
+    Type colType = cachedMeta.columnTypeMap().get(columns.get(0));
+    return colType instanceof io.trino.spi.type.VarcharType;
+  }
+
+  /**
+   * Execute a fused distinct-values scan for VARCHAR: read SortedSetDocValues for the single column
+   * and return only the distinct string values as a VarcharType Page. Uses ordinal-based dedup via
+   * FixedBitSet for efficient collection.
+   */
+  private List<Page> executeDistinctValuesScanVarchar(DqePlanNode plan, ShardExecuteRequest req)
+      throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query (cached across concurrent shard executions)
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    return FusedScanAggregate.executeDistinctValuesVarchar(columnName, shard, luceneQuery);
   }
 
   /**

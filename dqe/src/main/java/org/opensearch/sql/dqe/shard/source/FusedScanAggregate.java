@@ -35,6 +35,7 @@ import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -846,6 +847,140 @@ public final class FusedScanAggregate {
       if (occupied[i]) {
         BigintType.BIGINT.writeLong(builder, keys[i]);
       }
+    }
+    return List.of(new Page(builder.build()));
+  }
+
+  /**
+   * Execute a fused scan to collect distinct values for a single VARCHAR column, returning the
+   * distinct strings as a single-column VarcharType Page. Uses ordinal-based dedup via FixedBitSet
+   * for O(1) per-doc ordinal collection, then resolves strings in bulk from the term dictionary.
+   * For MatchAllDocsQuery with no deletes, this is nearly free as we can directly iterate the term
+   * dictionary.
+   *
+   * @param columnName the VARCHAR column to collect distinct values from
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @return a list containing a single Page with the distinct values as a VarcharType column
+   */
+  public static List<Page> executeDistinctValuesVarchar(
+      String columnName, IndexShard shard, Query query) throws Exception {
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-values-varchar")) {
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+
+      // For single-segment case (common), use ordinal-based approach directly
+      if (leaves.size() == 1) {
+        return executeDistinctValuesVarcharSingleSegment(columnName, leaves.get(0), query);
+      }
+
+      // Multi-segment: collect distinct strings using HashSet across segments
+      // (ordinals are per-segment and not directly comparable across segments)
+      HashSet<String> distinctStrings = new HashSet<>();
+      for (LeafReaderContext leafCtx : leaves) {
+        LeafReader reader = leafCtx.reader();
+        SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+        if (dv == null) continue;
+
+        int maxDoc = reader.maxDoc();
+        Bits liveDocs = reader.getLiveDocs();
+        long valueCount = dv.getValueCount();
+        FixedBitSet usedOrdinals = new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+
+        if (query instanceof MatchAllDocsQuery) {
+          if (liveDocs == null) {
+            // All docs live, all ordinals used — collect all terms directly
+            for (long ord = 0; ord < valueCount; ord++) {
+              distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+            }
+            continue;
+          }
+          // Has deletes: collect used ordinals via single-value nextOrd()
+          for (int doc = 0; doc < maxDoc; doc++) {
+            if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+              usedOrdinals.set((int) dv.nextOrd());
+            }
+          }
+        } else {
+          // Filtered: iterate all docs with filter check
+          for (int doc = 0; doc < maxDoc; doc++) {
+            boolean isLive = liveDocs == null || liveDocs.get(doc);
+            if (isLive && dv.advanceExact(doc)) {
+              usedOrdinals.set((int) dv.nextOrd());
+            }
+          }
+        }
+
+        // Resolve ordinals to strings
+        for (int ord = usedOrdinals.nextSetBit(0);
+            ord != -1;
+            ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+          distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+        }
+      }
+
+      if (distinctStrings.isEmpty()) {
+        return List.of();
+      }
+
+      // Build result page
+      BlockBuilder builder = VarcharType.VARCHAR.createBlockBuilder(null, distinctStrings.size());
+      for (String val : distinctStrings) {
+        VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(val));
+      }
+      return List.of(new Page(builder.build()));
+    }
+  }
+
+  /**
+   * Single-segment fast path for VARCHAR distinct values. Uses FixedBitSet for ordinal dedup and
+   * resolves strings in bulk from the sorted term dictionary.
+   */
+  private static List<Page> executeDistinctValuesVarcharSingleSegment(
+      String columnName, LeafReaderContext leafCtx, Query query) throws IOException {
+    LeafReader reader = leafCtx.reader();
+    SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+    if (dv == null) {
+      return List.of();
+    }
+
+    int maxDoc = reader.maxDoc();
+    Bits liveDocs = reader.getLiveDocs();
+    long valueCount = dv.getValueCount();
+
+    // For MatchAllDocsQuery with no deletes, all ordinals are used
+    if (query instanceof MatchAllDocsQuery && liveDocs == null) {
+      BlockBuilder builder = VarcharType.VARCHAR.createBlockBuilder(null, (int) valueCount);
+      for (long ord = 0; ord < valueCount; ord++) {
+        BytesRef bytes = dv.lookupOrd(ord);
+        VarcharType.VARCHAR.writeSlice(
+            builder,
+            io.airlift.slice.Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+      }
+      return List.of(new Page(builder.build()));
+    }
+
+    // Collect used ordinals (single-valued: one nextOrd() per doc)
+    FixedBitSet usedOrdinals = new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+    for (int doc = 0; doc < maxDoc; doc++) {
+      boolean isLive = liveDocs == null || liveDocs.get(doc);
+      if (isLive && dv.advanceExact(doc)) {
+        usedOrdinals.set((int) dv.nextOrd());
+      }
+    }
+
+    int distinctCount = usedOrdinals.cardinality();
+    if (distinctCount == 0) {
+      return List.of();
+    }
+
+    BlockBuilder builder = VarcharType.VARCHAR.createBlockBuilder(null, distinctCount);
+    for (int ord = usedOrdinals.nextSetBit(0);
+        ord != -1;
+        ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+      BytesRef bytes = dv.lookupOrd(ord);
+      VarcharType.VARCHAR.writeSlice(
+          builder, io.airlift.slice.Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
     }
     return List.of(new Page(builder.build()));
   }

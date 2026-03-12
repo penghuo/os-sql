@@ -267,6 +267,20 @@ public class TransportShardExecuteAction
       return new ShardExecuteResponse(pages, columnTypes);
     }
 
+    // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode
+    // where the group-by key is a computed expression (e.g., REGEXP_REPLACE) over a single
+    // VARCHAR column. Pre-computes the expression once per unique ordinal (~16K evaluations
+    // instead of ~921K), giving ~58x reduction in expression evaluations for Q29.
+    if (scanFactory == null
+        && plan instanceof AggregationNode aggExprNode
+        && FusedGroupByAggregate.canFuseWithExpressionKey(
+            aggExprNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+      List<Page> pages = executeFusedExprGroupByAggregate(aggExprNode, req);
+      List<Type> columnTypes =
+          resolveColumnTypes(plan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+
     // Try fused GROUP BY with sort+limit: detect LimitNode -> [ProjectNode] -> SortNode ->
     // AggregationNode pattern and use FusedGroupByAggregate for the aggregation, then apply
     // sort+limit in-process. This avoids the generic operator pipeline (ScanOperator ->
@@ -700,6 +714,28 @@ public class TransportShardExecuteAction
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+  }
+
+  /**
+   * Execute ordinal-cached expression GROUP BY aggregation. Pre-computes the group-by expression
+   * once per unique ordinal in SortedSetDocValues, then uses the cached result during the scan.
+   * This is critical for queries like Q29 where REGEXP_REPLACE on a VARCHAR column is the GROUP BY
+   * key: ~16K ordinals vs ~921K docs = ~58x reduction in regex evaluations.
+   */
+  private List<Page> executeFusedExprGroupByAggregate(
+      AggregationNode aggNode, ShardExecuteRequest req) throws Exception {
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    return FusedGroupByAggregate.executeWithExpressionKey(
+        aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
   }
 
   /**

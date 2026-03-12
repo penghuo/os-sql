@@ -172,6 +172,590 @@ public final class FusedGroupByAggregate {
     return true;
   }
 
+  /**
+   * Check if the plan is a GROUP BY with a single computed expression key over a VARCHAR column,
+   * suitable for ordinal-based expression caching. The pattern is:
+   *
+   * <pre>
+   *   AggregationNode(groupByKeys=[exprName]) -> EvalNode(exprName=expr(sourceCol)) -> TableScanNode
+   * </pre>
+   *
+   * <p>The key insight: if the source column has N unique ordinals in SortedSetDocValues, we
+   * evaluate the expression N times (once per ordinal) instead of M times (once per doc, M >> N).
+   * For Q29 with REGEXP_REPLACE on Referer: ~16K ordinals vs ~921K docs = ~58x reduction.
+   *
+   * @param aggNode the aggregation plan node
+   * @param columnTypeMap mapping from physical column name to Trino Type
+   * @return true if the plan can use ordinal-cached expression evaluation
+   */
+  public static boolean canFuseWithExpressionKey(
+      AggregationNode aggNode, Map<String, Type> columnTypeMap) {
+    // Must have exactly one group-by key
+    if (aggNode.getGroupByKeys().size() != 1) {
+      return false;
+    }
+    // Child must be EvalNode -> TableScanNode
+    if (!(aggNode.getChild() instanceof EvalNode evalNode)) {
+      return false;
+    }
+    if (!(evalNode.getChild() instanceof TableScanNode)) {
+      return false;
+    }
+
+    String groupByKey = aggNode.getGroupByKeys().get(0);
+
+    // The group-by key must NOT be a physical column (it must be a computed expression)
+    if (columnTypeMap.containsKey(groupByKey)) {
+      return false;
+    }
+
+    // The group-by key must be one of the EvalNode's output column names
+    int keyExprIdx = evalNode.getOutputColumnNames().indexOf(groupByKey);
+    if (keyExprIdx < 0) {
+      return false;
+    }
+
+    // The expression at that index must reference a single VARCHAR source column.
+    // We check this by looking at the EvalNode expression string and finding column
+    // references that are in the scan node's columns and are VARCHAR.
+    String exprStr = evalNode.getExpressions().get(keyExprIdx);
+    TableScanNode scanNode = (TableScanNode) evalNode.getChild();
+    List<String> scanColumns = scanNode.getColumns();
+
+    // Find which scan columns appear in the expression
+    String sourceVarcharCol = null;
+    for (String col : scanColumns) {
+      Type colType = columnTypeMap.get(col);
+      if (colType instanceof VarcharType && exprStr.contains(col)) {
+        if (sourceVarcharCol != null) {
+          return false; // Multiple VARCHAR columns referenced — not supported
+        }
+        sourceVarcharCol = col;
+      }
+    }
+    if (sourceVarcharCol == null) {
+      return false; // No VARCHAR source column found
+    }
+
+    // Check all aggregate functions are supported
+    for (String func : aggNode.getAggregateFunctions()) {
+      Matcher m = AGG_FUNCTION.matcher(func);
+      if (!m.matches()) {
+        return false;
+      }
+      // Verify aggregate arguments are either physical columns, *, or EvalNode outputs
+      String arg = m.group(3).trim();
+      if (!"*".equals(arg)
+          && !columnTypeMap.containsKey(arg)
+          && !evalNode.getOutputColumnNames().contains(arg)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Execute GROUP BY aggregation with ordinal-based expression caching. Pre-computes the group-by
+   * expression for each unique ordinal in SortedSetDocValues, then uses the cached result during
+   * the scan. Also pre-computes any EvalNode expressions used as aggregate arguments that depend on
+   * the same source column.
+   *
+   * @param aggNode the aggregation plan node
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @param columnTypeMap mapping from physical column name to Trino Type
+   * @return a list containing a single Page with the aggregated results
+   */
+  public static List<Page> executeWithExpressionKey(
+      AggregationNode aggNode, IndexShard shard, Query query, Map<String, Type> columnTypeMap)
+      throws Exception {
+
+    EvalNode evalNode = (EvalNode) aggNode.getChild();
+    TableScanNode scanNode = (TableScanNode) evalNode.getChild();
+    List<String> groupByKeys = aggNode.getGroupByKeys();
+    List<String> aggFunctions = aggNode.getAggregateFunctions();
+    String groupByKey = groupByKeys.get(0);
+
+    // Find the group-by key expression index in EvalNode
+    int keyExprIdx = evalNode.getOutputColumnNames().indexOf(groupByKey);
+    String keyExprStr = evalNode.getExpressions().get(keyExprIdx);
+
+    // Find the source VARCHAR column
+    List<String> scanColumns = scanNode.getColumns();
+    String sourceVarcharCol = null;
+    for (String col : scanColumns) {
+      Type colType = columnTypeMap.get(col);
+      if (colType instanceof VarcharType && keyExprStr.contains(col)) {
+        sourceVarcharCol = col;
+        break;
+      }
+    }
+
+    // Parse aggregate specs
+    final int numAggs = aggFunctions.size();
+    List<AggSpec> specs = new ArrayList<>();
+    for (String func : aggFunctions) {
+      Matcher m = AGG_FUNCTION.matcher(func);
+      m.matches();
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      boolean isDistinct = m.group(2) != null;
+      String arg = m.group(3).trim();
+      Type argType = arg.equals("*") ? null : columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+      specs.add(new AggSpec(funcName, isDistinct, arg, argType));
+    }
+
+    // Identify which aggregate args are EvalNode-computed (vs physical columns)
+    // For computed args that depend on sourceVarcharCol, we can cache them per ordinal too
+    boolean[] isComputedArg = new boolean[numAggs];
+    String[] computedArgExpr = new String[numAggs];
+    boolean[] isCountStar = new boolean[numAggs];
+    boolean[] isDoubleArg = new boolean[numAggs];
+    boolean[] isVarcharArg = new boolean[numAggs];
+    int[] accType = new int[numAggs];
+
+    for (int i = 0; i < numAggs; i++) {
+      AggSpec spec = specs.get(i);
+      isCountStar[i] = "*".equals(spec.arg);
+
+      if (!isCountStar[i]) {
+        // Check if the arg is a computed EvalNode column
+        int evalIdx = evalNode.getOutputColumnNames().indexOf(spec.arg);
+        if (evalIdx >= 0 && !columnTypeMap.containsKey(spec.arg)) {
+          isComputedArg[i] = true;
+          computedArgExpr[i] = evalNode.getExpressions().get(evalIdx);
+          // Computed args like length(Referer) produce BigintType
+          isDoubleArg[i] = false;
+          isVarcharArg[i] = false;
+        } else {
+          isDoubleArg[i] = spec.argType instanceof DoubleType;
+          isVarcharArg[i] = spec.argType instanceof VarcharType;
+        }
+      }
+
+      if (isCountStar[i]) {
+        accType[i] = 0;
+      } else {
+        switch (spec.funcName) {
+          case "COUNT":
+            accType[i] = spec.isDistinct ? 5 : 0;
+            break;
+          case "SUM":
+            accType[i] = isDoubleArg[i] ? 6 : 1;
+            break;
+          case "AVG":
+            accType[i] = isDoubleArg[i] ? 7 : 2;
+            break;
+          case "MIN":
+            accType[i] = 3;
+            break;
+          case "MAX":
+            accType[i] = 4;
+            break;
+        }
+      }
+    }
+
+    // Build expression evaluators for ordinal caching
+    // We parse and compile expressions using the function registry
+    org.opensearch.sql.dqe.function.FunctionRegistry registry =
+        org.opensearch.sql.dqe.function.BuiltinFunctions.createRegistry();
+    io.trino.sql.parser.SqlParser sqlParser = new io.trino.sql.parser.SqlParser();
+
+    // For the key expression, we need a function: String -> String
+    // Parse: "regexp_replace(Referer, '^pattern$', '$1')" with Referer at column index 0
+    Map<String, Integer> colIndexMap = new HashMap<>();
+    colIndexMap.put(sourceVarcharCol, 0);
+    org.opensearch.sql.dqe.function.expression.ExpressionCompiler compiler =
+        new org.opensearch.sql.dqe.function.expression.ExpressionCompiler(
+            registry, colIndexMap, columnTypeMap);
+
+    // Compile group-by key expression
+    io.trino.sql.tree.Expression keyAst = sqlParser.createExpression(keyExprStr);
+    org.opensearch.sql.dqe.function.expression.BlockExpression keyBlockExpr =
+        compiler.compile(keyAst);
+
+    // Compile computed aggregate arg expressions
+    org.opensearch.sql.dqe.function.expression.BlockExpression[] computedArgBlockExprs =
+        new org.opensearch.sql.dqe.function.expression.BlockExpression[numAggs];
+    for (int i = 0; i < numAggs; i++) {
+      if (isComputedArg[i]) {
+        io.trino.sql.tree.Expression argAst = sqlParser.createExpression(computedArgExpr[i]);
+        computedArgBlockExprs[i] = compiler.compile(argAst);
+      }
+    }
+
+    return executeWithExpressionKeyImpl(
+        shard,
+        query,
+        sourceVarcharCol,
+        specs,
+        numAggs,
+        isCountStar,
+        isComputedArg,
+        isDoubleArg,
+        isVarcharArg,
+        accType,
+        keyBlockExpr,
+        computedArgBlockExprs,
+        columnTypeMap);
+  }
+
+  /** Internal implementation of ordinal-cached expression GROUP BY using a global groups map. */
+  private static List<Page> executeWithExpressionKeyImpl(
+      IndexShard shard,
+      Query query,
+      String srcCol,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isComputedArg,
+      boolean[] isDoubleArg,
+      boolean[] isVarcharArg,
+      int[] accType,
+      org.opensearch.sql.dqe.function.expression.BlockExpression keyBlockExpr,
+      org.opensearch.sql.dqe.function.expression.BlockExpression[] computedArgBlockExprs,
+      Map<String, Type> columnTypeMap)
+      throws Exception {
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-expr-groupby")) {
+
+      // Global groups keyed by the computed expression result string.
+      // Since Lucene processes segments sequentially in a single collector thread,
+      // we can safely accumulate into this global map without synchronization.
+      HashMap<String, AccumulatorGroup> globalGroups = new HashMap<>();
+
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              LeafReader reader = context.reader();
+              SortedSetDocValues dv = reader.getSortedSetDocValues(srcCol);
+              if (dv == null) {
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) {}
+                };
+              }
+
+              long ordCount = dv.getValueCount();
+              if (ordCount <= 0 || ordCount > 10_000_000) {
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) {}
+                };
+              }
+
+              int ordCountInt = (int) ordCount;
+
+              // Pre-compute expressions for each ordinal in this segment
+              String[] ordToGroupKey = new String[ordCountInt];
+              long[][] ordToComputedArg = new long[numAggs][];
+              for (int i = 0; i < numAggs; i++) {
+                if (isComputedArg[i]) {
+                  ordToComputedArg[i] = new long[ordCountInt];
+                }
+              }
+
+              // Check if any VARCHAR agg arg references the same source column
+              // If so, cache the raw string per ordinal to avoid per-doc lookupOrd
+              boolean[] isVarcharSameCol = new boolean[numAggs];
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i]
+                    && !isComputedArg[i]
+                    && isVarcharArg[i]
+                    && specs.get(i).arg.equals(srcCol)) {
+                  isVarcharSameCol[i] = true;
+                }
+              }
+              boolean needRawStringCache = false;
+              for (int i = 0; i < numAggs; i++) {
+                if (isVarcharSameCol[i]) {
+                  needRawStringCache = true;
+                  break;
+                }
+              }
+              String[] ordToRawString = needRawStringCache ? new String[ordCountInt] : null;
+
+              // Process ordinals in batches for expression evaluation
+              int batchSize = Math.min(ordCountInt, 4096);
+              for (int batchStart = 0; batchStart < ordCountInt; batchStart += batchSize) {
+                int batchEnd = Math.min(batchStart + batchSize, ordCountInt);
+                int batchLen = batchEnd - batchStart;
+
+                BlockBuilder inputBuilder = VarcharType.VARCHAR.createBlockBuilder(null, batchLen);
+                for (int ord = batchStart; ord < batchEnd; ord++) {
+                  BytesRef bytes = dv.lookupOrd(ord);
+                  VarcharType.VARCHAR.writeSlice(
+                      inputBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+                  // Cache raw string if needed for VARCHAR agg args
+                  if (ordToRawString != null) {
+                    ordToRawString[ord] = bytes.utf8ToString();
+                  }
+                }
+                Block inputBlock = inputBuilder.build();
+                Page inputPage = new Page(inputBlock);
+
+                Block keyResultBlock = keyBlockExpr.evaluate(inputPage);
+                for (int j = 0; j < batchLen; j++) {
+                  if (keyResultBlock.isNull(j)) {
+                    ordToGroupKey[batchStart + j] = null;
+                  } else {
+                    ordToGroupKey[batchStart + j] =
+                        VarcharType.VARCHAR.getSlice(keyResultBlock, j).toStringUtf8();
+                  }
+                }
+
+                for (int i = 0; i < numAggs; i++) {
+                  if (isComputedArg[i]) {
+                    Block argResultBlock = computedArgBlockExprs[i].evaluate(inputPage);
+                    for (int j = 0; j < batchLen; j++) {
+                      if (!argResultBlock.isNull(j)) {
+                        ordToComputedArg[i][batchStart + j] =
+                            computedArgBlockExprs[i].getType().getLong(argResultBlock, j);
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Pre-wire ordinal -> AccumulatorGroup using global groups map
+              // Multiple ordinals may map to the same expression result string
+              AccumulatorGroup[] ordGroups = new AccumulatorGroup[ordCountInt];
+              for (int ord = 0; ord < ordCountInt; ord++) {
+                String gk = ordToGroupKey[ord];
+                if (gk != null) {
+                  AccumulatorGroup existing = globalGroups.get(gk);
+                  if (existing == null) {
+                    existing = createAccumulatorGroup(specs);
+                    globalGroups.put(gk, existing);
+                  }
+                  ordGroups[ord] = existing;
+                }
+              }
+
+              // Open doc values for physical aggregate args (skip same-col varchar args)
+              SortedNumericDocValues[] colNumDvs = new SortedNumericDocValues[numAggs];
+              SortedSetDocValues[] colVarDvs = new SortedSetDocValues[numAggs];
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i] && !isComputedArg[i] && !isVarcharSameCol[i]) {
+                  AggSpec spec = specs.get(i);
+                  if (isVarcharArg[i]) {
+                    colVarDvs[i] = reader.getSortedSetDocValues(spec.arg);
+                  } else {
+                    colNumDvs[i] = reader.getSortedNumericDocValues(spec.arg);
+                  }
+                }
+              }
+
+              final long[][] finalOrdToComputedArg = ordToComputedArg;
+              final String[] finalOrdToRawString = ordToRawString;
+              final boolean[] finalIsVarcharSameCol = isVarcharSameCol;
+
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  if (!dv.advanceExact(doc)) return;
+                  int ord = (int) dv.nextOrd();
+                  if (ord >= ordGroups.length) return;
+                  AccumulatorGroup accGroup = ordGroups[ord];
+                  if (accGroup == null) return;
+
+                  for (int i = 0; i < numAggs; i++) {
+                    MergeableAccumulator acc = accGroup.accumulators[i];
+                    if (isCountStar[i]) {
+                      ((CountStarAccum) acc).count++;
+                      continue;
+                    }
+                    // Fast path: VARCHAR agg arg referencing the source column
+                    // Use pre-cached string from ordinal (avoids advanceExact + lookupOrd)
+                    if (finalIsVarcharSameCol[i]) {
+                      String val = finalOrdToRawString[ord];
+                      switch (accType[i]) {
+                        case 5:
+                          ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                          break;
+                        case 3:
+                          MinAccum ma = (MinAccum) acc;
+                          if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                            ma.objectVal = val;
+                            ma.hasValue = true;
+                          }
+                          break;
+                        case 4:
+                          MaxAccum xa = (MaxAccum) acc;
+                          if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                            xa.objectVal = val;
+                            xa.hasValue = true;
+                          }
+                          break;
+                      }
+                      continue;
+                    }
+                    if (isComputedArg[i]) {
+                      long val = finalOrdToComputedArg[i][ord];
+                      switch (accType[i]) {
+                        case 0:
+                          ((CountStarAccum) acc).count++;
+                          break;
+                        case 1:
+                          SumAccum sa = (SumAccum) acc;
+                          sa.hasValue = true;
+                          sa.longSum += val;
+                          break;
+                        case 2:
+                          AvgAccum aa = (AvgAccum) acc;
+                          aa.count++;
+                          aa.longSum += val;
+                          break;
+                        case 3:
+                          MinAccum mna = (MinAccum) acc;
+                          mna.hasValue = true;
+                          if (val < mna.longVal) mna.longVal = val;
+                          break;
+                        case 4:
+                          MaxAccum mxa = (MaxAccum) acc;
+                          mxa.hasValue = true;
+                          if (val > mxa.longVal) mxa.longVal = val;
+                          break;
+                        case 5:
+                          CountDistinctAccum cda = (CountDistinctAccum) acc;
+                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(val);
+                          break;
+                      }
+                      continue;
+                    }
+                    if (isVarcharArg[i]) {
+                      SortedSetDocValues varcharDv = colVarDvs[i];
+                      if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                        BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+                        String val = bytes.utf8ToString();
+                        switch (accType[i]) {
+                          case 5:
+                            ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                            break;
+                          case 3:
+                            MinAccum ma = (MinAccum) acc;
+                            if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                              ma.objectVal = val;
+                              ma.hasValue = true;
+                            }
+                            break;
+                          case 4:
+                            MaxAccum xa = (MaxAccum) acc;
+                            if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                              xa.objectVal = val;
+                              xa.hasValue = true;
+                            }
+                            break;
+                        }
+                      }
+                      continue;
+                    }
+                    SortedNumericDocValues aggDv = colNumDvs[i];
+                    if (aggDv != null && aggDv.advanceExact(doc)) {
+                      long rawVal = aggDv.nextValue();
+                      switch (accType[i]) {
+                        case 0:
+                          ((CountStarAccum) acc).count++;
+                          break;
+                        case 1:
+                          SumAccum sa = (SumAccum) acc;
+                          sa.hasValue = true;
+                          sa.longSum += rawVal;
+                          break;
+                        case 2:
+                          AvgAccum aa = (AvgAccum) acc;
+                          aa.count++;
+                          aa.longSum += rawVal;
+                          break;
+                        case 3:
+                          MinAccum mna = (MinAccum) acc;
+                          mna.hasValue = true;
+                          if (isDoubleArg[i]) {
+                            double d = Double.longBitsToDouble(rawVal);
+                            if (d < mna.doubleVal) mna.doubleVal = d;
+                          } else {
+                            if (rawVal < mna.longVal) mna.longVal = rawVal;
+                          }
+                          break;
+                        case 4:
+                          MaxAccum mxa = (MaxAccum) acc;
+                          mxa.hasValue = true;
+                          if (isDoubleArg[i]) {
+                            double d = Double.longBitsToDouble(rawVal);
+                            if (d > mxa.doubleVal) mxa.doubleVal = d;
+                          } else {
+                            if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+                          }
+                          break;
+                        case 5:
+                          CountDistinctAccum cda = (CountDistinctAccum) acc;
+                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                          else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                          break;
+                        case 6:
+                          SumAccum sad = (SumAccum) acc;
+                          sad.hasValue = true;
+                          sad.doubleSum += Double.longBitsToDouble(rawVal);
+                          break;
+                        case 7:
+                          AvgAccum aad = (AvgAccum) acc;
+                          aad.count++;
+                          aad.doubleSum += Double.longBitsToDouble(rawVal);
+                          break;
+                      }
+                    }
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+
+      // Build output Page
+      if (globalGroups.isEmpty()) {
+        return List.of();
+      }
+
+      int groupCount = globalGroups.size();
+      int totalColumns = 1 + numAggs;
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+      for (int i = 0; i < numAggs; i++) {
+        builders[1 + i] =
+            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+      }
+
+      for (Map.Entry<String, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        VarcharType.VARCHAR.writeSlice(builders[0], Slices.utf8Slice(entry.getKey()));
+        AccumulatorGroup accGroup = entry.getValue();
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[1 + a]);
+        }
+      }
+
+      Block[] blocks = new Block[totalColumns];
+      for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+      return List.of(new Page(blocks));
+    }
+  }
+
   /** Check if a type is a numeric or timestamp type suitable for group-by keys. */
   private static boolean isNumericOrTimestamp(Type type) {
     return type instanceof BigintType

@@ -112,6 +112,18 @@ public class ResultMerger {
           limit);
     }
 
+    // Fast varchar path with fused top-N
+    if (canUseFastVarcharMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
+      return mergeAggregationFastVarcharWithSort(
+          shardResults,
+          numGroupByCols,
+          numAggCols,
+          columnTypes,
+          sortColumnIndices,
+          ascending,
+          limit);
+    }
+
     // Fast mixed path with fused top-N
     if (canUseFastMixedMerge(numGroupByCols, columnTypes, aggregateFunctions)) {
       return mergeAggregationFastMixedWithSort(
@@ -1836,6 +1848,250 @@ public class ResultMerger {
       blocks[i] = builders[i].build();
     }
     return List.of(new Page(blocks));
+  }
+
+  /**
+   * Fused varchar merge + sort + limit for single VARCHAR key with COUNT/SUM aggregates. Merges all
+   * shard results into a HashMap, then performs top-N selection using a bounded heap directly on
+   * the map entries, avoiding full Page construction for all groups. For high-cardinality VARCHAR
+   * GROUP BY with small LIMIT (e.g., Q34: ~170K groups with LIMIT 10), this avoids building
+   * BlockBuilder entries for 170K rows and sorting 170K elements.
+   */
+  @SuppressWarnings("unchecked")
+  private List<Page> mergeAggregationFastVarcharWithSort(
+      List<List<Page>> shardResults,
+      int numGroupByCols,
+      int numAggCols,
+      List<Type> columnTypes,
+      List<Integer> sortColumnIndices,
+      List<Boolean> ascending,
+      long limit) {
+
+    int totalCols = numGroupByCols + numAggCols;
+
+    // Estimate initial capacity from total rows across all shards
+    int estimatedGroups = 0;
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        estimatedGroups += page.getPositionCount();
+      }
+    }
+
+    // Merge into HashMap<Slice, long[]> — same as mergeAggregationFastVarchar
+    java.util.HashMap<io.airlift.slice.Slice, long[]> groups =
+        new java.util.HashMap<>(Math.max(estimatedGroups * 3 / 4, 16));
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(numGroupByCols + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          if (keyBlock.isNull(pos)) continue;
+          io.airlift.slice.Slice keySlice = VarcharType.VARCHAR.getSlice(keyBlock, pos);
+          long[] aggs = groups.get(keySlice);
+          if (aggs == null) {
+            aggs = new long[numAggCols];
+            for (int a = 0; a < numAggCols; a++) {
+              if (!aggBlocks[a].isNull(pos)) {
+                aggs[a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+            }
+            groups.put(keySlice, aggs);
+          } else {
+            for (int a = 0; a < numAggCols; a++) {
+              if (!aggBlocks[a].isNull(pos)) {
+                aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (groups.isEmpty()) {
+      return List.of();
+    }
+
+    int groupCount = groups.size();
+    int k = (int) Math.min(limit, groupCount);
+
+    // Determine sort column: 0 = varchar key (lexicographic), >= numGroupByCols = aggregate value
+    int sortCol = sortColumnIndices.get(0);
+    boolean sortAsc = ascending.get(0);
+    boolean sortByAgg = sortCol >= numGroupByCols;
+    int sortAggIdx = sortByAgg ? sortCol - numGroupByCols : -1;
+
+    // Collect entries into an array for heap-based top-N selection
+    java.util.Map.Entry<io.airlift.slice.Slice, long[]>[] entries =
+        groups.entrySet().toArray(new java.util.Map.Entry[0]);
+
+    // Bounded heap for top-K selection on entries array indices
+    int[] heap = new int[k];
+    int heapSize = 0;
+
+    for (int i = 0; i < entries.length; i++) {
+      if (heapSize < k) {
+        heap[heapSize] = i;
+        heapSize++;
+        // Sift up
+        int child = heapSize - 1;
+        while (child > 0) {
+          int parent = (child - 1) >>> 1;
+          if (heapShouldSwapVarchar(
+              entries, heap[child], heap[parent], sortByAgg, sortAggIdx, sortAsc)) {
+            int tmp = heap[child];
+            heap[child] = heap[parent];
+            heap[parent] = tmp;
+            child = parent;
+          } else {
+            break;
+          }
+        }
+      } else {
+        // Compare with heap root
+        boolean replace =
+            heapShouldReplaceRootVarchar(entries, i, heap[0], sortByAgg, sortAggIdx, sortAsc);
+        if (replace) {
+          heap[0] = i;
+          // Sift down
+          int parent = 0;
+          while (true) {
+            int left = 2 * parent + 1;
+            if (left >= heapSize) break;
+            int right = left + 1;
+            int target = left;
+            if (right < heapSize
+                && heapShouldSwapVarchar(
+                    entries, heap[right], heap[left], sortByAgg, sortAggIdx, sortAsc)) {
+              target = right;
+            }
+            if (heapShouldSwapVarchar(
+                entries, heap[target], heap[parent], sortByAgg, sortAggIdx, sortAsc)) {
+              int tmp = heap[parent];
+              heap[parent] = heap[target];
+              heap[target] = tmp;
+              parent = target;
+            } else {
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Sort the top-K entries by sort value (insertion sort, typically k <= 10-100)
+    for (int i = 1; i < heapSize; i++) {
+      int tmp = heap[i];
+      int j = i - 1;
+      while (j >= 0
+          && heapCompareForFinalSortVarchar(entries, heap[j], tmp, sortByAgg, sortAggIdx, sortAsc)
+              > 0) {
+        heap[j + 1] = heap[j];
+        j--;
+      }
+      heap[j + 1] = tmp;
+    }
+
+    // Build output Page for top-k only
+    BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+    BlockBuilder[] aggBuilders = new BlockBuilder[numAggCols];
+    for (int a = 0; a < numAggCols; a++) {
+      aggBuilders[a] = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+    }
+
+    for (int i = 0; i < heapSize; i++) {
+      java.util.Map.Entry<io.airlift.slice.Slice, long[]> entry = entries[heap[i]];
+      VarcharType.VARCHAR.writeSlice(keyBuilder, entry.getKey());
+      long[] aggs = entry.getValue();
+      for (int a = 0; a < numAggCols; a++) {
+        BigintType.BIGINT.writeLong(aggBuilders[a], aggs[a]);
+      }
+    }
+
+    Block[] blocks = new Block[totalCols];
+    blocks[0] = keyBuilder.build();
+    for (int a = 0; a < numAggCols; a++) {
+      blocks[numGroupByCols + a] = aggBuilders[a].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
+   * Heap comparison for VARCHAR merge top-N: determines if child should be above parent in the
+   * bounded heap. For DESC sort, we maintain a min-heap (child with smaller value goes up); for ASC
+   * sort, we maintain a max-heap (child with larger value goes up).
+   */
+  private static boolean heapShouldSwapVarchar(
+      java.util.Map.Entry<io.airlift.slice.Slice, long[]>[] entries,
+      int childIdx,
+      int parentIdx,
+      boolean sortByAgg,
+      int sortAggIdx,
+      boolean sortAsc) {
+    if (sortByAgg) {
+      long childVal = entries[childIdx].getValue()[sortAggIdx];
+      long parentVal = entries[parentIdx].getValue()[sortAggIdx];
+      return sortAsc ? childVal > parentVal : childVal < parentVal;
+    } else {
+      // Sort by VARCHAR key (lexicographic)
+      io.airlift.slice.Slice childKey = entries[childIdx].getKey();
+      io.airlift.slice.Slice parentKey = entries[parentIdx].getKey();
+      int cmp = childKey.compareTo(parentKey);
+      return sortAsc ? cmp > 0 : cmp < 0;
+    }
+  }
+
+  /**
+   * Check if a new entry should replace the heap root during top-N selection. For DESC sort (want
+   * largest K), replace root if new value is larger; for ASC sort (want smallest K), replace if
+   * smaller.
+   */
+  private static boolean heapShouldReplaceRootVarchar(
+      java.util.Map.Entry<io.airlift.slice.Slice, long[]>[] entries,
+      int newIdx,
+      int rootIdx,
+      boolean sortByAgg,
+      int sortAggIdx,
+      boolean sortAsc) {
+    if (sortByAgg) {
+      long newVal = entries[newIdx].getValue()[sortAggIdx];
+      long rootVal = entries[rootIdx].getValue()[sortAggIdx];
+      return sortAsc ? newVal < rootVal : newVal > rootVal;
+    } else {
+      io.airlift.slice.Slice newKey = entries[newIdx].getKey();
+      io.airlift.slice.Slice rootKey = entries[rootIdx].getKey();
+      int cmp = newKey.compareTo(rootKey);
+      return sortAsc ? cmp < 0 : cmp > 0;
+    }
+  }
+
+  /**
+   * Compare two entries for final sort (after top-K selection). Returns positive if entry at idx1
+   * should come after entry at idx2 in the sorted output.
+   */
+  private static int heapCompareForFinalSortVarchar(
+      java.util.Map.Entry<io.airlift.slice.Slice, long[]>[] entries,
+      int idx1,
+      int idx2,
+      boolean sortByAgg,
+      int sortAggIdx,
+      boolean sortAsc) {
+    if (sortByAgg) {
+      long v1 = entries[idx1].getValue()[sortAggIdx];
+      long v2 = entries[idx2].getValue()[sortAggIdx];
+      int cmp = Long.compare(v1, v2);
+      return sortAsc ? cmp : -cmp;
+    } else {
+      io.airlift.slice.Slice k1 = entries[idx1].getKey();
+      io.airlift.slice.Slice k2 = entries[idx2].getKey();
+      int cmp = k1.compareTo(k2);
+      return sortAsc ? cmp : -cmp;
+    }
   }
 
   /**

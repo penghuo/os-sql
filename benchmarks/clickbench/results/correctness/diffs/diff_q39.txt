@@ -1,4 +1,4 @@
-1,6c1,7
+1,6c1,6
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,94552/photo-3.xhtml?html_params%3D0%26rleurl%3D%26bn%3Dorder_by=0&hide	2
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,94552/photo-3.xhtml_param=0&driver.ru/cars/art/088848&s_yers=chat/svetlo	2
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,94552/photo-3.xhtml_params=rhost%3D400%26url%3D%26bn%3Dorder_by=0&hide	2
@@ -6,17 +6,17 @@
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/work=che&ch=UTF-8&sF=0,0,0&aN=Netscape&aV=5.0 (Windows NT 6.2; Windows NT 5.1) AppleWebKit%2F537.36&bL=ru-ru&cE=true&uA=Mozilla%2Fzhienskaia-moda-zhito-cvet-spa-advert27420	2
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/work=che&fssize%3D0%26rnd%3D2%26pz%3D0%26rnd%3D2788888,264;IC,236;IC,691;IC,60395&ch=UTF-8&sF=11,7,7,7;VL,2184087/photo=0&is_hot=0&view/10718&prr=http://wildberring	2
 ---
-> http://afisha.yandex.ru|yandex.ru/recipe/view/2-komn-kvarticles	2
-> http://irr.ru/index.php?showalbum/login-kapusta-advert2631920&lo=http://holodilnik.ru/spb/events/732709144394	2
-> http://love.ru/?p=1#countpage/130435395786965/refrigeratorii_gusenie	2
-> http://loveplanet.ru/film/4551685&pt=b&pd=9&pw=6&price_ot=&price=меньше 1000.ru/search?text=приколько	2
-> http://smeshariki.ru/index.ru/main.pl?cmd=show/47555	2
-> http://smeshariki.ru/msk/events-sale&__gclid=1373313338426	2
-> http://stalker-pub-20087898675494,960948/#page_type%3D0%26pz%3D0%26rleurl%3D%26custom%3D%26CompPath%3D2788885%26bn%3D1216629%26sob%3D158197%26width%3D2788885%26bn%3D1216/000000479#photo/464393681461396636697/detail	2
-8,10c9,10
+> http:%2F%2Fwwwww.bonprix.ru/sale/secondar/allwomen.aspx#localendacii	2
+> http://kaluga/?ext=фильм огурцы размеры - Для	2
+> http://msk/events/7401438966/page_type=0&m_city.info/forum.rostov.irr.ru/msk/events/7436/roomootofiles/5751 Safari%2F5.0 (Windows NT 6.1) AppleWebKit%2F537.22&bL=ru-ru&cE=true&uA=Mozilla%2Fzhienskaia-moda-topicID=2&IsOrder_by=0&page5/?elmt=pogoda	2
+> http://pogoda.yandex.ru&pvid=1	2
+> http://stalker-pub-20087898675494,960948/#page_type%3D0%26pz%3D0%26rleurl%3D//ad.adriver.ru/photo=0&is_hot=0&auto_id=577&oki=1&op_prodam-1-komn-kvarti-m.ru/allprice_ot=&price=меньше 100039.html_param=0&under_by	2
+> http://stalker-pub-20087898675494,960948/#page_type%3D0%26pz%3D0%26rleurl%3D//ad.adriver.ru/photo=0&is_hot=0&auto_id=577&oki=1&op_prodam-1-komn-kvarti-m.ru/allproduct_name=Платье бикини&ch=utf-8&sF=11,7	2
+8,10c8,10
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/work=ok&balance_mkadrov.ru/catalog/8503/p_000.ru/my/hit_list=0&vip=&input_city=0&page=4&marka=0&po_yers=20073192641#/view_type%3D0%26aktion/russinsk/details/?cat_number	2
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/work=ok&balances/hotelstvo.ru/real-estate/apartments-saledParams%3Drhost%3D_blank%26sid%3D2005&po_yers=200411/adfox/184618/irr.ru/page_type=0&vip=0&confiscategories	2
 < http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/work=vk&referre=all&text=rhost%3Dad.adriver.ru/moscowbooks/search/index.ru/vlg/events-saledParams%3Drhost%3D43%26bt%3D90%26nid%3D839322%26pz%3D0%26pz%3D0%26nid%3D43	2
 ---
-> http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9459301bd969/curre2.html%26custom=0&deletedAutos&marka=84&mode%3D0%26ad%3D90%26pz%3D27888/?date=0	2
-> http://vkirovoe-tourisma	2
+> http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9459301bd969/curre2/refrigerator=&o=300&currency=1&gearbox=0&type=0&colo1.adriver.ru%26bt%3D43%26bt	2
+> http://voroneza.diary	2
+> http://wildberries.ru/photo-1.xhtml?p=1280&lo=http://mirsoverkh%2F&sr=http://small/pansi.htm?adpid=3205	2

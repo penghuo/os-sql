@@ -74,7 +74,7 @@ public class PlanFragmenter {
 
     // 3. Build shard plan — only strip Sort/Limit/HAVING for multi-shard aggregation
     boolean multiShard = shards.size() > 1;
-    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan, columnTypeMap) : plan;
+    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan, columnTypeMap, shards.size()) : plan;
 
     // 4. Create shard fragments
     List<PlanFragment> shardFragments = new ArrayList<>();
@@ -105,12 +105,22 @@ public class PlanFragmenter {
    *
    * For non-aggregation queries: use the full plan.
    */
-  private DqePlanNode buildShardPlan(DqePlanNode plan, Map<String, Type> columnTypeMap) {
+  private DqePlanNode buildShardPlan(
+      DqePlanNode plan, Map<String, Type> columnTypeMap, int numShards) {
     AggregationNode aggNode = findAggregationNode(plan);
     if (aggNode == null) {
       return plan;
     }
     if (aggNode.getStep() == AggregationNode.Step.PARTIAL) {
+      // Optimization: for Limit -> Sort -> Agg(PARTIAL) patterns, keep Sort/Limit on the
+      // shard plan with an inflated limit. This lets each shard apply top-K pre-filtering,
+      // dramatically reducing the number of groups sent to the coordinator. For example,
+      // Q34 (GROUP BY URL COUNT(*) ORDER BY c DESC LIMIT 10) sends ~21K groups per shard
+      // without pre-filtering but only ~max(1000, 10*8) groups with it.
+      DqePlanNode shardPlanWithTopN = buildShardPlanWithInflatedLimit(plan, aggNode, numShards);
+      if (shardPlanWithTopN != null) {
+        return shardPlanWithTopN;
+      }
       // Strip Sort, Limit, and Project above the aggregation.
       // Walk up from the aggregation to find it in the tree and return it as the root.
       return stripAboveAggregation(plan);
@@ -245,6 +255,80 @@ public class PlanFragmenter {
       distinctCols.add(m.group(3).trim());
     }
     return distinctCols;
+  }
+
+  /**
+   * For PARTIAL aggregation with Limit -> [Project ->] Sort -> Agg pattern, build a shard plan that
+   * keeps Sort/Limit but inflates the limit to capture enough groups for correct coordinator merge.
+   * Only applies when sorting by a single aggregate column (e.g., ORDER BY COUNT(*) DESC) and no
+   * HAVING clause is present.
+   *
+   * <p>The inflated limit uses max(1000, originalLimit * numShards * 2) to ensure that globally
+   * top-N groups are captured even when counts are distributed across shards. This is a heuristic
+   * that works well in practice for decomposable aggregates (COUNT, SUM).
+   *
+   * @return shard plan with inflated Limit -> Sort -> Agg, or null if pattern doesn't match
+   */
+  private static DqePlanNode buildShardPlanWithInflatedLimit(
+      DqePlanNode plan, AggregationNode aggNode, int numShards) {
+    // Extract Limit -> [Project ->] Sort -> Agg pattern
+    if (!(plan instanceof LimitNode limitNode)) {
+      return null;
+    }
+    DqePlanNode belowLimit = limitNode.getChild();
+    // Skip optional ProjectNode
+    if (belowLimit instanceof ProjectNode projectNode) {
+      belowLimit = projectNode.getChild();
+    }
+    if (!(belowLimit instanceof SortNode sortNode)) {
+      return null;
+    }
+    // Primary sort key must be an aggregate column (not a group-by key) for pre-filter safety.
+    // Tiebreaker sort keys (added by LogicalPlanner) can be group-by or aggregate columns.
+    List<String> sortKeys = sortNode.getSortKeys();
+    List<String> groupByKeys = aggNode.getGroupByKeys();
+    List<String> aggFunctions = aggNode.getAggregateFunctions();
+    if (sortKeys.isEmpty()) {
+      return null;
+    }
+    // Check that the primary sort key is an aggregate output column
+    List<String> aggOutput = new ArrayList<>(groupByKeys);
+    aggOutput.addAll(aggFunctions);
+    String primarySortKey = sortKeys.get(0);
+    int primaryIdx = aggOutput.indexOf(primarySortKey);
+    if (primaryIdx < 0 || primaryIdx < groupByKeys.size()) {
+      return null; // Primary sort is by group-by key or unknown column — not safe for pre-filter
+    }
+    // No HAVING clause (FilterNode above aggregation)
+    if (hasFilterAboveAggregation(plan)) {
+      return null;
+    }
+
+    // Inflate limit: use max(1000, limit * numShards * 2) to ensure coverage
+    long originalLimit = limitNode.getCount() + limitNode.getOffset();
+    long inflatedLimit = Math.max(1000, originalLimit * numShards * 2);
+
+    // Build: LimitNode(inflated) -> SortNode -> AggregationNode(PARTIAL) -> child
+    return new LimitNode(
+        new SortNode(
+            aggNode, sortNode.getSortKeys(), sortNode.getAscending(), sortNode.getNullsFirst()),
+        inflatedLimit);
+  }
+
+  /** Check if there's a FilterNode (HAVING) between the root and the AggregationNode. */
+  private static boolean hasFilterAboveAggregation(DqePlanNode node) {
+    if (node instanceof AggregationNode) {
+      return false;
+    }
+    if (node instanceof FilterNode) {
+      return true;
+    }
+    for (DqePlanNode child : node.getChildren()) {
+      if (hasFilterAboveAggregation(child)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

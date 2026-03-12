@@ -2,8 +2,8 @@
   "date": "2026-03-12",
   "dataset": "1m",
   "total": 43,
-  "pass": 29,
-  "fail": 13,
+  "pass": 31,
+  "fail": 11,
   "skip": 1,
   "queries": [
     {
@@ -95,17 +95,13 @@
     },
     {
       "q": 18,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 19,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 20,

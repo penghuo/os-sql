@@ -29,11 +29,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -1044,15 +1047,24 @@ public final class FusedGroupByAggregate {
 
           // === MatchAllDocsQuery fast path: iterate docs directly ===
           if (query instanceof MatchAllDocsQuery) {
-            int maxDoc = reader.maxDoc();
             Bits liveDocs = reader.getLiveDocs();
             if (liveDocs == null) {
-              for (int doc = 0; doc < maxDoc; doc++) {
-                if (dv.advanceExact(doc)) {
+              // Ultra-fast path: use forward-only nextDoc() iteration.
+              // For single-valued fields (common for keyword columns like URL),
+              // unwrap to SortedDocValues and use ordValue() which avoids the
+              // multi-value ordinal state tracking overhead of nextOrd().
+              SortedDocValues sdv = DocValues.unwrapSingleton(dv);
+              if (sdv != null) {
+                while (sdv.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                  ordCounts[sdv.ordValue()]++;
+                }
+              } else {
+                while (dv.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
                   ordCounts[(int) dv.nextOrd()]++;
                 }
               }
             } else {
+              int maxDoc = reader.maxDoc();
               for (int doc = 0; doc < maxDoc; doc++) {
                 if (liveDocs.get(doc) && dv.advanceExact(doc)) {
                   ordCounts[(int) dv.nextOrd()]++;
@@ -1379,31 +1391,57 @@ public final class FusedGroupByAggregate {
 
           // === MatchAllDocsQuery fast path: iterate docs directly ===
           if (query instanceof MatchAllDocsQuery) {
-            int maxDoc = reader.maxDoc();
             Bits liveDocs = reader.getLiveDocs();
-            if (liveDocs == null) {
-              for (int doc = 0; doc < maxDoc; doc++) {
-                if (dv == null || !dv.advanceExact(doc)) continue;
-                int ord = (int) dv.nextOrd();
-                AccumulatorGroup accGroup = ordGroups[ord];
-                if (accGroup == null) {
-                  accGroup = createAccumulatorGroup(specs);
-                  ordGroups[ord] = accGroup;
+            if (liveDocs == null && dv != null) {
+              // Ultra-fast path: use forward-only nextDoc() iteration.
+              // For single-valued fields, unwrap to SortedDocValues and use
+              // ordValue() for less overhead than nextOrd().
+              SortedDocValues sdv = DocValues.unwrapSingleton(dv);
+              if (sdv != null) {
+                int doc;
+                while ((doc = sdv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                  int ord = sdv.ordValue();
+                  AccumulatorGroup accGroup = ordGroups[ord];
+                  if (accGroup == null) {
+                    accGroup = createAccumulatorGroup(specs);
+                    ordGroups[ord] = accGroup;
+                  }
+                  collectVarcharGenericAccumulate(
+                      doc,
+                      accGroup,
+                      numAggs,
+                      isCountStar,
+                      isVarcharArg,
+                      isDoubleArg,
+                      accType,
+                      numericAggDvs,
+                      varcharAggDvs);
                 }
-                collectVarcharGenericAccumulate(
-                    doc,
-                    accGroup,
-                    numAggs,
-                    isCountStar,
-                    isVarcharArg,
-                    isDoubleArg,
-                    accType,
-                    numericAggDvs,
-                    varcharAggDvs);
+              } else {
+                int doc;
+                while ((doc = dv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                  int ord = (int) dv.nextOrd();
+                  AccumulatorGroup accGroup = ordGroups[ord];
+                  if (accGroup == null) {
+                    accGroup = createAccumulatorGroup(specs);
+                    ordGroups[ord] = accGroup;
+                  }
+                  collectVarcharGenericAccumulate(
+                      doc,
+                      accGroup,
+                      numAggs,
+                      isCountStar,
+                      isVarcharArg,
+                      isDoubleArg,
+                      accType,
+                      numericAggDvs,
+                      varcharAggDvs);
+                }
               }
             } else {
+              int maxDoc = reader.maxDoc();
               for (int doc = 0; doc < maxDoc; doc++) {
-                if (!liveDocs.get(doc)) continue;
+                if (liveDocs != null && !liveDocs.get(doc)) continue;
                 if (dv == null || !dv.advanceExact(doc)) continue;
                 int ord = (int) dv.nextOrd();
                 AccumulatorGroup accGroup = ordGroups[ord];

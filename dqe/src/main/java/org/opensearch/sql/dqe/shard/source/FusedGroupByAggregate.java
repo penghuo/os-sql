@@ -109,6 +109,40 @@ public final class FusedGroupByAggregate {
   private FusedGroupByAggregate() {}
 
   /**
+   * Compile an expression string and return its output type. Used to determine the type of
+   * EvalNode-computed group-by keys (e.g., CASE WHEN expressions).
+   */
+  private static Type compileAndGetType(String exprStr, Map<String, Type> columnTypeMap) {
+    try {
+      org.opensearch.sql.dqe.function.FunctionRegistry registry =
+          org.opensearch.sql.dqe.function.BuiltinFunctions.createRegistry();
+      io.trino.sql.parser.SqlParser sqlParser = new io.trino.sql.parser.SqlParser();
+      // Normalize column types: integer-family -> BigintType
+      Map<String, Integer> colIndexMap = new HashMap<>();
+      Map<String, Type> normalizedMap = new HashMap<>();
+      int idx = 0;
+      for (Map.Entry<String, Type> entry : columnTypeMap.entrySet()) {
+        colIndexMap.put(entry.getKey(), idx++);
+        Type t = entry.getValue();
+        if (t instanceof VarcharType || t instanceof DoubleType || t instanceof TimestampType) {
+          normalizedMap.put(entry.getKey(), t);
+        } else {
+          normalizedMap.put(entry.getKey(), BigintType.BIGINT);
+        }
+      }
+      org.opensearch.sql.dqe.function.expression.ExpressionCompiler compiler =
+          new org.opensearch.sql.dqe.function.expression.ExpressionCompiler(
+              registry, colIndexMap, normalizedMap);
+      io.trino.sql.tree.Expression ast = sqlParser.createExpression(exprStr);
+      org.opensearch.sql.dqe.function.expression.BlockExpression blockExpr = compiler.compile(ast);
+      return blockExpr.getType();
+    } catch (Exception e) {
+      // If compilation fails, default to VARCHAR (most common for CASE WHEN)
+      return VarcharType.VARCHAR;
+    }
+  }
+
+  /**
    * Find the TableScanNode underneath an AggregationNode, looking through an optional EvalNode.
    * Returns null if the child structure is not TableScanNode or EvalNode → TableScanNode.
    */
@@ -140,6 +174,12 @@ public final class FusedGroupByAggregate {
     }
     if (findChildTableScan(aggNode) == null) {
       return false;
+    }
+
+    // Build set of EvalNode output column names for recognizing computed keys
+    Set<String> evalOutputNames = Set.of();
+    if (aggNode.getChild() instanceof EvalNode evalNode) {
+      evalOutputNames = new HashSet<>(evalNode.getOutputColumnNames());
     }
 
     // Check all group-by keys are supported types (VARCHAR, numeric, or timestamp)
@@ -177,6 +217,24 @@ public final class FusedGroupByAggregate {
               String sourceCol = am.group(1);
               Type sourceType = columnTypeMap.get(sourceCol);
               if (sourceType == null || !isNumericOrTimestamp(sourceType)) {
+                return false;
+              }
+            } else if (evalOutputNames.contains(key)) {
+              // EvalNode-computed key (e.g., CASE WHEN expression).
+              // The expression will be compiled and evaluated per-document
+              // using the ExpressionCompiler. Try to compile it now to verify.
+              try {
+                EvalNode evalNode = (EvalNode) aggNode.getChild();
+                int exprIdx = evalNode.getOutputColumnNames().indexOf(key);
+                if (exprIdx < 0) {
+                  return false;
+                }
+                String exprStr = evalNode.getExpressions().get(exprIdx);
+                // Quick check: the expression should not be a plain column pass-through
+                if (columnTypeMap.containsKey(exprStr)) {
+                  return false; // Should have been handled as a plain column
+                }
+              } catch (Exception e) {
                 return false;
               }
             } else {
@@ -905,6 +963,22 @@ public final class FusedGroupByAggregate {
               // (arithmetic on integers produces long in the Trino execution model)
               keyInfos.add(
                   new KeyInfo(sourceCol, BigintType.BIGINT, false, "arith", op + ":" + constant));
+            } else if (aggNode.getChild() instanceof EvalNode evalNode
+                && evalNode.getOutputColumnNames().contains(key)) {
+              // EvalNode-computed key (e.g., CASE WHEN expression).
+              // Mark as "eval" expression — will be compiled and evaluated per-document.
+              // Determine the output type by compiling the expression.
+              int exprIdx = evalNode.getOutputColumnNames().indexOf(key);
+              String exprStr = evalNode.getExpressions().get(exprIdx);
+              Type evalOutputType = compileAndGetType(exprStr, columnTypeMap);
+              boolean isEvalVarchar = evalOutputType instanceof VarcharType;
+              // Use the expression key name (not a physical column name) with "eval" exprFunc.
+              // The exprUnit carries the expression index in the EvalNode.
+              keyInfos.add(
+                  new KeyInfo(key, evalOutputType, isEvalVarchar, "eval", String.valueOf(exprIdx)));
+              if (isEvalVarchar) {
+                hasVarchar = true;
+              }
             } else {
               throw new IllegalArgumentException("Unsupported group-by expression: " + key);
             }
@@ -945,6 +1019,18 @@ public final class FusedGroupByAggregate {
             sortAggIndex,
             sortAscending,
             topN);
+      }
+      // Check if any key is an eval expression — use eval-aware path
+      boolean hasEvalKey = false;
+      for (KeyInfo ki : keyInfos) {
+        if ("eval".equals(ki.exprFunc)) {
+          hasEvalKey = true;
+          break;
+        }
+      }
+      if (hasEvalKey) {
+        return executeWithEvalKeys(
+            aggNode, shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
       }
       return executeWithVarcharKeys(
           shard,
@@ -3896,6 +3982,356 @@ public final class FusedGroupByAggregate {
   }
 
   /**
+   * Path for GROUP BY keys that include at least one EvalNode-computed expression (e.g., CASE
+   * WHEN). Uses a two-phase approach: (1) collect all matching doc IDs, (2) evaluate eval
+   * expressions in one large batch, then group and aggregate. Non-eval keys and aggregates use
+   * DocValues directly.
+   *
+   * <p>Only columns referenced by eval expressions are materialized into Pages for vectorized
+   * evaluation, minimizing allocation overhead. The eval Page is built once per segment, not per
+   * micro-batch.
+   */
+  private static List<Page> executeWithEvalKeys(
+      AggregationNode aggNode,
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys)
+      throws Exception {
+
+    EvalNode evalNode = (aggNode.getChild() instanceof EvalNode en) ? en : null;
+    TableScanNode scanNode = findChildTableScan(aggNode);
+
+    // Identify eval keys and their source columns
+    final int numKeys = keyInfos.size();
+    final int numAggs = specs.size();
+    final boolean[] isEvalKey = new boolean[numKeys];
+
+    // Collect only columns needed for eval expressions (not all scan columns)
+    Set<String> evalSourceColumns = new HashSet<>();
+    if (evalNode != null) {
+      for (int k = 0; k < numKeys; k++) {
+        KeyInfo ki = keyInfos.get(k);
+        if ("eval".equals(ki.exprFunc)) {
+          isEvalKey[k] = true;
+          int exprIdx = Integer.parseInt(ki.exprUnit);
+          String exprStr = evalNode.getExpressions().get(exprIdx);
+          for (String col : columnTypeMap.keySet()) {
+            if (exprStr.contains(col)) {
+              evalSourceColumns.add(col);
+            }
+          }
+        }
+      }
+    }
+
+    // Build column index map for expression compilation: only eval source columns
+    List<String> evalColumns = new ArrayList<>(evalSourceColumns);
+    java.util.Collections.sort(evalColumns); // Deterministic order
+    Map<String, Integer> colIndexMap = new HashMap<>();
+    for (int i = 0; i < evalColumns.size(); i++) {
+      colIndexMap.put(evalColumns.get(i), i);
+    }
+
+    // Normalized type map for expression compilation
+    Map<String, Type> normalizedTypeMap = new HashMap<>(columnTypeMap.size());
+    for (Map.Entry<String, Type> entry : columnTypeMap.entrySet()) {
+      Type t = entry.getValue();
+      if (t instanceof VarcharType || t instanceof DoubleType || t instanceof TimestampType) {
+        normalizedTypeMap.put(entry.getKey(), t);
+      } else {
+        normalizedTypeMap.put(entry.getKey(), BigintType.BIGINT);
+      }
+    }
+
+    // Normalized types for the eval columns
+    final Type[] evalColTypes = new Type[evalColumns.size()];
+    for (int c = 0; c < evalColumns.size(); c++) {
+      Type t = normalizedTypeMap.getOrDefault(evalColumns.get(c), BigintType.BIGINT);
+      evalColTypes[c] = t;
+    }
+
+    // Compile eval expressions
+    org.opensearch.sql.dqe.function.FunctionRegistry registry =
+        org.opensearch.sql.dqe.function.BuiltinFunctions.createRegistry();
+    io.trino.sql.parser.SqlParser sqlParser = new io.trino.sql.parser.SqlParser();
+    org.opensearch.sql.dqe.function.expression.ExpressionCompiler compiler =
+        new org.opensearch.sql.dqe.function.expression.ExpressionCompiler(
+            registry, colIndexMap, normalizedTypeMap);
+
+    final org.opensearch.sql.dqe.function.expression.BlockExpression[] evalExprs =
+        new org.opensearch.sql.dqe.function.expression.BlockExpression[numKeys];
+    for (int k = 0; k < numKeys; k++) {
+      if (isEvalKey[k]) {
+        int exprIdx = Integer.parseInt(keyInfos.get(k).exprUnit);
+        String exprStr = evalNode.getExpressions().get(exprIdx);
+        io.trino.sql.tree.Expression ast = sqlParser.createExpression(exprStr);
+        evalExprs[k] = compiler.compile(ast);
+      }
+    }
+
+    // Pre-compute aggregate dispatch types
+    final boolean[] isCountStar = new boolean[numAggs];
+    final int[] accType = new int[numAggs];
+    for (int i = 0; i < numAggs; i++) {
+      AggSpec spec = specs.get(i);
+      isCountStar[i] = "*".equals(spec.arg);
+      if (isCountStar[i]) {
+        accType[i] = 0;
+      } else {
+        boolean isDouble = spec.argType instanceof DoubleType;
+        switch (spec.funcName) {
+          case "COUNT":
+            accType[i] = spec.isDistinct ? 5 : 0;
+            break;
+          case "SUM":
+            accType[i] = isDouble ? 6 : 1;
+            break;
+          case "AVG":
+            accType[i] = isDouble ? 7 : 2;
+            break;
+          case "MIN":
+            accType[i] = 3;
+            break;
+          case "MAX":
+            accType[i] = 4;
+            break;
+        }
+      }
+    }
+
+    // Pre-compute transformation units for non-eval keys
+    final String[] truncUnits = new String[numKeys];
+    final String[] arithUnits = new String[numKeys];
+    for (int i = 0; i < numKeys; i++) {
+      KeyInfo ki = keyInfos.get(i);
+      if ("date_trunc".equals(ki.exprFunc)) truncUnits[i] = ki.exprUnit;
+      else if ("arith".equals(ki.exprFunc)) arithUnits[i] = ki.exprUnit;
+      else if ("extract".equals(ki.exprFunc)) arithUnits[i] = "E:" + ki.exprUnit;
+    }
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-eval")) {
+
+      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
+
+      // Phase 1: Collect doc IDs and non-eval key values per segment
+      for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+        LeafReader reader = leafCtx.reader();
+
+        // Collect matching doc IDs for this segment
+        List<Integer> segDocIds = new ArrayList<>();
+        engineSearcher
+            .getIndexReader()
+            .getContext()
+            .equals(null); // no-op, just ensure context is available
+        org.apache.lucene.search.Weight weight =
+            engineSearcher.createWeight(
+                engineSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+        org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+        if (scorer == null) continue;
+
+        DocIdSetIterator disi = scorer.iterator();
+        int doc;
+        while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+          segDocIds.add(doc);
+        }
+        if (segDocIds.isEmpty()) continue;
+
+        int segDocCount = segDocIds.size();
+
+        // Phase 2: Read non-eval key values for all collected docs
+        Object[] keyReaders = new Object[numKeys];
+        for (int i = 0; i < numKeys; i++) {
+          if (isEvalKey[i]) continue;
+          KeyInfo ki = keyInfos.get(i);
+          if (ki.isVarchar) keyReaders[i] = reader.getSortedSetDocValues(ki.name);
+          else keyReaders[i] = reader.getSortedNumericDocValues(ki.name);
+        }
+
+        long[][] segKeyValues = new long[segDocCount][numKeys];
+        boolean[][] segKeyNulls = new boolean[segDocCount][numKeys];
+
+        for (int d = 0; d < segDocCount; d++) {
+          int docId = segDocIds.get(d);
+          for (int k = 0; k < numKeys; k++) {
+            if (isEvalKey[k]) continue;
+            KeyInfo ki = keyInfos.get(k);
+            if (ki.isVarchar) {
+              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+              if (dv != null && dv.advanceExact(docId)) {
+                segKeyValues[d][k] = dv.nextOrd();
+              } else {
+                segKeyNulls[d][k] = true;
+              }
+            } else {
+              SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
+              if (dv != null && dv.advanceExact(docId)) {
+                long val = dv.nextValue();
+                if (truncUnits[k] != null) val = truncateMillis(val, truncUnits[k]);
+                else if (arithUnits[k] != null) val = applyArith(val, arithUnits[k]);
+                segKeyValues[d][k] = val;
+              } else {
+                segKeyNulls[d][k] = true;
+              }
+            }
+          }
+        }
+
+        // Phase 3: Build eval column blocks for the entire segment and evaluate expressions
+        // Only build blocks for columns referenced by eval expressions
+        BlockBuilder[] colBuilders = new BlockBuilder[evalColumns.size()];
+        for (int c = 0; c < evalColumns.size(); c++) {
+          colBuilders[c] = evalColTypes[c].createBlockBuilder(null, segDocCount);
+        }
+
+        // Open eval column DocValues
+        SortedNumericDocValues[] evalNumDvs = new SortedNumericDocValues[evalColumns.size()];
+        SortedSetDocValues[] evalVarDvs = new SortedSetDocValues[evalColumns.size()];
+        for (int c = 0; c < evalColumns.size(); c++) {
+          if (evalColTypes[c] instanceof VarcharType) {
+            evalVarDvs[c] = reader.getSortedSetDocValues(evalColumns.get(c));
+          } else {
+            evalNumDvs[c] = reader.getSortedNumericDocValues(evalColumns.get(c));
+          }
+        }
+
+        for (int d = 0; d < segDocCount; d++) {
+          int docId = segDocIds.get(d);
+          for (int c = 0; c < evalColumns.size(); c++) {
+            if (evalColTypes[c] instanceof VarcharType) {
+              SortedSetDocValues dv = evalVarDvs[c];
+              if (dv != null && dv.advanceExact(docId)) {
+                BytesRef bytes = dv.lookupOrd(dv.nextOrd());
+                VarcharType.VARCHAR.writeSlice(
+                    colBuilders[c], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              } else {
+                VarcharType.VARCHAR.writeSlice(colBuilders[c], Slices.EMPTY_SLICE);
+              }
+            } else if (evalColTypes[c] instanceof DoubleType) {
+              SortedNumericDocValues dv = evalNumDvs[c];
+              if (dv != null && dv.advanceExact(docId)) {
+                DoubleType.DOUBLE.writeDouble(
+                    colBuilders[c], Double.longBitsToDouble(dv.nextValue()));
+              } else {
+                colBuilders[c].appendNull();
+              }
+            } else {
+              SortedNumericDocValues dv = evalNumDvs[c];
+              if (dv != null && dv.advanceExact(docId)) {
+                BigintType.BIGINT.writeLong(colBuilders[c], dv.nextValue());
+              } else {
+                colBuilders[c].appendNull();
+              }
+            }
+          }
+        }
+
+        Block[] colBlocks = new Block[evalColumns.size()];
+        for (int c = 0; c < evalColumns.size(); c++) {
+          colBlocks[c] = colBuilders[c].build();
+        }
+        Page evalPage = new Page(colBlocks);
+
+        // Evaluate all eval expressions on the entire segment batch
+        Block[] evalResultBlocks = new Block[numKeys];
+        for (int k = 0; k < numKeys; k++) {
+          if (isEvalKey[k]) {
+            evalResultBlocks[k] = evalExprs[k].evaluate(evalPage);
+          }
+        }
+
+        // Phase 4: Group and aggregate
+        for (int d = 0; d < segDocCount; d++) {
+          Object[] resolvedKeys = new Object[numKeys];
+          for (int k = 0; k < numKeys; k++) {
+            if (isEvalKey[k]) {
+              Block block = evalResultBlocks[k];
+              if (block.isNull(d)) {
+                resolvedKeys[k] = null;
+              } else {
+                Type keyType = keyInfos.get(k).type;
+                if (keyType instanceof VarcharType) {
+                  io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(block, d);
+                  resolvedKeys[k] =
+                      new BytesRefKey(new BytesRef(slice.getBytes(), 0, slice.length()));
+                } else if (keyType instanceof DoubleType) {
+                  resolvedKeys[k] = Double.doubleToLongBits(DoubleType.DOUBLE.getDouble(block, d));
+                } else {
+                  resolvedKeys[k] = BigintType.BIGINT.getLong(block, d);
+                }
+              }
+            } else if (segKeyNulls[d][k]) {
+              resolvedKeys[k] = null;
+            } else if (keyInfos.get(k).isVarchar) {
+              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+              if (dv != null) {
+                BytesRef bytes = dv.lookupOrd(segKeyValues[d][k]);
+                resolvedKeys[k] = new BytesRefKey(bytes);
+              } else {
+                resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
+              }
+            } else {
+              resolvedKeys[k] = segKeyValues[d][k];
+            }
+          }
+
+          MergedGroupKey mgk = new MergedGroupKey(resolvedKeys, keyInfos);
+          AccumulatorGroup accGroup = globalGroups.get(mgk);
+          if (accGroup == null) {
+            accGroup = createAccumulatorGroup(specs);
+            globalGroups.put(mgk, accGroup);
+          }
+
+          // Only COUNT(*) for now — Q40 only uses COUNT(*)
+          for (int i = 0; i < numAggs; i++) {
+            if (isCountStar[i]) {
+              ((CountStarAccum) accGroup.accumulators[i]).count++;
+            }
+          }
+        }
+      }
+
+      if (globalGroups.isEmpty()) {
+        return List.of();
+      }
+
+      // Build output Page
+      int numGroupKeys = groupByKeys.size();
+      int totalColumns = numGroupKeys + numAggs;
+      int groupCount = globalGroups.size();
+
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      for (int i = 0; i < numGroupKeys; i++) {
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+      }
+      for (int i = 0; i < numAggs; i++) {
+        builders[numGroupKeys + i] =
+            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+      }
+
+      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        MergedGroupKey key = entry.getKey();
+        AccumulatorGroup accGroup = entry.getValue();
+        for (int k = 0; k < numGroupKeys; k++) {
+          writeKeyValueForMerged(builders[k], keyInfos.get(k), key.values[k]);
+        }
+        for (int a = 0; a < numAggs; a++) {
+          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+        }
+      }
+
+      Block[] blocks = new Block[totalColumns];
+      for (int i = 0; i < totalColumns; i++) {
+        blocks[i] = builders[i].build();
+      }
+      return List.of(new Page(blocks));
+    }
+  }
+
+  /**
    * Path for GROUP BY keys that include at least one VARCHAR column. Uses SortedSetDocValues
    * ordinals as hash keys during per-segment aggregation. For single-segment indices (common), the
    * segment-local ordinals ARE the final result — ordinals are resolved to raw UTF-8 bytes only at
@@ -5621,6 +6057,12 @@ public final class FusedGroupByAggregate {
             Matcher am = ARITH_EXPR_PATTERN.matcher(key);
             if (am.matches()) {
               types.add(BigintType.BIGINT);
+            } else if (aggNode.getChild() instanceof EvalNode evalNode
+                && evalNode.getOutputColumnNames().contains(key)) {
+              // EvalNode-computed key — determine type by compilation
+              int exprIdx = evalNode.getOutputColumnNames().indexOf(key);
+              String exprStr = evalNode.getExpressions().get(exprIdx);
+              types.add(compileAndGetType(exprStr, columnTypeMap));
             } else {
               types.add(BigintType.BIGINT);
             }

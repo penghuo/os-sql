@@ -2019,7 +2019,16 @@ public final class FusedGroupByAggregate {
       }
       if (allSameCol && allArithOrPlain) {
         return executeDerivedSingleKeyNumeric(
-            shard, query, keyInfos, specs, columnTypeMap, groupByKeys, arithUnits);
+            shard,
+            query,
+            keyInfos,
+            specs,
+            columnTypeMap,
+            groupByKeys,
+            arithUnits,
+            sortAggIndex,
+            sortAscending,
+            topN);
       }
     }
 
@@ -2678,7 +2687,10 @@ public final class FusedGroupByAggregate {
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
       List<String> groupByKeys,
-      String[] arithUnits)
+      String[] arithUnits,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     final int numAggs = specs.size();
@@ -2792,7 +2804,15 @@ public final class FusedGroupByAggregate {
       if (singleKeyMap.size == 0) return List.of();
 
       return buildDerivedKeyResult(
-          singleKeyMap, keyInfos, specs, columnTypeMap, groupByKeys, arithUnits);
+          singleKeyMap,
+          keyInfos,
+          specs,
+          columnTypeMap,
+          groupByKeys,
+          arithUnits,
+          sortAggIndex,
+          sortAscending,
+          topN);
     }
 
     // === Flat path (COUNT/SUM long/AVG long only) ===
@@ -2964,48 +2984,124 @@ public final class FusedGroupByAggregate {
     // Plain source keys use their original type; derived (arith) keys use BigintType.
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = flatMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+      int sortAccOff = accOffset[sortAggIndex];
+      int n = (int) Math.min(topN, flatMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (!flatMap.occupied[slot]) continue;
+        long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = flatMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
+            long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = flatMap.accData[heap[0] * slotsPerGroup + sortAccOff];
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = flatMap.accData[heap[left] * slotsPerGroup + sortAccOff];
+                long rv = flatMap.accData[heap[right] * slotsPerGroup + sortAccOff];
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal2 = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+              long tVal = flatMap.accData[heap[target] * slotsPerGroup + sortAccOff];
+              boolean swap = sortAscending ? (tVal > kVal2) : (tVal < kVal2);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < flatMap.size) {
+      int n = (int) Math.min(topN, flatMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[flatMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
     for (int i = 0; i < numGroupKeys; i++) {
       Type keyType = (arithUnits[i] != null) ? BigintType.BIGINT : keyInfos.get(i).type;
-      builders[i] = keyType.createBlockBuilder(null, groupCount);
+      builders[i] = keyType.createBlockBuilder(null, outputCount);
     }
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < flatMap.capacity; slot++) {
-      if (flatMap.occupied[slot]) {
-        long sourceVal = flatMap.keys[slot];
-        // Write all group-by keys from the single source value
-        for (int k = 0; k < numGroupKeys; k++) {
-          long keyVal = sourceVal;
-          if (arithUnits[k] != null) {
-            keyVal = applyArith(sourceVal, arithUnits[k]);
-            BigintType.BIGINT.writeLong(builders[k], keyVal);
-          } else {
-            writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
-          }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      long sourceVal = flatMap.keys[slot];
+      // Write all group-by keys from the single source value
+      for (int k = 0; k < numGroupKeys; k++) {
+        long keyVal = sourceVal;
+        if (arithUnits[k] != null) {
+          keyVal = applyArith(sourceVal, arithUnits[k]);
+          BigintType.BIGINT.writeLong(builders[k], keyVal);
+        } else {
+          writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
         }
-        // Write aggregate results
-        int base = slot * slotsPerGroup;
-        for (int a = 0; a < numAggs; a++) {
-          int off = base + accOffset[a];
-          switch (accType[a]) {
-            case 0:
-            case 1:
-              BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
-              break;
-            case 2:
-              long sum = flatMap.accData[off];
-              long cnt = flatMap.accData[off + 1];
-              if (cnt == 0) {
-                builders[numGroupKeys + a].appendNull();
-              } else {
-                DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
-              }
-              break;
-          }
+      }
+      // Write aggregate results
+      int base = slot * slotsPerGroup;
+      for (int a = 0; a < numAggs; a++) {
+        int off = base + accOffset[a];
+        switch (accType[a]) {
+          case 0:
+          case 1:
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            break;
+          case 2:
+            long sum = flatMap.accData[off];
+            long cnt = flatMap.accData[off + 1];
+            if (cnt == 0) {
+              builders[numGroupKeys + a].appendNull();
+            } else {
+              DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+            }
+            break;
         }
       }
     }
@@ -3021,37 +3117,117 @@ public final class FusedGroupByAggregate {
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
       List<String> groupByKeys,
-      String[] arithUnits) {
+      String[] arithUnits,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN) {
     if (singleKeyMap.size == 0) return List.of();
     int numAggs = specs.size();
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
-    int groupCount = singleKeyMap.size;
+
+    // Determine which slots to output (with optional top-N selection)
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < singleKeyMap.size) {
+      int n = (int) Math.min(topN, singleKeyMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+        if (!singleKeyMap.occupied[slot]) continue;
+        long val = singleKeyMap.groups[slot].accumulators[sortAggIndex].getSortValue();
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = singleKeyMap.groups[heap[parent]].accumulators[sortAggIndex].getSortValue();
+            long kVal2 = singleKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+            boolean swap = sortAscending ? (kVal2 > pVal) : (kVal2 < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[k];
+              heap[k] = tmp;
+              k = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = singleKeyMap.groups[heap[0]].accumulators[sortAggIndex].getSortValue();
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = singleKeyMap.groups[heap[left]].accumulators[sortAggIndex].getSortValue();
+                long rv =
+                    singleKeyMap.groups[heap[right]].accumulators[sortAggIndex].getSortValue();
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal2 = singleKeyMap.groups[heap[k]].accumulators[sortAggIndex].getSortValue();
+              long tVal =
+                  singleKeyMap.groups[heap[target]].accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (tVal > kVal2) : (tVal < kVal2);
+              if (swap) {
+                int tmp = heap[k];
+                heap[k] = heap[target];
+                heap[target] = tmp;
+                k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < singleKeyMap.size) {
+      int n = (int) Math.min(topN, singleKeyMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity && idx < n; slot++) {
+        if (singleKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[singleKeyMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
+        if (singleKeyMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
     BlockBuilder[] builders = new BlockBuilder[totalColumns];
     for (int i = 0; i < numGroupKeys; i++) {
       Type keyType = (arithUnits[i] != null) ? BigintType.BIGINT : keyInfos.get(i).type;
-      builders[i] = keyType.createBlockBuilder(null, groupCount);
+      builders[i] = keyType.createBlockBuilder(null, outputCount);
     }
     for (int i = 0; i < numAggs; i++) {
       builders[numGroupKeys + i] =
-          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
     }
-    for (int slot = 0; slot < singleKeyMap.capacity; slot++) {
-      if (singleKeyMap.occupied[slot]) {
-        long sourceVal = singleKeyMap.keys[slot];
-        for (int k = 0; k < numGroupKeys; k++) {
-          long keyVal = sourceVal;
-          if (arithUnits[k] != null) {
-            keyVal = applyArith(sourceVal, arithUnits[k]);
-            BigintType.BIGINT.writeLong(builders[k], keyVal);
-          } else {
-            writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
-          }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      long sourceVal = singleKeyMap.keys[slot];
+      for (int k = 0; k < numGroupKeys; k++) {
+        long keyVal = sourceVal;
+        if (arithUnits[k] != null) {
+          keyVal = applyArith(sourceVal, arithUnits[k]);
+          BigintType.BIGINT.writeLong(builders[k], keyVal);
+        } else {
+          writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
         }
-        AccumulatorGroup accGroup = singleKeyMap.groups[slot];
-        for (int a = 0; a < numAggs; a++) {
-          accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
-        }
+      }
+      AccumulatorGroup accGroup = singleKeyMap.groups[slot];
+      for (int a = 0; a < numAggs; a++) {
+        accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
       }
     }
     Block[] blocks = new Block[totalColumns];

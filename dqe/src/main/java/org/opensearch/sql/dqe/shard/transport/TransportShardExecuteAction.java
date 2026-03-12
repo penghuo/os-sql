@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.opensearch.action.ActionRequest;
@@ -46,6 +47,7 @@ import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanVisitor;
 import org.opensearch.sql.dqe.planner.plan.EvalNode;
+import org.opensearch.sql.dqe.planner.plan.FilterNode;
 import org.opensearch.sql.dqe.planner.plan.LimitNode;
 import org.opensearch.sql.dqe.planner.plan.ProjectNode;
 import org.opensearch.sql.dqe.planner.plan.SortNode;
@@ -196,6 +198,22 @@ public class TransportShardExecuteAction
       List<Page> pages = executeScalarCountStar(plan, req);
       List<Type> columnTypes = List.of(BigintType.BIGINT);
       return new ShardExecuteResponse(pages, columnTypes);
+    }
+
+    // Fast path: Lucene-native sorted scan for LimitNode -> [ProjectNode] -> SortNode ->
+    // TableScanNode patterns. Uses IndexSearcher.search(query, topN, Sort) which leverages
+    // Lucene's early-termination and segment-level competition to find the top N docs
+    // without scanning all matching docs. Critical for queries like:
+    //   SELECT col FROM t WHERE col <> '' ORDER BY col LIMIT 10
+    // where millions of docs match but only the first N in sort order are needed.
+    if (scanFactory == null) {
+      SortedScanSpec sortedSpec = extractSortedScanSpec(plan);
+      if (sortedSpec != null) {
+        List<Page> pages = executeSortedScan(sortedSpec, req);
+        List<Type> columnTypes =
+            resolveColumnTypes(plan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+        return new ShardExecuteResponse(pages, columnTypes);
+      }
     }
 
     // Try fused scan-aggregate for scalar aggregations (no GROUP BY)
@@ -978,5 +996,319 @@ public class TransportShardExecuteAction
     if (child instanceof ProjectNode proj) child = proj.getChild();
     if (child instanceof AggregationNode agg) return agg;
     return null;
+  }
+
+  /**
+   * Specification for a Lucene-native sorted scan: captures the plan components needed to execute a
+   * query using {@code IndexSearcher.search(query, topN, Sort)}.
+   */
+  private record SortedScanSpec(
+      TableScanNode scanNode,
+      List<String> sortKeys,
+      List<Boolean> ascending,
+      List<Boolean> nullsFirst,
+      long topN,
+      List<String> outputColumns) {}
+
+  /**
+   * Extract a {@link SortedScanSpec} from a LimitNode -> [ProjectNode] -> SortNode -> [FilterNode]
+   * -> TableScanNode pattern (no aggregation). Returns null if the pattern doesn't match or the
+   * sort keys cannot be handled by Lucene's native Sort.
+   *
+   * <p>All sort keys must be physical columns available as Lucene SortField types. Computed
+   * expressions are not supported.
+   */
+  private SortedScanSpec extractSortedScanSpec(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    long topN = limit.getCount() + limit.getOffset();
+    if (topN <= 0 || topN > 10000) return null; // Only use for small limits
+
+    DqePlanNode child = limit.getChild();
+    ProjectNode projNode = null;
+    if (child instanceof ProjectNode proj) {
+      projNode = proj;
+      child = proj.getChild();
+    }
+    if (!(child instanceof SortNode sort)) return null;
+
+    // The sort child must lead to TableScanNode (possibly through FilterNode)
+    DqePlanNode sortChild = sort.getChild();
+    if (sortChild instanceof FilterNode filterNode) {
+      sortChild = filterNode.getChild();
+    }
+    if (!(sortChild instanceof TableScanNode scanNode)) return null;
+
+    // All sort keys must be physical columns with sortable types
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(scanNode.getIndexName());
+    Map<String, Type> typeMap = cachedMeta.columnTypeMap();
+    Map<String, String> fieldTypeMap = cachedMeta.fieldTypeMap();
+    for (String key : sort.getSortKeys()) {
+      Type type = typeMap.get(key);
+      if (type == null) return null; // Not a physical column (expression)
+      String osType = fieldTypeMap.getOrDefault(key, "keyword");
+      // Supported: keyword, long, integer, short, byte, date, double, float
+      if (!isSortableFieldType(osType)) return null;
+    }
+
+    List<String> outputColumns =
+        projNode != null ? projNode.getOutputColumns() : scanNode.getColumns();
+
+    return new SortedScanSpec(
+        scanNode,
+        sort.getSortKeys(),
+        sort.getAscending(),
+        sort.getNullsFirst(),
+        topN,
+        outputColumns);
+  }
+
+  /** Check if an OpenSearch field type supports efficient Lucene-native sorting. */
+  private static boolean isSortableFieldType(String osType) {
+    return switch (osType) {
+      case "keyword",
+          "long",
+          "integer",
+          "short",
+          "byte",
+          "date",
+          "double",
+          "float",
+          "half_float",
+          "boolean" ->
+          true;
+      default -> false;
+    };
+  }
+
+  /**
+   * Execute a Lucene-native sorted scan using {@code IndexSearcher.search(query, topN, Sort)}.
+   * Instead of collecting all matching docs and sorting in memory, this leverages Lucene's
+   * TopFieldCollector with early termination and segment-level competition.
+   *
+   * @param spec the sorted scan specification
+   * @param req the shard execute request
+   * @return pages with the top N rows in sort order
+   */
+  private List<Page> executeSortedScan(SortedScanSpec spec, ShardExecuteRequest req)
+      throws Exception {
+    TableScanNode scanNode = spec.scanNode();
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    // Resolve IndexShard
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    // Compile Lucene query
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    // Build Lucene Sort from sort keys
+    org.apache.lucene.search.SortField[] sortFields =
+        new org.apache.lucene.search.SortField[spec.sortKeys().size()];
+    for (int i = 0; i < spec.sortKeys().size(); i++) {
+      String key = spec.sortKeys().get(i);
+      boolean asc = spec.ascending().get(i);
+      boolean nf = spec.nullsFirst().get(i);
+      String osType = cachedMeta.fieldTypeMap().getOrDefault(key, "keyword");
+      sortFields[i] = buildLuceneSortField(key, osType, !asc, nf);
+    }
+    org.apache.lucene.search.Sort luceneSort = new org.apache.lucene.search.Sort(sortFields);
+
+    int topN = (int) Math.min(spec.topN(), Integer.MAX_VALUE);
+
+    // Execute sorted search
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-sorted-scan")) {
+      org.apache.lucene.search.TopFieldDocs topDocs =
+          engineSearcher.search(luceneQuery, topN, luceneSort);
+
+      if (topDocs.scoreDocs.length == 0) {
+        return List.of();
+      }
+
+      // Read doc values for only the top N docs
+      // Group by segment for efficient doc values access
+      Map<String, Type> typeMap = cachedMeta.columnTypeMap();
+      List<String> outputCols = spec.outputColumns();
+      List<ColumnHandle> columns = new ArrayList<>();
+      for (String col : outputCols) {
+        columns.add(new ColumnHandle(col, typeMap.getOrDefault(col, BigintType.BIGINT)));
+      }
+
+      int numDocs = topDocs.scoreDocs.length;
+
+      // Read doc values for only the top N docs, resolving per-segment.
+      // TopFieldDocs returns global doc IDs in sort order. For each doc we:
+      // 1. Resolve to segment + segment-local doc ID
+      // 2. Read doc values directly (re-opening iterators per doc since N is small)
+      List<org.apache.lucene.index.LeafReaderContext> leaves =
+          engineSearcher.getIndexReader().leaves();
+
+      io.trino.spi.block.BlockBuilder[] builders =
+          new io.trino.spi.block.BlockBuilder[columns.size()];
+      for (int c = 0; c < columns.size(); c++) {
+        builders[c] = columns.get(c).type().createBlockBuilder(null, numDocs);
+      }
+
+      for (org.apache.lucene.search.ScoreDoc scoreDoc : topDocs.scoreDocs) {
+        int globalDocId = scoreDoc.doc;
+        int leafIdx = ReaderUtil.subIndex(globalDocId, leaves);
+        org.apache.lucene.index.LeafReaderContext leaf = leaves.get(leafIdx);
+        int segmentDocId = globalDocId - leaf.docBase;
+
+        for (int c = 0; c < columns.size(); c++) {
+          readSingleDocValue(leaf, segmentDocId, columns.get(c), builders[c]);
+        }
+      }
+
+      Block[] blocks = new Block[builders.length];
+      for (int i = 0; i < builders.length; i++) {
+        blocks[i] = builders[i].build();
+      }
+      return List.of(new Page(blocks));
+    }
+  }
+
+  /**
+   * Build a Lucene SortField for the given column name and OpenSearch type. Uses {@code
+   * SortedSetSortField} for keyword fields (which use SORTED_SET doc values) and standard {@code
+   * SortField} for numeric types.
+   */
+  private static org.apache.lucene.search.SortField buildLuceneSortField(
+      String fieldName, String osType, boolean reverse, boolean nullsFirst) {
+    switch (osType) {
+      case "keyword":
+        {
+          // Keyword fields use SORTED_SET doc values — must use SortedSetSortField
+          org.apache.lucene.search.SortedSetSortField sf =
+              new org.apache.lucene.search.SortedSetSortField(fieldName, reverse);
+          if (nullsFirst) {
+            sf.setMissingValue(org.apache.lucene.search.SortField.STRING_FIRST);
+          } else {
+            sf.setMissingValue(org.apache.lucene.search.SortField.STRING_LAST);
+          }
+          return sf;
+        }
+      case "long":
+      case "date":
+        {
+          // OpenSearch stores numeric fields with SortedNumericDocValues
+          org.apache.lucene.search.SortedNumericSortField sf =
+              new org.apache.lucene.search.SortedNumericSortField(
+                  fieldName, org.apache.lucene.search.SortField.Type.LONG, reverse);
+          sf.setMissingValue(
+              nullsFirst
+                  ? (reverse ? Long.MIN_VALUE : Long.MAX_VALUE)
+                  : (reverse ? Long.MAX_VALUE : Long.MIN_VALUE));
+          return sf;
+        }
+      case "integer":
+      case "short":
+      case "byte":
+        {
+          org.apache.lucene.search.SortedNumericSortField sf =
+              new org.apache.lucene.search.SortedNumericSortField(
+                  fieldName, org.apache.lucene.search.SortField.Type.INT, reverse);
+          sf.setMissingValue(
+              nullsFirst
+                  ? (reverse ? Integer.MIN_VALUE : Integer.MAX_VALUE)
+                  : (reverse ? Integer.MAX_VALUE : Integer.MIN_VALUE));
+          return sf;
+        }
+      case "double":
+      case "float":
+      case "half_float":
+        {
+          org.apache.lucene.search.SortedNumericSortField sf =
+              new org.apache.lucene.search.SortedNumericSortField(
+                  fieldName, org.apache.lucene.search.SortField.Type.DOUBLE, reverse);
+          sf.setMissingValue(
+              nullsFirst
+                  ? (reverse ? -Double.MAX_VALUE : Double.MAX_VALUE)
+                  : (reverse ? Double.MAX_VALUE : -Double.MAX_VALUE));
+          return sf;
+        }
+      case "boolean":
+        {
+          org.apache.lucene.search.SortedNumericSortField sf =
+              new org.apache.lucene.search.SortedNumericSortField(
+                  fieldName, org.apache.lucene.search.SortField.Type.LONG, reverse);
+          sf.setMissingValue(
+              nullsFirst
+                  ? (reverse ? Long.MIN_VALUE : Long.MAX_VALUE)
+                  : (reverse ? Long.MAX_VALUE : Long.MIN_VALUE));
+          return sf;
+        }
+      default:
+        {
+          org.apache.lucene.search.SortedSetSortField sf =
+              new org.apache.lucene.search.SortedSetSortField(fieldName, reverse);
+          if (nullsFirst) {
+            sf.setMissingValue(org.apache.lucene.search.SortField.STRING_FIRST);
+          } else {
+            sf.setMissingValue(org.apache.lucene.search.SortField.STRING_LAST);
+          }
+          return sf;
+        }
+    }
+  }
+
+  /** Read a single doc value from a specific segment and doc ID into a BlockBuilder. */
+  private static void readSingleDocValue(
+      org.apache.lucene.index.LeafReaderContext leaf,
+      int docId,
+      ColumnHandle column,
+      io.trino.spi.block.BlockBuilder builder)
+      throws java.io.IOException {
+    Type type = column.type();
+    String name = column.name();
+
+    if (type instanceof io.trino.spi.type.VarcharType) {
+      org.apache.lucene.index.SortedSetDocValues dv = leaf.reader().getSortedSetDocValues(name);
+      if (dv != null && dv.advanceExact(docId)) {
+        long ord = dv.nextOrd();
+        org.apache.lucene.util.BytesRef bytes = dv.lookupOrd(ord);
+        io.trino.spi.type.VarcharType.VARCHAR.writeSlice(
+            builder,
+            io.airlift.slice.Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+      } else {
+        builder.appendNull();
+      }
+    } else if (type instanceof DoubleType) {
+      org.apache.lucene.index.SortedNumericDocValues dv =
+          leaf.reader().getSortedNumericDocValues(name);
+      if (dv != null && dv.advanceExact(docId)) {
+        DoubleType.DOUBLE.writeDouble(builder, Double.longBitsToDouble(dv.nextValue()));
+      } else {
+        builder.appendNull();
+      }
+    } else if (type instanceof io.trino.spi.type.TimestampType) {
+      org.apache.lucene.index.SortedNumericDocValues dv =
+          leaf.reader().getSortedNumericDocValues(name);
+      if (dv != null && dv.advanceExact(docId)) {
+        long epochMillis = dv.nextValue();
+        io.trino.spi.type.TimestampType.TIMESTAMP_MILLIS.writeLong(builder, epochMillis * 1000L);
+      } else {
+        builder.appendNull();
+      }
+    } else if (type instanceof io.trino.spi.type.BooleanType) {
+      org.apache.lucene.index.SortedNumericDocValues dv =
+          leaf.reader().getSortedNumericDocValues(name);
+      if (dv != null && dv.advanceExact(docId)) {
+        io.trino.spi.type.BooleanType.BOOLEAN.writeBoolean(builder, dv.nextValue() == 1);
+      } else {
+        builder.appendNull();
+      }
+    } else {
+      // Numeric types (BigintType, IntegerType, SmallintType, TinyintType)
+      org.apache.lucene.index.SortedNumericDocValues dv =
+          leaf.reader().getSortedNumericDocValues(name);
+      if (dv != null && dv.advanceExact(docId)) {
+        type.writeLong(builder, dv.nextValue());
+      } else {
+        builder.appendNull();
+      }
+    }
   }
 }

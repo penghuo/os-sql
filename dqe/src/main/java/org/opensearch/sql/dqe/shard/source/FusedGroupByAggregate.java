@@ -2751,8 +2751,350 @@ public final class FusedGroupByAggregate {
 
       if (singleSegment && keyInfos.size() == 2) {
         // === Single-segment two-key fast path ===
-        // For exactly 2 keys (common: numeric + varchar), use open-addressing hash map
-        // with ordinals as the varchar key.
+
+        // Check if we can use the ordinal-indexed path: exactly one varchar key, one numeric
+        // key (no date_trunc/arith), COUNT(*) only, bounded ordinals. This replaces hash table
+        // operations with direct array indexing, eliminating hash computation and probing.
+        boolean allCountStar = true;
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i]) {
+            allCountStar = false;
+            break;
+          }
+        }
+        int varcharKeyIdx = -1, numericKeyIdx = -1;
+        if (allCountStar && numAggs == 1) {
+          for (int i = 0; i < 2; i++) {
+            KeyInfo ki = keyInfos.get(i);
+            if (ki.isVarchar && ki.exprFunc == null) {
+              varcharKeyIdx = i;
+            } else if (!ki.isVarchar && ki.exprFunc == null) {
+              numericKeyIdx = i;
+            }
+          }
+        }
+        if (varcharKeyIdx >= 0 && numericKeyIdx >= 0) {
+          // === Ordinal-indexed two-key COUNT(*) path ===
+          // Uses the varchar ordinal as a direct array index and maintains a small per-ordinal
+          // open-addressing map for the numeric key. Eliminates hash2() computation and two-key
+          // hash probing — critical for Q15 where SearchPhrase has 18K ordinals but
+          // SearchEngineID has only 39 distinct values.
+          LeafReaderContext leafCtx = leaves.get(0);
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+
+          SortedSetDocValues varcharDv =
+              reader.getSortedSetDocValues(keyInfos.get(varcharKeyIdx).name);
+          SortedNumericDocValues numericDv =
+              reader.getSortedNumericDocValues(keyInfos.get(numericKeyIdx).name);
+
+          if (varcharDv != null && numericDv != null) {
+            long valueCount = varcharDv.getValueCount();
+            // Limit: for very high cardinality varchars, fall through to hash map path
+            if (valueCount <= 500_000) {
+              int numOrds = (int) valueCount;
+
+              // Per-ordinal storage: for each ordinal, store (numericKey, count) pairs.
+              // Use a flat layout: numericKeys[ord * MAX_KEYS_PER_ORD + 0..n] and
+              // counts[ord * MAX_KEYS_PER_ORD + 0..n]. Since the numeric key has low
+              // cardinality (typically <100), we use a small fixed capacity per ordinal
+              // with linear scan. This is cache-friendly for small cardinalities.
+              final int KEYS_PER_ORD = 64;
+              // If total memory would exceed ~32MB, fall through
+              if ((long) numOrds * KEYS_PER_ORD * 16 <= 32_000_000L) {
+                long[] numericKeys = new long[numOrds * KEYS_PER_ORD];
+                long[] counts = new long[numOrds * KEYS_PER_ORD];
+                int[] numKeysPerOrd = new int[numOrds];
+                boolean overflowed = false;
+
+                if (query instanceof MatchAllDocsQuery) {
+                  if (liveDocs == null) {
+                    for (int doc = 0; doc < maxDoc; doc++) {
+                      if (!varcharDv.advanceExact(doc)) continue;
+                      long ord = varcharDv.nextOrd();
+                      if (!numericDv.advanceExact(doc)) continue;
+                      long nk = numericDv.nextValue();
+                      int base = (int) ord * KEYS_PER_ORD;
+                      int n = numKeysPerOrd[(int) ord];
+                      // Linear scan for matching numeric key
+                      int idx = -1;
+                      for (int j = 0; j < n; j++) {
+                        if (numericKeys[base + j] == nk) {
+                          idx = j;
+                          break;
+                        }
+                      }
+                      if (idx >= 0) {
+                        counts[base + idx]++;
+                      } else if (n < KEYS_PER_ORD) {
+                        numericKeys[base + n] = nk;
+                        counts[base + n] = 1;
+                        numKeysPerOrd[(int) ord]++;
+                      } else {
+                        overflowed = true;
+                        break;
+                      }
+                    }
+                  } else {
+                    for (int doc = 0; doc < maxDoc; doc++) {
+                      if (!liveDocs.get(doc)) continue;
+                      if (!varcharDv.advanceExact(doc)) continue;
+                      long ord = varcharDv.nextOrd();
+                      if (!numericDv.advanceExact(doc)) continue;
+                      long nk = numericDv.nextValue();
+                      int base = (int) ord * KEYS_PER_ORD;
+                      int n = numKeysPerOrd[(int) ord];
+                      int idx = -1;
+                      for (int j = 0; j < n; j++) {
+                        if (numericKeys[base + j] == nk) {
+                          idx = j;
+                          break;
+                        }
+                      }
+                      if (idx >= 0) {
+                        counts[base + idx]++;
+                      } else if (n < KEYS_PER_ORD) {
+                        numericKeys[base + n] = nk;
+                        counts[base + n] = 1;
+                        numKeysPerOrd[(int) ord]++;
+                      } else {
+                        overflowed = true;
+                        break;
+                      }
+                    }
+                  }
+                } else {
+                  // Filtered path using Lucene collector
+                  final boolean[] overflowFlag = {false};
+                  engineSearcher.search(
+                      query,
+                      new Collector() {
+                        @Override
+                        public LeafCollector getLeafCollector(LeafReaderContext context)
+                            throws IOException {
+                          return new LeafCollector() {
+                            @Override
+                            public void setScorer(Scorable scorer) {}
+
+                            @Override
+                            public void collect(int doc) throws IOException {
+                              if (overflowFlag[0]) return; // fast skip after overflow
+                              if (!varcharDv.advanceExact(doc)) return;
+                              long ord = varcharDv.nextOrd();
+                              if (!numericDv.advanceExact(doc)) return;
+                              long nk = numericDv.nextValue();
+                              int base = (int) ord * KEYS_PER_ORD;
+                              int n = numKeysPerOrd[(int) ord];
+                              int idx = -1;
+                              for (int j = 0; j < n; j++) {
+                                if (numericKeys[base + j] == nk) {
+                                  idx = j;
+                                  break;
+                                }
+                              }
+                              if (idx >= 0) {
+                                counts[base + idx]++;
+                              } else if (n < KEYS_PER_ORD) {
+                                numericKeys[base + n] = nk;
+                                counts[base + n] = 1;
+                                numKeysPerOrd[(int) ord]++;
+                              } else {
+                                overflowFlag[0] = true;
+                              }
+                            }
+                          };
+                        }
+
+                        @Override
+                        public ScoreMode scoreMode() {
+                          return ScoreMode.COMPLETE_NO_SCORES;
+                        }
+                      });
+                  overflowed = overflowFlag[0];
+                }
+
+                if (overflowed) {
+                  // Numeric key cardinality exceeded KEYS_PER_ORD per ordinal.
+                  // Fall through to the FlatTwoKeyMap path below.
+                } else {
+                  // Count total groups for output sizing
+                  int totalGroups = 0;
+                  for (int o = 0; o < numOrds; o++) {
+                    totalGroups += numKeysPerOrd[o];
+                  }
+                  if (totalGroups == 0) return List.of();
+
+                  // Build output Page or apply top-N selection
+                  int numGroupKeys = groupByKeys.size();
+                  int totalColumns = numGroupKeys + numAggs;
+
+                  if (sortAggIndex >= 0 && topN > 0 && topN < totalGroups) {
+                    // Top-N via min-heap: select top-N groups by count
+                    int n = (int) Math.min(topN, totalGroups);
+                    // Heap stores (ord, keyIdx) encoded as a single long: (ord << 32) | keyIdx
+                    long[] heap = new long[n];
+                    long[] heapVals = new long[n];
+                    int heapSize = 0;
+                    for (int o = 0; o < numOrds; o++) {
+                      int nk = numKeysPerOrd[o];
+                      int base = o * KEYS_PER_ORD;
+                      for (int j = 0; j < nk; j++) {
+                        long cnt = counts[base + j];
+                        if (heapSize < n) {
+                          heap[heapSize] = ((long) o << 32) | j;
+                          heapVals[heapSize] = cnt;
+                          heapSize++;
+                          // Sift up (min-heap for DESC, max-heap for ASC)
+                          int k = heapSize - 1;
+                          while (k > 0) {
+                            int parent = (k - 1) >>> 1;
+                            boolean swap =
+                                sortAscending
+                                    ? (heapVals[k] > heapVals[parent])
+                                    : (heapVals[k] < heapVals[parent]);
+                            if (swap) {
+                              long tmpL = heap[parent];
+                              heap[parent] = heap[k];
+                              heap[k] = tmpL;
+                              long tmpV = heapVals[parent];
+                              heapVals[parent] = heapVals[k];
+                              heapVals[k] = tmpV;
+                              k = parent;
+                            } else {
+                              break;
+                            }
+                          }
+                        } else {
+                          boolean better =
+                              sortAscending ? (cnt < heapVals[0]) : (cnt > heapVals[0]);
+                          if (better) {
+                            heap[0] = ((long) o << 32) | j;
+                            heapVals[0] = cnt;
+                            // Sift down
+                            int k = 0;
+                            while (true) {
+                              int left = 2 * k + 1;
+                              if (left >= heapSize) break;
+                              int right = left + 1;
+                              int target = left;
+                              if (right < heapSize) {
+                                boolean pickRight =
+                                    sortAscending
+                                        ? (heapVals[right] > heapVals[left])
+                                        : (heapVals[right] < heapVals[left]);
+                                if (pickRight) target = right;
+                              }
+                              boolean swap =
+                                  sortAscending
+                                      ? (heapVals[target] > heapVals[k])
+                                      : (heapVals[target] < heapVals[k]);
+                              if (swap) {
+                                long tmpL = heap[k];
+                                heap[k] = heap[target];
+                                heap[target] = tmpL;
+                                long tmpV = heapVals[k];
+                                heapVals[k] = heapVals[target];
+                                heapVals[target] = tmpV;
+                                k = target;
+                              } else {
+                                break;
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    // Sort heap by value for output
+                    for (int i = 1; i < heapSize; i++) {
+                      long key = heap[i];
+                      long keyVal = heapVals[i];
+                      int j = i - 1;
+                      while (j >= 0) {
+                        boolean needsSwap =
+                            sortAscending ? (heapVals[j] > keyVal) : (heapVals[j] < keyVal);
+                        if (needsSwap) {
+                          heap[j + 1] = heap[j];
+                          heapVals[j + 1] = heapVals[j];
+                          j--;
+                        } else {
+                          break;
+                        }
+                      }
+                      heap[j + 1] = key;
+                      heapVals[j + 1] = keyVal;
+                    }
+
+                    // Build output Page for top-N
+                    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+                    for (int i = 0; i < numGroupKeys; i++) {
+                      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, heapSize);
+                    }
+                    builders[numGroupKeys] = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+
+                    for (int si = 0; si < heapSize; si++) {
+                      long encoded = heap[si];
+                      int ord = (int) (encoded >>> 32);
+                      int keyIdx = (int) (encoded & 0xFFFFFFFFL);
+                      long nk = numericKeys[ord * KEYS_PER_ORD + keyIdx];
+                      long cnt = counts[ord * KEYS_PER_ORD + keyIdx];
+
+                      // Write keys in correct column order
+                      if (varcharKeyIdx == 0) {
+                        BytesRef bytes = varcharDv.lookupOrd(ord);
+                        VarcharType.VARCHAR.writeSlice(
+                            builders[0],
+                            Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+                        writeNumericKeyValue(builders[1], keyInfos.get(1), nk);
+                      } else {
+                        writeNumericKeyValue(builders[0], keyInfos.get(0), nk);
+                        BytesRef bytes = varcharDv.lookupOrd(ord);
+                        VarcharType.VARCHAR.writeSlice(
+                            builders[1],
+                            Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+                      }
+                      BigintType.BIGINT.writeLong(builders[numGroupKeys], cnt);
+                    }
+
+                    Block[] blocks = new Block[totalColumns];
+                    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+                    return List.of(new Page(blocks));
+                  } else {
+                    // No top-N: output all groups
+                    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+                    for (int i = 0; i < numGroupKeys; i++) {
+                      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, totalGroups);
+                    }
+                    builders[numGroupKeys] =
+                        BigintType.BIGINT.createBlockBuilder(null, totalGroups);
+                    for (int o = 0; o < numOrds; o++) {
+                      int nk = numKeysPerOrd[o];
+                      if (nk == 0) continue;
+                      int base = o * KEYS_PER_ORD;
+                      BytesRef bytes = varcharDv.lookupOrd(o);
+                      io.airlift.slice.Slice slice =
+                          Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length);
+                      for (int j = 0; j < nk; j++) {
+                        if (varcharKeyIdx == 0) {
+                          VarcharType.VARCHAR.writeSlice(builders[0], slice);
+                          writeNumericKeyValue(builders[1], keyInfos.get(1), numericKeys[base + j]);
+                        } else {
+                          writeNumericKeyValue(builders[0], keyInfos.get(0), numericKeys[base + j]);
+                          VarcharType.VARCHAR.writeSlice(builders[1], slice);
+                        }
+                        BigintType.BIGINT.writeLong(builders[numGroupKeys], counts[base + j]);
+                      }
+                    }
+                    Block[] blocks = new Block[totalColumns];
+                    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+                    return List.of(new Page(blocks));
+                  }
+                } // end of !overflowed else block
+              }
+            }
+          }
+          // Fall through to FlatTwoKeyMap path if ordinal-indexed path not applicable
+        }
 
         // Check if all aggregates can use flat long[] storage
         boolean canUseFlatVarchar = true;
@@ -2796,100 +3138,307 @@ public final class FusedGroupByAggregate {
           final int flatSlotsPerGroup = flatTotalSlots;
           final FlatTwoKeyMap flatMap = new FlatTwoKeyMap(flatSlotsPerGroup);
           final Object[][] keyReadersHolder = new Object[1][];
+          final boolean key0Varchar = keyInfos.get(0).isVarchar;
+          final boolean key1Varchar = keyInfos.get(1).isVarchar;
 
-          engineSearcher.search(
-              query,
-              new Collector() {
-                @Override
-                public LeafCollector getLeafCollector(LeafReaderContext context)
-                    throws IOException {
-                  Object[] keyReaders = new Object[2];
-                  for (int i = 0; i < 2; i++) {
-                    KeyInfo ki = keyInfos.get(i);
-                    if (ki.isVarchar) {
-                      keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
-                    } else {
-                      keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+          if (query instanceof MatchAllDocsQuery) {
+            // === MatchAllDocsQuery fast path ===
+            // Iterate docs directly without Lucene's Collector/BulkScorer framework.
+            // Eliminates virtual dispatch overhead per doc and BulkScorer construction.
+            LeafReaderContext leafCtx = leaves.get(0);
+            LeafReader reader = leafCtx.reader();
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+
+            // Open key readers
+            Object[] keyReaders = new Object[2];
+            for (int i = 0; i < 2; i++) {
+              KeyInfo ki = keyInfos.get(i);
+              if (ki.isVarchar) {
+                keyReaders[i] = reader.getSortedSetDocValues(ki.name);
+              } else {
+                keyReaders[i] = reader.getSortedNumericDocValues(ki.name);
+              }
+            }
+            keyReadersHolder[0] = keyReaders;
+
+            // Open aggregate doc values
+            SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              if (!isCountStar[i]) {
+                numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+              }
+            }
+
+            // Check for count-star-only fast path (no aggregate DV reads needed)
+            boolean allCountStarFlat = true;
+            for (int i = 0; i < numAggs; i++) {
+              if (!isCountStar[i]) {
+                allCountStarFlat = false;
+                break;
+              }
+            }
+
+            if (allCountStarFlat) {
+              // Ultra-fast path: COUNT(*) only -- no aggregate DV reads
+              if (liveDocs == null) {
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  long k0 = 0, k1 = 0;
+                  if (key0Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k0 = dv.nextValue();
+                      if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                      else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
                     }
                   }
-                  keyReadersHolder[0] = keyReaders;
-
-                  final SortedNumericDocValues[] numericAggDvs =
-                      new SortedNumericDocValues[numAggs];
+                  if (key1Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k1 = dv.nextValue();
+                      if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                      else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                    }
+                  }
+                  int slot = flatMap.findOrInsert(k0, k1);
+                  flatMap.accData[slot * flatSlotsPerGroup]++;
+                }
+              } else {
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  if (!liveDocs.get(doc)) continue;
+                  long k0 = 0, k1 = 0;
+                  if (key0Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k0 = dv.nextValue();
+                      if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                      else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+                    }
+                  }
+                  if (key1Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k1 = dv.nextValue();
+                      if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                      else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                    }
+                  }
+                  int slot = flatMap.findOrInsert(k0, k1);
+                  flatMap.accData[slot * flatSlotsPerGroup]++;
+                }
+              }
+            } else {
+              // General MatchAllDocsQuery fast path with aggregate reads
+              if (liveDocs == null) {
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  long k0 = 0, k1 = 0;
+                  if (key0Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k0 = dv.nextValue();
+                      if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                      else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+                    }
+                  }
+                  if (key1Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k1 = dv.nextValue();
+                      if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                      else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                    }
+                  }
+                  int slot = flatMap.findOrInsert(k0, k1);
+                  int base = slot * flatSlotsPerGroup;
                   for (int i = 0; i < numAggs; i++) {
-                    if (!isCountStar[i]) {
-                      numericAggDvs[i] =
-                          context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                    int off = base + flatAccOffset[i];
+                    if (isCountStar[i]) {
+                      flatMap.accData[off]++;
+                      continue;
+                    }
+                    SortedNumericDocValues aggDv = numericAggDvs[i];
+                    if (aggDv != null && aggDv.advanceExact(doc)) {
+                      long rawVal = aggDv.nextValue();
+                      switch (accType[i]) {
+                        case 0:
+                          flatMap.accData[off]++;
+                          break;
+                        case 1:
+                          flatMap.accData[off] += rawVal;
+                          break;
+                        case 2:
+                          flatMap.accData[off] += rawVal;
+                          flatMap.accData[off + 1]++;
+                          break;
+                      }
                     }
                   }
-
-                  final boolean key0Varchar = keyInfos.get(0).isVarchar;
-                  final boolean key1Varchar = keyInfos.get(1).isVarchar;
-
-                  return new LeafCollector() {
-                    @Override
-                    public void setScorer(Scorable scorer) {}
-
-                    @Override
-                    public void collect(int doc) throws IOException {
-                      long k0 = 0, k1 = 0;
-                      if (key0Varchar) {
-                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
-                        if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
-                      } else {
-                        SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
-                        if (dv != null && dv.advanceExact(doc)) {
-                          k0 = dv.nextValue();
-                          if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
-                          else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
-                        }
-                      }
-                      if (key1Varchar) {
-                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
-                        if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
-                      } else {
-                        SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
-                        if (dv != null && dv.advanceExact(doc)) {
-                          k1 = dv.nextValue();
-                          if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
-                          else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
-                        }
-                      }
-                      int slot = flatMap.findOrInsert(k0, k1);
-                      int base = slot * flatSlotsPerGroup;
-
-                      for (int i = 0; i < numAggs; i++) {
-                        int off = base + flatAccOffset[i];
-                        if (isCountStar[i]) {
+                }
+              } else {
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  if (!liveDocs.get(doc)) continue;
+                  long k0 = 0, k1 = 0;
+                  if (key0Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k0 = dv.nextValue();
+                      if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                      else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+                    }
+                  }
+                  if (key1Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k1 = dv.nextValue();
+                      if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                      else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                    }
+                  }
+                  int slot = flatMap.findOrInsert(k0, k1);
+                  int base = slot * flatSlotsPerGroup;
+                  for (int i = 0; i < numAggs; i++) {
+                    int off = base + flatAccOffset[i];
+                    if (isCountStar[i]) {
+                      flatMap.accData[off]++;
+                      continue;
+                    }
+                    SortedNumericDocValues aggDv = numericAggDvs[i];
+                    if (aggDv != null && aggDv.advanceExact(doc)) {
+                      long rawVal = aggDv.nextValue();
+                      switch (accType[i]) {
+                        case 0:
                           flatMap.accData[off]++;
-                          continue;
+                          break;
+                        case 1:
+                          flatMap.accData[off] += rawVal;
+                          break;
+                        case 2:
+                          flatMap.accData[off] += rawVal;
+                          flatMap.accData[off + 1]++;
+                          break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            // === General Collector path for filtered queries ===
+            engineSearcher.search(
+                query,
+                new Collector() {
+                  @Override
+                  public LeafCollector getLeafCollector(LeafReaderContext context)
+                      throws IOException {
+                    Object[] keyReaders = new Object[2];
+                    for (int i = 0; i < 2; i++) {
+                      KeyInfo ki = keyInfos.get(i);
+                      if (ki.isVarchar) {
+                        keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
+                      } else {
+                        keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+                      }
+                    }
+                    keyReadersHolder[0] = keyReaders;
+
+                    final SortedNumericDocValues[] numericAggDvs =
+                        new SortedNumericDocValues[numAggs];
+                    for (int i = 0; i < numAggs; i++) {
+                      if (!isCountStar[i]) {
+                        numericAggDvs[i] =
+                            context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                      }
+                    }
+
+                    return new LeafCollector() {
+                      @Override
+                      public void setScorer(Scorable scorer) {}
+
+                      @Override
+                      public void collect(int doc) throws IOException {
+                        long k0 = 0, k1 = 0;
+                        if (key0Varchar) {
+                          SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+                          if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                        } else {
+                          SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+                          if (dv != null && dv.advanceExact(doc)) {
+                            k0 = dv.nextValue();
+                            if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                            else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+                          }
                         }
-                        SortedNumericDocValues aggDv = numericAggDvs[i];
-                        if (aggDv != null && aggDv.advanceExact(doc)) {
-                          long rawVal = aggDv.nextValue();
-                          switch (accType[i]) {
-                            case 0:
-                              flatMap.accData[off]++;
-                              break;
-                            case 1:
-                              flatMap.accData[off] += rawVal;
-                              break;
-                            case 2:
-                              flatMap.accData[off] += rawVal;
-                              flatMap.accData[off + 1]++;
-                              break;
+                        if (key1Varchar) {
+                          SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+                          if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                        } else {
+                          SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+                          if (dv != null && dv.advanceExact(doc)) {
+                            k1 = dv.nextValue();
+                            if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                            else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                          }
+                        }
+                        int slot = flatMap.findOrInsert(k0, k1);
+                        int base = slot * flatSlotsPerGroup;
+
+                        for (int i = 0; i < numAggs; i++) {
+                          int off = base + flatAccOffset[i];
+                          if (isCountStar[i]) {
+                            flatMap.accData[off]++;
+                            continue;
+                          }
+                          SortedNumericDocValues aggDv = numericAggDvs[i];
+                          if (aggDv != null && aggDv.advanceExact(doc)) {
+                            long rawVal = aggDv.nextValue();
+                            switch (accType[i]) {
+                              case 0:
+                                flatMap.accData[off]++;
+                                break;
+                              case 1:
+                                flatMap.accData[off] += rawVal;
+                                break;
+                              case 2:
+                                flatMap.accData[off] += rawVal;
+                                flatMap.accData[off + 1]++;
+                                break;
+                            }
                           }
                         }
                       }
-                    }
-                  };
-                }
+                    };
+                  }
 
-                @Override
-                public ScoreMode scoreMode() {
-                  return ScoreMode.COMPLETE_NO_SCORES;
-                }
-              });
+                  @Override
+                  public ScoreMode scoreMode() {
+                    return ScoreMode.COMPLETE_NO_SCORES;
+                  }
+                });
+          } // end of general Collector path
 
           if (flatMap.size == 0) return List.of();
 

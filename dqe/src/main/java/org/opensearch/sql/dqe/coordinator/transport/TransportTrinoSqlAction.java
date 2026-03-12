@@ -1892,6 +1892,7 @@ public class TransportTrinoSqlAction
     boolean[] isMin = new boolean[numOrigAggs];
     boolean[] isMax = new boolean[numOrigAggs];
     boolean[] isOutputDouble = new boolean[numOrigAggs];
+    boolean[] isVarcharAgg = new boolean[numOrigAggs];
     java.util.Arrays.fill(shardAggIdx, -1);
     java.util.Arrays.fill(shardCountIdx, -1);
 
@@ -1917,12 +1918,14 @@ public class TransportTrinoSqlAction
         shardAggIdx[i] = shardAggOffset;
         Type aggType = dedupTypes.get(numDedupKeys + shardAggOffset);
         isOutputDouble[i] = aggType instanceof DoubleType;
+        isVarcharAgg[i] = aggType instanceof VarcharType;
         shardAggOffset++;
       } else if ("MAX".equals(funcName)) {
         isMax[i] = true;
         shardAggIdx[i] = shardAggOffset;
         Type aggType = dedupTypes.get(numDedupKeys + shardAggOffset);
         isOutputDouble[i] = aggType instanceof DoubleType;
+        isVarcharAgg[i] = aggType instanceof VarcharType;
         shardAggOffset++;
       } else {
         // SUM, COUNT(*)
@@ -1953,6 +1956,9 @@ public class TransportTrinoSqlAction
       // Use a simple structure: for each group, store values in fixed-size array
       int numValues = numOrigAggs * 2; // space for sum + count for AVG, value for others
       java.util.HashMap<Long, double[]> groups = new java.util.HashMap<>();
+      // Separate storage for VARCHAR MIN/MAX values (keyed by group key)
+      java.util.HashMap<Long, String[]> varcharAccums =
+          hasAnyVarcharAgg(isVarcharAgg) ? new java.util.HashMap<>() : null;
 
       for (Page page : dedupedPages) {
         Block keyBlock = page.getBlock(0);
@@ -1980,6 +1986,19 @@ public class TransportTrinoSqlAction
                   vals[a * 2] += sumType.getLong(sumBlock, pos);
                 }
                 vals[a * 2 + 1] += BigintType.BIGINT.getLong(cntBlock, pos);
+              }
+            } else if ((isMin[a] || isMax[a]) && isVarcharAgg[a]) {
+              // VARCHAR MIN/MAX: compare as strings, store in separate map
+              int col = numDedupKeys + shardAggIdx[a];
+              Block valBlock = page.getBlock(col);
+              if (!valBlock.isNull(pos)) {
+                String sv = VarcharType.VARCHAR.getSlice(valBlock, pos).toStringUtf8();
+                String[] vVals = varcharAccums.computeIfAbsent(key, k -> new String[numOrigAggs]);
+                if (vVals[a] == null) {
+                  vVals[a] = sv;
+                } else if (isMin[a] ? sv.compareTo(vVals[a]) < 0 : sv.compareTo(vVals[a]) > 0) {
+                  vVals[a] = sv;
+                }
               }
             } else if (isMin[a] || isMax[a]) {
               int col = numDedupKeys + shardAggIdx[a];
@@ -2036,6 +2055,7 @@ public class TransportTrinoSqlAction
           kt.writeLong(builders[0], key);
         }
         // Write aggregate values
+        String[] vVals = varcharAccums != null ? varcharAccums.get(key) : null;
         for (int a = 0; a < numOrigAggs; a++) {
           Type outType = columnTypes.get(numOriginalKeys + a);
           if (isCountDistinct[a]) {
@@ -2045,6 +2065,14 @@ public class TransportTrinoSqlAction
             double count = vals[a * 2 + 1];
             DoubleType.DOUBLE.writeDouble(
                 builders[numOriginalKeys + a], count > 0 ? sum / count : 0.0);
+          } else if (isVarcharAgg[a]) {
+            String sv = vVals != null ? vVals[a] : null;
+            if (sv != null) {
+              VarcharType.VARCHAR.writeSlice(
+                  builders[numOriginalKeys + a], io.airlift.slice.Slices.utf8Slice(sv));
+            } else {
+              builders[numOriginalKeys + a].appendNull();
+            }
           } else if (outType instanceof DoubleType) {
             DoubleType.DOUBLE.writeDouble(builders[numOriginalKeys + a], vals[a * 2]);
           } else {
@@ -2069,6 +2097,9 @@ public class TransportTrinoSqlAction
 
     int numValues = numOrigAggs * 2;
     java.util.LinkedHashMap<Object, double[]> groups = new java.util.LinkedHashMap<>();
+    // Separate storage for VARCHAR MIN/MAX values (keyed by group key)
+    java.util.LinkedHashMap<Object, String[]> varcharGroups =
+        hasAnyVarcharAgg(isVarcharAgg) ? new java.util.LinkedHashMap<>() : null;
 
     for (Page page : dedupedPages) {
       for (int pos = 0; pos < page.getPositionCount(); pos++) {
@@ -2100,6 +2131,19 @@ public class TransportTrinoSqlAction
                 vals[a * 2] += sumType.getLong(sumBlock, pos);
               }
               vals[a * 2 + 1] += BigintType.BIGINT.getLong(cntBlock, pos);
+            }
+          } else if ((isMin[a] || isMax[a]) && isVarcharAgg[a]) {
+            // VARCHAR MIN/MAX: compare as strings, store in separate map
+            int col = numDedupKeys + shardAggIdx[a];
+            Block valBlock = page.getBlock(col);
+            if (!valBlock.isNull(pos)) {
+              String sv = VarcharType.VARCHAR.getSlice(valBlock, pos).toStringUtf8();
+              String[] vVals = varcharGroups.computeIfAbsent(key, k -> new String[numOrigAggs]);
+              if (vVals[a] == null) {
+                vVals[a] = sv;
+              } else if (isMin[a] ? sv.compareTo(vVals[a]) < 0 : sv.compareTo(vVals[a]) > 0) {
+                vVals[a] = sv;
+              }
             }
           } else if (isMin[a] || isMax[a]) {
             int col = numDedupKeys + shardAggIdx[a];
@@ -2159,6 +2203,7 @@ public class TransportTrinoSqlAction
           appendTypedValue(builders[i], keyTypes[i], multiKey.get(i));
         }
       }
+      String[] vVals = varcharGroups != null ? varcharGroups.get(key) : null;
       for (int a = 0; a < numOrigAggs; a++) {
         Type outType = columnTypes.get(numOriginalKeys + a);
         if (isCountDistinct[a]) {
@@ -2168,6 +2213,14 @@ public class TransportTrinoSqlAction
           double count = vals[a * 2 + 1];
           DoubleType.DOUBLE.writeDouble(
               builders[numOriginalKeys + a], count > 0 ? sum / count : 0.0);
+        } else if (isVarcharAgg[a]) {
+          String sv = vVals != null ? vVals[a] : null;
+          if (sv != null) {
+            VarcharType.VARCHAR.writeSlice(
+                builders[numOriginalKeys + a], io.airlift.slice.Slices.utf8Slice(sv));
+          } else {
+            builders[numOriginalKeys + a].appendNull();
+          }
         } else if (outType instanceof DoubleType) {
           DoubleType.DOUBLE.writeDouble(builders[numOriginalKeys + a], vals[a * 2]);
         } else {
@@ -2181,6 +2234,14 @@ public class TransportTrinoSqlAction
       blocks[i] = builders[i].build();
     }
     return List.of(new Page(blocks));
+  }
+
+  /** Check if any element in the boolean array is true. */
+  private static boolean hasAnyVarcharAgg(boolean[] isVarcharAgg) {
+    for (boolean v : isVarcharAgg) {
+      if (v) return true;
+    }
+    return false;
   }
 
   /**

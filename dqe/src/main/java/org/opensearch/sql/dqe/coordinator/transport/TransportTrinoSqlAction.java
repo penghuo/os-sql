@@ -1564,21 +1564,59 @@ public class TransportTrinoSqlAction
   /**
    * Merge pre-deduplicated distinct VARCHAR value pages from all shards into a single
    * COUNT(DISTINCT) result. Each shard sends a page of unique string values; the coordinator unions
-   * them via HashSet&lt;String&gt; and returns the count.
+   * them via a zero-allocation open-addressing hash set and returns the count.
+   *
+   * <p>Uses {@link org.opensearch.sql.dqe.operator.SliceRangeHashSet} which operates directly on
+   * raw byte ranges from VariableWidthBlock, avoiding all per-entry object allocation: no String
+   * conversion (UTF-16 decoding), no Slice copying, no boxing. Pre-sizes the hash set based on
+   * total values across all shards to avoid resize overhead.
    *
    * @param shardPages pages from each shard, each containing distinct values as a VarcharType
    *     column
    * @return single-row page with the global distinct count
    */
   private static List<Page> mergeCountDistinctVarcharValues(List<List<Page>> shardPages) {
-    java.util.HashSet<String> globalSet = new java.util.HashSet<>();
+    // Pre-compute total values to pre-size the hash set (avoids expensive resizing)
+    int totalValues = 0;
+    for (List<Page> pages : shardPages) {
+      for (Page page : pages) {
+        totalValues += page.getPositionCount();
+      }
+    }
+    // Zero-allocation open-addressing hash set: stores (Slice ref, offset, length) triples
+    // referencing the raw block bytes. No String or Slice object allocated per entry.
+    org.opensearch.sql.dqe.operator.SliceRangeHashSet globalSet =
+        new org.opensearch.sql.dqe.operator.SliceRangeHashSet(totalValues);
     for (List<Page> pages : shardPages) {
       for (Page page : pages) {
         Block block = page.getBlock(0);
         int positionCount = page.getPositionCount();
-        for (int pos = 0; pos < positionCount; pos++) {
-          if (!block.isNull(pos)) {
-            globalSet.add(VarcharType.VARCHAR.getSlice(block, pos).toStringUtf8());
+        if (block instanceof io.trino.spi.block.VariableWidthBlock vwb) {
+          // Fast path: access raw slice directly — zero object allocation per position
+          io.airlift.slice.Slice rawSlice = vwb.getRawSlice();
+          if (!vwb.mayHaveNull()) {
+            // No nulls: skip null check entirely
+            for (int pos = 0; pos < positionCount; pos++) {
+              globalSet.add(rawSlice, vwb.getRawSliceOffset(pos), vwb.getSliceLength(pos));
+            }
+          } else {
+            for (int pos = 0; pos < positionCount; pos++) {
+              if (!vwb.isNull(pos)) {
+                globalSet.add(rawSlice, vwb.getRawSliceOffset(pos), vwb.getSliceLength(pos));
+              }
+            }
+          }
+        } else {
+          // Fallback for other block types (e.g., DictionaryBlock)
+          io.trino.spi.block.VariableWidthBlock underlying =
+              (io.trino.spi.block.VariableWidthBlock) block.getUnderlyingValueBlock();
+          io.airlift.slice.Slice rawSlice = underlying.getRawSlice();
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (!block.isNull(pos)) {
+              int uPos = block.getUnderlyingValuePosition(pos);
+              globalSet.add(
+                  rawSlice, underlying.getRawSliceOffset(uPos), underlying.getSliceLength(uPos));
+            }
           }
         }
       }

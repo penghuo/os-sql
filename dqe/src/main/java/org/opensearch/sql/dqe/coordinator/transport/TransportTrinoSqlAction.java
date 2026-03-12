@@ -1837,6 +1837,14 @@ public class TransportTrinoSqlAction
       }
     }
 
+    if (allNumericDedup && numOriginalKeys == 1 && numDedupKeys == 2) {
+      // Ultra-fast 2-key fused path: uses two flat long[] arrays instead of long[][]
+      // to eliminate all per-entry array allocation and indirection. For Q9-style
+      // GROUP BY RegionID COUNT(DISTINCT UserID), this avoids 80K long[2] allocations.
+      return mergeDedupCountDistinct2Key(
+          shardPages, dedupTypes, numOriginalKeys, numCountDistinctAggs);
+    }
+
     if (allNumericDedup && numOriginalKeys == 1) {
       // Fused: Build dedup hashmap from shard pages, then count per original key.
       // Uses open-addressing hash map with long[] keys for zero-allocation inner loop.
@@ -2039,11 +2047,406 @@ public class TransportTrinoSqlAction
   }
 
   /**
+   * Ultra-fast 2-key fused merge for COUNT(DISTINCT) with exactly 2 numeric dedup keys and 1
+   * numeric original key. Uses two flat long[] arrays instead of long[][] to eliminate all
+   * per-entry array allocation. For Q9-style queries (GROUP BY RegionID, COUNT(DISTINCT UserID)),
+   * this processes ~327K shard rows with zero allocation in the inner loop.
+   *
+   * <p>Stage 1: Build open-addressing hash map from (key0, key1) pairs, summing COUNT(*) values.
+   * Stage 2: Count entries per original key (key0) to get COUNT(DISTINCT).
+   */
+  private static List<Page> mergeDedupCountDistinct2Key(
+      List<List<Page>> shardPages,
+      List<Type> dedupTypes,
+      int numOriginalKeys,
+      int numCountDistinctAggs) {
+    // Pre-size capacity based on estimated unique pairs (avoid resizing)
+    int estimatedUnique = 0;
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        estimatedUnique += page.getPositionCount();
+      }
+    }
+    // Start with next power of two above estimated / load_factor
+    int capacity = Integer.highestOneBit(Math.max(1024, (int) (estimatedUnique / 0.65f))) << 1;
+    float loadFactor = 0.65f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKey0 = new long[capacity];
+    long[] mapKey1 = new long[capacity];
+    boolean[] mapOccupied = new boolean[capacity];
+    // No mapCounts needed — for COUNT(DISTINCT), we just need the unique pairs.
+    // Stage 2 directly counts entries per group key.
+
+    Type type0 = dedupTypes.get(0);
+    Type type1 = dedupTypes.get(1);
+
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        int positionCount = page.getPositionCount();
+        Block block0 = page.getBlock(0);
+        Block block1 = page.getBlock(1);
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long k0 = type0.getLong(block0, pos);
+          long k1 = type1.getLong(block1, pos);
+          // Murmur-style hash mix for better distribution
+          int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
+          int mask = capacity - 1;
+          int slot = hash & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKey0[slot] = k0;
+              mapKey1[slot] = k1;
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                // Resize
+                int newCap = capacity * 2;
+                long[] nk0 = new long[newCap];
+                long[] nk1 = new long[newCap];
+                boolean[] no = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    int h = Long.hashCode(mapKey0[s]) * 0x9E3779B9 + Long.hashCode(mapKey1[s]);
+                    int ns = h & nm;
+                    while (no[ns]) ns = (ns + 1) & nm;
+                    nk0[ns] = mapKey0[s];
+                    nk1[ns] = mapKey1[s];
+                    no[ns] = true;
+                  }
+                }
+                mapKey0 = nk0;
+                mapKey1 = nk1;
+                mapOccupied = no;
+                capacity = newCap;
+                mask = nm;
+                threshold = (int) (newCap * loadFactor);
+                // Re-probe is unnecessary — key was just inserted before resize
+              }
+              break;
+            }
+            if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
+              break; // duplicate — skip
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) {
+      return List.of();
+    }
+
+    // Stage 2: Count entries per original key (key0)
+    // Use primitive long→long open-addressing map to avoid boxing
+    int grpCap = 256;
+    long[] grpKeys = new long[grpCap];
+    long[] grpCounts = new long[grpCap];
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
+
+    for (int s = 0; s < capacity; s++) {
+      if (!mapOccupied[s]) continue;
+      long origKey = mapKey0[s];
+      int gm = grpCap - 1;
+      int gs = Long.hashCode(origKey) & gm;
+      while (grpOcc[gs] && grpKeys[gs] != origKey) {
+        gs = (gs + 1) & gm;
+      }
+      if (grpOcc[gs]) {
+        grpCounts[gs]++;
+      } else {
+        grpKeys[gs] = origKey;
+        grpCounts[gs] = 1;
+        grpOcc[gs] = true;
+        grpSize++;
+        if (grpSize > grpThreshold) {
+          int newGC = grpCap * 2;
+          long[] ngk = new long[newGC];
+          long[] ngc = new long[newGC];
+          boolean[] ngo = new boolean[newGC];
+          int ngm = newGC - 1;
+          for (int g = 0; g < grpCap; g++) {
+            if (grpOcc[g]) {
+              int ns = Long.hashCode(grpKeys[g]) & ngm;
+              while (ngo[ns]) ns = (ns + 1) & ngm;
+              ngk[ns] = grpKeys[g];
+              ngc[ns] = grpCounts[g];
+              ngo[ns] = true;
+            }
+          }
+          grpKeys = ngk;
+          grpCounts = ngc;
+          grpOcc = ngo;
+          grpCap = newGC;
+          grpThreshold = (int) (newGC * 0.7f);
+        }
+      }
+    }
+
+    // Build result page
+    Type keyType = dedupTypes.get(0);
+    int numOutputCols = numOriginalKeys + numCountDistinctAggs;
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    builders[0] = keyType.createBlockBuilder(null, grpSize);
+    for (int i = numOriginalKeys; i < numOutputCols; i++) {
+      builders[i] = BigintType.BIGINT.createBlockBuilder(null, grpSize);
+    }
+
+    for (int gs = 0; gs < grpCap; gs++) {
+      if (!grpOcc[gs]) continue;
+      long key = grpKeys[gs];
+      if (keyType instanceof IntegerType) {
+        IntegerType.INTEGER.writeLong(builders[0], (int) key);
+      } else {
+        keyType.writeLong(builders[0], key);
+      }
+      // Write the same count for all COUNT(DISTINCT) columns
+      for (int i = numOriginalKeys; i < numOutputCols; i++) {
+        BigintType.BIGINT.writeLong(builders[i], grpCounts[gs]);
+      }
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
+  /**
    * Check if the shard plan uses mixed-aggregate dedup. Returns true when the shard plan is a
    * PARTIAL AggregationNode whose GROUP BY keys are a superset of the original SINGLE aggregation's
    * GROUP BY keys, AND the shard has more aggregate functions than just COUNT(*) (distinguishing
    * from the COUNT-DISTINCT-only dedup path).
    */
+
+  /**
+   * Ultra-fast 2-key fused merge for mixed-aggregate dedup queries (Q10-style). Uses two flat
+   * long[] arrays instead of long[][] to eliminate per-entry allocation. Combines Stage 1 (dedup
+   * merge) and Stage 2 (re-aggregate by original key) into a single pass.
+   */
+  private static List<Page> mergeMixedDedup2Key(
+      List<List<Page>> shardPages,
+      List<Type> dedupTypes,
+      int numDedupKeys,
+      int numShardAggs,
+      int numOriginalKeys,
+      int numOrigAggs,
+      boolean[] isCountDistinct,
+      boolean[] isAvg,
+      int[] shardAggIdx,
+      int[] shardCountIdx,
+      List<Type> columnTypes) {
+    // Pre-size capacity
+    int estimatedUnique = 0;
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        estimatedUnique += page.getPositionCount();
+      }
+    }
+    int capacity = Integer.highestOneBit(Math.max(1024, (int) (estimatedUnique / 0.65f))) << 1;
+    float loadFactor = 0.65f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[] mapKey0 = new long[capacity];
+    long[] mapKey1 = new long[capacity];
+    // Flatten agg values: aggs[slot * numShardAggs + a]
+    long[] mapAggs = new long[capacity * numShardAggs];
+    boolean[] mapOccupied = new boolean[capacity];
+
+    Type type0 = dedupTypes.get(0);
+    Type type1 = dedupTypes.get(1);
+
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        int positionCount = page.getPositionCount();
+        Block block0 = page.getBlock(0);
+        Block block1 = page.getBlock(1);
+        Block[] aggBlocks = new Block[numShardAggs];
+        for (int a = 0; a < numShardAggs; a++) {
+          aggBlocks[a] = page.getBlock(numDedupKeys + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          long k0 = type0.getLong(block0, pos);
+          long k1 = type1.getLong(block1, pos);
+          int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
+          int mask = capacity - 1;
+          int slot = hash & mask;
+          while (true) {
+            if (!mapOccupied[slot]) {
+              mapKey0[slot] = k0;
+              mapKey1[slot] = k1;
+              int base = slot * numShardAggs;
+              for (int a = 0; a < numShardAggs; a++) {
+                if (!aggBlocks[a].isNull(pos)) {
+                  mapAggs[base + a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                }
+              }
+              mapOccupied[slot] = true;
+              size++;
+              if (size > threshold) {
+                int newCap = capacity * 2;
+                long[] nk0 = new long[newCap];
+                long[] nk1 = new long[newCap];
+                long[] na = new long[newCap * numShardAggs];
+                boolean[] no = new boolean[newCap];
+                int nm = newCap - 1;
+                for (int s = 0; s < capacity; s++) {
+                  if (mapOccupied[s]) {
+                    int h = Long.hashCode(mapKey0[s]) * 0x9E3779B9 + Long.hashCode(mapKey1[s]);
+                    int ns = h & nm;
+                    while (no[ns]) ns = (ns + 1) & nm;
+                    nk0[ns] = mapKey0[s];
+                    nk1[ns] = mapKey1[s];
+                    System.arraycopy(
+                        mapAggs, s * numShardAggs, na, ns * numShardAggs, numShardAggs);
+                    no[ns] = true;
+                  }
+                }
+                mapKey0 = nk0;
+                mapKey1 = nk1;
+                mapAggs = na;
+                mapOccupied = no;
+                capacity = newCap;
+                mask = nm;
+                threshold = (int) (newCap * loadFactor);
+              }
+              break;
+            }
+            if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
+              // Merge: SUM for all COUNT/SUM shard aggs
+              int base = slot * numShardAggs;
+              for (int a = 0; a < numShardAggs; a++) {
+                if (!aggBlocks[a].isNull(pos)) {
+                  mapAggs[base + a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+                }
+              }
+              break;
+            }
+            slot = (slot + 1) & mask;
+          }
+        }
+      }
+    }
+
+    if (size == 0) {
+      return List.of();
+    }
+
+    // Stage 2: Re-aggregate by original key (key0)
+    int numValues = numOrigAggs * 2;
+    // Use primitive long→double[] open-addressing map
+    int grpCap = 256;
+    long[] grpKeys = new long[grpCap];
+    double[][] grpVals = new double[grpCap][];
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
+
+    for (int s = 0; s < capacity; s++) {
+      if (!mapOccupied[s]) continue;
+      long origKey = mapKey0[s];
+      int gm = grpCap - 1;
+      int gs = Long.hashCode(origKey) & gm;
+      while (grpOcc[gs] && grpKeys[gs] != origKey) {
+        gs = (gs + 1) & gm;
+      }
+      if (!grpOcc[gs]) {
+        grpKeys[gs] = origKey;
+        grpVals[gs] = new double[numValues];
+        grpOcc[gs] = true;
+        grpSize++;
+        if (grpSize > grpThreshold) {
+          int newGC = grpCap * 2;
+          long[] ngk = new long[newGC];
+          double[][] ngv = new double[newGC][];
+          boolean[] ngo = new boolean[newGC];
+          int ngm = newGC - 1;
+          for (int g = 0; g < grpCap; g++) {
+            if (grpOcc[g]) {
+              int ns = Long.hashCode(grpKeys[g]) & ngm;
+              while (ngo[ns]) ns = (ns + 1) & ngm;
+              ngk[ns] = grpKeys[g];
+              ngv[ns] = grpVals[g];
+              ngo[ns] = true;
+            }
+          }
+          grpKeys = ngk;
+          grpVals = ngv;
+          grpOcc = ngo;
+          grpCap = newGC;
+          grpThreshold = (int) (newGC * 0.7f);
+          // Re-probe
+          gm = grpCap - 1;
+          gs = Long.hashCode(origKey) & gm;
+          while (grpOcc[gs] && grpKeys[gs] != origKey) {
+            gs = (gs + 1) & gm;
+          }
+        }
+      }
+      double[] vals = grpVals[gs];
+      int base = s * numShardAggs;
+      for (int a = 0; a < numOrigAggs; a++) {
+        if (isCountDistinct[a]) {
+          vals[a * 2]++;
+        } else if (isAvg[a]) {
+          vals[a * 2] += mapAggs[base + shardAggIdx[a]]; // sum
+          vals[a * 2 + 1] += mapAggs[base + shardCountIdx[a]]; // count
+        } else {
+          vals[a * 2] += mapAggs[base + shardAggIdx[a]];
+        }
+      }
+    }
+
+    // Build result page
+    int numOutputCols = numOriginalKeys + numOrigAggs;
+    Type keyType = dedupTypes.get(0);
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    builders[0] = keyType.createBlockBuilder(null, grpSize);
+    for (int i = 0; i < numOrigAggs; i++) {
+      Type outType = columnTypes.get(numOriginalKeys + i);
+      builders[numOriginalKeys + i] = outType.createBlockBuilder(null, grpSize);
+    }
+
+    for (int gs = 0; gs < grpCap; gs++) {
+      if (!grpOcc[gs]) continue;
+      long key = grpKeys[gs];
+      double[] vals = grpVals[gs];
+      if (keyType instanceof IntegerType) {
+        IntegerType.INTEGER.writeLong(builders[0], (int) key);
+      } else {
+        keyType.writeLong(builders[0], key);
+      }
+      for (int a = 0; a < numOrigAggs; a++) {
+        Type outType = columnTypes.get(numOriginalKeys + a);
+        if (isCountDistinct[a]) {
+          BigintType.BIGINT.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+        } else if (isAvg[a]) {
+          double sum = vals[a * 2];
+          double count = vals[a * 2 + 1];
+          DoubleType.DOUBLE.writeDouble(
+              builders[numOriginalKeys + a], count > 0 ? sum / count : 0.0);
+        } else if (outType instanceof DoubleType) {
+          DoubleType.DOUBLE.writeDouble(builders[numOriginalKeys + a], vals[a * 2]);
+        } else {
+          BigintType.BIGINT.writeLong(builders[numOriginalKeys + a], (long) vals[a * 2]);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
   private static boolean isShardMixedDedup(DqePlanNode shardPlan, AggregationNode singleAgg) {
     if (!(shardPlan instanceof AggregationNode shardAgg)) {
       return false;
@@ -2228,6 +2631,29 @@ public class TransportTrinoSqlAction
         break;
       }
     }
+    if (allNumericDedupKeys
+        && allShardAggsLong
+        && numOriginalKeys == 1
+        && numDedupKeys == 2
+        && !(dedupTypes.get(0) instanceof VarcharType)
+        && !(dedupTypes.get(0) instanceof DoubleType)
+        && noMinMaxVarchar) {
+      // Ultra-fast 2-key fused path for mixed dedup (Q10-style queries).
+      // Uses two flat long[] arrays instead of long[][] to eliminate per-entry allocation.
+      return mergeMixedDedup2Key(
+          shardPages,
+          dedupTypes,
+          numDedupKeys,
+          numShardAggs,
+          numOriginalKeys,
+          numOrigAggs,
+          isCountDistinct,
+          isAvg,
+          shardAggIdx,
+          shardCountIdx,
+          columnTypes);
+    }
+
     if (allNumericDedupKeys
         && allShardAggsLong
         && numOriginalKeys == 1

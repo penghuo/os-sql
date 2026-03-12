@@ -5915,19 +5915,80 @@ public final class FusedGroupByAggregate {
         Object[] keyReaders = keyReadersHolder[0];
         int numGroupKeys = groupByKeys.size();
         int totalColumns = numGroupKeys + numAggs;
-        int groupCount = segmentGroups.size();
 
+        // If top-N is requested and fewer than total groups, select top-N entries via min-heap.
+        // This avoids constructing a full Page with all groups and dramatically reduces the
+        // number of rows sent to the coordinator (e.g., Q19 with 30K+ groups -> 1000 groups).
+        java.util.Collection<Map.Entry<SegmentGroupKey, AccumulatorGroup>> outputEntries;
+        if (sortAggIndex >= 0 && topN > 0 && topN < segmentGroups.size()) {
+          int n = (int) Math.min(topN, segmentGroups.size());
+          @SuppressWarnings("unchecked")
+          Map.Entry<SegmentGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+          int heapSize = 0;
+          for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : segmentGroups.entrySet()) {
+            long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+            if (heapSize < n) {
+              heap[heapSize++] = entry;
+              int ki = heapSize - 1;
+              while (ki > 0) {
+                int parent = (ki - 1) >>> 1;
+                long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+                long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+                boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+                if (swap) {
+                  var tmp = heap[parent];
+                  heap[parent] = heap[ki];
+                  heap[ki] = tmp;
+                  ki = parent;
+                } else break;
+              }
+            } else {
+              long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+              boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+              if (better) {
+                heap[0] = entry;
+                int ki = 0;
+                while (true) {
+                  int left = 2 * ki + 1;
+                  if (left >= heapSize) break;
+                  int right = left + 1;
+                  int target = left;
+                  if (right < heapSize) {
+                    long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                    long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                    boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                    if (pickRight) target = right;
+                  }
+                  long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+                  long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+                  boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+                  if (swap) {
+                    var tmp = heap[ki];
+                    heap[ki] = heap[target];
+                    heap[target] = tmp;
+                    ki = target;
+                  } else break;
+                }
+              }
+            }
+          }
+          outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
+        } else {
+          outputEntries = segmentGroups.entrySet();
+        }
+
+        int outputCount = outputEntries.size();
         BlockBuilder[] builders = new BlockBuilder[totalColumns];
         for (int i = 0; i < numGroupKeys; i++) {
-          builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+          builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
         }
         for (int i = 0; i < numAggs; i++) {
           builders[numGroupKeys + i] =
               resolveAggOutputType(specs.get(i), columnTypeMap)
-                  .createBlockBuilder(null, groupCount);
+                  .createBlockBuilder(null, outputCount);
         }
 
-        for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : segmentGroups.entrySet()) {
+        for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : outputEntries) {
           SegmentGroupKey sgk = entry.getKey();
           AccumulatorGroup accGroup = entry.getValue();
 
@@ -6176,18 +6237,77 @@ public final class FusedGroupByAggregate {
 
       int numGroupKeys = groupByKeys.size();
       int totalColumns = numGroupKeys + numAggs;
-      int groupCount = globalGroups.size();
 
+      // If top-N is requested and fewer than total groups, select top-N entries via min-heap.
+      java.util.Collection<Map.Entry<MergedGroupKey, AccumulatorGroup>> outputEntries;
+      if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+        int n = (int) Math.min(topN, globalGroups.size());
+        @SuppressWarnings("unchecked")
+        Map.Entry<MergedGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+        int heapSize = 0;
+        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+          long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+          if (heapSize < n) {
+            heap[heapSize++] = entry;
+            int ki = heapSize - 1;
+            while (ki > 0) {
+              int parent = (ki - 1) >>> 1;
+              long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+              long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+              if (swap) {
+                var tmp = heap[parent];
+                heap[parent] = heap[ki];
+                heap[ki] = tmp;
+                ki = parent;
+              } else break;
+            }
+          } else {
+            long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+            boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+            if (better) {
+              heap[0] = entry;
+              int ki = 0;
+              while (true) {
+                int left = 2 * ki + 1;
+                if (left >= heapSize) break;
+                int right = left + 1;
+                int target = left;
+                if (right < heapSize) {
+                  long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                  long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                  boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                  if (pickRight) target = right;
+                }
+                long kVal = heap[ki].getValue().accumulators[sortAggIndex].getSortValue();
+                long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+                boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+                if (swap) {
+                  var tmp = heap[ki];
+                  heap[ki] = heap[target];
+                  heap[target] = tmp;
+                  ki = target;
+                } else break;
+              }
+            }
+          }
+        }
+        outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
+      } else {
+        outputEntries = globalGroups.entrySet();
+      }
+
+      int outputCount = outputEntries.size();
       BlockBuilder[] builders = new BlockBuilder[totalColumns];
       for (int i = 0; i < numGroupKeys; i++) {
-        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
       }
       for (int i = 0; i < numAggs; i++) {
         builders[numGroupKeys + i] =
-            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
       }
 
-      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : outputEntries) {
         MergedGroupKey key = entry.getKey();
         AccumulatorGroup accGroup = entry.getValue();
 

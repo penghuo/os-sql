@@ -5,13 +5,6 @@
 
 package org.opensearch.sql.dqe.coordinator.fragment;
 
-import io.trino.spi.type.BigintType;
-import io.trino.spi.type.BooleanType;
-import io.trino.spi.type.DoubleType;
-import io.trino.spi.type.IntegerType;
-import io.trino.spi.type.SmallintType;
-import io.trino.spi.type.TimestampType;
-import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import java.util.ArrayList;
 import java.util.List;
@@ -122,15 +115,15 @@ public class PlanFragmenter {
       // Walk up from the aggregation to find it in the tree and return it as the root.
       return stripAboveAggregation(plan);
     }
-    // SINGLE with GROUP BY: try shard-level dedup for COUNT(DISTINCT)-only queries
-    // where all group-by keys AND distinct columns are numeric types. This ensures
-    // the fast fused numeric path is used at the shard level. VARCHAR keys are excluded
-    // because high-cardinality string GROUP BY can produce more overhead than it saves.
+    // SINGLE with GROUP BY: try shard-level dedup for COUNT(DISTINCT)-only queries.
+    // Each shard performs GROUP BY (original_keys + distinct_columns) with COUNT(*),
+    // deduplicating values locally. The coordinator then runs the full aggregation
+    // on pre-deduped data, significantly reducing work for high-cardinality datasets.
+    // This applies to any column type (numeric and VARCHAR) since the generic hash
+    // aggregation path handles all types.
     if (!aggNode.getGroupByKeys().isEmpty() && !columnTypeMap.isEmpty()) {
       List<String> distinctColumns = extractCountDistinctColumns(aggNode.getAggregateFunctions());
-      if (distinctColumns != null
-          && allNumericColumns(aggNode.getGroupByKeys(), columnTypeMap)
-          && allNumericColumns(distinctColumns, columnTypeMap)) {
+      if (distinctColumns != null) {
         // Build dedup GROUP BY: original keys + distinct columns, with COUNT(*)
         List<String> dedupKeys = new ArrayList<>(aggNode.getGroupByKeys());
         dedupKeys.addAll(distinctColumns);
@@ -140,30 +133,6 @@ public class PlanFragmenter {
     }
     // SINGLE: strip aggregation and above, shards only scan+filter
     return aggNode.getChild();
-  }
-
-  /**
-   * Check if all specified columns are numeric (long-representable) types suitable for the fast
-   * fused GROUP BY path. Returns false if any column type is unknown or non-numeric (e.g.,
-   * VARCHAR).
-   */
-  private static boolean allNumericColumns(List<String> columns, Map<String, Type> columnTypeMap) {
-    for (String col : columns) {
-      Type type = columnTypeMap.get(col);
-      if (type == null) {
-        return false;
-      }
-      if (!(type instanceof BigintType
-          || type instanceof IntegerType
-          || type instanceof SmallintType
-          || type instanceof TinyintType
-          || type instanceof DoubleType
-          || type instanceof TimestampType
-          || type instanceof BooleanType)) {
-        return false;
-      }
-    }
-    return true;
   }
 
   /**

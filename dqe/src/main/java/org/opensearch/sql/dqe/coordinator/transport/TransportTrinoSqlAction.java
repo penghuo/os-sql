@@ -278,17 +278,34 @@ public class TransportTrinoSqlAction
                         // values. Merge distinct value sets using LongOpenHashSet and count.
                         mergedPages = mergeCountDistinctValues(shardPages);
                       } else if (coordinatorPlan instanceof AggregationNode singleAgg
-                          && singleAgg.getStep() == AggregationNode.Step.SINGLE) {
+                          && singleAgg.getStep() == AggregationNode.Step.SINGLE
+                          && isShardDedupCountDistinct(
+                              shardFragments.get(0).shardPlan(), singleAgg, columnTypeMap)) {
+                        // Fast path: shard-deduped COUNT(DISTINCT) with GROUP BY.
+                        // Two-stage merge: FINAL dedup merge + re-aggregate.
+                        mergedPages =
+                            mergeDedupCountDistinct(
+                                shardPages,
+                                singleAgg,
+                                shardFragments.get(0).shardPlan(),
+                                columnTypes,
+                                columnTypeMap,
+                                merger);
+                        mergedPages =
+                            applyCoordinatorSort(
+                                mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+                      } else if (coordinatorPlan instanceof AggregationNode singleAgg2
+                          && singleAgg2.getStep() == AggregationNode.Step.SINGLE) {
                         // SINGLE aggregation: shards sent raw data, coordinator aggregates
                         List<String> shardColumnNames =
                             resolveColumnNames(shardFragments.get(0).shardPlan());
                         List<Page> rawPages = merger.mergePassthrough(shardPages);
                         mergedPages =
                             runCoordinatorAggregation(
-                                singleAgg, rawPages, shardColumnNames, columnTypeMap);
+                                singleAgg2, rawPages, shardColumnNames, columnTypeMap);
                         mergedPages =
                             applyCoordinatorSort(
-                                mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+                                mergedPages, singleAgg2, optimizedPlan, columnTypes, merger);
                       } else if (coordinatorPlan instanceof AggregationNode aggNode) {
                         // Check if we can use the fused merge+sort path (no HAVING clause)
                         FilterNode havingNode = findHavingNode(optimizedPlan);
@@ -459,13 +476,28 @@ public class TransportTrinoSqlAction
               && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
             mergedPages = mergeCountDistinctValues(shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg
-              && singleAgg.getStep() == AggregationNode.Step.SINGLE) {
+              && singleAgg.getStep() == AggregationNode.Step.SINGLE
+              && isShardDedupCountDistinct(
+                  shardFragments.get(0).shardPlan(), singleAgg, columnTypeMap)) {
+            // Fast path: shard-deduped COUNT(DISTINCT) with GROUP BY.
+            mergedPages =
+                mergeDedupCountDistinct(
+                    shardPages,
+                    singleAgg,
+                    shardFragments.get(0).shardPlan(),
+                    columnTypes,
+                    columnTypeMap,
+                    merger);
+            mergedPages =
+                applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+          } else if (coordinatorPlan instanceof AggregationNode singleAgg2
+              && singleAgg2.getStep() == AggregationNode.Step.SINGLE) {
             List<String> shardColumnNames = resolveColumnNames(shardFragments.get(0).shardPlan());
             List<Page> rawPages = merger.mergePassthrough(shardPages);
             mergedPages =
-                runCoordinatorAggregation(singleAgg, rawPages, shardColumnNames, columnTypeMap);
+                runCoordinatorAggregation(singleAgg2, rawPages, shardColumnNames, columnTypeMap);
             mergedPages =
-                applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+                applyCoordinatorSort(mergedPages, singleAgg2, optimizedPlan, columnTypes, merger);
           } else if (coordinatorPlan instanceof AggregationNode aggNode) {
             FilterNode havingNode = findHavingNode(optimizedPlan);
             SortNode sortNodeForFuse = findSortNode(optimizedPlan);
@@ -1498,6 +1530,145 @@ public class TransportTrinoSqlAction
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
     BigintType.BIGINT.writeLong(builder, globalSet.size());
     return List.of(new Page(builder.build()));
+  }
+
+  /**
+   * Check if the shard plan uses dedup for COUNT(DISTINCT) queries AND has a VARCHAR group key.
+   * Returns true when the shard plan is a PARTIAL AggregationNode (created by PlanFragmenter for
+   * dedup), the coordinator plan is a SINGLE AggregationNode with GROUP BY + COUNT(DISTINCT), and
+   * at least one original group-by key is VARCHAR. For all-numeric group keys, the existing
+   * runCoordinatorAggregation with HashAggregationOperator is faster.
+   */
+  private static boolean isShardDedupCountDistinct(
+      DqePlanNode shardPlan, AggregationNode singleAgg, Map<String, Type> columnTypeMap) {
+    if (!(shardPlan instanceof AggregationNode shardAgg)) {
+      return false;
+    }
+    if (shardAgg.getStep() != AggregationNode.Step.PARTIAL) {
+      return false;
+    }
+    if (singleAgg.getGroupByKeys().isEmpty()) {
+      return false;
+    }
+    // Shard dedup has more group-by keys than the original (original keys + distinct columns)
+    if (shardAgg.getGroupByKeys().size() <= singleAgg.getGroupByKeys().size()
+        || shardAgg.getAggregateFunctions().size() != 1
+        || !"COUNT(*)".equals(shardAgg.getAggregateFunctions().get(0))) {
+      return false;
+    }
+    // Only use the two-stage merge for VARCHAR group keys (the FINAL merge path is faster
+    // for string keys). For all-numeric keys, runCoordinatorAggregation is faster.
+    for (String key : singleAgg.getGroupByKeys()) {
+      Type type = columnTypeMap.get(key);
+      if (type instanceof VarcharType) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Two-stage merge for shard-deduped COUNT(DISTINCT) queries. Shards produce pre-deduped (key +
+   * distinct_col, COUNT(*)) tuples. The coordinator:
+   *
+   * <ol>
+   *   <li>Stage 1: FINAL merge for dedup keys to remove cross-shard duplicates
+   *   <li>Stage 2: GROUP BY original keys with COUNT(*) to get COUNT(DISTINCT)
+   * </ol>
+   *
+   * This leverages the fast FINAL merge path (O(n) hash merge) instead of the generic
+   * HashAggregationOperator with per-row CountDistinctAccumulator (HashSet per group).
+   */
+  private static List<Page> mergeDedupCountDistinct(
+      List<List<Page>> shardPages,
+      AggregationNode singleAgg,
+      DqePlanNode shardPlan,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap,
+      ResultMerger merger) {
+    AggregationNode shardAgg = (AggregationNode) shardPlan;
+    List<String> dedupKeys = shardAgg.getGroupByKeys();
+    List<String> originalKeys = singleAgg.getGroupByKeys();
+
+    // Stage 1: FINAL merge for dedup keys (removes cross-shard duplicates)
+    // Build types for the dedup output: [dedupKey types..., BigintType for COUNT(*)]
+    List<Type> dedupTypes = new ArrayList<>();
+    for (String key : dedupKeys) {
+      dedupTypes.add(columnTypeMap.getOrDefault(key, BigintType.BIGINT));
+    }
+    dedupTypes.add(BigintType.BIGINT); // COUNT(*) column
+
+    AggregationNode finalDedupNode =
+        new AggregationNode(null, dedupKeys, List.of("COUNT(*)"), AggregationNode.Step.FINAL);
+    List<Page> dedupedPages = merger.mergeAggregation(shardPages, finalDedupNode, dedupTypes);
+
+    // Stage 2: GROUP BY original keys with COUNT(*)
+    // The deduplicated pages have columns: [originalKey0, ..., distinctCol0, ..., COUNT(*)]
+    // We need to GROUP BY originalKey columns and count rows per group.
+    int numOriginalKeys = originalKeys.size();
+
+    Type[] keyTypes = new Type[numOriginalKeys];
+    for (int i = 0; i < numOriginalKeys; i++) {
+      keyTypes[i] = dedupTypes.get(i);
+    }
+
+    // Use HashMap with string/long key for fast grouping
+    java.util.LinkedHashMap<Object, Long> groupCounts = new java.util.LinkedHashMap<>();
+
+    for (Page page : dedupedPages) {
+      if (numOriginalKeys == 1) {
+        // Fast path: single group-by key
+        Block keyBlock = page.getBlock(0);
+        Type keyType = keyTypes[0];
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          Object key = extractValue(page, 0, pos, keyType);
+          groupCounts.merge(key, 1L, Long::sum);
+        }
+      } else {
+        // Multi-key path: use List<Object> as group key
+        for (int pos = 0; pos < page.getPositionCount(); pos++) {
+          List<Object> key = new ArrayList<>(numOriginalKeys);
+          for (int i = 0; i < numOriginalKeys; i++) {
+            key.add(extractValue(page, i, pos, keyTypes[i]));
+          }
+          groupCounts.merge(key, 1L, Long::sum);
+        }
+      }
+    }
+
+    if (groupCounts.isEmpty()) {
+      return List.of();
+    }
+
+    // Build result page: [originalKey0, ..., COUNT(DISTINCT)]
+    int numOutputCols = numOriginalKeys + singleAgg.getAggregateFunctions().size();
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    for (int i = 0; i < numOriginalKeys; i++) {
+      builders[i] = keyTypes[i].createBlockBuilder(null, groupCounts.size());
+    }
+    for (int i = numOriginalKeys; i < numOutputCols; i++) {
+      builders[i] = BigintType.BIGINT.createBlockBuilder(null, groupCounts.size());
+    }
+
+    for (var entry : groupCounts.entrySet()) {
+      Object key = entry.getKey();
+      if (numOriginalKeys == 1) {
+        appendTypedValue(builders[0], keyTypes[0], key);
+      } else {
+        @SuppressWarnings("unchecked")
+        List<Object> multiKey = (List<Object>) key;
+        for (int i = 0; i < numOriginalKeys; i++) {
+          appendTypedValue(builders[i], keyTypes[i], multiKey.get(i));
+        }
+      }
+      BigintType.BIGINT.writeLong(builders[numOriginalKeys], entry.getValue());
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
   }
 
   /**

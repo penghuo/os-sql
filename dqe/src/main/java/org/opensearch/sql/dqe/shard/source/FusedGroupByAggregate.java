@@ -3930,8 +3930,40 @@ public final class FusedGroupByAggregate {
               // cardinality (typically <100), we use a small fixed capacity per ordinal
               // with linear scan. This is cache-friendly for small cardinalities.
               final int KEYS_PER_ORD = 64;
+
+              // Heuristic: check numeric key's value range via PointValues. If the
+              // range exceeds KEYS_PER_ORD, the field likely has high cardinality
+              // (e.g., UserID) and will overflow the per-ordinal linear scan. Skip
+              // to FlatTwoKeyMap to avoid wasted iteration and array allocation.
+              // For low-cardinality fields (e.g., SearchEngineID range 0-39), the
+              // ordinal-indexed path is much faster.
+              boolean numericKeyLikelyHighCardinality = false;
+              org.apache.lucene.index.PointValues pv =
+                  reader.getPointValues(keyInfos.get(numericKeyIdx).name);
+              if (pv != null) {
+                byte[] minBytes = pv.getMinPackedValue();
+                byte[] maxBytes = pv.getMaxPackedValue();
+                if (minBytes != null && maxBytes != null && minBytes.length >= 8) {
+                  // Decode big-endian long values (OpenSearch/Lucene uses big-endian
+                  // encoding for numeric point values)
+                  long minVal = 0, maxVal = 0;
+                  for (int b = 0; b < 8; b++) {
+                    minVal = (minVal << 8) | (minBytes[b] & 0xFFL);
+                    maxVal = (maxVal << 8) | (maxBytes[b] & 0xFFL);
+                  }
+                  // Flip sign bit for signed long encoding used by Lucene
+                  minVal ^= 0x8000000000000000L;
+                  maxVal ^= 0x8000000000000000L;
+                  long range = maxVal - minVal;
+                  if (range < 0 || range > KEYS_PER_ORD) {
+                    numericKeyLikelyHighCardinality = true;
+                  }
+                }
+              }
+
               // If total memory would exceed ~32MB, fall through
-              if ((long) numOrds * KEYS_PER_ORD * 16 <= 32_000_000L) {
+              if (!numericKeyLikelyHighCardinality
+                  && (long) numOrds * KEYS_PER_ORD * 16 <= 32_000_000L) {
                 long[] numericKeys = new long[numOrds * KEYS_PER_ORD];
                 long[] counts = new long[numOrds * KEYS_PER_ORD];
                 int[] numKeysPerOrd = new int[numOrds];

@@ -4587,380 +4587,22 @@ public final class FusedGroupByAggregate {
       if (singleSegment && keyInfos.size() == 2) {
         // === Single-segment two-key fast path ===
 
-        // Check if we can use the ordinal-indexed path: exactly one varchar key, one numeric
-        // key (no date_trunc/arith), COUNT(*) only, bounded ordinals. This replaces hash table
-        // operations with direct array indexing, eliminating hash computation and probing.
-        boolean allCountStar = true;
-        for (int i = 0; i < numAggs; i++) {
-          if (!isCountStar[i]) {
-            allCountStar = false;
-            break;
-          }
-        }
-        int varcharKeyIdx = -1, numericKeyIdx = -1;
-        if (allCountStar && numAggs == 1) {
-          for (int i = 0; i < 2; i++) {
-            KeyInfo ki = keyInfos.get(i);
-            if (ki.isVarchar && ki.exprFunc == null) {
-              varcharKeyIdx = i;
-            } else if (!ki.isVarchar && ki.exprFunc == null) {
-              numericKeyIdx = i;
-            }
-          }
-        }
-        if (varcharKeyIdx >= 0 && numericKeyIdx >= 0) {
-          // === Ordinal-indexed two-key COUNT(*) path ===
-          // Uses the varchar ordinal as a direct array index and maintains a small per-ordinal
-          // open-addressing map for the numeric key. Eliminates hash2() computation and two-key
-          // hash probing — critical for Q15 where SearchPhrase has 18K ordinals but
-          // SearchEngineID has only 39 distinct values.
-          LeafReaderContext leafCtx = leaves.get(0);
-          LeafReader reader = leafCtx.reader();
-          int maxDoc = reader.maxDoc();
-          Bits liveDocs = reader.getLiveDocs();
-
-          SortedSetDocValues varcharDv =
-              reader.getSortedSetDocValues(keyInfos.get(varcharKeyIdx).name);
-          SortedNumericDocValues numericDv =
-              reader.getSortedNumericDocValues(keyInfos.get(numericKeyIdx).name);
-
-          if (varcharDv != null && numericDv != null) {
-            long valueCount = varcharDv.getValueCount();
-            // Limit: for very high cardinality varchars, fall through to hash map path
-            if (valueCount <= 500_000) {
-              int numOrds = (int) valueCount;
-
-              // Per-ordinal storage: for each ordinal, store (numericKey, count) pairs.
-              // Use a flat layout: numericKeys[ord * MAX_KEYS_PER_ORD + 0..n] and
-              // counts[ord * MAX_KEYS_PER_ORD + 0..n]. Since the numeric key has low
-              // cardinality (typically <100), we use a small fixed capacity per ordinal
-              // with linear scan. This is cache-friendly for small cardinalities.
-              final int KEYS_PER_ORD = 64;
-
-              // Heuristic: check numeric key's value range via PointValues. If the
-              // range exceeds KEYS_PER_ORD, the field likely has high cardinality
-              // (e.g., UserID) and will overflow the per-ordinal linear scan. Skip
-              // to FlatTwoKeyMap to avoid wasted iteration and array allocation.
-              // For low-cardinality fields (e.g., SearchEngineID range 0-39), the
-              // ordinal-indexed path is much faster.
-              boolean numericKeyLikelyHighCardinality = false;
-              org.apache.lucene.index.PointValues pv =
-                  reader.getPointValues(keyInfos.get(numericKeyIdx).name);
-              if (pv != null) {
-                byte[] minBytes = pv.getMinPackedValue();
-                byte[] maxBytes = pv.getMaxPackedValue();
-                if (minBytes != null && maxBytes != null && minBytes.length >= 8) {
-                  // Decode big-endian long values (OpenSearch/Lucene uses big-endian
-                  // encoding for numeric point values)
-                  long minVal = 0, maxVal = 0;
-                  for (int b = 0; b < 8; b++) {
-                    minVal = (minVal << 8) | (minBytes[b] & 0xFFL);
-                    maxVal = (maxVal << 8) | (maxBytes[b] & 0xFFL);
-                  }
-                  // Flip sign bit for signed long encoding used by Lucene
-                  minVal ^= 0x8000000000000000L;
-                  maxVal ^= 0x8000000000000000L;
-                  long range = maxVal - minVal;
-                  if (range < 0 || range > KEYS_PER_ORD) {
-                    numericKeyLikelyHighCardinality = true;
-                  }
-                }
-              }
-
-              // If total memory would exceed ~32MB, fall through
-              if (!numericKeyLikelyHighCardinality
-                  && (long) numOrds * KEYS_PER_ORD * 16 <= 32_000_000L) {
-                long[] numericKeys = new long[numOrds * KEYS_PER_ORD];
-                long[] counts = new long[numOrds * KEYS_PER_ORD];
-                int[] numKeysPerOrd = new int[numOrds];
-                boolean overflowed = false;
-
-                if (query instanceof MatchAllDocsQuery) {
-                  if (liveDocs == null) {
-                    for (int doc = 0; doc < maxDoc; doc++) {
-                      if (!varcharDv.advanceExact(doc)) continue;
-                      long ord = varcharDv.nextOrd();
-                      if (!numericDv.advanceExact(doc)) continue;
-                      long nk = numericDv.nextValue();
-                      int base = (int) ord * KEYS_PER_ORD;
-                      int n = numKeysPerOrd[(int) ord];
-                      // Linear scan for matching numeric key
-                      int idx = -1;
-                      for (int j = 0; j < n; j++) {
-                        if (numericKeys[base + j] == nk) {
-                          idx = j;
-                          break;
-                        }
-                      }
-                      if (idx >= 0) {
-                        counts[base + idx]++;
-                      } else if (n < KEYS_PER_ORD) {
-                        numericKeys[base + n] = nk;
-                        counts[base + n] = 1;
-                        numKeysPerOrd[(int) ord]++;
-                      } else {
-                        overflowed = true;
-                        break;
-                      }
-                    }
-                  } else {
-                    for (int doc = 0; doc < maxDoc; doc++) {
-                      if (!liveDocs.get(doc)) continue;
-                      if (!varcharDv.advanceExact(doc)) continue;
-                      long ord = varcharDv.nextOrd();
-                      if (!numericDv.advanceExact(doc)) continue;
-                      long nk = numericDv.nextValue();
-                      int base = (int) ord * KEYS_PER_ORD;
-                      int n = numKeysPerOrd[(int) ord];
-                      int idx = -1;
-                      for (int j = 0; j < n; j++) {
-                        if (numericKeys[base + j] == nk) {
-                          idx = j;
-                          break;
-                        }
-                      }
-                      if (idx >= 0) {
-                        counts[base + idx]++;
-                      } else if (n < KEYS_PER_ORD) {
-                        numericKeys[base + n] = nk;
-                        counts[base + n] = 1;
-                        numKeysPerOrd[(int) ord]++;
-                      } else {
-                        overflowed = true;
-                        break;
-                      }
-                    }
-                  }
-                } else {
-                  // Filtered path using Lucene collector
-                  final boolean[] overflowFlag = {false};
-                  engineSearcher.search(
-                      query,
-                      new Collector() {
-                        @Override
-                        public LeafCollector getLeafCollector(LeafReaderContext context)
-                            throws IOException {
-                          return new LeafCollector() {
-                            @Override
-                            public void setScorer(Scorable scorer) {}
-
-                            @Override
-                            public void collect(int doc) throws IOException {
-                              if (overflowFlag[0]) return; // fast skip after overflow
-                              if (!varcharDv.advanceExact(doc)) return;
-                              long ord = varcharDv.nextOrd();
-                              if (!numericDv.advanceExact(doc)) return;
-                              long nk = numericDv.nextValue();
-                              int base = (int) ord * KEYS_PER_ORD;
-                              int n = numKeysPerOrd[(int) ord];
-                              int idx = -1;
-                              for (int j = 0; j < n; j++) {
-                                if (numericKeys[base + j] == nk) {
-                                  idx = j;
-                                  break;
-                                }
-                              }
-                              if (idx >= 0) {
-                                counts[base + idx]++;
-                              } else if (n < KEYS_PER_ORD) {
-                                numericKeys[base + n] = nk;
-                                counts[base + n] = 1;
-                                numKeysPerOrd[(int) ord]++;
-                              } else {
-                                overflowFlag[0] = true;
-                              }
-                            }
-                          };
-                        }
-
-                        @Override
-                        public ScoreMode scoreMode() {
-                          return ScoreMode.COMPLETE_NO_SCORES;
-                        }
-                      });
-                  overflowed = overflowFlag[0];
-                }
-
-                if (overflowed) {
-                  // Numeric key cardinality exceeded KEYS_PER_ORD per ordinal.
-                  // Fall through to the FlatTwoKeyMap path below.
-                } else {
-                  // Count total groups for output sizing
-                  int totalGroups = 0;
-                  for (int o = 0; o < numOrds; o++) {
-                    totalGroups += numKeysPerOrd[o];
-                  }
-                  if (totalGroups == 0) return List.of();
-
-                  // Build output Page or apply top-N selection
-                  int numGroupKeys = groupByKeys.size();
-                  int totalColumns = numGroupKeys + numAggs;
-
-                  if (sortAggIndex >= 0 && topN > 0 && topN < totalGroups) {
-                    // Top-N via min-heap: select top-N groups by count
-                    int n = (int) Math.min(topN, totalGroups);
-                    // Heap stores (ord, keyIdx) encoded as a single long: (ord << 32) | keyIdx
-                    long[] heap = new long[n];
-                    long[] heapVals = new long[n];
-                    int heapSize = 0;
-                    for (int o = 0; o < numOrds; o++) {
-                      int nk = numKeysPerOrd[o];
-                      int base = o * KEYS_PER_ORD;
-                      for (int j = 0; j < nk; j++) {
-                        long cnt = counts[base + j];
-                        if (heapSize < n) {
-                          heap[heapSize] = ((long) o << 32) | j;
-                          heapVals[heapSize] = cnt;
-                          heapSize++;
-                          // Sift up (min-heap for DESC, max-heap for ASC)
-                          int k = heapSize - 1;
-                          while (k > 0) {
-                            int parent = (k - 1) >>> 1;
-                            boolean swap =
-                                sortAscending
-                                    ? (heapVals[k] > heapVals[parent])
-                                    : (heapVals[k] < heapVals[parent]);
-                            if (swap) {
-                              long tmpL = heap[parent];
-                              heap[parent] = heap[k];
-                              heap[k] = tmpL;
-                              long tmpV = heapVals[parent];
-                              heapVals[parent] = heapVals[k];
-                              heapVals[k] = tmpV;
-                              k = parent;
-                            } else {
-                              break;
-                            }
-                          }
-                        } else {
-                          boolean better =
-                              sortAscending ? (cnt < heapVals[0]) : (cnt > heapVals[0]);
-                          if (better) {
-                            heap[0] = ((long) o << 32) | j;
-                            heapVals[0] = cnt;
-                            // Sift down
-                            int k = 0;
-                            while (true) {
-                              int left = 2 * k + 1;
-                              if (left >= heapSize) break;
-                              int right = left + 1;
-                              int target = left;
-                              if (right < heapSize) {
-                                boolean pickRight =
-                                    sortAscending
-                                        ? (heapVals[right] > heapVals[left])
-                                        : (heapVals[right] < heapVals[left]);
-                                if (pickRight) target = right;
-                              }
-                              boolean swap =
-                                  sortAscending
-                                      ? (heapVals[target] > heapVals[k])
-                                      : (heapVals[target] < heapVals[k]);
-                              if (swap) {
-                                long tmpL = heap[k];
-                                heap[k] = heap[target];
-                                heap[target] = tmpL;
-                                long tmpV = heapVals[k];
-                                heapVals[k] = heapVals[target];
-                                heapVals[target] = tmpV;
-                                k = target;
-                              } else {
-                                break;
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                    // Sort heap by value for output
-                    for (int i = 1; i < heapSize; i++) {
-                      long key = heap[i];
-                      long keyVal = heapVals[i];
-                      int j = i - 1;
-                      while (j >= 0) {
-                        boolean needsSwap =
-                            sortAscending ? (heapVals[j] > keyVal) : (heapVals[j] < keyVal);
-                        if (needsSwap) {
-                          heap[j + 1] = heap[j];
-                          heapVals[j + 1] = heapVals[j];
-                          j--;
-                        } else {
-                          break;
-                        }
-                      }
-                      heap[j + 1] = key;
-                      heapVals[j + 1] = keyVal;
-                    }
-
-                    // Build output Page for top-N
-                    BlockBuilder[] builders = new BlockBuilder[totalColumns];
-                    for (int i = 0; i < numGroupKeys; i++) {
-                      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, heapSize);
-                    }
-                    builders[numGroupKeys] = BigintType.BIGINT.createBlockBuilder(null, heapSize);
-
-                    for (int si = 0; si < heapSize; si++) {
-                      long encoded = heap[si];
-                      int ord = (int) (encoded >>> 32);
-                      int keyIdx = (int) (encoded & 0xFFFFFFFFL);
-                      long nk = numericKeys[ord * KEYS_PER_ORD + keyIdx];
-                      long cnt = counts[ord * KEYS_PER_ORD + keyIdx];
-
-                      // Write keys in correct column order
-                      if (varcharKeyIdx == 0) {
-                        BytesRef bytes = varcharDv.lookupOrd(ord);
-                        VarcharType.VARCHAR.writeSlice(
-                            builders[0],
-                            Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
-                        writeNumericKeyValue(builders[1], keyInfos.get(1), nk);
-                      } else {
-                        writeNumericKeyValue(builders[0], keyInfos.get(0), nk);
-                        BytesRef bytes = varcharDv.lookupOrd(ord);
-                        VarcharType.VARCHAR.writeSlice(
-                            builders[1],
-                            Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
-                      }
-                      BigintType.BIGINT.writeLong(builders[numGroupKeys], cnt);
-                    }
-
-                    Block[] blocks = new Block[totalColumns];
-                    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
-                    return List.of(new Page(blocks));
-                  } else {
-                    // No top-N: output all groups
-                    BlockBuilder[] builders = new BlockBuilder[totalColumns];
-                    for (int i = 0; i < numGroupKeys; i++) {
-                      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, totalGroups);
-                    }
-                    builders[numGroupKeys] =
-                        BigintType.BIGINT.createBlockBuilder(null, totalGroups);
-                    for (int o = 0; o < numOrds; o++) {
-                      int nk = numKeysPerOrd[o];
-                      if (nk == 0) continue;
-                      int base = o * KEYS_PER_ORD;
-                      BytesRef bytes = varcharDv.lookupOrd(o);
-                      io.airlift.slice.Slice slice =
-                          Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length);
-                      for (int j = 0; j < nk; j++) {
-                        if (varcharKeyIdx == 0) {
-                          VarcharType.VARCHAR.writeSlice(builders[0], slice);
-                          writeNumericKeyValue(builders[1], keyInfos.get(1), numericKeys[base + j]);
-                        } else {
-                          writeNumericKeyValue(builders[0], keyInfos.get(0), numericKeys[base + j]);
-                          VarcharType.VARCHAR.writeSlice(builders[1], slice);
-                        }
-                        BigintType.BIGINT.writeLong(builders[numGroupKeys], counts[base + j]);
-                      }
-                    }
-                    Block[] blocks = new Block[totalColumns];
-                    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
-                    return List.of(new Page(blocks));
-                  }
-                } // end of !overflowed else block
-              }
-            }
-          }
-          // Fall through to FlatTwoKeyMap path if ordinal-indexed path not applicable
+        // Try the ordinal-indexed two-key COUNT(*) path first (extracted to keep this
+        // method below the JVM's HugeMethodLimit of 8000 bytecodes for C2 JIT compilation).
+        List<Page> ordinalResult =
+            tryOrdinalIndexedTwoKeyCountStar(
+                engineSearcher,
+                query,
+                leaves.get(0),
+                keyInfos,
+                numAggs,
+                isCountStar,
+                groupByKeys,
+                sortAggIndex,
+                sortAscending,
+                topN);
+        if (ordinalResult != null) {
+          return ordinalResult;
         }
 
         // Check if all aggregates can use flat long[] storage
@@ -5048,6 +4690,12 @@ public final class FusedGroupByAggregate {
 
             if (allCountStarFlat) {
               // Ultra-fast path: COUNT(*) only -- no aggregate DV reads
+              // When we have LIMIT without ORDER BY (sortAggIndex < 0 && topN > 0),
+              // use capped insertion: once we have enough groups, skip new groups
+              // entirely. This is correct because any N groups are valid output
+              // and avoids hash map growth for high-cardinality queries like Q18.
+              final boolean useCapped = (sortAggIndex < 0 && topN > 0);
+              final int groupCap = useCapped ? (int) topN : Integer.MAX_VALUE;
               if (liveDocs == null) {
                 for (int doc = 0; doc < maxDoc; doc++) {
                   long k0 = 0, k1 = 0;
@@ -5073,8 +4721,13 @@ public final class FusedGroupByAggregate {
                       else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                     }
                   }
-                  int slot = flatMap.findOrInsert(k0, k1);
-                  flatMap.accData[slot * flatSlotsPerGroup]++;
+                  int slot =
+                      useCapped
+                          ? flatMap.findOrInsertCapped(k0, k1, groupCap)
+                          : flatMap.findOrInsert(k0, k1);
+                  if (slot >= 0) {
+                    flatMap.accData[slot * flatSlotsPerGroup]++;
+                  }
                 }
               } else {
                 for (int doc = 0; doc < maxDoc; doc++) {
@@ -5102,12 +4755,19 @@ public final class FusedGroupByAggregate {
                       else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                     }
                   }
-                  int slot = flatMap.findOrInsert(k0, k1);
-                  flatMap.accData[slot * flatSlotsPerGroup]++;
+                  int slot =
+                      useCapped
+                          ? flatMap.findOrInsertCapped(k0, k1, groupCap)
+                          : flatMap.findOrInsert(k0, k1);
+                  if (slot >= 0) {
+                    flatMap.accData[slot * flatSlotsPerGroup]++;
+                  }
                 }
               }
             } else {
               // General MatchAllDocsQuery fast path with aggregate reads
+              final boolean useCappedGen = (sortAggIndex < 0 && topN > 0);
+              final int groupCapGen = useCappedGen ? (int) topN : Integer.MAX_VALUE;
               if (liveDocs == null) {
                 for (int doc = 0; doc < maxDoc; doc++) {
                   long k0 = 0, k1 = 0;
@@ -5133,7 +4793,11 @@ public final class FusedGroupByAggregate {
                       else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                     }
                   }
-                  int slot = flatMap.findOrInsert(k0, k1);
+                  int slot =
+                      useCappedGen
+                          ? flatMap.findOrInsertCapped(k0, k1, groupCapGen)
+                          : flatMap.findOrInsert(k0, k1);
+                  if (slot < 0) continue;
                   int base = slot * flatSlotsPerGroup;
                   for (int i = 0; i < numAggs; i++) {
                     int off = base + flatAccOffset[i];
@@ -5185,7 +4849,11 @@ public final class FusedGroupByAggregate {
                       else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                     }
                   }
-                  int slot = flatMap.findOrInsert(k0, k1);
+                  int slot =
+                      useCappedGen
+                          ? flatMap.findOrInsertCapped(k0, k1, groupCapGen)
+                          : flatMap.findOrInsert(k0, k1);
+                  if (slot < 0) continue;
                   int base = slot * flatSlotsPerGroup;
                   for (int i = 0; i < numAggs; i++) {
                     int off = base + flatAccOffset[i];
@@ -5270,7 +4938,11 @@ public final class FusedGroupByAggregate {
                             else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
                           }
                         }
-                        int slot = flatMap.findOrInsert(k0, k1);
+                        int slot =
+                            (sortAggIndex < 0 && topN > 0)
+                                ? flatMap.findOrInsertCapped(k0, k1, (int) topN)
+                                : flatMap.findOrInsert(k0, k1);
+                        if (slot < 0) return;
                         int base = slot * flatSlotsPerGroup;
 
                         for (int i = 0; i < numAggs; i++) {
@@ -5752,6 +5424,380 @@ public final class FusedGroupByAggregate {
           sortAscending,
           topN,
           columnTypeMap);
+    }
+  }
+
+  /**
+   * Ordinal-indexed two-key COUNT(*) path, extracted from executeWithVarcharKeys to keep that
+   * method below the JVM's HugeMethodLimit (8000 bytecodes) for C2 JIT compilation.
+   *
+   * <p>Uses the varchar ordinal as a direct array index and maintains a small per-ordinal
+   * open-addressing map for the numeric key. Eliminates hash2() computation and two-key hash
+   * probing -- critical for Q15 where SearchPhrase has 18K ordinals but SearchEngineID has only 39
+   * distinct values.
+   *
+   * @return the result pages, or {@code null} if this path is not applicable (caller should fall
+   *     through to FlatTwoKeyMap)
+   */
+  private static List<Page> tryOrdinalIndexedTwoKeyCountStar(
+      org.opensearch.index.engine.Engine.Searcher engineSearcher,
+      Query query,
+      LeafReaderContext leafCtx,
+      List<KeyInfo> keyInfos,
+      int numAggs,
+      boolean[] isCountStar,
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
+      throws Exception {
+    // Check precondition: exactly one varchar key, one numeric key (no date_trunc/arith), all
+    // COUNT(*)
+    boolean allCountStar = true;
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i]) {
+        allCountStar = false;
+        break;
+      }
+    }
+    int varcharKeyIdx = -1, numericKeyIdx = -1;
+    if (allCountStar && numAggs == 1) {
+      for (int i = 0; i < 2; i++) {
+        KeyInfo ki = keyInfos.get(i);
+        if (ki.isVarchar && ki.exprFunc == null) {
+          varcharKeyIdx = i;
+        } else if (!ki.isVarchar && ki.exprFunc == null) {
+          numericKeyIdx = i;
+        }
+      }
+    }
+    if (varcharKeyIdx < 0 || numericKeyIdx < 0) {
+      return null; // not applicable
+    }
+
+    LeafReader reader = leafCtx.reader();
+    int maxDoc = reader.maxDoc();
+    Bits liveDocs = reader.getLiveDocs();
+
+    SortedSetDocValues varcharDv = reader.getSortedSetDocValues(keyInfos.get(varcharKeyIdx).name);
+    SortedNumericDocValues numericDv =
+        reader.getSortedNumericDocValues(keyInfos.get(numericKeyIdx).name);
+
+    if (varcharDv == null || numericDv == null) {
+      return null;
+    }
+    long valueCount = varcharDv.getValueCount();
+    if (valueCount > 500_000) {
+      return null;
+    }
+    int numOrds = (int) valueCount;
+
+    final int KEYS_PER_ORD = 64;
+
+    // Heuristic: check numeric key's value range via PointValues
+    boolean numericKeyLikelyHighCardinality = false;
+    org.apache.lucene.index.PointValues pv =
+        reader.getPointValues(keyInfos.get(numericKeyIdx).name);
+    if (pv != null) {
+      byte[] minBytes = pv.getMinPackedValue();
+      byte[] maxBytes = pv.getMaxPackedValue();
+      if (minBytes != null && maxBytes != null && minBytes.length >= 8) {
+        long minVal = 0, maxVal = 0;
+        for (int b = 0; b < 8; b++) {
+          minVal = (minVal << 8) | (minBytes[b] & 0xFFL);
+          maxVal = (maxVal << 8) | (maxBytes[b] & 0xFFL);
+        }
+        minVal ^= 0x8000000000000000L;
+        maxVal ^= 0x8000000000000000L;
+        long range = maxVal - minVal;
+        if (range < 0 || range > KEYS_PER_ORD) {
+          numericKeyLikelyHighCardinality = true;
+        }
+      }
+    }
+
+    if (numericKeyLikelyHighCardinality || (long) numOrds * KEYS_PER_ORD * 16 > 32_000_000L) {
+      return null;
+    }
+
+    long[] numericKeys = new long[numOrds * KEYS_PER_ORD];
+    long[] counts = new long[numOrds * KEYS_PER_ORD];
+    int[] numKeysPerOrd = new int[numOrds];
+    boolean overflowed = false;
+
+    if (query instanceof MatchAllDocsQuery) {
+      if (liveDocs == null) {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (!varcharDv.advanceExact(doc)) continue;
+          long ord = varcharDv.nextOrd();
+          if (!numericDv.advanceExact(doc)) continue;
+          long nk = numericDv.nextValue();
+          int base = (int) ord * KEYS_PER_ORD;
+          int n = numKeysPerOrd[(int) ord];
+          int idx = -1;
+          for (int j = 0; j < n; j++) {
+            if (numericKeys[base + j] == nk) {
+              idx = j;
+              break;
+            }
+          }
+          if (idx >= 0) {
+            counts[base + idx]++;
+          } else if (n < KEYS_PER_ORD) {
+            numericKeys[base + n] = nk;
+            counts[base + n] = 1;
+            numKeysPerOrd[(int) ord]++;
+          } else {
+            overflowed = true;
+            break;
+          }
+        }
+      } else {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (!liveDocs.get(doc)) continue;
+          if (!varcharDv.advanceExact(doc)) continue;
+          long ord = varcharDv.nextOrd();
+          if (!numericDv.advanceExact(doc)) continue;
+          long nk = numericDv.nextValue();
+          int base = (int) ord * KEYS_PER_ORD;
+          int n = numKeysPerOrd[(int) ord];
+          int idx = -1;
+          for (int j = 0; j < n; j++) {
+            if (numericKeys[base + j] == nk) {
+              idx = j;
+              break;
+            }
+          }
+          if (idx >= 0) {
+            counts[base + idx]++;
+          } else if (n < KEYS_PER_ORD) {
+            numericKeys[base + n] = nk;
+            counts[base + n] = 1;
+            numKeysPerOrd[(int) ord]++;
+          } else {
+            overflowed = true;
+            break;
+          }
+        }
+      }
+    } else {
+      // Filtered path using Lucene collector
+      final boolean[] overflowFlag = {false};
+      final SortedSetDocValues fVarcharDv = varcharDv;
+      final SortedNumericDocValues fNumericDv = numericDv;
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  if (overflowFlag[0]) return;
+                  if (!fVarcharDv.advanceExact(doc)) return;
+                  long ord = fVarcharDv.nextOrd();
+                  if (!fNumericDv.advanceExact(doc)) return;
+                  long nk = fNumericDv.nextValue();
+                  int base = (int) ord * KEYS_PER_ORD;
+                  int n = numKeysPerOrd[(int) ord];
+                  int idx = -1;
+                  for (int j = 0; j < n; j++) {
+                    if (numericKeys[base + j] == nk) {
+                      idx = j;
+                      break;
+                    }
+                  }
+                  if (idx >= 0) {
+                    counts[base + idx]++;
+                  } else if (n < KEYS_PER_ORD) {
+                    numericKeys[base + n] = nk;
+                    counts[base + n] = 1;
+                    numKeysPerOrd[(int) ord]++;
+                  } else {
+                    overflowFlag[0] = true;
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+      overflowed = overflowFlag[0];
+    }
+
+    if (overflowed) {
+      return null; // fall through to FlatTwoKeyMap
+    }
+
+    // Count total groups for output sizing
+    int totalGroups = 0;
+    for (int o = 0; o < numOrds; o++) {
+      totalGroups += numKeysPerOrd[o];
+    }
+    if (totalGroups == 0) return List.of();
+
+    // Build output Page or apply top-N selection
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < totalGroups) {
+      // Top-N via min-heap: select top-N groups by count
+      int n = (int) Math.min(topN, totalGroups);
+      long[] heap = new long[n];
+      long[] heapVals = new long[n];
+      int heapSize = 0;
+      for (int o = 0; o < numOrds; o++) {
+        int nk = numKeysPerOrd[o];
+        int base = o * KEYS_PER_ORD;
+        for (int j = 0; j < nk; j++) {
+          long cnt = counts[base + j];
+          if (heapSize < n) {
+            heap[heapSize] = ((long) o << 32) | j;
+            heapVals[heapSize] = cnt;
+            heapSize++;
+            int k = heapSize - 1;
+            while (k > 0) {
+              int parent = (k - 1) >>> 1;
+              boolean swap =
+                  sortAscending
+                      ? (heapVals[k] > heapVals[parent])
+                      : (heapVals[k] < heapVals[parent]);
+              if (swap) {
+                long tmpL = heap[parent];
+                heap[parent] = heap[k];
+                heap[k] = tmpL;
+                long tmpV = heapVals[parent];
+                heapVals[parent] = heapVals[k];
+                heapVals[k] = tmpV;
+                k = parent;
+              } else {
+                break;
+              }
+            }
+          } else {
+            boolean better = sortAscending ? (cnt < heapVals[0]) : (cnt > heapVals[0]);
+            if (better) {
+              heap[0] = ((long) o << 32) | j;
+              heapVals[0] = cnt;
+              int k = 0;
+              while (true) {
+                int left = 2 * k + 1;
+                if (left >= heapSize) break;
+                int right = left + 1;
+                int target = left;
+                if (right < heapSize) {
+                  boolean pickRight =
+                      sortAscending
+                          ? (heapVals[right] > heapVals[left])
+                          : (heapVals[right] < heapVals[left]);
+                  if (pickRight) target = right;
+                }
+                boolean swap =
+                    sortAscending
+                        ? (heapVals[target] > heapVals[k])
+                        : (heapVals[target] < heapVals[k]);
+                if (swap) {
+                  long tmpL = heap[k];
+                  heap[k] = heap[target];
+                  heap[target] = tmpL;
+                  long tmpV = heapVals[k];
+                  heapVals[k] = heapVals[target];
+                  heapVals[target] = tmpV;
+                  k = target;
+                } else {
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+      // Sort heap by value for output
+      for (int i = 1; i < heapSize; i++) {
+        long key = heap[i];
+        long keyVal = heapVals[i];
+        int j = i - 1;
+        while (j >= 0) {
+          boolean needsSwap = sortAscending ? (heapVals[j] > keyVal) : (heapVals[j] < keyVal);
+          if (needsSwap) {
+            heap[j + 1] = heap[j];
+            heapVals[j + 1] = heapVals[j];
+            j--;
+          } else {
+            break;
+          }
+        }
+        heap[j + 1] = key;
+        heapVals[j + 1] = keyVal;
+      }
+
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      for (int i = 0; i < numGroupKeys; i++) {
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, heapSize);
+      }
+      builders[numGroupKeys] = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+
+      for (int si = 0; si < heapSize; si++) {
+        long encoded = heap[si];
+        int ord = (int) (encoded >>> 32);
+        int keyIdx = (int) (encoded & 0xFFFFFFFFL);
+        long nk = numericKeys[ord * KEYS_PER_ORD + keyIdx];
+        long cnt = counts[ord * KEYS_PER_ORD + keyIdx];
+
+        if (varcharKeyIdx == 0) {
+          BytesRef bytes = varcharDv.lookupOrd(ord);
+          VarcharType.VARCHAR.writeSlice(
+              builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+          writeNumericKeyValue(builders[1], keyInfos.get(1), nk);
+        } else {
+          writeNumericKeyValue(builders[0], keyInfos.get(0), nk);
+          BytesRef bytes = varcharDv.lookupOrd(ord);
+          VarcharType.VARCHAR.writeSlice(
+              builders[1], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+        }
+        BigintType.BIGINT.writeLong(builders[numGroupKeys], cnt);
+      }
+
+      Block[] blocks = new Block[totalColumns];
+      for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+      return List.of(new Page(blocks));
+    } else {
+      // No top-N or LIMIT-only: output all groups (or first topN if LIMIT set)
+      int outputGroups = (topN > 0 && topN < totalGroups) ? (int) topN : totalGroups;
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      for (int i = 0; i < numGroupKeys; i++) {
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputGroups);
+      }
+      builders[numGroupKeys] = BigintType.BIGINT.createBlockBuilder(null, outputGroups);
+      int emitted = 0;
+      for (int o = 0; o < numOrds && emitted < outputGroups; o++) {
+        int nk = numKeysPerOrd[o];
+        if (nk == 0) continue;
+        int base = o * KEYS_PER_ORD;
+        BytesRef bytes = varcharDv.lookupOrd(o);
+        io.airlift.slice.Slice slice =
+            Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length);
+        for (int j = 0; j < nk && emitted < outputGroups; j++) {
+          if (varcharKeyIdx == 0) {
+            VarcharType.VARCHAR.writeSlice(builders[0], slice);
+            writeNumericKeyValue(builders[1], keyInfos.get(1), numericKeys[base + j]);
+          } else {
+            writeNumericKeyValue(builders[0], keyInfos.get(0), numericKeys[base + j]);
+            VarcharType.VARCHAR.writeSlice(builders[1], slice);
+          }
+          BigintType.BIGINT.writeLong(builders[numGroupKeys], counts[base + j]);
+          emitted++;
+        }
+      }
+      Block[] blocks = new Block[totalColumns];
+      for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+      return List.of(new Page(blocks));
     }
   }
 
@@ -6899,6 +6945,38 @@ public final class FusedGroupByAggregate {
       if (size > threshold) {
         resize();
         // Find the slot in the new layout
+        return findExisting(key0, key1);
+      }
+      return h;
+    }
+
+    /**
+     * Find existing slot or insert new entry, but refuse new insertions once size >= cap. Returns
+     * the slot index if the key already exists or was just inserted; returns -1 if the key is new
+     * and the map already has {@code cap} groups.
+     *
+     * <p>This enables LIMIT-without-ORDER-BY early-close: once we have enough groups, skip new
+     * groups entirely, avoiding hash map growth for high-cardinality queries.
+     */
+    int findOrInsertCapped(long key0, long key1, int cap) {
+      int mask = capacity - 1;
+      int h = TwoKeyHashMap.hash2(key0, key1) & mask;
+      while (occupied[h]) {
+        if (keys0[h] == key0 && keys1[h] == key1) {
+          return h;
+        }
+        h = (h + 1) & mask;
+      }
+      // New entry -- reject if capped
+      if (size >= cap) {
+        return -1;
+      }
+      keys0[h] = key0;
+      keys1[h] = key1;
+      occupied[h] = true;
+      size++;
+      if (size > threshold) {
+        resize();
         return findExisting(key0, key1);
       }
       return h;

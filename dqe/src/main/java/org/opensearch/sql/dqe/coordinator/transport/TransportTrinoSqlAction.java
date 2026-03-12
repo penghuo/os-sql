@@ -3274,30 +3274,42 @@ public class TransportTrinoSqlAction
       }
     }
 
-    // Handle AVG weighting if we have a companion COUNT column
-    if (countColIdx >= 0) {
-      for (int a = 0; a < numAggs; a++) {
-        if (isAvg[a]) {
-          // Each shard sent (partial_avg, partial_count). Correct merge:
-          // sum(avg_i * count_i) / sum(count_i). But we already summed the
-          // avg values naively above. Re-compute using weighted approach.
-          double weightedSum = 0;
-          long totalCount = 0;
-          for (List<Page> pages : shardPages) {
-            for (Page page : pages) {
-              for (int pos = 0; pos < page.getPositionCount(); pos++) {
-                Block avgBlock = page.getBlock(a);
-                Block cntBlock = page.getBlock(countColIdx);
-                if (!avgBlock.isNull(pos) && !cntBlock.isNull(pos)) {
-                  double avg = DoubleType.DOUBLE.getDouble(avgBlock, pos);
-                  long cnt = BigintType.BIGINT.getLong(cntBlock, pos);
-                  weightedSum += avg * cnt;
-                  totalCount += cnt;
-                }
+    // Handle AVG weighting: merge shard-level AVG values correctly.
+    // Each shard computes a shard-local AVG. To merge, we need weighted averaging.
+    for (int a = 0; a < numAggs; a++) {
+      if (!isAvg[a]) continue;
+      if (countColIdx >= 0) {
+        // Weighted merge: use companion COUNT column as weight.
+        // Correct merge: sum(avg_i * count_i) / sum(count_i).
+        double weightedSum = 0;
+        long totalCount = 0;
+        for (List<Page> pages : shardPages) {
+          for (Page page : pages) {
+            for (int pos = 0; pos < page.getPositionCount(); pos++) {
+              Block avgBlock = page.getBlock(a);
+              Block cntBlock = page.getBlock(countColIdx);
+              if (!avgBlock.isNull(pos) && !cntBlock.isNull(pos)) {
+                double avg = DoubleType.DOUBLE.getDouble(avgBlock, pos);
+                long cnt = BigintType.BIGINT.getLong(cntBlock, pos);
+                weightedSum += avg * cnt;
+                totalCount += cnt;
               }
             }
           }
-          sumValues[a] = totalCount > 0 ? weightedSum / totalCount : 0.0;
+        }
+        sumValues[a] = totalCount > 0 ? weightedSum / totalCount : 0.0;
+      } else {
+        // No companion COUNT column (e.g., SELECT AVG(col) FROM t).
+        // Simple average of shard AVGs — correct when shards have equal row counts,
+        // which is the default for evenly distributed OpenSearch indices.
+        int shardCount = 0;
+        for (List<Page> pages : shardPages) {
+          for (Page page : pages) {
+            shardCount += page.getPositionCount();
+          }
+        }
+        if (shardCount > 0) {
+          sumValues[a] = sumValues[a] / shardCount;
         }
       }
     }

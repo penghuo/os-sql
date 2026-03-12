@@ -188,37 +188,59 @@ public final class FusedScanAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-eval-agg")) {
       String[] colArray = uniquePhysicalColumns.toArray(new String[0]);
+      // Pre-resolve Map entries to flat arrays for zero-alloc inner loop
+      long[][] scArrays = new long[colArray.length][];
+      for (int i = 0; i < colArray.length; i++) {
+        scArrays[i] = colSumCount.get(colArray[i]);
+      }
 
       if (query instanceof MatchAllDocsQuery) {
-        // Fast path: iterate all docs directly without Scorer/Collector overhead
+        // Fast path: column-major iteration using nextDoc() for sequential access.
+        // Avoids advanceExact() overhead and Map lookups in the inner loop.
+        boolean noDeletes = true;
         for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-          LeafReader reader = leafCtx.reader();
-          int maxDoc = reader.maxDoc();
-          Bits liveDocs = reader.getLiveDocs();
-          SortedNumericDocValues[] dvs = new SortedNumericDocValues[colArray.length];
-          for (int i = 0; i < colArray.length; i++) {
-            dvs[i] = reader.getSortedNumericDocValues(colArray[i]);
+          if (leafCtx.reader().getLiveDocs() != null) {
+            noDeletes = false;
+            break;
           }
-          if (liveDocs == null) {
-            for (int doc = 0; doc < maxDoc; doc++) {
-              for (int i = 0; i < colArray.length; i++) {
-                SortedNumericDocValues dv = dvs[i];
-                if (dv != null && dv.advanceExact(doc)) {
-                  long[] sc = colSumCount.get(colArray[i]);
-                  sc[0] += dv.nextValue();
-                  sc[1]++;
-                }
+        }
+
+        if (noDeletes) {
+          // Ultra-fast: column-major with nextDoc() — no deleted docs check
+          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+            LeafReader reader = leafCtx.reader();
+            for (int i = 0; i < colArray.length; i++) {
+              SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[i]);
+              if (dv == null) continue;
+              long localSum = 0;
+              long localCount = 0;
+              int doc = dv.nextDoc();
+              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                localSum += dv.nextValue();
+                localCount++;
+                doc = dv.nextDoc();
               }
+              scArrays[i][0] += localSum;
+              scArrays[i][1] += localCount;
             }
-          } else {
+          }
+        } else {
+          // Has deleted docs: row-major with advanceExact
+          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+            LeafReader reader = leafCtx.reader();
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+            SortedNumericDocValues[] dvs = new SortedNumericDocValues[colArray.length];
+            for (int i = 0; i < colArray.length; i++) {
+              dvs[i] = reader.getSortedNumericDocValues(colArray[i]);
+            }
             for (int doc = 0; doc < maxDoc; doc++) {
               if (liveDocs.get(doc)) {
                 for (int i = 0; i < colArray.length; i++) {
                   SortedNumericDocValues dv = dvs[i];
                   if (dv != null && dv.advanceExact(doc)) {
-                    long[] sc = colSumCount.get(colArray[i]);
-                    sc[0] += dv.nextValue();
-                    sc[1]++;
+                    scArrays[i][0] += dv.nextValue();
+                    scArrays[i][1]++;
                   }
                 }
               }
@@ -615,6 +637,7 @@ public final class FusedScanAggregate {
     int numCols = uniqueColumns.size();
     // Per-column accumulators: [sum, count, min, max] per column
     long[] colSum = new long[numCols];
+    double[] colDoubleSum = new double[numCols]; // For AVG to avoid long overflow
     long[] colCount = new long[numCols];
     long[] colMin = new long[numCols];
     long[] colMax = new long[numCols];
@@ -625,28 +648,91 @@ public final class FusedScanAggregate {
     long totalDocs = 0;
     String[] colArray = uniqueColumns.toArray(new String[0]);
 
-    // Tight inner loop: iterate all segments, all docs, all columns
+    // Determine which aggregate types are actually needed to skip unnecessary work.
+    // Also track which columns need double accumulation (for AVG) to avoid long overflow
+    // when summing large values like UserID (~10^18) across 1M+ rows.
+    boolean needMin = false, needMax = false;
+    boolean[] colNeedsDouble = new boolean[numCols];
+    for (AggSpec spec : specs) {
+      if ("MIN".equals(spec.funcName())) needMin = true;
+      if ("MAX".equals(spec.funcName())) needMax = true;
+      if ("AVG".equals(spec.funcName()) && !"*".equals(spec.arg())) {
+        int colIdx = uniqueColumns.indexOf(spec.arg());
+        if (colIdx >= 0) colNeedsDouble[colIdx] = true;
+      }
+    }
+
+    // Column-major iteration: process one column at a time across all docs per segment.
+    // Uses nextDoc() sequential iteration instead of advanceExact(doc) random access.
+    // For dense columns (all docs have values, typical in ClickBench), nextDoc() is
+    // significantly faster because it reads the compressed doc value stream sequentially
+    // instead of seeking to each doc position individually. This also improves CPU cache
+    // utilization since we're reading one column's data contiguously before moving to the next.
     for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
       LeafReader reader = leafCtx.reader();
       int maxDoc = reader.maxDoc();
       totalDocs += maxDoc;
 
-      SortedNumericDocValues[] dvs = new SortedNumericDocValues[numCols];
       for (int c = 0; c < numCols; c++) {
-        dvs[c] = reader.getSortedNumericDocValues(colArray[c]);
-      }
+        SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
+        if (dv == null) continue;
 
-      for (int doc = 0; doc < maxDoc; doc++) {
-        for (int c = 0; c < numCols; c++) {
-          SortedNumericDocValues dv = dvs[c];
-          if (dv != null && dv.advanceExact(doc)) {
-            long val = dv.nextValue();
-            colSum[c] += val;
-            colCount[c]++;
-            if (val < colMin[c]) colMin[c] = val;
-            if (val > colMax[c]) colMax[c] = val;
+        long localCount = 0;
+
+        if (colNeedsDouble[c]) {
+          // Double accumulation for AVG columns to avoid long overflow
+          double localDoubleSum = 0;
+          if (needMin || needMax) {
+            long localMin = Long.MAX_VALUE;
+            long localMax = Long.MIN_VALUE;
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              long val = dv.nextValue();
+              localDoubleSum += val;
+              localCount++;
+              if (val < localMin) localMin = val;
+              if (val > localMax) localMax = val;
+              doc = dv.nextDoc();
+            }
+            if (localMin < colMin[c]) colMin[c] = localMin;
+            if (localMax > colMax[c]) colMax[c] = localMax;
+          } else {
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              localDoubleSum += dv.nextValue();
+              localCount++;
+              doc = dv.nextDoc();
+            }
           }
+          colDoubleSum[c] += localDoubleSum;
+        } else {
+          // Long accumulation for SUM/COUNT columns
+          long localSum = 0;
+          if (needMin || needMax) {
+            long localMin = Long.MAX_VALUE;
+            long localMax = Long.MIN_VALUE;
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              long val = dv.nextValue();
+              localSum += val;
+              localCount++;
+              if (val < localMin) localMin = val;
+              if (val > localMax) localMax = val;
+              doc = dv.nextDoc();
+            }
+            if (localMin < colMin[c]) colMin[c] = localMin;
+            if (localMax > colMax[c]) colMax[c] = localMax;
+          } else {
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              localSum += dv.nextValue();
+              localCount++;
+              doc = dv.nextDoc();
+            }
+          }
+          colSum[c] += localSum;
         }
+        colCount[c] += localCount;
       }
     }
 
@@ -673,7 +759,11 @@ public final class FusedScanAggregate {
             break;
           case "AVG":
             if (acc instanceof AvgDirectAccumulator aa) {
-              aa.addLongSumCount(colSum[colIdx], colCount[colIdx]);
+              if (colNeedsDouble[colIdx]) {
+                aa.addDoubleSumCount(colDoubleSum[colIdx], colCount[colIdx]);
+              } else {
+                aa.addLongSumCount(colSum[colIdx], colCount[colIdx]);
+              }
             }
             break;
           case "MIN":
@@ -991,12 +1081,16 @@ public final class FusedScanAggregate {
     }
   }
 
-  /** AVG accumulator. */
+  /**
+   * AVG accumulator. Uses double accumulation for the sum to avoid long overflow when summing large
+   * values (e.g., UserID ~10^18) across many rows. The output is always DOUBLE, so the slight
+   * precision loss from double arithmetic is acceptable and matches standard SQL behavior for AVG
+   * on integer types.
+   */
   private static class AvgDirectAccumulator implements DirectAccumulator {
     private final String field;
     private final boolean isDoubleType;
     private SortedNumericDocValues dv;
-    private long longSum = 0;
     private double doubleSum = 0;
     private long count = 0;
 
@@ -1008,7 +1102,15 @@ public final class FusedScanAggregate {
     /** Merge pre-computed long sum and count from the flat-array fast path. */
     void addLongSumCount(long sum, long cnt) {
       if (cnt > 0) {
-        longSum += sum;
+        doubleSum += sum;
+        count += cnt;
+      }
+    }
+
+    /** Merge pre-computed double sum and count from the flat-array fast path. */
+    void addDoubleSumCount(double sum, long cnt) {
+      if (cnt > 0) {
+        doubleSum += sum;
         count += cnt;
       }
     }
@@ -1025,7 +1127,7 @@ public final class FusedScanAggregate {
         if (isDoubleType) {
           doubleSum += Double.longBitsToDouble(dv.nextValue());
         } else {
-          longSum += dv.nextValue();
+          doubleSum += dv.nextValue();
         }
       }
     }
@@ -1039,10 +1141,8 @@ public final class FusedScanAggregate {
     public void writeTo(BlockBuilder builder) {
       if (count == 0) {
         builder.appendNull();
-      } else if (isDoubleType) {
-        DoubleType.DOUBLE.writeDouble(builder, doubleSum / count);
       } else {
-        DoubleType.DOUBLE.writeDouble(builder, (double) longSum / count);
+        DoubleType.DOUBLE.writeDouble(builder, doubleSum / count);
       }
     }
   }

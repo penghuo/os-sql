@@ -103,7 +103,9 @@ public class TransportTrinoSqlAction
       List<String> internalColumnNames,
       List<Type> columnTypes,
       Map<String, Type> columnTypeMap,
-      long metadataVersion) {}
+      long metadataVersion,
+      String schemaJsonPrefix,
+      Type[] columnTypeArray) {}
 
   private final ClusterService clusterService;
   private final TransportService transportService;
@@ -150,6 +152,8 @@ public class TransportTrinoSqlAction
       final List<String> internalColumnNames;
       final List<Type> columnTypes;
       final Map<String, Type> columnTypeMap;
+      final String schemaJsonPrefix;
+      final Type[] columnTypeArray;
 
       if (cached != null) {
         // === Cache hit: reuse pre-compiled plan ===
@@ -159,6 +163,8 @@ public class TransportTrinoSqlAction
         internalColumnNames = cached.internalColumnNames();
         columnTypes = cached.columnTypes();
         columnTypeMap = cached.columnTypeMap();
+        schemaJsonPrefix = cached.schemaJsonPrefix();
+        columnTypeArray = cached.columnTypeArray();
       } else {
         // === Cache miss: full compilation pipeline ===
 
@@ -223,6 +229,9 @@ public class TransportTrinoSqlAction
         }
         List<PlanFragment> shardFrags = compiledFragments.shardFragments();
         DqePlanNode cachedShardPlan = shardFrags.isEmpty() ? null : shardFrags.get(0).shardPlan();
+        // Pre-build schema JSON prefix and type array for response formatting
+        String schemaPrefix = buildSchemaJsonPrefix(compiledColumnNames, compiledColumnTypes);
+        Type[] typeArray = compiledColumnTypes.toArray(new Type[0]);
         QUERY_PLAN_CACHE.put(
             queryStr,
             new CachedQueryPlan(
@@ -234,7 +243,9 @@ public class TransportTrinoSqlAction
                 compiledInternalColumnNames,
                 compiledColumnTypes,
                 compiledColumnTypeMap,
-                currentMetaVersion));
+                currentMetaVersion,
+                schemaPrefix,
+                typeArray));
 
         // Assign to final variables for the execution phase
         fragments = compiledFragments;
@@ -243,6 +254,8 @@ public class TransportTrinoSqlAction
         internalColumnNames = compiledInternalColumnNames;
         columnTypes = compiledColumnTypes;
         columnTypeMap = compiledColumnTypeMap;
+        schemaJsonPrefix = schemaPrefix;
+        columnTypeArray = typeArray;
       }
 
       // 8. Dispatch to shards via transport
@@ -407,7 +420,13 @@ public class TransportTrinoSqlAction
                       }
 
                       // 11. Format response (Page -> JSON for REST client)
-                      String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
+                      String responseJson =
+                          formatResponse(
+                              mergedPages,
+                              columnNames,
+                              columnTypes,
+                              schemaJsonPrefix,
+                              columnTypeArray);
                       listener.onResponse(new TrinoSqlResponse(responseJson));
                     } catch (Exception e) {
                       listener.onFailure(e);
@@ -434,47 +453,69 @@ public class TransportTrinoSqlAction
       if (allLocal && shardAction != null) {
         // === Local-node fast path ===
         // Execute all shard plans directly without transport serialization.
-        // Uses CountDownLatch + shared array for lighter synchronization than
-        // GroupedActionListener (avoids CopyOnWriteArrayList + ActionListener chain).
+        // Dispatches N-1 shards to the thread pool and executes the last shard on the
+        // coordinator thread itself, overlapping with the latch wait. This saves one
+        // thread pool submission and eliminates the latch entirely for single-shard cases.
         LOG.debug("DQE: Using local-node fast path for {} shard fragments", shardFragments.size());
         DqePlanNode shardPlan = shardFragments.get(0).shardPlan();
         int numShards = shardFragments.size();
         ShardExecuteResponse[] shardResults = new ShardExecuteResponse[numShards];
         Exception[] shardErrors = new Exception[1]; // first error wins
-        java.util.concurrent.CountDownLatch latch =
-            new java.util.concurrent.CountDownLatch(numShards);
 
-        java.util.concurrent.ExecutorService executor =
-            transportService
-                .getThreadPool()
-                .executor(
-                    org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction
-                        .DQE_THREAD_POOL_NAME);
-        for (int i = 0; i < numShards; i++) {
-          PlanFragment frag = shardFragments.get(i);
-          final int fragIdx = i;
-          final int fragShardId = frag.shardId();
-          final String fragIndexName = frag.indexName();
-          executor.execute(
-              () -> {
-                ShardExecuteRequest shardReq =
-                    new ShardExecuteRequest(new byte[0], fragIndexName, fragShardId, timeoutMillis);
-                try {
-                  shardResults[fragIdx] = shardAction.executeLocal(shardPlan, shardReq);
-                } catch (Exception e) {
-                  shardErrors[0] = e;
-                }
-                latch.countDown();
-              });
+        // Dispatch shards 0..N-2 to the thread pool; shard N-1 runs on this thread
+        int remoteShards = numShards - 1;
+        java.util.concurrent.CountDownLatch latch =
+            new java.util.concurrent.CountDownLatch(remoteShards);
+
+        if (remoteShards > 0) {
+          java.util.concurrent.ExecutorService executor =
+              transportService
+                  .getThreadPool()
+                  .executor(
+                      org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction
+                          .DQE_THREAD_POOL_NAME);
+          for (int i = 0; i < remoteShards; i++) {
+            PlanFragment frag = shardFragments.get(i);
+            final int fragIdx = i;
+            final int fragShardId = frag.shardId();
+            final String fragIndexName = frag.indexName();
+            executor.execute(
+                () -> {
+                  ShardExecuteRequest shardReq =
+                      new ShardExecuteRequest(
+                          new byte[0], fragIndexName, fragShardId, timeoutMillis);
+                  try {
+                    shardResults[fragIdx] = shardAction.executeLocal(shardPlan, shardReq);
+                  } catch (Exception e) {
+                    shardErrors[0] = e;
+                  }
+                  latch.countDown();
+                });
+          }
         }
 
-        // Wait for all shards and process results synchronously
-        try {
-          latch.await(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ie) {
-          Thread.currentThread().interrupt();
-          listener.onFailure(ie);
-          return;
+        // Execute the last shard on the coordinator thread (overlaps with pool execution)
+        {
+          PlanFragment lastFrag = shardFragments.get(remoteShards);
+          ShardExecuteRequest shardReq =
+              new ShardExecuteRequest(
+                  new byte[0], lastFrag.indexName(), lastFrag.shardId(), timeoutMillis);
+          try {
+            shardResults[remoteShards] = shardAction.executeLocal(shardPlan, shardReq);
+          } catch (Exception e) {
+            shardErrors[0] = e;
+          }
+        }
+
+        // Wait for the pool-dispatched shards (the last shard is already done)
+        if (remoteShards > 0) {
+          try {
+            latch.await(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            listener.onFailure(ie);
+            return;
+          }
         }
 
         if (shardErrors[0] != null) {
@@ -600,7 +641,9 @@ public class TransportTrinoSqlAction
           if (globalLimit >= 0) {
             mergedPages = applyGlobalLimit(mergedPages, globalLimit);
           }
-          String responseJson = formatResponse(mergedPages, columnNames, columnTypes);
+          String responseJson =
+              formatResponse(
+                  mergedPages, columnNames, columnTypes, schemaJsonPrefix, columnTypeArray);
           listener.onResponse(new TrinoSqlResponse(responseJson));
         } catch (Exception e) {
           listener.onFailure(e);
@@ -990,35 +1033,70 @@ public class TransportTrinoSqlAction
    * @return JSON response string
    */
   static String formatResponse(List<Page> pages, List<String> columnNames, List<Type> columnTypes) {
-    // Pre-compute total row count for StringBuilder sizing
-    int totalRows = 0;
-    for (Page page : pages) {
-      totalRows += page.getPositionCount();
-    }
-    // Estimate ~40 bytes per cell for initial capacity
-    int numCols = columnNames.size();
-    StringBuilder sb = new StringBuilder(Math.max(256, totalRows * numCols * 40));
-    sb.append("{\"schema\":[");
+    return formatResponse(pages, columnNames, columnTypes, null, null);
+  }
 
-    // Build schema from column names and types
-    // Pre-resolve type strings to avoid repeated instanceof checks
-    String[] typeStrings = new String[numCols];
+  /**
+   * Build the schema JSON prefix: {@code {"schema":[...],"datarows":[}. This is identical for
+   * repeated executions of the same query and can be cached alongside the query plan.
+   */
+  static String buildSchemaJsonPrefix(List<String> columnNames, List<Type> columnTypes) {
+    int numCols = columnNames.size();
+    StringBuilder sb = new StringBuilder(numCols * 40 + 32);
+    sb.append("{\"schema\":[");
     for (int i = 0; i < numCols; i++) {
-      typeStrings[i] = trinoTypeToOpenSearchType(columnTypes.get(i));
       if (i > 0) {
         sb.append(",");
       }
       sb.append("{\"name\":\"")
           .append(escapeJson(columnNames.get(i)))
           .append("\",\"type\":\"")
-          .append(typeStrings[i])
+          .append(trinoTypeToOpenSearchType(columnTypes.get(i)))
           .append("\"}");
     }
     sb.append("],\"datarows\":[");
+    return sb.toString();
+  }
 
-    // Build data rows from Pages
-    // Pre-fetch column types into array for fast indexed access
-    Type[] types = columnTypes.toArray(new Type[0]);
+  /**
+   * Overloaded formatResponse that accepts a pre-built schema JSON prefix and type array from the
+   * plan cache to avoid re-computing the schema portion and List-to-array conversion per query.
+   */
+  static String formatResponse(
+      List<Page> pages,
+      List<String> columnNames,
+      List<Type> columnTypes,
+      String cachedSchemaPrefix,
+      Type[] cachedTypes) {
+    // Pre-compute total row count for StringBuilder sizing
+    int totalRows = 0;
+    for (Page page : pages) {
+      totalRows += page.getPositionCount();
+    }
+    int numCols = columnNames.size();
+    // Estimate ~40 bytes per cell for initial capacity
+    StringBuilder sb = new StringBuilder(Math.max(256, totalRows * numCols * 40));
+
+    // Use cached schema prefix if available, otherwise build it inline
+    if (cachedSchemaPrefix != null) {
+      sb.append(cachedSchemaPrefix);
+    } else {
+      sb.append("{\"schema\":[");
+      for (int i = 0; i < numCols; i++) {
+        if (i > 0) {
+          sb.append(",");
+        }
+        sb.append("{\"name\":\"")
+            .append(escapeJson(columnNames.get(i)))
+            .append("\",\"type\":\"")
+            .append(trinoTypeToOpenSearchType(columnTypes.get(i)))
+            .append("\"}");
+      }
+      sb.append("],\"datarows\":[");
+    }
+
+    // Use cached type array if available, otherwise build from list
+    Type[] types = cachedTypes != null ? cachedTypes : columnTypes.toArray(new Type[0]);
     boolean firstRow = true;
     for (Page page : pages) {
       int channelCount = page.getChannelCount();
@@ -1190,9 +1268,25 @@ public class TransportTrinoSqlAction
     }
   }
 
+  private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
   private static String escapeJson(String s) {
     if (s == null) {
       return "null";
+    }
+    // Fast-path: scan for characters that need escaping. Most strings (column names,
+    // numeric values) never need escaping, so we can return the original string directly
+    // and avoid StringBuilder allocation entirely.
+    boolean needsEscape = false;
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t' || c < 0x20) {
+        needsEscape = true;
+        break;
+      }
+    }
+    if (!needsEscape) {
+      return s;
     }
     StringBuilder sb = new StringBuilder(s.length() + 16);
     for (int i = 0; i < s.length(); i++) {
@@ -1215,8 +1309,11 @@ public class TransportTrinoSqlAction
           break;
         default:
           if (c < 0x20) {
-            // Escape control characters as JSON unicode escapes
-            sb.append(String.format("\\u%04x", (int) c));
+            // Escape control characters as JSON unicode escapes (manual hex to avoid
+            // String.format overhead)
+            sb.append("\\u00");
+            sb.append(HEX_DIGITS[(c >> 4) & 0xF]);
+            sb.append(HEX_DIGITS[c & 0xF]);
           } else {
             sb.append(c);
           }

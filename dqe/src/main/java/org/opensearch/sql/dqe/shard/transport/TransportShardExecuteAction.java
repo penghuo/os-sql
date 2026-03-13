@@ -193,9 +193,25 @@ public class TransportShardExecuteAction
    */
   private ShardExecuteResponse executePlan(DqePlanNode plan, ShardExecuteRequest req)
       throws Exception {
+    // Unwrap top-level ProjectNode for fused path dispatch.
+    // For single-shard indices, the full optimized plan (ProjectNode -> AggregationNode -> ...)
+    // becomes the shard plan. The ProjectNode prevents fused paths from firing because they
+    // check "plan instanceof AggregationNode". Unwrapping here enables fused paths for all
+    // scalar and GROUP BY aggregation queries on single-shard indices, avoiding the much
+    // slower generic operator pipeline (LucenePageSource -> HashAggregationOperator).
+    final DqePlanNode effectivePlan;
+    final ProjectNode topProject;
+    if (plan instanceof ProjectNode proj && proj.getChild() instanceof AggregationNode) {
+      topProject = proj;
+      effectivePlan = proj.getChild();
+    } else {
+      topProject = null;
+      effectivePlan = plan;
+    }
+
     // Try short-circuit for scalar COUNT(*) — avoids pipeline construction entirely
-    if (scanFactory == null && isScalarCountStar(plan)) {
-      List<Page> pages = executeScalarCountStar(plan, req);
+    if (scanFactory == null && isScalarCountStar(effectivePlan)) {
+      List<Page> pages = executeScalarCountStar(effectivePlan, req);
       List<Type> columnTypes = List.of(BigintType.BIGINT);
       return new ShardExecuteResponse(pages, columnTypes);
     }
@@ -218,13 +234,13 @@ public class TransportShardExecuteAction
 
     // Try fused scan-aggregate for scalar aggregations (no GROUP BY)
     if (scanFactory == null
-        && plan instanceof AggregationNode aggNode
+        && effectivePlan instanceof AggregationNode aggNode
         && FusedScanAggregate.canFuse(aggNode)) {
       List<Page> pages = executeFusedScanAggregate(aggNode, req);
       List<Type> columnTypes =
           FusedScanAggregate.resolveOutputTypes(
               aggNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      return new ShardExecuteResponse(pages, columnTypes);
+      return applyTopProject(pages, columnTypes, topProject, aggNode);
     }
 
     // Fast path: bare TableScanNode with single numeric column — pre-dedup for COUNT(DISTINCT).
@@ -248,23 +264,23 @@ public class TransportShardExecuteAction
 
     // Try fused eval-aggregate for SUM(col + constant) patterns
     if (scanFactory == null
-        && plan instanceof AggregationNode aggEvalNode
+        && effectivePlan instanceof AggregationNode aggEvalNode
         && FusedScanAggregate.canFuseWithEval(aggEvalNode)) {
       List<Page> pages = executeFusedEvalAggregate(aggEvalNode, req);
       List<Type> columnTypes = FusedScanAggregate.resolveEvalAggOutputTypes(aggEvalNode);
-      return new ShardExecuteResponse(pages, columnTypes);
+      return applyTopProject(pages, columnTypes, topProject, aggEvalNode);
     }
 
     // Try fused ordinal-based GROUP BY for aggregations with string group keys
     if (scanFactory == null
-        && plan instanceof AggregationNode aggGroupNode
+        && effectivePlan instanceof AggregationNode aggGroupNode
         && FusedGroupByAggregate.canFuse(
             aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
       List<Page> pages = executeFusedGroupByAggregate(aggGroupNode, req);
       List<Type> columnTypes =
           FusedGroupByAggregate.resolveOutputTypes(
               aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      return new ShardExecuteResponse(pages, columnTypes);
+      return applyTopProject(pages, columnTypes, topProject, aggGroupNode);
     }
 
     // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode
@@ -272,13 +288,14 @@ public class TransportShardExecuteAction
     // VARCHAR column. Pre-computes the expression once per unique ordinal (~16K evaluations
     // instead of ~921K), giving ~58x reduction in expression evaluations for Q29.
     if (scanFactory == null
-        && plan instanceof AggregationNode aggExprNode
+        && effectivePlan instanceof AggregationNode aggExprNode
         && FusedGroupByAggregate.canFuseWithExpressionKey(
             aggExprNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
       List<Page> pages = executeFusedExprGroupByAggregate(aggExprNode, req);
       List<Type> columnTypes =
-          resolveColumnTypes(plan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      return new ShardExecuteResponse(pages, columnTypes);
+          resolveColumnTypes(
+              effectivePlan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+      return applyTopProject(pages, columnTypes, topProject, aggExprNode);
     }
 
     // Try fused GROUP BY with sort+limit: detect LimitNode -> [ProjectNode] -> SortNode ->
@@ -1352,6 +1369,48 @@ public class TransportShardExecuteAction
           return sf;
         }
     }
+  }
+
+  /**
+   * Apply a top-level ProjectNode to the fused path result, if needed. When the original plan was
+   * ProjectNode -> AggregationNode, the fused path ran on the inner AggregationNode. This method
+   * re-applies the projection (column subsetting / reordering) if the ProjectNode's output columns
+   * differ from the AggregationNode's output. For scalar aggregations, the projection is typically
+   * identity and this is a no-op.
+   */
+  private ShardExecuteResponse applyTopProject(
+      List<Page> pages, List<Type> columnTypes, ProjectNode topProject, AggregationNode aggNode) {
+    if (topProject == null) {
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+    // Build the AggregationNode output column names
+    List<String> aggOutputColumns = new ArrayList<>(aggNode.getGroupByKeys());
+    aggOutputColumns.addAll(aggNode.getAggregateFunctions());
+    List<String> projColumns = topProject.getOutputColumns();
+    // Check if projection is identity
+    if (projColumns.equals(aggOutputColumns)) {
+      return new ShardExecuteResponse(pages, columnTypes);
+    }
+    // Resolve projection indices
+    List<Integer> projIndices = new ArrayList<>();
+    for (String col : projColumns) {
+      int idx = aggOutputColumns.indexOf(col);
+      projIndices.add(idx >= 0 ? idx : 0);
+    }
+    // Apply projection
+    List<Page> projectedPages = new ArrayList<>();
+    for (Page p : pages) {
+      Block[] newBlocks = new Block[projIndices.size()];
+      for (int i = 0; i < projIndices.size(); i++) {
+        newBlocks[i] = p.getBlock(projIndices.get(i));
+      }
+      projectedPages.add(new Page(newBlocks));
+    }
+    List<Type> projTypes = new ArrayList<>();
+    for (int idx : projIndices) {
+      projTypes.add(columnTypes.get(idx));
+    }
+    return new ShardExecuteResponse(projectedPages, projTypes);
   }
 
   /** Read a single doc value from a specific segment and doc ID into a BlockBuilder. */

@@ -1030,7 +1030,16 @@ public final class FusedGroupByAggregate {
       }
       if (hasEvalKey) {
         return executeWithEvalKeys(
-            aggNode, shard, query, keyInfos, specs, columnTypeMap, groupByKeys);
+            aggNode,
+            shard,
+            query,
+            keyInfos,
+            specs,
+            columnTypeMap,
+            groupByKeys,
+            sortAggIndex,
+            sortAscending,
+            topN);
       }
       return executeWithVarcharKeys(
           shard,
@@ -4359,7 +4368,10 @@ public final class FusedGroupByAggregate {
       List<KeyInfo> keyInfos,
       List<AggSpec> specs,
       Map<String, Type> columnTypeMap,
-      List<String> groupByKeys)
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN)
       throws Exception {
 
     EvalNode evalNode = (aggNode.getChild() instanceof EvalNode en) ? en : null;
@@ -4370,8 +4382,8 @@ public final class FusedGroupByAggregate {
     final int numAggs = specs.size();
     final boolean[] isEvalKey = new boolean[numKeys];
 
-    // Collect only columns needed for eval expressions (not all scan columns)
-    Set<String> evalSourceColumns = new HashSet<>();
+    // First pass: collect ALL eval source columns for expression compilation
+    Set<String> allEvalSourceColumns = new HashSet<>();
     if (evalNode != null) {
       for (int k = 0; k < numKeys; k++) {
         KeyInfo ki = keyInfos.get(k);
@@ -4381,19 +4393,19 @@ public final class FusedGroupByAggregate {
           String exprStr = evalNode.getExpressions().get(exprIdx);
           for (String col : columnTypeMap.keySet()) {
             if (exprStr.contains(col)) {
-              evalSourceColumns.add(col);
+              allEvalSourceColumns.add(col);
             }
           }
         }
       }
     }
 
-    // Build column index map for expression compilation: only eval source columns
-    List<String> evalColumns = new ArrayList<>(evalSourceColumns);
-    java.util.Collections.sort(evalColumns); // Deterministic order
-    Map<String, Integer> colIndexMap = new HashMap<>();
-    for (int i = 0; i < evalColumns.size(); i++) {
-      colIndexMap.put(evalColumns.get(i), i);
+    // Build column index map for expression compilation using ALL eval source columns
+    List<String> allEvalColumns = new ArrayList<>(allEvalSourceColumns);
+    java.util.Collections.sort(allEvalColumns); // Deterministic order
+    Map<String, Integer> allColIndexMap = new HashMap<>();
+    for (int i = 0; i < allEvalColumns.size(); i++) {
+      allColIndexMap.put(allEvalColumns.get(i), i);
     }
 
     // Normalized type map for expression compilation
@@ -4407,20 +4419,13 @@ public final class FusedGroupByAggregate {
       }
     }
 
-    // Normalized types for the eval columns
-    final Type[] evalColTypes = new Type[evalColumns.size()];
-    for (int c = 0; c < evalColumns.size(); c++) {
-      Type t = normalizedTypeMap.getOrDefault(evalColumns.get(c), BigintType.BIGINT);
-      evalColTypes[c] = t;
-    }
-
-    // Compile eval expressions
+    // Compile eval expressions and optimize column references
     org.opensearch.sql.dqe.function.FunctionRegistry registry =
         org.opensearch.sql.dqe.function.BuiltinFunctions.createRegistry();
     io.trino.sql.parser.SqlParser sqlParser = new io.trino.sql.parser.SqlParser();
     org.opensearch.sql.dqe.function.expression.ExpressionCompiler compiler =
         new org.opensearch.sql.dqe.function.expression.ExpressionCompiler(
-            registry, colIndexMap, normalizedTypeMap);
+            registry, allColIndexMap, normalizedTypeMap);
 
     final org.opensearch.sql.dqe.function.expression.BlockExpression[] evalExprs =
         new org.opensearch.sql.dqe.function.expression.BlockExpression[numKeys];
@@ -4430,6 +4435,67 @@ public final class FusedGroupByAggregate {
         String exprStr = evalNode.getExpressions().get(exprIdx);
         io.trino.sql.tree.Expression ast = sqlParser.createExpression(exprStr);
         evalExprs[k] = compiler.compile(ast);
+        // Optimization: if the eval expression is a simple column reference (e.g., URL AS Dst),
+        // convert it to a regular (non-eval) key to avoid Block-based expression evaluation.
+        // This uses direct DocValues reading which is much faster for VARCHAR columns.
+        if (evalExprs[k]
+            instanceof org.opensearch.sql.dqe.function.expression.ColumnReference colRef) {
+          String colName = allEvalColumns.get(colRef.getColumnIndex());
+          Type colType = columnTypeMap.getOrDefault(colName, BigintType.BIGINT);
+          boolean colIsVarchar = colType instanceof VarcharType;
+          keyInfos.set(k, new KeyInfo(colName, colType, colIsVarchar, null, null));
+          isEvalKey[k] = false;
+          evalExprs[k] = null;
+        }
+      }
+    }
+
+    // Second pass: rebuild eval source columns excluding columns only needed by
+    // now-converted column references. This avoids building expensive Block objects
+    // for columns that are now read directly via DocValues.
+    Set<String> evalSourceColumns = new HashSet<>();
+    if (evalNode != null) {
+      for (int k = 0; k < numKeys; k++) {
+        if (isEvalKey[k]) {
+          int exprIdx = Integer.parseInt(keyInfos.get(k).exprUnit);
+          String exprStr = evalNode.getExpressions().get(exprIdx);
+          for (String col : columnTypeMap.keySet()) {
+            if (exprStr.contains(col)) {
+              evalSourceColumns.add(col);
+            }
+          }
+        }
+      }
+    }
+    List<String> evalColumns = new ArrayList<>(evalSourceColumns);
+    java.util.Collections.sort(evalColumns);
+    // Build a mapping from allEvalColumns indices (used by compiled expressions)
+    // to the reduced evalColumns indices (used for actual Block building)
+    Map<String, Integer> reducedColIndexMap = new HashMap<>();
+    for (int i = 0; i < evalColumns.size(); i++) {
+      reducedColIndexMap.put(evalColumns.get(i), i);
+    }
+
+    // Normalized types for the eval columns
+    final Type[] evalColTypes = new Type[evalColumns.size()];
+    for (int c = 0; c < evalColumns.size(); c++) {
+      Type t = normalizedTypeMap.getOrDefault(evalColumns.get(c), BigintType.BIGINT);
+      evalColTypes[c] = t;
+    }
+
+    // Re-compile remaining eval expressions with reduced column set so column indices match
+    // the reduced evalColumns used for Block building
+    if (!reducedColIndexMap.equals(allColIndexMap)) {
+      org.opensearch.sql.dqe.function.expression.ExpressionCompiler reducedCompiler =
+          new org.opensearch.sql.dqe.function.expression.ExpressionCompiler(
+              registry, reducedColIndexMap, normalizedTypeMap);
+      for (int k = 0; k < numKeys; k++) {
+        if (isEvalKey[k]) {
+          int exprIdx = Integer.parseInt(keyInfos.get(k).exprUnit);
+          String exprStr = evalNode.getExpressions().get(exprIdx);
+          io.trino.sql.tree.Expression ast = sqlParser.createExpression(exprStr);
+          evalExprs[k] = reducedCompiler.compile(ast);
+        }
       }
     }
 
@@ -4476,7 +4542,7 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-eval")) {
 
-      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
+      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>(16384, 0.75f);
 
       // Phase 1: Collect doc IDs and non-eval key values per segment
       for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
@@ -4590,17 +4656,36 @@ public final class FusedGroupByAggregate {
           }
         }
 
-        Block[] colBlocks = new Block[evalColumns.size()];
-        for (int c = 0; c < evalColumns.size(); c++) {
-          colBlocks[c] = colBuilders[c].build();
-        }
-        Page evalPage = new Page(colBlocks);
-
         // Evaluate all eval expressions on the entire segment batch
         Block[] evalResultBlocks = new Block[numKeys];
+        boolean hasRemainingEvalKeys = false;
         for (int k = 0; k < numKeys; k++) {
           if (isEvalKey[k]) {
-            evalResultBlocks[k] = evalExprs[k].evaluate(evalPage);
+            hasRemainingEvalKeys = true;
+            break;
+          }
+        }
+        if (hasRemainingEvalKeys) {
+          Page evalPage;
+          if (!evalColumns.isEmpty()) {
+            Block[] colBlocks = new Block[evalColumns.size()];
+            for (int c = 0; c < evalColumns.size(); c++) {
+              colBlocks[c] = colBuilders[c].build();
+            }
+            evalPage = new Page(colBlocks);
+          } else {
+            // Eval keys that don't reference any columns (e.g., constant expressions like "1")
+            // need a Page with the correct position count but no columns. Create a dummy block.
+            BlockBuilder dummyBuilder = BigintType.BIGINT.createBlockBuilder(null, segDocCount);
+            for (int d = 0; d < segDocCount; d++) {
+              BigintType.BIGINT.writeLong(dummyBuilder, 0);
+            }
+            evalPage = new Page(dummyBuilder.build());
+          }
+          for (int k = 0; k < numKeys; k++) {
+            if (isEvalKey[k]) {
+              evalResultBlocks[k] = evalExprs[k].evaluate(evalPage);
+            }
           }
         }
 
@@ -4659,21 +4744,89 @@ public final class FusedGroupByAggregate {
         return List.of();
       }
 
-      // Build output Page
+      // Apply top-N selection if requested, to reduce output volume
       int numGroupKeys = groupByKeys.size();
       int totalColumns = numGroupKeys + numAggs;
-      int groupCount = globalGroups.size();
 
+      java.util.Collection<Map.Entry<MergedGroupKey, AccumulatorGroup>> outputEntries;
+      if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+        int n = (int) Math.min(topN, globalGroups.size());
+        // Use a min-heap (for DESC) or max-heap (for ASC) to select top-N entries
+        @SuppressWarnings("unchecked")
+        Map.Entry<MergedGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+        int heapSize = 0;
+        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+          long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+          if (heapSize < n) {
+            heap[heapSize++] = entry;
+            int k = heapSize - 1;
+            while (k > 0) {
+              int parent = (k - 1) >>> 1;
+              long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+              long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+              boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+              if (swap) {
+                var tmp = heap[parent];
+                heap[parent] = heap[k];
+                heap[k] = tmp;
+                k = parent;
+              } else break;
+            }
+          } else {
+            long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+            boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+            if (better) {
+              heap[0] = entry;
+              int k = 0;
+              while (true) {
+                int left = 2 * k + 1;
+                if (left >= heapSize) break;
+                int right = left + 1;
+                int target = left;
+                if (right < heapSize) {
+                  long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                  long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                  boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                  if (pickRight) target = right;
+                }
+                long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+                long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+                boolean swp = sortAscending ? (tVal > kVal) : (tVal < kVal);
+                if (swp) {
+                  var tmp = heap[k];
+                  heap[k] = heap[target];
+                  heap[target] = tmp;
+                  k = target;
+                } else break;
+              }
+            }
+          }
+        }
+        outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
+      } else if (topN > 0 && topN < globalGroups.size()) {
+        // LIMIT without ORDER BY: just take the first topN entries
+        List<Map.Entry<MergedGroupKey, AccumulatorGroup>> limited = new ArrayList<>();
+        int count = 0;
+        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+          if (count++ >= topN) break;
+          limited.add(entry);
+        }
+        outputEntries = limited;
+      } else {
+        outputEntries = globalGroups.entrySet();
+      }
+
+      int outputCount = outputEntries.size();
       BlockBuilder[] builders = new BlockBuilder[totalColumns];
       for (int i = 0; i < numGroupKeys; i++) {
-        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, groupCount);
+        builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
       }
       for (int i = 0; i < numAggs; i++) {
         builders[numGroupKeys + i] =
-            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, groupCount);
+            resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
       }
 
-      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : outputEntries) {
         MergedGroupKey key = entry.getKey();
         AccumulatorGroup accGroup = entry.getValue();
         for (int k = 0; k < numGroupKeys; k++) {

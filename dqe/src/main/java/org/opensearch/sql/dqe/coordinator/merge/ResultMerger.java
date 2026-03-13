@@ -3118,4 +3118,180 @@ public class ResultMerger {
     }
     return defaults;
   }
+
+  /**
+   * Capped aggregation merge for FINAL aggregation with LIMIT but no ORDER BY. Since any N groups
+   * are valid output when there is no ORDER BY, this method caps the number of tracked groups to
+   * {@code maxGroups}. New groups beyond the cap are ignored; existing groups continue to
+   * accumulate partial results from all shards, ensuring correct total counts for the capped set.
+   *
+   * <p>This reduces coordinator merge time from O(totalGroups * numShards) to O(maxGroups *
+   * numShards) for high-cardinality GROUP BY queries with small LIMIT (e.g., Q18: 98K groups with
+   * LIMIT 10 reduces to 10 groups tracked across 8 shards = 80 lookups instead of 784K).
+   *
+   * @param shardResults pages from each shard
+   * @param finalAggNode the FINAL aggregation node
+   * @param columnTypes Trino types for output columns
+   * @param maxGroups maximum number of groups to track (typically LIMIT + OFFSET)
+   * @return merged result pages with at most maxGroups rows
+   */
+  public List<Page> mergeAggregationCapped(
+      List<List<Page>> shardResults,
+      AggregationNode finalAggNode,
+      List<Type> columnTypes,
+      long maxGroups) {
+
+    List<String> groupByKeys = finalAggNode.getGroupByKeys();
+    List<String> aggregateFunctions = finalAggNode.getAggregateFunctions();
+    int numGroupByCols = groupByKeys.size();
+    int numAggCols = aggregateFunctions.size();
+    int totalCols = numGroupByCols + numAggCols;
+    int cap = (int) Math.min(maxGroups, Integer.MAX_VALUE);
+
+    // Classify keys: which are varchar, which are numeric
+    boolean[] isVarcharKey = new boolean[numGroupByCols];
+    boolean hasVarchar = false;
+    for (int k = 0; k < numGroupByCols; k++) {
+      isVarcharKey[k] = columnTypes.get(k) instanceof VarcharType;
+      if (isVarcharKey[k]) hasVarchar = true;
+    }
+
+    // Classify aggregates for output type
+    boolean[] isAvgAgg = new boolean[numAggCols];
+    int countAggIdx = -1;
+    for (int a = 0; a < numAggCols; a++) {
+      Matcher m = AGG_PATTERN.matcher(aggregateFunctions.get(a));
+      if (m.matches()) {
+        String funcName = m.group(1).toUpperCase(Locale.ROOT);
+        if ("AVG".equals(funcName)) {
+          isAvgAgg[a] = true;
+        } else if ("COUNT".equals(funcName) && m.group(2) == null) {
+          countAggIdx = a;
+        }
+      }
+    }
+    boolean hasAvg = false;
+    for (boolean b : isAvgAgg) {
+      if (b) {
+        hasAvg = true;
+        break;
+      }
+    }
+
+    // HashMap with compound key -> long[] aggs (capped to maxGroups entries)
+    java.util.HashMap<MixedMergeKey, long[]> groups = new java.util.HashMap<>(cap * 2);
+    java.util.HashMap<MixedMergeKey, double[]> doubleGroups =
+        hasAvg ? new java.util.HashMap<>() : null;
+
+    // Reusable probe key arrays
+    long[] tmpNumericKeys = new long[numGroupByCols];
+    io.airlift.slice.Slice[] tmpSliceKeys = new io.airlift.slice.Slice[numGroupByCols];
+
+    for (List<Page> shardPages : shardResults) {
+      for (Page page : shardPages) {
+        int positionCount = page.getPositionCount();
+
+        Block[] keyBlocks = new Block[numGroupByCols];
+        for (int k = 0; k < numGroupByCols; k++) {
+          keyBlocks[k] = page.getBlock(k);
+        }
+        Block[] aggBlocks = new Block[numAggCols];
+        for (int a = 0; a < numAggCols; a++) {
+          aggBlocks[a] = page.getBlock(numGroupByCols + a);
+        }
+
+        for (int pos = 0; pos < positionCount; pos++) {
+          // Extract key values into reusable arrays
+          int hash = 1;
+          for (int k = 0; k < numGroupByCols; k++) {
+            if (isVarcharKey[k]) {
+              io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(keyBlocks[k], pos);
+              tmpSliceKeys[k] = slice;
+              hash = hash * 31 + slice.hashCode();
+            } else {
+              long val = columnTypes.get(k).getLong(keyBlocks[k], pos);
+              tmpNumericKeys[k] = val;
+              hash = hash * 31 + Long.hashCode(val);
+            }
+          }
+
+          // Probe with reusable key
+          MixedMergeKey probeKey =
+              new MixedMergeKey(tmpNumericKeys, tmpSliceKeys, isVarcharKey, hash);
+
+          long[] aggs = groups.get(probeKey);
+          if (aggs == null) {
+            // New group — skip if we've already reached the cap
+            if (groups.size() >= cap) {
+              continue;
+            }
+            // Create permanent key with cloned arrays
+            MixedMergeKey permanentKey =
+                new MixedMergeKey(tmpNumericKeys.clone(), tmpSliceKeys.clone(), isVarcharKey, hash);
+            aggs = new long[numAggCols];
+            groups.put(permanentKey, aggs);
+            if (hasAvg) {
+              doubleGroups.put(permanentKey, new double[numAggCols]);
+            }
+          }
+
+          // Accumulate
+          for (int a = 0; a < numAggCols; a++) {
+            if (isAvgAgg[a]) {
+              double avg = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+              long count =
+                  countAggIdx >= 0 ? BigintType.BIGINT.getLong(aggBlocks[countAggIdx], pos) : 1;
+              double[] dAggs = doubleGroups.get(probeKey);
+              dAggs[a] += avg * count;
+            } else {
+              aggs[a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
+            }
+          }
+        }
+      }
+    }
+
+    if (groups.isEmpty()) return List.of();
+
+    // Build output Page
+    int groupCount = groups.size();
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    for (int k = 0; k < numGroupByCols; k++) {
+      builders[k] = columnTypes.get(k).createBlockBuilder(null, groupCount);
+    }
+    for (int a = 0; a < numAggCols; a++) {
+      Type outType = isAvgAgg[a] ? DoubleType.DOUBLE : BigintType.BIGINT;
+      builders[numGroupByCols + a] = outType.createBlockBuilder(null, groupCount);
+    }
+
+    for (java.util.Map.Entry<MixedMergeKey, long[]> entry : groups.entrySet()) {
+      MixedMergeKey key = entry.getKey();
+      long[] aggs = entry.getValue();
+
+      for (int k = 0; k < numGroupByCols; k++) {
+        if (isVarcharKey[k]) {
+          VarcharType.VARCHAR.writeSlice(builders[k], key.sliceKeys[k]);
+        } else {
+          columnTypes.get(k).writeLong(builders[k], key.numericKeys[k]);
+        }
+      }
+
+      for (int a = 0; a < numAggCols; a++) {
+        if (isAvgAgg[a]) {
+          double[] dAggs = doubleGroups.get(key);
+          long totalCount = countAggIdx >= 0 ? aggs[countAggIdx] : 1;
+          double avg = totalCount > 0 ? dAggs[a] / totalCount : 0.0;
+          DoubleType.DOUBLE.writeDouble(builders[numGroupByCols + a], avg);
+        } else {
+          BigintType.BIGINT.writeLong(builders[numGroupByCols + a], aggs[a]);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
 }

@@ -121,6 +121,15 @@ public class PlanFragmenter {
       if (shardPlanWithTopN != null) {
         return shardPlanWithTopN;
       }
+      // Optimization: for Limit -> [Project ->] Agg(PARTIAL) without Sort (GROUP BY + LIMIT
+      // without ORDER BY), keep the LimitNode on the shard plan. This enables capped insertion
+      // at the shard level via FusedGroupByAggregate, dramatically reducing the number of
+      // groups computed and sent to the coordinator. For Q18 (98K groups with LIMIT 10),
+      // each shard caps to 10 groups instead of computing all ~12K groups.
+      DqePlanNode shardPlanWithLimit = buildShardPlanWithLimitOnly(plan, aggNode);
+      if (shardPlanWithLimit != null) {
+        return shardPlanWithLimit;
+      }
       // Strip Sort, Limit, and Project above the aggregation.
       // Walk up from the aggregation to find it in the tree and return it as the root.
       return stripAboveAggregation(plan);
@@ -313,6 +322,45 @@ public class PlanFragmenter {
         new SortNode(
             aggNode, sortNode.getSortKeys(), sortNode.getAscending(), sortNode.getNullsFirst()),
         inflatedLimit);
+  }
+
+  /**
+   * For Limit -> [Project ->] Agg(PARTIAL) patterns WITHOUT a SortNode (GROUP BY + LIMIT without
+   * ORDER BY), keep the LimitNode on the shard plan so FusedGroupByAggregate can apply capped
+   * insertion. This is safe because without ORDER BY, any N groups are valid output. No HAVING
+   * clause may be present.
+   *
+   * @return shard plan with Limit -> Agg, or null if pattern doesn't match
+   */
+  private static DqePlanNode buildShardPlanWithLimitOnly(
+      DqePlanNode plan, AggregationNode aggNode) {
+    if (!(plan instanceof LimitNode limitNode)) {
+      return null;
+    }
+    DqePlanNode belowLimit = limitNode.getChild();
+    // Skip optional ProjectNode
+    if (belowLimit instanceof ProjectNode) {
+      belowLimit = ((ProjectNode) belowLimit).getChild();
+    }
+    // Must NOT have a SortNode (ORDER BY handled by buildShardPlanWithInflatedLimit)
+    if (belowLimit instanceof SortNode) {
+      return null;
+    }
+    // Must reach the AggregationNode directly
+    if (!(belowLimit instanceof AggregationNode)) {
+      return null;
+    }
+    // Must have GROUP BY (scalar agg doesn't benefit from capping)
+    if (aggNode.getGroupByKeys().isEmpty()) {
+      return null;
+    }
+    // No HAVING clause
+    if (hasFilterAboveAggregation(plan)) {
+      return null;
+    }
+    // Build: LimitNode(limit) -> AggregationNode(PARTIAL) -> child
+    long limit = limitNode.getCount() + limitNode.getOffset();
+    return new LimitNode(aggNode, limit);
   }
 
   /** Check if there's a FilterNode (HAVING) between the root and the AggregationNode. */

@@ -399,6 +399,20 @@ public class TransportTrinoSqlAction
                                   sortNodeForFuse.getAscending(),
                                   sortNodeForFuse.getNullsFirst(),
                                   sortLimitForFuse);
+                        } else if (havingNode == null
+                            && sortNodeForFuse == null
+                            && fusedLimit > 0
+                            && aggNode.getStep() == AggregationNode.Step.FINAL
+                            && !aggNode.getGroupByKeys().isEmpty()) {
+                          // Capped merge: LIMIT without ORDER BY on GROUP BY aggregation.
+                          // Any N groups are valid output, so cap the merge to N groups.
+                          // Groups in the capped set get correct total counts from all shards;
+                          // groups outside the set are simply excluded (valid for non-ordered
+                          // output).
+                          long cappedLimit = fusedLimit + findGlobalOffset(optimizedPlan);
+                          mergedPages =
+                              merger.mergeAggregationCapped(
+                                  shardPages, aggNode, columnTypes, cappedLimit);
                         } else {
                           // Fallback: separate merge + HAVING + sort
                           mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
@@ -634,6 +648,15 @@ public class TransportTrinoSqlAction
                       sortNodeForFuse.getAscending(),
                       sortNodeForFuse.getNullsFirst(),
                       sortLimitForFuse);
+            } else if (havingNode == null
+                && sortNodeForFuse == null
+                && fusedLimit > 0
+                && aggNode.getStep() == AggregationNode.Step.FINAL
+                && !aggNode.getGroupByKeys().isEmpty()) {
+              // Capped merge: LIMIT without ORDER BY on GROUP BY aggregation.
+              long cappedLimit = fusedLimit + findGlobalOffset(optimizedPlan);
+              mergedPages =
+                  merger.mergeAggregationCapped(shardPages, aggNode, columnTypes, cappedLimit);
             } else {
               mergedPages = merger.mergeAggregation(shardPages, aggNode, columnTypes);
               mergedPages =

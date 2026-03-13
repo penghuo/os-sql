@@ -86,6 +86,18 @@ public class TransportTrinoSqlAction
   private static final Logger LOG = LogManager.getLogger();
 
   /**
+   * Singleton reference set during Guice construction. Used by {@link
+   * org.opensearch.sql.dqe.coordinator.rest.RestTrinoSqlAction} to bypass the transport action
+   * framework for reduced per-query overhead.
+   */
+  private static volatile TransportTrinoSqlAction INSTANCE;
+
+  /** Return the singleton instance (available after Guice initialization). */
+  public static TransportTrinoSqlAction getInstance() {
+    return INSTANCE;
+  }
+
+  /**
    * Cache for compiled SQL query plans. Eliminates the parse-plan-optimize-fragment overhead for
    * repeated queries. Keyed by (SQL string, cluster metadata version) so that schema changes
    * automatically invalidate the cache. Bounded to 128 entries to limit memory usage.
@@ -129,19 +141,38 @@ public class TransportTrinoSqlAction
     this.clusterService = clusterService;
     this.transportService = transportService;
     this.shardAction = shardAction;
+    INSTANCE = this;
+  }
+
+  /**
+   * Execute a Trino SQL query directly, bypassing the transport action framework. This avoids
+   * action filter chain, task creation, action map lookup, and TrinoSqlRequest object allocation
+   * overhead.
+   *
+   * @param queryStr the SQL query string
+   * @param isExplain whether this is an explain request
+   * @param listener the response listener
+   */
+  public void executeDirect(
+      String queryStr, boolean isExplain, ActionListener<TrinoSqlResponse> listener) {
+    executeInternal(queryStr, isExplain, listener);
   }
 
   @Override
   protected void doExecute(
       Task task, ActionRequest request, ActionListener<TrinoSqlResponse> listener) {
     TrinoSqlRequest sqlReq = TrinoSqlRequest.fromActionRequest(request);
+    executeInternal(sqlReq.getQuery(), sqlReq.isExplain(), listener);
+  }
+
+  private void executeInternal(
+      String queryStr, boolean isExplain, ActionListener<TrinoSqlResponse> listener) {
     try {
       // Check query plan cache first (skips parse/plan/optimize/fragment for repeated queries)
       long currentMetaVersion = clusterService.state().metadata().version();
-      String queryStr = sqlReq.getQuery();
 
       // Explain mode cannot use the cache (needs the unoptimized plan for display)
-      CachedQueryPlan cached = sqlReq.isExplain() ? null : QUERY_PLAN_CACHE.get(queryStr);
+      CachedQueryPlan cached = isExplain ? null : QUERY_PLAN_CACHE.get(queryStr);
       if (cached != null && cached.metadataVersion() != currentMetaVersion) {
         cached = null; // Stale cache entry — schema may have changed
       }
@@ -203,7 +234,7 @@ public class TransportTrinoSqlAction
                 compiledOptimizedPlan, clusterService.state(), compiledColumnTypeMap);
 
         // 6. Explain mode: return logical plan, optimized plan, and fragments
-        if (sqlReq.isExplain()) {
+        if (isExplain) {
           listener.onResponse(
               new TrinoSqlResponse(formatExplain(plan, compiledOptimizedPlan, compiledFragments)));
           return;
@@ -699,7 +730,7 @@ public class TransportTrinoSqlAction
       }
 
     } catch (Exception e) {
-      LOG.error("Error executing Trino SQL query: {}", sqlReq.getQuery(), e);
+      LOG.error("Error executing Trino SQL query: {}", queryStr, e);
       listener.onFailure(e);
     }
   }

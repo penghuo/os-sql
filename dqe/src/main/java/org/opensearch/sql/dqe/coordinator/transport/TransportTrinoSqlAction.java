@@ -2060,14 +2060,19 @@ public class TransportTrinoSqlAction
       List<Type> dedupTypes,
       int numOriginalKeys,
       int numCountDistinctAggs) {
-    // Pre-size capacity based on estimated unique pairs (avoid resizing)
-    int estimatedUnique = 0;
+    // Pre-size capacity: use largest single shard's row count as estimate (not total)
+    // because dedup keys overlap across shards.
+    int maxShardRows = 0;
+    int totalRows = 0;
     for (List<Page> shardPageList : shardPages) {
+      int shardRows = 0;
       for (Page page : shardPageList) {
-        estimatedUnique += page.getPositionCount();
+        shardRows += page.getPositionCount();
       }
+      totalRows += shardRows;
+      if (shardRows > maxShardRows) maxShardRows = shardRows;
     }
-    // Start with next power of two above estimated / load_factor
+    int estimatedUnique = Math.min(totalRows, maxShardRows * 2);
     int capacity = Integer.highestOneBit(Math.max(1024, (int) (estimatedUnique / 0.65f))) << 1;
     float loadFactor = 0.65f;
     int threshold = (int) (capacity * loadFactor);
@@ -2075,8 +2080,8 @@ public class TransportTrinoSqlAction
     long[] mapKey0 = new long[capacity];
     long[] mapKey1 = new long[capacity];
     boolean[] mapOccupied = new boolean[capacity];
-    // No mapCounts needed — for COUNT(DISTINCT), we just need the unique pairs.
-    // Stage 2 directly counts entries per group key.
+    // Track occupied slots for O(size) Stage 2 iteration
+    int[] occupiedSlots = new int[Math.max(1024, estimatedUnique)];
 
     Type type0 = dedupTypes.get(0);
     Type type1 = dedupTypes.get(1);
@@ -2099,6 +2104,10 @@ public class TransportTrinoSqlAction
               mapKey0[slot] = k0;
               mapKey1[slot] = k1;
               mapOccupied[slot] = true;
+              if (size >= occupiedSlots.length) {
+                occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, occupiedSlots.length * 2);
+              }
+              occupiedSlots[size] = slot;
               size++;
               if (size > threshold) {
                 // Resize
@@ -2107,15 +2116,21 @@ public class TransportTrinoSqlAction
                 long[] nk1 = new long[newCap];
                 boolean[] no = new boolean[newCap];
                 int nm = newCap - 1;
-                for (int s = 0; s < capacity; s++) {
-                  if (mapOccupied[s]) {
-                    int h = Long.hashCode(mapKey0[s]) * 0x9E3779B9 + Long.hashCode(mapKey1[s]);
-                    int ns = h & nm;
-                    while (no[ns]) ns = (ns + 1) & nm;
-                    nk0[ns] = mapKey0[s];
-                    nk1[ns] = mapKey1[s];
-                    no[ns] = true;
-                  }
+                int rebuildIdx = 0;
+                if (size > occupiedSlots.length) {
+                  occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, size * 2);
+                }
+                for (int si = 0; si < size; si++) {
+                  int oldSlot = occupiedSlots[si];
+                  int h =
+                      Long.hashCode(mapKey0[oldSlot]) * 0x9E3779B9
+                          + Long.hashCode(mapKey1[oldSlot]);
+                  int ns = h & nm;
+                  while (no[ns]) ns = (ns + 1) & nm;
+                  nk0[ns] = mapKey0[oldSlot];
+                  nk1[ns] = mapKey1[oldSlot];
+                  no[ns] = true;
+                  occupiedSlots[rebuildIdx++] = ns;
                 }
                 mapKey0 = nk0;
                 mapKey1 = nk1;
@@ -2123,7 +2138,6 @@ public class TransportTrinoSqlAction
                 capacity = newCap;
                 mask = nm;
                 threshold = (int) (newCap * loadFactor);
-                // Re-probe is unnecessary — key was just inserted before resize
               }
               break;
             }
@@ -2141,7 +2155,7 @@ public class TransportTrinoSqlAction
     }
 
     // Stage 2: Count entries per original key (key0)
-    // Use primitive long→long open-addressing map to avoid boxing
+    // Iterate only occupied slots (O(size) instead of O(capacity))
     int grpCap = 256;
     long[] grpKeys = new long[grpCap];
     long[] grpCounts = new long[grpCap];
@@ -2149,8 +2163,8 @@ public class TransportTrinoSqlAction
     int grpSize = 0;
     int grpThreshold = (int) (grpCap * 0.7f);
 
-    for (int s = 0; s < capacity; s++) {
-      if (!mapOccupied[s]) continue;
+    for (int si = 0; si < size; si++) {
+      int s = occupiedSlots[si];
       long origKey = mapKey0[s];
       int gm = grpCap - 1;
       int gs = Long.hashCode(origKey) & gm;
@@ -2242,13 +2256,21 @@ public class TransportTrinoSqlAction
       int[] shardAggIdx,
       int[] shardCountIdx,
       List<Type> columnTypes) {
-    // Pre-size capacity
-    int estimatedUnique = 0;
+    // Pre-size capacity: use largest single shard's row count as estimate (not total)
+    // because dedup keys overlap across shards. This avoids massive over-allocation
+    // (e.g., 8 shards x 10K rows = 80K total, but only ~15K unique pairs).
+    int maxShardRows = 0;
+    int totalRows = 0;
     for (List<Page> shardPageList : shardPages) {
+      int shardRows = 0;
       for (Page page : shardPageList) {
-        estimatedUnique += page.getPositionCount();
+        shardRows += page.getPositionCount();
       }
+      totalRows += shardRows;
+      if (shardRows > maxShardRows) maxShardRows = shardRows;
     }
+    // Estimate unique as 2x the largest shard (to handle some non-overlap), capped at totalRows
+    int estimatedUnique = Math.min(totalRows, maxShardRows * 2);
     int capacity = Integer.highestOneBit(Math.max(1024, (int) (estimatedUnique / 0.65f))) << 1;
     float loadFactor = 0.65f;
     int threshold = (int) (capacity * loadFactor);
@@ -2258,6 +2280,8 @@ public class TransportTrinoSqlAction
     // Flatten agg values: aggs[slot * numShardAggs + a]
     long[] mapAggs = new long[capacity * numShardAggs];
     boolean[] mapOccupied = new boolean[capacity];
+    // Track occupied slot indices for fast Stage 2 iteration
+    int[] occupiedSlots = new int[Math.max(1024, estimatedUnique)];
 
     Type type0 = dedupTypes.get(0);
     Type type1 = dedupTypes.get(1);
@@ -2289,6 +2313,10 @@ public class TransportTrinoSqlAction
                 }
               }
               mapOccupied[slot] = true;
+              if (size >= occupiedSlots.length) {
+                occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, occupiedSlots.length * 2);
+              }
+              occupiedSlots[size] = slot;
               size++;
               if (size > threshold) {
                 int newCap = capacity * 2;
@@ -2297,17 +2325,24 @@ public class TransportTrinoSqlAction
                 long[] na = new long[newCap * numShardAggs];
                 boolean[] no = new boolean[newCap];
                 int nm = newCap - 1;
-                for (int s = 0; s < capacity; s++) {
-                  if (mapOccupied[s]) {
-                    int h = Long.hashCode(mapKey0[s]) * 0x9E3779B9 + Long.hashCode(mapKey1[s]);
-                    int ns = h & nm;
-                    while (no[ns]) ns = (ns + 1) & nm;
-                    nk0[ns] = mapKey0[s];
-                    nk1[ns] = mapKey1[s];
-                    System.arraycopy(
-                        mapAggs, s * numShardAggs, na, ns * numShardAggs, numShardAggs);
-                    no[ns] = true;
-                  }
+                // Rebuild occupied slots list during resize
+                int rebuildIdx = 0;
+                if (size > occupiedSlots.length) {
+                  occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, size * 2);
+                }
+                for (int si = 0; si < size; si++) {
+                  int oldSlot = occupiedSlots[si];
+                  int h =
+                      Long.hashCode(mapKey0[oldSlot]) * 0x9E3779B9
+                          + Long.hashCode(mapKey1[oldSlot]);
+                  int ns = h & nm;
+                  while (no[ns]) ns = (ns + 1) & nm;
+                  nk0[ns] = mapKey0[oldSlot];
+                  nk1[ns] = mapKey1[oldSlot];
+                  System.arraycopy(
+                      mapAggs, oldSlot * numShardAggs, na, ns * numShardAggs, numShardAggs);
+                  no[ns] = true;
+                  occupiedSlots[rebuildIdx++] = ns;
                 }
                 mapKey0 = nk0;
                 mapKey1 = nk1;
@@ -2340,6 +2375,7 @@ public class TransportTrinoSqlAction
     }
 
     // Stage 2: Re-aggregate by original key (key0)
+    // Iterate only occupied slots (O(size) instead of O(capacity))
     int numValues = numOrigAggs * 2;
     // Use primitive long→double[] open-addressing map
     int grpCap = 256;
@@ -2349,8 +2385,8 @@ public class TransportTrinoSqlAction
     int grpSize = 0;
     int grpThreshold = (int) (grpCap * 0.7f);
 
-    for (int s = 0; s < capacity; s++) {
-      if (!mapOccupied[s]) continue;
+    for (int si = 0; si < size; si++) {
+      int s = occupiedSlots[si];
       long origKey = mapKey0[s];
       int gm = grpCap - 1;
       int gs = Long.hashCode(origKey) & gm;

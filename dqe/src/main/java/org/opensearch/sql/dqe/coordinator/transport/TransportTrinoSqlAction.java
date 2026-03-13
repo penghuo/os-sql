@@ -1981,6 +1981,18 @@ public class TransportTrinoSqlAction
       return List.of(new Page(blocks));
     }
 
+    // === Fused path: VARCHAR original key + numeric distinct column ===
+    // For Q14-style queries: GROUP BY SearchPhrase COUNT(DISTINCT UserID)
+    // Dedup keys are [SearchPhrase (VARCHAR), UserID (BIGINT)], original key is [SearchPhrase].
+    // Uses SliceLongDedupMap for zero-copy dedup, then SliceCountMap for group counting.
+    if (!allNumericDedup
+        && numOriginalKeys == 1
+        && numDedupKeys == 2
+        && dedupTypes.get(0) instanceof VarcharType
+        && isNumericType(dedupTypes.get(1))) {
+      return mergeDedupCountDistinctVarcharKey(shardPages, dedupTypes, numCountDistinctAggs);
+    }
+
     // === Fallback: two-stage merge via intermediate Pages ===
     AggregationNode finalDedupNode =
         new AggregationNode(null, dedupKeys, List.of("COUNT(*)"), AggregationNode.Step.FINAL);
@@ -3391,5 +3403,126 @@ public class TransportTrinoSqlAction
     } else {
       type.writeLong(builder, ((Number) value).longValue());
     }
+  }
+
+  /** Check if a Type is a numeric type that supports getLong(). */
+  private static boolean isNumericType(Type type) {
+    return type instanceof BigintType
+        || type instanceof IntegerType
+        || type instanceof io.trino.spi.type.TimestampType
+        || type instanceof io.trino.spi.type.SmallintType
+        || type instanceof io.trino.spi.type.TinyintType
+        || type instanceof io.trino.spi.type.BooleanType;
+  }
+
+  /**
+   * Fused two-stage merge for COUNT(DISTINCT) with VARCHAR original key and numeric distinct
+   * column. For Q14-style queries (GROUP BY SearchPhrase COUNT(DISTINCT UserID)), the dedup keys
+   * are [SearchPhrase (VARCHAR), UserID (BIGINT)].
+   *
+   * <p>Stage 1: Insert all (SearchPhrase, UserID) pairs into a SliceLongDedupMap, which
+   * deduplicates across shards using zero-copy Slice references and open-addressing hashing.
+   *
+   * <p>Stage 2: Count entries per SearchPhrase group using SliceCountMap, then build the result
+   * page.
+   *
+   * <p>This eliminates the expensive intermediate merger.mergeAggregation call and avoids all
+   * boxing/String conversion that the generic fallback path requires.
+   */
+  private static List<Page> mergeDedupCountDistinctVarcharKey(
+      List<List<Page>> shardPages, List<Type> dedupTypes, int numCountDistinctAggs) {
+
+    // Pre-compute total rows for pre-sizing
+    int totalRows = 0;
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        totalRows += page.getPositionCount();
+      }
+    }
+
+    if (totalRows == 0) {
+      return List.of();
+    }
+
+    Type numericType = dedupTypes.get(1);
+
+    // Stage 1: Build global dedup set of (SearchPhrase, UserID) pairs
+    org.opensearch.sql.dqe.operator.SliceLongDedupMap dedupMap =
+        new org.opensearch.sql.dqe.operator.SliceLongDedupMap(totalRows);
+
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        int positionCount = page.getPositionCount();
+        Block varcharBlock = page.getBlock(0);
+        Block numericBlock = page.getBlock(1);
+
+        if (varcharBlock instanceof io.trino.spi.block.VariableWidthBlock vwb) {
+          // Fast path: access raw slice directly
+          io.airlift.slice.Slice rawSlice = vwb.getRawSlice();
+          if (!vwb.mayHaveNull()) {
+            for (int pos = 0; pos < positionCount; pos++) {
+              long numVal = numericType.getLong(numericBlock, pos);
+              dedupMap.add(rawSlice, vwb.getRawSliceOffset(pos), vwb.getSliceLength(pos), numVal);
+            }
+          } else {
+            for (int pos = 0; pos < positionCount; pos++) {
+              if (!vwb.isNull(pos)) {
+                long numVal =
+                    numericBlock.isNull(pos) ? 0L : numericType.getLong(numericBlock, pos);
+                dedupMap.add(rawSlice, vwb.getRawSliceOffset(pos), vwb.getSliceLength(pos), numVal);
+              }
+            }
+          }
+        } else {
+          // Fallback for DictionaryBlock etc.
+          io.trino.spi.block.VariableWidthBlock underlying =
+              (io.trino.spi.block.VariableWidthBlock) varcharBlock.getUnderlyingValueBlock();
+          io.airlift.slice.Slice rawSlice = underlying.getRawSlice();
+          for (int pos = 0; pos < positionCount; pos++) {
+            if (!varcharBlock.isNull(pos)) {
+              int uPos = varcharBlock.getUnderlyingValuePosition(pos);
+              long numVal = numericBlock.isNull(pos) ? 0L : numericType.getLong(numericBlock, pos);
+              dedupMap.add(
+                  rawSlice,
+                  underlying.getRawSliceOffset(uPos),
+                  underlying.getSliceLength(uPos),
+                  numVal);
+            }
+          }
+        }
+      }
+    }
+
+    if (dedupMap.size() == 0) {
+      return List.of();
+    }
+
+    // Stage 2: Count entries per VARCHAR group key
+    // Estimate unique groups (much fewer than dedup entries)
+    org.opensearch.sql.dqe.operator.SliceCountMap groupCounts =
+        new org.opensearch.sql.dqe.operator.SliceCountMap(Math.max(64, dedupMap.size() / 4));
+
+    dedupMap.countPerGroup(groupCounts::increment);
+
+    // Build result page: [SearchPhrase (VARCHAR), COUNT(DISTINCT) (BIGINT)]
+    int numGroups = groupCounts.size();
+    int numOutputCols = 1 + numCountDistinctAggs;
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, numGroups);
+    for (int i = 1; i < numOutputCols; i++) {
+      builders[i] = BigintType.BIGINT.createBlockBuilder(null, numGroups);
+    }
+
+    groupCounts.forEach(
+        (slice, offset, length, count) -> {
+          VarcharType.VARCHAR.writeSlice(builders[0], slice, offset, length);
+          BigintType.BIGINT.writeLong(builders[1], count);
+        });
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
   }
 }

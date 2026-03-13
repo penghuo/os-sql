@@ -2363,17 +2363,123 @@ public final class FusedGroupByAggregate {
           }
 
           if (liveDocs == null) {
-            for (int doc = 0; doc < maxDoc; doc++) {
-              collectSingleKeyNumericDoc(
-                  doc,
-                  dv0,
-                  singleKeyMap,
-                  numAggs,
-                  isCountStar,
-                  isDoubleArg,
-                  accType,
-                  numericAggDvs,
-                  varcharAggDvs);
+            // Check if all numeric DocValues iterators are non-null (dense columns).
+            // For dense columns, use nextDoc() sequential iteration which is much faster
+            // than advanceExact() because it reads the compressed DocValues stream
+            // sequentially instead of doing per-doc binary search/skip.
+            boolean allDense = dv0 != null;
+            boolean hasVarcharAgg = false;
+            if (allDense) {
+              for (int i = 0; i < numAggs; i++) {
+                if (isCountStar[i]) continue;
+                if (varcharAggDvs[i] != null) {
+                  hasVarcharAgg = true;
+                  break;
+                }
+                if (numericAggDvs[i] == null) {
+                  allDense = false;
+                  break;
+                }
+              }
+            }
+            if (allDense && !hasVarcharAgg && maxDoc > 0) {
+              // Sequential nextDoc() path: advance all iterators in lockstep.
+              // For dense columns, nextDoc() returns consecutive doc IDs 0, 1, 2, ...
+              // This avoids the advanceExact() binary search overhead per doc per column.
+              // Position all iterators at their first doc.
+              int keyDoc = dv0.nextDoc();
+              int[] aggDocs = new int[numAggs];
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i] && numericAggDvs[i] != null) {
+                  aggDocs[i] = numericAggDvs[i].nextDoc();
+                }
+              }
+              for (int doc = 0; doc < maxDoc; doc++) {
+                // Read key: if the key iterator is at this doc, read value; otherwise use 0
+                long key0;
+                if (keyDoc == doc) {
+                  key0 = dv0.nextValue();
+                  keyDoc = dv0.nextDoc();
+                } else {
+                  key0 = 0;
+                }
+                AccumulatorGroup accGroup = singleKeyMap.getOrCreate(key0);
+                for (int i = 0; i < numAggs; i++) {
+                  MergeableAccumulator acc = accGroup.accumulators[i];
+                  if (isCountStar[i]) {
+                    ((CountStarAccum) acc).count++;
+                    continue;
+                  }
+                  SortedNumericDocValues aggDv = numericAggDvs[i];
+                  if (aggDocs[i] == doc) {
+                    long rawVal = aggDv.nextValue();
+                    aggDocs[i] = aggDv.nextDoc();
+                    switch (accType[i]) {
+                      case 0:
+                        ((CountStarAccum) acc).count++;
+                        break;
+                      case 1: // SUM long
+                        SumAccum sa = (SumAccum) acc;
+                        sa.hasValue = true;
+                        sa.longSum += rawVal;
+                        break;
+                      case 2: // AVG long
+                        AvgAccum aa = (AvgAccum) acc;
+                        aa.count++;
+                        aa.longSum += rawVal;
+                        break;
+                      case 3: // MIN
+                        MinAccum ma = (MinAccum) acc;
+                        ma.hasValue = true;
+                        if (isDoubleArg[i]) {
+                          double d = Double.longBitsToDouble(rawVal);
+                          if (d < ma.doubleVal) ma.doubleVal = d;
+                        } else {
+                          if (rawVal < ma.longVal) ma.longVal = rawVal;
+                        }
+                        break;
+                      case 4: // MAX
+                        MaxAccum xa = (MaxAccum) acc;
+                        xa.hasValue = true;
+                        if (isDoubleArg[i]) {
+                          double d = Double.longBitsToDouble(rawVal);
+                          if (d > xa.doubleVal) xa.doubleVal = d;
+                        } else {
+                          if (rawVal > xa.longVal) xa.longVal = rawVal;
+                        }
+                        break;
+                      case 5: // COUNT(DISTINCT)
+                        CountDistinctAccum cda = (CountDistinctAccum) acc;
+                        if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                        else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                        break;
+                      case 6: // SUM double
+                        SumAccum sad = (SumAccum) acc;
+                        sad.hasValue = true;
+                        sad.doubleSum += Double.longBitsToDouble(rawVal);
+                        break;
+                      case 7: // AVG double
+                        AvgAccum aad = (AvgAccum) acc;
+                        aad.count++;
+                        aad.doubleSum += Double.longBitsToDouble(rawVal);
+                        break;
+                    }
+                  }
+                }
+              }
+            } else {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                collectSingleKeyNumericDoc(
+                    doc,
+                    dv0,
+                    singleKeyMap,
+                    numAggs,
+                    isCountStar,
+                    isDoubleArg,
+                    accType,
+                    numericAggDvs,
+                    varcharAggDvs);
+              }
             }
           } else {
             for (int doc = 0; doc < maxDoc; doc++) {

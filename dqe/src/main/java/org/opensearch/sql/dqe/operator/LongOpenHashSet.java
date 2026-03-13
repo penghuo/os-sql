@@ -69,7 +69,14 @@ public final class LongOpenHashSet {
     }
 
     int mask = capacity - 1;
-    int slot = (int) (value ^ (value >>> 32)) & mask;
+    // Murmur3 finalizer for better distribution of correlated long keys
+    long h = value;
+    h ^= h >>> 33;
+    h *= 0xff51afd7ed558ccdL;
+    h ^= h >>> 33;
+    h *= 0xc4ceb9fe1a85ec53L;
+    h ^= h >>> 33;
+    int slot = (int) h & mask;
     while (occupied[slot]) {
       if (keys[slot] == value) {
         return false; // Already present
@@ -135,7 +142,13 @@ public final class LongOpenHashSet {
     for (int i = 0; i < capacity; i++) {
       if (occupied[i]) {
         long key = keys[i];
-        int slot = (int) (key ^ (key >>> 32)) & newMask;
+        long h = key;
+        h ^= h >>> 33;
+        h *= 0xff51afd7ed558ccdL;
+        h ^= h >>> 33;
+        h *= 0xc4ceb9fe1a85ec53L;
+        h ^= h >>> 33;
+        int slot = (int) h & newMask;
         while (newOccupied[slot]) {
           slot = (slot + 1) & newMask;
         }

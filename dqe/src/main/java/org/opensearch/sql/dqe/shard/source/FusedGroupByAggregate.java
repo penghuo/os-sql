@@ -4645,17 +4645,28 @@ public final class FusedGroupByAggregate {
       else if ("extract".equals(ki.exprFunc)) arithUnits[i] = "E:" + ki.exprUnit;
     }
 
+    // Pre-compute which non-eval keys are varchar for fast dispatch in grouping loop
+    final boolean[] keyIsVarchar = new boolean[numKeys];
+    for (int k = 0; k < numKeys; k++) {
+      if (!isEvalKey[k]) keyIsVarchar[k] = keyInfos.get(k).isVarchar;
+    }
+
+    // Shared empty BytesRefKey — avoids per-row allocation for empty-string CASE WHEN results
+    final BytesRefKey emptyBytesRefKey = new BytesRefKey(new BytesRef(""));
+
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-eval")) {
 
       Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>(16384, 0.75f);
 
-      // Phase 1: Collect doc IDs and non-eval key values per segment
+      // For single-segment ordinal resolution at output time
+      SortedSetDocValues[] savedVarcharDvs = null;
+
+      // Phase 1: Collect doc IDs per segment
       for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
         LeafReader reader = leafCtx.reader();
 
-        // Collect matching doc IDs for this segment
-        List<Integer> segDocIds = new ArrayList<>();
+        // Collect matching doc IDs into primitive int array (no boxing overhead)
         engineSearcher
             .getIndexReader()
             .getContext()
@@ -4666,54 +4677,34 @@ public final class FusedGroupByAggregate {
         org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
         if (scorer == null) continue;
 
+        int[] segDocIds = new int[256];
+        int segDocCount = 0;
         DocIdSetIterator disi = scorer.iterator();
         int doc;
         while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-          segDocIds.add(doc);
-        }
-        if (segDocIds.isEmpty()) continue;
-
-        int segDocCount = segDocIds.size();
-
-        // Phase 2: Read non-eval key values for all collected docs
-        Object[] keyReaders = new Object[numKeys];
-        for (int i = 0; i < numKeys; i++) {
-          if (isEvalKey[i]) continue;
-          KeyInfo ki = keyInfos.get(i);
-          if (ki.isVarchar) keyReaders[i] = reader.getSortedSetDocValues(ki.name);
-          else keyReaders[i] = reader.getSortedNumericDocValues(ki.name);
-        }
-
-        long[][] segKeyValues = new long[segDocCount][numKeys];
-        boolean[][] segKeyNulls = new boolean[segDocCount][numKeys];
-
-        for (int d = 0; d < segDocCount; d++) {
-          int docId = segDocIds.get(d);
-          for (int k = 0; k < numKeys; k++) {
-            if (isEvalKey[k]) continue;
-            KeyInfo ki = keyInfos.get(k);
-            if (ki.isVarchar) {
-              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-              if (dv != null && dv.advanceExact(docId)) {
-                segKeyValues[d][k] = dv.nextOrd();
-              } else {
-                segKeyNulls[d][k] = true;
-              }
-            } else {
-              SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
-              if (dv != null && dv.advanceExact(docId)) {
-                long val = dv.nextValue();
-                if (truncUnits[k] != null) val = truncateMillis(val, truncUnits[k]);
-                else if (arithUnits[k] != null) val = applyArith(val, arithUnits[k]);
-                segKeyValues[d][k] = val;
-              } else {
-                segKeyNulls[d][k] = true;
-              }
-            }
+          if (segDocCount == segDocIds.length) {
+            segDocIds = java.util.Arrays.copyOf(segDocIds, segDocIds.length * 2);
           }
+          segDocIds[segDocCount++] = doc;
         }
+        if (segDocCount == 0) continue;
 
-        // Phase 3: Build eval column blocks for the entire segment and evaluate expressions
+        // For single-segment indices, use ordinals for non-eval VARCHAR keys
+        // to avoid BytesRefKey allocation and byte-array copy per row.
+        boolean singleSegment = (engineSearcher.getIndexReader().leaves().size() == 1);
+
+        // Open non-eval key DocValues for inline reading during grouping phase
+        SortedSetDocValues[] varcharKeyDvs = new SortedSetDocValues[numKeys];
+        SortedNumericDocValues[] numericKeyDvs = new SortedNumericDocValues[numKeys];
+        for (int k = 0; k < numKeys; k++) {
+          if (isEvalKey[k]) continue;
+          KeyInfo ki = keyInfos.get(k);
+          if (ki.isVarchar) varcharKeyDvs[k] = reader.getSortedSetDocValues(ki.name);
+          else numericKeyDvs[k] = reader.getSortedNumericDocValues(ki.name);
+        }
+        if (singleSegment) savedVarcharDvs = varcharKeyDvs;
+
+        // Phase 2: Build eval column blocks for the entire segment and evaluate expressions
         // Only build blocks for columns referenced by eval expressions
         BlockBuilder[] colBuilders = new BlockBuilder[evalColumns.size()];
         for (int c = 0; c < evalColumns.size(); c++) {
@@ -4732,7 +4723,7 @@ public final class FusedGroupByAggregate {
         }
 
         for (int d = 0; d < segDocCount; d++) {
-          int docId = segDocIds.get(d);
+          int docId = segDocIds[d];
           for (int c = 0; c < evalColumns.size(); c++) {
             if (evalColTypes[c] instanceof VarcharType) {
               SortedSetDocValues dv = evalVarDvs[c];
@@ -4795,8 +4786,9 @@ public final class FusedGroupByAggregate {
           }
         }
 
-        // Phase 4: Group and aggregate
+        // Phase 3: Group and aggregate — read non-eval keys from DocValues inline
         for (int d = 0; d < segDocCount; d++) {
+          int docId = segDocIds[d];
           Object[] resolvedKeys = new Object[numKeys];
           for (int k = 0; k < numKeys; k++) {
             if (isEvalKey[k]) {
@@ -4807,26 +4799,42 @@ public final class FusedGroupByAggregate {
                 Type keyType = keyInfos.get(k).type;
                 if (keyType instanceof VarcharType) {
                   io.airlift.slice.Slice slice = VarcharType.VARCHAR.getSlice(block, d);
-                  resolvedKeys[k] =
-                      new BytesRefKey(new BytesRef(slice.getBytes(), 0, slice.length()));
+                  if (slice.length() == 0) {
+                    resolvedKeys[k] = emptyBytesRefKey;
+                  } else {
+                    resolvedKeys[k] =
+                        new BytesRefKey(new BytesRef(slice.getBytes(), 0, slice.length()));
+                  }
                 } else if (keyType instanceof DoubleType) {
                   resolvedKeys[k] = Double.doubleToLongBits(DoubleType.DOUBLE.getDouble(block, d));
                 } else {
                   resolvedKeys[k] = BigintType.BIGINT.getLong(block, d);
                 }
               }
-            } else if (segKeyNulls[d][k]) {
-              resolvedKeys[k] = null;
-            } else if (keyInfos.get(k).isVarchar) {
-              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-              if (dv != null) {
-                BytesRef bytes = dv.lookupOrd(segKeyValues[d][k]);
-                resolvedKeys[k] = new BytesRefKey(bytes);
+            } else if (keyIsVarchar[k]) {
+              SortedSetDocValues dv = varcharKeyDvs[k];
+              if (dv != null && dv.advanceExact(docId)) {
+                if (singleSegment) {
+                  // Use ordinal as key — avoids byte copy and hash computation per row.
+                  // Ordinals are resolved to bytes only at output time.
+                  resolvedKeys[k] = dv.nextOrd();
+                } else {
+                  BytesRef bytes = dv.lookupOrd(dv.nextOrd());
+                  resolvedKeys[k] = new BytesRefKey(bytes);
+                }
               } else {
-                resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
+                resolvedKeys[k] = singleSegment ? (Object) (-1L) : emptyBytesRefKey;
               }
             } else {
-              resolvedKeys[k] = segKeyValues[d][k];
+              SortedNumericDocValues dv = numericKeyDvs[k];
+              if (dv != null && dv.advanceExact(docId)) {
+                long val = dv.nextValue();
+                if (truncUnits[k] != null) val = truncateMillis(val, truncUnits[k]);
+                else if (arithUnits[k] != null) val = applyArith(val, arithUnits[k]);
+                resolvedKeys[k] = val;
+              } else {
+                resolvedKeys[k] = null;
+              }
             }
           }
 
@@ -4936,7 +4944,22 @@ public final class FusedGroupByAggregate {
         MergedGroupKey key = entry.getKey();
         AccumulatorGroup accGroup = entry.getValue();
         for (int k = 0; k < numGroupKeys; k++) {
-          writeKeyValueForMerged(builders[k], keyInfos.get(k), key.values[k]);
+          Object val = key.values[k];
+          // Resolve ordinals to bytes for single-segment VARCHAR keys
+          if (val instanceof Long && keyIsVarchar[k] && !isEvalKey[k] && savedVarcharDvs != null) {
+            long ord = (Long) val;
+            if (ord >= 0 && savedVarcharDvs[k] != null) {
+              try {
+                BytesRef bytes = savedVarcharDvs[k].lookupOrd(ord);
+                val = new BytesRefKey(bytes);
+              } catch (IOException e) {
+                val = emptyBytesRefKey;
+              }
+            } else {
+              val = emptyBytesRefKey;
+            }
+          }
+          writeKeyValueForMerged(builders[k], keyInfos.get(k), val);
         }
         for (int a = 0; a < numAggs; a++) {
           accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);

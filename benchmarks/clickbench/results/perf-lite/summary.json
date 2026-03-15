@@ -1,609 +1,306 @@
 {
-  "date": "2026-03-15",
-  "dataset": "1m",
-  "correctness": {},
   "queries": [
     {
-      "q": 1,
-      "correct": "skip",
-      "ch_times": [
-        0.002,
-        0.002,
-        0.002
-      ],
-      "os_times": [
-        0.053,
-        0.008,
-        0.008
-      ]
+      "query": "Q1",
+      "clickhouse": 0.002,
+      "opensearch": 0.007,
+      "ratio": 3.5,
+      "within_2x": false
     },
     {
-      "q": 2,
-      "correct": "skip",
-      "ch_times": [
-        0.009,
-        0.004,
-        0.004
-      ],
-      "os_times": [
-        0.054,
-        0.008,
-        0.008
-      ]
+      "query": "Q2",
+      "clickhouse": 0.004,
+      "opensearch": 0.008,
+      "ratio": 2.0,
+      "within_2x": true
     },
     {
-      "q": 3,
-      "correct": "skip",
-      "ch_times": [
-        0.011,
-        0.005,
-        0.005
-      ],
-      "os_times": [
-        0.06,
-        0.014,
-        0.013
-      ]
+      "query": "Q3",
+      "clickhouse": 0.005,
+      "opensearch": 0.01,
+      "ratio": 2.0,
+      "within_2x": true
     },
     {
-      "q": 4,
-      "correct": "skip",
-      "ch_times": [
-        0.01,
-        0.004,
-        0.004
-      ],
-      "os_times": [
-        0.061,
-        0.012,
-        0.014
-      ]
+      "query": "Q4",
+      "clickhouse": 0.004,
+      "opensearch": 0.012,
+      "ratio": 3.0,
+      "within_2x": false
     },
     {
-      "q": 5,
-      "correct": "skip",
-      "ch_times": [
-        0.014,
-        0.009,
-        0.009
-      ],
-      "os_times": [
-        0.065,
-        0.016,
-        0.019
-      ]
+      "query": "Q5",
+      "clickhouse": 0.009,
+      "opensearch": 0.016,
+      "ratio": 1.78,
+      "within_2x": true
     },
     {
-      "q": 6,
-      "correct": "skip",
-      "ch_times": [
-        0.019,
-        0.011,
-        0.011
-      ],
-      "os_times": [
-        0.064,
-        0.018,
-        0.018
-      ]
+      "query": "Q6",
+      "clickhouse": 0.011,
+      "opensearch": 0.02,
+      "ratio": 1.82,
+      "within_2x": true
     },
     {
-      "q": 7,
-      "correct": "skip",
-      "ch_times": [
-        0.009,
-        0.004,
-        0.004
-      ],
-      "os_times": [
-        0.052,
-        0.008,
-        0.007
-      ]
+      "query": "Q7",
+      "clickhouse": 0.004,
+      "opensearch": 0.007,
+      "ratio": 1.75,
+      "within_2x": true
     },
     {
-      "q": 8,
-      "correct": "skip",
-      "ch_times": [
-        0.011,
-        0.005,
-        0.005
-      ],
-      "os_times": [
-        0.056,
-        0.008,
-        0.007
-      ]
+      "query": "Q8",
+      "clickhouse": 0.005,
+      "opensearch": 0.008,
+      "ratio": 1.6,
+      "within_2x": true
     },
     {
-      "q": 9,
-      "correct": "skip",
-      "ch_times": [
-        0.017,
-        0.012,
-        0.011
-      ],
-      "os_times": [
-        0.078,
-        0.027,
-        0.027
-      ]
+      "query": "Q9",
+      "clickhouse": 0.011,
+      "opensearch": 0.026,
+      "ratio": 2.36,
+      "within_2x": false
     },
     {
-      "q": 10,
-      "correct": "skip",
-      "ch_times": [
-        0.022,
-        0.012,
-        0.013
-      ],
-      "os_times": [
-        0.119,
-        0.065,
-        0.075
-      ]
+      "query": "Q10",
+      "clickhouse": 0.012,
+      "opensearch": 0.067,
+      "ratio": 5.58,
+      "within_2x": false
     },
     {
-      "q": 11,
-      "correct": "skip",
-      "ch_times": [
-        0.014,
-        0.006,
-        0.006
-      ],
-      "os_times": [
-        0.058,
-        0.008,
-        0.008
-      ]
+      "query": "Q11",
+      "clickhouse": 0.006,
+      "opensearch": 0.009,
+      "ratio": 1.5,
+      "within_2x": true
     },
     {
-      "q": 12,
-      "correct": "skip",
-      "ch_times": [
-        0.016,
-        0.007,
-        0.007
-      ],
-      "os_times": [
-        0.063,
-        0.017,
-        0.017
-      ]
+      "query": "Q12",
+      "clickhouse": 0.007,
+      "opensearch": 0.012,
+      "ratio": 1.71,
+      "within_2x": true
     },
     {
-      "q": 13,
-      "correct": "skip",
-      "ch_times": [
-        0.017,
-        0.011,
-        0.011
-      ],
-      "os_times": [
-        0.067,
-        0.018,
-        0.014
-      ]
+      "query": "Q13",
+      "clickhouse": 0.011,
+      "opensearch": 0.021,
+      "ratio": 1.91,
+      "within_2x": true
     },
     {
-      "q": 14,
-      "correct": "skip",
-      "ch_times": [
-        0.022,
-        0.014,
-        0.014
-      ],
-      "os_times": [
-        0.172,
-        0.122,
-        0.083
-      ]
+      "query": "Q14",
+      "clickhouse": 0.014,
+      "opensearch": 0.083,
+      "ratio": 5.93,
+      "within_2x": false
     },
     {
-      "q": 15,
-      "correct": "skip",
-      "ch_times": [
-        0.02,
-        0.014,
-        0.014
-      ],
-      "os_times": [
-        0.072,
-        0.023,
-        0.023
-      ]
+      "query": "Q15",
+      "clickhouse": 0.014,
+      "opensearch": 0.024,
+      "ratio": 1.71,
+      "within_2x": true
     },
     {
-      "q": 16,
-      "correct": "skip",
-      "ch_times": [
-        0.021,
-        0.012,
-        0.013
-      ],
-      "os_times": [
-        0.063,
-        0.019,
-        0.015
-      ]
+      "query": "Q16",
+      "clickhouse": 0.012,
+      "opensearch": 0.014,
+      "ratio": 1.17,
+      "within_2x": true
     },
     {
-      "q": 17,
-      "correct": "skip",
-      "ch_times": [
-        0.043,
-        0.036,
-        0.035
-      ],
-      "os_times": [
-        0.074,
-        0.024,
-        0.019
-      ]
+      "query": "Q17",
+      "clickhouse": 0.035,
+      "opensearch": 0.024,
+      "ratio": 0.69,
+      "within_2x": true
     },
     {
-      "q": 18,
-      "correct": "skip",
-      "ch_times": [
-        0.039,
-        0.035,
-        0.032
-      ],
-      "os_times": [
-        0.059,
-        0.014,
-        0.011
-      ]
+      "query": "Q18",
+      "clickhouse": 0.032,
+      "opensearch": 0.019,
+      "ratio": 0.59,
+      "within_2x": true
     },
     {
-      "q": 19,
-      "correct": "skip",
-      "ch_times": [
-        0.04,
-        0.031,
-        0.027
-      ],
-      "os_times": [
-        0.263,
-        0.219,
-        0.227
-      ]
+      "query": "Q19",
+      "clickhouse": 0.027,
+      "opensearch": 0.078,
+      "ratio": 2.89,
+      "within_2x": false
     },
     {
-      "q": 20,
-      "correct": "skip",
-      "ch_times": [
-        0.002,
-        0.002,
-        0.002
-      ],
-      "os_times": [
-        0.053,
-        0.008,
-        0.007
-      ]
+      "query": "Q20",
+      "clickhouse": 0.002,
+      "opensearch": 0.007,
+      "ratio": 3.5,
+      "within_2x": false
     },
     {
-      "q": 21,
-      "correct": "skip",
-      "ch_times": [
-        0.043,
-        0.012,
-        0.012
-      ],
-      "os_times": [
-        0.078,
-        0.007,
-        0.007
-      ]
+      "query": "Q21",
+      "clickhouse": 0.012,
+      "opensearch": 0.007,
+      "ratio": 0.58,
+      "within_2x": true
     },
     {
-      "q": 22,
-      "correct": "skip",
-      "ch_times": [
-        0.014,
-        0.005,
-        0.005
-      ],
-      "os_times": [
-        0.078,
-        0.01,
-        0.009
-      ]
+      "query": "Q22",
+      "clickhouse": 0.005,
+      "opensearch": 0.01,
+      "ratio": 2.0,
+      "within_2x": true
     },
     {
-      "q": 23,
-      "correct": "skip",
-      "ch_times": [
-        0.083,
-        0.04,
-        0.039
-      ],
-      "os_times": [
-        0.115,
-        0.01,
-        0.011
-      ]
+      "query": "Q23",
+      "clickhouse": 0.039,
+      "opensearch": 0.01,
+      "ratio": 0.26,
+      "within_2x": true
     },
     {
-      "q": 24,
-      "correct": "skip",
-      "ch_times": [
-        0.286,
-        0.049,
-        0.053
-      ],
-      "os_times": [
-        0.083,
-        0.012,
-        0.012
-      ]
+      "query": "Q24",
+      "clickhouse": 0.049,
+      "opensearch": 0.012,
+      "ratio": 0.24,
+      "within_2x": true
     },
     {
-      "q": 25,
-      "correct": "skip",
-      "ch_times": [
-        0.016,
-        0.007,
-        0.007
-      ],
-      "os_times": [
-        0.057,
-        0.009,
-        0.009
-      ]
+      "query": "Q25",
+      "clickhouse": 0.007,
+      "opensearch": 0.009,
+      "ratio": 1.29,
+      "within_2x": true
     },
     {
-      "q": 26,
-      "correct": "skip",
-      "ch_times": [
-        0.013,
-        0.006,
-        0.005
-      ],
-      "os_times": [
-        0.061,
-        0.011,
-        0.012
-      ]
+      "query": "Q26",
+      "clickhouse": 0.005,
+      "opensearch": 0.011,
+      "ratio": 2.2,
+      "within_2x": false
     },
     {
-      "q": 27,
-      "correct": "skip",
-      "ch_times": [
-        0.016,
-        0.007,
-        0.007
-      ],
-      "os_times": [
-        0.058,
-        0.01,
-        0.009
-      ]
+      "query": "Q27",
+      "clickhouse": 0.007,
+      "opensearch": 0.01,
+      "ratio": 1.43,
+      "within_2x": true
     },
     {
-      "q": 28,
-      "correct": "skip",
-      "ch_times": [
-        0.016,
-        0.008,
-        0.008
-      ],
-      "os_times": [
-        0.061,
-        0.015,
-        0.015
-      ]
+      "query": "Q28",
+      "clickhouse": 0.008,
+      "opensearch": 0.013,
+      "ratio": 1.62,
+      "within_2x": true
     },
     {
-      "q": 29,
-      "correct": "skip",
-      "ch_times": [
-        0.238,
-        0.247,
-        0.236
-      ],
-      "os_times": [
-        0.059,
-        0.01,
-        0.01
-      ]
+      "query": "Q29",
+      "clickhouse": 0.236,
+      "opensearch": 0.01,
+      "ratio": 0.04,
+      "within_2x": true
     },
     {
-      "q": 30,
-      "correct": "skip",
-      "ch_times": [
-        0.025,
-        0.019,
-        0.019
-      ],
-      "os_times": [
-        0.059,
-        0.012,
-        0.012
-      ]
+      "query": "Q30",
+      "clickhouse": 0.019,
+      "opensearch": 0.011,
+      "ratio": 0.58,
+      "within_2x": true
     },
     {
-      "q": 31,
-      "correct": "skip",
-      "ch_times": [
-        0.021,
-        0.01,
-        0.011
-      ],
-      "os_times": [
-        0.062,
-        0.015,
-        0.019
-      ]
+      "query": "Q31",
+      "clickhouse": 0.01,
+      "opensearch": 0.016,
+      "ratio": 1.6,
+      "within_2x": true
     },
     {
-      "q": 32,
-      "correct": "skip",
-      "ch_times": [
-        0.035,
-        0.021,
-        0.02
-      ],
-      "os_times": [
-        0.064,
-        0.016,
-        0.015
-      ]
+      "query": "Q32",
+      "clickhouse": 0.02,
+      "opensearch": 0.016,
+      "ratio": 0.8,
+      "within_2x": true
     },
     {
-      "q": 33,
-      "correct": "skip",
-      "ch_times": [
-        0.048,
-        0.039,
-        0.038
-      ],
-      "os_times": [
-        0.09,
-        0.062,
-        0.062
-      ]
+      "query": "Q33",
+      "clickhouse": 0.038,
+      "opensearch": 0.057,
+      "ratio": 1.5,
+      "within_2x": true
     },
     {
-      "q": 34,
-      "correct": "skip",
-      "ch_times": [
-        0.072,
-        0.038,
-        0.044
-      ],
-      "os_times": [
-        0.064,
-        0.018,
-        0.018
-      ]
+      "query": "Q34",
+      "clickhouse": 0.038,
+      "opensearch": 0.014,
+      "ratio": 0.37,
+      "within_2x": true
     },
     {
-      "q": 35,
-      "correct": "skip",
-      "ch_times": [
-        0.068,
-        0.04,
-        0.045
-      ],
-      "os_times": [
-        null,
-        null,
-        null
-      ]
+      "query": "Q35",
+      "clickhouse": 0.04,
+      "opensearch": null
     },
     {
-      "q": 36,
-      "correct": "skip",
-      "ch_times": [
-        0.018,
-        0.013,
-        0.013
-      ],
-      "os_times": [
-        0.064,
-        0.023,
-        0.02
-      ]
+      "query": "Q36",
+      "clickhouse": 0.013,
+      "opensearch": 0.016,
+      "ratio": 1.23,
+      "within_2x": true
     },
     {
-      "q": 37,
-      "correct": "skip",
-      "ch_times": [
-        0.103,
-        0.069,
-        0.067
-      ],
-      "os_times": [
-        0.066,
-        0.015,
-        0.018
-      ]
+      "query": "Q37",
+      "clickhouse": 0.067,
+      "opensearch": 0.019,
+      "ratio": 0.28,
+      "within_2x": true
     },
     {
-      "q": 38,
-      "correct": "skip",
-      "ch_times": [
-        0.044,
-        0.034,
-        0.033
-      ],
-      "os_times": [
-        0.074,
-        0.024,
-        0.024
-      ]
+      "query": "Q38",
+      "clickhouse": 0.033,
+      "opensearch": 0.018,
+      "ratio": 0.55,
+      "within_2x": true
     },
     {
-      "q": 39,
-      "correct": "skip",
-      "ch_times": [
-        0.06,
-        0.027,
-        0.027
-      ],
-      "os_times": [
-        0.063,
-        0.012,
-        0.011
-      ]
+      "query": "Q39",
+      "clickhouse": 0.027,
+      "opensearch": 0.012,
+      "ratio": 0.44,
+      "within_2x": true
     },
     {
-      "q": 40,
-      "correct": "skip",
-      "ch_times": [
-        0.189,
-        0.135,
-        0.133
-      ],
-      "os_times": [
-        0.892,
-        0.86,
-        1.135
-      ]
+      "query": "Q40",
+      "clickhouse": 0.133,
+      "opensearch": 1.162,
+      "ratio": 8.74,
+      "within_2x": false
     },
     {
-      "q": 41,
-      "correct": "skip",
-      "ch_times": [
-        0.036,
-        0.014,
-        0.014
-      ],
-      "os_times": [
-        0.063,
-        0.014,
-        0.013
-      ]
+      "query": "Q41",
+      "clickhouse": 0.014,
+      "opensearch": 0.016,
+      "ratio": 1.14,
+      "within_2x": true
     },
     {
-      "q": 42,
-      "correct": "skip",
-      "ch_times": [
-        0.034,
-        0.013,
-        0.013
-      ],
-      "os_times": [
-        0.067,
-        0.02,
-        0.02
-      ]
+      "query": "Q42",
+      "clickhouse": 0.013,
+      "opensearch": 0.02,
+      "ratio": 1.54,
+      "within_2x": true
     },
     {
-      "q": 43,
-      "correct": "skip",
-      "ch_times": [
-        0.038,
-        0.013,
-        0.011
-      ],
-      "os_times": [
-        0.064,
-        0.016,
-        0.016
-      ]
+      "query": "Q43",
+      "clickhouse": 0.011,
+      "opensearch": 0.019,
+      "ratio": 1.73,
+      "within_2x": true
     }
-  ]
+  ],
+  "within_2x_count": 33,
+  "total_valid": 42,
+  "within_2x_pct": 79
 }

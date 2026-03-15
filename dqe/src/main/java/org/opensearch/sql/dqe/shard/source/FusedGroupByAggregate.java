@@ -6603,6 +6603,551 @@ public final class FusedGroupByAggregate {
    * <p>Handles both single-segment (3+ keys) and multi-segment cases with SegmentGroupKey /
    * MergedGroupKey maps. Includes optional top-N pre-filtering via min-heap.
    */
+
+  /**
+   * Fast flat 3-key path for single-segment GROUP BY with 3 keys and COUNT(*)/SUM/AVG aggregates.
+   * Uses FlatThreeKeyMap with direct doc iteration (MatchAllDocsQuery bypass) to eliminate
+   * per-group SegmentGroupKey/AccumulatorGroup allocation and Collector virtual dispatch.
+   *
+   * @return result pages, or null if the path is not applicable (caller falls through)
+   */
+  private static List<Page> executeThreeKeyFlat(
+      org.opensearch.index.engine.Engine.Searcher engineSearcher,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      String[] truncUnits,
+      String[] arithUnits,
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      Map<String, Type> columnTypeMap)
+      throws Exception {
+
+    // Pre-compute flat accumulator offsets (same scheme as 2-key path)
+    final int[] flatAccOffset = new int[numAggs];
+    int flatTotalSlots = 0;
+    for (int i = 0; i < numAggs; i++) {
+      flatAccOffset[i] = flatTotalSlots;
+      if (isCountStar[i] || accType[i] == 0 || accType[i] == 1) {
+        flatTotalSlots += 1;
+      } else if (accType[i] == 2) { // AVG
+        flatTotalSlots += 2;
+      }
+    }
+    final int flatSlotsPerGroup = flatTotalSlots;
+    final FlatThreeKeyMap flatMap = new FlatThreeKeyMap(flatSlotsPerGroup);
+
+    final boolean key0Varchar = keyInfos.get(0).isVarchar;
+    final boolean key1Varchar = keyInfos.get(1).isVarchar;
+    final boolean key2Varchar = keyInfos.get(2).isVarchar;
+
+    List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+    LeafReaderContext leafCtx = leaves.get(0);
+    LeafReader reader = leafCtx.reader();
+    int maxDoc = reader.maxDoc();
+    Bits liveDocs = reader.getLiveDocs();
+
+    // Open key readers
+    Object[] keyReaders = new Object[3];
+    for (int i = 0; i < 3; i++) {
+      KeyInfo ki = keyInfos.get(i);
+      if (ki.isVarchar) {
+        keyReaders[i] = reader.getSortedSetDocValues(ki.name);
+      } else {
+        keyReaders[i] = reader.getSortedNumericDocValues(ki.name);
+      }
+    }
+
+    // Check if all aggregates are COUNT(*) for ultra-fast path
+    boolean allCountStar = true;
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i]) {
+        allCountStar = false;
+        break;
+      }
+    }
+
+    if (query instanceof MatchAllDocsQuery && allCountStar) {
+      // Ultra-fast path: COUNT(*) only, no aggregate DV reads, direct doc iteration
+      if (liveDocs == null) {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          long k0 = 0, k1 = 0, k2 = 0;
+          if (key0Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) {
+              k0 = dv.nextValue();
+              if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+              else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+            }
+          }
+          if (key1Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) {
+              k1 = dv.nextValue();
+              if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+              else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+            }
+          }
+          if (key2Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) k2 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) {
+              k2 = dv.nextValue();
+              if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
+              else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
+            }
+          }
+          int slot = flatMap.findOrInsert(k0, k1, k2);
+          flatMap.accData[slot * flatSlotsPerGroup]++;
+        }
+      } else {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (!liveDocs.get(doc)) continue;
+          long k0 = 0, k1 = 0, k2 = 0;
+          if (key0Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) {
+              k0 = dv.nextValue();
+              if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+              else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+            }
+          }
+          if (key1Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) {
+              k1 = dv.nextValue();
+              if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+              else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+            }
+          }
+          if (key2Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) k2 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) {
+              k2 = dv.nextValue();
+              if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
+              else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
+            }
+          }
+          int slot = flatMap.findOrInsert(k0, k1, k2);
+          flatMap.accData[slot * flatSlotsPerGroup]++;
+        }
+      }
+    } else if (query instanceof MatchAllDocsQuery) {
+      // MatchAllDocsQuery with general aggregates (SUM, AVG)
+      SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+      for (int i = 0; i < numAggs; i++) {
+        if (!isCountStar[i]) {
+          numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+        }
+      }
+      if (liveDocs == null) {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          long k0 = 0, k1 = 0, k2 = 0;
+          if (key0Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) {
+              k0 = dv.nextValue();
+              if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+              else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+            }
+          }
+          if (key1Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) {
+              k1 = dv.nextValue();
+              if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+              else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+            }
+          }
+          if (key2Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) k2 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) {
+              k2 = dv.nextValue();
+              if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
+              else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
+            }
+          }
+          int slot = flatMap.findOrInsert(k0, k1, k2);
+          int base = slot * flatSlotsPerGroup;
+          for (int i = 0; i < numAggs; i++) {
+            int off = base + flatAccOffset[i];
+            if (isCountStar[i]) {
+              flatMap.accData[off]++;
+              continue;
+            }
+            SortedNumericDocValues aggDv = numericAggDvs[i];
+            if (aggDv != null && aggDv.advanceExact(doc)) {
+              long rawVal = aggDv.nextValue();
+              switch (accType[i]) {
+                case 0:
+                  flatMap.accData[off]++;
+                  break;
+                case 1:
+                  flatMap.accData[off] += rawVal;
+                  break;
+                case 2:
+                  flatMap.accData[off] += rawVal;
+                  flatMap.accData[off + 1]++;
+                  break;
+              }
+            }
+          }
+        }
+      } else {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (!liveDocs.get(doc)) continue;
+          long k0 = 0, k1 = 0, k2 = 0;
+          if (key0Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[0];
+            if (dv != null && dv.advanceExact(doc)) {
+              k0 = dv.nextValue();
+              if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+              else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+            }
+          }
+          if (key1Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[1];
+            if (dv != null && dv.advanceExact(doc)) {
+              k1 = dv.nextValue();
+              if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+              else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+            }
+          }
+          if (key2Varchar) {
+            SortedSetDocValues dv = (SortedSetDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) k2 = dv.nextOrd();
+          } else {
+            SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[2];
+            if (dv != null && dv.advanceExact(doc)) {
+              k2 = dv.nextValue();
+              if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
+              else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
+            }
+          }
+          int slot = flatMap.findOrInsert(k0, k1, k2);
+          int base = slot * flatSlotsPerGroup;
+          for (int i = 0; i < numAggs; i++) {
+            int off = base + flatAccOffset[i];
+            if (isCountStar[i]) {
+              flatMap.accData[off]++;
+              continue;
+            }
+            SortedNumericDocValues aggDv = numericAggDvs[i];
+            if (aggDv != null && aggDv.advanceExact(doc)) {
+              long rawVal = aggDv.nextValue();
+              switch (accType[i]) {
+                case 0:
+                  flatMap.accData[off]++;
+                  break;
+                case 1:
+                  flatMap.accData[off] += rawVal;
+                  break;
+                case 2:
+                  flatMap.accData[off] += rawVal;
+                  flatMap.accData[off + 1]++;
+                  break;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // Filtered query: use Collector framework
+      final FlatThreeKeyMap fMap = flatMap;
+      final Object[] fKeyReaders = keyReaders;
+      SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+      for (int i = 0; i < numAggs; i++) {
+        if (!isCountStar[i]) {
+          numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+        }
+      }
+      final SortedNumericDocValues[] fAggDvs = numericAggDvs;
+      engineSearcher.search(
+          query,
+          new Collector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+              // Re-open DVs for the correct leaf context
+              for (int i = 0; i < 3; i++) {
+                KeyInfo ki = keyInfos.get(i);
+                if (ki.isVarchar) {
+                  fKeyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
+                } else {
+                  fKeyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+                }
+              }
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i]) {
+                  fAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                }
+              }
+              return new LeafCollector() {
+                @Override
+                public void setScorer(Scorable scorer) {}
+
+                @Override
+                public void collect(int doc) throws IOException {
+                  long k0 = 0, k1 = 0, k2 = 0;
+                  if (key0Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) fKeyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) k0 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) fKeyReaders[0];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k0 = dv.nextValue();
+                      if (truncUnits[0] != null) k0 = truncateMillis(k0, truncUnits[0]);
+                      else if (arithUnits[0] != null) k0 = applyArith(k0, arithUnits[0]);
+                    }
+                  }
+                  if (key1Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) fKeyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) k1 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) fKeyReaders[1];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k1 = dv.nextValue();
+                      if (truncUnits[1] != null) k1 = truncateMillis(k1, truncUnits[1]);
+                      else if (arithUnits[1] != null) k1 = applyArith(k1, arithUnits[1]);
+                    }
+                  }
+                  if (key2Varchar) {
+                    SortedSetDocValues dv = (SortedSetDocValues) fKeyReaders[2];
+                    if (dv != null && dv.advanceExact(doc)) k2 = dv.nextOrd();
+                  } else {
+                    SortedNumericDocValues dv = (SortedNumericDocValues) fKeyReaders[2];
+                    if (dv != null && dv.advanceExact(doc)) {
+                      k2 = dv.nextValue();
+                      if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
+                      else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
+                    }
+                  }
+                  int slot = fMap.findOrInsert(k0, k1, k2);
+                  int base = slot * flatSlotsPerGroup;
+                  for (int i = 0; i < numAggs; i++) {
+                    int off = base + flatAccOffset[i];
+                    if (isCountStar[i]) {
+                      fMap.accData[off]++;
+                      continue;
+                    }
+                    SortedNumericDocValues aggDv = fAggDvs[i];
+                    if (aggDv != null && aggDv.advanceExact(doc)) {
+                      long rawVal = aggDv.nextValue();
+                      switch (accType[i]) {
+                        case 0:
+                          fMap.accData[off]++;
+                          break;
+                        case 1:
+                          fMap.accData[off] += rawVal;
+                          break;
+                        case 2:
+                          fMap.accData[off] += rawVal;
+                          fMap.accData[off + 1]++;
+                          break;
+                      }
+                    }
+                  }
+                }
+              };
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    if (flatMap.size == 0) return List.of();
+
+    // Build output Page from FlatThreeKeyMap, resolving varchar ordinals to UTF-8.
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+
+    // Determine which slots to output (top-N selection if applicable)
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+      // Top-N selection using a min-heap (for DESC) or max-heap (for ASC)
+      int sortAccOff = flatAccOffset[sortAggIndex];
+      int n = (int) Math.min(topN, flatMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (!flatMap.occupied[slot]) continue;
+        long val = flatMap.accData[slot * flatSlotsPerGroup + sortAccOff];
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int ki = heapSize - 1;
+          while (ki > 0) {
+            int parent = (ki - 1) >>> 1;
+            long pVal = flatMap.accData[heap[parent] * flatSlotsPerGroup + sortAccOff];
+            long kVal = flatMap.accData[heap[ki] * flatSlotsPerGroup + sortAccOff];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heap[parent];
+              heap[parent] = heap[ki];
+              heap[ki] = tmp;
+              ki = parent;
+            } else break;
+          }
+        } else {
+          long rootVal = flatMap.accData[heap[0] * flatSlotsPerGroup + sortAccOff];
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int ki = 0;
+            while (true) {
+              int left = 2 * ki + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = flatMap.accData[heap[left] * flatSlotsPerGroup + sortAccOff];
+                long rv = flatMap.accData[heap[right] * flatSlotsPerGroup + sortAccOff];
+                boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+                if (pickRight) target = right;
+              }
+              long kVal = flatMap.accData[heap[ki] * flatSlotsPerGroup + sortAccOff];
+              long tVal = flatMap.accData[heap[target] * flatSlotsPerGroup + sortAccOff];
+              boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+              if (swap) {
+                int tmp = heap[ki];
+                heap[ki] = heap[target];
+                heap[target] = tmp;
+                ki = target;
+              } else break;
+            }
+          }
+        }
+      }
+      // Sort the heap by actual value for ordered output
+      final int sOff = sortAccOff;
+      final int spg = flatSlotsPerGroup;
+      for (int i = 1; i < heapSize; i++) {
+        int key = heap[i];
+        long keyVal = flatMap.accData[key * spg + sOff];
+        int j = i - 1;
+        while (j >= 0) {
+          long jVal = flatMap.accData[heap[j] * spg + sOff];
+          boolean needsSwap = sortAscending ? (jVal > keyVal) : (jVal < keyVal);
+          if (needsSwap) {
+            heap[j + 1] = heap[j];
+            j--;
+          } else break;
+        }
+        heap[j + 1] = key;
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < flatMap.size) {
+      int n = (int) Math.min(topN, flatMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[flatMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      builders[i] = keyInfos.get(i).type.createBlockBuilder(null, outputCount);
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
+    }
+
+    for (int si = 0; si < outputCount; si++) {
+      int slot = outputSlots[si];
+      long[] keyVals = {flatMap.keys0[slot], flatMap.keys1[slot], flatMap.keys2[slot]};
+      for (int ki = 0; ki < 3; ki++) {
+        if (keyInfos.get(ki).isVarchar) {
+          SortedSetDocValues dv = (SortedSetDocValues) keyReaders[ki];
+          if (dv != null) {
+            BytesRef bytes = dv.lookupOrd(keyVals[ki]);
+            VarcharType.VARCHAR.writeSlice(
+                builders[ki], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+          } else {
+            VarcharType.VARCHAR.writeSlice(builders[ki], Slices.EMPTY_SLICE);
+          }
+        } else {
+          writeNumericKeyValue(builders[ki], keyInfos.get(ki), keyVals[ki]);
+        }
+      }
+      int base = slot * flatSlotsPerGroup;
+      for (int a = 0; a < numAggs; a++) {
+        int off = base + flatAccOffset[a];
+        switch (accType[a]) {
+          case 0: // COUNT
+          case 1: // SUM long
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            break;
+          case 2: // AVG long
+            long sum = flatMap.accData[off];
+            long cnt = flatMap.accData[off + 1];
+            if (cnt == 0) {
+              builders[numGroupKeys + a].appendNull();
+            } else {
+              DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+            }
+            break;
+        }
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+    return List.of(new Page(blocks));
+  }
+
   private static List<Page> executeNKeyVarcharPath(
       org.opensearch.index.engine.Engine.Searcher engineSearcher,
       Query query,
@@ -6624,6 +7169,56 @@ public final class FusedGroupByAggregate {
       throws Exception {
 
     if (singleSegment) {
+      // === Single-segment 3-key flat fast path ===
+      // For exactly 3 keys with COUNT(*)-only aggregates and flat-compatible agg types,
+      // use FlatThreeKeyMap with direct doc iteration to avoid per-group object allocation
+      // (SegmentGroupKey, AccumulatorGroup, MergeableAccumulator) and Collector overhead.
+      if (keyInfos.size() == 3) {
+        boolean canUseFlatThreeKey = true;
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i]) {
+            AggSpec spec = specs.get(i);
+            if (isVarcharArg[i] || isDoubleArg[i]) {
+              canUseFlatThreeKey = false;
+              break;
+            }
+            switch (spec.funcName) {
+              case "COUNT":
+                if (spec.isDistinct) canUseFlatThreeKey = false;
+                break;
+              case "SUM":
+              case "AVG":
+                break;
+              default:
+                canUseFlatThreeKey = false;
+                break;
+            }
+            if (!canUseFlatThreeKey) break;
+          }
+        }
+        if (canUseFlatThreeKey) {
+          List<Page> flatResult =
+              executeThreeKeyFlat(
+                  engineSearcher,
+                  query,
+                  keyInfos,
+                  specs,
+                  numAggs,
+                  isCountStar,
+                  accType,
+                  truncUnits,
+                  arithUnits,
+                  groupByKeys,
+                  sortAggIndex,
+                  sortAscending,
+                  topN,
+                  columnTypeMap);
+          if (flatResult != null) {
+            return flatResult;
+          }
+        }
+      }
+
       // === Single-segment N-key path (3+ keys) ===
       // Uses SegmentGroupKey map with ordinals for varchar keys.
       Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
@@ -7806,6 +8401,107 @@ public final class FusedGroupByAggregate {
       }
       this.keys0 = nk0;
       this.keys1 = nk1;
+      this.occupied = nocc;
+      this.accData = nacc;
+      this.capacity = newCap;
+      this.threshold = (int) (newCap * LOAD_FACTOR);
+    }
+  }
+
+  /**
+   * Open-addressing hash map with three primitive long keys and contiguous flat accumulator
+   * storage, analogous to {@link FlatTwoKeyMap}. Used for 3-key GROUP BY queries (e.g., Q19: GROUP
+   * BY UserID, extract(minute FROM EventTime), SearchPhrase) to avoid per-group object allocation
+   * (SegmentGroupKey, AccumulatorGroup, MergeableAccumulator).
+   */
+  private static final class FlatThreeKeyMap {
+    private static final int INITIAL_CAPACITY = 8192;
+    private static final float LOAD_FACTOR = 0.7f;
+
+    long[] keys0;
+    long[] keys1;
+    long[] keys2;
+    boolean[] occupied;
+    long[] accData;
+    int size;
+    int capacity;
+    int threshold;
+    final int slotsPerGroup;
+
+    FlatThreeKeyMap(int slotsPerGroup) {
+      this.slotsPerGroup = slotsPerGroup;
+      this.capacity = INITIAL_CAPACITY;
+      this.keys0 = new long[capacity];
+      this.keys1 = new long[capacity];
+      this.keys2 = new long[capacity];
+      this.occupied = new boolean[capacity];
+      this.accData = new long[capacity * slotsPerGroup];
+      this.size = 0;
+      this.threshold = (int) (capacity * LOAD_FACTOR);
+    }
+
+    private static int hash3(long k0, long k1, long k2) {
+      long h = k0 * 0x9E3779B97F4A7C15L + k1;
+      h = h * 0xff51afd7ed558ccdL + k2;
+      h ^= h >>> 33;
+      h *= 0xff51afd7ed558ccdL;
+      h ^= h >>> 33;
+      return (int) h;
+    }
+
+    int findOrInsert(long key0, long key1, long key2) {
+      int mask = capacity - 1;
+      int h = hash3(key0, key1, key2) & mask;
+      while (occupied[h]) {
+        if (keys0[h] == key0 && keys1[h] == key1 && keys2[h] == key2) {
+          return h;
+        }
+        h = (h + 1) & mask;
+      }
+      keys0[h] = key0;
+      keys1[h] = key1;
+      keys2[h] = key2;
+      occupied[h] = true;
+      size++;
+      if (size > threshold) {
+        resize();
+        return findExisting(key0, key1, key2);
+      }
+      return h;
+    }
+
+    private int findExisting(long key0, long key1, long key2) {
+      int mask = capacity - 1;
+      int h = hash3(key0, key1, key2) & mask;
+      while (occupied[h]) {
+        if (keys0[h] == key0 && keys1[h] == key1 && keys2[h] == key2) return h;
+        h = (h + 1) & mask;
+      }
+      throw new IllegalStateException("Key not found after resize");
+    }
+
+    private void resize() {
+      int newCap = capacity * 2;
+      long[] nk0 = new long[newCap];
+      long[] nk1 = new long[newCap];
+      long[] nk2 = new long[newCap];
+      boolean[] nocc = new boolean[newCap];
+      long[] nacc = new long[newCap * slotsPerGroup];
+      int nm = newCap - 1;
+      for (int s = 0; s < capacity; s++) {
+        if (occupied[s]) {
+          int nh = hash3(keys0[s], keys1[s], keys2[s]) & nm;
+          while (nocc[nh]) nh = (nh + 1) & nm;
+          nk0[nh] = keys0[s];
+          nk1[nh] = keys1[s];
+          nk2[nh] = keys2[s];
+          nocc[nh] = true;
+          System.arraycopy(accData, s * slotsPerGroup, nacc, nh * slotsPerGroup, slotsPerGroup);
+        }
+      }
+      this.keys0 = nk0;
+      this.keys1 = nk1;
+      this.keys2 = nk2;
       this.occupied = nocc;
       this.accData = nacc;
       this.capacity = newCap;

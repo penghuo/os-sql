@@ -19,6 +19,7 @@ import java.util.Optional;
  * <p>Uses direct {@link ByteArrayBlock} construction instead of {@code BlockBuilder} for reduced
  * overhead.
  */
+@lombok.Getter
 public class LogicalAndExpression implements BlockExpression {
 
   private final BlockExpression left;

@@ -24,6 +24,7 @@ import java.util.Optional;
  * overhead. Includes specialized fast paths for BIGINT-only comparisons (the most common case in
  * ClickBench filter predicates).
  */
+@lombok.Getter
 public class ComparisonBlockExpression implements BlockExpression {
 
   private final ComparisonExpression.Operator operator;

@@ -19,6 +19,7 @@ import java.util.List;
  * Vectorized CASE WHEN expression. Evaluates WHEN conditions in order and picks the first matching
  * THEN result. Falls back to ELSE (or null).
  */
+@lombok.Getter
 public class CaseBlockExpression implements BlockExpression {
 
   private final List<BlockExpression> whenConditions;

@@ -17,29 +17,29 @@
     {
       "query": "Q3",
       "clickhouse": 0.009,
-      "opensearch": 0.01,
-      "ratio": 1.11,
+      "opensearch": 0.014,
+      "ratio": 1.56,
       "within_2x": true
     },
     {
       "query": "Q4",
       "clickhouse": 0.009,
-      "opensearch": 0.012,
-      "ratio": 1.33,
+      "opensearch": 0.014,
+      "ratio": 1.56,
       "within_2x": true
     },
     {
       "query": "Q5",
       "clickhouse": 0.012,
-      "opensearch": 0.015,
-      "ratio": 1.25,
+      "opensearch": 0.018,
+      "ratio": 1.5,
       "within_2x": true
     },
     {
       "query": "Q6",
       "clickhouse": 0.014,
-      "opensearch": 0.012,
-      "ratio": 0.86,
+      "opensearch": 0.017,
+      "ratio": 1.21,
       "within_2x": true
     },
     {
@@ -66,8 +66,8 @@
     {
       "query": "Q10",
       "clickhouse": 0.017,
-      "opensearch": 0.05,
-      "ratio": 2.94,
+      "opensearch": 0.054,
+      "ratio": 3.18,
       "within_2x": false
     },
     {
@@ -80,43 +80,43 @@
     {
       "query": "Q12",
       "clickhouse": 0.012,
-      "opensearch": 0.011,
-      "ratio": 0.92,
+      "opensearch": 0.01,
+      "ratio": 0.83,
       "within_2x": true
     },
     {
       "query": "Q13",
       "clickhouse": 0.014,
-      "opensearch": 0.017,
-      "ratio": 1.21,
+      "opensearch": 0.018,
+      "ratio": 1.29,
       "within_2x": true
     },
     {
       "query": "Q14",
       "clickhouse": 0.017,
-      "opensearch": 0.085,
-      "ratio": 5.0,
+      "opensearch": 0.089,
+      "ratio": 5.24,
       "within_2x": false
     },
     {
       "query": "Q15",
       "clickhouse": 0.017,
-      "opensearch": 0.018,
-      "ratio": 1.06,
+      "opensearch": 0.019,
+      "ratio": 1.12,
       "within_2x": true
     },
     {
       "query": "Q16",
       "clickhouse": 0.017,
-      "opensearch": 0.015,
-      "ratio": 0.88,
+      "opensearch": 0.017,
+      "ratio": 1.0,
       "within_2x": true
     },
     {
       "query": "Q17",
       "clickhouse": 0.036,
-      "opensearch": 0.02,
-      "ratio": 0.56,
+      "opensearch": 0.019,
+      "ratio": 0.53,
       "within_2x": true
     },
     {
@@ -129,8 +129,8 @@
     {
       "query": "Q19",
       "clickhouse": 0.034,
-      "opensearch": 0.038,
-      "ratio": 1.12,
+      "opensearch": 0.056,
+      "ratio": 1.65,
       "within_2x": true
     },
     {
@@ -143,15 +143,15 @@
     {
       "query": "Q21",
       "clickhouse": 0.016,
-      "opensearch": 0.006,
-      "ratio": 0.38,
+      "opensearch": 0.007,
+      "ratio": 0.44,
       "within_2x": true
     },
     {
       "query": "Q22",
       "clickhouse": 0.01,
-      "opensearch": 0.009,
-      "ratio": 0.9,
+      "opensearch": 0.007,
+      "ratio": 0.7,
       "within_2x": true
     },
     {
@@ -178,8 +178,8 @@
     {
       "query": "Q26",
       "clickhouse": 0.01,
-      "opensearch": 0.009,
-      "ratio": 0.9,
+      "opensearch": 0.01,
+      "ratio": 1.0,
       "within_2x": true
     },
     {
@@ -192,14 +192,14 @@
     {
       "query": "Q28",
       "clickhouse": 0.013,
-      "opensearch": 0.012,
-      "ratio": 0.92,
+      "opensearch": 0.014,
+      "ratio": 1.08,
       "within_2x": true
     },
     {
       "query": "Q29",
       "clickhouse": 0.243,
-      "opensearch": 0.009,
+      "opensearch": 0.01,
       "ratio": 0.04,
       "within_2x": true
     },
@@ -220,22 +220,22 @@
     {
       "query": "Q32",
       "clickhouse": 0.024,
-      "opensearch": 0.013,
-      "ratio": 0.54,
+      "opensearch": 0.014,
+      "ratio": 0.58,
       "within_2x": true
     },
     {
       "query": "Q33",
       "clickhouse": 0.049,
-      "opensearch": 0.043,
-      "ratio": 0.88,
+      "opensearch": 0.047,
+      "ratio": 0.96,
       "within_2x": true
     },
     {
       "query": "Q34",
       "clickhouse": 0.05,
-      "opensearch": 0.017,
-      "ratio": 0.34,
+      "opensearch": 0.014,
+      "ratio": 0.28,
       "within_2x": true
     },
     {
@@ -253,8 +253,8 @@
     {
       "query": "Q37",
       "clickhouse": 0.048,
-      "opensearch": 0.017,
-      "ratio": 0.35,
+      "opensearch": 0.014,
+      "ratio": 0.29,
       "within_2x": true
     },
     {
@@ -274,8 +274,8 @@
     {
       "query": "Q40",
       "clickhouse": 0.092,
-      "opensearch": 0.852,
-      "ratio": 9.26,
+      "opensearch": 0.572,
+      "ratio": 6.22,
       "within_2x": false
     },
     {
@@ -288,8 +288,8 @@
     {
       "query": "Q42",
       "clickhouse": 0.016,
-      "opensearch": 0.018,
-      "ratio": 1.12,
+      "opensearch": 0.017,
+      "ratio": 1.06,
       "within_2x": true
     },
     {

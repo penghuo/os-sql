@@ -4829,6 +4829,17 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-eval")) {
 
+      // Detect single-segment, all-long-keys case for flat open-addressing map
+      // (avoids HashMap Entry/MergedGroupKey/Object[] allocation entirely)
+      boolean useFlatLongMap = false;
+      // Will be initialized if useFlatLongMap is true
+      int flatCap = 0;
+      long[] flatKeys = null; // flatKeys[slot * numKeys + k] = key k at slot
+      AccumulatorGroup[] flatValues = null;
+      int flatSize = 0;
+      int flatThreshold = 0;
+      long[] probeLongKeys = new long[numKeys]; // reusable probe buffer
+
       Map<Object, AccumulatorGroup> globalGroups = new LinkedHashMap<>(16384, 0.75f);
       ProbeGroupKey probeKey = new ProbeGroupKey(numKeys);
 
@@ -4876,7 +4887,31 @@ public final class FusedGroupByAggregate {
           if (ki.isVarchar) varcharKeyDvs[k] = reader.getSortedSetDocValues(ki.name);
           else numericKeyDvs[k] = reader.getSortedNumericDocValues(ki.name);
         }
-        if (singleSegment) savedVarcharDvs = varcharKeyDvs;
+        if (singleSegment) {
+          savedVarcharDvs = varcharKeyDvs;
+          // Check if ALL keys resolve to long in single-segment mode
+          // (non-eval varchar → ordinal long, inline-eval varchar → ordinal long, numeric → long)
+          boolean allKeysLong = true;
+          for (int k = 0; k < numKeys; k++) {
+            if (isEvalKey[k]) {
+              // eval keys that produce VARCHAR via Block expressions can't be long
+              Type kt = keyInfos.get(k).type;
+              if (kt instanceof VarcharType) {
+                allKeysLong = false;
+                break;
+              }
+            }
+            // inline eval + non-eval varchar + numeric all resolve to long in single-segment
+          }
+          if (allKeysLong && !useFlatLongMap) {
+            useFlatLongMap = true;
+            flatCap = 32768; // initial capacity for ~20K entries at 0.65 load
+            flatKeys = new long[flatCap * numKeys];
+            java.util.Arrays.fill(flatKeys, Long.MIN_VALUE); // sentinel
+            flatValues = new AccumulatorGroup[flatCap];
+            flatThreshold = (int) (flatCap * 0.65f);
+          }
+        }
 
         // Open DocValues for inline CASE WHEN result columns
         SortedSetDocValues[] inlineResultDvs = new SortedSetDocValues[numKeys];
@@ -5071,12 +5106,87 @@ public final class FusedGroupByAggregate {
               }
             }
 
-            probeKey.computeHash();
-            AccumulatorGroup accGroup = globalGroups.get(probeKey);
-            if (accGroup == null) {
-              MergedGroupKey mgk = probeKey.snapshot();
-              accGroup = createAccumulatorGroup(specs);
-              globalGroups.put(mgk, accGroup);
+            AccumulatorGroup accGroup;
+            if (useFlatLongMap) {
+              // Flat open-addressing map path: zero allocation per row
+              for (int k = 0; k < numKeys; k++) {
+                Object v = resolvedKeys[k];
+                probeLongKeys[k] = (v instanceof Long) ? (Long) v : 0L;
+              }
+              // Hash: combine all N keys
+              long h = 0;
+              for (int k = 0; k < numKeys; k++) {
+                h = h * 0x9E3779B97F4A7C15L + probeLongKeys[k];
+              }
+              h ^= h >>> 33;
+              h *= 0xff51afd7ed558ccdL;
+              h ^= h >>> 33;
+              int mask = flatCap - 1;
+              int slot = (int) h & mask;
+              while (true) {
+                int base = slot * numKeys;
+                if (flatValues[slot] == null) {
+                  // Empty slot — insert new group
+                  for (int k = 0; k < numKeys; k++) flatKeys[base + k] = probeLongKeys[k];
+                  accGroup = createAccumulatorGroup(specs);
+                  flatValues[slot] = accGroup;
+                  flatSize++;
+                  if (flatSize > flatThreshold) {
+                    // Resize flat map
+                    int newCap = flatCap * 2;
+                    long[] nk = new long[newCap * numKeys];
+                    java.util.Arrays.fill(nk, Long.MIN_VALUE);
+                    AccumulatorGroup[] nv = new AccumulatorGroup[newCap];
+                    int nm = newCap - 1;
+                    for (int s = 0; s < flatCap; s++) {
+                      if (flatValues[s] != null) {
+                        long rh = 0;
+                        for (int kk = 0; kk < numKeys; kk++) {
+                          rh = rh * 0x9E3779B97F4A7C15L + flatKeys[s * numKeys + kk];
+                        }
+                        rh ^= rh >>> 33;
+                        rh *= 0xff51afd7ed558ccdL;
+                        rh ^= rh >>> 33;
+                        int ns = (int) rh & nm;
+                        while (nv[ns] != null) ns = (ns + 1) & nm;
+                        int nb = ns * numKeys;
+                        for (int kk = 0; kk < numKeys; kk++) {
+                          nk[nb + kk] = flatKeys[s * numKeys + kk];
+                        }
+                        nv[ns] = flatValues[s];
+                      }
+                    }
+                    flatKeys = nk;
+                    flatValues = nv;
+                    flatCap = newCap;
+                    flatThreshold = (int) (newCap * 0.65f);
+                    mask = flatCap - 1;
+                  }
+                  break;
+                }
+                // Check if this slot matches
+                boolean match = true;
+                for (int k = 0; k < numKeys; k++) {
+                  if (flatKeys[base + k] != probeLongKeys[k]) {
+                    match = false;
+                    break;
+                  }
+                }
+                if (match) {
+                  accGroup = flatValues[slot];
+                  break;
+                }
+                slot = (slot + 1) & mask;
+              }
+            } else {
+              // Generic HashMap path
+              probeKey.computeHash();
+              accGroup = globalGroups.get(probeKey);
+              if (accGroup == null) {
+                MergedGroupKey mgk = probeKey.snapshot();
+                accGroup = createAccumulatorGroup(specs);
+                globalGroups.put(mgk, accGroup);
+              }
             }
 
             for (int i = 0; i < numAggs; i++) {
@@ -5086,6 +5196,133 @@ public final class FusedGroupByAggregate {
             }
           }
         }
+      }
+
+      // If using flat long map, build output directly from flat arrays
+      if (useFlatLongMap && flatSize > 0) {
+        int numGroupKeys = groupByKeys.size();
+        int totalColumns = numGroupKeys + numAggs;
+
+        // Select top-N from flat map using heap
+        int effectiveTopN = (topN > 0) ? (int) Math.min(topN, flatSize) : flatSize;
+        int[] topSlots;
+        if (sortAggIndex >= 0 && topN > 0 && effectiveTopN < flatSize) {
+          int n = effectiveTopN;
+          int[] heap = new int[n];
+          int heapSize = 0;
+          for (int s = 0; s < flatCap; s++) {
+            if (flatValues[s] == null) continue;
+            long val = flatValues[s].accumulators[sortAggIndex].getSortValue();
+            if (heapSize < n) {
+              heap[heapSize++] = s;
+              int ki = heapSize - 1;
+              while (ki > 0) {
+                int parent = (ki - 1) >>> 1;
+                long pVal = flatValues[heap[parent]].accumulators[sortAggIndex].getSortValue();
+                long kVal2 = flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
+                boolean swap = sortAscending ? (kVal2 > pVal) : (kVal2 < pVal);
+                if (swap) {
+                  int tmp = heap[parent];
+                  heap[parent] = heap[ki];
+                  heap[ki] = tmp;
+                  ki = parent;
+                } else break;
+              }
+            } else {
+              long rootVal = flatValues[heap[0]].accumulators[sortAggIndex].getSortValue();
+              boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+              if (better) {
+                heap[0] = s;
+                int ki = 0;
+                while (true) {
+                  int left = 2 * ki + 1;
+                  if (left >= heapSize) break;
+                  int right = left + 1;
+                  int target = left;
+                  if (right < heapSize) {
+                    long lv = flatValues[heap[left]].accumulators[sortAggIndex].getSortValue();
+                    long rv = flatValues[heap[right]].accumulators[sortAggIndex].getSortValue();
+                    if (sortAscending ? (rv > lv) : (rv < lv)) target = right;
+                  }
+                  long kVal2 = flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
+                  long tVal = flatValues[heap[target]].accumulators[sortAggIndex].getSortValue();
+                  if (sortAscending ? (tVal > kVal2) : (tVal < kVal2)) {
+                    int tmp = heap[ki];
+                    heap[ki] = heap[target];
+                    heap[target] = tmp;
+                    ki = target;
+                  } else break;
+                }
+              }
+            }
+          }
+          topSlots = java.util.Arrays.copyOf(heap, heapSize);
+        } else {
+          // No sort or all groups: collect all occupied slots
+          topSlots = new int[flatSize];
+          int idx = 0;
+          for (int s = 0; s < flatCap; s++) {
+            if (flatValues[s] != null) topSlots[idx++] = s;
+          }
+        }
+
+        // Build output page
+        BlockBuilder[] builders = new BlockBuilder[totalColumns];
+        for (int i = 0; i < numGroupKeys; i++) {
+          builders[i] = keyInfos.get(i).type.createBlockBuilder(null, topSlots.length);
+        }
+        for (int i = 0; i < numAggs; i++) {
+          builders[numGroupKeys + i] =
+              resolveAggOutputType(specs.get(i), columnTypeMap)
+                  .createBlockBuilder(null, topSlots.length);
+        }
+
+        for (int s : topSlots) {
+          int base = s * numKeys;
+          for (int k = 0; k < numGroupKeys; k++) {
+            long val = flatKeys[base + k];
+            // Resolve ordinals to bytes for VARCHAR keys
+            if (keyIsVarchar[k] && !isEvalKey[k] && !inlineEvalKey[k] && savedVarcharDvs != null) {
+              if (val >= 0 && savedVarcharDvs[k] != null) {
+                try {
+                  BytesRef bytes = savedVarcharDvs[k].lookupOrd(val);
+                  writeKeyValueForMerged(builders[k], keyInfos.get(k), new BytesRefKey(bytes));
+                } catch (IOException e) {
+                  writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
+                }
+              } else {
+                writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
+              }
+            } else if (inlineEvalKey[k]
+                && inlineResultIsVarchar[k]
+                && savedInlineResultDvs != null) {
+              if (val == -1L) {
+                writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
+              } else if (val == -2L) {
+                writeKeyValueForMerged(builders[k], keyInfos.get(k), inlineElseValue[k]);
+              } else if (savedInlineResultDvs[k] != null) {
+                try {
+                  BytesRef bytes = savedInlineResultDvs[k].lookupOrd(val);
+                  writeKeyValueForMerged(builders[k], keyInfos.get(k), new BytesRefKey(bytes));
+                } catch (IOException e) {
+                  writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
+                }
+              } else {
+                writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
+              }
+            } else {
+              writeKeyValueForMerged(builders[k], keyInfos.get(k), val);
+            }
+          }
+          AccumulatorGroup ag = flatValues[s];
+          for (int a = 0; a < numAggs; a++) {
+            ag.accumulators[a].writeTo(builders[numGroupKeys + a]);
+          }
+        }
+
+        Block[] blocks = new Block[totalColumns];
+        for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+        return List.of(new Page(blocks));
       }
 
       if (globalGroups.isEmpty()) {

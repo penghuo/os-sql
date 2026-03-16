@@ -30,6 +30,15 @@ public class ShardExecuteResponse extends ActionResponse {
   /** The Trino types for each column in the result pages. */
   private final List<Type> columnTypes;
 
+  /**
+   * Optional per-group distinct value sets for COUNT(DISTINCT) optimization. Key: original GROUP BY
+   * key value (e.g., RegionID as Long). Value: set of distinct values (e.g., UserIDs) for that
+   * group. Only populated for local execution; null for remote shards.
+   */
+  @lombok.Setter
+  private transient java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+      distinctSets;
+
   public ShardExecuteResponse(List<Page> pages, List<Type> columnTypes) {
     this.pages = pages;
     this.columnTypes = columnTypes;

@@ -593,14 +593,28 @@ public class TransportTrinoSqlAction
               && isShardDedupCountDistinct(
                   shardFragments.get(0).shardPlan(), singleAgg, columnTypeMap)) {
             // Fast path: shard-deduped COUNT(DISTINCT) with GROUP BY.
-            mergedPages =
-                mergeDedupCountDistinct(
-                    shardPages,
-                    singleAgg,
-                    shardFragments.get(0).shardPlan(),
-                    columnTypes,
-                    columnTypeMap,
-                    merger);
+            // Check if shard responses have HashSet attachments for faster merge.
+            boolean allHaveSets = true;
+            for (ShardExecuteResponse sr : shardResults) {
+              if (sr.getDistinctSets() == null) {
+                allHaveSets = false;
+                break;
+              }
+            }
+            if (allHaveSets && singleAgg.getGroupByKeys().size() == 1) {
+              mergedPages =
+                  mergeDedupCountDistinctViaSets(
+                      shardResults, singleAgg, columnTypes, columnTypeMap);
+            } else {
+              mergedPages =
+                  mergeDedupCountDistinct(
+                      shardPages,
+                      singleAgg,
+                      shardFragments.get(0).shardPlan(),
+                      columnTypes,
+                      columnTypeMap,
+                      merger);
+            }
             mergedPages =
                 applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
           } else if (coordinatorPlan instanceof AggregationNode singleMixed2
@@ -2121,6 +2135,77 @@ public class TransportTrinoSqlAction
    * <p>Stage 1: Build open-addressing hash map from (key0, key1) pairs (set insertion, ignoring
    * counts). Stage 2: Count entries per original key (key0) to get COUNT(DISTINCT).
    */
+  /**
+   * Fast COUNT(DISTINCT) merge using pre-built per-group HashSets from shard responses. Instead of
+   * processing 80K (key, distinct_val) rows through a dedup hash map, unions ~450 per-group
+   * LongOpenHashSets from 8 shards and counts set sizes. Reduces coordinator work from
+   * O(total_pairs) to O(groups × avg_set_size).
+   */
+  private static List<Page> mergeDedupCountDistinctViaSets(
+      ShardExecuteResponse[] shardResults,
+      AggregationNode singleAgg,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap) {
+
+    String groupKey = singleAgg.getGroupByKeys().get(0);
+    Type keyType = columnTypeMap.getOrDefault(groupKey, BigintType.BIGINT);
+    int numCountDistinctAggs = singleAgg.getAggregateFunctions().size();
+
+    // Union all shard sets per group key
+    java.util.HashMap<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> merged =
+        new java.util.HashMap<>();
+    for (ShardExecuteResponse sr : shardResults) {
+      java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> shardSets =
+          sr.getDistinctSets();
+      if (shardSets == null) continue;
+      for (var entry : shardSets.entrySet()) {
+        org.opensearch.sql.dqe.operator.LongOpenHashSet target =
+            merged.computeIfAbsent(
+                entry.getKey(), k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet());
+        // Union: add all values from the shard set into the merged set
+        org.opensearch.sql.dqe.operator.LongOpenHashSet source = entry.getValue();
+        // Union: iterate source set and insert all values into target
+        if (source.hasZeroValue()) target.add(0);
+        long[] sourceTable = source.keys();
+        boolean[] sourceOccupied = source.occupied();
+        for (int i = 0; i < sourceTable.length; i++) {
+          if (sourceOccupied[i]) {
+            target.add(sourceTable[i]);
+          }
+        }
+      }
+    }
+
+    if (merged.isEmpty()) return List.of();
+
+    // Build result page
+    int numOutputCols = 1 + numCountDistinctAggs;
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    builders[0] = keyType.createBlockBuilder(null, merged.size());
+    for (int i = 1; i < numOutputCols; i++) {
+      builders[i] = BigintType.BIGINT.createBlockBuilder(null, merged.size());
+    }
+
+    for (var entry : merged.entrySet()) {
+      long key = entry.getKey();
+      long count = entry.getValue().size();
+      if (keyType instanceof IntegerType) {
+        IntegerType.INTEGER.writeLong(builders[0], (int) key);
+      } else {
+        keyType.writeLong(builders[0], key);
+      }
+      for (int i = 1; i < numOutputCols; i++) {
+        BigintType.BIGINT.writeLong(builders[i], count);
+      }
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
   private static List<Page> mergeDedupCountDistinct2Key(
       List<List<Page>> shardPages,
       List<Type> dedupTypes,

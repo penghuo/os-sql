@@ -280,7 +280,39 @@ public class TransportShardExecuteAction
       List<Type> columnTypes =
           FusedGroupByAggregate.resolveOutputTypes(
               aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      return applyTopProject(pages, columnTypes, topProject, aggGroupNode);
+      ShardExecuteResponse resp = applyTopProject(pages, columnTypes, topProject, aggGroupNode);
+
+      // Post-processing: for COUNT(DISTINCT) dedup plans with 2 numeric keys and COUNT(*),
+      // convert the (key0, key1, count) pages into per-group HashSets for faster coordinator merge.
+      if (aggGroupNode.getStep() == AggregationNode.Step.PARTIAL
+          && aggGroupNode.getGroupByKeys().size() == 2
+          && aggGroupNode.getAggregateFunctions().size() == 1
+          && "COUNT(*)".equals(aggGroupNode.getAggregateFunctions().get(0))) {
+        Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+        Type t0 = ctm.get(aggGroupNode.getGroupByKeys().get(0));
+        Type t1 = ctm.get(aggGroupNode.getGroupByKeys().get(1));
+        if (t0 != null
+            && !(t0 instanceof io.trino.spi.type.VarcharType)
+            && t1 != null
+            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+          java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> sets =
+              new java.util.HashMap<>();
+          for (Page page : resp.getPages()) {
+            Block b0 = page.getBlock(0);
+            Block b1 = page.getBlock(1);
+            int cnt = page.getPositionCount();
+            for (int p = 0; p < cnt; p++) {
+              long groupKey = t0.getLong(b0, p);
+              long distinctVal = t1.getLong(b1, p);
+              sets.computeIfAbsent(
+                      groupKey, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
+                  .add(distinctVal);
+            }
+          }
+          resp.setDistinctSets(sets);
+        }
+      }
+      return resp;
     }
 
     // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode

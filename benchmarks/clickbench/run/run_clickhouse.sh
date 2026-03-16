@@ -25,6 +25,7 @@ OUTPUT_DIR=""
 TRIES=""
 ONLY_QUERY=""
 CACHE_CLEAR=true
+USE_HTTP=false
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -41,6 +42,8 @@ while [ $# -gt 0 ]; do
             ONLY_QUERY="$2"; shift 2 ;;
         --no-cache-clear)
             CACHE_CLEAR=false; shift ;;
+        --use-http)
+            USE_HTTP=true; shift ;;
         *)
             die "Unknown flag: $1" ;;
     esac
@@ -115,30 +118,53 @@ while IFS= read -r query; do
             drop_caches
         fi
 
-        # Build the clickhouse-client command
-        ch_cmd=(clickhouse-client --host "$CH_HOST" --port "$CH_PORT"
-                --time --format Null -q "$query")
+        if [ "$USE_HTTP" = true ]; then
+            # HTTP mode: measure via curl (same transport as OpenSearch benchmark)
+            CH_HTTP_PORT="${CH_HTTP_PORT:-8123}"
+            CURL_ARGS=(-sf -o /dev/null)
+            if [ "$TIMEOUT" -gt 0 ]; then
+                CURL_ARGS+=(--max-time "$TIMEOUT")
+            fi
 
-        # Run query with optional timeout wrapper.
-        # Capture full output first so we can inspect the exit code of the
-        # actual command rather than a downstream pipe stage.
-        EXIT_CODE=0
-        if [ "$TIMEOUT" -gt 0 ]; then
-            RAW_OUTPUT=$(timeout "$TIMEOUT" "${ch_cmd[@]}" 2>&1) || EXIT_CODE=$?
-        else
-            RAW_OUTPUT=$("${ch_cmd[@]}" 2>&1) || EXIT_CODE=$?
-        fi
-        TIME=$(echo "$RAW_OUTPUT" | tail -1)
+            START_NS=$(date +%s%N)
+            EXIT_CODE=0
+            curl "${CURL_ARGS[@]}" "http://${CH_HOST}:${CH_HTTP_PORT}/" \
+                --data-binary "$query" 2>/dev/null || EXIT_CODE=$?
+            END_NS=$(date +%s%N)
 
-        # Handle timeout (exit code 124) or other failures
-        if [ "$EXIT_CODE" -eq 124 ]; then
-            log "  Q${QUERY_NUM} run $i: TIMEOUT (${TIMEOUT}s)"
-            TIME="null"
-        elif ! echo "$TIME" | grep -qE '^[0-9]+\.?[0-9]*$'; then
-            log "  Q${QUERY_NUM} run $i: FAILED"
-            TIME="null"
+            if [ "$EXIT_CODE" -eq 28 ]; then
+                log "  Q${QUERY_NUM} run $i: TIMEOUT (${TIMEOUT}s)"
+                TIME="null"
+            elif [ "$EXIT_CODE" -ne 0 ]; then
+                log "  Q${QUERY_NUM} run $i: FAILED (curl exit $EXIT_CODE)"
+                TIME="null"
+            else
+                ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
+                TIME=$(echo "scale=3; $ELAPSED_MS / 1000" | bc)
+                log "  Q${QUERY_NUM} run $i: ${TIME}s"
+            fi
         else
-            log "  Q${QUERY_NUM} run $i: ${TIME}s"
+            # Native protocol mode: use clickhouse-client --time
+            ch_cmd=(clickhouse-client --host "$CH_HOST" --port "$CH_PORT"
+                    --time --format Null -q "$query")
+
+            EXIT_CODE=0
+            if [ "$TIMEOUT" -gt 0 ]; then
+                RAW_OUTPUT=$(timeout "$TIMEOUT" "${ch_cmd[@]}" 2>&1) || EXIT_CODE=$?
+            else
+                RAW_OUTPUT=$("${ch_cmd[@]}" 2>&1) || EXIT_CODE=$?
+            fi
+            TIME=$(echo "$RAW_OUTPUT" | tail -1)
+
+            if [ "$EXIT_CODE" -eq 124 ]; then
+                log "  Q${QUERY_NUM} run $i: TIMEOUT (${TIMEOUT}s)"
+                TIME="null"
+            elif ! echo "$TIME" | grep -qE '^[0-9]+\.?[0-9]*$'; then
+                log "  Q${QUERY_NUM} run $i: FAILED"
+                TIME="null"
+            else
+                log "  Q${QUERY_NUM} run $i: ${TIME}s"
+            fi
         fi
 
         TIMES=$(echo "$TIMES" | jq ". + [$TIME]")

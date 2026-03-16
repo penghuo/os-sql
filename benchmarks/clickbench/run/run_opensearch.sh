@@ -13,6 +13,7 @@
 #   --num-tries N         Number of runs per query (default: $NUM_TRIES from setup_common.sh).
 #   --query N             Run only query N; others get [null] in results.
 #   --no-cache-clear      Skip cache clearing and drop_caches before cold run.
+#   --warmup N            Run N warmup passes (all queries) before timing to trigger JIT.
 #
 # The script sources setup/setup_common.sh for shared variables:
 #   $INDEX_NAME_1M, $INDEX_NAME, $QUERY_DIR, $RESULT_DIR, $NUM_TRIES, $OS_URL, $QUERY_TIMEOUT
@@ -26,6 +27,7 @@ OUTPUT_DIR=""
 TRIES=""
 ONLY_QUERY=""
 CACHE_CLEAR=true
+WARMUP_PASSES=0
 
 # -- Parse flags ---------------------------------------------------------------
 while [ $# -gt 0 ]; do
@@ -42,6 +44,8 @@ while [ $# -gt 0 ]; do
             ONLY_QUERY="$2"; shift 2 ;;
         --no-cache-clear)
             CACHE_CLEAR=false; shift ;;
+        --warmup)
+            WARMUP_PASSES="$2"; shift 2 ;;
         *)
             die "Unknown flag: $1" ;;
     esac
@@ -88,6 +92,31 @@ if [ "$TIMEOUT" -gt 0 ]; then
 fi
 if [ -n "$ONLY_QUERY" ]; then
     log "Running only query #$ONLY_QUERY"
+fi
+
+# -- Warmup passes (JIT compilation) ------------------------------------------
+if [ "$WARMUP_PASSES" -gt 0 ]; then
+    log "Running $WARMUP_PASSES warmup pass(es) to trigger JIT compilation..."
+    for wp in $(seq 1 "$WARMUP_PASSES"); do
+        WP_NUM=0
+        while IFS= read -r wq; do
+            WP_NUM=$((WP_NUM + 1))
+            [ -z "$wq" ] && continue
+            # Skip Q35 during warmup (can timeout)
+            [ "$WP_NUM" -eq 35 ] && continue
+            wq=$(echo "$wq" | sed 's/;[[:space:]]*$//')
+            if [ "$DATASET" = "1m" ]; then
+                wq=$(echo "$wq" | sed "s/\bhits\b/${TARGET_INDEX}/g")
+            fi
+            WQ_ESC=$(printf '%s' "$wq" | jq -Rs '.')
+            curl -sf -o /dev/null \
+                -XPOST "${OS_URL}/_plugins/_trino_sql" \
+                -H 'Content-Type: application/json' \
+                -d "{\"query\": $WQ_ESC}" \
+                --max-time 30 2>/dev/null || true
+        done < "$QUERY_FILE"
+        log "  Warmup pass $wp/$WARMUP_PASSES complete"
+    done
 fi
 
 # -- Execute queries -----------------------------------------------------------

@@ -1225,10 +1225,14 @@ public final class FusedScanAggregate {
     if (distinctSet.hasZeroValue()) {
       BigintType.BIGINT.writeLong(builder, 0L);
     }
+    if (distinctSet.hasSentinelValue()) {
+      BigintType.BIGINT.writeLong(
+          builder, org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
+    }
     long[] keys = distinctSet.keys();
-    boolean[] occupied = distinctSet.occupied();
+    long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
     for (int i = 0; i < keys.length; i++) {
-      if (occupied[i]) {
+      if (keys[i] != emptyMarker) {
         BigintType.BIGINT.writeLong(builder, keys[i]);
       }
     }

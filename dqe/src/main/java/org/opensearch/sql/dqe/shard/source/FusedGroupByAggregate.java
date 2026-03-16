@@ -4829,10 +4829,12 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-eval")) {
 
-      Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>(16384, 0.75f);
+      Map<Object, AccumulatorGroup> globalGroups = new LinkedHashMap<>(16384, 0.75f);
+      ProbeGroupKey probeKey = new ProbeGroupKey(numKeys);
 
       // For single-segment ordinal resolution at output time
       SortedSetDocValues[] savedVarcharDvs = null;
+      SortedSetDocValues[] savedInlineResultDvs = null;
 
       // Phase 1: Collect doc IDs per segment
       for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
@@ -4883,6 +4885,8 @@ public final class FusedGroupByAggregate {
             inlineResultDvs[k] = reader.getSortedSetDocValues(inlineResultColumn[k]);
           }
         }
+
+        if (singleSegment) savedInlineResultDvs = inlineResultDvs;
 
         // Check if any eval keys remain after column-reference optimization
         boolean hasRemainingEvalKeys = false;
@@ -4975,7 +4979,7 @@ public final class FusedGroupByAggregate {
           // Group and aggregate for this micro-batch
           for (int d = 0; d < batchCount; d++) {
             int docId = segDocIds[batchStart + d];
-            Object[] resolvedKeys = new Object[numKeys];
+            Object[] resolvedKeys = probeKey.values;
             // First pass: resolve non-eval and block-eval keys
             for (int k = 0; k < numKeys; k++) {
               if (inlineEvalKey[k]) continue; // resolved in second pass
@@ -5042,20 +5046,35 @@ public final class FusedGroupByAggregate {
                 // Condition true: read result column from DocValues
                 SortedSetDocValues dv = inlineResultDvs[k];
                 if (dv != null && dv.advanceExact(docId)) {
-                  BytesRef bytes = dv.lookupOrd(dv.nextOrd());
-                  resolvedKeys[k] = new BytesRefKey(bytes);
+                  long ord = dv.nextOrd();
+                  if (singleSegment) {
+                    // Ordinal-based: avoids byte-array copy per row
+                    resolvedKeys[k] = ord;
+                  } else {
+                    BytesRef bytes = dv.lookupOrd(ord);
+                    resolvedKeys[k] = new BytesRefKey(bytes);
+                  }
                 } else {
-                  resolvedKeys[k] = inlineElseValue[k];
+                  if (singleSegment) {
+                    resolvedKeys[k] = -1L; // sentinel ordinal for missing/empty
+                  } else {
+                    resolvedKeys[k] = inlineElseValue[k];
+                  }
                 }
               } else {
                 // Condition false: use else value (no DocValues read needed)
-                resolvedKeys[k] = inlineElseValue[k];
+                if (singleSegment) {
+                  resolvedKeys[k] = -2L; // sentinel ordinal for else branch
+                } else {
+                  resolvedKeys[k] = inlineElseValue[k];
+                }
               }
             }
 
-            MergedGroupKey mgk = new MergedGroupKey(resolvedKeys, keyInfos);
-            AccumulatorGroup accGroup = globalGroups.get(mgk);
+            probeKey.computeHash();
+            AccumulatorGroup accGroup = globalGroups.get(probeKey);
             if (accGroup == null) {
+              MergedGroupKey mgk = probeKey.snapshot();
               accGroup = createAccumulatorGroup(specs);
               globalGroups.put(mgk, accGroup);
             }
@@ -5077,14 +5096,14 @@ public final class FusedGroupByAggregate {
       int numGroupKeys = groupByKeys.size();
       int totalColumns = numGroupKeys + numAggs;
 
-      java.util.Collection<Map.Entry<MergedGroupKey, AccumulatorGroup>> outputEntries;
+      java.util.Collection<Map.Entry<Object, AccumulatorGroup>> outputEntries;
       if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
         int n = (int) Math.min(topN, globalGroups.size());
         // Use a min-heap (for DESC) or max-heap (for ASC) to select top-N entries
         @SuppressWarnings("unchecked")
-        Map.Entry<MergedGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
+        Map.Entry<Object, AccumulatorGroup>[] heap = new Map.Entry[n];
         int heapSize = 0;
-        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        for (Map.Entry<Object, AccumulatorGroup> entry : globalGroups.entrySet()) {
           long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
           if (heapSize < n) {
             heap[heapSize++] = entry;
@@ -5134,9 +5153,9 @@ public final class FusedGroupByAggregate {
         outputEntries = java.util.Arrays.asList(heap).subList(0, heapSize);
       } else if (topN > 0 && topN < globalGroups.size()) {
         // LIMIT without ORDER BY: just take the first topN entries
-        List<Map.Entry<MergedGroupKey, AccumulatorGroup>> limited = new ArrayList<>();
+        List<Map.Entry<Object, AccumulatorGroup>> limited = new ArrayList<>();
         int count = 0;
-        for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+        for (Map.Entry<Object, AccumulatorGroup> entry : globalGroups.entrySet()) {
           if (count++ >= topN) break;
           limited.add(entry);
         }
@@ -5155,17 +5174,42 @@ public final class FusedGroupByAggregate {
             resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
       }
 
-      for (Map.Entry<MergedGroupKey, AccumulatorGroup> entry : outputEntries) {
-        MergedGroupKey key = entry.getKey();
+      for (Map.Entry<Object, AccumulatorGroup> entry : outputEntries) {
+        MergedGroupKey key = (MergedGroupKey) entry.getKey();
         AccumulatorGroup accGroup = entry.getValue();
         for (int k = 0; k < numGroupKeys; k++) {
           Object val = key.values[k];
-          // Resolve ordinals to bytes for single-segment VARCHAR keys
-          if (val instanceof Long && keyIsVarchar[k] && !isEvalKey[k] && savedVarcharDvs != null) {
+          // Resolve ordinals to bytes for single-segment VARCHAR keys (non-eval)
+          if (val instanceof Long
+              && keyIsVarchar[k]
+              && !isEvalKey[k]
+              && !inlineEvalKey[k]
+              && savedVarcharDvs != null) {
             long ord = (Long) val;
             if (ord >= 0 && savedVarcharDvs[k] != null) {
               try {
                 BytesRef bytes = savedVarcharDvs[k].lookupOrd(ord);
+                val = new BytesRefKey(bytes);
+              } catch (IOException e) {
+                val = emptyBytesRefKey;
+              }
+            } else {
+              val = emptyBytesRefKey;
+            }
+          }
+          // Resolve ordinals for single-segment inline eval VARCHAR keys
+          if (val instanceof Long
+              && inlineEvalKey[k]
+              && inlineResultIsVarchar[k]
+              && savedInlineResultDvs != null) {
+            long ord = (Long) val;
+            if (ord == -1L) {
+              val = emptyBytesRefKey;
+            } else if (ord == -2L) {
+              val = inlineElseValue[k];
+            } else if (savedInlineResultDvs[k] != null) {
+              try {
+                BytesRef bytes = savedInlineResultDvs[k].lookupOrd(ord);
                 val = new BytesRefKey(bytes);
               } catch (IOException e) {
                 val = emptyBytesRefKey;
@@ -8022,6 +8066,11 @@ public final class FusedGroupByAggregate {
       this.hash = h;
     }
 
+    MergedGroupKey(Object[] values, int precomputedHash) {
+      this.values = values;
+      this.hash = precomputedHash;
+    }
+
     @Override
     public int hashCode() {
       return hash;
@@ -8030,16 +8079,84 @@ public final class FusedGroupByAggregate {
     @Override
     public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (!(obj instanceof MergedGroupKey other)) return false;
-      if (this.hash != other.hash || this.values.length != other.values.length) return false;
-      for (int i = 0; i < values.length; i++) {
-        if (values[i] == null) {
-          if (other.values[i] != null) return false;
-        } else if (!values[i].equals(other.values[i])) {
-          return false;
+      if (obj instanceof MergedGroupKey other) {
+        if (this.hash != other.hash || this.values.length != other.values.length) return false;
+        for (int i = 0; i < values.length; i++) {
+          if (values[i] == null) {
+            if (other.values[i] != null) return false;
+          } else if (!values[i].equals(other.values[i])) {
+            return false;
+          }
         }
+        return true;
       }
-      return true;
+      if (obj instanceof ProbeGroupKey probe) {
+        if (this.hash != probe.hash || this.values.length != probe.size) return false;
+        for (int i = 0; i < values.length; i++) {
+          if (values[i] == null) {
+            if (probe.values[i] != null) return false;
+          } else if (!values[i].equals(probe.values[i])) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Mutable group key for probe-first HashMap lookups. Avoids allocating a new Object[] and
+   * MergedGroupKey for every row — only creates an immutable copy when the key is not found in the
+   * map (cache miss). For duplicate rows (~68% of Q40 traffic), this eliminates two object
+   * allocations per row.
+   */
+  private static final class ProbeGroupKey {
+    Object[] values;
+    int hash;
+    final int size;
+
+    ProbeGroupKey(int numKeys) {
+      this.values = new Object[numKeys];
+      this.size = numKeys;
+    }
+
+    void computeHash() {
+      int h = 1;
+      for (int i = 0; i < size; i++) {
+        Object v = values[i];
+        h = 31 * h + (v == null ? 0 : v.hashCode());
+      }
+      this.hash = h;
+    }
+
+    /** Create an immutable snapshot for insertion into the map. */
+    MergedGroupKey snapshot() {
+      Object[] copy = new Object[size];
+      System.arraycopy(values, 0, copy, 0, size);
+      return new MergedGroupKey(copy, hash);
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (obj instanceof MergedGroupKey other) {
+        if (this.hash != other.hash || this.size != other.values.length) return false;
+        for (int i = 0; i < size; i++) {
+          if (values[i] == null) {
+            if (other.values[i] != null) return false;
+          } else if (!values[i].equals(other.values[i])) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
     }
   }
 

@@ -2166,10 +2166,12 @@ public class TransportTrinoSqlAction
         org.opensearch.sql.dqe.operator.LongOpenHashSet source = entry.getValue();
         // Union: iterate source set and insert all values into target
         if (source.hasZeroValue()) target.add(0);
+        if (source.hasSentinelValue())
+          target.add(org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
         long[] sourceTable = source.keys();
-        boolean[] sourceOccupied = source.occupied();
+        long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
         for (int i = 0; i < sourceTable.length; i++) {
-          if (sourceOccupied[i]) {
+          if (sourceTable[i] != emptyMarker) {
             target.add(sourceTable[i]);
           }
         }

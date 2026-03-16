@@ -169,13 +169,14 @@ do_perf_lite() {
     local instance_type
     instance_type=$(get_instance_type)
 
-    echo "=== PERF-LITE: ClickHouse (1M, ${NUM_TRIES} tries) ==="
+    echo "=== PERF-LITE: ClickHouse (1M, ${NUM_TRIES} tries, HTTP mode) ==="
     mkdir -p "$PERF_LITE_RESULT_DIR"
     # shellcheck disable=SC2086
     run_cmd bash "$BENCH_DIR/run/run_clickhouse.sh" \
         --dataset 1m \
         --timeout "$QUERY_TIMEOUT" \
         --num-tries "$NUM_TRIES" \
+        --use-http \
         --output-dir "$PERF_LITE_RESULT_DIR" \
         $QUERY_FLAG
 
@@ -185,12 +186,13 @@ do_perf_lite() {
     fi
 
     echo ""
-    echo "=== PERF-LITE: OpenSearch (1M, ${NUM_TRIES} tries) ==="
+    echo "=== PERF-LITE: OpenSearch (1M, ${NUM_TRIES} tries, warmup=${WARMUP_PASSES_OS:-3}) ==="
     # shellcheck disable=SC2086
     run_cmd bash "$BENCH_DIR/run/run_opensearch.sh" \
         --dataset 1m \
         --timeout "$QUERY_TIMEOUT" \
         --num-tries "$NUM_TRIES" \
+        --warmup "${WARMUP_PASSES_OS:-3}" \
         --output-dir "$PERF_LITE_RESULT_DIR" \
         $QUERY_FLAG
 

@@ -22,14 +22,22 @@ public final class LongOpenHashSet {
   private static final int INITIAL_CAPACITY = 1024;
   private static final float LOAD_FACTOR = 0.65f;
 
+  /**
+   * Sentinel value marking empty slots. Using Long.MIN_VALUE eliminates the need for a separate
+   * boolean[] occupied array, halving memory usage and reducing cache misses during probing.
+   */
+  private static final long EMPTY = Long.MIN_VALUE;
+
   private long[] keys;
-  private boolean[] occupied;
   private int size;
   private int capacity;
   private int threshold;
 
   /** Track whether the value 0 has been added (since 0 is the default value in long[]). */
   private boolean hasZero;
+
+  /** Track whether EMPTY sentinel has been added as an actual value. */
+  private boolean hasSentinel;
 
   public LongOpenHashSet() {
     this(INITIAL_CAPACITY);
@@ -46,10 +54,11 @@ public final class LongOpenHashSet {
     // Round up to next power of two
     this.capacity = Integer.highestOneBit(rawCapacity - 1) << 1;
     this.keys = new long[capacity];
-    this.occupied = new boolean[capacity];
+    java.util.Arrays.fill(this.keys, EMPTY);
     this.size = 0;
     this.threshold = (int) (capacity * LOAD_FACTOR);
     this.hasZero = false;
+    this.hasSentinel = false;
   }
 
   /**
@@ -60,16 +69,20 @@ public final class LongOpenHashSet {
    */
   public boolean add(long value) {
     if (value == 0) {
-      if (hasZero) {
-        return false;
-      }
+      if (hasZero) return false;
       hasZero = true;
+      size++;
+      return true;
+    }
+    if (value == EMPTY) {
+      if (hasSentinel) return false;
+      hasSentinel = true;
       size++;
       return true;
     }
 
     int mask = capacity - 1;
-    // Murmur3 finalizer for better distribution of correlated long keys
+    // Murmur3 finalizer: good distribution even for correlated keys
     long h = value;
     h ^= h >>> 33;
     h *= 0xff51afd7ed558ccdL;
@@ -77,16 +90,13 @@ public final class LongOpenHashSet {
     h *= 0xc4ceb9fe1a85ec53L;
     h ^= h >>> 33;
     int slot = (int) h & mask;
-    while (occupied[slot]) {
-      if (keys[slot] == value) {
-        return false; // Already present
-      }
+    long k;
+    while ((k = keys[slot]) != EMPTY) {
+      if (k == value) return false;
       slot = (slot + 1) & mask;
     }
 
-    // Insert new value
     keys[slot] = value;
-    occupied[slot] = true;
     size++;
 
     if (size > threshold) {
@@ -100,14 +110,21 @@ public final class LongOpenHashSet {
     return size;
   }
 
-  /** Return the underlying keys array (for iteration). Non-null only at occupied positions. */
+  /** Return the underlying keys array (for iteration). Slots equal to EMPTY are unoccupied. */
   public long[] keys() {
     return keys;
   }
 
-  /** Return the occupied flags array (for iteration). */
+  /**
+   * Return an occupied flags view for iteration compatibility. Callers should prefer checking
+   * keys[i] != EMPTY directly when possible.
+   */
   public boolean[] occupied() {
-    return occupied;
+    boolean[] occ = new boolean[capacity];
+    for (int i = 0; i < capacity; i++) {
+      occ[i] = keys[i] != EMPTY;
+    }
+    return occ;
   }
 
   /** Return whether the value 0 is in the set. */
@@ -115,20 +132,33 @@ public final class LongOpenHashSet {
     return hasZero;
   }
 
+  /** Return whether the sentinel value (Long.MIN_VALUE) is in the set. */
+  public boolean hasSentinelValue() {
+    return hasSentinel;
+  }
+
+  /** Return the sentinel value used for empty slots. */
+  public static long emptyMarker() {
+    return EMPTY;
+  }
+
   /**
    * Add all values from another LongOpenHashSet into this one. Used for merging cross-segment
    * results.
    */
   public void addAll(LongOpenHashSet other) {
-    if (other.hasZero) {
-      if (!hasZero) {
-        hasZero = true;
-        size++;
-      }
+    if (other.hasZero && !hasZero) {
+      hasZero = true;
+      size++;
     }
-    for (int i = 0; i < other.capacity; i++) {
-      if (other.occupied[i]) {
-        add(other.keys[i]);
+    if (other.hasSentinel && !hasSentinel) {
+      hasSentinel = true;
+      size++;
+    }
+    long[] otherKeys = other.keys;
+    for (int i = 0; i < otherKeys.length; i++) {
+      if (otherKeys[i] != EMPTY) {
+        add(otherKeys[i]);
       }
     }
   }
@@ -136,12 +166,12 @@ public final class LongOpenHashSet {
   private void resize() {
     int newCapacity = capacity * 2;
     long[] newKeys = new long[newCapacity];
-    boolean[] newOccupied = new boolean[newCapacity];
+    java.util.Arrays.fill(newKeys, EMPTY);
     int newMask = newCapacity - 1;
 
     for (int i = 0; i < capacity; i++) {
-      if (occupied[i]) {
-        long key = keys[i];
+      long key = keys[i];
+      if (key != EMPTY) {
         long h = key;
         h ^= h >>> 33;
         h *= 0xff51afd7ed558ccdL;
@@ -149,16 +179,14 @@ public final class LongOpenHashSet {
         h *= 0xc4ceb9fe1a85ec53L;
         h ^= h >>> 33;
         int slot = (int) h & newMask;
-        while (newOccupied[slot]) {
+        while (newKeys[slot] != EMPTY) {
           slot = (slot + 1) & newMask;
         }
         newKeys[slot] = key;
-        newOccupied[slot] = true;
       }
     }
 
     this.keys = newKeys;
-    this.occupied = newOccupied;
     this.capacity = newCapacity;
     this.threshold = (int) (newCapacity * LOAD_FACTOR);
   }

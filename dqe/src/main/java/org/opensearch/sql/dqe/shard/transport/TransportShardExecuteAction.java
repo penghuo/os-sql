@@ -793,51 +793,107 @@ public class TransportShardExecuteAction
         org.apache.lucene.index.SortedNumericDocValues dv1 =
             reader.getSortedNumericDocValues(keyName1);
 
-        org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
-        int doc;
-        while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-          long k0 = 0;
-          if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
-          long k1 = 0;
-          if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
+        // For MatchAllDocsQuery, use sequential nextDoc() on DocValues (faster than advanceExact).
+        // For filtered queries, use scorer + advanceExact.
+        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
 
-          // Find or create group for k0
-          int gm = grpCap - 1;
-          int gs = Long.hashCode(k0) & gm;
-          while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
-          if (!grpOcc[gs]) {
-            grpKeys[gs] = k0;
-            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
-            grpOcc[gs] = true;
-            grpSize++;
-            if (grpSize > grpThreshold) {
-              int newGC = grpCap * 2;
-              long[] ngk = new long[newGC];
-              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
-                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
-              boolean[] ngo = new boolean[newGC];
-              int ngm = newGC - 1;
-              for (int g = 0; g < grpCap; g++) {
-                if (grpOcc[g]) {
-                  int ns = Long.hashCode(grpKeys[g]) & ngm;
-                  while (ngo[ns]) ns = (ns + 1) & ngm;
-                  ngk[ns] = grpKeys[g];
-                  ngs[ns] = grpSets[g];
-                  ngo[ns] = true;
-                }
-              }
-              grpKeys = ngk;
-              grpSets = ngs;
-              grpOcc = ngo;
-              grpCap = newGC;
-              grpThreshold = (int) (newGC * 0.7f);
-              // Re-probe after resize
-              gm = grpCap - 1;
-              gs = Long.hashCode(k0) & gm;
-              while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+        if (isMatchAll && dv0 != null && dv1 != null) {
+          // Sequential DocValues iteration (no scorer needed)
+          int maxDoc = reader.maxDoc();
+          int dvDoc0 = dv0.nextDoc();
+          int dvDoc1 = dv1.nextDoc();
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long k0 = 0;
+            if (dvDoc0 == doc) {
+              k0 = dv0.nextValue();
+              dvDoc0 = dv0.nextDoc();
             }
+            long k1 = 0;
+            if (dvDoc1 == doc) {
+              k1 = dv1.nextValue();
+              dvDoc1 = dv1.nextDoc();
+            }
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (!grpOcc[gs]) {
+              grpKeys[gs] = k0;
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+              grpOcc[gs] = true;
+              grpSize++;
+              if (grpSize > grpThreshold) {
+                int newGC = grpCap * 2;
+                long[] ngk = new long[newGC];
+                org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                    new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+                boolean[] ngo = new boolean[newGC];
+                int ngm = newGC - 1;
+                for (int g = 0; g < grpCap; g++) {
+                  if (grpOcc[g]) {
+                    int ns = Long.hashCode(grpKeys[g]) & ngm;
+                    while (ngo[ns]) ns = (ns + 1) & ngm;
+                    ngk[ns] = grpKeys[g];
+                    ngs[ns] = grpSets[g];
+                    ngo[ns] = true;
+                  }
+                }
+                grpKeys = ngk;
+                grpSets = ngs;
+                grpOcc = ngo;
+                grpCap = newGC;
+                grpThreshold = (int) (newGC * 0.7f);
+                gm = grpCap - 1;
+                gs = Long.hashCode(k0) & gm;
+                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+              }
+            }
+            grpSets[gs].add(k1);
           }
-          grpSets[gs].add(k1);
+        } else {
+          // Filtered path: use scorer + advanceExact
+          org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+          int doc;
+          while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+            long k0 = 0;
+            if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
+            long k1 = 0;
+            if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (!grpOcc[gs]) {
+              grpKeys[gs] = k0;
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+              grpOcc[gs] = true;
+              grpSize++;
+              if (grpSize > grpThreshold) {
+                int newGC = grpCap * 2;
+                long[] ngk = new long[newGC];
+                org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                    new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+                boolean[] ngo = new boolean[newGC];
+                int ngm = newGC - 1;
+                for (int g = 0; g < grpCap; g++) {
+                  if (grpOcc[g]) {
+                    int ns = Long.hashCode(grpKeys[g]) & ngm;
+                    while (ngo[ns]) ns = (ns + 1) & ngm;
+                    ngk[ns] = grpKeys[g];
+                    ngs[ns] = grpSets[g];
+                    ngo[ns] = true;
+                  }
+                }
+                grpKeys = ngk;
+                grpSets = ngs;
+                grpOcc = ngo;
+                grpCap = newGC;
+                grpThreshold = (int) (newGC * 0.7f);
+                gm = grpCap - 1;
+                gs = Long.hashCode(k0) & gm;
+                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+              }
+            }
+            grpSets[gs].add(k1);
+          }
         }
       }
     }

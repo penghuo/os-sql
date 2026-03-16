@@ -2126,18 +2126,36 @@ public class TransportTrinoSqlAction
       List<Type> dedupTypes,
       int numOriginalKeys,
       int numCountDistinctAggs) {
-    // Pre-size capacity: use largest single shard's row count as estimate (not total)
-    // because dedup keys overlap across shards.
-    int maxShardRows = 0;
+    // Phase 0: Batch all shard data into flat long arrays to eliminate Block virtual dispatch.
     int totalRows = 0;
+    int maxShardRows = 0;
     for (List<Page> shardPageList : shardPages) {
       int shardRows = 0;
-      for (Page page : shardPageList) {
-        shardRows += page.getPositionCount();
-      }
+      for (Page page : shardPageList) shardRows += page.getPositionCount();
       totalRows += shardRows;
       if (shardRows > maxShardRows) maxShardRows = shardRows;
     }
+    if (totalRows == 0) return List.of();
+
+    long[] allKey0 = new long[totalRows];
+    long[] allKey1 = new long[totalRows];
+    int off = 0;
+    Type type0 = dedupTypes.get(0);
+    Type type1 = dedupTypes.get(1);
+    for (List<Page> shardPageList : shardPages) {
+      for (Page page : shardPageList) {
+        int cnt = page.getPositionCount();
+        Block b0 = page.getBlock(0);
+        Block b1 = page.getBlock(1);
+        for (int p = 0; p < cnt; p++) {
+          allKey0[off] = type0.getLong(b0, p);
+          allKey1[off] = type1.getLong(b1, p);
+          off++;
+        }
+      }
+    }
+
+    // Phase 1+2 fused: Dedup (k0, k1) pairs and count per k0 in single pass.
     int estimatedUnique = Math.min(totalRows, maxShardRows * 2);
     int capacity = Integer.highestOneBit(Math.max(1024, (int) (estimatedUnique / 0.65f))) << 1;
     float loadFactor = 0.65f;
@@ -2146,82 +2164,8 @@ public class TransportTrinoSqlAction
     long[] mapKey0 = new long[capacity];
     long[] mapKey1 = new long[capacity];
     boolean[] mapOccupied = new boolean[capacity];
-    // Track occupied slots for O(size) Stage 2 iteration
-    int[] occupiedSlots = new int[Math.max(1024, estimatedUnique)];
 
-    Type type0 = dedupTypes.get(0);
-    Type type1 = dedupTypes.get(1);
-
-    for (List<Page> shardPageList : shardPages) {
-      for (Page page : shardPageList) {
-        int positionCount = page.getPositionCount();
-        Block block0 = page.getBlock(0);
-        Block block1 = page.getBlock(1);
-
-        for (int pos = 0; pos < positionCount; pos++) {
-          long k0 = type0.getLong(block0, pos);
-          long k1 = type1.getLong(block1, pos);
-          // Murmur-style hash mix for better distribution
-          int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
-          int mask = capacity - 1;
-          int slot = hash & mask;
-          while (true) {
-            if (!mapOccupied[slot]) {
-              mapKey0[slot] = k0;
-              mapKey1[slot] = k1;
-              mapOccupied[slot] = true;
-              if (size >= occupiedSlots.length) {
-                occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, occupiedSlots.length * 2);
-              }
-              occupiedSlots[size] = slot;
-              size++;
-              if (size > threshold) {
-                // Resize
-                int newCap = capacity * 2;
-                long[] nk0 = new long[newCap];
-                long[] nk1 = new long[newCap];
-                boolean[] no = new boolean[newCap];
-                int nm = newCap - 1;
-                int rebuildIdx = 0;
-                if (size > occupiedSlots.length) {
-                  occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, size * 2);
-                }
-                for (int si = 0; si < size; si++) {
-                  int oldSlot = occupiedSlots[si];
-                  int h =
-                      Long.hashCode(mapKey0[oldSlot]) * 0x9E3779B9
-                          + Long.hashCode(mapKey1[oldSlot]);
-                  int ns = h & nm;
-                  while (no[ns]) ns = (ns + 1) & nm;
-                  nk0[ns] = mapKey0[oldSlot];
-                  nk1[ns] = mapKey1[oldSlot];
-                  no[ns] = true;
-                  occupiedSlots[rebuildIdx++] = ns;
-                }
-                mapKey0 = nk0;
-                mapKey1 = nk1;
-                mapOccupied = no;
-                capacity = newCap;
-                mask = nm;
-                threshold = (int) (newCap * loadFactor);
-              }
-              break;
-            }
-            if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
-              break; // duplicate — skip
-            }
-            slot = (slot + 1) & mask;
-          }
-        }
-      }
-    }
-
-    if (size == 0) {
-      return List.of();
-    }
-
-    // Stage 2: Count entries per original key (key0)
-    // Iterate only occupied slots (O(size) instead of O(capacity))
+    // Group counter map (maintained incrementally during dedup)
     int grpCap = 256;
     long[] grpKeys = new long[grpCap];
     long[] grpCounts = new long[grpCap];
@@ -2229,44 +2173,89 @@ public class TransportTrinoSqlAction
     int grpSize = 0;
     int grpThreshold = (int) (grpCap * 0.7f);
 
-    for (int si = 0; si < size; si++) {
-      int s = occupiedSlots[si];
-      long origKey = mapKey0[s];
-      int gm = grpCap - 1;
-      int gs = Long.hashCode(origKey) & gm;
-      while (grpOcc[gs] && grpKeys[gs] != origKey) {
-        gs = (gs + 1) & gm;
-      }
-      if (grpOcc[gs]) {
-        grpCounts[gs]++;
-      } else {
-        grpKeys[gs] = origKey;
-        grpCounts[gs] = 1;
-        grpOcc[gs] = true;
-        grpSize++;
-        if (grpSize > grpThreshold) {
-          int newGC = grpCap * 2;
-          long[] ngk = new long[newGC];
-          long[] ngc = new long[newGC];
-          boolean[] ngo = new boolean[newGC];
-          int ngm = newGC - 1;
-          for (int g = 0; g < grpCap; g++) {
-            if (grpOcc[g]) {
-              int ns = Long.hashCode(grpKeys[g]) & ngm;
-              while (ngo[ns]) ns = (ns + 1) & ngm;
-              ngk[ns] = grpKeys[g];
-              ngc[ns] = grpCounts[g];
-              ngo[ns] = true;
+    for (int i = 0; i < totalRows; i++) {
+      long k0 = allKey0[i];
+      long k1 = allKey1[i];
+      int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
+      int mask = capacity - 1;
+      int slot = hash & mask;
+      boolean isNew = false;
+      while (true) {
+        if (!mapOccupied[slot]) {
+          mapKey0[slot] = k0;
+          mapKey1[slot] = k1;
+          mapOccupied[slot] = true;
+          size++;
+          isNew = true;
+          if (size > threshold) {
+            int newCap = capacity * 2;
+            long[] nk0 = new long[newCap];
+            long[] nk1 = new long[newCap];
+            boolean[] no = new boolean[newCap];
+            int nm = newCap - 1;
+            for (int s = 0; s < capacity; s++) {
+              if (mapOccupied[s]) {
+                int h = Long.hashCode(mapKey0[s]) * 0x9E3779B9 + Long.hashCode(mapKey1[s]);
+                int ns = h & nm;
+                while (no[ns]) ns = (ns + 1) & nm;
+                nk0[ns] = mapKey0[s];
+                nk1[ns] = mapKey1[s];
+                no[ns] = true;
+              }
             }
+            mapKey0 = nk0;
+            mapKey1 = nk1;
+            mapOccupied = no;
+            capacity = newCap;
+            mask = nm;
+            threshold = (int) (newCap * loadFactor);
           }
-          grpKeys = ngk;
-          grpCounts = ngc;
-          grpOcc = ngo;
-          grpCap = newGC;
-          grpThreshold = (int) (newGC * 0.7f);
+          break;
+        }
+        if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
+          break; // duplicate
+        }
+        slot = (slot + 1) & mask;
+      }
+
+      // Fused: increment group counter for k0 when a new unique pair is found
+      if (isNew) {
+        int gm = grpCap - 1;
+        int gs = Long.hashCode(k0) & gm;
+        while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+        if (grpOcc[gs]) {
+          grpCounts[gs]++;
+        } else {
+          grpKeys[gs] = k0;
+          grpCounts[gs] = 1;
+          grpOcc[gs] = true;
+          grpSize++;
+          if (grpSize > grpThreshold) {
+            int newGC = grpCap * 2;
+            long[] ngk = new long[newGC];
+            long[] ngc = new long[newGC];
+            boolean[] ngo = new boolean[newGC];
+            int ngm = newGC - 1;
+            for (int g = 0; g < grpCap; g++) {
+              if (grpOcc[g]) {
+                int ns = Long.hashCode(grpKeys[g]) & ngm;
+                while (ngo[ns]) ns = (ns + 1) & ngm;
+                ngk[ns] = grpKeys[g];
+                ngc[ns] = grpCounts[g];
+                ngo[ns] = true;
+              }
+            }
+            grpKeys = ngk;
+            grpCounts = ngc;
+            grpOcc = ngo;
+            grpCap = newGC;
+            grpThreshold = (int) (newGC * 0.7f);
+          }
         }
       }
     }
+
+    if (grpSize == 0) return List.of();
 
     // Build result page
     Type keyType = dedupTypes.get(0);
@@ -2285,7 +2274,6 @@ public class TransportTrinoSqlAction
       } else {
         keyType.writeLong(builders[0], key);
       }
-      // Write the same count for all COUNT(DISTINCT) columns
       for (int i = numOriginalKeys; i < numOutputCols; i++) {
         BigintType.BIGINT.writeLong(builders[i], grpCounts[gs]);
       }

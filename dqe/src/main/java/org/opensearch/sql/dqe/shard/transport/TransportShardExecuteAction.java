@@ -271,6 +271,34 @@ public class TransportShardExecuteAction
       return applyTopProject(pages, columnTypes, topProject, aggEvalNode);
     }
 
+    // Fast path: COUNT(DISTINCT) dedup plan with 2 numeric keys and COUNT(*).
+    // Instead of GROUP BY (key0, key1) producing ~10K rows, builds per-group HashSets
+    // directly during DocValues iteration. Outputs compact pages (~450 rows) + attached
+    // HashSets for the coordinator to union across shards.
+    if (scanFactory == null
+        && effectivePlan instanceof AggregationNode aggDedupNode
+        && aggDedupNode.getStep() == AggregationNode.Step.PARTIAL
+        && aggDedupNode.getGroupByKeys().size() == 2
+        && aggDedupNode.getAggregateFunctions().size() == 1
+        && "COUNT(*)".equals(aggDedupNode.getAggregateFunctions().get(0))
+        && FusedGroupByAggregate.canFuse(
+            aggDedupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+      Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+      String keyName0 = aggDedupNode.getGroupByKeys().get(0);
+      String keyName1 = aggDedupNode.getGroupByKeys().get(1);
+      Type t0 = ctm.get(keyName0);
+      Type t1 = ctm.get(keyName1);
+      if (t0 != null
+          && !(t0 instanceof io.trino.spi.type.VarcharType)
+          && t1 != null
+          && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+        // Execute with HashSet-per-group: single-key GROUP BY with LongOpenHashSet accumulators
+        ShardExecuteResponse resp =
+            executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
+        return resp;
+      }
+    }
+
     // Try fused ordinal-based GROUP BY for aggregations with string group keys
     if (scanFactory == null
         && effectivePlan instanceof AggregationNode aggGroupNode
@@ -280,39 +308,7 @@ public class TransportShardExecuteAction
       List<Type> columnTypes =
           FusedGroupByAggregate.resolveOutputTypes(
               aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      ShardExecuteResponse resp = applyTopProject(pages, columnTypes, topProject, aggGroupNode);
-
-      // Post-processing: for COUNT(DISTINCT) dedup plans with 2 numeric keys and COUNT(*),
-      // convert the (key0, key1, count) pages into per-group HashSets for faster coordinator merge.
-      if (aggGroupNode.getStep() == AggregationNode.Step.PARTIAL
-          && aggGroupNode.getGroupByKeys().size() == 2
-          && aggGroupNode.getAggregateFunctions().size() == 1
-          && "COUNT(*)".equals(aggGroupNode.getAggregateFunctions().get(0))) {
-        Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
-        Type t0 = ctm.get(aggGroupNode.getGroupByKeys().get(0));
-        Type t1 = ctm.get(aggGroupNode.getGroupByKeys().get(1));
-        if (t0 != null
-            && !(t0 instanceof io.trino.spi.type.VarcharType)
-            && t1 != null
-            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
-          java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> sets =
-              new java.util.HashMap<>();
-          for (Page page : resp.getPages()) {
-            Block b0 = page.getBlock(0);
-            Block b1 = page.getBlock(1);
-            int cnt = page.getPositionCount();
-            for (int p = 0; p < cnt; p++) {
-              long groupKey = t0.getLong(b0, p);
-              long distinctVal = t1.getLong(b1, p);
-              sets.computeIfAbsent(
-                      groupKey, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
-                  .add(distinctVal);
-            }
-          }
-          resp.setDistinctSets(sets);
-        }
-      }
-      return resp;
+      return applyTopProject(pages, columnTypes, topProject, aggGroupNode);
     }
 
     // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode
@@ -747,6 +743,144 @@ public class TransportShardExecuteAction
    * keys during grouping. This avoids the expensive lookupOrd() per row, deferring string
    * resolution to the final output phase.
    */
+  /**
+   * Execute COUNT(DISTINCT) with HashSet-per-group accumulators. Instead of GROUP BY (key0, key1)
+   * producing ~10K unique pairs per shard, does GROUP BY (key0) with a LongOpenHashSet per group to
+   * collect key1 values. Outputs a compact page (~450 rows) + attached HashSets.
+   */
+  private ShardExecuteResponse executeCountDistinctWithHashSets(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      String keyName0,
+      String keyName1,
+      Type type0,
+      Type type1)
+      throws Exception {
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    // Open-addressing hash map: key0 → LongOpenHashSet(key1 values)
+    int grpCap = 256;
+    long[] grpKeys = new long[grpCap];
+    org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
+        new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-count-distinct-hashset")) {
+      for (org.apache.lucene.index.LeafReaderContext leafCtx :
+          engineSearcher.getIndexReader().leaves()) {
+        org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+        org.apache.lucene.search.Weight weight =
+            engineSearcher.createWeight(
+                engineSearcher.rewrite(luceneQuery),
+                org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                1.0f);
+        org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+        if (scorer == null) continue;
+
+        org.apache.lucene.index.SortedNumericDocValues dv0 =
+            reader.getSortedNumericDocValues(keyName0);
+        org.apache.lucene.index.SortedNumericDocValues dv1 =
+            reader.getSortedNumericDocValues(keyName1);
+
+        org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+        int doc;
+        while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+          long k0 = 0;
+          if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
+          long k1 = 0;
+          if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
+
+          // Find or create group for k0
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(k0) & gm;
+          while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+          if (!grpOcc[gs]) {
+            grpKeys[gs] = k0;
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpOcc[gs] = true;
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              int newGC = grpCap * 2;
+              long[] ngk = new long[newGC];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int ns = Long.hashCode(grpKeys[g]) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  ngk[ns] = grpKeys[g];
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
+              }
+              grpKeys = ngk;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              // Re-probe after resize
+              gm = grpCap - 1;
+              gs = Long.hashCode(k0) & gm;
+              while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            }
+          }
+          grpSets[gs].add(k1);
+        }
+      }
+    }
+
+    // Build compact output page: (key0, key1_placeholder=0, COUNT(*)=local_distinct_count)
+    // The page format matches the dedup plan output so the coordinator can fall back to
+    // page-based merge if needed. But the attached HashSets enable the fast merge path.
+    List<Type> colTypes =
+        List.of(
+            type0 instanceof io.trino.spi.type.IntegerType
+                ? io.trino.spi.type.IntegerType.INTEGER
+                : io.trino.spi.type.BigintType.BIGINT,
+            type1 instanceof io.trino.spi.type.IntegerType
+                ? io.trino.spi.type.IntegerType.INTEGER
+                : io.trino.spi.type.BigintType.BIGINT,
+            io.trino.spi.type.BigintType.BIGINT);
+
+    // Build HashSets map for attachment
+    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> distinctSets =
+        new java.util.HashMap<>(grpSize);
+
+    // Also build a fallback page with expanded (key0, key1) pairs for compatibility
+    // Actually, for the HashSet merge path we only need the attachment. But for safety,
+    // output a minimal page with (key0, COUNT_DISTINCT_placeholder) so the response is valid.
+    io.trino.spi.block.BlockBuilder b0 = colTypes.get(0).createBlockBuilder(null, grpSize);
+    io.trino.spi.block.BlockBuilder b1 = colTypes.get(1).createBlockBuilder(null, grpSize);
+    io.trino.spi.block.BlockBuilder b2 = colTypes.get(2).createBlockBuilder(null, grpSize);
+
+    for (int g = 0; g < grpCap; g++) {
+      if (!grpOcc[g]) continue;
+      distinctSets.put(grpKeys[g], grpSets[g]);
+      // Output one row per group with a representative key1 value (0) and count
+      colTypes.get(0).writeLong(b0, grpKeys[g]);
+      colTypes.get(1).writeLong(b1, 0L);
+      io.trino.spi.type.BigintType.BIGINT.writeLong(b2, grpSets[g].size());
+    }
+
+    Page page = new Page(b0.build(), b1.build(), b2.build());
+    ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
+    resp.setDistinctSets(distinctSets);
+    return resp;
+  }
+
   private List<Page> executeFusedGroupByAggregate(AggregationNode aggNode, ShardExecuteRequest req)
       throws Exception {
     // Walk through optional EvalNode to find the TableScanNode

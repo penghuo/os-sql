@@ -35,6 +35,13 @@
 - For integration coverage, place REST and end-to-end cases in `integ-test` or `yamlRestTest` with clear dataset setup/cleanup.
 - Run the narrowest relevant Gradle target before opening a PR; include seeds or commands used to reproduce failures.
 
+## Correctness-First Rule (STRICT)
+- **ALWAYS verify correctness BEFORE measuring performance.** No performance optimization is valid if it breaks query correctness.
+- After ANY code change to DQE query execution, run the full ClickBench correctness suite: `cd benchmarks/clickbench && bash run/run_all.sh correctness`
+- The correctness baseline MUST NOT regress. If a change introduces new failures, revert it before proceeding.
+- Performance benchmarks (`bash run/run_all.sh perf-lite`) should only be run AFTER correctness is confirmed.
+- When optimizing a specific query (e.g., Q14), verify that query’s result matches ClickHouse output before benchmarking timing.
+
 ## Commit & Pull Request Guidelines
 - Write concise, imperative commit subjects; reference GitHub issues (`#123`) when applicable.
 - One logical change per commit; keep diffs focused on the described scope.

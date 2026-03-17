@@ -1,306 +1,609 @@
 {
+  "date": "2026-03-17",
+  "dataset": "1m",
+  "correctness": {},
   "queries": [
     {
-      "query": "Q1",
-      "clickhouse": 0.007,
-      "opensearch": 0.008,
-      "ratio": 1.14,
-      "within_2x": true
+      "q": 1,
+      "correct": "skip",
+      "ch_times": [
+        0.051,
+        0.007,
+        0.007
+      ],
+      "os_times": [
+        0.051,
+        0.007,
+        0.006
+      ]
     },
     {
-      "query": "Q2",
-      "clickhouse": 0.009,
-      "opensearch": 0.007,
-      "ratio": 0.78,
-      "within_2x": true
+      "q": 2,
+      "correct": "skip",
+      "ch_times": [
+        0.061,
+        0.010,
+        0.009
+      ],
+      "os_times": [
+        0.051,
+        0.007,
+        0.007
+      ]
     },
     {
-      "query": "Q3",
-      "clickhouse": 0.009,
-      "opensearch": 0.011,
-      "ratio": 1.22,
-      "within_2x": true
+      "q": 3,
+      "correct": "skip",
+      "ch_times": [
+        0.061,
+        0.010,
+        0.010
+      ],
+      "os_times": [
+        0.056,
+        0.010,
+        0.012
+      ]
     },
     {
-      "query": "Q4",
-      "clickhouse": 0.009,
-      "opensearch": 0.012,
-      "ratio": 1.33,
-      "within_2x": true
+      "q": 4,
+      "correct": "skip",
+      "ch_times": [
+        0.061,
+        0.010,
+        0.009
+      ],
+      "os_times": [
+        0.059,
+        0.011,
+        0.013
+      ]
     },
     {
-      "query": "Q5",
-      "clickhouse": 0.012,
-      "opensearch": 0.017,
-      "ratio": 1.42,
-      "within_2x": true
+      "q": 5,
+      "correct": "skip",
+      "ch_times": [
+        0.068,
+        0.015,
+        0.015
+      ],
+      "os_times": [
+        0.061,
+        0.016,
+        0.015
+      ]
     },
     {
-      "query": "Q6",
-      "clickhouse": 0.014,
-      "opensearch": 0.015,
-      "ratio": 1.07,
-      "within_2x": true
+      "q": 6,
+      "correct": "skip",
+      "ch_times": [
+        0.067,
+        0.017,
+        0.017
+      ],
+      "os_times": [
+        0.056,
+        0.012,
+        0.012
+      ]
     },
     {
-      "query": "Q7",
-      "clickhouse": 0.009,
-      "opensearch": 0.007,
-      "ratio": 0.78,
-      "within_2x": true
+      "q": 7,
+      "correct": "skip",
+      "ch_times": [
+        0.055,
+        0.009,
+        0.009
+      ],
+      "os_times": [
+        0.048,
+        0.007,
+        0.006
+      ]
     },
     {
-      "query": "Q8",
-      "clickhouse": 0.01,
-      "opensearch": 0.007,
-      "ratio": 0.7,
-      "within_2x": true
+      "q": 8,
+      "correct": "skip",
+      "ch_times": [
+        0.061,
+        0.011,
+        0.011
+      ],
+      "os_times": [
+        0.057,
+        0.007,
+        0.007
+      ]
     },
     {
-      "query": "Q9",
-      "clickhouse": 0.015,
-      "opensearch": 0.047,
-      "ratio": 3.13,
-      "within_2x": false
+      "q": 9,
+      "correct": "skip",
+      "ch_times": [
+        0.071,
+        0.017,
+        0.017
+      ],
+      "os_times": [
+        0.092,
+        0.051,
+        0.050
+      ]
     },
     {
-      "query": "Q10",
-      "clickhouse": 0.017,
-      "opensearch": 0.056,
-      "ratio": 3.29,
-      "within_2x": false
+      "q": 10,
+      "correct": "skip",
+      "ch_times": [
+        0.072,
+        0.019,
+        0.018
+      ],
+      "os_times": [
+        0.108,
+        0.065,
+        0.049
+      ]
     },
     {
-      "query": "Q11",
-      "clickhouse": 0.011,
-      "opensearch": 0.008,
-      "ratio": 0.73,
-      "within_2x": true
+      "q": 11,
+      "correct": "skip",
+      "ch_times": [
+        0.066,
+        0.012,
+        0.012
+      ],
+      "os_times": [
+        0.054,
+        0.008,
+        0.008
+      ]
     },
     {
-      "query": "Q12",
-      "clickhouse": 0.012,
-      "opensearch": 0.014,
-      "ratio": 1.17,
-      "within_2x": true
+      "q": 12,
+      "correct": "skip",
+      "ch_times": [
+        0.066,
+        0.012,
+        0.012
+      ],
+      "os_times": [
+        0.056,
+        0.009,
+        0.008
+      ]
     },
     {
-      "query": "Q13",
-      "clickhouse": 0.014,
-      "opensearch": 0.017,
-      "ratio": 1.21,
-      "within_2x": true
+      "q": 13,
+      "correct": "skip",
+      "ch_times": [
+        0.067,
+        0.015,
+        0.016
+      ],
+      "os_times": [
+        0.064,
+        0.018,
+        0.018
+      ]
     },
     {
-      "query": "Q14",
-      "clickhouse": 0.017,
-      "opensearch": 0.084,
-      "ratio": 4.94,
-      "within_2x": false
+      "q": 14,
+      "correct": "skip",
+      "ch_times": [
+        0.070,
+        0.020,
+        0.019
+      ],
+      "os_times": [
+        0.152,
+        0.122,
+        0.116
+      ]
     },
     {
-      "query": "Q15",
-      "clickhouse": 0.017,
-      "opensearch": 0.019,
-      "ratio": 1.12,
-      "within_2x": true
+      "q": 15,
+      "correct": "skip",
+      "ch_times": [
+        0.072,
+        0.021,
+        0.018
+      ],
+      "os_times": [
+        0.072,
+        0.022,
+        0.023
+      ]
     },
     {
-      "query": "Q16",
-      "clickhouse": 0.017,
-      "opensearch": 0.017,
-      "ratio": 1.0,
-      "within_2x": true
+      "q": 16,
+      "correct": "skip",
+      "ch_times": [
+        0.066,
+        0.016,
+        0.018
+      ],
+      "os_times": [
+        0.055,
+        0.016,
+        0.016
+      ]
     },
     {
-      "query": "Q17",
-      "clickhouse": 0.036,
-      "opensearch": 0.024,
-      "ratio": 0.67,
-      "within_2x": true
+      "q": 17,
+      "correct": "skip",
+      "ch_times": [
+        0.092,
+        0.042,
+        0.039
+      ],
+      "os_times": [
+        0.072,
+        0.024,
+        0.023
+      ]
     },
     {
-      "query": "Q18",
-      "clickhouse": 0.025,
-      "opensearch": 0.011,
-      "ratio": 0.44,
-      "within_2x": true
+      "q": 18,
+      "correct": "skip",
+      "ch_times": [
+        0.085,
+        0.029,
+        0.036
+      ],
+      "os_times": [
+        0.054,
+        0.010,
+        0.013
+      ]
     },
     {
-      "query": "Q19",
-      "clickhouse": 0.034,
-      "opensearch": 0.066,
-      "ratio": 1.94,
-      "within_2x": true
+      "q": 19,
+      "correct": "skip",
+      "ch_times": [
+        0.091,
+        0.043,
+        0.035
+      ],
+      "os_times": [
+        0.100,
+        0.056,
+        0.056
+      ]
     },
     {
-      "query": "Q20",
-      "clickhouse": 0.007,
-      "opensearch": 0.007,
-      "ratio": 1.0,
-      "within_2x": true
+      "q": 20,
+      "correct": "skip",
+      "ch_times": [
+        0.052,
+        0.008,
+        0.007
+      ],
+      "os_times": [
+        0.054,
+        0.007,
+        0.006
+      ]
     },
     {
-      "query": "Q21",
-      "clickhouse": 0.016,
-      "opensearch": 0.007,
-      "ratio": 0.44,
-      "within_2x": true
+      "q": 21,
+      "correct": "skip",
+      "ch_times": [
+        0.086,
+        0.016,
+        0.016
+      ],
+      "os_times": [
+        0.074,
+        0.007,
+        0.006
+      ]
     },
     {
-      "query": "Q22",
-      "clickhouse": 0.01,
-      "opensearch": 0.011,
-      "ratio": 1.1,
-      "within_2x": true
+      "q": 22,
+      "correct": "skip",
+      "ch_times": [
+        0.065,
+        0.011,
+        0.010
+      ],
+      "os_times": [
+        0.074,
+        0.007,
+        0.007
+      ]
     },
     {
-      "query": "Q23",
-      "clickhouse": 0.036,
-      "opensearch": 0.01,
-      "ratio": 0.28,
-      "within_2x": true
+      "q": 23,
+      "correct": "skip",
+      "ch_times": [
+        0.125,
+        0.037,
+        0.036
+      ],
+      "os_times": [
+        0.113,
+        0.009,
+        0.009
+      ]
     },
     {
-      "query": "Q24",
-      "clickhouse": 0.045,
-      "opensearch": 0.012,
-      "ratio": 0.27,
-      "within_2x": true
+      "q": 24,
+      "correct": "skip",
+      "ch_times": [
+        0.268,
+        0.053,
+        0.052
+      ],
+      "os_times": [
+        0.078,
+        0.010,
+        0.009
+      ]
     },
     {
-      "query": "Q25",
-      "clickhouse": 0.012,
-      "opensearch": 0.009,
-      "ratio": 0.75,
-      "within_2x": true
+      "q": 25,
+      "correct": "skip",
+      "ch_times": [
+        0.066,
+        0.014,
+        0.013
+      ],
+      "os_times": [
+        0.054,
+        0.007,
+        0.007
+      ]
     },
     {
-      "query": "Q26",
-      "clickhouse": 0.01,
-      "opensearch": 0.011,
-      "ratio": 1.1,
-      "within_2x": true
+      "q": 26,
+      "correct": "skip",
+      "ch_times": [
+        0.065,
+        0.012,
+        0.012
+      ],
+      "os_times": [
+        0.056,
+        0.010,
+        0.010
+      ]
     },
     {
-      "query": "Q27",
-      "clickhouse": 0.012,
-      "opensearch": 0.01,
-      "ratio": 0.83,
-      "within_2x": true
+      "q": 27,
+      "correct": "skip",
+      "ch_times": [
+        0.071,
+        0.014,
+        0.012
+      ],
+      "os_times": [
+        0.056,
+        0.008,
+        0.008
+      ]
     },
     {
-      "query": "Q28",
-      "clickhouse": 0.013,
-      "opensearch": 0.013,
-      "ratio": 1.0,
-      "within_2x": true
+      "q": 28,
+      "correct": "skip",
+      "ch_times": [
+        0.067,
+        0.013,
+        0.012
+      ],
+      "os_times": [
+        0.052,
+        0.014,
+        0.013
+      ]
     },
     {
-      "query": "Q29",
-      "clickhouse": 0.243,
-      "opensearch": 0.009,
-      "ratio": 0.04,
-      "within_2x": true
+      "q": 29,
+      "correct": "skip",
+      "ch_times": [
+        0.295,
+        0.251,
+        0.237
+      ],
+      "os_times": [
+        0.057,
+        0.009,
+        0.009
+      ]
     },
     {
-      "query": "Q30",
-      "clickhouse": 0.025,
-      "opensearch": 0.012,
-      "ratio": 0.48,
-      "within_2x": true
+      "q": 30,
+      "correct": "skip",
+      "ch_times": [
+        0.080,
+        0.025,
+        0.025
+      ],
+      "os_times": [
+        0.055,
+        0.011,
+        0.011
+      ]
     },
     {
-      "query": "Q31",
-      "clickhouse": 0.015,
-      "opensearch": 0.012,
-      "ratio": 0.8,
-      "within_2x": true
+      "q": 31,
+      "correct": "skip",
+      "ch_times": [
+        0.071,
+        0.018,
+        0.017
+      ],
+      "os_times": [
+        0.061,
+        0.012,
+        0.012
+      ]
     },
     {
-      "query": "Q32",
-      "clickhouse": 0.024,
-      "opensearch": 0.013,
-      "ratio": 0.54,
-      "within_2x": true
+      "q": 32,
+      "correct": "skip",
+      "ch_times": [
+        0.087,
+        0.026,
+        0.025
+      ],
+      "os_times": [
+        0.058,
+        0.014,
+        0.013
+      ]
     },
     {
-      "query": "Q33",
-      "clickhouse": 0.049,
-      "opensearch": 0.044,
-      "ratio": 0.9,
-      "within_2x": true
+      "q": 33,
+      "correct": "skip",
+      "ch_times": [
+        0.112,
+        0.049,
+        0.056
+      ],
+      "os_times": [
+        0.103,
+        0.055,
+        0.057
+      ]
     },
     {
-      "query": "Q34",
-      "clickhouse": 0.05,
-      "opensearch": 0.014,
-      "ratio": 0.28,
-      "within_2x": true
+      "q": 34,
+      "correct": "skip",
+      "ch_times": [
+        0.116,
+        0.050,
+        0.047
+      ],
+      "os_times": [
+        0.057,
+        0.015,
+        0.016
+      ]
     },
     {
-      "query": "Q35",
-      "clickhouse": null,
-      "opensearch": null
+      "q": 35,
+      "correct": "skip",
+      "ch_times": [
+        0.117,
+        0.053,
+        0.058
+      ],
+      "os_times": [
+        null,
+        null,
+        null
+      ]
     },
     {
-      "query": "Q36",
-      "clickhouse": 0.016,
-      "opensearch": 0.022,
-      "ratio": 1.38,
-      "within_2x": true
+      "q": 36,
+      "correct": "skip",
+      "ch_times": [
+        0.067,
+        0.017,
+        0.019
+      ],
+      "os_times": [
+        0.060,
+        0.019,
+        0.018
+      ]
     },
     {
-      "query": "Q37",
-      "clickhouse": 0.048,
-      "opensearch": 0.016,
-      "ratio": 0.33,
-      "within_2x": true
+      "q": 37,
+      "correct": "skip",
+      "ch_times": [
+        0.126,
+        0.053,
+        0.056
+      ],
+      "os_times": [
+        0.063,
+        0.017,
+        0.013
+      ]
     },
     {
-      "query": "Q38",
-      "clickhouse": 0.03,
-      "opensearch": 0.024,
-      "ratio": 0.8,
-      "within_2x": true
+      "q": 38,
+      "correct": "skip",
+      "ch_times": [
+        0.095,
+        0.035,
+        0.034
+      ],
+      "os_times": [
+        0.074,
+        0.023,
+        0.017
+      ]
     },
     {
-      "query": "Q39",
-      "clickhouse": 0.026,
-      "opensearch": 0.011,
-      "ratio": 0.42,
-      "within_2x": true
+      "q": 39,
+      "correct": "skip",
+      "ch_times": [
+        0.103,
+        0.031,
+        0.029
+      ],
+      "os_times": [
+        0.066,
+        0.015,
+        0.012
+      ]
     },
     {
-      "query": "Q40",
-      "clickhouse": 0.092,
-      "opensearch": 0.563,
-      "ratio": 6.12,
-      "within_2x": false
+      "q": 40,
+      "correct": "skip",
+      "ch_times": [
+        0.187,
+        0.104,
+        0.102
+      ],
+      "os_times": [
+        0.093,
+        0.072,
+        0.068
+      ]
     },
     {
-      "query": "Q41",
-      "clickhouse": 0.019,
-      "opensearch": 0.014,
-      "ratio": 0.74,
-      "within_2x": true
+      "q": 41,
+      "correct": "skip",
+      "ch_times": [
+        0.087,
+        0.019,
+        0.019
+      ],
+      "os_times": [
+        0.056,
+        0.011,
+        0.011
+      ]
     },
     {
-      "query": "Q42",
-      "clickhouse": 0.016,
-      "opensearch": 0.02,
-      "ratio": 1.25,
-      "within_2x": true
+      "q": 42,
+      "correct": "skip",
+      "ch_times": [
+        0.080,
+        0.016,
+        0.017
+      ],
+      "os_times": [
+        0.063,
+        0.019,
+        0.017
+      ]
     },
     {
-      "query": "Q43",
-      "clickhouse": 0.015,
-      "opensearch": 0.018,
-      "ratio": 1.2,
-      "within_2x": true
+      "q": 43,
+      "correct": "skip",
+      "ch_times": [
+        0.072,
+        0.015,
+        0.015
+      ],
+      "os_times": [
+        0.062,
+        0.016,
+        0.012
+      ]
     }
-  ],
-  "within_2x_count": 38,
-  "total_valid": 42,
-  "within_2x_pct": 90
+  ]
 }

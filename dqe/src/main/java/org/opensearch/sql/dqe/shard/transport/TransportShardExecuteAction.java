@@ -307,6 +307,24 @@ public class TransportShardExecuteAction
       }
     }
 
+    // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode
+    // where the group-by key is a computed expression (e.g., REGEXP_REPLACE) over a single
+    // VARCHAR column. Pre-computes the expression once per unique ordinal (~16K evaluations
+    // instead of ~921K), giving ~58x reduction in expression evaluations for Q29.
+    // NOTE: This check MUST come before the generic canFuse() check below, because canFuse()
+    // also matches expression keys via EvalNode but routes to a path that doesn't handle
+    // expression GROUP BY correctly when there's no Sort/Limit wrapping (HAVING case).
+    if (scanFactory == null
+        && effectivePlan instanceof AggregationNode aggExprNode
+        && FusedGroupByAggregate.canFuseWithExpressionKey(
+            aggExprNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+      List<Page> pages = executeFusedExprGroupByAggregate(aggExprNode, req);
+      List<Type> columnTypes =
+          resolveColumnTypes(
+              effectivePlan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
+      return applyTopProject(pages, columnTypes, topProject, aggExprNode);
+    }
+
     // Try fused ordinal-based GROUP BY for aggregations with string group keys
     if (scanFactory == null
         && effectivePlan instanceof AggregationNode aggGroupNode
@@ -317,21 +335,6 @@ public class TransportShardExecuteAction
           FusedGroupByAggregate.resolveOutputTypes(
               aggGroupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
       return applyTopProject(pages, columnTypes, topProject, aggGroupNode);
-    }
-
-    // Try ordinal-cached expression GROUP BY: AggregationNode -> EvalNode -> TableScanNode
-    // where the group-by key is a computed expression (e.g., REGEXP_REPLACE) over a single
-    // VARCHAR column. Pre-computes the expression once per unique ordinal (~16K evaluations
-    // instead of ~921K), giving ~58x reduction in expression evaluations for Q29.
-    if (scanFactory == null
-        && effectivePlan instanceof AggregationNode aggExprNode
-        && FusedGroupByAggregate.canFuseWithExpressionKey(
-            aggExprNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
-      List<Page> pages = executeFusedExprGroupByAggregate(aggExprNode, req);
-      List<Type> columnTypes =
-          resolveColumnTypes(
-              effectivePlan, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap());
-      return applyTopProject(pages, columnTypes, topProject, aggExprNode);
     }
 
     // Try fused GROUP BY with sort+limit: detect LimitNode -> [ProjectNode] -> SortNode ->

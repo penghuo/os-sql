@@ -417,7 +417,8 @@ public final class StringFunctions {
           }
         }
         cachedReplacementStr[0] = firstReplacement;
-        replacementStr = firstReplacement;
+        // Convert SQL backreference syntax \1-\9 to Java regex replacement syntax $1-$9
+        replacementStr = convertSqlBackreferences(firstReplacement);
       }
 
       if (compiledPattern != null) {
@@ -543,13 +544,39 @@ public final class StringFunctions {
    * a group reference in Java's {@code Matcher.replaceAll} — the backslash escapes the digit,
    * producing just the literal digit character.
    */
+  /** Convert SQL/Trino backreference syntax (\1-\9) to Java regex replacement syntax ($1-$9). */
+  private static String convertSqlBackreferences(String replacement) {
+    if (replacement == null || !replacement.contains("\\")) return replacement;
+    StringBuilder sb = new StringBuilder(replacement.length());
+    for (int i = 0; i < replacement.length(); i++) {
+      char c = replacement.charAt(i);
+      if (c == '\\' && i + 1 < replacement.length()) {
+        char next = replacement.charAt(i + 1);
+        if (next >= '0' && next <= '9') {
+          sb.append('$').append(next); // \1 → $1
+          i++;
+        } else {
+          sb.append(c);
+        }
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
+  }
+
   private static int detectSimpleGroupReference(String replacement) {
     if (replacement == null || replacement.length() != 2) {
       return -1;
     }
     char first = replacement.charAt(0);
     char second = replacement.charAt(1);
+    // Java regex syntax: $1
     if (first == '$' && second >= '1' && second <= '9') {
+      return second - '0';
+    }
+    // SQL/Trino syntax: \1 (backslash + digit = backreference)
+    if (first == '\\' && second >= '1' && second <= '9') {
       return second - '0';
     }
     return -1;
@@ -582,9 +609,14 @@ public final class StringFunctions {
         // Group reference — result depends on match, not constant
         return null;
       } else if (c == '\\') {
-        // Escape: next character is literal
         if (i + 1 < replacement.length()) {
-          sb.append(replacement.charAt(i + 1));
+          char next = replacement.charAt(i + 1);
+          if (next >= '1' && next <= '9') {
+            // Backreference \1-\9 — result depends on match, not constant
+            return null;
+          }
+          // Other escape: next character is literal
+          sb.append(next);
           i++; // skip escaped char
         }
         // Trailing backslash: technically invalid, but treat as literal backslash

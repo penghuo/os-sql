@@ -245,10 +245,18 @@ public final class FusedGroupByAggregate {
       }
     }
 
-    // Check all aggregate functions are supported
+    // Check all aggregate functions are supported and their arguments are physical columns
     for (String func : aggNode.getAggregateFunctions()) {
       Matcher m = AGG_FUNCTION.matcher(func);
       if (!m.matches()) {
+        return false;
+      }
+      // Verify the aggregate argument is a physical column (or *)
+      String arg = m.group(3);
+      if (!"*".equals(arg) && !columnTypeMap.containsKey(arg)) {
+        // Computed expression argument (e.g., length(URL)) — can't fuse because
+        // the fused path reads DocValues by column name. Fall back to generic pipeline
+        // which handles EvalNode-computed columns via the operator framework.
         return false;
       }
     }

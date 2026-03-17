@@ -2517,87 +2517,95 @@ public class TransportTrinoSqlAction
     Type type0 = dedupTypes.get(0);
     Type type1 = dedupTypes.get(1);
 
+    // Pre-batch all Block data into flat arrays to eliminate virtual dispatch in inner loop
+    long[] allK0 = new long[totalRows];
+    long[] allK1 = new long[totalRows];
+    long[] allAggs = new long[totalRows * numShardAggs];
+    int off = 0;
     for (List<Page> shardPageList : shardPages) {
       for (Page page : shardPageList) {
-        int positionCount = page.getPositionCount();
-        Block block0 = page.getBlock(0);
-        Block block1 = page.getBlock(1);
-        Block[] aggBlocks = new Block[numShardAggs];
-        for (int a = 0; a < numShardAggs; a++) {
-          aggBlocks[a] = page.getBlock(numDedupKeys + a);
-        }
-
-        for (int pos = 0; pos < positionCount; pos++) {
-          long k0 = type0.getLong(block0, pos);
-          long k1 = type1.getLong(block1, pos);
-          int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
-          int mask = capacity - 1;
-          int slot = hash & mask;
-          while (true) {
-            if (!mapOccupied[slot]) {
-              mapKey0[slot] = k0;
-              mapKey1[slot] = k1;
-              int base = slot * numShardAggs;
-              for (int a = 0; a < numShardAggs; a++) {
-                if (!aggBlocks[a].isNull(pos)) {
-                  mapAggs[base + a] = BigintType.BIGINT.getLong(aggBlocks[a], pos);
-                }
-              }
-              mapOccupied[slot] = true;
-              if (size >= occupiedSlots.length) {
-                occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, occupiedSlots.length * 2);
-              }
-              occupiedSlots[size] = slot;
-              size++;
-              if (size > threshold) {
-                int newCap = capacity * 2;
-                long[] nk0 = new long[newCap];
-                long[] nk1 = new long[newCap];
-                long[] na = new long[newCap * numShardAggs];
-                boolean[] no = new boolean[newCap];
-                int nm = newCap - 1;
-                // Rebuild occupied slots list during resize
-                int rebuildIdx = 0;
-                if (size > occupiedSlots.length) {
-                  occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, size * 2);
-                }
-                for (int si = 0; si < size; si++) {
-                  int oldSlot = occupiedSlots[si];
-                  int h =
-                      Long.hashCode(mapKey0[oldSlot]) * 0x9E3779B9
-                          + Long.hashCode(mapKey1[oldSlot]);
-                  int ns = h & nm;
-                  while (no[ns]) ns = (ns + 1) & nm;
-                  nk0[ns] = mapKey0[oldSlot];
-                  nk1[ns] = mapKey1[oldSlot];
-                  System.arraycopy(
-                      mapAggs, oldSlot * numShardAggs, na, ns * numShardAggs, numShardAggs);
-                  no[ns] = true;
-                  occupiedSlots[rebuildIdx++] = ns;
-                }
-                mapKey0 = nk0;
-                mapKey1 = nk1;
-                mapAggs = na;
-                mapOccupied = no;
-                capacity = newCap;
-                mask = nm;
-                threshold = (int) (newCap * loadFactor);
-              }
-              break;
+        int cnt = page.getPositionCount();
+        Block b0 = page.getBlock(0);
+        Block b1 = page.getBlock(1);
+        for (int p = 0; p < cnt; p++) {
+          allK0[off] = type0.getLong(b0, p);
+          allK1[off] = type1.getLong(b1, p);
+          int aggBase = off * numShardAggs;
+          for (int a = 0; a < numShardAggs; a++) {
+            Block ab = page.getBlock(numDedupKeys + a);
+            if (!ab.isNull(p)) {
+              allAggs[aggBase + a] = BigintType.BIGINT.getLong(ab, p);
             }
-            if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
-              // Merge: SUM for all COUNT/SUM shard aggs
-              int base = slot * numShardAggs;
-              for (int a = 0; a < numShardAggs; a++) {
-                if (!aggBlocks[a].isNull(pos)) {
-                  mapAggs[base + a] += BigintType.BIGINT.getLong(aggBlocks[a], pos);
-                }
-              }
-              break;
-            }
-            slot = (slot + 1) & mask;
           }
+          off++;
         }
+      }
+    }
+
+    for (int i = 0; i < totalRows; i++) {
+      long k0 = allK0[i];
+      long k1 = allK1[i];
+      int hash = Long.hashCode(k0) * 0x9E3779B9 + Long.hashCode(k1);
+      int mask = capacity - 1;
+      int slot = hash & mask;
+      while (true) {
+        if (!mapOccupied[slot]) {
+          mapKey0[slot] = k0;
+          mapKey1[slot] = k1;
+          int base = slot * numShardAggs;
+          int srcBase = i * numShardAggs;
+          for (int a = 0; a < numShardAggs; a++) {
+            mapAggs[base + a] = allAggs[srcBase + a];
+          }
+          mapOccupied[slot] = true;
+          if (size >= occupiedSlots.length) {
+            occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, occupiedSlots.length * 2);
+          }
+          occupiedSlots[size] = slot;
+          size++;
+          if (size > threshold) {
+            int newCap = capacity * 2;
+            long[] nk0 = new long[newCap];
+            long[] nk1 = new long[newCap];
+            long[] na = new long[newCap * numShardAggs];
+            boolean[] no = new boolean[newCap];
+            int nm = newCap - 1;
+            int rebuildIdx = 0;
+            if (size > occupiedSlots.length) {
+              occupiedSlots = java.util.Arrays.copyOf(occupiedSlots, size * 2);
+            }
+            for (int si = 0; si < size; si++) {
+              int oldSlot = occupiedSlots[si];
+              int h =
+                  Long.hashCode(mapKey0[oldSlot]) * 0x9E3779B9 + Long.hashCode(mapKey1[oldSlot]);
+              int ns = h & nm;
+              while (no[ns]) ns = (ns + 1) & nm;
+              nk0[ns] = mapKey0[oldSlot];
+              nk1[ns] = mapKey1[oldSlot];
+              System.arraycopy(
+                  mapAggs, oldSlot * numShardAggs, na, ns * numShardAggs, numShardAggs);
+              no[ns] = true;
+              occupiedSlots[rebuildIdx++] = ns;
+            }
+            mapKey0 = nk0;
+            mapKey1 = nk1;
+            mapAggs = na;
+            mapOccupied = no;
+            capacity = newCap;
+            mask = nm;
+            threshold = (int) (newCap * loadFactor);
+          }
+          break;
+        }
+        if (mapKey0[slot] == k0 && mapKey1[slot] == k1) {
+          int base = slot * numShardAggs;
+          int srcBase = i * numShardAggs;
+          for (int a = 0; a < numShardAggs; a++) {
+            mapAggs[base + a] += allAggs[srcBase + a];
+          }
+          break;
+        }
+        slot = (slot + 1) & mask;
       }
     }
 

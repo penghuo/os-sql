@@ -9429,7 +9429,9 @@ public final class FusedGroupByAggregate {
     CountDistinctAccum(Type argType) {
       this.argType = argType;
       this.usePrimitiveLong = !(argType instanceof VarcharType) && !(argType instanceof DoubleType);
-      this.longDistinctValues = usePrimitiveLong ? new LongOpenHashSet() : null;
+      // Start with small capacity (16) to minimize allocation for high-cardinality GROUP BY
+      // where most groups have few distinct values. The set resizes dynamically as needed.
+      this.longDistinctValues = usePrimitiveLong ? new LongOpenHashSet(16) : null;
       this.objectDistinctValues = usePrimitiveLong ? null : new HashSet<>();
     }
 

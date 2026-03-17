@@ -39,6 +39,15 @@ public class ShardExecuteResponse extends ActionResponse {
   private transient java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet>
       distinctSets;
 
+  /**
+   * Optional per-group distinct value sets for VARCHAR-keyed COUNT(DISTINCT) optimization. Key:
+   * GROUP BY varchar value (e.g., SearchPhrase). Value: set of distinct numeric values (e.g.,
+   * UserIDs). Only populated for local execution; null for remote shards.
+   */
+  @lombok.Setter
+  private transient java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+      varcharDistinctSets;
+
   public ShardExecuteResponse(List<Page> pages, List<Type> columnTypes) {
     this.pages = pages;
     this.columnTypes = columnTypes;

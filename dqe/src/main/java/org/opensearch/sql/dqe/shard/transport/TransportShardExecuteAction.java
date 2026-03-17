@@ -297,6 +297,14 @@ public class TransportShardExecuteAction
             executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
         return resp;
       }
+      // VARCHAR key0 + numeric key1: Q14 pattern (GROUP BY SearchPhrase, COUNT(DISTINCT UserID))
+      if (t0 instanceof io.trino.spi.type.VarcharType
+          && t1 != null
+          && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+        ShardExecuteResponse resp =
+            executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
+        return resp;
+      }
     }
 
     // Try fused ordinal-based GROUP BY for aggregations with string group keys
@@ -935,6 +943,205 @@ public class TransportShardExecuteAction
     ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
     resp.setDistinctSets(distinctSets);
     return resp;
+  }
+
+  /**
+   * Fast path for VARCHAR key + COUNT(DISTINCT numeric) pattern (Q14). Instead of expanding all
+   * (SearchPhrase, UserID) pairs, builds per-group LongOpenHashSets directly. Uses
+   * collect-then-sequential-scan for WHERE-filtered queries: first collects matching doc IDs, then
+   * iterates DocValues sequentially instead of random advanceExact() per doc.
+   */
+  private ShardExecuteResponse executeVarcharCountDistinctWithHashSets(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      String varcharKeyName,
+      String numericKeyName,
+      Type numericKeyType)
+      throws Exception {
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    // Per-group accumulators: ordinal → LongOpenHashSet of distinct values.
+    // Using ordinal-indexed array (no hash computation for VARCHAR keys).
+    java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> varcharDistinctSets =
+        new java.util.HashMap<>();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-varchar-count-distinct-hashset")) {
+
+      for (org.apache.lucene.index.LeafReaderContext leafCtx :
+          engineSearcher.getIndexReader().leaves()) {
+        org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+        org.apache.lucene.index.SortedSetDocValues varcharDv =
+            reader.getSortedSetDocValues(varcharKeyName);
+        org.apache.lucene.index.SortedNumericDocValues numericDv =
+            reader.getSortedNumericDocValues(numericKeyName);
+        if (varcharDv == null) continue;
+
+        long ordCount = varcharDv.getValueCount();
+        // Ordinal-indexed array for this segment
+        org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
+            new org.opensearch.sql.dqe.operator.LongOpenHashSet
+                [(int) Math.min(ordCount, 10_000_000)];
+
+        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+
+        if (isMatchAll) {
+          // Sequential scan: iterate DocValues directly
+          org.apache.lucene.index.SortedDocValues sdv =
+              org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
+          if (sdv != null) {
+            int doc;
+            while ((doc = sdv.nextDoc())
+                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              int ord = sdv.ordValue();
+              if (ordSets[ord] == null)
+                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              long val = 0;
+              if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+              ordSets[ord].add(val);
+            }
+          } else {
+            int doc;
+            while ((doc = varcharDv.nextDoc())
+                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              int ord = (int) varcharDv.nextOrd();
+              if (ordSets[ord] == null)
+                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              long val = 0;
+              if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+              ordSets[ord].add(val);
+            }
+          }
+        } else {
+          // Collect-then-sequential-scan: collect matching doc IDs first, then scan sequentially.
+          // This converts random advanceExact() into sequential nextDoc() iteration.
+          org.apache.lucene.search.Weight weight =
+              engineSearcher.createWeight(
+                  engineSearcher.rewrite(luceneQuery),
+                  org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                  1.0f);
+          org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+          if (scorer == null) {
+            // Resolve ordinals for this segment and merge into varcharDistinctSets
+            mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
+            continue;
+          }
+
+          // Step 1: Collect matching doc IDs into sorted array
+          org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+          int[] matchDocs = new int[1024];
+          int matchCount = 0;
+          int doc;
+          while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+            if (matchCount == matchDocs.length) {
+              matchDocs = java.util.Arrays.copyOf(matchDocs, matchDocs.length * 2);
+            }
+            matchDocs[matchCount++] = doc;
+          }
+
+          // Step 2: Sequential scan of varchar DocValues, matching against collected doc IDs
+          org.apache.lucene.index.SortedDocValues sdv =
+              org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
+          if (sdv != null && matchCount > 0) {
+            int matchIdx = 0;
+            int dvDoc;
+            while ((dvDoc = sdv.nextDoc())
+                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              if (matchIdx >= matchCount) break;
+              if (dvDoc == matchDocs[matchIdx]) {
+                int ord = sdv.ordValue();
+                if (ordSets[ord] == null)
+                  ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                long val = 0;
+                if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                ordSets[ord].add(val);
+                matchIdx++;
+              }
+            }
+          } else if (matchCount > 0) {
+            // Multi-valued path: use advanceExact for remaining unmatched docs
+            int matchIdx = 0;
+            int dvDoc;
+            while ((dvDoc = varcharDv.nextDoc())
+                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              if (matchIdx >= matchCount) break;
+              if (dvDoc == matchDocs[matchIdx]) {
+                int ord = (int) varcharDv.nextOrd();
+                if (ordSets[ord] == null)
+                  ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                long val = 0;
+                if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                ordSets[ord].add(val);
+                matchIdx++;
+              }
+            }
+          }
+        }
+
+        // Merge this segment's ordinal-indexed sets into the cross-segment String-keyed map
+        mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
+      }
+    }
+
+    // Build output page: (varcharKey, placeholder=0, COUNT(*)=distinct_count)
+    List<Type> colTypes =
+        List.of(
+            io.trino.spi.type.VarcharType.VARCHAR,
+            numericKeyType instanceof io.trino.spi.type.IntegerType
+                ? io.trino.spi.type.IntegerType.INTEGER
+                : io.trino.spi.type.BigintType.BIGINT,
+            io.trino.spi.type.BigintType.BIGINT);
+
+    int groupCount = varcharDistinctSets.size();
+    io.trino.spi.block.BlockBuilder b0 = colTypes.get(0).createBlockBuilder(null, groupCount);
+    io.trino.spi.block.BlockBuilder b1 = colTypes.get(1).createBlockBuilder(null, groupCount);
+    io.trino.spi.block.BlockBuilder b2 = colTypes.get(2).createBlockBuilder(null, groupCount);
+
+    for (java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> e :
+        varcharDistinctSets.entrySet()) {
+      io.airlift.slice.Slice keySlice = io.airlift.slice.Slices.utf8Slice(e.getKey());
+      io.trino.spi.type.VarcharType.VARCHAR.writeSlice(b0, keySlice);
+      colTypes.get(1).writeLong(b1, 0L);
+      io.trino.spi.type.BigintType.BIGINT.writeLong(b2, e.getValue().size());
+    }
+
+    Page page = new Page(b0.build(), b1.build(), b2.build());
+    ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
+    resp.setVarcharDistinctSets(varcharDistinctSets);
+    return resp;
+  }
+
+  /** Merge ordinal-indexed LongOpenHashSets into a String-keyed map (cross-segment merge). */
+  private static void mergeOrdSetsIntoMap(
+      org.apache.lucene.index.SortedSetDocValues dv,
+      org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets,
+      java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> target)
+      throws java.io.IOException {
+    for (int ord = 0; ord < ordSets.length; ord++) {
+      if (ordSets[ord] == null) continue;
+      org.apache.lucene.util.BytesRef bytes = dv.lookupOrd(ord);
+      String key = bytes.utf8ToString();
+      org.opensearch.sql.dqe.operator.LongOpenHashSet existing = target.get(key);
+      if (existing == null) {
+        target.put(key, ordSets[ord]);
+      } else {
+        // Merge: add all values from ordSets[ord] into existing
+        long[] srcKeys = ordSets[ord].keys();
+        for (long v : srcKeys) {
+          if (v != ordSets[ord].emptyMarker()) existing.add(v);
+        }
+        if (ordSets[ord].hasZeroValue()) existing.add(0L);
+        if (ordSets[ord].hasSentinelValue()) existing.add(Long.MIN_VALUE);
+      }
+    }
   }
 
   private List<Page> executeFusedGroupByAggregate(AggregationNode aggNode, ShardExecuteRequest req)

@@ -601,12 +601,37 @@ public class TransportTrinoSqlAction
                 break;
               }
             }
-            if (allHaveSets && singleAgg.getGroupByKeys().size() == 1) {
+            // Check for VARCHAR-keyed HashSet attachments (Q14 pattern)
+            boolean allHaveVarcharSets = true;
+            for (ShardExecuteResponse sr : shardResults) {
+              if (sr.getVarcharDistinctSets() == null) {
+                allHaveVarcharSets = false;
+                break;
+              }
+            }
+            if (allHaveVarcharSets && singleAgg.getGroupByKeys().size() == 1) {
+              long _topNHint = findGlobalLimit(optimizedPlan);
+              if (_topNHint > 0) _topNHint += findGlobalOffset(optimizedPlan);
+              // Merge + sort + limit all handled inside; output is 2-col (key, count)
+              mergedPages =
+                  mergeDedupCountDistinctViaVarcharSets(
+                      shardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
+              // Override columnTypes to match 2-column merged output
+              List<Type> mergedColumnTypes =
+                  List.of(
+                      io.trino.spi.type.VarcharType.VARCHAR, io.trino.spi.type.BigintType.BIGINT);
+              // Apply sort using correct column types for the 2-column output
+              mergedPages =
+                  applyCoordinatorSort(
+                      mergedPages, singleAgg, optimizedPlan, mergedColumnTypes, merger);
+            } else if (allHaveSets && singleAgg.getGroupByKeys().size() == 1) {
               long _topNHint = findGlobalLimit(optimizedPlan);
               if (_topNHint > 0) _topNHint += findGlobalOffset(optimizedPlan);
               mergedPages =
                   mergeDedupCountDistinctViaSets(
                       shardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
+              mergedPages =
+                  applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
             } else {
               mergedPages =
                   mergeDedupCountDistinct(
@@ -616,9 +641,9 @@ public class TransportTrinoSqlAction
                       columnTypes,
                       columnTypeMap,
                       merger);
+              mergedPages =
+                  applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
             }
-            mergedPages =
-                applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
           } else if (coordinatorPlan instanceof AggregationNode singleMixed2
               && singleMixed2.getStep() == AggregationNode.Step.SINGLE
               && isShardMixedDedup(shardFragments.get(0).shardPlan(), singleMixed2)) {
@@ -2296,6 +2321,155 @@ public class TransportTrinoSqlAction
       blocks[i] = builders[i].build();
     }
     return List.of(new Page(blocks));
+  }
+
+  /**
+   * Merge VARCHAR-keyed COUNT(DISTINCT) results using attached per-group LongOpenHashSets. Each
+   * shard provides a Map&lt;String, LongOpenHashSet&gt; of (groupKey → distinct values). The
+   * coordinator unions sets across shards per group and computes the final distinct count.
+   */
+  private static List<Page> mergeDedupCountDistinctViaVarcharSets(
+      ShardExecuteResponse[] shardResults,
+      AggregationNode singleAgg,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap,
+      long topN) {
+
+    // Phase 1: Collect per-group per-shard set sizes for top-K pruning
+    // Gather all group keys and their per-shard set references
+    int numShards = shardResults.length;
+    java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet[]> perGroupSets =
+        new java.util.HashMap<>();
+
+    for (int s = 0; s < numShards; s++) {
+      java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> shardSets =
+          shardResults[s].getVarcharDistinctSets();
+      if (shardSets == null) continue;
+      for (java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> e :
+          shardSets.entrySet()) {
+        org.opensearch.sql.dqe.operator.LongOpenHashSet[] arr =
+            perGroupSets.computeIfAbsent(
+                e.getKey(), k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet[numShards]);
+        arr[s] = e.getValue();
+      }
+    }
+
+    int totalGroups = perGroupSets.size();
+
+    // Phase 2: Top-K pruning — only merge groups that could be in the top-K
+    // For each group: upper_bound = sum(shard_sizes), lower_bound = max(shard_sizes)
+    // Build min-heap of top-K lower bounds as pruning threshold
+    java.util.Set<String> candidateGroups;
+    if (topN > 0 && topN * 10 < totalGroups) {
+      // Compute bounds
+      int[] upperBounds = new int[totalGroups];
+      int[] lowerBounds = new int[totalGroups];
+      String[] groupKeys = new String[totalGroups];
+      int gi = 0;
+      for (java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet[]> e :
+          perGroupSets.entrySet()) {
+        groupKeys[gi] = e.getKey();
+        int ub = 0, lb = 0;
+        for (org.opensearch.sql.dqe.operator.LongOpenHashSet set : e.getValue()) {
+          if (set != null) {
+            ub += set.size();
+            if (set.size() > lb) lb = set.size();
+          }
+        }
+        upperBounds[gi] = ub;
+        lowerBounds[gi] = lb;
+        gi++;
+      }
+
+      // Build min-heap of top-K lower bounds
+      java.util.PriorityQueue<Integer> minHeap = new java.util.PriorityQueue<>();
+      for (int i = 0; i < totalGroups; i++) {
+        minHeap.offer(lowerBounds[i]);
+        if (minHeap.size() > topN) minHeap.poll();
+      }
+      int threshold = minHeap.isEmpty() ? 0 : minHeap.peek();
+
+      // Select candidates: groups where upper_bound >= threshold
+      candidateGroups = new java.util.HashSet<>();
+      for (int i = 0; i < totalGroups; i++) {
+        if (upperBounds[i] >= threshold) {
+          candidateGroups.add(groupKeys[i]);
+        }
+      }
+    } else {
+      candidateGroups = perGroupSets.keySet();
+    }
+
+    // Phase 3: Merge only candidate groups
+    java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> mergedSets =
+        new java.util.HashMap<>(candidateGroups.size() * 2);
+
+    for (String key : candidateGroups) {
+      org.opensearch.sql.dqe.operator.LongOpenHashSet[] shardSets = perGroupSets.get(key);
+      // Take ownership of the largest shard's set
+      org.opensearch.sql.dqe.operator.LongOpenHashSet merged = null;
+      int mergedIdx = -1;
+      for (int s = 0; s < numShards; s++) {
+        if (shardSets[s] != null && (merged == null || shardSets[s].size() > merged.size())) {
+          merged = shardSets[s];
+          mergedIdx = s;
+        }
+      }
+      if (merged == null) continue;
+
+      // Union remaining shards into the largest
+      for (int s = 0; s < numShards; s++) {
+        if (s == mergedIdx || shardSets[s] == null) continue;
+        org.opensearch.sql.dqe.operator.LongOpenHashSet src = shardSets[s];
+        long[] srcKeys = src.keys();
+        long empty = src.emptyMarker();
+        for (long v : srcKeys) {
+          if (v != empty) merged.add(v);
+        }
+        if (src.hasZeroValue()) merged.add(0L);
+        if (src.hasSentinelValue()) merged.add(Long.MIN_VALUE);
+      }
+      mergedSets.put(key, merged);
+    }
+
+    int mergedGroupCount = mergedSets.size();
+    if (mergedGroupCount == 0) {
+      return List.of();
+    }
+
+    // Phase 2: Build result with optional top-K pruning
+    // If topN > 0 and much smaller than totalGroups, use a min-heap to select top-K
+    String groupByKeyName = singleAgg.getGroupByKeys().get(0);
+    Type keyType =
+        columnTypeMap.getOrDefault(groupByKeyName, io.trino.spi.type.VarcharType.VARCHAR);
+
+    // Collect (key, distinctCount) entries
+    java.util.List<java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>>
+        entries = new java.util.ArrayList<>(mergedSets.entrySet());
+
+    // Build output: 2 columns (groupKey VARCHAR, count BIGINT)
+    int outputSize = (topN > 0 && topN < mergedGroupCount) ? (int) topN : mergedGroupCount;
+
+    if (topN > 0 && topN < mergedGroupCount) {
+      // Partial sort: only need top-K by count DESC
+      entries.sort((a, b) -> Integer.compare(b.getValue().size(), a.getValue().size()));
+      entries = entries.subList(0, outputSize);
+    }
+
+    io.trino.spi.block.BlockBuilder keyBuilder =
+        io.trino.spi.type.VarcharType.VARCHAR.createBlockBuilder(null, outputSize);
+    io.trino.spi.block.BlockBuilder countBuilder =
+        io.trino.spi.type.BigintType.BIGINT.createBlockBuilder(null, outputSize);
+
+    for (java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> e : entries) {
+      io.airlift.slice.Slice keySlice = io.airlift.slice.Slices.utf8Slice(e.getKey());
+      io.trino.spi.type.VarcharType.VARCHAR.writeSlice(keyBuilder, keySlice);
+      io.trino.spi.type.BigintType.BIGINT.writeLong(countBuilder, e.getValue().size());
+    }
+
+    // Output column types: match the coordinator aggregation output schema
+    // singleAgg outputs: [groupByKey, COUNT(DISTINCT col)]
+    return List.of(new Page(keyBuilder.build(), countBuilder.build()));
   }
 
   private static List<Page> mergeDedupCountDistinct2Key(

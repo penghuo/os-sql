@@ -245,18 +245,23 @@ public final class FusedGroupByAggregate {
       }
     }
 
-    // Check all aggregate functions are supported and their arguments are physical columns
+    // Check all aggregate functions are supported and their arguments are resolvable
     for (String func : aggNode.getAggregateFunctions()) {
       Matcher m = AGG_FUNCTION.matcher(func);
       if (!m.matches()) {
         return false;
       }
-      // Verify the aggregate argument is a physical column (or *)
+      // Verify the aggregate argument is a physical column, *, or a supported expression
       String arg = m.group(3);
       if (!"*".equals(arg) && !columnTypeMap.containsKey(arg)) {
-        // Computed expression argument (e.g., length(URL)) — can't fuse because
-        // the fused path reads DocValues by column name. Fall back to generic pipeline
-        // which handles EvalNode-computed columns via the operator framework.
+        // Check for length(col) pattern — supported as inline expression
+        if (arg.startsWith("length(") && arg.endsWith(")")) {
+          String innerCol = arg.substring(7, arg.length() - 1).trim();
+          if (columnTypeMap.containsKey(innerCol)
+              && columnTypeMap.get(innerCol) instanceof VarcharType) {
+            continue; // length(varchar_col) is supported inline
+          }
+        }
         return false;
       }
     }
@@ -927,8 +932,25 @@ public final class FusedGroupByAggregate {
       String funcName = m.group(1).toUpperCase(Locale.ROOT);
       boolean isDistinct = m.group(2) != null;
       String arg = m.group(3).trim();
-      Type argType = arg.equals("*") ? null : columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
-      specs.add(new AggSpec(funcName, isDistinct, arg, argType));
+      // Handle length(col): resolve to underlying VARCHAR column, flag for inline computation
+      boolean applyLength = false;
+      if (arg.startsWith("length(") && arg.endsWith(")")) {
+        String innerCol = arg.substring(7, arg.length() - 1).trim();
+        if (columnTypeMap.containsKey(innerCol)
+            && columnTypeMap.get(innerCol) instanceof VarcharType) {
+          arg = innerCol;
+          applyLength = true;
+        }
+      }
+      Type argType;
+      if (applyLength) {
+        argType = BigintType.BIGINT; // length() returns long
+      } else {
+        argType = arg.equals("*") ? null : columnTypeMap.getOrDefault(arg, BigintType.BIGINT);
+      }
+      AggSpec spec = new AggSpec(funcName, isDistinct, arg, argType);
+      spec.applyLength = applyLength;
+      specs.add(spec);
     }
 
     // Classify group-by keys, detecting DATE_TRUNC expressions
@@ -3438,15 +3460,33 @@ public final class FusedGroupByAggregate {
           SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
 
           final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+          // For applyLength args: pre-compute ordinal→length map for O(1) per-doc lookup
+          final SortedSetDocValues[] lengthVarcharDvs = new SortedSetDocValues[numAggs];
+          final int[][] ordLengthMaps = new int[numAggs][];
+          final boolean[] aggApplyLength = new boolean[numAggs];
           for (int i = 0; i < numAggs; i++) {
             if (!isCountStar[i]) {
-              numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+              if (specs.get(i).applyLength) {
+                SortedSetDocValues varcharDv = reader.getSortedSetDocValues(specs.get(i).arg);
+                lengthVarcharDvs[i] = varcharDv;
+                aggApplyLength[i] = true;
+                if (varcharDv != null) {
+                  int ordCount = (int) Math.min(varcharDv.getValueCount(), 10_000_000);
+                  int[] ordLengths = new int[ordCount];
+                  for (int ord = 0; ord < ordCount; ord++) {
+                    ordLengths[ord] = varcharDv.lookupOrd(ord).length;
+                  }
+                  ordLengthMaps[i] = ordLengths;
+                }
+              } else {
+                numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+              }
             }
           }
 
           if (liveDocs == null) {
             for (int doc = 0; doc < maxDoc; doc++) {
-              collectFlatSingleKeyDoc(
+              collectFlatSingleKeyDocWithLength(
                   doc,
                   dv0,
                   flatMap,
@@ -3455,12 +3495,15 @@ public final class FusedGroupByAggregate {
                   isCountStar,
                   accType,
                   accOffset,
-                  numericAggDvs);
+                  numericAggDvs,
+                  lengthVarcharDvs,
+                  ordLengthMaps,
+                  aggApplyLength);
             }
           } else {
             for (int doc = 0; doc < maxDoc; doc++) {
               if (liveDocs.get(doc)) {
-                collectFlatSingleKeyDoc(
+                collectFlatSingleKeyDocWithLength(
                     doc,
                     dv0,
                     flatMap,
@@ -3469,7 +3512,10 @@ public final class FusedGroupByAggregate {
                     isCountStar,
                     accType,
                     accOffset,
-                    numericAggDvs);
+                    numericAggDvs,
+                    lengthVarcharDvs,
+                    ordLengthMaps,
+                    aggApplyLength);
               }
             }
           }
@@ -3484,10 +3530,27 @@ public final class FusedGroupByAggregate {
                 SortedNumericDocValues dv0 =
                     context.reader().getSortedNumericDocValues(keyInfos.get(0).name());
 
-                final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                final SortedNumericDocValues[] numericAggDvs2 = new SortedNumericDocValues[numAggs];
+                final SortedSetDocValues[] lengthVarcharDvs2 = new SortedSetDocValues[numAggs];
+                final int[][] ordLengthMaps2 = new int[numAggs][];
+                final boolean[] aggApplyLength2 = new boolean[numAggs];
                 for (int i = 0; i < numAggs; i++) {
                   if (!isCountStar[i]) {
-                    numericAggDvs[i] = context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                    if (specs.get(i).applyLength) {
+                      SortedSetDocValues vdv =
+                          context.reader().getSortedSetDocValues(specs.get(i).arg);
+                      lengthVarcharDvs2[i] = vdv;
+                      aggApplyLength2[i] = true;
+                      if (vdv != null) {
+                        int oc = (int) Math.min(vdv.getValueCount(), 10_000_000);
+                        int[] ol = new int[oc];
+                        for (int o = 0; o < oc; o++) ol[o] = vdv.lookupOrd(o).length;
+                        ordLengthMaps2[i] = ol;
+                      }
+                    } else {
+                      numericAggDvs2[i] =
+                          context.reader().getSortedNumericDocValues(specs.get(i).arg);
+                    }
                   }
                 }
 
@@ -3497,7 +3560,7 @@ public final class FusedGroupByAggregate {
 
                   @Override
                   public void collect(int doc) throws IOException {
-                    collectFlatSingleKeyDoc(
+                    collectFlatSingleKeyDocWithLength(
                         doc,
                         dv0,
                         flatMap,
@@ -3506,7 +3569,10 @@ public final class FusedGroupByAggregate {
                         isCountStar,
                         accType,
                         accOffset,
-                        numericAggDvs);
+                        numericAggDvs2,
+                        lengthVarcharDvs2,
+                        ordLengthMaps2,
+                        aggApplyLength2);
                   }
                 };
               }
@@ -3669,6 +3735,71 @@ public final class FusedGroupByAggregate {
             flatMap.accData[off] += rawVal;
             break;
           case 2: // AVG long (sum, count)
+            flatMap.accData[off] += rawVal;
+            flatMap.accData[off + 1]++;
+            break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Same as collectFlatSingleKeyDoc but handles applyLength: reads VARCHAR DocValues for length.
+   */
+  private static void collectFlatSingleKeyDocWithLength(
+      int doc,
+      SortedNumericDocValues dv0,
+      FlatSingleKeyMap flatMap,
+      int slotsPerGroup,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      SortedNumericDocValues[] numericAggDvs,
+      SortedSetDocValues[] lengthVarcharDvs,
+      int[][] ordLengthMaps,
+      boolean[] aggApplyLength)
+      throws IOException {
+    long key0 = 0;
+    if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+    int slot = flatMap.findOrInsert(key0);
+    int base = slot * slotsPerGroup;
+
+    for (int i = 0; i < numAggs; i++) {
+      int off = base + accOffset[i];
+      if (isCountStar[i]) {
+        flatMap.accData[off]++;
+        continue;
+      }
+      long rawVal = 0;
+      boolean hasValue = false;
+      if (aggApplyLength[i]) {
+        // Use pre-computed ordinal→length map for O(1) per-doc lookup
+        SortedSetDocValues varcharDv = lengthVarcharDvs[i];
+        if (varcharDv != null && varcharDv.advanceExact(doc)) {
+          int ord = (int) varcharDv.nextOrd();
+          rawVal =
+              (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                  ? ordLengthMaps[i][ord]
+                  : varcharDv.lookupOrd(ord).length;
+          hasValue = true;
+        }
+      } else {
+        SortedNumericDocValues aggDv = numericAggDvs[i];
+        if (aggDv != null && aggDv.advanceExact(doc)) {
+          rawVal = aggDv.nextValue();
+          hasValue = true;
+        }
+      }
+      if (hasValue) {
+        switch (accType[i]) {
+          case 0:
+            flatMap.accData[off]++;
+            break;
+          case 1:
+            flatMap.accData[off] += rawVal;
+            break;
+          case 2:
             flatMap.accData[off] += rawVal;
             flatMap.accData[off + 1]++;
             break;
@@ -8177,7 +8308,20 @@ public final class FusedGroupByAggregate {
   // Internal structures
   // =========================================================================
 
-  private record AggSpec(String funcName, boolean isDistinct, String arg, Type argType) {}
+  private static final class AggSpec {
+    final String funcName;
+    final boolean isDistinct;
+    final String arg;
+    final Type argType;
+    boolean applyLength; // length(col) inline computation flag
+
+    AggSpec(String funcName, boolean isDistinct, String arg, Type argType) {
+      this.funcName = funcName;
+      this.isDistinct = isDistinct;
+      this.arg = arg;
+      this.argType = argType;
+    }
+  }
 
   /**
    * Metadata for a single GROUP BY key.

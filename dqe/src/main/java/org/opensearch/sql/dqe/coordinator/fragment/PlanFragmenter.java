@@ -313,9 +313,17 @@ public class PlanFragmenter {
       return null;
     }
 
-    // Inflate limit: use max(1000, limit * numShards * 2) to ensure coverage
+    // For COUNT(*)-only aggregations, each shard's local top-K is guaranteed to contain
+    // all globally top-K entries (COUNT is perfectly decomposable: shard count <= global count).
+    // For mixed aggregates (SUM, AVG), use inflated limit to cover cross-shard distribution.
     long originalLimit = limitNode.getCount() + limitNode.getOffset();
-    long inflatedLimit = Math.max(1000, originalLimit * numShards * 2);
+    boolean allCountStar =
+        aggNode.getAggregateFunctions().stream()
+            .allMatch(f -> f.trim().equalsIgnoreCase("COUNT(*)"));
+    long inflatedLimit =
+        allCountStar
+            ? Math.max(1000, originalLimit)
+            : Math.max(1000, originalLimit * numShards * 2);
 
     // Build: LimitNode(inflated) -> SortNode -> AggregationNode(PARTIAL) -> child
     return new LimitNode(

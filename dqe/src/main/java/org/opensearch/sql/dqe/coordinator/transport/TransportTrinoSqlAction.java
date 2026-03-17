@@ -250,7 +250,8 @@ public class TransportTrinoSqlAction
         } else {
           compiledColumnNames = compiledInternalColumnNames;
         }
-        List<Type> compiledColumnTypes =
+        List<Type> compiledColumnTypes;
+        compiledColumnTypes =
             resolveColumnTypes(
                 compiledInternalColumnNames, compiledColumnTypeMap, compiledOptimizedPlan);
 

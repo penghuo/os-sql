@@ -250,10 +250,31 @@ public class TransportTrinoSqlAction
         } else {
           compiledColumnNames = compiledInternalColumnNames;
         }
-        List<Type> compiledColumnTypes;
-        compiledColumnTypes =
+
+        // Filter literal-only columns from internal names. Literals (e.g., SELECT 1, URL)
+        // are stripped from GROUP BY by LogicalPlanner but remain in the ProjectNode output.
+        // The shard output only has data columns, not literals. Keeping literals in the
+        // internal names causes column count mismatch (ClassCastException in Q35).
+        List<String> effectiveInternalNames = compiledInternalColumnNames;
+        boolean hasLiteralCols = false;
+        for (String col : compiledInternalColumnNames) {
+          if (isIntegerLiteral(col)) {
+            hasLiteralCols = true;
+            break;
+          }
+        }
+        if (hasLiteralCols) {
+          effectiveInternalNames = new ArrayList<>();
+          for (String col : compiledInternalColumnNames) {
+            if (!isIntegerLiteral(col)) {
+              effectiveInternalNames.add(col);
+            }
+          }
+        }
+
+        List<Type> compiledColumnTypes =
             resolveColumnTypes(
-                compiledInternalColumnNames, compiledColumnTypeMap, compiledOptimizedPlan);
+                effectiveInternalNames, compiledColumnTypeMap, compiledOptimizedPlan);
 
         // Store in cache (bounded to 128 entries to limit memory)
         if (QUERY_PLAN_CACHE.size() > 128) {
@@ -272,7 +293,7 @@ public class TransportTrinoSqlAction
                 cachedShardPlan,
                 compiledFragments.coordinatorPlan(),
                 compiledColumnNames,
-                compiledInternalColumnNames,
+                effectiveInternalNames,
                 compiledColumnTypes,
                 compiledColumnTypeMap,
                 currentMetaVersion,
@@ -283,7 +304,7 @@ public class TransportTrinoSqlAction
         fragments = compiledFragments;
         optimizedPlan = compiledOptimizedPlan;
         columnNames = compiledColumnNames;
-        internalColumnNames = compiledInternalColumnNames;
+        internalColumnNames = effectiveInternalNames;
         columnTypes = compiledColumnTypes;
         columnTypeMap = compiledColumnTypeMap;
         schemaJsonPrefix = schemaPrefix;
@@ -1138,16 +1159,27 @@ public class TransportTrinoSqlAction
    */
   static String buildSchemaJsonPrefix(List<String> columnNames, List<Type> columnTypes) {
     int numCols = columnNames.size();
+    boolean hasLiteralMismatch = numCols != columnTypes.size();
     StringBuilder sb = new StringBuilder(numCols * 40 + 32);
     sb.append("{\"schema\":[");
+    int typeIdx = 0;
     for (int i = 0; i < numCols; i++) {
       if (i > 0) {
         sb.append(",");
       }
+      String colName = columnNames.get(i);
+      String typeName;
+      if (hasLiteralMismatch && isIntegerLiteral(colName)) {
+        typeName = "integer";
+      } else if (typeIdx < columnTypes.size()) {
+        typeName = trinoTypeToOpenSearchType(columnTypes.get(typeIdx++));
+      } else {
+        typeName = "keyword";
+      }
       sb.append("{\"name\":\"")
-          .append(escapeJson(columnNames.get(i)))
+          .append(escapeJson(colName))
           .append("\",\"type\":\"")
-          .append(trinoTypeToOpenSearchType(columnTypes.get(i)))
+          .append(typeName)
           .append("\"}");
     }
     sb.append("],\"datarows\":[");
@@ -1193,13 +1225,31 @@ public class TransportTrinoSqlAction
 
     // Use cached type array if available, otherwise build from list
     Type[] types = cachedTypes != null ? cachedTypes : columnTypes.toArray(new Type[0]);
+
+    // Build display-to-channel mapping when literal columns exist
+    // (columnNames has more entries than columnTypes/page channels)
+    int[] displayToChannel = null;
+    String[] literalValues = null;
+    if (numCols > types.length) {
+      displayToChannel = new int[numCols];
+      literalValues = new String[numCols];
+      int ch = 0;
+      for (int i = 0; i < numCols; i++) {
+        if (isIntegerLiteral(columnNames.get(i))) {
+          displayToChannel[i] = -1;
+          literalValues[i] = columnNames.get(i);
+        } else {
+          displayToChannel[i] = ch++;
+        }
+      }
+    }
+
     boolean firstRow = true;
     for (Page page : pages) {
       int channelCount = page.getChannelCount();
       int positionCount = page.getPositionCount();
-      // Pre-fetch blocks for this page to avoid repeated getBlock calls
-      Block[] blocks = new Block[Math.min(numCols, channelCount)];
-      for (int col = 0; col < blocks.length; col++) {
+      Block[] blocks = new Block[channelCount];
+      for (int col = 0; col < channelCount; col++) {
         blocks[col] = page.getBlock(col);
       }
       for (int pos = 0; pos < positionCount; pos++) {
@@ -1212,7 +1262,16 @@ public class TransportTrinoSqlAction
           if (col > 0) {
             sb.append(",");
           }
-          if (col < channelCount) {
+          if (displayToChannel != null) {
+            int ch = displayToChannel[col];
+            if (ch < 0) {
+              sb.append(literalValues[col]);
+            } else if (ch < channelCount) {
+              appendExtractedValue(sb, blocks[ch], pos, types[ch]);
+            } else {
+              sb.append("null");
+            }
+          } else if (col < channelCount) {
             appendExtractedValue(sb, blocks[col], pos, types[col]);
           } else {
             sb.append("null");
@@ -1365,6 +1424,17 @@ public class TransportTrinoSqlAction
   }
 
   private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
+  /** Check if a column name is a pure integer literal (e.g., "1", "42"). */
+  private static boolean isIntegerLiteral(String col) {
+    if (col == null || col.isEmpty()) return false;
+    for (int i = 0; i < col.length(); i++) {
+      char c = col.charAt(i);
+      if (i == 0 && c == '-') continue;
+      if (c < '0' || c > '9') return false;
+    }
+    return true;
+  }
 
   private static String escapeJson(String s) {
     if (s == null) {

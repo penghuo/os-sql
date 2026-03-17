@@ -523,7 +523,9 @@ public class LogicalPlanner {
     for (SelectItem item : querySpec.getSelect().getSelectItems()) {
       if (item instanceof SingleColumn singleColumn) {
         Expression expr = singleColumn.getExpression();
-        if (!containsAggregateFunction(expr) && !(expr instanceof Identifier)) {
+        if (!containsAggregateFunction(expr)
+            && !(expr instanceof Identifier)
+            && !(expr instanceof LongLiteral)) {
           String exprName = expressionToColumnName(expr);
           if (!groupByKeys.contains(exprName) && !scanColumnSet.contains(exprName)) {
             // This is a computed expression in SELECT that's not a GROUP BY key

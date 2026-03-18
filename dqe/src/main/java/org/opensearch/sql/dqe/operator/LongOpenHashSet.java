@@ -19,7 +19,7 @@ package org.opensearch.sql.dqe.operator;
  */
 public final class LongOpenHashSet {
 
-  private static final int INITIAL_CAPACITY = 1024;
+  private static final int INITIAL_CAPACITY = 8;
   private static final float LOAD_FACTOR = 0.65f;
 
   /**

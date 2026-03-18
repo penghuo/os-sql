@@ -8588,6 +8588,7 @@ public final class FusedGroupByAggregate {
   private static final class TwoKeyHashMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
+    private static final int MAX_CAPACITY = 8_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -8647,6 +8648,15 @@ public final class FusedGroupByAggregate {
     }
 
     private void resize() {
+      if (size > MAX_CAPACITY) {
+        throw new RuntimeException(
+            "GROUP BY exceeded memory limit ("
+                + size
+                + " unique groups, max "
+                + MAX_CAPACITY
+                + "). "
+                + "Add a WHERE clause to reduce cardinality.");
+      }
       int newCapacity = capacity * 2;
       long[] newKeys0 = new long[newCapacity];
       long[] newKeys1 = new long[newCapacity];
@@ -8695,6 +8705,7 @@ public final class FusedGroupByAggregate {
   private static final class SingleKeyHashMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
+    private static final int MAX_CAPACITY = 8_000_000;
 
     long[] keys;
     AccumulatorGroup[] groups;
@@ -8749,6 +8760,15 @@ public final class FusedGroupByAggregate {
     }
 
     private void resize() {
+      if (size > MAX_CAPACITY) {
+        throw new RuntimeException(
+            "GROUP BY exceeded memory limit ("
+                + size
+                + " unique groups, max "
+                + MAX_CAPACITY
+                + "). "
+                + "Add a WHERE clause to reduce cardinality.");
+      }
       int newCapacity = capacity * 2;
       long[] newKeys = new long[newCapacity];
       AccumulatorGroup[] newGroups = new AccumulatorGroup[newCapacity];
@@ -8796,6 +8816,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatTwoKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
+    private static final int MAX_CAPACITY = 8_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -8889,6 +8910,15 @@ public final class FusedGroupByAggregate {
     }
 
     private void resize() {
+      if (size > MAX_CAPACITY) {
+        throw new RuntimeException(
+            "GROUP BY exceeded memory limit ("
+                + size
+                + " unique groups, max "
+                + MAX_CAPACITY
+                + "). "
+                + "Add a WHERE clause to reduce cardinality.");
+      }
       int newCap = capacity * 2;
       long[] nk0 = new long[newCap];
       long[] nk1 = new long[newCap];
@@ -8923,6 +8953,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatThreeKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
+    private static final int MAX_CAPACITY = 8_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -8987,6 +9018,15 @@ public final class FusedGroupByAggregate {
     }
 
     private void resize() {
+      if (size > MAX_CAPACITY) {
+        throw new RuntimeException(
+            "GROUP BY exceeded memory limit ("
+                + size
+                + " unique groups, max "
+                + MAX_CAPACITY
+                + "). "
+                + "Add a WHERE clause to reduce cardinality.");
+      }
       int newCap = capacity * 2;
       long[] nk0 = new long[newCap];
       long[] nk1 = new long[newCap];
@@ -9028,6 +9068,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatSingleKeyMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
+    private static final int MAX_CAPACITY = 8_000_000;
 
     long[] keys;
     boolean[] occupied;
@@ -9083,6 +9124,15 @@ public final class FusedGroupByAggregate {
     }
 
     private void resize() {
+      if (size > MAX_CAPACITY) {
+        throw new RuntimeException(
+            "GROUP BY exceeded memory limit ("
+                + size
+                + " unique groups, max "
+                + MAX_CAPACITY
+                + "). "
+                + "Add a WHERE clause to reduce cardinality.");
+      }
       int newCap = capacity * 2;
       long[] nk = new long[newCap];
       boolean[] nocc = new boolean[newCap];

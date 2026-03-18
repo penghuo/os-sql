@@ -72,9 +72,12 @@ public class PlanFragmenter {
     IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(indexName);
     Map<Integer, IndexShardRoutingTable> shards = indexRoutingTable.shards();
 
-    // 3. Build shard plan — only strip Sort/Limit/HAVING for multi-shard aggregation
-    boolean multiShard = shards.size() > 1;
-    DqePlanNode shardPlan = multiShard ? buildShardPlan(plan, columnTypeMap, shards.size()) : plan;
+    // 3. Build shard plan — strip Sort/Limit/HAVING and decompose COUNT(DISTINCT).
+    // Always apply plan transformations regardless of shard count so that the shard
+    // execution hits fused fast paths (DocValues scan, HashSet-based COUNT(DISTINCT)).
+    // For single-shard indices, the coordinator merge on 1 result is trivial overhead.
+    int numShards = shards.size();
+    DqePlanNode shardPlan = buildShardPlan(plan, columnTypeMap, Math.max(numShards, 2));
 
     // 4. Create shard fragments
     List<PlanFragment> shardFragments = new ArrayList<>();
@@ -85,8 +88,8 @@ public class PlanFragmenter {
       shardFragments.add(new PlanFragment(shardPlan, indexName, shardId, nodeId));
     }
 
-    // 5. If multi-shard and AggregationNode present, create coordinator plan for merging
-    DqePlanNode coordinatorPlan = multiShard ? buildCoordinatorPlan(plan) : null;
+    // 5. Create coordinator plan for merging shard results
+    DqePlanNode coordinatorPlan = buildCoordinatorPlan(plan);
 
     return new FragmentResult(shardFragments, coordinatorPlan);
   }

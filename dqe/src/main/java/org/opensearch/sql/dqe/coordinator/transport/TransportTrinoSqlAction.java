@@ -669,16 +669,43 @@ public class TransportTrinoSqlAction
           } else if (coordinatorPlan instanceof AggregationNode singleMixed2
               && singleMixed2.getStep() == AggregationNode.Step.SINGLE
               && isShardMixedDedup(shardFragments.get(0).shardPlan(), singleMixed2)) {
-            mergedPages =
-                mergeMixedDedup(
-                    shardPages,
-                    singleMixed2,
-                    shardFragments.get(0).shardPlan(),
-                    columnTypes,
-                    columnTypeMap,
-                    merger);
-            mergedPages =
-                applyCoordinatorSort(mergedPages, singleMixed2, optimizedPlan, columnTypes, merger);
+            // Check if shards have HashSet attachments for native mixed dedup (Q10 optimization)
+            boolean mixedHaveSets = true;
+            for (ShardExecuteResponse sr : shardResults) {
+              if (sr.getDistinctSets() == null) {
+                mixedHaveSets = false;
+                break;
+              }
+            }
+            if (mixedHaveSets && singleMixed2.getGroupByKeys().size() == 1) {
+              // Native mixed dedup: shards already computed SUM/COUNT per group with HashSets.
+              // Merge accumulators across shards + union HashSets.
+              long _topNHint = findGlobalLimit(optimizedPlan);
+              if (_topNHint > 0) _topNHint += findGlobalOffset(optimizedPlan);
+              mergedPages =
+                  mergeMixedDedupViaSets(
+                      shardResults,
+                      singleMixed2,
+                      shardFragments.get(0).shardPlan(),
+                      columnTypes,
+                      columnTypeMap,
+                      _topNHint);
+              mergedPages =
+                  applyCoordinatorSort(
+                      mergedPages, singleMixed2, optimizedPlan, columnTypes, merger);
+            } else {
+              mergedPages =
+                  mergeMixedDedup(
+                      shardPages,
+                      singleMixed2,
+                      shardFragments.get(0).shardPlan(),
+                      columnTypes,
+                      columnTypeMap,
+                      merger);
+              mergedPages =
+                  applyCoordinatorSort(
+                      mergedPages, singleMixed2, optimizedPlan, columnTypes, merger);
+            }
           } else if (coordinatorPlan instanceof AggregationNode singleAgg2
               && singleAgg2.getStep() == AggregationNode.Step.SINGLE) {
             List<String> shardColumnNames = resolveColumnNames(shardFragments.get(0).shardPlan());
@@ -2720,6 +2747,161 @@ public class TransportTrinoSqlAction
    * long[] arrays instead of long[][] to eliminate per-entry allocation. Combines Stage 1 (dedup
    * merge) and Stage 2 (re-aggregate by original key) into a single pass.
    */
+
+  /**
+   * Merge mixed-dedup results using attached HashSets (Q10 optimization). Each shard provides ~400
+   * groups with SUM/COUNT accumulators + per-group LongOpenHashSets, instead of ~25K expanded
+   * (key0, key1) rows. Merges accumulators + unions HashSets across shards.
+   */
+  private static List<Page> mergeMixedDedupViaSets(
+      ShardExecuteResponse[] shardResults,
+      AggregationNode singleAgg,
+      DqePlanNode shardPlan,
+      List<Type> columnTypes,
+      Map<String, Type> columnTypeMap,
+      long topN) {
+
+    // Parse the coordinator's aggregation functions to know output format
+    List<String> coordAggFunctions = singleAgg.getAggregateFunctions();
+    // Parse the shard's aggregation functions to know input page layout
+    AggregationNode shardAgg =
+        shardPlan instanceof AggregationNode sa
+            ? sa
+            : (shardPlan instanceof LimitNode ln
+                    && ln.getChild() instanceof SortNode sn
+                    && sn.getChild() instanceof AggregationNode sa2
+                ? sa2
+                : null);
+    if (shardAgg == null) return List.of();
+
+    List<String> shardAggFunctions = shardAgg.getAggregateFunctions();
+    int numShardAggs = shardAggFunctions.size();
+    int numGroupKeys = singleAgg.getGroupByKeys().size(); // 1 for Q10
+
+    // Merge per-group: key0 → (long[] accumulators, LongOpenHashSet)
+    java.util.Map<Long, long[]> mergedAccs = new java.util.HashMap<>();
+    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> mergedSets =
+        new java.util.HashMap<>();
+
+    for (ShardExecuteResponse sr : shardResults) {
+      java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> shardSets =
+          sr.getDistinctSets();
+      for (Page page : sr.getPages()) {
+        int posCount = page.getPositionCount();
+        Block keyBlock = page.getBlock(0);
+        // Shard page layout: [key0, key1_placeholder, agg0, agg1, ...]
+        for (int pos = 0; pos < posCount; pos++) {
+          long key0 =
+              keyBlock instanceof io.trino.spi.block.IntArrayBlock
+                  ? io.trino.spi.type.IntegerType.INTEGER.getLong(keyBlock, pos)
+                  : io.trino.spi.type.BigintType.BIGINT.getLong(keyBlock, pos);
+
+          long[] accs = mergedAccs.get(key0);
+          if (accs == null) {
+            accs = new long[numShardAggs];
+            mergedAccs.put(key0, accs);
+          }
+          for (int a = 0; a < numShardAggs; a++) {
+            Block aggBlock = page.getBlock(2 + a); // skip key0, key1
+            if (!aggBlock.isNull(pos)) {
+              accs[a] += io.trino.spi.type.BigintType.BIGINT.getLong(aggBlock, pos);
+            }
+          }
+
+          // Merge HashSet
+          if (shardSets != null) {
+            org.opensearch.sql.dqe.operator.LongOpenHashSet shardSet = shardSets.get(key0);
+            if (shardSet != null) {
+              org.opensearch.sql.dqe.operator.LongOpenHashSet existing = mergedSets.get(key0);
+              if (existing == null) {
+                mergedSets.put(key0, shardSet);
+              } else {
+                long[] srcKeys = shardSet.keys();
+                long empty = shardSet.emptyMarker();
+                for (long v : srcKeys) {
+                  if (v != empty) existing.add(v);
+                }
+                if (shardSet.hasZeroValue()) existing.add(0L);
+                if (shardSet.hasSentinelValue()) existing.add(Long.MIN_VALUE);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (mergedAccs.isEmpty()) return List.of();
+
+    // Build output page matching coordinator aggregation output:
+    // [key0, coordAgg0, coordAgg1, ...]
+    // Coordinator aggs for Q10: SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth), COUNT(DISTINCT
+    // UserID)
+    int numCoordAggs = coordAggFunctions.size();
+    int numOutputCols = numGroupKeys + numCoordAggs;
+
+    String keyColName = singleAgg.getGroupByKeys().get(0);
+    Type keyType = columnTypeMap.getOrDefault(keyColName, io.trino.spi.type.BigintType.BIGINT);
+    io.trino.spi.block.BlockBuilder keyBuilder =
+        keyType.createBlockBuilder(null, mergedAccs.size());
+    io.trino.spi.block.BlockBuilder[] aggBuilders =
+        new io.trino.spi.block.BlockBuilder[numCoordAggs];
+    for (int i = 0; i < numCoordAggs; i++) {
+      // Determine output type
+      String func = coordAggFunctions.get(i);
+      boolean isAvg = func.matches("(?i)^avg\\(.*\\)$");
+      aggBuilders[i] =
+          (isAvg ? io.trino.spi.type.DoubleType.DOUBLE : io.trino.spi.type.BigintType.BIGINT)
+              .createBlockBuilder(null, mergedAccs.size());
+    }
+
+    // Map coordinator aggs to shard accumulators
+    // Coordinator: SUM(X) → shard acc[i] direct
+    //              COUNT(*) → shard acc[i] direct
+    //              AVG(X) → shard SUM(X)/COUNT(X) pair
+    //              COUNT(DISTINCT Y) → merged HashSet size
+    for (var entry : mergedAccs.entrySet()) {
+      long key0 = entry.getKey();
+      long[] accs = entry.getValue();
+      keyType.writeLong(keyBuilder, key0);
+
+      int shardAccIdx = 0;
+      for (int i = 0; i < numCoordAggs; i++) {
+        String func = coordAggFunctions.get(i);
+        java.util.regex.Matcher m =
+            java.util.regex.Pattern.compile("(?i)^(count|sum|avg)\\((DISTINCT\\s+)?(.+?)\\)$")
+                .matcher(func);
+        if (!m.matches()) {
+          io.trino.spi.type.BigintType.BIGINT.writeLong(aggBuilders[i], 0);
+          continue;
+        }
+        String funcName = m.group(1).toUpperCase();
+        boolean isDistinct = m.group(2) != null;
+        if (isDistinct) {
+          // COUNT(DISTINCT) → use merged HashSet
+          org.opensearch.sql.dqe.operator.LongOpenHashSet set = mergedSets.get(key0);
+          io.trino.spi.type.BigintType.BIGINT.writeLong(
+              aggBuilders[i], set != null ? set.size() : 0);
+        } else if ("AVG".equals(funcName)) {
+          // AVG → shard provides SUM + COUNT as two consecutive accumulators
+          long sum = accs[shardAccIdx++];
+          long count = accs[shardAccIdx++];
+          double avg = count > 0 ? (double) sum / count : 0.0;
+          io.trino.spi.type.DoubleType.DOUBLE.writeDouble(aggBuilders[i], avg);
+        } else {
+          // SUM or COUNT(*) → direct accumulator
+          io.trino.spi.type.BigintType.BIGINT.writeLong(aggBuilders[i], accs[shardAccIdx++]);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    blocks[0] = keyBuilder.build();
+    for (int i = 0; i < numCoordAggs; i++) {
+      blocks[1 + i] = aggBuilders[i].build();
+    }
+    return List.of(new Page(blocks));
+  }
+
   private static List<Page> mergeMixedDedup2Key(
       List<List<Page>> shardPages,
       List<Type> dedupTypes,

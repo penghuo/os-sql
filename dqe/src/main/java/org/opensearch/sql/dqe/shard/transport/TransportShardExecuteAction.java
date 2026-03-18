@@ -279,31 +279,58 @@ public class TransportShardExecuteAction
         && effectivePlan instanceof AggregationNode aggDedupNode
         && aggDedupNode.getStep() == AggregationNode.Step.PARTIAL
         && aggDedupNode.getGroupByKeys().size() == 2
-        && aggDedupNode.getAggregateFunctions().size() == 1
-        && "COUNT(*)".equals(aggDedupNode.getAggregateFunctions().get(0))
         && FusedGroupByAggregate.canFuse(
             aggDedupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
-      Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
-      String keyName0 = aggDedupNode.getGroupByKeys().get(0);
-      String keyName1 = aggDedupNode.getGroupByKeys().get(1);
-      Type t0 = ctm.get(keyName0);
-      Type t1 = ctm.get(keyName1);
-      if (t0 != null
-          && !(t0 instanceof io.trino.spi.type.VarcharType)
-          && t1 != null
-          && !(t1 instanceof io.trino.spi.type.VarcharType)) {
-        // Execute with HashSet-per-group: single-key GROUP BY with LongOpenHashSet accumulators
-        ShardExecuteResponse resp =
-            executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
-        return resp;
-      }
-      // VARCHAR key0 + numeric key1: Q14 pattern (GROUP BY SearchPhrase, COUNT(DISTINCT UserID))
-      if (t0 instanceof io.trino.spi.type.VarcharType
-          && t1 != null
-          && !(t1 instanceof io.trino.spi.type.VarcharType)) {
-        ShardExecuteResponse resp =
-            executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
-        return resp;
+      // Check if it's a pure COUNT(*)-only dedup (Q9) or mixed dedup (Q10)
+      boolean isSingleCountStar =
+          aggDedupNode.getAggregateFunctions().size() == 1
+              && "COUNT(*)".equals(aggDedupNode.getAggregateFunctions().get(0));
+      // For mixed dedup: all aggregates must be SUM/COUNT (decomposable) — no DISTINCT, no AVG
+      boolean isMixedDedup =
+          !isSingleCountStar
+              && aggDedupNode.getAggregateFunctions().stream()
+                  .allMatch(f -> f.matches("(?i)^(sum|count)\\(.*\\)$"));
+      if (isSingleCountStar) {
+        Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+        String keyName0 = aggDedupNode.getGroupByKeys().get(0);
+        String keyName1 = aggDedupNode.getGroupByKeys().get(1);
+        Type t0 = ctm.get(keyName0);
+        Type t1 = ctm.get(keyName1);
+        if (t0 != null
+            && !(t0 instanceof io.trino.spi.type.VarcharType)
+            && t1 != null
+            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+          // Execute with HashSet-per-group: single-key GROUP BY with LongOpenHashSet accumulators
+          ShardExecuteResponse resp =
+              executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
+          return resp;
+        }
+        // VARCHAR key0 + numeric key1: Q14 pattern (GROUP BY SearchPhrase, COUNT(DISTINCT UserID))
+        if (t0 instanceof io.trino.spi.type.VarcharType
+            && t1 != null
+            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+          ShardExecuteResponse resp =
+              executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
+          return resp;
+        }
+      } else if (isMixedDedup) {
+        // Q10 pattern: GROUP BY (key0, key1) with mixed SUM/COUNT aggregates.
+        // Native path: GROUP BY key0 only with per-group HashSet for key1 + accumulators for
+        // SUM/COUNT.
+        // Reduces shard output from ~25K (key0×key1) rows to ~400 (key0) rows.
+        Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+        String keyName0 = aggDedupNode.getGroupByKeys().get(0);
+        String keyName1 = aggDedupNode.getGroupByKeys().get(1);
+        Type t0 = ctm.get(keyName0);
+        Type t1 = ctm.get(keyName1);
+        if (t0 != null
+            && !(t0 instanceof io.trino.spi.type.VarcharType)
+            && t1 != null
+            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+          ShardExecuteResponse resp =
+              executeMixedDedupWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
+          return resp;
+        }
       }
     }
 
@@ -943,6 +970,267 @@ public class TransportShardExecuteAction
     }
 
     Page page = new Page(b0.build(), b1.build(), b2.build());
+    ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
+    resp.setDistinctSets(distinctSets);
+    return resp;
+  }
+
+  /**
+   * Fast path for Q10 pattern: GROUP BY (key0, key1) with mixed SUM/COUNT aggregates. Instead of
+   * expanding all (key0, key1) pairs (~25K rows), groups by key0 only (~400 rows) with per-group
+   * HashSets for key1 and direct SUM/COUNT accumulators. The coordinator then unions HashSets and
+   * sums accumulators across shards.
+   */
+  private ShardExecuteResponse executeMixedDedupWithHashSets(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      String keyName0,
+      String keyName1,
+      Type type0,
+      Type type1)
+      throws Exception {
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    List<String> aggFunctions = aggNode.getAggregateFunctions();
+    int numAggs = aggFunctions.size();
+
+    // Open-addressing hash map: key0 → (LongOpenHashSet for key1, long[] for accumulators)
+    int grpCap = 256;
+    long[] grpKeys = new long[grpCap];
+    org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
+        new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+    long[][] grpAccs = new long[grpCap][numAggs]; // per-group accumulator values
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
+
+    // Resolve aggregate argument column names and function types
+    String[] aggArgNames = new String[numAggs];
+    boolean[] aggIsCountStar = new boolean[numAggs];
+    boolean[] aggIsCount = new boolean[numAggs]; // COUNT(col) — increment by 1, not by value
+    for (int i = 0; i < numAggs; i++) {
+      String f = aggFunctions.get(i);
+      java.util.regex.Matcher m =
+          java.util.regex.Pattern.compile("(?i)^(sum|count)\\((.+?)\\)$").matcher(f);
+      if (m.matches()) {
+        String funcName = m.group(1).toUpperCase();
+        String arg = m.group(2).trim();
+        aggIsCountStar[i] = "*".equals(arg);
+        aggIsCount[i] = "COUNT".equals(funcName) && !"*".equals(arg);
+        aggArgNames[i] = arg;
+      }
+    }
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-mixed-dedup-hashset")) {
+      for (org.apache.lucene.index.LeafReaderContext leafCtx :
+          engineSearcher.getIndexReader().leaves()) {
+        org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+        org.apache.lucene.index.SortedNumericDocValues dv0 =
+            reader.getSortedNumericDocValues(keyName0);
+        org.apache.lucene.index.SortedNumericDocValues dv1 =
+            reader.getSortedNumericDocValues(keyName1);
+
+        // Open aggregate argument DocValues
+        org.apache.lucene.index.SortedNumericDocValues[] aggDvs =
+            new org.apache.lucene.index.SortedNumericDocValues[numAggs];
+        for (int i = 0; i < numAggs; i++) {
+          if (!aggIsCountStar[i]) {
+            aggDvs[i] = reader.getSortedNumericDocValues(aggArgNames[i]);
+          }
+        }
+
+        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+
+        if (isMatchAll && dv0 != null && dv1 != null) {
+          int maxDoc = reader.maxDoc();
+          int dvDoc0 = dv0.nextDoc();
+          int dvDoc1 = dv1.nextDoc();
+          // Advance all aggregate DV iterators
+          int[] aggDvDocs = new int[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (aggDvs[i] != null) aggDvDocs[i] = aggDvs[i].nextDoc();
+            else aggDvDocs[i] = org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+          }
+
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long k0 = 0;
+            if (dvDoc0 == doc) {
+              k0 = dv0.nextValue();
+              dvDoc0 = dv0.nextDoc();
+            }
+            long k1 = 0;
+            if (dvDoc1 == doc) {
+              k1 = dv1.nextValue();
+              dvDoc1 = dv1.nextDoc();
+            }
+
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (!grpOcc[gs]) {
+              grpKeys[gs] = k0;
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              grpAccs[gs] = new long[numAggs];
+              grpOcc[gs] = true;
+              grpSize++;
+              if (grpSize > grpThreshold) {
+                // Resize hash map
+                int nc = grpCap * 2;
+                long[] nk = new long[nc];
+                var ns = new org.opensearch.sql.dqe.operator.LongOpenHashSet[nc];
+                long[][] na = new long[nc][numAggs];
+                boolean[] no = new boolean[nc];
+                int nm = nc - 1;
+                for (int g = 0; g < grpCap; g++) {
+                  if (grpOcc[g]) {
+                    int s = Long.hashCode(grpKeys[g]) & nm;
+                    while (no[s]) s = (s + 1) & nm;
+                    nk[s] = grpKeys[g];
+                    ns[s] = grpSets[g];
+                    na[s] = grpAccs[g];
+                    no[s] = true;
+                  }
+                }
+                grpKeys = nk;
+                grpSets = ns;
+                grpAccs = na;
+                grpOcc = no;
+                grpCap = nc;
+                grpThreshold = (int) (nc * 0.7f);
+                gm = grpCap - 1;
+                gs = Long.hashCode(k0) & gm;
+                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+              }
+            }
+            grpSets[gs].add(k1);
+
+            // Accumulate SUM/COUNT for each aggregate
+            for (int i = 0; i < numAggs; i++) {
+              if (aggIsCountStar[i]) {
+                grpAccs[gs][i]++;
+              } else if (aggDvDocs[i] == doc) {
+                long val = aggDvs[i].nextValue();
+                aggDvDocs[i] = aggDvs[i].nextDoc();
+                grpAccs[gs][i] += aggIsCount[i] ? 1 : val;
+              }
+            }
+          }
+        } else {
+          // Filtered path
+          org.apache.lucene.search.Weight weight =
+              engineSearcher.createWeight(
+                  engineSearcher.rewrite(luceneQuery),
+                  org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                  1.0f);
+          org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+          if (scorer == null) continue;
+          org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+          int doc;
+          while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+            long k0 = 0;
+            if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
+            long k1 = 0;
+            if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
+
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (!grpOcc[gs]) {
+              grpKeys[gs] = k0;
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              grpAccs[gs] = new long[numAggs];
+              grpOcc[gs] = true;
+              grpSize++;
+              if (grpSize > grpThreshold) {
+                int nc = grpCap * 2;
+                long[] nk = new long[nc];
+                var ns = new org.opensearch.sql.dqe.operator.LongOpenHashSet[nc];
+                long[][] na = new long[nc][numAggs];
+                boolean[] no = new boolean[nc];
+                int nm = nc - 1;
+                for (int g = 0; g < grpCap; g++) {
+                  if (grpOcc[g]) {
+                    int s = Long.hashCode(grpKeys[g]) & nm;
+                    while (no[s]) s = (s + 1) & nm;
+                    nk[s] = grpKeys[g];
+                    ns[s] = grpSets[g];
+                    na[s] = grpAccs[g];
+                    no[s] = true;
+                  }
+                }
+                grpKeys = nk;
+                grpSets = ns;
+                grpAccs = na;
+                grpOcc = no;
+                grpCap = nc;
+                grpThreshold = (int) (nc * 0.7f);
+                gm = grpCap - 1;
+                gs = Long.hashCode(k0) & gm;
+                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+              }
+            }
+            grpSets[gs].add(k1);
+            for (int i = 0; i < numAggs; i++) {
+              if (aggIsCountStar[i]) {
+                grpAccs[gs][i]++;
+              } else if (aggDvs[i] != null && aggDvs[i].advanceExact(doc)) {
+                grpAccs[gs][i] += aggIsCount[i] ? 1 : aggDvs[i].nextValue();
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Build output page: (key0, key1_placeholder=0, agg0, agg1, ...)
+    // Same format as the decomposed plan so the coordinator merge path still works.
+    // But only ~400 rows instead of ~25K — with HashSets attached for COUNT(DISTINCT).
+    int numOutputCols = 2 + numAggs;
+    List<Type> colTypes = new java.util.ArrayList<>();
+    colTypes.add(
+        type0 instanceof io.trino.spi.type.IntegerType
+            ? io.trino.spi.type.IntegerType.INTEGER
+            : io.trino.spi.type.BigintType.BIGINT);
+    colTypes.add(
+        type1 instanceof io.trino.spi.type.IntegerType
+            ? io.trino.spi.type.IntegerType.INTEGER
+            : io.trino.spi.type.BigintType.BIGINT);
+    for (int i = 0; i < numAggs; i++) {
+      colTypes.add(io.trino.spi.type.BigintType.BIGINT);
+    }
+
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      builders[i] = colTypes.get(i).createBlockBuilder(null, grpSize);
+    }
+
+    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> distinctSets =
+        new java.util.HashMap<>(grpSize);
+
+    for (int g = 0; g < grpCap; g++) {
+      if (!grpOcc[g]) continue;
+      distinctSets.put(grpKeys[g], grpSets[g]);
+      colTypes.get(0).writeLong(builders[0], grpKeys[g]);
+      colTypes.get(1).writeLong(builders[1], 0L); // placeholder for key1
+      for (int i = 0; i < numAggs; i++) {
+        io.trino.spi.type.BigintType.BIGINT.writeLong(builders[2 + i], grpAccs[g][i]);
+      }
+    }
+
+    Block[] blocks = new Block[numOutputCols];
+    for (int i = 0; i < numOutputCols; i++) {
+      blocks[i] = builders[i].build();
+    }
+    Page page = new Page(blocks);
     ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
     resp.setDistinctSets(distinctSets);
     return resp;

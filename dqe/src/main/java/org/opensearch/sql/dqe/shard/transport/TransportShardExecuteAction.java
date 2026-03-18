@@ -1450,7 +1450,10 @@ public class TransportShardExecuteAction
     Query luceneQuery =
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
-    return FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+    List<Page> result =
+        FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
+    System.gc();
+    return result;
   }
 
   /**
@@ -1499,8 +1502,20 @@ public class TransportShardExecuteAction
     Query luceneQuery =
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
-    return FusedGroupByAggregate.executeWithTopN(
-        aggNode, shard, luceneQuery, cachedMeta.columnTypeMap(), sortAggIndex, sortAscending, topN);
+    List<Page> result =
+        FusedGroupByAggregate.executeWithTopN(
+            aggNode,
+            shard,
+            luceneQuery,
+            cachedMeta.columnTypeMap(),
+            sortAggIndex,
+            sortAscending,
+            topN);
+    // Hint GC to collect large hash maps from old gen before next query arrives.
+    // Without this, G1GC may not collect old gen promptly, causing circuit breaker
+    // trips on the next query (observed with Q19 → Q20 on 100M rows).
+    System.gc();
+    return result;
   }
 
   /**

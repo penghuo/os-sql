@@ -3900,19 +3900,72 @@ public final class FusedGroupByAggregate {
 
     // === Flat accumulator path for two-key numeric ===
     if (canUseFlatAccumulators) {
-      return executeTwoKeyNumericFlat(
-          shard,
-          query,
-          keyInfos,
-          specs,
-          columnTypeMap,
-          groupByKeys,
-          numAggs,
-          isCountStar,
-          accType,
-          sortAggIndex,
-          sortAscending,
-          topN);
+      // Estimate number of docs to decide if hash-partitioned aggregation is needed.
+      // When numGroups could exceed MAX_CAPACITY (8M), partition the key space into
+      // multiple buckets and execute sequential passes, each aggregating only one bucket.
+      int numBuckets;
+      try (org.opensearch.index.engine.Engine.Searcher estSearcher =
+          shard.acquireSearcher("dqe-fused-groupby-estimate")) {
+        long totalDocs = 0;
+        for (LeafReaderContext leaf : estSearcher.getIndexReader().leaves()) {
+          totalDocs += leaf.reader().maxDoc();
+        }
+        numBuckets = Math.max(1, (int) Math.ceil((double) totalDocs / FlatTwoKeyMap.MAX_CAPACITY));
+      }
+
+      if (numBuckets <= 1) {
+        return executeTwoKeyNumericFlat(
+            shard,
+            query,
+            keyInfos,
+            specs,
+            columnTypeMap,
+            groupByKeys,
+            numAggs,
+            isCountStar,
+            accType,
+            sortAggIndex,
+            sortAscending,
+            topN,
+            0,
+            1);
+      } else {
+        // Multi-bucket partitioned aggregation: each pass aggregates only groups
+        // whose hash falls into the current bucket, keeping map size under MAX_CAPACITY.
+        List<Page> allBucketResults = new ArrayList<>();
+        for (int bucket = 0; bucket < numBuckets; bucket++) {
+          List<Page> bucketPages =
+              executeTwoKeyNumericFlat(
+                  shard,
+                  query,
+                  keyInfos,
+                  specs,
+                  columnTypeMap,
+                  groupByKeys,
+                  numAggs,
+                  isCountStar,
+                  accType,
+                  sortAggIndex,
+                  sortAscending,
+                  topN,
+                  bucket,
+                  numBuckets);
+          allBucketResults.addAll(bucketPages);
+        }
+        if (allBucketResults.isEmpty()) return List.of();
+        if (allBucketResults.size() == 1) return allBucketResults;
+        return mergePartitionedPages(
+            allBucketResults,
+            keyInfos,
+            specs,
+            columnTypeMap,
+            groupByKeys,
+            numAggs,
+            accType,
+            sortAggIndex,
+            sortAscending,
+            topN);
+      }
     }
 
     // Use TwoKeyHashMap with AccumulatorGroup objects and pre-computed dispatch
@@ -4137,7 +4190,9 @@ public final class FusedGroupByAggregate {
       int[] accType,
       int sortAggIndex,
       boolean sortAscending,
-      long topN)
+      long topN,
+      int bucket,
+      int numBuckets)
       throws Exception {
 
     final int[] accOffset = new int[numAggs];
@@ -4232,7 +4287,9 @@ public final class FusedGroupByAggregate {
                     uniqueDvReaders,
                     dvValues,
                     dvHasValue,
-                    aggToDvIdx);
+                    aggToDvIdx,
+                    bucket,
+                    numBuckets);
               }
             } else {
               for (int doc = 0; doc < maxDoc; doc++) {
@@ -4250,7 +4307,9 @@ public final class FusedGroupByAggregate {
                       uniqueDvReaders,
                       dvValues,
                       dvHasValue,
-                      aggToDvIdx);
+                      aggToDvIdx,
+                      bucket,
+                      numBuckets);
                 }
               }
             }
@@ -4275,7 +4334,9 @@ public final class FusedGroupByAggregate {
                     isCountStar,
                     accType,
                     accOffset,
-                    numericAggDvs);
+                    numericAggDvs,
+                    bucket,
+                    numBuckets);
               }
             } else {
               for (int doc = 0; doc < maxDoc; doc++) {
@@ -4290,7 +4351,9 @@ public final class FusedGroupByAggregate {
                       isCountStar,
                       accType,
                       accOffset,
-                      numericAggDvs);
+                      numericAggDvs,
+                      bucket,
+                      numBuckets);
                 }
               }
             }
@@ -4337,7 +4400,9 @@ public final class FusedGroupByAggregate {
                           uniqueDvReaders,
                           dvValues,
                           dvHasValue,
-                          aggToDvIdx);
+                          aggToDvIdx,
+                          bucket,
+                          numBuckets);
                     }
                   };
                 } else {
@@ -4366,7 +4431,9 @@ public final class FusedGroupByAggregate {
                           isCountStar,
                           accType,
                           accOffset,
-                          numericAggDvs);
+                          numericAggDvs,
+                          bucket,
+                          numBuckets);
                     }
                   };
                 }
@@ -4517,11 +4584,18 @@ public final class FusedGroupByAggregate {
       boolean[] isCountStar,
       int[] accType,
       int[] accOffset,
-      SortedNumericDocValues[] numericAggDvs)
+      SortedNumericDocValues[] numericAggDvs,
+      int bucket,
+      int numBuckets)
       throws IOException {
     long key0 = 0, key1 = 0;
     if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
     if (dv1 != null && dv1.advanceExact(doc)) key1 = dv1.nextValue();
+    // Hash-partition filter: skip docs not in this bucket
+    if (numBuckets > 1) {
+      int docBucket = (TwoKeyHashMap.hash2(key0, key1) & 0x7FFFFFFF) % numBuckets;
+      if (docBucket != bucket) return;
+    }
     int slot = flatMap.findOrInsert(key0, key1);
     int base = slot * slotsPerGroup;
 
@@ -4569,11 +4643,18 @@ public final class FusedGroupByAggregate {
       SortedNumericDocValues[] uniqueDvReaders,
       long[] dvValues,
       boolean[] dvHasValue,
-      int[] aggToDvIdx)
+      int[] aggToDvIdx,
+      int bucket,
+      int numBuckets)
       throws IOException {
     long key0 = 0, key1 = 0;
     if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
     if (dv1 != null && dv1.advanceExact(doc)) key1 = dv1.nextValue();
+    // Hash-partition filter: skip docs not in this bucket
+    if (numBuckets > 1) {
+      int docBucket = (TwoKeyHashMap.hash2(key0, key1) & 0x7FFFFFFF) % numBuckets;
+      if (docBucket != bucket) return;
+    }
     int slot = flatMap.findOrInsert(key0, key1);
     int base = slot * slotsPerGroup;
 
@@ -7025,6 +7106,190 @@ public final class FusedGroupByAggregate {
    */
 
   /**
+   * Merge result Pages from multiple hash-partitioned aggregation buckets. Each bucket produces a
+   * Page with its top-K rows; this method merges them by sorting on the aggregate column and taking
+   * the global top-K.
+   */
+  private static List<Page> mergePartitionedPages(
+      List<Page> bucketPages,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys,
+      int numAggs,
+      int[] accType,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN) {
+
+    // Count total rows across all bucket pages
+    int totalRows = 0;
+    for (Page p : bucketPages) {
+      totalRows += p.getPositionCount();
+    }
+    if (totalRows == 0) return List.of();
+
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+
+    // Resolve column types for output
+    Type[] colTypes = new Type[totalColumns];
+    for (int c = 0; c < numGroupKeys; c++) {
+      colTypes[c] = keyInfos.get(c).type;
+    }
+    for (int c = 0; c < numAggs; c++) {
+      colTypes[numGroupKeys + c] = resolveAggOutputType(specs.get(c), columnTypeMap);
+    }
+
+    // If no sorting or topN, just concatenate all pages
+    if (sortAggIndex < 0 || topN <= 0) {
+      int limit = topN > 0 ? (int) Math.min(topN, totalRows) : totalRows;
+      BlockBuilder[] builders = new BlockBuilder[totalColumns];
+      for (int c = 0; c < totalColumns; c++) {
+        builders[c] = colTypes[c].createBlockBuilder(null, limit);
+      }
+      int written = 0;
+      for (Page p : bucketPages) {
+        for (int row = 0; row < p.getPositionCount() && written < limit; row++) {
+          for (int c = 0; c < totalColumns; c++) {
+            copyBlockValue(p.getBlock(c), row, builders[c], colTypes[c]);
+          }
+          written++;
+        }
+      }
+      Block[] blocks = new Block[totalColumns];
+      for (int c = 0; c < totalColumns; c++) blocks[c] = builders[c].build();
+      return List.of(new Page(blocks));
+    }
+
+    // Sort by aggregate column and take topN. Build index array pointing to (page, row).
+    int[] pageIdx = new int[totalRows];
+    int[] rowIdx = new int[totalRows];
+    int idx = 0;
+    for (int pi = 0; pi < bucketPages.size(); pi++) {
+      Page p = bucketPages.get(pi);
+      for (int r = 0; r < p.getPositionCount(); r++) {
+        pageIdx[idx] = pi;
+        rowIdx[idx] = r;
+        idx++;
+      }
+    }
+
+    // Extract sort values (the aggregate column at sortAggIndex).
+    // Sort column is always BIGINT (COUNT/SUM) in the flat accumulator path.
+    int sortCol = numGroupKeys + sortAggIndex;
+    Type sortType = colTypes[sortCol];
+    long[] sortValues = new long[totalRows];
+    for (int i = 0; i < totalRows; i++) {
+      Page p = bucketPages.get(pageIdx[i]);
+      Block block = p.getBlock(sortCol);
+      sortValues[i] = sortType.getLong(block, rowIdx[i]);
+    }
+
+    // Use top-N with min-heap for DESC (or max-heap for ASC)
+    int n = (int) Math.min(topN, totalRows);
+    int[] heap = new int[n];
+    int heapSize = 0;
+    for (int i = 0; i < totalRows; i++) {
+      long val = sortValues[i];
+      if (heapSize < n) {
+        heap[heapSize] = i;
+        heapSize++;
+        // Sift up
+        int k = heapSize - 1;
+        while (k > 0) {
+          int parent = (k - 1) >>> 1;
+          long pVal = sortValues[heap[parent]];
+          long kVal = sortValues[heap[k]];
+          boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+          if (swap) {
+            int tmp = heap[parent];
+            heap[parent] = heap[k];
+            heap[k] = tmp;
+            k = parent;
+          } else break;
+        }
+      } else {
+        long rootVal = sortValues[heap[0]];
+        boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+        if (better) {
+          heap[0] = i;
+          // Sift down
+          int k = 0;
+          while (true) {
+            int left = 2 * k + 1;
+            if (left >= heapSize) break;
+            int right = left + 1;
+            int target = left;
+            if (right < heapSize) {
+              long lv = sortValues[heap[left]];
+              long rv = sortValues[heap[right]];
+              boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
+              if (pickRight) target = right;
+            }
+            long kVal = sortValues[heap[k]];
+            long tVal = sortValues[heap[target]];
+            boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
+            if (swap) {
+              int tmp = heap[k];
+              heap[k] = heap[target];
+              heap[target] = tmp;
+              k = target;
+            } else break;
+          }
+        }
+      }
+    }
+
+    // Sort the heap entries by value for ordered output
+    for (int i = 1; i < heapSize; i++) {
+      int key = heap[i];
+      long keyVal = sortValues[key];
+      int j = i - 1;
+      while (j >= 0) {
+        long jVal = sortValues[heap[j]];
+        boolean needsSwap = sortAscending ? (jVal > keyVal) : (jVal < keyVal);
+        if (needsSwap) {
+          heap[j + 1] = heap[j];
+          j--;
+        } else break;
+      }
+      heap[j + 1] = key;
+    }
+
+    // Build output page from selected rows
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int c = 0; c < totalColumns; c++) {
+      builders[c] = colTypes[c].createBlockBuilder(null, heapSize);
+    }
+    for (int i = 0; i < heapSize; i++) {
+      int gi = heap[i];
+      Page p = bucketPages.get(pageIdx[gi]);
+      int row = rowIdx[gi];
+      for (int c = 0; c < totalColumns; c++) {
+        copyBlockValue(p.getBlock(c), row, builders[c], colTypes[c]);
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int c = 0; c < totalColumns; c++) blocks[c] = builders[c].build();
+    return List.of(new Page(blocks));
+  }
+
+  /** Copy a single value from a Block at the given position into a BlockBuilder, using the Type. */
+  private static void copyBlockValue(Block source, int position, BlockBuilder dest, Type type) {
+    if (source.isNull(position)) {
+      dest.appendNull();
+    } else if (type instanceof VarcharType) {
+      VarcharType.VARCHAR.writeSlice(dest, VarcharType.VARCHAR.getSlice(source, position));
+    } else if (type instanceof DoubleType) {
+      DoubleType.DOUBLE.writeDouble(dest, DoubleType.DOUBLE.getDouble(source, position));
+    } else {
+      // BIGINT, INTEGER, SMALLINT, TINYINT, TIMESTAMP — all use writeLong
+      type.writeLong(dest, type.getLong(source, position));
+    }
+  }
+
+  /**
    * Fast flat 3-key path for single-segment GROUP BY with 3 keys and COUNT(*)/SUM/AVG aggregates.
    * Uses FlatThreeKeyMap with direct doc iteration (MatchAllDocsQuery bypass) to eliminate
    * per-group SegmentGroupKey/AccumulatorGroup allocation and Collector virtual dispatch.
@@ -7045,7 +7310,9 @@ public final class FusedGroupByAggregate {
       int sortAggIndex,
       boolean sortAscending,
       long topN,
-      Map<String, Type> columnTypeMap)
+      Map<String, Type> columnTypeMap,
+      int bucket,
+      int numBuckets)
       throws Exception {
 
     // Pre-compute flat accumulator offsets (same scheme as 2-key path)
@@ -7130,6 +7397,11 @@ public final class FusedGroupByAggregate {
               else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
             }
           }
+          // Hash-partition filter: skip docs not in this bucket
+          if (numBuckets > 1) {
+            int docBucket = (FlatThreeKeyMap.hash3(k0, k1, k2) & 0x7FFFFFFF) % numBuckets;
+            if (docBucket != bucket) continue;
+          }
           int slot = flatMap.findOrInsert(k0, k1, k2);
           flatMap.accData[slot * flatSlotsPerGroup]++;
         }
@@ -7169,6 +7441,11 @@ public final class FusedGroupByAggregate {
               if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
               else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
             }
+          }
+          // Hash-partition filter: skip docs not in this bucket
+          if (numBuckets > 1) {
+            int docBucket = (FlatThreeKeyMap.hash3(k0, k1, k2) & 0x7FFFFFFF) % numBuckets;
+            if (docBucket != bucket) continue;
           }
           int slot = flatMap.findOrInsert(k0, k1, k2);
           flatMap.accData[slot * flatSlotsPerGroup]++;
@@ -7217,6 +7494,11 @@ public final class FusedGroupByAggregate {
               if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
               else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
             }
+          }
+          // Hash-partition filter: skip docs not in this bucket
+          if (numBuckets > 1) {
+            int docBucket = (FlatThreeKeyMap.hash3(k0, k1, k2) & 0x7FFFFFFF) % numBuckets;
+            if (docBucket != bucket) continue;
           }
           int slot = flatMap.findOrInsert(k0, k1, k2);
           int base = slot * flatSlotsPerGroup;
@@ -7280,6 +7562,11 @@ public final class FusedGroupByAggregate {
               if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
               else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
             }
+          }
+          // Hash-partition filter: skip docs not in this bucket
+          if (numBuckets > 1) {
+            int docBucket = (FlatThreeKeyMap.hash3(k0, k1, k2) & 0x7FFFFFFF) % numBuckets;
+            if (docBucket != bucket) continue;
           }
           int slot = flatMap.findOrInsert(k0, k1, k2);
           int base = slot * flatSlotsPerGroup;
@@ -7377,6 +7664,11 @@ public final class FusedGroupByAggregate {
                       if (truncUnits[2] != null) k2 = truncateMillis(k2, truncUnits[2]);
                       else if (arithUnits[2] != null) k2 = applyArith(k2, arithUnits[2]);
                     }
+                  }
+                  // Hash-partition filter: skip docs not in this bucket
+                  if (numBuckets > 1) {
+                    int docBucket = (FlatThreeKeyMap.hash3(k0, k1, k2) & 0x7FFFFFFF) % numBuckets;
+                    if (docBucket != bucket) return;
                   }
                   int slot = fMap.findOrInsert(k0, k1, k2);
                   int base = slot * flatSlotsPerGroup;
@@ -7617,24 +7909,76 @@ public final class FusedGroupByAggregate {
           }
         }
         if (canUseFlatThreeKey) {
-          List<Page> flatResult =
-              executeThreeKeyFlat(
-                  engineSearcher,
-                  query,
+          // Estimate number of docs to decide if hash-partitioned aggregation is needed.
+          long totalDocs = 0;
+          for (LeafReaderContext leaf : engineSearcher.getIndexReader().leaves()) {
+            totalDocs += leaf.reader().maxDoc();
+          }
+          int threeKeyBuckets =
+              Math.max(1, (int) Math.ceil((double) totalDocs / FlatThreeKeyMap.MAX_CAPACITY));
+
+          if (threeKeyBuckets <= 1) {
+            List<Page> flatResult =
+                executeThreeKeyFlat(
+                    engineSearcher,
+                    query,
+                    keyInfos,
+                    specs,
+                    numAggs,
+                    isCountStar,
+                    accType,
+                    truncUnits,
+                    arithUnits,
+                    groupByKeys,
+                    sortAggIndex,
+                    sortAscending,
+                    topN,
+                    columnTypeMap,
+                    0,
+                    1);
+            if (flatResult != null) {
+              return flatResult;
+            }
+          } else {
+            // Multi-bucket partitioned aggregation for 3-key GROUP BY
+            List<Page> allBucketResults = new ArrayList<>();
+            for (int bkt = 0; bkt < threeKeyBuckets; bkt++) {
+              List<Page> bucketPages =
+                  executeThreeKeyFlat(
+                      engineSearcher,
+                      query,
+                      keyInfos,
+                      specs,
+                      numAggs,
+                      isCountStar,
+                      accType,
+                      truncUnits,
+                      arithUnits,
+                      groupByKeys,
+                      sortAggIndex,
+                      sortAscending,
+                      topN,
+                      columnTypeMap,
+                      bkt,
+                      threeKeyBuckets);
+              if (bucketPages != null) {
+                allBucketResults.addAll(bucketPages);
+              }
+            }
+            if (!allBucketResults.isEmpty()) {
+              if (allBucketResults.size() == 1) return allBucketResults;
+              return mergePartitionedPages(
+                  allBucketResults,
                   keyInfos,
                   specs,
-                  numAggs,
-                  isCountStar,
-                  accType,
-                  truncUnits,
-                  arithUnits,
+                  columnTypeMap,
                   groupByKeys,
+                  numAggs,
+                  accType,
                   sortAggIndex,
                   sortAscending,
-                  topN,
-                  columnTypeMap);
-          if (flatResult != null) {
-            return flatResult;
+                  topN);
+            }
           }
         }
       }
@@ -8977,7 +9321,7 @@ public final class FusedGroupByAggregate {
       this.threshold = (int) (capacity * LOAD_FACTOR);
     }
 
-    private static int hash3(long k0, long k1, long k2) {
+    static int hash3(long k0, long k1, long k2) {
       long h = k0 * 0x9E3779B97F4A7C15L + k1;
       h = h * 0xff51afd7ed558ccdL + k2;
       h ^= h >>> 33;

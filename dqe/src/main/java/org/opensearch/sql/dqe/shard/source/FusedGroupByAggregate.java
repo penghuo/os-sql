@@ -4242,12 +4242,149 @@ public final class FusedGroupByAggregate {
 
     final int slotsPerGroup = totalSlots;
     final FlatSingleKeyMap flatMap = new FlatSingleKeyMap(slotsPerGroup);
+    FlatSingleKeyMap resultMap = flatMap;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat")) {
 
-      if (query instanceof MatchAllDocsQuery) {
-        // Fast path: iterate all docs directly without Collector/Scorer overhead.
+      // === Parallel segment scan for MatchAllDocsQuery ===
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      if (!"off".equals(PARALLELISM_MODE)
+          && THREADS_PER_SHARD > 1
+          && leaves.size() > 1
+          && query instanceof MatchAllDocsQuery) {
+        int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+
+        // Partition segments round-robin by size (greedy load balance)
+        @SuppressWarnings("unchecked")
+        List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) workerSegments[i] = new ArrayList<>();
+        List<LeafReaderContext> sortedLeaves = new ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        final int spg = slotsPerGroup;
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<FlatSingleKeyMap>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final List<LeafReaderContext> mySegs = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    FlatSingleKeyMap wMap = new FlatSingleKeyMap(spg);
+                    try {
+                      for (LeafReaderContext leafCtx : mySegs) {
+                        LeafReader reader = leafCtx.reader();
+                        int maxDoc = reader.maxDoc();
+                        Bits liveDocs = reader.getLiveDocs();
+                        SortedNumericDocValues dv0 =
+                            reader.getSortedNumericDocValues(keyInfos.get(0).name());
+
+                        SortedNumericDocValues[] numericAggDvs =
+                            new SortedNumericDocValues[numAggs];
+                        SortedSetDocValues[] lengthVarcharDvs = new SortedSetDocValues[numAggs];
+                        int[][] ordLengthMaps = new int[numAggs][];
+                        boolean[] aggApplyLength = new boolean[numAggs];
+                        for (int i = 0; i < numAggs; i++) {
+                          if (!isCountStar[i]) {
+                            if (specs.get(i).applyLength) {
+                              SortedSetDocValues varcharDv =
+                                  reader.getSortedSetDocValues(specs.get(i).arg);
+                              lengthVarcharDvs[i] = varcharDv;
+                              aggApplyLength[i] = true;
+                              if (varcharDv != null) {
+                                int ordCount =
+                                    (int) Math.min(varcharDv.getValueCount(), 10_000_000);
+                                int[] ordLengths = new int[ordCount];
+                                for (int ord = 0; ord < ordCount; ord++) {
+                                  ordLengths[ord] = varcharDv.lookupOrd(ord).length;
+                                }
+                                ordLengthMaps[i] = ordLengths;
+                              }
+                            } else {
+                              numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+                            }
+                          }
+                        }
+
+                        if (liveDocs == null) {
+                          for (int doc = 0; doc < maxDoc; doc++) {
+                            collectFlatSingleKeyDocWithLength(
+                                doc,
+                                dv0,
+                                wMap,
+                                spg,
+                                numAggs,
+                                isCountStar,
+                                accType,
+                                accOffset,
+                                numericAggDvs,
+                                lengthVarcharDvs,
+                                ordLengthMaps,
+                                aggApplyLength);
+                          }
+                        } else {
+                          for (int doc = 0; doc < maxDoc; doc++) {
+                            if (!liveDocs.get(doc)) continue;
+                            collectFlatSingleKeyDocWithLength(
+                                doc,
+                                dv0,
+                                wMap,
+                                spg,
+                                numAggs,
+                                isCountStar,
+                                accType,
+                                accOffset,
+                                numericAggDvs,
+                                lengthVarcharDvs,
+                                ordLengthMaps,
+                                aggApplyLength);
+                          }
+                        }
+                      }
+                    } catch (IOException e) {
+                      throw new java.io.UncheckedIOException(e);
+                    }
+                    return wMap;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+        // Merge: pick largest as base, merge others into it
+        FlatSingleKeyMap[] workerMaps = new FlatSingleKeyMap[numWorkers];
+        int largestIdx = 0;
+        for (int i = 0; i < numWorkers; i++) {
+          workerMaps[i] = futures[i].join();
+          if (workerMaps[i].size > workerMaps[largestIdx].size) largestIdx = i;
+        }
+        FlatSingleKeyMap base = workerMaps[largestIdx];
+        for (int i = 0; i < numWorkers; i++) {
+          if (i == largestIdx) continue;
+          FlatSingleKeyMap other = workerMaps[i];
+          for (int s = 0; s < other.capacity; s++) {
+            if (other.occupied[s]) {
+              int slot = base.findOrInsert(other.keys[s]);
+              for (int a = 0; a < spg; a++) {
+                base.accData[slot * spg + a] += other.accData[s * spg + a];
+              }
+            }
+          }
+        }
+        resultMap = base;
+      } else if (query instanceof MatchAllDocsQuery) {
+        // Fast path (sequential): iterate all docs directly without Collector/Scorer overhead.
         for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
           LeafReader reader = leafCtx.reader();
           int maxDoc = reader.maxDoc();
@@ -4380,7 +4517,7 @@ public final class FusedGroupByAggregate {
       }
     }
 
-    if (flatMap.size == 0) return List.of();
+    if (resultMap.size == 0) return List.of();
 
     int numGroupKeys = groupByKeys.size();
     int totalColumns = numGroupKeys + numAggs;
@@ -4389,22 +4526,22 @@ public final class FusedGroupByAggregate {
     int[] outputSlots;
     int outputCount;
 
-    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+    if (sortAggIndex >= 0 && topN > 0 && topN < resultMap.size) {
       int sortAccOff = accOffset[sortAggIndex];
-      int n = (int) Math.min(topN, flatMap.size);
+      int n = (int) Math.min(topN, resultMap.size);
       int[] heap = new int[n];
       int heapSize = 0;
-      for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (!flatMap.occupied[slot]) continue;
-        long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
+      for (int slot = 0; slot < resultMap.capacity; slot++) {
+        if (!resultMap.occupied[slot]) continue;
+        long val = resultMap.accData[slot * slotsPerGroup + sortAccOff];
         if (heapSize < n) {
           heap[heapSize] = slot;
           heapSize++;
           int k = heapSize - 1;
           while (k > 0) {
             int parent = (k - 1) >>> 1;
-            long pVal = flatMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
-            long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+            long pVal = resultMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
+            long kVal = resultMap.accData[heap[k] * slotsPerGroup + sortAccOff];
             boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
             if (swap) {
               int tmp = heap[parent];
@@ -4414,7 +4551,7 @@ public final class FusedGroupByAggregate {
             } else break;
           }
         } else {
-          long rootVal = flatMap.accData[heap[0] * slotsPerGroup + sortAccOff];
+          long rootVal = resultMap.accData[heap[0] * slotsPerGroup + sortAccOff];
           boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
           if (better) {
             heap[0] = slot;
@@ -4425,13 +4562,13 @@ public final class FusedGroupByAggregate {
               int right = left + 1;
               int target = left;
               if (right < heapSize) {
-                long lv = flatMap.accData[heap[left] * slotsPerGroup + sortAccOff];
-                long rv = flatMap.accData[heap[right] * slotsPerGroup + sortAccOff];
+                long lv = resultMap.accData[heap[left] * slotsPerGroup + sortAccOff];
+                long rv = resultMap.accData[heap[right] * slotsPerGroup + sortAccOff];
                 boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
                 if (pickRight) target = right;
               }
-              long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
-              long tVal = flatMap.accData[heap[target] * slotsPerGroup + sortAccOff];
+              long kVal = resultMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+              long tVal = resultMap.accData[heap[target] * slotsPerGroup + sortAccOff];
               boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
               if (swap) {
                 int tmp = heap[k];
@@ -4445,19 +4582,19 @@ public final class FusedGroupByAggregate {
       }
       outputSlots = heap;
       outputCount = heapSize;
-    } else if (topN > 0 && topN < flatMap.size) {
-      int n = (int) Math.min(topN, flatMap.size);
+    } else if (topN > 0 && topN < resultMap.size) {
+      int n = (int) Math.min(topN, resultMap.size);
       outputSlots = new int[n];
       int idx = 0;
-      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      for (int slot = 0; slot < resultMap.capacity && idx < n; slot++) {
+        if (resultMap.occupied[slot]) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     } else {
-      outputSlots = new int[flatMap.size];
+      outputSlots = new int[resultMap.size];
       int idx = 0;
-      for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+      for (int slot = 0; slot < resultMap.capacity; slot++) {
+        if (resultMap.occupied[slot]) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -4470,18 +4607,18 @@ public final class FusedGroupByAggregate {
     }
     for (int o = 0; o < outputCount; o++) {
       int slot = outputSlots[o];
-      writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys[slot]);
+      writeNumericKeyValue(builders[0], keyInfos.get(0), resultMap.keys[slot]);
       int base = slot * slotsPerGroup;
       for (int a = 0; a < numAggs; a++) {
         int off = base + accOffset[a];
         switch (accType[a]) {
           case 0: // COUNT
           case 1: // SUM long
-            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], resultMap.accData[off]);
             break;
           case 2: // AVG long
-            long sum = flatMap.accData[off];
-            long cnt = flatMap.accData[off + 1];
+            long sum = resultMap.accData[off];
+            long cnt = resultMap.accData[off + 1];
             if (cnt == 0) {
               builders[numGroupKeys + a].appendNull();
             } else {

@@ -36,6 +36,7 @@ import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
@@ -8334,6 +8335,27 @@ public final class FusedGroupByAggregate {
           columnTypeMap);
     }
 
+    // === Parallel multi-segment path (Approach C: Lucene parallel search) ===
+    if ("lucene".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1) {
+      return executeNKeyVarcharParallelLucene(
+          engineSearcher,
+          query,
+          keyInfos,
+          specs,
+          numAggs,
+          isCountStar,
+          isDoubleArg,
+          isVarcharArg,
+          accType,
+          truncUnits,
+          arithUnits,
+          groupByKeys,
+          sortAggIndex,
+          sortAscending,
+          topN,
+          columnTypeMap);
+    }
+
     // === Multi-segment path ===
     // Uses BytesRefKey (raw UTF-8 bytes) for cross-segment merge to avoid String allocation
     Map<MergedGroupKey, AccumulatorGroup> globalGroups = new LinkedHashMap<>();
@@ -9309,6 +9331,284 @@ public final class FusedGroupByAggregate {
     for (Map<MergedGroupKey, AccumulatorGroup> wMap : workerMaps) {
       mergeMergedGroupMaps(globalGroups, wMap);
     }
+
+    if (globalGroups.isEmpty()) {
+      return List.of();
+    }
+
+    return buildMergedGroupOutput(
+        globalGroups,
+        keyInfos,
+        specs,
+        numAggs,
+        groupByKeys,
+        sortAggIndex,
+        sortAscending,
+        topN,
+        columnTypeMap);
+  }
+
+  /**
+   * Lucene parallel search GROUP BY for the N-key varchar path. Uses Lucene's parallel
+   * IndexSearcher with a custom CollectorManager. Each Collector maintains its own per-segment
+   * HashMap and merges into a per-Collector MergedGroupKey map in finish(). The reduce() step
+   * merges all Collector maps.
+   */
+  private static List<Page> executeNKeyVarcharParallelLucene(
+      org.opensearch.index.engine.Engine.Searcher engineSearcher,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isDoubleArg,
+      boolean[] isVarcharArg,
+      int[] accType,
+      String[] truncUnits,
+      String[] arithUnits,
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      Map<String, Type> columnTypeMap)
+      throws Exception {
+
+    final int numKeys = keyInfos.size();
+
+    // Create a parallel IndexSearcher backed by PARALLEL_POOL
+    IndexSearcher parallelSearcher =
+        new IndexSearcher(engineSearcher.getIndexReader(), PARALLEL_POOL);
+
+    // Thread-safe queue to collect per-Collector merged-group maps.
+    // Each Collector adds its map on creation; reduce() merges them all.
+    java.util.concurrent.ConcurrentLinkedQueue<Map<MergedGroupKey, AccumulatorGroup>>
+        allCollectorMaps = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    CollectorManager<Collector, Map<MergedGroupKey, AccumulatorGroup>> collectorManager =
+        new CollectorManager<>() {
+
+          @Override
+          public Collector newCollector() {
+            Map<MergedGroupKey, AccumulatorGroup> collectorGroups = new LinkedHashMap<>();
+            allCollectorMaps.add(collectorGroups);
+
+            return new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                Object[] keyReaders = new Object[numKeys];
+                for (int i = 0; i < numKeys; i++) {
+                  KeyInfo ki = keyInfos.get(i);
+                  if (ki.isVarchar) {
+                    keyReaders[i] = context.reader().getSortedSetDocValues(ki.name);
+                  } else {
+                    keyReaders[i] = context.reader().getSortedNumericDocValues(ki.name);
+                  }
+                }
+
+                SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+                SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    AggSpec spec = specs.get(i);
+                    if (isVarcharArg[i]) {
+                      varcharAggDvs[i] = context.reader().getSortedSetDocValues(spec.arg);
+                    } else {
+                      numericAggDvs[i] = context.reader().getSortedNumericDocValues(spec.arg);
+                    }
+                  }
+                }
+
+                Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
+                NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    probeKey.reset();
+                    for (int k = 0; k < numKeys; k++) {
+                      KeyInfo ki = keyInfos.get(k);
+                      if (ki.isVarchar) {
+                        SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                        if (dv != null && dv.advanceExact(doc)) {
+                          probeKey.set(k, dv.nextOrd());
+                        } else {
+                          probeKey.setNull(k);
+                        }
+                      } else {
+                        SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
+                        if (dv != null && dv.advanceExact(doc)) {
+                          long val = dv.nextValue();
+                          if (truncUnits[k] != null) {
+                            val = truncateMillis(val, truncUnits[k]);
+                          } else if (arithUnits[k] != null) {
+                            val = applyArith(val, arithUnits[k]);
+                          }
+                          probeKey.set(k, val);
+                        } else {
+                          probeKey.setNull(k);
+                        }
+                      }
+                    }
+                    probeKey.computeHash();
+
+                    AccumulatorGroup accGroup = segmentGroups.get(probeKey);
+                    if (accGroup == null) {
+                      SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                      accGroup = createAccumulatorGroup(specs);
+                      segmentGroups.put(immutableKey, accGroup);
+                    }
+
+                    // Inline accumulation with pre-computed dispatch flags
+                    for (int i = 0; i < numAggs; i++) {
+                      MergeableAccumulator acc = accGroup.accumulators[i];
+                      if (isCountStar[i]) {
+                        ((CountStarAccum) acc).count++;
+                        continue;
+                      }
+                      if (isVarcharArg[i]) {
+                        SortedSetDocValues varcharDv = varcharAggDvs[i];
+                        if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                          BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+                          String val = bytes.utf8ToString();
+                          switch (accType[i]) {
+                            case 5:
+                              ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                              break;
+                            case 3:
+                              MinAccum ma = (MinAccum) acc;
+                              if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                                ma.objectVal = val;
+                                ma.hasValue = true;
+                              }
+                              break;
+                            case 4:
+                              MaxAccum xa = (MaxAccum) acc;
+                              if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                                xa.objectVal = val;
+                                xa.hasValue = true;
+                              }
+                              break;
+                          }
+                        }
+                        continue;
+                      }
+                      SortedNumericDocValues aggDv = numericAggDvs[i];
+                      if (aggDv != null && aggDv.advanceExact(doc)) {
+                        long rawVal = aggDv.nextValue();
+                        switch (accType[i]) {
+                          case 0:
+                            ((CountStarAccum) acc).count++;
+                            break;
+                          case 1:
+                            SumAccum sa = (SumAccum) acc;
+                            sa.hasValue = true;
+                            sa.longSum += rawVal;
+                            break;
+                          case 2:
+                            AvgAccum aa = (AvgAccum) acc;
+                            aa.count++;
+                            aa.longSum += rawVal;
+                            break;
+                          case 3:
+                            MinAccum mna = (MinAccum) acc;
+                            mna.hasValue = true;
+                            if (isDoubleArg[i]) {
+                              double d = Double.longBitsToDouble(rawVal);
+                              if (d < mna.doubleVal) mna.doubleVal = d;
+                            } else {
+                              if (rawVal < mna.longVal) mna.longVal = rawVal;
+                            }
+                            break;
+                          case 4:
+                            MaxAccum mxa = (MaxAccum) acc;
+                            mxa.hasValue = true;
+                            if (isDoubleArg[i]) {
+                              double d = Double.longBitsToDouble(rawVal);
+                              if (d > mxa.doubleVal) mxa.doubleVal = d;
+                            } else {
+                              if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+                            }
+                            break;
+                          case 5:
+                            CountDistinctAccum cda = (CountDistinctAccum) acc;
+                            if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                            else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                            break;
+                          case 6:
+                            SumAccum sad = (SumAccum) acc;
+                            sad.hasValue = true;
+                            sad.doubleSum += Double.longBitsToDouble(rawVal);
+                            break;
+                          case 7:
+                            AvgAccum aad = (AvgAccum) acc;
+                            aad.count++;
+                            aad.doubleSum += Double.longBitsToDouble(rawVal);
+                            break;
+                        }
+                      }
+                    }
+                  }
+
+                  @Override
+                  public void finish() throws IOException {
+                    // Resolve segment ordinals to actual values and merge into collector's map
+                    for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry :
+                        segmentGroups.entrySet()) {
+                      SegmentGroupKey sgk = entry.getKey();
+                      AccumulatorGroup segAccs = entry.getValue();
+
+                      Object[] resolvedKeys = new Object[numKeys];
+                      for (int k = 0; k < numKeys; k++) {
+                        if (sgk.nulls[k]) {
+                          resolvedKeys[k] = null;
+                        } else if (keyInfos.get(k).isVarchar) {
+                          SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                          if (dv != null) {
+                            BytesRef bytes = dv.lookupOrd(sgk.values[k]);
+                            resolvedKeys[k] = new BytesRefKey(bytes);
+                          } else {
+                            resolvedKeys[k] = new BytesRefKey(new BytesRef(""));
+                          }
+                        } else {
+                          resolvedKeys[k] = sgk.values[k];
+                        }
+                      }
+
+                      MergedGroupKey mgk = new MergedGroupKey(resolvedKeys, keyInfos);
+                      AccumulatorGroup existing = collectorGroups.get(mgk);
+                      if (existing == null) {
+                        collectorGroups.put(mgk, segAccs);
+                      } else {
+                        existing.merge(segAccs);
+                      }
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            };
+          }
+
+          @Override
+          public Map<MergedGroupKey, AccumulatorGroup> reduce(
+              java.util.Collection<Collector> collectors) {
+            Map<MergedGroupKey, AccumulatorGroup> merged = new LinkedHashMap<>();
+            for (Map<MergedGroupKey, AccumulatorGroup> cMap : allCollectorMaps) {
+              mergeMergedGroupMaps(merged, cMap);
+            }
+            return merged;
+          }
+        };
+
+    Map<MergedGroupKey, AccumulatorGroup> globalGroups =
+        parallelSearcher.search(query, collectorManager);
 
     if (globalGroups.isEmpty()) {
       return List.of();

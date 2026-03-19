@@ -29,6 +29,7 @@ import org.apache.lucene.index.PointValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -668,71 +669,226 @@ public final class FusedScanAggregate {
     // significantly faster because it reads the compressed doc value stream sequentially
     // instead of seeking to each doc position individually. This also improves CPU cache
     // utilization since we're reading one column's data contiguously before moving to the next.
-    for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-      LeafReader reader = leafCtx.reader();
-      int maxDoc = reader.maxDoc();
-      totalDocs += maxDoc;
 
-      for (int c = 0; c < numCols; c++) {
-        SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
-        if (dv == null) continue;
+    // Parallelize across segments using ForkJoinPool
+    List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+    int numWorkers =
+        Math.min(
+            Math.max(
+                1,
+                Runtime.getRuntime().availableProcessors()
+                    / Integer.getInteger("dqe.numLocalShards", 4)),
+            leaves.size());
 
-        long localCount = 0;
+    if (numWorkers > 1 && leaves.size() > 1) {
+      // Parallel path: partition segments among workers using largest-first assignment
+      @SuppressWarnings("unchecked")
+      List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+      long[] workerDocCounts = new long[numWorkers];
+      for (int i = 0; i < numWorkers; i++) {
+        workerSegments[i] = new java.util.ArrayList<>();
+      }
 
-        if (colNeedsDouble[c]) {
-          // Double accumulation for AVG columns to avoid long overflow
-          double localDoubleSum = 0;
-          if (needMin || needMax) {
-            long localMin = Long.MAX_VALUE;
-            long localMax = Long.MIN_VALUE;
-            int doc = dv.nextDoc();
-            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              long val = dv.nextValue();
-              localDoubleSum += val;
-              localCount++;
-              if (val < localMin) localMin = val;
-              if (val > localMax) localMax = val;
-              doc = dv.nextDoc();
-            }
-            if (localMin < colMin[c]) colMin[c] = localMin;
-            if (localMax > colMax[c]) colMax[c] = localMax;
-          } else {
-            int doc = dv.nextDoc();
-            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              localDoubleSum += dv.nextValue();
-              localCount++;
-              doc = dv.nextDoc();
-            }
-          }
-          colDoubleSum[c] += localDoubleSum;
-        } else {
-          // Long accumulation for SUM/COUNT columns
-          long localSum = 0;
-          if (needMin || needMax) {
-            long localMin = Long.MAX_VALUE;
-            long localMax = Long.MIN_VALUE;
-            int doc = dv.nextDoc();
-            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              long val = dv.nextValue();
-              localSum += val;
-              localCount++;
-              if (val < localMin) localMin = val;
-              if (val > localMax) localMax = val;
-              doc = dv.nextDoc();
-            }
-            if (localMin < colMin[c]) colMin[c] = localMin;
-            if (localMax > colMax[c]) colMax[c] = localMax;
-          } else {
-            int doc = dv.nextDoc();
-            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              localSum += dv.nextValue();
-              localCount++;
-              doc = dv.nextDoc();
-            }
-          }
-          colSum[c] += localSum;
+      // Sort segments by doc count descending, assign largest-first to lightest worker
+      java.util.List<LeafReaderContext> sortedLeaves = new java.util.ArrayList<>(leaves);
+      sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+      for (LeafReaderContext leaf : sortedLeaves) {
+        int lightest = 0;
+        for (int i = 1; i < numWorkers; i++) {
+          if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
         }
-        colCount[c] += localCount;
+        workerSegments[lightest].add(leaf);
+        workerDocCounts[lightest] += leaf.reader().maxDoc();
+      }
+
+      // Capture effectively-final locals for lambda
+      final int nc = numCols;
+      final boolean needMinF = needMin, needMaxF = needMax;
+      final boolean[] colNeedsDoubleF = colNeedsDouble;
+
+      // Each worker packs results into a long[]:
+      //   [totalDocs, colSum[0..nc-1], colDoubleSumBits[0..nc-1],
+      //    colCount[0..nc-1], colMin[0..nc-1], colMax[0..nc-1]]
+      @SuppressWarnings("unchecked")
+      java.util.concurrent.CompletableFuture<long[]>[] futures =
+          new java.util.concurrent.CompletableFuture[numWorkers];
+
+      for (int w = 0; w < numWorkers; w++) {
+        final List<LeafReaderContext> mySegments = workerSegments[w];
+        futures[w] =
+            java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> {
+                  long[] pack = new long[1 + nc * 5];
+                  long[] wColSum = new long[nc];
+                  double[] wColDoubleSum = new double[nc];
+                  long[] wColCount = new long[nc];
+                  long[] wColMin = new long[nc];
+                  long[] wColMax = new long[nc];
+                  for (int i = 0; i < nc; i++) {
+                    wColMin[i] = Long.MAX_VALUE;
+                    wColMax[i] = Long.MIN_VALUE;
+                  }
+                  long wTotalDocs = 0;
+
+                  try {
+                    for (LeafReaderContext leafCtx : mySegments) {
+                      LeafReader reader = leafCtx.reader();
+                      wTotalDocs += reader.maxDoc();
+
+                      for (int c = 0; c < nc; c++) {
+                        SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
+                        if (dv == null) continue;
+                        long localCount = 0;
+
+                        if (colNeedsDoubleF[c]) {
+                          double localDoubleSum = 0;
+                          if (needMinF || needMaxF) {
+                            long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
+                            int doc = dv.nextDoc();
+                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                              long val = dv.nextValue();
+                              localDoubleSum += val;
+                              localCount++;
+                              if (val < localMin) localMin = val;
+                              if (val > localMax) localMax = val;
+                              doc = dv.nextDoc();
+                            }
+                            if (localMin < wColMin[c]) wColMin[c] = localMin;
+                            if (localMax > wColMax[c]) wColMax[c] = localMax;
+                          } else {
+                            int doc = dv.nextDoc();
+                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                              localDoubleSum += dv.nextValue();
+                              localCount++;
+                              doc = dv.nextDoc();
+                            }
+                          }
+                          wColDoubleSum[c] += localDoubleSum;
+                        } else {
+                          long localSum = 0;
+                          if (needMinF || needMaxF) {
+                            long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
+                            int doc = dv.nextDoc();
+                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                              long val = dv.nextValue();
+                              localSum += val;
+                              localCount++;
+                              if (val < localMin) localMin = val;
+                              if (val > localMax) localMax = val;
+                              doc = dv.nextDoc();
+                            }
+                            if (localMin < wColMin[c]) wColMin[c] = localMin;
+                            if (localMax > wColMax[c]) wColMax[c] = localMax;
+                          } else {
+                            int doc = dv.nextDoc();
+                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                              localSum += dv.nextValue();
+                              localCount++;
+                              doc = dv.nextDoc();
+                            }
+                          }
+                          wColSum[c] += localSum;
+                        }
+                        wColCount[c] += localCount;
+                      }
+                    }
+                  } catch (java.io.IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                  }
+
+                  // Pack results into long array
+                  pack[0] = wTotalDocs;
+                  for (int c = 0; c < nc; c++) {
+                    pack[1 + c] = wColSum[c];
+                    pack[1 + nc + c] = Double.doubleToLongBits(wColDoubleSum[c]);
+                    pack[1 + 2 * nc + c] = wColCount[c];
+                    pack[1 + 3 * nc + c] = wColMin[c];
+                    pack[1 + 4 * nc + c] = wColMax[c];
+                  }
+                  return pack;
+                },
+                java.util.concurrent.ForkJoinPool.commonPool());
+      }
+
+      // Merge worker results
+      java.util.concurrent.CompletableFuture.allOf(futures).join();
+      for (var future : futures) {
+        long[] pack = future.join();
+        totalDocs += pack[0];
+        for (int c = 0; c < numCols; c++) {
+          colSum[c] += pack[1 + c];
+          colDoubleSum[c] += Double.longBitsToDouble(pack[1 + numCols + c]);
+          colCount[c] += pack[1 + 2 * numCols + c];
+          if (pack[1 + 3 * numCols + c] < colMin[c]) colMin[c] = pack[1 + 3 * numCols + c];
+          if (pack[1 + 4 * numCols + c] > colMax[c]) colMax[c] = pack[1 + 4 * numCols + c];
+        }
+      }
+    } else {
+      // Sequential path: single worker or single segment
+      for (LeafReaderContext leafCtx : leaves) {
+        LeafReader reader = leafCtx.reader();
+        int maxDoc = reader.maxDoc();
+        totalDocs += maxDoc;
+
+        for (int c = 0; c < numCols; c++) {
+          SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
+          if (dv == null) continue;
+
+          long localCount = 0;
+
+          if (colNeedsDouble[c]) {
+            double localDoubleSum = 0;
+            if (needMin || needMax) {
+              long localMin = Long.MAX_VALUE;
+              long localMax = Long.MIN_VALUE;
+              int doc = dv.nextDoc();
+              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                long val = dv.nextValue();
+                localDoubleSum += val;
+                localCount++;
+                if (val < localMin) localMin = val;
+                if (val > localMax) localMax = val;
+                doc = dv.nextDoc();
+              }
+              if (localMin < colMin[c]) colMin[c] = localMin;
+              if (localMax > colMax[c]) colMax[c] = localMax;
+            } else {
+              int doc = dv.nextDoc();
+              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                localDoubleSum += dv.nextValue();
+                localCount++;
+                doc = dv.nextDoc();
+              }
+            }
+            colDoubleSum[c] += localDoubleSum;
+          } else {
+            long localSum = 0;
+            if (needMin || needMax) {
+              long localMin = Long.MAX_VALUE;
+              long localMax = Long.MIN_VALUE;
+              int doc = dv.nextDoc();
+              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                long val = dv.nextValue();
+                localSum += val;
+                localCount++;
+                if (val < localMin) localMin = val;
+                if (val > localMax) localMax = val;
+                doc = dv.nextDoc();
+              }
+              if (localMin < colMin[c]) colMin[c] = localMin;
+              if (localMax > colMax[c]) colMax[c] = localMax;
+            } else {
+              int doc = dv.nextDoc();
+              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                localSum += dv.nextValue();
+                localCount++;
+                doc = dv.nextDoc();
+              }
+            }
+            colSum[c] += localSum;
+          }
+          colCount[c] += localCount;
+        }
       }
     }
 

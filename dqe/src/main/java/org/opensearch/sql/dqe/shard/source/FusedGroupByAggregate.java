@@ -1453,6 +1453,202 @@ public final class FusedGroupByAggregate {
         // Fall through to multi-segment path for very large ordinal spaces
       }
 
+      // === Parallel multi-segment path ===
+      if (!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1) {
+        int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+        // Partition segments: largest-first to lightest worker
+        @SuppressWarnings("unchecked")
+        List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) workerSegments[i] = new ArrayList<>();
+        List<LeafReaderContext> sortedLeaves = new ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        // Create Weight for per-segment Scorers
+        IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+        Weight weight =
+            luceneSearcher.createWeight(
+                luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<HashMap<BytesRefKey, long[]>>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final List<LeafReaderContext> mySegments = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    HashMap<BytesRefKey, long[]> workerCounts = new HashMap<>();
+                    try {
+                      for (LeafReaderContext leafCtx : mySegments) {
+                        Scorer scorer = weight.scorer(leafCtx);
+                        if (scorer == null) continue;
+                        SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+                        if (dv == null) continue;
+                        long ordCount = dv.getValueCount();
+                        long[] ordCounts =
+                            (ordCount > 0 && ordCount <= 1_000_000)
+                                ? new long[(int) ordCount]
+                                : null;
+                        HashMap<Long, long[]> ordMap = (ordCounts == null) ? new HashMap<>() : null;
+
+                        DocIdSetIterator docIt = scorer.iterator();
+                        int doc;
+                        while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                          if (dv.advanceExact(doc)) {
+                            long ord = dv.nextOrd();
+                            if (ordCounts != null) {
+                              ordCounts[(int) ord]++;
+                            } else {
+                              ordMap.merge(
+                                  ord,
+                                  new long[] {1},
+                                  (a, b) -> {
+                                    a[0]++;
+                                    return a;
+                                  });
+                            }
+                          }
+                        }
+
+                        // Resolve ordinals and merge into worker map
+                        if (ordCounts != null) {
+                          for (int i = 0; i < ordCounts.length; i++) {
+                            if (ordCounts[i] > 0) {
+                              BytesRef bytes = dv.lookupOrd(i);
+                              BytesRefKey key = new BytesRefKey(bytes);
+                              long[] existing = workerCounts.get(key);
+                              if (existing == null) {
+                                workerCounts.put(key, new long[] {ordCounts[i]});
+                              } else {
+                                existing[0] += ordCounts[i];
+                              }
+                            }
+                          }
+                        } else if (ordMap != null) {
+                          for (Map.Entry<Long, long[]> entry : ordMap.entrySet()) {
+                            BytesRef bytes = dv.lookupOrd(entry.getKey());
+                            BytesRefKey key = new BytesRefKey(bytes);
+                            long[] existing = workerCounts.get(key);
+                            if (existing == null) {
+                              workerCounts.put(key, new long[] {entry.getValue()[0]});
+                            } else {
+                              existing[0] += entry.getValue()[0];
+                            }
+                          }
+                        }
+                      }
+                    } catch (IOException e) {
+                      throw new java.io.UncheckedIOException(e);
+                    }
+                    return workerCounts;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+        HashMap<BytesRefKey, long[]> globalCounts = new HashMap<>();
+        for (var future : futures) {
+          HashMap<BytesRefKey, long[]> wMap = future.join();
+          for (Map.Entry<BytesRefKey, long[]> e : wMap.entrySet()) {
+            long[] existing = globalCounts.get(e.getKey());
+            if (existing == null) {
+              globalCounts.put(e.getKey(), e.getValue());
+            } else {
+              existing[0] += e.getValue()[0];
+            }
+          }
+        }
+
+        if (globalCounts.isEmpty()) return List.of();
+
+        int groupCount = globalCounts.size();
+
+        // Top-N selection for COUNT(*) single-varchar
+        if (sortAggIndex >= 0 && topN > 0 && topN < groupCount) {
+          int n = (int) Math.min(topN, groupCount);
+          @SuppressWarnings("unchecked")
+          Map.Entry<BytesRefKey, long[]>[] heap = new Map.Entry[n];
+          int heapSize = 0;
+          for (Map.Entry<BytesRefKey, long[]> entry : globalCounts.entrySet()) {
+            if (heapSize < n) {
+              heap[heapSize++] = entry;
+              int ki = heapSize - 1;
+              while (ki > 0) {
+                int parent = (ki - 1) >>> 1;
+                boolean swap =
+                    sortAscending
+                        ? (heap[ki].getValue()[0] > heap[parent].getValue()[0])
+                        : (heap[ki].getValue()[0] < heap[parent].getValue()[0]);
+                if (swap) {
+                  var tmp = heap[parent];
+                  heap[parent] = heap[ki];
+                  heap[ki] = tmp;
+                  ki = parent;
+                } else break;
+              }
+            } else {
+              long val = entry.getValue()[0];
+              boolean better =
+                  sortAscending ? (val < heap[0].getValue()[0]) : (val > heap[0].getValue()[0]);
+              if (better) {
+                heap[0] = entry;
+                int ki = 0;
+                while (true) {
+                  int left = 2 * ki + 1;
+                  if (left >= heapSize) break;
+                  int right = left + 1;
+                  int target = left;
+                  if (right < heapSize) {
+                    boolean pickRight =
+                        sortAscending
+                            ? (heap[right].getValue()[0] > heap[left].getValue()[0])
+                            : (heap[right].getValue()[0] < heap[left].getValue()[0]);
+                    if (pickRight) target = right;
+                  }
+                  boolean swap =
+                      sortAscending
+                          ? (heap[target].getValue()[0] > heap[ki].getValue()[0])
+                          : (heap[target].getValue()[0] < heap[ki].getValue()[0]);
+                  if (swap) {
+                    var tmp = heap[ki];
+                    heap[ki] = heap[target];
+                    heap[target] = tmp;
+                    ki = target;
+                  } else break;
+                }
+              }
+            }
+          }
+          BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+          BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+          for (int i = 0; i < heapSize; i++) {
+            VarcharType.VARCHAR.writeSlice(
+                keyBuilder, Slices.wrappedBuffer(heap[i].getKey().bytes));
+            BigintType.BIGINT.writeLong(countBuilder, heap[i].getValue()[0]);
+          }
+          return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+        }
+
+        BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+        BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+        for (Map.Entry<BytesRefKey, long[]> entry : globalCounts.entrySet()) {
+          VarcharType.VARCHAR.writeSlice(keyBuilder, Slices.wrappedBuffer(entry.getKey().bytes));
+          BigintType.BIGINT.writeLong(countBuilder, entry.getValue()[0]);
+        }
+        return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+      }
+
       // === Multi-segment path ===
       // Use HashMap<BytesRefKey, long[]> to avoid String allocation during cross-segment merge.
       HashMap<BytesRefKey, long[]> globalCounts = new HashMap<>();
@@ -1876,6 +2072,152 @@ public final class FusedGroupByAggregate {
           return List.of(new Page(blocks));
         }
         // Fall through to multi-segment path
+      }
+
+      // === Parallel multi-segment path ===
+      if (!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1) {
+        int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+        @SuppressWarnings("unchecked")
+        List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) workerSegments[i] = new ArrayList<>();
+        List<LeafReaderContext> sortedLeaves = new ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+        Weight weight =
+            luceneSearcher.createWeight(
+                luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<HashMap<BytesRefKey, AccumulatorGroup>>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final List<LeafReaderContext> mySegments = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    HashMap<BytesRefKey, AccumulatorGroup> workerGroups = new HashMap<>();
+                    try {
+                      for (LeafReaderContext leafCtx : mySegments) {
+                        Scorer scorer = weight.scorer(leafCtx);
+                        if (scorer == null) continue;
+                        SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+                        if (dv == null) continue;
+                        long ordCount = dv.getValueCount();
+                        AccumulatorGroup[] ordGroups =
+                            (ordCount > 0 && ordCount <= 1_000_000)
+                                ? new AccumulatorGroup[(int) ordCount]
+                                : null;
+                        if (ordGroups == null) continue;
+
+                        // Open agg doc values
+                        SortedNumericDocValues[] numericAggDvs =
+                            new SortedNumericDocValues[numAggs];
+                        SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+                        for (int i = 0; i < numAggs; i++) {
+                          if (!isCountStar[i]) {
+                            AggSpec spec = specs.get(i);
+                            if (isVarcharArg[i]) {
+                              varcharAggDvs[i] = leafCtx.reader().getSortedSetDocValues(spec.arg);
+                            } else {
+                              numericAggDvs[i] =
+                                  leafCtx.reader().getSortedNumericDocValues(spec.arg);
+                            }
+                          }
+                        }
+
+                        DocIdSetIterator docIt = scorer.iterator();
+                        int doc;
+                        while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                          if (!dv.advanceExact(doc)) continue;
+                          int ord = (int) dv.nextOrd();
+                          AccumulatorGroup accGroup = ordGroups[ord];
+                          if (accGroup == null) {
+                            accGroup = createAccumulatorGroup(specs);
+                            ordGroups[ord] = accGroup;
+                          }
+                          collectVarcharGenericAccumulate(
+                              doc,
+                              accGroup,
+                              numAggs,
+                              isCountStar,
+                              isVarcharArg,
+                              isDoubleArg,
+                              accType,
+                              numericAggDvs,
+                              varcharAggDvs);
+                        }
+
+                        // Resolve and merge into worker map
+                        for (int i = 0; i < ordGroups.length; i++) {
+                          if (ordGroups[i] != null) {
+                            BytesRef bytes = dv.lookupOrd(i);
+                            BytesRefKey key = new BytesRefKey(bytes);
+                            AccumulatorGroup existing = workerGroups.get(key);
+                            if (existing == null) {
+                              workerGroups.put(key, ordGroups[i]);
+                            } else {
+                              existing.merge(ordGroups[i]);
+                            }
+                          }
+                        }
+                      }
+                    } catch (IOException e) {
+                      throw new java.io.UncheckedIOException(e);
+                    }
+                    return workerGroups;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+        HashMap<BytesRefKey, AccumulatorGroup> globalGroups = new HashMap<>();
+        for (var future : futures) {
+          HashMap<BytesRefKey, AccumulatorGroup> wMap = future.join();
+          for (Map.Entry<BytesRefKey, AccumulatorGroup> e : wMap.entrySet()) {
+            AccumulatorGroup existing = globalGroups.get(e.getKey());
+            if (existing == null) {
+              globalGroups.put(e.getKey(), e.getValue());
+            } else {
+              existing.merge(e.getValue());
+            }
+          }
+        }
+
+        if (globalGroups.isEmpty()) return List.of();
+
+        // Build output
+        int numGroupKeys = groupByKeys.size();
+        int totalColumns = numGroupKeys + numAggs;
+        int groupCount = globalGroups.size();
+        BlockBuilder[] builders = new BlockBuilder[totalColumns];
+        builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+        for (int i = 0; i < numAggs; i++) {
+          builders[numGroupKeys + i] =
+              resolveAggOutputType(specs.get(i), columnTypeMap)
+                  .createBlockBuilder(null, groupCount);
+        }
+        for (Map.Entry<BytesRefKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
+          VarcharType.VARCHAR.writeSlice(builders[0], Slices.wrappedBuffer(entry.getKey().bytes));
+          AccumulatorGroup accGroup = entry.getValue();
+          for (int a = 0; a < numAggs; a++) {
+            accGroup.accumulators[a].writeTo(builders[numGroupKeys + a]);
+          }
+        }
+        Block[] blocks = new Block[totalColumns];
+        for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+        return List.of(new Page(blocks));
       }
 
       // === Multi-segment path ===

@@ -9017,7 +9017,10 @@ public final class FusedGroupByAggregate {
     // === Global ordinals multi-segment path ===
     // Build OrdinalMap for each VARCHAR key. With global ordinals, all keys
     // become longs, enabling a single global HashMap without cross-segment merge.
-    if (query instanceof MatchAllDocsQuery) {
+    // Only use when sortAggIndex >= 0 AND topN > 0 (ORDER BY agg DESC LIMIT N) —
+    // this enables top-K pruning that keeps the HashMap small. Without ORDER BY,
+    // all ~6M groups go into the HashMap and the parallel docrange path is faster.
+    if (query instanceof MatchAllDocsQuery && sortAggIndex >= 0 && topN > 0) {
       List<LeafReaderContext> globalOrdLeaves = engineSearcher.getIndexReader().leaves();
       OrdinalMap[] ordinalMaps = new OrdinalMap[keyInfos.size()];
       boolean canUseGlobalOrd = globalOrdLeaves.size() > 1;

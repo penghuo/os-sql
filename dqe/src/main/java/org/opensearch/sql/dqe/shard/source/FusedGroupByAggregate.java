@@ -111,7 +111,7 @@ public final class FusedGroupByAggregate {
           Pattern.CASE_INSENSITIVE);
 
   // === Intra-shard parallelism configuration ===
-  private static final String PARALLELISM_MODE = System.getProperty("dqe.parallelism", "off");
+  private static final String PARALLELISM_MODE = System.getProperty("dqe.parallelism", "docrange");
   private static final int THREADS_PER_SHARD =
       Math.max(
           1,

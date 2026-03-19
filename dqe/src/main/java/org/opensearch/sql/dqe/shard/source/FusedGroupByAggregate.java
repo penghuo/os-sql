@@ -2247,6 +2247,206 @@ public final class FusedGroupByAggregate {
         // Fall through to multi-segment path
       }
 
+      // === Global ordinals multi-segment path ===
+      if (query instanceof MatchAllDocsQuery) {
+        OrdinalMap ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+        if (ordinalMap != null) {
+          long globalOrdCount = ordinalMap.getValueCount();
+          if (globalOrdCount > 0 && globalOrdCount <= 10_000_000) {
+            AccumulatorGroup[] globalGroups = new AccumulatorGroup[(int) globalOrdCount];
+
+            for (int segIdx = 0; segIdx < leaves.size(); segIdx++) {
+              LeafReaderContext leafCtx = leaves.get(segIdx);
+              SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+              if (dv == null) continue;
+              LongValues segToGlobal = ordinalMap.getGlobalOrds(segIdx);
+
+              // Open agg DocValues for this segment
+              SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+              SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i]) {
+                  AggSpec spec = specs.get(i);
+                  if (isVarcharArg[i]) {
+                    varcharAggDvs[i] = leafCtx.reader().getSortedSetDocValues(spec.arg);
+                  } else {
+                    numericAggDvs[i] = leafCtx.reader().getSortedNumericDocValues(spec.arg);
+                  }
+                }
+              }
+
+              // Scan using global ordinals - MatchAll, iterate all docs
+              SortedDocValues sdv = DocValues.unwrapSingleton(dv);
+              if (sdv != null) {
+                int doc;
+                while ((doc = sdv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                  int globalOrd = (int) segToGlobal.get(sdv.ordValue());
+                  AccumulatorGroup accGroup = globalGroups[globalOrd];
+                  if (accGroup == null) {
+                    accGroup = createAccumulatorGroup(specs);
+                    globalGroups[globalOrd] = accGroup;
+                  }
+                  collectVarcharGenericAccumulate(
+                      doc,
+                      accGroup,
+                      numAggs,
+                      isCountStar,
+                      isVarcharArg,
+                      isDoubleArg,
+                      accType,
+                      numericAggDvs,
+                      varcharAggDvs);
+                }
+              } else {
+                int doc;
+                while ((doc = dv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                  int globalOrd = (int) segToGlobal.get(dv.nextOrd());
+                  AccumulatorGroup accGroup = globalGroups[globalOrd];
+                  if (accGroup == null) {
+                    accGroup = createAccumulatorGroup(specs);
+                    globalGroups[globalOrd] = accGroup;
+                  }
+                  collectVarcharGenericAccumulate(
+                      doc,
+                      accGroup,
+                      numAggs,
+                      isCountStar,
+                      isVarcharArg,
+                      isDoubleArg,
+                      accType,
+                      numericAggDvs,
+                      varcharAggDvs);
+                }
+              }
+            }
+
+            // Count non-null groups
+            int groupCount = 0;
+            for (AccumulatorGroup g : globalGroups) {
+              if (g != null) groupCount++;
+            }
+            if (groupCount == 0) return List.of();
+
+            // Prepare segment DVs for ordinal lookup
+            SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+            for (int i = 0; i < leaves.size(); i++) {
+              segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+            }
+
+            int numGroupKeys = groupByKeys.size();
+            int totalColumns = numGroupKeys + numAggs;
+
+            // Top-N selection
+            if (sortAggIndex >= 0 && topN > 0 && topN < groupCount) {
+              int n = (int) Math.min(topN, groupCount);
+              int[] heap = new int[n];
+              long[] heapVals = new long[n];
+              int heapSize = 0;
+
+              for (int i = 0; i < globalGroups.length; i++) {
+                if (globalGroups[i] == null) continue;
+                long val = globalGroups[i].accumulators[sortAggIndex].getSortValue();
+                if (heapSize < n) {
+                  heap[heapSize] = i;
+                  heapVals[heapSize] = val;
+                  heapSize++;
+                  int k = heapSize - 1;
+                  while (k > 0) {
+                    int parent = (k - 1) >>> 1;
+                    boolean swap =
+                        sortAscending
+                            ? (heapVals[k] > heapVals[parent])
+                            : (heapVals[k] < heapVals[parent]);
+                    if (swap) {
+                      int tmpI = heap[parent];
+                      heap[parent] = heap[k];
+                      heap[k] = tmpI;
+                      long tmpV = heapVals[parent];
+                      heapVals[parent] = heapVals[k];
+                      heapVals[k] = tmpV;
+                      k = parent;
+                    } else break;
+                  }
+                } else {
+                  boolean better = sortAscending ? (val < heapVals[0]) : (val > heapVals[0]);
+                  if (better) {
+                    heap[0] = i;
+                    heapVals[0] = val;
+                    int k = 0;
+                    while (true) {
+                      int left = 2 * k + 1;
+                      if (left >= heapSize) break;
+                      int right = left + 1;
+                      int target = left;
+                      if (right < heapSize) {
+                        boolean pickRight =
+                            sortAscending
+                                ? (heapVals[right] > heapVals[left])
+                                : (heapVals[right] < heapVals[left]);
+                        if (pickRight) target = right;
+                      }
+                      boolean swap =
+                          sortAscending
+                              ? (heapVals[target] > heapVals[k])
+                              : (heapVals[target] < heapVals[k]);
+                      if (swap) {
+                        int tmpI = heap[k];
+                        heap[k] = heap[target];
+                        heap[target] = tmpI;
+                        long tmpV = heapVals[k];
+                        heapVals[k] = heapVals[target];
+                        heapVals[target] = tmpV;
+                        k = target;
+                      } else break;
+                    }
+                  }
+                }
+              }
+
+              BlockBuilder[] builders = new BlockBuilder[totalColumns];
+              builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+              for (int i = 0; i < numAggs; i++) {
+                builders[numGroupKeys + i] =
+                    resolveAggOutputType(specs.get(i), columnTypeMap)
+                        .createBlockBuilder(null, heapSize);
+              }
+              for (int i = 0; i < heapSize; i++) {
+                BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvs, heap[i]);
+                VarcharType.VARCHAR.writeSlice(
+                    builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+                for (int a = 0; a < numAggs; a++) {
+                  globalGroups[heap[i]].accumulators[a].writeTo(builders[numGroupKeys + a]);
+                }
+              }
+              Block[] blocks = new Block[totalColumns];
+              for (int j = 0; j < totalColumns; j++) blocks[j] = builders[j].build();
+              return List.of(new Page(blocks));
+            }
+
+            // No top-N: output all groups
+            BlockBuilder[] builders = new BlockBuilder[totalColumns];
+            builders[0] = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+            for (int i = 0; i < numAggs; i++) {
+              builders[numGroupKeys + i] =
+                  resolveAggOutputType(specs.get(i), columnTypeMap)
+                      .createBlockBuilder(null, groupCount);
+            }
+            for (int i = 0; i < globalGroups.length; i++) {
+              if (globalGroups[i] == null) continue;
+              BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvs, i);
+              VarcharType.VARCHAR.writeSlice(
+                  builders[0], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              for (int a = 0; a < numAggs; a++) {
+                globalGroups[i].accumulators[a].writeTo(builders[numGroupKeys + a]);
+              }
+            }
+            Block[] blocks = new Block[totalColumns];
+            for (int j = 0; j < totalColumns; j++) blocks[j] = builders[j].build();
+            return List.of(new Page(blocks));
+          }
+        }
+      }
+
       // === Parallel multi-segment path ===
       // Only parallelize when ordinal counts are manageable (< 500K per segment).
       boolean canParallelizeGeneric =

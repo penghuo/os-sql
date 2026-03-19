@@ -10814,14 +10814,32 @@ public final class FusedGroupByAggregate {
    * Build a Lucene OrdinalMap for a VARCHAR field across all segments. Maps segment-local ordinals
    * to a global ordinal space.
    */
+  // Cache for OrdinalMaps keyed by (IndexReader generation + field name).
+  // OrdinalMaps are expensive to build (~100-500ms) but safe to reuse across queries
+  // as long as the IndexReader hasn't changed (same segments).
+  private static final java.util.concurrent.ConcurrentHashMap<String, OrdinalMap>
+      ORDINAL_MAP_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
   private static OrdinalMap buildGlobalOrdinalMap(List<LeafReaderContext> leaves, String fieldName)
       throws IOException {
+    // Build cache key from leaf reader identities (stable per DirectoryReader)
+    StringBuilder keyBuilder = new StringBuilder(fieldName);
+    for (LeafReaderContext leaf : leaves) {
+      keyBuilder.append(':').append(System.identityHashCode(leaf.reader()));
+    }
+    String cacheKey = keyBuilder.toString();
+
+    OrdinalMap cached = ORDINAL_MAP_CACHE.get(cacheKey);
+    if (cached != null) return cached;
+
     SortedSetDocValues[] subs = new SortedSetDocValues[leaves.size()];
     for (int i = 0; i < leaves.size(); i++) {
       subs[i] = leaves.get(i).reader().getSortedSetDocValues(fieldName);
       if (subs[i] == null) return null;
     }
-    return OrdinalMap.build(null, subs, PackedInts.DEFAULT);
+    OrdinalMap map = OrdinalMap.build(null, subs, PackedInts.DEFAULT);
+    ORDINAL_MAP_CACHE.put(cacheKey, map);
+    return map;
   }
 
   /** Look up the term bytes for a global ordinal using OrdinalMap reverse mapping. */

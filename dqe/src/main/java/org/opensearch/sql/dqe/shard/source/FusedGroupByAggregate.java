@@ -9073,7 +9073,24 @@ public final class FusedGroupByAggregate {
     // Only use when sortAggIndex >= 0 AND topN > 0 (ORDER BY agg DESC LIMIT N) —
     // this enables top-K pruning that keeps the HashMap small. Without ORDER BY,
     // all ~6M groups go into the HashMap and the parallel docrange path is faster.
-    if (query instanceof MatchAllDocsQuery && sortAggIndex >= 0 && topN > 0) {
+    // Use global ordinals for MatchAll always, or filtered queries when VARCHAR keys have ≤1M
+    // ordinals
+    boolean useGlobalOrdMultiKey = sortAggIndex >= 0 && topN > 0;
+    if (useGlobalOrdMultiKey && !(query instanceof MatchAllDocsQuery)) {
+      // Check if all VARCHAR keys have low cardinality (OrdinalMap build cost acceptable)
+      List<LeafReaderContext> checkLeaves = engineSearcher.getIndexReader().leaves();
+      for (int k = 0; k < keyInfos.size(); k++) {
+        if (keyInfos.get(k).isVarchar && checkLeaves.size() > 0) {
+          SortedSetDocValues checkDv =
+              checkLeaves.get(0).reader().getSortedSetDocValues(keyInfos.get(k).name);
+          if (checkDv == null || checkDv.getValueCount() > 1_000_000) {
+            useGlobalOrdMultiKey = false;
+            break;
+          }
+        }
+      }
+    }
+    if (useGlobalOrdMultiKey) {
       List<LeafReaderContext> globalOrdLeaves = engineSearcher.getIndexReader().leaves();
       OrdinalMap[] ordinalMaps = new OrdinalMap[keyInfos.size()];
       boolean canUseGlobalOrd = globalOrdLeaves.size() > 1;
@@ -9127,6 +9144,17 @@ public final class FusedGroupByAggregate {
           workerDocCounts[lightest] += globalOrdLeaves.get(idx).reader().maxDoc();
         }
 
+        // Build Weight for filtered queries
+        final Weight globalOrdWeight;
+        if (query instanceof MatchAllDocsQuery) {
+          globalOrdWeight = null;
+        } else {
+          IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+          globalOrdWeight =
+              luceneSearcher.createWeight(
+                  luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+        }
+
         // Parallel scan with per-worker HashMaps
         @SuppressWarnings("unchecked")
         java.util.concurrent.CompletableFuture<Map<SegmentGroupKey, AccumulatorGroup>>[] futures =
@@ -9176,13 +9204,49 @@ public final class FusedGroupByAggregate {
                           }
                         }
 
-                        // Iterate all docs
-                        LeafReader reader = leafCtx.reader();
-                        Bits liveDocs = reader.getLiveDocs();
-                        int maxDoc = reader.maxDoc();
+                        // Iterate docs — use Scorer for filtered queries, direct for MatchAll
+                        DocIdSetIterator docIter;
+                        if (globalOrdWeight != null) {
+                          Scorer scorer = globalOrdWeight.scorer(leafCtx);
+                          if (scorer == null) continue; // no matching docs in this segment
+                          docIter = scorer.iterator();
+                        } else {
+                          // MatchAll: iterate all docs
+                          LeafReader reader = leafCtx.reader();
+                          Bits liveDocs = reader.getLiveDocs();
+                          int maxDoc = reader.maxDoc();
+                          docIter =
+                              new DocIdSetIterator() {
+                                int current = -1;
 
-                        for (int doc = 0; doc < maxDoc; doc++) {
-                          if (liveDocs != null && !liveDocs.get(doc)) continue;
+                                @Override
+                                public int docID() {
+                                  return current;
+                                }
+
+                                @Override
+                                public int nextDoc() {
+                                  while (++current < maxDoc) {
+                                    if (liveDocs == null || liveDocs.get(current)) return current;
+                                  }
+                                  return NO_MORE_DOCS;
+                                }
+
+                                @Override
+                                public int advance(int target) {
+                                  current = target - 1;
+                                  return nextDoc();
+                                }
+
+                                @Override
+                                public long cost() {
+                                  return maxDoc;
+                                }
+                              };
+                        }
+
+                        int doc;
+                        while ((doc = docIter.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
 
                           probeKey.reset();
                           for (int k = 0; k < numKeys; k++) {

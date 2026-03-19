@@ -9038,8 +9038,6 @@ public final class FusedGroupByAggregate {
 
       if (canUseGlobalOrd) {
         final int numKeys = keyInfos.size();
-        Map<SegmentGroupKey, AccumulatorGroup> globalGroups = new HashMap<>();
-        NumericProbeKey probeKey = new NumericProbeKey(numKeys);
 
         // Prepare per-segment global ordinal mappings
         LongValues[][] segToGlobalMaps = new LongValues[globalOrdLeaves.size()][numKeys];
@@ -9051,172 +9049,224 @@ public final class FusedGroupByAggregate {
           }
         }
 
-        // Scan all segments with global ordinals
-        for (int segIdx = 0; segIdx < globalOrdLeaves.size(); segIdx++) {
-          LeafReaderContext leafCtx = globalOrdLeaves.get(segIdx);
+        // Partition segments among workers (largest-first load balancing)
+        int numWorkers = Math.min(THREADS_PER_SHARD, globalOrdLeaves.size());
+        @SuppressWarnings("unchecked")
+        List<Integer>[] workerSegments = new List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) workerSegments[i] = new ArrayList<>();
 
-          // Open key DocValues
-          Object[] keyReaders = new Object[numKeys];
-          for (int i = 0; i < numKeys; i++) {
-            KeyInfo ki = keyInfos.get(i);
-            if (ki.isVarchar) {
-              keyReaders[i] = leafCtx.reader().getSortedSetDocValues(ki.name);
-            } else {
-              keyReaders[i] = leafCtx.reader().getSortedNumericDocValues(ki.name);
-            }
+        // Sort segment indices by doc count descending
+        Integer[] segIndices = new Integer[globalOrdLeaves.size()];
+        for (int i = 0; i < segIndices.length; i++) segIndices[i] = i;
+        java.util.Arrays.sort(
+            segIndices,
+            (a, b) ->
+                Integer.compare(
+                    globalOrdLeaves.get(b).reader().maxDoc(),
+                    globalOrdLeaves.get(a).reader().maxDoc()));
+        for (int idx : segIndices) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
           }
+          workerSegments[lightest].add(idx);
+          workerDocCounts[lightest] += globalOrdLeaves.get(idx).reader().maxDoc();
+        }
 
-          // Open agg DocValues
-          SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-          SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
-          for (int i = 0; i < numAggs; i++) {
-            if (!isCountStar[i]) {
-              AggSpec spec = specs.get(i);
-              if (isVarcharArg[i]) {
-                varcharAggDvs[i] = leafCtx.reader().getSortedSetDocValues(spec.arg);
-              } else {
-                numericAggDvs[i] = leafCtx.reader().getSortedNumericDocValues(spec.arg);
-              }
-            }
-          }
+        // Parallel scan with per-worker HashMaps
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<Map<SegmentGroupKey, AccumulatorGroup>>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
 
-          LongValues[] segGlobalMaps = segToGlobalMaps[segIdx];
+        for (int w = 0; w < numWorkers; w++) {
+          final List<Integer> mySegments = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    Map<SegmentGroupKey, AccumulatorGroup> workerMap = new HashMap<>();
+                    NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+                    try {
+                      for (int segIdx : mySegments) {
+                        LeafReaderContext leafCtx = globalOrdLeaves.get(segIdx);
+                        LongValues[] segGlobalMaps = segToGlobalMaps[segIdx];
 
-          // Iterate all docs (MatchAll)
-          LeafReader reader = leafCtx.reader();
-          Bits liveDocs = reader.getLiveDocs();
-          int maxDoc = reader.maxDoc();
+                        // Open key DocValues
+                        Object[] keyReaders = new Object[numKeys];
+                        for (int i = 0; i < numKeys; i++) {
+                          KeyInfo ki = keyInfos.get(i);
+                          if (ki.isVarchar) {
+                            keyReaders[i] = leafCtx.reader().getSortedSetDocValues(ki.name);
+                          } else {
+                            keyReaders[i] = leafCtx.reader().getSortedNumericDocValues(ki.name);
+                          }
+                        }
 
-          for (int doc = 0; doc < maxDoc; doc++) {
-            if (liveDocs != null && !liveDocs.get(doc)) continue;
+                        // Open agg DocValues
+                        SortedNumericDocValues[] numericAggDvs =
+                            new SortedNumericDocValues[numAggs];
+                        SortedSetDocValues[] varcharAggDvs = new SortedSetDocValues[numAggs];
+                        for (int i = 0; i < numAggs; i++) {
+                          if (!isCountStar[i]) {
+                            AggSpec spec = specs.get(i);
+                            if (isVarcharArg[i]) {
+                              varcharAggDvs[i] = leafCtx.reader().getSortedSetDocValues(spec.arg);
+                            } else {
+                              numericAggDvs[i] =
+                                  leafCtx.reader().getSortedNumericDocValues(spec.arg);
+                            }
+                          }
+                        }
 
-            probeKey.reset();
-            boolean skip = false;
-            for (int k = 0; k < numKeys; k++) {
-              KeyInfo ki = keyInfos.get(k);
-              if (ki.isVarchar) {
-                SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
-                if (dv != null && dv.advanceExact(doc)) {
-                  long segOrd = dv.nextOrd();
-                  long globalOrd = segGlobalMaps[k].get(segOrd);
-                  probeKey.set(k, globalOrd);
-                } else {
-                  probeKey.setNull(k);
-                }
-              } else {
-                SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
-                if (dv != null && dv.advanceExact(doc)) {
-                  long val = dv.nextValue();
-                  if (truncUnits[k] != null) {
-                    val = truncateMillis(val, truncUnits[k]);
-                  } else if (arithUnits[k] != null) {
-                    val = applyArith(val, arithUnits[k]);
-                  }
-                  probeKey.set(k, val);
-                } else {
-                  probeKey.setNull(k);
-                }
-              }
-            }
-            probeKey.computeHash();
+                        // Iterate all docs
+                        LeafReader reader = leafCtx.reader();
+                        Bits liveDocs = reader.getLiveDocs();
+                        int maxDoc = reader.maxDoc();
 
-            AccumulatorGroup accGroup = globalGroups.get(probeKey);
-            if (accGroup == null) {
-              SegmentGroupKey immutableKey = probeKey.toImmutableKey();
-              accGroup = createAccumulatorGroup(specs);
-              globalGroups.put(immutableKey, accGroup);
-            }
+                        for (int doc = 0; doc < maxDoc; doc++) {
+                          if (liveDocs != null && !liveDocs.get(doc)) continue;
 
-            // Inline accumulation
-            for (int i = 0; i < numAggs; i++) {
-              MergeableAccumulator acc = accGroup.accumulators[i];
-              if (isCountStar[i]) {
-                ((CountStarAccum) acc).count++;
-                continue;
-              }
-              if (isVarcharArg[i]) {
-                SortedSetDocValues varcharDv = varcharAggDvs[i];
-                if (varcharDv != null && varcharDv.advanceExact(doc)) {
-                  BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
-                  String val = bytes.utf8ToString();
-                  switch (accType[i]) {
-                    case 5:
-                      ((CountDistinctAccum) acc).objectDistinctValues.add(val);
-                      break;
-                    case 3:
-                      MinAccum ma = (MinAccum) acc;
-                      if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
-                        ma.objectVal = val;
-                        ma.hasValue = true;
+                          probeKey.reset();
+                          for (int k = 0; k < numKeys; k++) {
+                            KeyInfo ki = keyInfos.get(k);
+                            if (ki.isVarchar) {
+                              SortedSetDocValues dv = (SortedSetDocValues) keyReaders[k];
+                              if (dv != null && dv.advanceExact(doc)) {
+                                long segOrd = dv.nextOrd();
+                                long globalOrd = segGlobalMaps[k].get(segOrd);
+                                probeKey.set(k, globalOrd);
+                              } else {
+                                probeKey.setNull(k);
+                              }
+                            } else {
+                              SortedNumericDocValues dv = (SortedNumericDocValues) keyReaders[k];
+                              if (dv != null && dv.advanceExact(doc)) {
+                                long val = dv.nextValue();
+                                if (truncUnits[k] != null) {
+                                  val = truncateMillis(val, truncUnits[k]);
+                                } else if (arithUnits[k] != null) {
+                                  val = applyArith(val, arithUnits[k]);
+                                }
+                                probeKey.set(k, val);
+                              } else {
+                                probeKey.setNull(k);
+                              }
+                            }
+                          }
+                          probeKey.computeHash();
+
+                          AccumulatorGroup accGroup = workerMap.get(probeKey);
+                          if (accGroup == null) {
+                            SegmentGroupKey immutableKey = probeKey.toImmutableKey();
+                            accGroup = createAccumulatorGroup(specs);
+                            workerMap.put(immutableKey, accGroup);
+                          }
+
+                          // Inline accumulation
+                          for (int i = 0; i < numAggs; i++) {
+                            MergeableAccumulator acc = accGroup.accumulators[i];
+                            if (isCountStar[i]) {
+                              ((CountStarAccum) acc).count++;
+                              continue;
+                            }
+                            if (isVarcharArg[i]) {
+                              SortedSetDocValues varcharDv = varcharAggDvs[i];
+                              if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                                BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+                                String val = bytes.utf8ToString();
+                                switch (accType[i]) {
+                                  case 5:
+                                    ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                                    break;
+                                  case 3:
+                                    MinAccum ma = (MinAccum) acc;
+                                    if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                                      ma.objectVal = val;
+                                      ma.hasValue = true;
+                                    }
+                                    break;
+                                  case 4:
+                                    MaxAccum xa = (MaxAccum) acc;
+                                    if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                                      xa.objectVal = val;
+                                      xa.hasValue = true;
+                                    }
+                                    break;
+                                }
+                              }
+                              continue;
+                            }
+                            SortedNumericDocValues aggDv = numericAggDvs[i];
+                            if (aggDv != null && aggDv.advanceExact(doc)) {
+                              long rawVal = aggDv.nextValue();
+                              switch (accType[i]) {
+                                case 0:
+                                  ((CountStarAccum) acc).count++;
+                                  break;
+                                case 1:
+                                  SumAccum sa = (SumAccum) acc;
+                                  sa.hasValue = true;
+                                  sa.longSum += rawVal;
+                                  break;
+                                case 2:
+                                  AvgAccum aa = (AvgAccum) acc;
+                                  aa.count++;
+                                  aa.longSum += rawVal;
+                                  break;
+                                case 3:
+                                  MinAccum mna = (MinAccum) acc;
+                                  mna.hasValue = true;
+                                  if (isDoubleArg[i]) {
+                                    double d = Double.longBitsToDouble(rawVal);
+                                    if (d < mna.doubleVal) mna.doubleVal = d;
+                                  } else {
+                                    if (rawVal < mna.longVal) mna.longVal = rawVal;
+                                  }
+                                  break;
+                                case 4:
+                                  MaxAccum mxa = (MaxAccum) acc;
+                                  mxa.hasValue = true;
+                                  if (isDoubleArg[i]) {
+                                    double d = Double.longBitsToDouble(rawVal);
+                                    if (d > mxa.doubleVal) mxa.doubleVal = d;
+                                  } else {
+                                    if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+                                  }
+                                  break;
+                                case 5:
+                                  CountDistinctAccum cda = (CountDistinctAccum) acc;
+                                  if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+                                  else
+                                    cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+                                  break;
+                                case 6:
+                                  SumAccum sad = (SumAccum) acc;
+                                  sad.hasValue = true;
+                                  sad.doubleSum += Double.longBitsToDouble(rawVal);
+                                  break;
+                                case 7:
+                                  AvgAccum aad = (AvgAccum) acc;
+                                  aad.count++;
+                                  aad.doubleSum += Double.longBitsToDouble(rawVal);
+                                  break;
+                              }
+                            }
+                          }
+                        }
                       }
-                      break;
-                    case 4:
-                      MaxAccum xa = (MaxAccum) acc;
-                      if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
-                        xa.objectVal = val;
-                        xa.hasValue = true;
-                      }
-                      break;
-                  }
-                }
-                continue;
-              }
-              SortedNumericDocValues aggDv = numericAggDvs[i];
-              if (aggDv != null && aggDv.advanceExact(doc)) {
-                long rawVal = aggDv.nextValue();
-                switch (accType[i]) {
-                  case 0:
-                    ((CountStarAccum) acc).count++;
-                    break;
-                  case 1:
-                    SumAccum sa = (SumAccum) acc;
-                    sa.hasValue = true;
-                    sa.longSum += rawVal;
-                    break;
-                  case 2:
-                    AvgAccum aa = (AvgAccum) acc;
-                    aa.count++;
-                    aa.longSum += rawVal;
-                    break;
-                  case 3:
-                    MinAccum mna = (MinAccum) acc;
-                    mna.hasValue = true;
-                    if (isDoubleArg[i]) {
-                      double d = Double.longBitsToDouble(rawVal);
-                      if (d < mna.doubleVal) mna.doubleVal = d;
-                    } else {
-                      if (rawVal < mna.longVal) mna.longVal = rawVal;
+                    } catch (IOException e) {
+                      throw new java.io.UncheckedIOException(e);
                     }
-                    break;
-                  case 4:
-                    MaxAccum mxa = (MaxAccum) acc;
-                    mxa.hasValue = true;
-                    if (isDoubleArg[i]) {
-                      double d = Double.longBitsToDouble(rawVal);
-                      if (d > mxa.doubleVal) mxa.doubleVal = d;
-                    } else {
-                      if (rawVal > mxa.longVal) mxa.longVal = rawVal;
-                    }
-                    break;
-                  case 5:
-                    CountDistinctAccum cda = (CountDistinctAccum) acc;
-                    if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                    else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                    break;
-                  case 6:
-                    SumAccum sad = (SumAccum) acc;
-                    sad.hasValue = true;
-                    sad.doubleSum += Double.longBitsToDouble(rawVal);
-                    break;
-                  case 7:
-                    AvgAccum aad = (AvgAccum) acc;
-                    aad.count++;
-                    aad.doubleSum += Double.longBitsToDouble(rawVal);
-                    break;
-                }
-              }
-            }
-          }
+                    return workerMap;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        // Wait for all workers, merge maps
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+        Map<SegmentGroupKey, AccumulatorGroup> globalGroups = new HashMap<>();
+        for (var future : futures) {
+          mergeGroupMaps(globalGroups, future.join());
         }
 
         if (globalGroups.isEmpty()) {

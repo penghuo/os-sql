@@ -1454,7 +1454,18 @@ public final class FusedGroupByAggregate {
       }
 
       // === Parallel multi-segment path ===
-      if (!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1) {
+      // Only parallelize when ordinal counts are manageable (< 500K per segment).
+      // High-cardinality VARCHAR keys (e.g., URL with 18M unique values) create too many
+      // BytesRefKey copies per worker, making merge overhead exceed the parallelism benefit.
+      boolean canParallelize =
+          !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
+      if (canParallelize) {
+        SortedSetDocValues checkDv = leaves.get(0).reader().getSortedSetDocValues(columnName);
+        if (checkDv != null && checkDv.getValueCount() > 500_000) {
+          canParallelize = false;
+        }
+      }
+      if (canParallelize) {
         int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
         // Partition segments: largest-first to lightest worker
         @SuppressWarnings("unchecked")
@@ -2075,7 +2086,16 @@ public final class FusedGroupByAggregate {
       }
 
       // === Parallel multi-segment path ===
-      if (!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1) {
+      // Only parallelize when ordinal counts are manageable (< 500K per segment).
+      boolean canParallelizeGeneric =
+          !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
+      if (canParallelizeGeneric) {
+        SortedSetDocValues checkDv = leaves.get(0).reader().getSortedSetDocValues(columnName);
+        if (checkDv != null && checkDv.getValueCount() > 500_000) {
+          canParallelizeGeneric = false;
+        }
+      }
+      if (canParallelizeGeneric) {
         int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
         @SuppressWarnings("unchecked")
         List<LeafReaderContext>[] workerSegments = new List[numWorkers];

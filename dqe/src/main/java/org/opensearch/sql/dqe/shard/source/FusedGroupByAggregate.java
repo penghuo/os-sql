@@ -9137,7 +9137,12 @@ public final class FusedGroupByAggregate {
           futures[w] =
               java.util.concurrent.CompletableFuture.supplyAsync(
                   () -> {
-                    Map<SegmentGroupKey, AccumulatorGroup> workerMap = new HashMap<>();
+                    // Pre-size HashMap based on estimated docs per worker to avoid resizes.
+                    // Each worker processes ~totalDocs/numWorkers docs; assume ~50% unique groups.
+                    long estDocs = workerDocCounts[0]; // approximate
+                    int initCap = Math.min((int) (estDocs / 2), 4_000_000);
+                    Map<SegmentGroupKey, AccumulatorGroup> workerMap =
+                        new HashMap<>(Math.max(initCap, 16384), 0.75f);
                     NumericProbeKey probeKey = new NumericProbeKey(numKeys);
                     try {
                       for (int segIdx : mySegments) {
@@ -9317,9 +9322,17 @@ public final class FusedGroupByAggregate {
 
         // Wait for all workers, merge maps
         java.util.concurrent.CompletableFuture.allOf(futures).join();
-        Map<SegmentGroupKey, AccumulatorGroup> globalGroups = new HashMap<>();
-        for (var future : futures) {
-          mergeGroupMaps(globalGroups, future.join());
+        // Use largest worker map as base to avoid copying
+        Map<SegmentGroupKey, AccumulatorGroup>[] workerResults = new Map[numWorkers];
+        int largestIdx = 0;
+        for (int i = 0; i < numWorkers; i++) {
+          workerResults[i] = futures[i].join();
+          if (workerResults[i].size() > workerResults[largestIdx].size()) largestIdx = i;
+        }
+        Map<SegmentGroupKey, AccumulatorGroup> globalGroups = workerResults[largestIdx];
+        for (int i = 0; i < numWorkers; i++) {
+          if (i == largestIdx) continue;
+          mergeGroupMaps(globalGroups, workerResults[i]);
         }
 
         if (globalGroups.isEmpty()) {

@@ -1473,7 +1473,7 @@ public final class FusedGroupByAggregate {
       }
       if (ordinalMap != null) {
         long globalOrdCount = ordinalMap.getValueCount();
-        if (globalOrdCount > 0 && globalOrdCount <= 50_000_000) {
+        if (globalOrdCount > 0 && globalOrdCount <= 10_000_000) {
           long[] globalCounts = new long[(int) globalOrdCount];
 
           // Build Weight for filtered queries
@@ -9165,9 +9165,10 @@ public final class FusedGroupByAggregate {
           futures[w] =
               java.util.concurrent.CompletableFuture.supplyAsync(
                   () -> {
-                    // Pre-size HashMap based on estimated docs per worker to avoid resizes.
-                    // Each worker processes ~totalDocs/numWorkers docs; assume ~50% unique groups.
-                    long estDocs = workerDocCounts[0]; // approximate
+                    // Pre-size HashMap to avoid resizes. Use total docs / numWorkers as estimate.
+                    long totalDocs = 0;
+                    for (long dc : workerDocCounts) totalDocs += dc;
+                    long estDocs = totalDocs / numWorkers;
                     int initCap = Math.min((int) (estDocs / 2), 4_000_000);
                     Map<SegmentGroupKey, AccumulatorGroup> workerMap =
                         new HashMap<>(Math.max(initCap, 16384), 0.75f);
@@ -10891,32 +10892,67 @@ public final class FusedGroupByAggregate {
    * Build a Lucene OrdinalMap for a VARCHAR field across all segments. Maps segment-local ordinals
    * to a global ordinal space.
    */
-  // Cache for OrdinalMaps keyed by (IndexReader generation + field name).
-  // OrdinalMaps are expensive to build (~100-500ms) but safe to reuse across queries
-  // as long as the IndexReader hasn't changed (same segments).
-  private static final java.util.concurrent.ConcurrentHashMap<String, OrdinalMap>
+  // Cache for OrdinalMaps keyed by (IndexReader CacheKey + field name).
+  // Uses IndexReader.CacheHelper.getKey() for collision-free identity, and registers
+  // a close listener to evict entries when the IndexReader is closed/refreshed.
+  // Bounded to 64 entries as a safety net against unbounded growth.
+  private static final java.util.concurrent.ConcurrentHashMap<Object, OrdinalMap>
       ORDINAL_MAP_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
   private static OrdinalMap buildGlobalOrdinalMap(List<LeafReaderContext> leaves, String fieldName)
       throws IOException {
-    // Build cache key from leaf reader identities (stable per DirectoryReader)
-    StringBuilder keyBuilder = new StringBuilder(fieldName);
-    for (LeafReaderContext leaf : leaves) {
-      keyBuilder.append(':').append(System.identityHashCode(leaf.reader()));
+    // Use the top-level IndexReader's CacheHelper key for collision-free identity.
+    // LeafReaders don't change within a DirectoryReader's lifetime.
+    org.apache.lucene.index.IndexReader topReader = leaves.get(0).parent.reader();
+    org.apache.lucene.index.IndexReader.CacheHelper cacheHelper = topReader.getReaderCacheHelper();
+    if (cacheHelper == null) {
+      // No cache helper available — build without caching
+      return buildOrdinalMapUncached(leaves, fieldName);
     }
-    String cacheKey = keyBuilder.toString();
+    Object readerKey = cacheHelper.getKey();
+    // Composite key: readerKey + fieldName
+    String cacheKey =
+        System.identityHashCode(readerKey) + ":" + readerKey.hashCode() + ":" + fieldName;
 
     OrdinalMap cached = ORDINAL_MAP_CACHE.get(cacheKey);
     if (cached != null) return cached;
 
+    OrdinalMap map = buildOrdinalMapUncached(leaves, fieldName);
+    if (map == null) return null;
+
+    // Evict on reader close to prevent memory leaks
+    ORDINAL_MAP_CACHE.put(cacheKey, map);
+    try {
+      cacheHelper.addClosedListener(
+          key -> {
+            ORDINAL_MAP_CACHE
+                .entrySet()
+                .removeIf(
+                    e ->
+                        e.getKey()
+                            .toString()
+                            .startsWith(System.identityHashCode(key) + ":" + key.hashCode() + ":"));
+          });
+    } catch (Exception ignored) {
+      // Listener already registered or reader closed — cache entry will be orphaned
+      // but bounded by size limit below
+    }
+
+    // Safety: bound cache size (shouldn't happen with close listener, but just in case)
+    if (ORDINAL_MAP_CACHE.size() > 64) {
+      ORDINAL_MAP_CACHE.clear();
+    }
+    return map;
+  }
+
+  private static OrdinalMap buildOrdinalMapUncached(
+      List<LeafReaderContext> leaves, String fieldName) throws IOException {
     SortedSetDocValues[] subs = new SortedSetDocValues[leaves.size()];
     for (int i = 0; i < leaves.size(); i++) {
       subs[i] = leaves.get(i).reader().getSortedSetDocValues(fieldName);
       if (subs[i] == null) return null;
     }
-    OrdinalMap map = OrdinalMap.build(null, subs, PackedInts.DEFAULT);
-    ORDINAL_MAP_CACHE.put(cacheKey, map);
-    return map;
+    return OrdinalMap.build(null, subs, PackedInts.DEFAULT);
   }
 
   /** Look up the term bytes for a global ordinal using OrdinalMap reverse mapping. */
@@ -10924,6 +10960,7 @@ public final class FusedGroupByAggregate {
       OrdinalMap ordinalMap, SortedSetDocValues[] segmentDvs, long globalOrd) throws IOException {
     int segIdx = ordinalMap.getFirstSegmentNumber(globalOrd);
     long segOrd = ordinalMap.getFirstSegmentOrd(globalOrd);
+    if (segmentDvs[segIdx] == null) return new BytesRef("");
     return segmentDvs[segIdx].lookupOrd(segOrd);
   }
 

@@ -1457,12 +1457,19 @@ public final class FusedGroupByAggregate {
       }
 
       // === Global ordinals multi-segment path ===
-      // Only use global ordinals for full-table scans (MatchAllDocsQuery) or queries
-      // scanning >1M docs. For selective WHERE filters (e.g., Q37-Q43 with CounterID=62),
-      // the OrdinalMap build cost (~2-3s for 18M ordinals) exceeds the scan time.
+      // Use global ordinals when the OrdinalMap build cost is acceptable:
+      // - Always for MatchAllDocsQuery (full scan, build cost amortized)
+      // - For filtered queries when the field has ≤ 1M ordinals (build cost ~200ms)
+      // - Skip for high-cardinality filtered queries (e.g., URL with 18M ordinals, build ~3s)
       OrdinalMap ordinalMap = null;
       if (query instanceof MatchAllDocsQuery) {
         ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+      } else {
+        // Check first segment's ordinal count as estimate
+        SortedSetDocValues checkDv = leaves.get(0).reader().getSortedSetDocValues(columnName);
+        if (checkDv != null && checkDv.getValueCount() <= 1_000_000) {
+          ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+        }
       }
       if (ordinalMap != null) {
         long globalOrdCount = ordinalMap.getValueCount();
@@ -2248,12 +2255,29 @@ public final class FusedGroupByAggregate {
       }
 
       // === Global ordinals multi-segment path ===
-      if (query instanceof MatchAllDocsQuery) {
-        OrdinalMap ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+      // Use global ordinals for MatchAll or low-cardinality VARCHAR fields
+      {
+        OrdinalMap ordinalMap = null;
+        if (query instanceof MatchAllDocsQuery) {
+          ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+        } else {
+          SortedSetDocValues checkDv = leaves.get(0).reader().getSortedSetDocValues(columnName);
+          if (checkDv != null && checkDv.getValueCount() <= 1_000_000) {
+            ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+          }
+        }
         if (ordinalMap != null) {
           long globalOrdCount = ordinalMap.getValueCount();
           if (globalOrdCount > 0 && globalOrdCount <= 10_000_000) {
             AccumulatorGroup[] globalGroups = new AccumulatorGroup[(int) globalOrdCount];
+
+            // Build Weight for filtered queries
+            IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+            Weight weight =
+                (query instanceof MatchAllDocsQuery)
+                    ? null
+                    : luceneSearcher.createWeight(
+                        luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
 
             for (int segIdx = 0; segIdx < leaves.size(); segIdx++) {
               LeafReaderContext leafCtx = leaves.get(segIdx);
@@ -2275,47 +2299,76 @@ public final class FusedGroupByAggregate {
                 }
               }
 
-              // Scan using global ordinals - MatchAll, iterate all docs
-              SortedDocValues sdv = DocValues.unwrapSingleton(dv);
-              if (sdv != null) {
-                int doc;
-                while ((doc = sdv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-                  int globalOrd = (int) segToGlobal.get(sdv.ordValue());
-                  AccumulatorGroup accGroup = globalGroups[globalOrd];
-                  if (accGroup == null) {
-                    accGroup = createAccumulatorGroup(specs);
-                    globalGroups[globalOrd] = accGroup;
+              // Scan using global ordinals
+              if (weight == null) {
+                // MatchAll: iterate all docs directly
+                SortedDocValues sdv = DocValues.unwrapSingleton(dv);
+                if (sdv != null) {
+                  int doc;
+                  while ((doc = sdv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                    int globalOrd = (int) segToGlobal.get(sdv.ordValue());
+                    AccumulatorGroup accGroup = globalGroups[globalOrd];
+                    if (accGroup == null) {
+                      accGroup = createAccumulatorGroup(specs);
+                      globalGroups[globalOrd] = accGroup;
+                    }
+                    collectVarcharGenericAccumulate(
+                        doc,
+                        accGroup,
+                        numAggs,
+                        isCountStar,
+                        isVarcharArg,
+                        isDoubleArg,
+                        accType,
+                        numericAggDvs,
+                        varcharAggDvs);
                   }
-                  collectVarcharGenericAccumulate(
-                      doc,
-                      accGroup,
-                      numAggs,
-                      isCountStar,
-                      isVarcharArg,
-                      isDoubleArg,
-                      accType,
-                      numericAggDvs,
-                      varcharAggDvs);
+                } else {
+                  int doc;
+                  while ((doc = dv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                    int globalOrd = (int) segToGlobal.get(dv.nextOrd());
+                    AccumulatorGroup accGroup = globalGroups[globalOrd];
+                    if (accGroup == null) {
+                      accGroup = createAccumulatorGroup(specs);
+                      globalGroups[globalOrd] = accGroup;
+                    }
+                    collectVarcharGenericAccumulate(
+                        doc,
+                        accGroup,
+                        numAggs,
+                        isCountStar,
+                        isVarcharArg,
+                        isDoubleArg,
+                        accType,
+                        numericAggDvs,
+                        varcharAggDvs);
+                  }
                 }
               } else {
-                int doc;
-                while ((doc = dv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-                  int globalOrd = (int) segToGlobal.get(dv.nextOrd());
-                  AccumulatorGroup accGroup = globalGroups[globalOrd];
-                  if (accGroup == null) {
-                    accGroup = createAccumulatorGroup(specs);
-                    globalGroups[globalOrd] = accGroup;
+                // Filtered query: use Scorer
+                Scorer scorer = weight.scorer(leafCtx);
+                if (scorer != null) {
+                  DocIdSetIterator docIt = scorer.iterator();
+                  int doc;
+                  while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                    if (!dv.advanceExact(doc)) continue;
+                    int globalOrd = (int) segToGlobal.get(dv.nextOrd());
+                    AccumulatorGroup accGroup = globalGroups[globalOrd];
+                    if (accGroup == null) {
+                      accGroup = createAccumulatorGroup(specs);
+                      globalGroups[globalOrd] = accGroup;
+                    }
+                    collectVarcharGenericAccumulate(
+                        doc,
+                        accGroup,
+                        numAggs,
+                        isCountStar,
+                        isVarcharArg,
+                        isDoubleArg,
+                        accType,
+                        numericAggDvs,
+                        varcharAggDvs);
                   }
-                  collectVarcharGenericAccumulate(
-                      doc,
-                      accGroup,
-                      numAggs,
-                      isCountStar,
-                      isVarcharArg,
-                      isDoubleArg,
-                      accType,
-                      numericAggDvs,
-                      varcharAggDvs);
                 }
               }
             }

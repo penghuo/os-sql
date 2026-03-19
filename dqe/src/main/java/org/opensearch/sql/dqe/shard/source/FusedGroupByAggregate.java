@@ -106,6 +106,20 @@ public final class FusedGroupByAggregate {
           "^EXTRACT\\((YEAR|QUARTER|MONTH|WEEK|DAY|DAY_OF_MONTH|DAY_OF_WEEK|DOW|DAY_OF_YEAR|DOY|HOUR|MINUTE|SECOND)\\s+FROM\\s+(\\w+)\\)$",
           Pattern.CASE_INSENSITIVE);
 
+  // === Intra-shard parallelism configuration ===
+  private static final String PARALLELISM_MODE = System.getProperty("dqe.parallelism", "off");
+  private static final int THREADS_PER_SHARD =
+      Math.max(
+          1,
+          Runtime.getRuntime().availableProcessors() / Integer.getInteger("dqe.numLocalShards", 4));
+
+  private static final java.util.concurrent.ForkJoinPool PARALLEL_POOL =
+      new java.util.concurrent.ForkJoinPool(
+          Runtime.getRuntime().availableProcessors(),
+          java.util.concurrent.ForkJoinPool.defaultForkJoinWorkerThreadFactory,
+          null,
+          true); // asyncMode=true for work-stealing
+
   private FusedGroupByAggregate() {}
 
   /**
@@ -8646,6 +8660,39 @@ public final class FusedGroupByAggregate {
       }
     }
     return types;
+  }
+
+  /**
+   * Merge a source SegmentGroupKey→AccumulatorGroup map into a target map. For matching keys,
+   * accumulators are merged in place.
+   */
+  private static void mergeGroupMaps(
+      Map<SegmentGroupKey, AccumulatorGroup> target,
+      Map<SegmentGroupKey, AccumulatorGroup> source) {
+    for (Map.Entry<SegmentGroupKey, AccumulatorGroup> e : source.entrySet()) {
+      AccumulatorGroup existing = target.get(e.getKey());
+      if (existing == null) {
+        target.put(e.getKey(), e.getValue());
+      } else {
+        existing.merge(e.getValue());
+      }
+    }
+  }
+
+  /**
+   * Merge a source MergedGroupKey→AccumulatorGroup map into a target map. For matching keys,
+   * accumulators are merged in place.
+   */
+  private static void mergeMergedGroupMaps(
+      Map<MergedGroupKey, AccumulatorGroup> target, Map<MergedGroupKey, AccumulatorGroup> source) {
+    for (Map.Entry<MergedGroupKey, AccumulatorGroup> e : source.entrySet()) {
+      AccumulatorGroup existing = target.get(e.getKey());
+      if (existing == null) {
+        target.put(e.getKey(), e.getValue());
+      } else {
+        existing.merge(e.getValue());
+      }
+    }
   }
 
   // =========================================================================

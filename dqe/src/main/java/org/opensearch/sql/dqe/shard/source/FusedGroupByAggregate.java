@@ -32,6 +32,7 @@ import java.util.regex.Pattern;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.OrdinalMap;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
@@ -48,6 +49,8 @@ import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LongValues;
+import org.apache.lucene.util.packed.PackedInts;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -1451,6 +1454,159 @@ public final class FusedGroupByAggregate {
           return List.of(new Page(keyBuilder.build(), countBuilder.build()));
         }
         // Fall through to multi-segment path for very large ordinal spaces
+      }
+
+      // === Global ordinals multi-segment path ===
+      OrdinalMap ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+      if (ordinalMap != null) {
+        long globalOrdCount = ordinalMap.getValueCount();
+        if (globalOrdCount > 0 && globalOrdCount <= 50_000_000) {
+          long[] globalCounts = new long[(int) globalOrdCount];
+
+          // Build Weight for filtered queries
+          IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+          Weight weight =
+              (query instanceof MatchAllDocsQuery)
+                  ? null
+                  : luceneSearcher.createWeight(
+                      luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+          // Scan all segments using global ordinals
+          for (int segIdx = 0; segIdx < leaves.size(); segIdx++) {
+            LeafReaderContext leafCtx = leaves.get(segIdx);
+            SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+            if (dv == null) continue;
+            LongValues segToGlobal = ordinalMap.getGlobalOrds(segIdx);
+
+            if (weight == null) {
+              // MatchAll: iterate all docs directly
+              SortedDocValues sdv = DocValues.unwrapSingleton(dv);
+              if (sdv != null) {
+                while (sdv.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                  globalCounts[(int) segToGlobal.get(sdv.ordValue())]++;
+                }
+              } else {
+                while (dv.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                  globalCounts[(int) segToGlobal.get(dv.nextOrd())]++;
+                }
+              }
+            } else {
+              Scorer scorer = weight.scorer(leafCtx);
+              if (scorer == null) continue;
+              DocIdSetIterator docIt = scorer.iterator();
+              int doc;
+              while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                if (dv.advanceExact(doc)) {
+                  globalCounts[(int) segToGlobal.get(dv.nextOrd())]++;
+                }
+              }
+            }
+          }
+
+          // Count non-zero groups
+          int groupCount = 0;
+          for (long c : globalCounts) {
+            if (c > 0) groupCount++;
+          }
+          if (groupCount == 0) return List.of();
+
+          // Prepare segment DVs for ordinal lookup
+          SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+          for (int i = 0; i < leaves.size(); i++) {
+            segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+          }
+
+          // Top-N selection
+          if (sortAggIndex >= 0 && topN > 0 && topN < groupCount) {
+            int n = (int) Math.min(topN, groupCount);
+            int[] heap = new int[n];
+            long[] heapVals = new long[n];
+            int heapSize = 0;
+
+            for (int i = 0; i < globalCounts.length; i++) {
+              if (globalCounts[i] == 0) continue;
+              long cnt = globalCounts[i];
+              if (heapSize < n) {
+                heap[heapSize] = i;
+                heapVals[heapSize] = cnt;
+                heapSize++;
+                int k = heapSize - 1;
+                while (k > 0) {
+                  int parent = (k - 1) >>> 1;
+                  boolean swap =
+                      sortAscending
+                          ? (heapVals[k] > heapVals[parent])
+                          : (heapVals[k] < heapVals[parent]);
+                  if (swap) {
+                    int tmpI = heap[parent];
+                    heap[parent] = heap[k];
+                    heap[k] = tmpI;
+                    long tmpV = heapVals[parent];
+                    heapVals[parent] = heapVals[k];
+                    heapVals[k] = tmpV;
+                    k = parent;
+                  } else break;
+                }
+              } else {
+                boolean better = sortAscending ? (cnt < heapVals[0]) : (cnt > heapVals[0]);
+                if (better) {
+                  heap[0] = i;
+                  heapVals[0] = cnt;
+                  int k = 0;
+                  while (true) {
+                    int left = 2 * k + 1;
+                    if (left >= heapSize) break;
+                    int right = left + 1;
+                    int target = left;
+                    if (right < heapSize) {
+                      boolean pickRight =
+                          sortAscending
+                              ? (heapVals[right] > heapVals[left])
+                              : (heapVals[right] < heapVals[left]);
+                      if (pickRight) target = right;
+                    }
+                    boolean swap =
+                        sortAscending
+                            ? (heapVals[target] > heapVals[k])
+                            : (heapVals[target] < heapVals[k]);
+                    if (swap) {
+                      int tmpI = heap[k];
+                      heap[k] = heap[target];
+                      heap[target] = tmpI;
+                      long tmpV = heapVals[k];
+                      heapVals[k] = heapVals[target];
+                      heapVals[target] = tmpV;
+                      k = target;
+                    } else break;
+                  }
+                }
+              }
+            }
+
+            BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, heapSize);
+            BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, heapSize);
+            for (int i = 0; i < heapSize; i++) {
+              BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvs, heap[i]);
+              VarcharType.VARCHAR.writeSlice(
+                  keyBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              BigintType.BIGINT.writeLong(countBuilder, heapVals[i]);
+            }
+            return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+          }
+
+          // No top-N: output all groups
+          BlockBuilder keyBuilder = VarcharType.VARCHAR.createBlockBuilder(null, groupCount);
+          BlockBuilder countBuilder = BigintType.BIGINT.createBlockBuilder(null, groupCount);
+          for (int i = 0; i < globalCounts.length; i++) {
+            if (globalCounts[i] > 0) {
+              BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvs, i);
+              VarcharType.VARCHAR.writeSlice(
+                  keyBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+              BigintType.BIGINT.writeLong(countBuilder, globalCounts[i]);
+            }
+          }
+          return List.of(new Page(keyBuilder.build(), countBuilder.build()));
+        }
       }
 
       // === Parallel multi-segment path ===
@@ -10019,6 +10175,28 @@ public final class FusedGroupByAggregate {
         existing.merge(e.getValue());
       }
     }
+  }
+
+  /**
+   * Build a Lucene OrdinalMap for a VARCHAR field across all segments. Maps segment-local ordinals
+   * to a global ordinal space.
+   */
+  private static OrdinalMap buildGlobalOrdinalMap(List<LeafReaderContext> leaves, String fieldName)
+      throws IOException {
+    SortedSetDocValues[] subs = new SortedSetDocValues[leaves.size()];
+    for (int i = 0; i < leaves.size(); i++) {
+      subs[i] = leaves.get(i).reader().getSortedSetDocValues(fieldName);
+      if (subs[i] == null) return null;
+    }
+    return OrdinalMap.build(null, subs, PackedInts.DEFAULT);
+  }
+
+  /** Look up the term bytes for a global ordinal using OrdinalMap reverse mapping. */
+  private static BytesRef lookupGlobalOrd(
+      OrdinalMap ordinalMap, SortedSetDocValues[] segmentDvs, long globalOrd) throws IOException {
+    int segIdx = ordinalMap.getFirstSegmentNumber(globalOrd);
+    long segOrd = ordinalMap.getFirstSegmentOrd(globalOrd);
+    return segmentDvs[segIdx].lookupOrd(segOrd);
   }
 
   // =========================================================================

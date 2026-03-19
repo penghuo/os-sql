@@ -1457,7 +1457,13 @@ public final class FusedGroupByAggregate {
       }
 
       // === Global ordinals multi-segment path ===
-      OrdinalMap ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+      // Only use global ordinals for full-table scans (MatchAllDocsQuery) or queries
+      // scanning >1M docs. For selective WHERE filters (e.g., Q37-Q43 with CounterID=62),
+      // the OrdinalMap build cost (~2-3s for 18M ordinals) exceeds the scan time.
+      OrdinalMap ordinalMap = null;
+      if (query instanceof MatchAllDocsQuery) {
+        ordinalMap = buildGlobalOrdinalMap(leaves, columnName);
+      }
       if (ordinalMap != null) {
         long globalOrdCount = ordinalMap.getValueCount();
         if (globalOrdCount > 0 && globalOrdCount <= 50_000_000) {

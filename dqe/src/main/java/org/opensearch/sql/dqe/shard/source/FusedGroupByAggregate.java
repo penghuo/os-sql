@@ -5874,19 +5874,17 @@ public final class FusedGroupByAggregate {
       SortedSetDocValues[] savedVarcharDvs = null;
       SortedSetDocValues[] savedInlineResultDvs = null;
 
+      // Pre-compute Weight once before the segment loop (rewrite + createWeight is expensive)
+      final org.apache.lucene.search.Weight cachedWeight =
+          engineSearcher.createWeight(
+              engineSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
       // Phase 1: Collect doc IDs per segment
       for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
         LeafReader reader = leafCtx.reader();
 
         // Collect matching doc IDs into primitive int array (no boxing overhead)
-        engineSearcher
-            .getIndexReader()
-            .getContext()
-            .equals(null); // no-op, just ensure context is available
-        org.apache.lucene.search.Weight weight =
-            engineSearcher.createWeight(
-                engineSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
-        org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+        org.apache.lucene.search.Scorer scorer = cachedWeight.scorer(leafCtx);
         if (scorer == null) continue;
 
         int[] segDocIds = new int[256];

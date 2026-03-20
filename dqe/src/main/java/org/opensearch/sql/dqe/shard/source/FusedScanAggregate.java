@@ -513,34 +513,55 @@ public final class FusedScanAggregate {
           }
         }
       } else {
-        // General path: use Lucene's search framework with Collector
-        engineSearcher.search(
-            query,
-            new Collector() {
-              @Override
-              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-                // Open doc values iterators for each accumulator in this segment
-                for (DirectAccumulator acc : accumulators) {
-                  acc.initSegment(context);
-                }
-                return new LeafCollector() {
-                  @Override
-                  public void setScorer(Scorable scorer) {}
-
-                  @Override
-                  public void collect(int doc) throws IOException {
-                    for (DirectAccumulator acc : accumulators) {
-                      acc.accumulate(doc);
-                    }
+        // Fast path: filtered COUNT(*) only — use IndexSearcher.count(query) which is
+        // highly optimized in Lucene (uses PointValues ranges, block scoring, segment
+        // statistics). Avoids Collector/LeafCollector overhead entirely.
+        // Critical for Q2: COUNT(*) WHERE AdvEngineID <> 0.
+        boolean allCountStarFiltered = true;
+        for (AggSpec spec : specs) {
+          if (!"COUNT".equals(spec.funcName()) || !"*".equals(spec.arg())) {
+            allCountStarFiltered = false;
+            break;
+          }
+        }
+        if (allCountStarFiltered) {
+          int totalCount = engineSearcher.count(query);
+          for (DirectAccumulator acc : accumulators) {
+            if (acc instanceof CountStarDirectAccumulator csa) {
+              csa.addCount(totalCount);
+            }
+          }
+        } else {
+          // General path: use Lucene's search framework with Collector
+          engineSearcher.search(
+              query,
+              new Collector() {
+                @Override
+                public LeafCollector getLeafCollector(LeafReaderContext context)
+                    throws IOException {
+                  // Open doc values iterators for each accumulator in this segment
+                  for (DirectAccumulator acc : accumulators) {
+                    acc.initSegment(context);
                   }
-                };
-              }
+                  return new LeafCollector() {
+                    @Override
+                    public void setScorer(Scorable scorer) {}
 
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-              }
-            });
+                    @Override
+                    public void collect(int doc) throws IOException {
+                      for (DirectAccumulator acc : accumulators) {
+                        acc.accumulate(doc);
+                      }
+                    }
+                  };
+                }
+
+                @Override
+                public ScoreMode scoreMode() {
+                  return ScoreMode.COMPLETE_NO_SCORES;
+                }
+              });
+        }
       }
     }
 

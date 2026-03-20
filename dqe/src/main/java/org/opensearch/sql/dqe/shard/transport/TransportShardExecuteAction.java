@@ -1452,7 +1452,13 @@ public class TransportShardExecuteAction
 
     List<Page> result =
         FusedGroupByAggregate.execute(aggNode, shard, luceneQuery, cachedMeta.columnTypeMap());
-    System.gc();
+    int totalRows = 0;
+    for (Page p : result) {
+      totalRows += p.getPositionCount();
+    }
+    if (totalRows > 10000) {
+      System.gc();
+    }
     return result;
   }
 
@@ -1514,7 +1520,15 @@ public class TransportShardExecuteAction
     // Hint GC to collect large hash maps from old gen before next query arrives.
     // Without this, G1GC may not collect old gen promptly, causing circuit breaker
     // trips on the next query (observed with Q19 → Q20 on 100M rows).
-    System.gc();
+    // Skip GC for small results (narrow-filter queries like Q40) where the hash map
+    // is tiny and GC pause (~10-50ms) would dominate the total query time.
+    int totalRows = 0;
+    for (Page p : result) {
+      totalRows += p.getPositionCount();
+    }
+    if (totalRows > 10000) {
+      System.gc();
+    }
     return result;
   }
 

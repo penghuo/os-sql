@@ -207,22 +207,101 @@ public final class FusedScanAggregate {
         }
 
         if (noDeletes) {
-          // Ultra-fast: column-major with nextDoc() — no deleted docs check
-          for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-            LeafReader reader = leafCtx.reader();
-            for (int i = 0; i < colArray.length; i++) {
-              SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[i]);
-              if (dv == null) continue;
-              long localSum = 0;
-              long localCount = 0;
-              int doc = dv.nextDoc();
-              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-                localSum += dv.nextValue();
-                localCount++;
-                doc = dv.nextDoc();
+          // Parallel path: distribute segments across workers for segment-level parallelism.
+          // Each worker accumulates sum/count for all columns across its assigned segments,
+          // then results are merged. This is the same strategy as tryFlatArrayPath.
+          List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+          int numWorkers =
+              Math.min(
+                  Math.max(
+                      1,
+                      Runtime.getRuntime().availableProcessors()
+                          / Integer.getInteger("dqe.numLocalShards", 4)),
+                  leaves.size());
+
+          if (numWorkers > 1 && leaves.size() > 1) {
+            // Partition segments among workers using largest-first assignment
+            @SuppressWarnings("unchecked")
+            List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+            long[] workerDocCounts = new long[numWorkers];
+            for (int i = 0; i < numWorkers; i++) {
+              workerSegments[i] = new java.util.ArrayList<>();
+            }
+            java.util.List<LeafReaderContext> sortedLeaves = new java.util.ArrayList<>(leaves);
+            sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+            for (LeafReaderContext leaf : sortedLeaves) {
+              int lightest = 0;
+              for (int i = 1; i < numWorkers; i++) {
+                if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
               }
-              scArrays[i][0] += localSum;
-              scArrays[i][1] += localCount;
+              workerSegments[lightest].add(leaf);
+              workerDocCounts[lightest] += leaf.reader().maxDoc();
+            }
+
+            final int nc = colArray.length;
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.CompletableFuture<long[]>[] futures =
+                new java.util.concurrent.CompletableFuture[numWorkers];
+
+            for (int w = 0; w < numWorkers; w++) {
+              final List<LeafReaderContext> mySegments = workerSegments[w];
+              futures[w] =
+                  java.util.concurrent.CompletableFuture.supplyAsync(
+                      () -> {
+                        // Pack: [sum0, count0, sum1, count1, ...]
+                        long[] pack = new long[nc * 2];
+                        try {
+                          for (LeafReaderContext leafCtx : mySegments) {
+                            LeafReader reader = leafCtx.reader();
+                            for (int i = 0; i < nc; i++) {
+                              SortedNumericDocValues dv =
+                                  reader.getSortedNumericDocValues(colArray[i]);
+                              if (dv == null) continue;
+                              long localSum = 0;
+                              long localCount = 0;
+                              int doc = dv.nextDoc();
+                              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                                localSum += dv.nextValue();
+                                localCount++;
+                                doc = dv.nextDoc();
+                              }
+                              pack[i * 2] += localSum;
+                              pack[i * 2 + 1] += localCount;
+                            }
+                          }
+                        } catch (IOException e) {
+                          throw new java.io.UncheckedIOException(e);
+                        }
+                        return pack;
+                      });
+            }
+
+            // Merge worker results
+            for (var future : futures) {
+              long[] pack = future.join();
+              for (int i = 0; i < nc; i++) {
+                scArrays[i][0] += pack[i * 2];
+                scArrays[i][1] += pack[i * 2 + 1];
+              }
+            }
+          } else {
+            // Sequential fallback for single segment or single worker
+            for (LeafReaderContext leafCtx : leaves) {
+              LeafReader reader = leafCtx.reader();
+              for (int i = 0; i < colArray.length; i++) {
+                SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[i]);
+                if (dv == null) continue;
+                long localSum = 0;
+                long localCount = 0;
+                int doc = dv.nextDoc();
+                while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                  localSum += dv.nextValue();
+                  localCount++;
+                  doc = dv.nextDoc();
+                }
+                scArrays[i][0] += localSum;
+                scArrays[i][1] += localCount;
+              }
             }
           }
         } else {

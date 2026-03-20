@@ -8781,6 +8781,9 @@ public final class FusedGroupByAggregate {
       // Uses SegmentGroupKey map with ordinals for varchar keys.
       Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
       final Object[][] keyReadersHolder = new Object[1][];
+      // Early termination cap for LIMIT without ORDER BY
+      final boolean singleSegEarlyTerm = (sortAggIndex < 0 && topN > 0);
+      final int singleSegGroupCap = singleSegEarlyTerm ? (int) topN : Integer.MAX_VALUE;
 
       engineSearcher.search(
           query,
@@ -8849,6 +8852,10 @@ public final class FusedGroupByAggregate {
 
                   AccumulatorGroup accGroup = segmentGroups.get(probeKey);
                   if (accGroup == null) {
+                    // Early termination: skip new groups once we have enough
+                    if (segmentGroups.size() >= singleSegGroupCap) {
+                      throw new org.apache.lucene.search.CollectionTerminatedException();
+                    }
                     SegmentGroupKey immutableKey = probeKey.toImmutableKey();
                     accGroup = createAccumulatorGroup(specs);
                     segmentGroups.put(immutableKey, accGroup);
@@ -9518,6 +9525,68 @@ public final class FusedGroupByAggregate {
       }
     }
 
+    // === Multi-segment 2-key global-ordinal flat path (LIMIT without ORDER BY) ===
+    // For 2-key GROUP BY (numeric + varchar) with LIMIT but no ORDER BY,
+    // use global ordinals + FlatTwoKeyMap with early termination.
+    // Stops scanning as soon as enough distinct groups are found.
+    // Only activated for LIMIT-without-ORDER-BY since the global ordinal lookup
+    // per doc adds overhead that's not justified for full-scan ORDER BY queries.
+    if (sortAggIndex < 0
+        && topN > 0
+        && keyInfos.size() == 2
+        && truncUnits[0] == null
+        && arithUnits[0] == null
+        && truncUnits[1] == null
+        && arithUnits[1] == null) {
+      boolean canUseFlatGlobalOrd = true;
+      // Check: exactly one varchar key, one numeric key, and flat-compatible aggs
+      int varcharKeyIdx = -1;
+      for (int i = 0; i < 2; i++) {
+        if (keyInfos.get(i).isVarchar) varcharKeyIdx = i;
+      }
+      if (varcharKeyIdx < 0) canUseFlatGlobalOrd = false;
+      for (int i = 0; i < numAggs && canUseFlatGlobalOrd; i++) {
+        if (!isCountStar[i]) {
+          AggSpec spec = specs.get(i);
+          if (isVarcharArg[i] || isDoubleArg[i]) {
+            canUseFlatGlobalOrd = false;
+          } else {
+            switch (spec.funcName) {
+              case "COUNT":
+                if (spec.isDistinct) canUseFlatGlobalOrd = false;
+                break;
+              case "SUM":
+              case "AVG":
+                break;
+              default:
+                canUseFlatGlobalOrd = false;
+                break;
+            }
+          }
+        }
+      }
+      if (canUseFlatGlobalOrd) {
+        List<Page> result =
+            executeMultiSegGlobalOrdFlatTwoKey(
+                engineSearcher,
+                query,
+                keyInfos,
+                specs,
+                numAggs,
+                isCountStar,
+                accType,
+                varcharKeyIdx,
+                groupByKeys,
+                sortAggIndex,
+                sortAscending,
+                topN,
+                columnTypeMap);
+        if (result != null) {
+          return result;
+        }
+      }
+    }
+
     // === Parallel multi-segment path (Approach B: doc-range) ===
     if ("docrange".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1) {
       return executeNKeyVarcharParallelDocRange(
@@ -9971,6 +10040,11 @@ public final class FusedGroupByAggregate {
     Weight weight =
         searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
 
+    // Early termination for LIMIT without ORDER BY: any N groups are valid.
+    final boolean earlyTerminate = (sortAggIndex < 0 && topN > 0);
+    final java.util.concurrent.atomic.AtomicBoolean stopFlag =
+        earlyTerminate ? new java.util.concurrent.atomic.AtomicBoolean(false) : null;
+
     // Per-worker global maps
     @SuppressWarnings("unchecked")
     Map<MergedGroupKey, AccumulatorGroup>[] workerMaps = new Map[numWorkers];
@@ -9980,6 +10054,9 @@ public final class FusedGroupByAggregate {
 
     // Process each segment: collect matching doc IDs, split among workers
     for (LeafReaderContext leafCtx : leaves) {
+      // Early termination: skip remaining segments once we have enough groups
+      if (earlyTerminate && stopFlag.get()) break;
+
       Scorer scorer = weight.scorer(leafCtx);
       if (scorer == null) continue;
 
@@ -10048,8 +10125,13 @@ public final class FusedGroupByAggregate {
 
                     Map<SegmentGroupKey, AccumulatorGroup> segmentGroups = new HashMap<>();
                     NumericProbeKey probeKey = new NumericProbeKey(numKeys);
+                    // For early termination: cap per-worker segment groups
+                    final int groupCap = earlyTerminate ? (int) topN : Integer.MAX_VALUE;
 
                     for (int idx = startIdx; idx < endIdx; idx++) {
+                      // Check shared stop flag periodically (every 4096 docs) to exit early
+                      if (earlyTerminate && (idx & 0xFFF) == 0 && stopFlag.get()) break;
+
                       int doc = docs[idx];
                       probeKey.reset();
                       for (int k = 0; k < numKeys; k++) {
@@ -10080,6 +10162,10 @@ public final class FusedGroupByAggregate {
 
                       AccumulatorGroup accGroup = segmentGroups.get(probeKey);
                       if (accGroup == null) {
+                        // Early termination: stop scanning once we have enough groups.
+                        // Without ORDER BY, any N groups are valid — no need to continue
+                        // accumulating counts for existing groups either.
+                        if (segmentGroups.size() >= groupCap) break;
                         SegmentGroupKey immutableKey = probeKey.toImmutableKey();
                         accGroup = createAccumulatorGroup(specs);
                         segmentGroups.put(immutableKey, accGroup);
@@ -10217,6 +10303,17 @@ public final class FusedGroupByAggregate {
 
       // Wait for this segment's workers to finish before moving to next segment
       java.util.concurrent.CompletableFuture.allOf(segFutures).join();
+
+      // Early termination: check if we have enough groups across all workers
+      if (earlyTerminate) {
+        int totalGroups = 0;
+        for (Map<MergedGroupKey, AccumulatorGroup> wMap : workerMaps) {
+          totalGroups += wMap.size();
+        }
+        if (totalGroups >= topN) {
+          stopFlag.set(true);
+        }
+      }
     }
 
     // Merge all worker maps
@@ -10239,6 +10336,513 @@ public final class FusedGroupByAggregate {
         sortAscending,
         topN,
         columnTypeMap);
+  }
+
+  /**
+   * Multi-segment 2-key GROUP BY using global ordinals + FlatTwoKeyMap. For (numeric + varchar) key
+   * pairs, converts segment-local ordinals to global ordinals using a cached OrdinalMap, then
+   * accumulates into FlatTwoKeyMap per worker. This avoids per-group object allocation AND
+   * per-segment ordinal resolution, only resolving ordinals to strings for the final top-N output
+   * groups.
+   *
+   * @return result pages, or null if the path is not applicable (e.g., too many global ordinals)
+   */
+  private static List<Page> executeMultiSegGlobalOrdFlatTwoKey(
+      org.opensearch.index.engine.Engine.Searcher engineSearcher,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int varcharKeyIdx,
+      List<String> groupByKeys,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      Map<String, Type> columnTypeMap)
+      throws Exception {
+
+    List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+    int numericKeyIdx = 1 - varcharKeyIdx;
+
+    // Build global ordinal map for the varchar key
+    String varcharField = keyInfos.get(varcharKeyIdx).name;
+    OrdinalMap ordinalMap = buildGlobalOrdinalMap(leaves, varcharField);
+    if (ordinalMap == null) return null;
+    long globalOrdCount = ordinalMap.getValueCount();
+    // Safety check: don't use this path if global ordinals are too large
+    if (globalOrdCount > 50_000_000) return null;
+
+    // Compute flat accumulator layout
+    final int[] flatAccOffset = new int[numAggs];
+    int flatTotalSlots = 0;
+    for (int i = 0; i < numAggs; i++) {
+      flatAccOffset[i] = flatTotalSlots;
+      if (isCountStar[i] || accType[i] == 0 || accType[i] == 1) {
+        flatTotalSlots += 1;
+      } else if (accType[i] == 2) { // AVG
+        flatTotalSlots += 2;
+      }
+    }
+    final int flatSlotsPerGroup = flatTotalSlots;
+
+    int numWorkers = Math.min(THREADS_PER_SHARD, Runtime.getRuntime().availableProcessors());
+
+    // Per-worker global FlatTwoKeyMaps: key0=numericKey, key1=globalOrd
+    // Workers accumulate across all segments into the same map.
+    // Early termination for LIMIT without ORDER BY
+    final boolean earlyTerminate = (sortAggIndex < 0 && topN > 0);
+    final int groupCap = earlyTerminate ? (int) topN : -1;
+
+    // === Ultra-fast path: LIMIT without ORDER BY — sequential scan with early stop ===
+    // For queries like Q18 (GROUP BY UserID, SearchPhrase LIMIT 10 with no ORDER BY),
+    // any N groups are valid output. Scan segments sequentially, stop after finding
+    // enough groups. No parallelism overhead, no doc-ID collection.
+    if (earlyTerminate) {
+      FlatTwoKeyMap flatMap = new FlatTwoKeyMap(flatSlotsPerGroup);
+      for (int segIdx = 0; segIdx < leaves.size(); segIdx++) {
+        if (flatMap.size >= groupCap) break;
+        LeafReaderContext leafCtx = leaves.get(segIdx);
+        LeafReader reader = leafCtx.reader();
+        int maxDoc = reader.maxDoc();
+        Bits liveDocs = reader.getLiveDocs();
+        LongValues segToGlobal = ordinalMap.getGlobalOrds(segIdx);
+
+        SortedSetDocValues varcharDv =
+            reader.getSortedSetDocValues(keyInfos.get(varcharKeyIdx).name);
+        SortedNumericDocValues numericDv =
+            reader.getSortedNumericDocValues(keyInfos.get(numericKeyIdx).name);
+
+        // Open aggregate DocValues
+        SortedNumericDocValues[] aggDvs = new SortedNumericDocValues[numAggs];
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i]) {
+            aggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+          }
+        }
+
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (liveDocs != null && !liveDocs.get(doc)) continue;
+
+          long numericKey = 0;
+          long globalOrd = 0;
+          if (numericDv != null && numericDv.advanceExact(doc)) {
+            numericKey = numericDv.nextValue();
+          }
+          if (varcharDv != null && varcharDv.advanceExact(doc)) {
+            long segOrd = varcharDv.nextOrd();
+            globalOrd = segToGlobal.get(segOrd);
+          }
+
+          int slot = flatMap.findOrInsertCapped(numericKey, globalOrd, groupCap);
+          if (slot < 0) break; // cap reached
+          int base = slot * flatSlotsPerGroup;
+
+          for (int i = 0; i < numAggs; i++) {
+            if (isCountStar[i]) {
+              flatMap.accData[base + flatAccOffset[i]]++;
+            } else {
+              SortedNumericDocValues aggDv = aggDvs[i];
+              if (aggDv != null && aggDv.advanceExact(doc)) {
+                long rawVal = aggDv.nextValue();
+                switch (accType[i]) {
+                  case 0:
+                    flatMap.accData[base + flatAccOffset[i]]++;
+                    break;
+                  case 1:
+                    flatMap.accData[base + flatAccOffset[i]] += rawVal;
+                    break;
+                  case 2:
+                    flatMap.accData[base + flatAccOffset[i]] += rawVal;
+                    flatMap.accData[base + flatAccOffset[i] + 1]++;
+                    break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (flatMap.size == 0) return List.of();
+
+      // Build output: resolve global ordinals only for the found groups
+      SortedSetDocValues[] segDvsEarly = new SortedSetDocValues[leaves.size()];
+      for (int si = 0; si < leaves.size(); si++) {
+        segDvsEarly[si] = leaves.get(si).reader().getSortedSetDocValues(varcharField);
+      }
+      int numGroupKeysEarly = groupByKeys.size();
+      int totalColumnsEarly = numGroupKeysEarly + numAggs;
+      int outputCountEarly = Math.min(flatMap.size, groupCap);
+
+      BlockBuilder[] bldrs = new BlockBuilder[totalColumnsEarly];
+      for (int i = 0; i < numGroupKeysEarly; i++) {
+        KeyInfo ki = keyInfos.get(i);
+        bldrs[i] =
+            ki.isVarchar
+                ? VarcharType.VARCHAR.createBlockBuilder(null, outputCountEarly)
+                : BigintType.BIGINT.createBlockBuilder(null, outputCountEarly);
+      }
+      for (int i = 0; i < numAggs; i++) {
+        bldrs[numGroupKeysEarly + i] = BigintType.BIGINT.createBlockBuilder(null, outputCountEarly);
+      }
+
+      int written = 0;
+      for (int slot = 0; slot < flatMap.capacity && written < outputCountEarly; slot++) {
+        if (!flatMap.occupied[slot]) continue;
+        long numericKey = flatMap.keys0[slot];
+        long gOrd = flatMap.keys1[slot];
+        int base = slot * flatSlotsPerGroup;
+
+        BigintType.BIGINT.writeLong(bldrs[numericKeyIdx], numericKey);
+        BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvsEarly, gOrd);
+        if (bytes != null) {
+          VarcharType.VARCHAR.writeSlice(
+              bldrs[varcharKeyIdx], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+        } else {
+          VarcharType.VARCHAR.writeSlice(bldrs[varcharKeyIdx], Slices.EMPTY_SLICE);
+        }
+        for (int i = 0; i < numAggs; i++) {
+          if (accType[i] == 2) {
+            long sum = flatMap.accData[base + flatAccOffset[i]];
+            long count = flatMap.accData[base + flatAccOffset[i] + 1];
+            if (count > 0) {
+              BigintType.BIGINT.writeLong(
+                  bldrs[numGroupKeysEarly + i], Double.doubleToLongBits((double) sum / count));
+            } else {
+              bldrs[numGroupKeysEarly + i].appendNull();
+            }
+          } else {
+            BigintType.BIGINT.writeLong(
+                bldrs[numGroupKeysEarly + i], flatMap.accData[base + flatAccOffset[i]]);
+          }
+        }
+        written++;
+      }
+
+      Block[] blks = new Block[totalColumnsEarly];
+      for (int i = 0; i < totalColumnsEarly; i++) blks[i] = bldrs[i].build();
+      return List.of(new Page(blks));
+    }
+
+    final java.util.concurrent.atomic.AtomicBoolean stopFlag = null;
+
+    FlatTwoKeyMap[] workerMaps = new FlatTwoKeyMap[numWorkers];
+    for (int i = 0; i < numWorkers; i++) {
+      workerMaps[i] = new FlatTwoKeyMap(flatSlotsPerGroup);
+    }
+
+    // Create Weight for getting Scorers
+    IndexSearcher searcher = new IndexSearcher(engineSearcher.getIndexReader());
+    Weight weight =
+        searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+    // Process each segment: collect matching doc IDs, split among workers
+    for (int segIdx = 0; segIdx < leaves.size(); segIdx++) {
+      // Early termination: skip remaining segments once we have enough groups
+      if (earlyTerminate && stopFlag.get()) break;
+
+      LeafReaderContext leafCtx = leaves.get(segIdx);
+      Scorer scorer = weight.scorer(leafCtx);
+      if (scorer == null) continue;
+
+      // Get segment-to-global ordinal mapping for this segment
+      final LongValues segToGlobal = ordinalMap.getGlobalOrds(segIdx);
+
+      // Collect all matching doc IDs for this segment
+      DocIdSetIterator docIt = scorer.iterator();
+      int matchCount = 0;
+      int cap = Math.min(leafCtx.reader().maxDoc(), 65536);
+      int[] buf = new int[cap];
+      int d;
+      while ((d = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        if (matchCount >= buf.length) {
+          buf = java.util.Arrays.copyOf(buf, buf.length * 2);
+        }
+        buf[matchCount++] = d;
+      }
+      final int[] matchedDocs = buf;
+      final int segMatchCount = matchCount;
+
+      if (segMatchCount == 0) continue;
+
+      // Split doc IDs among workers
+      int chunkSize = (segMatchCount + numWorkers - 1) / numWorkers;
+      int actualWorkers = Math.min(numWorkers, (segMatchCount + chunkSize - 1) / chunkSize);
+
+      @SuppressWarnings("unchecked")
+      java.util.concurrent.CompletableFuture<Void>[] segFutures =
+          new java.util.concurrent.CompletableFuture[actualWorkers];
+
+      for (int w = 0; w < actualWorkers; w++) {
+        final int startIdx = w * chunkSize;
+        final int endIdx = Math.min(startIdx + chunkSize, segMatchCount);
+        final int workerIdx = w;
+        final LeafReaderContext ctx = leafCtx;
+
+        segFutures[w] =
+            java.util.concurrent.CompletableFuture.runAsync(
+                () -> {
+                  try {
+                    // Open key DocValues for this worker
+                    SortedSetDocValues varcharDv =
+                        ctx.reader().getSortedSetDocValues(keyInfos.get(varcharKeyIdx).name);
+                    SortedNumericDocValues numericDv =
+                        ctx.reader().getSortedNumericDocValues(keyInfos.get(numericKeyIdx).name);
+
+                    // Open aggregate DocValues
+                    SortedNumericDocValues[] aggDvs = new SortedNumericDocValues[numAggs];
+                    for (int i = 0; i < numAggs; i++) {
+                      if (!isCountStar[i]) {
+                        aggDvs[i] = ctx.reader().getSortedNumericDocValues(specs.get(i).arg);
+                      }
+                    }
+
+                    FlatTwoKeyMap flatMap = workerMaps[workerIdx];
+
+                    for (int idx = startIdx; idx < endIdx; idx++) {
+                      // Check stop flag periodically
+                      if (earlyTerminate && (idx & 0xFFF) == 0 && stopFlag.get()) break;
+
+                      int doc = matchedDocs[idx];
+                      long numericKey = 0;
+                      long globalOrd = 0;
+
+                      if (numericDv != null && numericDv.advanceExact(doc)) {
+                        numericKey = numericDv.nextValue();
+                      }
+                      if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                        long segOrd = varcharDv.nextOrd();
+                        globalOrd = segToGlobal.get(segOrd);
+                      }
+
+                      // FlatTwoKeyMap keys: key0=numericKey, key1=globalOrd
+                      int slot;
+                      if (earlyTerminate) {
+                        slot = flatMap.findOrInsertCapped(numericKey, globalOrd, groupCap);
+                        if (slot < 0) break; // cap reached — stop scanning
+                      } else {
+                        slot = flatMap.findOrInsert(numericKey, globalOrd);
+                      }
+                      int base = slot * flatSlotsPerGroup;
+
+                      // Inline accumulation
+                      for (int i = 0; i < numAggs; i++) {
+                        if (isCountStar[i]) {
+                          flatMap.accData[base + flatAccOffset[i]]++;
+                        } else {
+                          SortedNumericDocValues aggDv = aggDvs[i];
+                          if (aggDv != null && aggDv.advanceExact(doc)) {
+                            long rawVal = aggDv.nextValue();
+                            switch (accType[i]) {
+                              case 0: // COUNT non-star
+                                flatMap.accData[base + flatAccOffset[i]]++;
+                                break;
+                              case 1: // SUM long
+                                flatMap.accData[base + flatAccOffset[i]] += rawVal;
+                                break;
+                              case 2: // AVG
+                                flatMap.accData[base + flatAccOffset[i]] += rawVal;
+                                flatMap.accData[base + flatAccOffset[i] + 1]++;
+                                break;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                  }
+                },
+                PARALLEL_POOL);
+      }
+
+      java.util.concurrent.CompletableFuture.allOf(segFutures).join();
+
+      // Check if any worker has enough groups for early termination
+      if (earlyTerminate && !stopFlag.get()) {
+        for (FlatTwoKeyMap wMap : workerMaps) {
+          if (wMap.size >= groupCap) {
+            stopFlag.set(true);
+            break;
+          }
+        }
+      }
+    }
+
+    // Merge all worker FlatTwoKeyMaps into a single map
+    // Use workerMaps[0] as the base and merge others into it
+    FlatTwoKeyMap merged = workerMaps[0];
+    for (int w = 1; w < numWorkers; w++) {
+      FlatTwoKeyMap other = workerMaps[w];
+      for (int slot = 0; slot < other.capacity; slot++) {
+        if (!other.occupied[slot]) continue;
+        int mSlot = merged.findOrInsert(other.keys0[slot], other.keys1[slot]);
+        int mBase = mSlot * flatSlotsPerGroup;
+        int oBase = slot * flatSlotsPerGroup;
+        for (int s = 0; s < flatSlotsPerGroup; s++) {
+          merged.accData[mBase + s] += other.accData[oBase + s];
+        }
+      }
+    }
+
+    if (merged.size == 0) {
+      return List.of();
+    }
+
+    // Apply TopN if needed: iterate merged map, keep top-N by sort agg
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+
+    // Collect slots, optionally applying TopN
+    int[] outputSlots;
+    int outputCount;
+    if (sortAggIndex >= 0 && topN > 0 && topN < merged.size) {
+      int n = (int) topN;
+      int[] heapSlots = new int[n];
+      int heapSize = 0;
+      int sai = flatAccOffset[sortAggIndex];
+      for (int slot = 0; slot < merged.capacity; slot++) {
+        if (!merged.occupied[slot]) continue;
+        long val = merged.accData[slot * flatSlotsPerGroup + sai];
+        if (heapSize < n) {
+          heapSlots[heapSize++] = slot;
+          // Sift up (min-heap for DESC, max-heap for ASC)
+          int ki = heapSize - 1;
+          while (ki > 0) {
+            int parent = (ki - 1) >>> 1;
+            long pVal = merged.accData[heapSlots[parent] * flatSlotsPerGroup + sai];
+            long kVal = merged.accData[heapSlots[ki] * flatSlotsPerGroup + sai];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) {
+              int tmp = heapSlots[parent];
+              heapSlots[parent] = heapSlots[ki];
+              heapSlots[ki] = tmp;
+              ki = parent;
+            } else break;
+          }
+        } else {
+          long heapTopVal = merged.accData[heapSlots[0] * flatSlotsPerGroup + sai];
+          boolean replace = sortAscending ? (val < heapTopVal) : (val > heapTopVal);
+          if (replace) {
+            heapSlots[0] = slot;
+            // Sift down
+            int parent = 0;
+            while (true) {
+              int left = 2 * parent + 1;
+              int right = left + 1;
+              int target = parent;
+              long targetVal = merged.accData[heapSlots[target] * flatSlotsPerGroup + sai];
+              if (left < n) {
+                long lVal = merged.accData[heapSlots[left] * flatSlotsPerGroup + sai];
+                boolean better = sortAscending ? (lVal > targetVal) : (lVal < targetVal);
+                if (better) {
+                  target = left;
+                  targetVal = lVal;
+                }
+              }
+              if (right < n) {
+                long rVal = merged.accData[heapSlots[right] * flatSlotsPerGroup + sai];
+                boolean better = sortAscending ? (rVal > targetVal) : (rVal < targetVal);
+                if (better) {
+                  target = right;
+                }
+              }
+              if (target == parent) break;
+              int tmp = heapSlots[parent];
+              heapSlots[parent] = heapSlots[target];
+              heapSlots[target] = tmp;
+              parent = target;
+            }
+          }
+        }
+      }
+      // Sort heap slots by value for output
+      final int fsai = sai;
+      final FlatTwoKeyMap fm = merged;
+      Integer[] sortableSlots = new Integer[heapSize];
+      for (int i = 0; i < heapSize; i++) sortableSlots[i] = heapSlots[i];
+      java.util.Arrays.sort(
+          sortableSlots,
+          (a, b) -> {
+            long av = fm.accData[a * flatSlotsPerGroup + fsai];
+            long bv = fm.accData[b * flatSlotsPerGroup + fsai];
+            return sortAscending ? Long.compare(av, bv) : Long.compare(bv, av);
+          });
+      outputSlots = new int[heapSize];
+      for (int i = 0; i < heapSize; i++) outputSlots[i] = sortableSlots[i];
+      outputCount = heapSize;
+    } else {
+      // Collect all occupied slots
+      outputSlots = new int[merged.size];
+      int idx = 0;
+      for (int slot = 0; slot < merged.capacity; slot++) {
+        if (merged.occupied[slot]) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
+    // Build Page: resolve global ordinals to strings only for output groups
+    // Get segment DocValues for ordinal lookup
+    SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+    for (int si = 0; si < leaves.size(); si++) {
+      segDvs[si] = leaves.get(si).reader().getSortedSetDocValues(varcharField);
+    }
+
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    for (int i = 0; i < numGroupKeys; i++) {
+      KeyInfo ki = keyInfos.get(i);
+      if (ki.isVarchar) {
+        builders[i] = VarcharType.VARCHAR.createBlockBuilder(null, outputCount);
+      } else {
+        builders[i] = BigintType.BIGINT.createBlockBuilder(null, outputCount);
+      }
+    }
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] = BigintType.BIGINT.createBlockBuilder(null, outputCount);
+    }
+
+    for (int oi = 0; oi < outputCount; oi++) {
+      int slot = outputSlots[oi];
+      long numericKey = merged.keys0[slot]; // key0 = numericKey
+      long globalOrd = merged.keys1[slot]; // key1 = globalOrd
+
+      // Write numeric key
+      BigintType.BIGINT.writeLong(builders[numericKeyIdx], numericKey);
+
+      // Write varchar key: resolve global ordinal to bytes
+      BytesRef bytes = lookupGlobalOrd(ordinalMap, segDvs, globalOrd);
+      if (bytes != null) {
+        VarcharType.VARCHAR.writeSlice(
+            builders[varcharKeyIdx], Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+      } else {
+        VarcharType.VARCHAR.writeSlice(builders[varcharKeyIdx], Slices.EMPTY_SLICE);
+      }
+
+      // Write aggregates
+      int base = slot * flatSlotsPerGroup;
+      for (int i = 0; i < numAggs; i++) {
+        if (accType[i] == 2) { // AVG
+          long sum = merged.accData[base + flatAccOffset[i]];
+          long count = merged.accData[base + flatAccOffset[i] + 1];
+          if (count > 0) {
+            double avg = (double) sum / count;
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + i], Double.doubleToLongBits(avg));
+          } else {
+            builders[numGroupKeys + i].appendNull();
+          }
+        } else {
+          BigintType.BIGINT.writeLong(
+              builders[numGroupKeys + i], merged.accData[base + flatAccOffset[i]]);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) {
+      blocks[i] = builders[i].build();
+    }
+    return List.of(new Page(blocks));
   }
 
   /**

@@ -1496,6 +1496,139 @@ public final class FusedScanAggregate {
   }
 
   /**
+   * Execute a fused scan to collect distinct values for a single numeric column, returning the raw
+   * LongOpenHashSet directly (no Page construction). This avoids the overhead of building a
+   * BlockBuilder with millions of entries and then extracting them again at the coordinator.
+   *
+   * @param columnName the column to collect distinct values from
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @return the raw LongOpenHashSet containing all distinct values in this shard
+   */
+  public static LongOpenHashSet collectDistinctValuesRaw(
+      String columnName, IndexShard shard, Query query) throws Exception {
+    LongOpenHashSet distinctSet = new LongOpenHashSet();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-values-raw")) {
+      if (query instanceof MatchAllDocsQuery) {
+        // Sequential scan: for high-cardinality columns like UserID (~18M distinct),
+        // parallel per-segment scanning creates too many large HashSets (6 segments * 8 shards)
+        // causing memory pressure and thread contention. Sequential is better here.
+        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
+          LeafReader reader = leafCtx.reader();
+          int maxDoc = reader.maxDoc();
+          Bits liveDocs = reader.getLiveDocs();
+          SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
+          if (dv == null) continue;
+          if (liveDocs == null) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (dv.advanceExact(doc)) {
+                distinctSet.add(dv.nextValue());
+              }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                distinctSet.add(dv.nextValue());
+              }
+            }
+          }
+        }
+      } else {
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv = context.reader().getSortedNumericDocValues(columnName);
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    if (dv != null && dv.advanceExact(doc)) {
+                      distinctSet.add(dv.nextValue());
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
+    }
+    return distinctSet;
+  }
+
+  /**
+   * Execute a fused scan to collect distinct strings for a single VARCHAR column, returning the raw
+   * HashSet directly (no Page construction). This avoids BlockBuilder overhead.
+   *
+   * @param columnName the VARCHAR column to collect distinct values from
+   * @param shard the index shard
+   * @param query the compiled Lucene query
+   * @return the raw HashSet containing all distinct string values in this shard
+   */
+  public static java.util.HashSet<String> collectDistinctStringsRaw(
+      String columnName, IndexShard shard, Query query) throws Exception {
+    java.util.HashSet<String> distinctStrings = new java.util.HashSet<>();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-strings-raw")) {
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+
+      for (LeafReaderContext leafCtx : leaves) {
+        LeafReader reader = leafCtx.reader();
+        SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+        if (dv == null) continue;
+
+        int maxDoc = reader.maxDoc();
+        Bits liveDocs = reader.getLiveDocs();
+        long valueCount = dv.getValueCount();
+
+        if (query instanceof MatchAllDocsQuery) {
+          if (liveDocs == null) {
+            for (long ord = 0; ord < valueCount; ord++) {
+              distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+            }
+            continue;
+          }
+          FixedBitSet usedOrdinals = new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+          for (int doc = 0; doc < maxDoc; doc++) {
+            if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+              usedOrdinals.set((int) dv.nextOrd());
+            }
+          }
+          for (int ord = usedOrdinals.nextSetBit(0);
+              ord != -1;
+              ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+            distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+          }
+        } else {
+          FixedBitSet usedOrdinals = new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+          for (int doc = 0; doc < maxDoc; doc++) {
+            boolean isLive = liveDocs == null || liveDocs.get(doc);
+            if (isLive && dv.advanceExact(doc)) {
+              usedOrdinals.set((int) dv.nextOrd());
+            }
+          }
+          for (int ord = usedOrdinals.nextSetBit(0);
+              ord != -1;
+              ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+            distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+          }
+        }
+      }
+    }
+    return distinctStrings;
+  }
+
+  /**
    * Execute a fused scan to collect distinct values for a single VARCHAR column, returning the
    * distinct strings as a single-column VarcharType Page. Uses ordinal-based dedup via FixedBitSet
    * for O(1) per-doc ordinal collection, then resolves strings in bulk from the term dictionary.

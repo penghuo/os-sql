@@ -48,6 +48,22 @@ public class ShardExecuteResponse extends ActionResponse {
   private transient java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>
       varcharDistinctSets;
 
+  /**
+   * Optional raw distinct value set for scalar COUNT(DISTINCT numericCol) optimization. Carries the
+   * shard-local LongOpenHashSet directly so the coordinator can union raw sets without going
+   * through Page construction/extraction. Only populated for local execution; null for remote
+   * shards.
+   */
+  @lombok.Setter
+  private transient org.opensearch.sql.dqe.operator.LongOpenHashSet scalarDistinctSet;
+
+  /**
+   * Optional raw distinct string set for scalar COUNT(DISTINCT varcharCol) optimization. Carries
+   * shard-local distinct strings directly so the coordinator can union without Page extraction.
+   * Only populated for local execution; null for remote shards.
+   */
+  @lombok.Setter private transient java.util.Set<String> scalarDistinctStrings;
+
   public ShardExecuteResponse(List<Page> pages, List<Type> columnTypes) {
     this.pages = pages;
     this.columnTypes = columnTypes;

@@ -340,14 +340,12 @@ public class TransportTrinoSqlAction
                       } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
                           && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
                           && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
-                        // Fast path: scalar COUNT(DISTINCT numericCol) — shards already pre-deduped
-                        // values. Merge distinct value sets using LongOpenHashSet and count.
+                        // Remote path: raw sets not available (transient), use Page-based merge
                         mergedPages = mergeCountDistinctValues(shardPages);
                       } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg
                           && singleCdVarcharAgg.getStep() == AggregationNode.Step.SINGLE
                           && isScalarCountDistinctVarchar(singleCdVarcharAgg, columnTypeMap)) {
-                        // Fast path: scalar COUNT(DISTINCT varcharCol) — shards already pre-deduped
-                        // values using ordinal-based collection. Merge by unioning string sets.
+                        // Remote path: raw sets not available (transient), use Page-based merge
                         mergedPages = mergeCountDistinctVarcharValues(shardPages);
                       } else if (coordinatorPlan instanceof AggregationNode singleAgg
                           && singleAgg.getStep() == AggregationNode.Step.SINGLE
@@ -605,11 +603,11 @@ public class TransportTrinoSqlAction
           } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
               && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
-            mergedPages = mergeCountDistinctValues(shardPages);
+            mergedPages = mergeCountDistinctValuesViaRawSets(shardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg2
               && singleCdVarcharAgg2.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctVarchar(singleCdVarcharAgg2, columnTypeMap)) {
-            mergedPages = mergeCountDistinctVarcharValues(shardPages);
+            mergedPages = mergeCountDistinctVarcharViaRawSets(shardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg
               && singleAgg.getStep() == AggregationNode.Step.SINGLE
               && isShardDedupCountDistinct(
@@ -1948,6 +1946,104 @@ public class TransportTrinoSqlAction
     }
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
     BigintType.BIGINT.writeLong(builder, globalSet.size());
+    return List.of(new Page(builder.build()));
+  }
+
+  /**
+   * Merge scalar COUNT(DISTINCT numericCol) using raw LongOpenHashSet attachments from shards. If
+   * all shards have the raw set, unions them directly (no Page extraction). Falls back to
+   * Page-based merge if any shard lacks the attachment.
+   */
+  private static List<Page> mergeCountDistinctValuesViaRawSets(
+      ShardExecuteResponse[] shardResults, List<List<Page>> shardPages) {
+    // Check if all shards have raw sets
+    boolean allHaveRawSets = true;
+    for (ShardExecuteResponse sr : shardResults) {
+      if (sr.getScalarDistinctSet() == null) {
+        allHaveRawSets = false;
+        break;
+      }
+    }
+    if (!allHaveRawSets) {
+      return mergeCountDistinctValues(shardPages);
+    }
+
+    // Fast path: union raw LongOpenHashSets directly.
+    // Pick the largest shard set as the base and merge others into it.
+    org.opensearch.sql.dqe.operator.LongOpenHashSet largest = null;
+    int largestSize = -1;
+    int largestIdx = -1;
+    for (int i = 0; i < shardResults.length; i++) {
+      org.opensearch.sql.dqe.operator.LongOpenHashSet set = shardResults[i].getScalarDistinctSet();
+      if (set.size() > largestSize) {
+        largest = set;
+        largestSize = set.size();
+        largestIdx = i;
+      }
+    }
+    // Merge all other sets into the largest
+    for (int i = 0; i < shardResults.length; i++) {
+      if (i == largestIdx) continue;
+      org.opensearch.sql.dqe.operator.LongOpenHashSet other =
+          shardResults[i].getScalarDistinctSet();
+      // Iterate the raw keys array to add all entries
+      if (other.hasZeroValue()) {
+        largest.add(0L);
+      }
+      if (other.hasSentinelValue()) {
+        largest.add(org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
+      }
+      long[] otherKeys = other.keys();
+      long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
+      for (int j = 0; j < otherKeys.length; j++) {
+        if (otherKeys[j] != emptyMarker) {
+          largest.add(otherKeys[j]);
+        }
+      }
+    }
+    io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, largest.size());
+    return List.of(new Page(builder.build()));
+  }
+
+  /**
+   * Merge scalar COUNT(DISTINCT varcharCol) using raw string set attachments from shards. If all
+   * shards have the raw set, unions them directly (no Page extraction). Falls back to Page-based
+   * merge if any shard lacks the attachment.
+   */
+  private static List<Page> mergeCountDistinctVarcharViaRawSets(
+      ShardExecuteResponse[] shardResults, List<List<Page>> shardPages) {
+    // Check if all shards have raw string sets
+    boolean allHaveRawSets = true;
+    for (ShardExecuteResponse sr : shardResults) {
+      if (sr.getScalarDistinctStrings() == null) {
+        allHaveRawSets = false;
+        break;
+      }
+    }
+    if (!allHaveRawSets) {
+      return mergeCountDistinctVarcharValues(shardPages);
+    }
+
+    // Fast path: union raw HashSet<String> directly.
+    // Pick the largest shard set as the base and merge others into it.
+    java.util.Set<String> largest = null;
+    int largestSize = -1;
+    int largestIdx = -1;
+    for (int i = 0; i < shardResults.length; i++) {
+      java.util.Set<String> set = shardResults[i].getScalarDistinctStrings();
+      if (set.size() > largestSize) {
+        largest = set;
+        largestSize = set.size();
+        largestIdx = i;
+      }
+    }
+    for (int i = 0; i < shardResults.length; i++) {
+      if (i == largestIdx) continue;
+      largest.addAll(shardResults[i].getScalarDistinctStrings());
+    }
+    io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, largest.size());
     return List.of(new Page(builder.build()));
   }
 

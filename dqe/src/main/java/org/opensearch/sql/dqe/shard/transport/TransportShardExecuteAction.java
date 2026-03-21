@@ -245,21 +245,20 @@ public class TransportShardExecuteAction
 
     // Fast path: bare TableScanNode with single numeric column — pre-dedup for COUNT(DISTINCT).
     // In the SINGLE aggregation path, the PlanFragmenter strips the AggregationNode, leaving a
-    // bare TableScanNode. For scalar COUNT(DISTINCT numericCol), the shard deduplicates locally
-    // (~25K distinct values instead of ~125K raw rows), reducing coordinator merge work by ~5x.
+    // bare TableScanNode. For scalar COUNT(DISTINCT numericCol), the shard collects distinct
+    // values into a raw LongOpenHashSet and attaches it to the response, avoiding Page
+    // construction overhead for millions of entries. The coordinator unions the raw sets.
     if (scanFactory == null && isBareSingleNumericColumnScan(plan)) {
-      List<Page> pages = executeDistinctValuesScan(plan, req);
-      List<Type> columnTypes = List.of(BigintType.BIGINT);
-      return new ShardExecuteResponse(pages, columnTypes);
+      ShardExecuteResponse resp = executeDistinctValuesScanWithRawSet(plan, req);
+      return resp;
     }
 
     // Fast path: bare TableScanNode with single VARCHAR column — pre-dedup for COUNT(DISTINCT).
-    // Uses ordinal-based dedup via FixedBitSet for fast ordinal collection, then resolves strings
-    // in bulk from the term dictionary. Sends ~50K unique strings instead of ~125K raw rows.
+    // Uses ordinal-based dedup via FixedBitSet for fast ordinal collection, then attaches the
+    // raw string set to the response for direct coordinator merge.
     if (scanFactory == null && isBareSingleVarcharColumnScan(plan)) {
-      List<Page> pages = executeDistinctValuesScanVarchar(plan, req);
-      List<Type> columnTypes = List.of(io.trino.spi.type.VarcharType.VARCHAR);
-      return new ShardExecuteResponse(pages, columnTypes);
+      ShardExecuteResponse resp = executeDistinctValuesScanVarcharWithRawSet(plan, req);
+      return resp;
     }
 
     // Try fused eval-aggregate for SUM(col + constant) patterns
@@ -804,141 +803,90 @@ public class TransportShardExecuteAction
     Query luceneQuery =
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
-    // Open-addressing hash map: key0 → LongOpenHashSet(key1 values)
-    int grpCap = 256;
-    long[] grpKeys = new long[grpCap];
-    org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
-        new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
-    boolean[] grpOcc = new boolean[grpCap];
-    int grpSize = 0;
-    int grpThreshold = (int) (grpCap * 0.7f);
+    // Parallel segment scanning: each segment builds its own per-group HashSet map,
+    // then we merge across segments. This exploits multiple CPU cores within a single shard.
+    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> finalSets;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-count-distinct-hashset")) {
-      for (org.apache.lucene.index.LeafReaderContext leafCtx :
-          engineSearcher.getIndexReader().leaves()) {
-        org.apache.lucene.index.LeafReader reader = leafCtx.reader();
-        org.apache.lucene.search.Weight weight =
-            engineSearcher.createWeight(
-                engineSearcher.rewrite(luceneQuery),
-                org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
-                1.0f);
-        org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
-        if (scorer == null) continue;
+      java.util.List<org.apache.lucene.index.LeafReaderContext> leaves =
+          engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+      org.apache.lucene.search.Weight weight =
+          isMatchAll
+              ? null
+              : engineSearcher.createWeight(
+                  engineSearcher.rewrite(luceneQuery),
+                  org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                  1.0f);
 
-        org.apache.lucene.index.SortedNumericDocValues dv0 =
-            reader.getSortedNumericDocValues(keyName0);
-        org.apache.lucene.index.SortedNumericDocValues dv1 =
-            reader.getSortedNumericDocValues(keyName1);
+      if (leaves.size() <= 1) {
+        // Single segment: direct scan (no parallelism overhead)
+        finalSets =
+            scanSegmentForCountDistinct(
+                leaves.isEmpty() ? null : leaves.get(0), weight, keyName0, keyName1, isMatchAll);
+      } else {
+        // Multi-segment: parallel scan using ForkJoinPool
+        @SuppressWarnings("unchecked")
+        java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet>[] segResults =
+            new java.util.Map[leaves.size()];
+        java.util.concurrent.CountDownLatch segLatch =
+            new java.util.concurrent.CountDownLatch(leaves.size() - 1);
+        Exception[] segError = new Exception[1];
 
-        // For MatchAllDocsQuery, use sequential nextDoc() on DocValues (faster than advanceExact).
-        // For filtered queries, use scorer + advanceExact.
-        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+        // Dispatch all but last segment to thread pool
+        for (int s = 0; s < leaves.size() - 1; s++) {
+          final int segIdx = s;
+          final org.apache.lucene.index.LeafReaderContext leafCtx = leaves.get(s);
+          FusedGroupByAggregate.getParallelPool()
+              .execute(
+                  () -> {
+                    try {
+                      segResults[segIdx] =
+                          scanSegmentForCountDistinct(
+                              leafCtx, weight, keyName0, keyName1, isMatchAll);
+                    } catch (Exception e) {
+                      segError[0] = e;
+                    }
+                    segLatch.countDown();
+                  });
+        }
 
-        if (isMatchAll && dv0 != null && dv1 != null) {
-          // Sequential DocValues iteration (no scorer needed)
-          int maxDoc = reader.maxDoc();
-          int dvDoc0 = dv0.nextDoc();
-          int dvDoc1 = dv1.nextDoc();
-          for (int doc = 0; doc < maxDoc; doc++) {
-            long k0 = 0;
-            if (dvDoc0 == doc) {
-              k0 = dv0.nextValue();
-              dvDoc0 = dv0.nextDoc();
-            }
-            long k1 = 0;
-            if (dvDoc1 == doc) {
-              k1 = dv1.nextValue();
-              dvDoc1 = dv1.nextDoc();
-            }
-            int gm = grpCap - 1;
-            int gs = Long.hashCode(k0) & gm;
-            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
-            if (!grpOcc[gs]) {
-              grpKeys[gs] = k0;
-              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
-              grpOcc[gs] = true;
-              grpSize++;
-              if (grpSize > grpThreshold) {
-                int newGC = grpCap * 2;
-                long[] ngk = new long[newGC];
-                org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
-                    new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
-                boolean[] ngo = new boolean[newGC];
-                int ngm = newGC - 1;
-                for (int g = 0; g < grpCap; g++) {
-                  if (grpOcc[g]) {
-                    int ns = Long.hashCode(grpKeys[g]) & ngm;
-                    while (ngo[ns]) ns = (ns + 1) & ngm;
-                    ngk[ns] = grpKeys[g];
-                    ngs[ns] = grpSets[g];
-                    ngo[ns] = true;
-                  }
-                }
-                grpKeys = ngk;
-                grpSets = ngs;
-                grpOcc = ngo;
-                grpCap = newGC;
-                grpThreshold = (int) (newGC * 0.7f);
-                gm = grpCap - 1;
-                gs = Long.hashCode(k0) & gm;
-                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+        // Run last segment on current thread
+        segResults[leaves.size() - 1] =
+            scanSegmentForCountDistinct(
+                leaves.get(leaves.size() - 1), weight, keyName0, keyName1, isMatchAll);
+
+        segLatch.await();
+        if (segError[0] != null) throw segError[0];
+
+        // Merge per-segment results: union all LongOpenHashSets per key0
+        finalSets = segResults[0] != null ? segResults[0] : new java.util.HashMap<>();
+        for (int s = 1; s < segResults.length; s++) {
+          if (segResults[s] == null) continue;
+          for (var entry : segResults[s].entrySet()) {
+            org.opensearch.sql.dqe.operator.LongOpenHashSet existing =
+                finalSets.get(entry.getKey());
+            if (existing == null) {
+              finalSets.put(entry.getKey(), entry.getValue());
+            } else {
+              // Merge the smaller set into the larger one
+              org.opensearch.sql.dqe.operator.LongOpenHashSet other = entry.getValue();
+              if (other.size() > existing.size()) {
+                mergeHashSets(other, existing);
+                finalSets.put(entry.getKey(), other);
+              } else {
+                mergeHashSets(existing, other);
               }
             }
-            grpSets[gs].add(k1);
-          }
-        } else {
-          // Filtered path: use scorer + advanceExact
-          org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
-          int doc;
-          while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-            long k0 = 0;
-            if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
-            long k1 = 0;
-            if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
-            int gm = grpCap - 1;
-            int gs = Long.hashCode(k0) & gm;
-            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
-            if (!grpOcc[gs]) {
-              grpKeys[gs] = k0;
-              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
-              grpOcc[gs] = true;
-              grpSize++;
-              if (grpSize > grpThreshold) {
-                int newGC = grpCap * 2;
-                long[] ngk = new long[newGC];
-                org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
-                    new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
-                boolean[] ngo = new boolean[newGC];
-                int ngm = newGC - 1;
-                for (int g = 0; g < grpCap; g++) {
-                  if (grpOcc[g]) {
-                    int ns = Long.hashCode(grpKeys[g]) & ngm;
-                    while (ngo[ns]) ns = (ns + 1) & ngm;
-                    ngk[ns] = grpKeys[g];
-                    ngs[ns] = grpSets[g];
-                    ngo[ns] = true;
-                  }
-                }
-                grpKeys = ngk;
-                grpSets = ngs;
-                grpOcc = ngo;
-                grpCap = newGC;
-                grpThreshold = (int) (newGC * 0.7f);
-                gm = grpCap - 1;
-                gs = Long.hashCode(k0) & gm;
-                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
-              }
-            }
-            grpSets[gs].add(k1);
           }
         }
       }
     }
 
+    int grpSize = finalSets.size();
+
     // Build compact output page: (key0, key1_placeholder=0, COUNT(*)=local_distinct_count)
-    // The page format matches the dedup plan output so the coordinator can fall back to
-    // page-based merge if needed. But the attached HashSets enable the fast merge path.
     List<Type> colTypes =
         List.of(
             type0 instanceof io.trino.spi.type.IntegerType
@@ -949,30 +897,174 @@ public class TransportShardExecuteAction
                 : io.trino.spi.type.BigintType.BIGINT,
             io.trino.spi.type.BigintType.BIGINT);
 
-    // Build HashSets map for attachment
-    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> distinctSets =
-        new java.util.HashMap<>(grpSize);
-
-    // Also build a fallback page with expanded (key0, key1) pairs for compatibility
-    // Actually, for the HashSet merge path we only need the attachment. But for safety,
-    // output a minimal page with (key0, COUNT_DISTINCT_placeholder) so the response is valid.
     io.trino.spi.block.BlockBuilder b0 = colTypes.get(0).createBlockBuilder(null, grpSize);
     io.trino.spi.block.BlockBuilder b1 = colTypes.get(1).createBlockBuilder(null, grpSize);
     io.trino.spi.block.BlockBuilder b2 = colTypes.get(2).createBlockBuilder(null, grpSize);
 
-    for (int g = 0; g < grpCap; g++) {
-      if (!grpOcc[g]) continue;
-      distinctSets.put(grpKeys[g], grpSets[g]);
-      // Output one row per group with a representative key1 value (0) and count
-      colTypes.get(0).writeLong(b0, grpKeys[g]);
+    for (var entry : finalSets.entrySet()) {
+      colTypes.get(0).writeLong(b0, entry.getKey());
       colTypes.get(1).writeLong(b1, 0L);
-      io.trino.spi.type.BigintType.BIGINT.writeLong(b2, grpSets[g].size());
+      io.trino.spi.type.BigintType.BIGINT.writeLong(b2, entry.getValue().size());
     }
 
     Page page = new Page(b0.build(), b1.build(), b2.build());
     ShardExecuteResponse resp = new ShardExecuteResponse(List.of(page), colTypes);
-    resp.setDistinctSets(distinctSets);
+    resp.setDistinctSets(finalSets);
     return resp;
+  }
+
+  /**
+   * Scan a single segment for the COUNT(DISTINCT) pattern: GROUP BY key0 with per-group
+   * LongOpenHashSet for key1 values. Returns a map from key0 to its set of key1 values.
+   */
+  private static java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+      scanSegmentForCountDistinct(
+          org.apache.lucene.index.LeafReaderContext leafCtx,
+          org.apache.lucene.search.Weight weight,
+          String keyName0,
+          String keyName1,
+          boolean isMatchAll)
+          throws Exception {
+    if (leafCtx == null) return new java.util.HashMap<>();
+
+    org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+    org.apache.lucene.index.SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyName0);
+    org.apache.lucene.index.SortedNumericDocValues dv1 = reader.getSortedNumericDocValues(keyName1);
+
+    // Open-addressing hash map: key0 → LongOpenHashSet(key1)
+    int grpCap = 256;
+    long[] grpKeys = new long[grpCap];
+    org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
+        new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
+
+    if (isMatchAll && dv0 != null && dv1 != null) {
+      int maxDoc = reader.maxDoc();
+      int dvDoc0 = dv0.nextDoc();
+      int dvDoc1 = dv1.nextDoc();
+      for (int doc = 0; doc < maxDoc; doc++) {
+        long k0 = 0;
+        if (dvDoc0 == doc) {
+          k0 = dv0.nextValue();
+          dvDoc0 = dv0.nextDoc();
+        }
+        long k1 = 0;
+        if (dvDoc1 == doc) {
+          k1 = dv1.nextValue();
+          dvDoc1 = dv1.nextDoc();
+        }
+        int gm = grpCap - 1;
+        int gs = Long.hashCode(k0) & gm;
+        while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+        if (!grpOcc[gs]) {
+          grpKeys[gs] = k0;
+          grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+          grpOcc[gs] = true;
+          grpSize++;
+          if (grpSize > grpThreshold) {
+            int newGC = grpCap * 2;
+            long[] ngk = new long[newGC];
+            org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+            boolean[] ngo = new boolean[newGC];
+            int ngm = newGC - 1;
+            for (int g = 0; g < grpCap; g++) {
+              if (grpOcc[g]) {
+                int ns = Long.hashCode(grpKeys[g]) & ngm;
+                while (ngo[ns]) ns = (ns + 1) & ngm;
+                ngk[ns] = grpKeys[g];
+                ngs[ns] = grpSets[g];
+                ngo[ns] = true;
+              }
+            }
+            grpKeys = ngk;
+            grpSets = ngs;
+            grpOcc = ngo;
+            grpCap = newGC;
+            grpThreshold = (int) (newGC * 0.7f);
+            gm = grpCap - 1;
+            gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+          }
+        }
+        grpSets[gs].add(k1);
+      }
+    } else if (weight != null) {
+      org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+      if (scorer != null) {
+        org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+        int doc;
+        while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+          long k0 = 0;
+          if (dv0 != null && dv0.advanceExact(doc)) k0 = dv0.nextValue();
+          long k1 = 0;
+          if (dv1 != null && dv1.advanceExact(doc)) k1 = dv1.nextValue();
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(k0) & gm;
+          while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+          if (!grpOcc[gs]) {
+            grpKeys[gs] = k0;
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpOcc[gs] = true;
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              int newGC = grpCap * 2;
+              long[] ngk = new long[newGC];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int ns = Long.hashCode(grpKeys[g]) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  ngk[ns] = grpKeys[g];
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
+              }
+              grpKeys = ngk;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              gm = grpCap - 1;
+              gs = Long.hashCode(k0) & gm;
+              while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            }
+          }
+          grpSets[gs].add(k1);
+        }
+      }
+    }
+
+    // Convert open-addressing arrays to HashMap
+    java.util.Map<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
+        new java.util.HashMap<>(grpSize);
+    for (int g = 0; g < grpCap; g++) {
+      if (grpOcc[g]) {
+        result.put(grpKeys[g], grpSets[g]);
+      }
+    }
+    return result;
+  }
+
+  /** Merge all entries from 'source' into 'target' LongOpenHashSet. */
+  private static void mergeHashSets(
+      org.opensearch.sql.dqe.operator.LongOpenHashSet target,
+      org.opensearch.sql.dqe.operator.LongOpenHashSet source) {
+    if (source.hasZeroValue()) target.add(0L);
+    if (source.hasSentinelValue())
+      target.add(org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
+    long[] srcKeys = source.keys();
+    long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
+    for (int i = 0; i < srcKeys.length; i++) {
+      if (srcKeys[i] != emptyMarker) {
+        target.add(srcKeys[i]);
+      }
+    }
   }
 
   /**
@@ -1617,6 +1709,67 @@ public class TransportShardExecuteAction
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
     return FusedScanAggregate.executeDistinctValues(columnName, shard, luceneQuery);
+  }
+
+  /**
+   * Execute a distinct-values scan for a single numeric column and return the raw LongOpenHashSet
+   * as an attachment on the response. Avoids building a Page with millions of entries — the
+   * coordinator merges the raw sets directly.
+   */
+  private ShardExecuteResponse executeDistinctValuesScanWithRawSet(
+      DqePlanNode plan, ShardExecuteRequest req) throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    org.opensearch.sql.dqe.operator.LongOpenHashSet rawSet =
+        FusedScanAggregate.collectDistinctValuesRaw(columnName, shard, luceneQuery);
+
+    // Build a minimal 1-row Page with the count (fallback for non-local paths)
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, rawSet.size());
+    List<Type> columnTypes = List.of(BigintType.BIGINT);
+    ShardExecuteResponse resp =
+        new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
+    resp.setScalarDistinctSet(rawSet);
+    return resp;
+  }
+
+  /**
+   * Execute a distinct-values scan for a single VARCHAR column and return the raw string HashSet as
+   * an attachment on the response. Avoids building a Page with thousands of strings.
+   */
+  private ShardExecuteResponse executeDistinctValuesScanVarcharWithRawSet(
+      DqePlanNode plan, ShardExecuteRequest req) throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    java.util.HashSet<String> rawStrings =
+        FusedScanAggregate.collectDistinctStringsRaw(columnName, shard, luceneQuery);
+
+    // Build a minimal 1-row Page with the count (fallback for non-local paths)
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, rawStrings.size());
+    List<Type> columnTypes = List.of(io.trino.spi.type.VarcharType.VARCHAR);
+    ShardExecuteResponse resp =
+        new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
+    resp.setScalarDistinctStrings(rawStrings);
+    return resp;
   }
 
   /**

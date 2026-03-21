@@ -128,6 +128,11 @@ public final class FusedGroupByAggregate {
 
   private FusedGroupByAggregate() {}
 
+  /** Expose the shared ForkJoinPool for intra-shard parallelism in other fast paths. */
+  public static java.util.concurrent.ForkJoinPool getParallelPool() {
+    return PARALLEL_POOL;
+  }
+
   /**
    * Compile an expression string and return its output type. Used to determine the type of
    * EvalNode-computed group-by keys (e.g., CASE WHEN expressions).

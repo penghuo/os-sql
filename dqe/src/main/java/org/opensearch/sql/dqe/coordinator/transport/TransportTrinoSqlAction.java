@@ -3963,43 +3963,49 @@ public class TransportTrinoSqlAction
     List<String> aggFunctions = aggNode.getAggregateFunctions();
     int numAggs = aggFunctions.size();
 
-    // Initialize accumulators
-    double[] sumValues = new double[numAggs];
-    long[] longSumValues = new long[numAggs];
-    boolean[] isDouble = new boolean[numAggs];
-    boolean[] isMinMax = new boolean[numAggs];
-    boolean[] isMin = new boolean[numAggs];
-    boolean[] isAvg = new boolean[numAggs];
-    // For AVG weighting: track companion COUNT column index
-    int countColIdx = -1;
-
     java.util.regex.Pattern AGG_PAT =
         java.util.regex.Pattern.compile(
             "^(COUNT|SUM|MIN|MAX|AVG)\\((DISTINCT\\s+)?(.+?)\\)$",
             java.util.regex.Pattern.CASE_INSENSITIVE);
 
+    // Build coordinator-to-shard column index mapping.
+    // AVG(col) is decomposed to SUM(col) + COUNT(col) at the shard level, so each AVG
+    // in the coordinator plan maps to TWO shard columns.
+    int[] shardSumIdx = new int[numAggs]; // For AVG: index of SUM(col) in shard data
+    int[] shardCountIdx = new int[numAggs]; // For AVG: index of COUNT(col) in shard data
+    int[] shardColIdx = new int[numAggs]; // For non-AVG: direct shard column index
+    boolean[] isAvg = new boolean[numAggs];
+    boolean[] isMinMax = new boolean[numAggs];
+    boolean[] isMin = new boolean[numAggs];
+    boolean[] isDouble = new boolean[numAggs];
+
+    int shardIdx = 0;
     for (int a = 0; a < numAggs; a++) {
       java.util.regex.Matcher m = AGG_PAT.matcher(aggFunctions.get(a));
       String funcName = m.matches() ? m.group(1).toUpperCase(java.util.Locale.ROOT) : "SUM";
-      if ("MIN".equals(funcName) || "MAX".equals(funcName)) {
-        isMinMax[a] = true;
-        isMin[a] = "MIN".equals(funcName);
-      } else if ("AVG".equals(funcName)) {
+      if ("AVG".equals(funcName)) {
         isAvg[a] = true;
-        isDouble[a] = true;
+        shardSumIdx[a] = shardIdx++;
+        shardCountIdx[a] = shardIdx++;
       } else {
-        // COUNT or SUM
-        isDouble[a] = columnTypes.get(a) instanceof DoubleType;
-      }
-      if ("COUNT".equals(funcName) && (m.group(2) == null)) {
-        countColIdx = a;
+        shardColIdx[a] = shardIdx++;
+        if ("MIN".equals(funcName) || "MAX".equals(funcName)) {
+          isMinMax[a] = true;
+          isMin[a] = "MIN".equals(funcName);
+        } else {
+          isDouble[a] = columnTypes.get(a) instanceof DoubleType;
+        }
       }
     }
 
-    // For MIN/MAX, track raw values to avoid type conversion issues.
-    // Long types (integers, timestamps) use long comparison.
-    // Double types use double comparison.
-    // VarcharType uses Slice-based comparison.
+    // Initialize accumulators
+    double[] sumValues = new double[numAggs];
+    long[] longSumValues = new long[numAggs];
+    // For AVG: accumulate SUM and COUNT separately from shard data
+    long[] avgLongSum = new long[numAggs];
+    long[] avgCount = new long[numAggs];
+
+    // For MIN/MAX, track raw values
     long[] minMaxLongValues = new long[numAggs];
     double[] minMaxDoubleValues = new double[numAggs];
     io.airlift.slice.Slice[] minMaxSliceValues = new io.airlift.slice.Slice[numAggs];
@@ -4021,94 +4027,68 @@ public class TransportTrinoSqlAction
       for (Page page : pages) {
         for (int pos = 0; pos < page.getPositionCount(); pos++) {
           for (int a = 0; a < numAggs; a++) {
-            Block block = page.getBlock(a);
-            if (block.isNull(pos)) continue;
-
-            if (isMinMax[a]) {
-              if (minMaxIsVarchar[a]) {
-                // VARCHAR: compare Slices
-                io.airlift.slice.Slice val = VarcharType.VARCHAR.getSlice(block, pos);
-                if (!minMaxInitialized[a]) {
-                  minMaxSliceValues[a] = val;
-                  minMaxInitialized[a] = true;
-                } else {
-                  int cmp = val.compareTo(minMaxSliceValues[a]);
-                  if (isMin[a] ? cmp < 0 : cmp > 0) {
-                    minMaxSliceValues[a] = val;
-                  }
-                }
-              } else if (minMaxIsDouble[a]) {
-                // DOUBLE: compare doubles
-                double val = DoubleType.DOUBLE.getDouble(block, pos);
-                if (!minMaxInitialized[a]) {
-                  minMaxDoubleValues[a] = val;
-                  minMaxInitialized[a] = true;
-                } else {
-                  if (isMin[a] ? val < minMaxDoubleValues[a] : val > minMaxDoubleValues[a]) {
-                    minMaxDoubleValues[a] = val;
-                  }
-                }
-              } else {
-                // Long types (including TimestampType): compare raw longs
-                long val = columnTypes.get(a).getLong(block, pos);
-                if (!minMaxInitialized[a]) {
-                  minMaxLongValues[a] = val;
-                  minMaxInitialized[a] = true;
-                } else {
-                  if (isMin[a] ? val < minMaxLongValues[a] : val > minMaxLongValues[a]) {
-                    minMaxLongValues[a] = val;
-                  }
-                }
+            if (isAvg[a]) {
+              // AVG decomposed: read SUM and COUNT from separate shard columns
+              Block sumBlock = page.getBlock(shardSumIdx[a]);
+              Block cntBlock = page.getBlock(shardCountIdx[a]);
+              if (!sumBlock.isNull(pos)) {
+                avgLongSum[a] += BigintType.BIGINT.getLong(sumBlock, pos);
               }
-            } else if (isAvg[a]) {
-              sumValues[a] += DoubleType.DOUBLE.getDouble(block, pos);
-            } else if (isDouble[a]) {
-              sumValues[a] += DoubleType.DOUBLE.getDouble(block, pos);
+              if (!cntBlock.isNull(pos)) {
+                avgCount[a] += BigintType.BIGINT.getLong(cntBlock, pos);
+              }
             } else {
-              longSumValues[a] += BigintType.BIGINT.getLong(block, pos);
+              Block block = page.getBlock(shardColIdx[a]);
+              if (block.isNull(pos)) continue;
+
+              if (isMinMax[a]) {
+                if (minMaxIsVarchar[a]) {
+                  io.airlift.slice.Slice val = VarcharType.VARCHAR.getSlice(block, pos);
+                  if (!minMaxInitialized[a]) {
+                    minMaxSliceValues[a] = val;
+                    minMaxInitialized[a] = true;
+                  } else {
+                    int cmp = val.compareTo(minMaxSliceValues[a]);
+                    if (isMin[a] ? cmp < 0 : cmp > 0) {
+                      minMaxSliceValues[a] = val;
+                    }
+                  }
+                } else if (minMaxIsDouble[a]) {
+                  double val = DoubleType.DOUBLE.getDouble(block, pos);
+                  if (!minMaxInitialized[a]) {
+                    minMaxDoubleValues[a] = val;
+                    minMaxInitialized[a] = true;
+                  } else {
+                    if (isMin[a] ? val < minMaxDoubleValues[a] : val > minMaxDoubleValues[a]) {
+                      minMaxDoubleValues[a] = val;
+                    }
+                  }
+                } else {
+                  long val = columnTypes.get(a).getLong(block, pos);
+                  if (!minMaxInitialized[a]) {
+                    minMaxLongValues[a] = val;
+                    minMaxInitialized[a] = true;
+                  } else {
+                    if (isMin[a] ? val < minMaxLongValues[a] : val > minMaxLongValues[a]) {
+                      minMaxLongValues[a] = val;
+                    }
+                  }
+                }
+              } else if (isDouble[a]) {
+                sumValues[a] += DoubleType.DOUBLE.getDouble(block, pos);
+              } else {
+                longSumValues[a] += BigintType.BIGINT.getLong(block, pos);
+              }
             }
           }
         }
       }
     }
 
-    // Handle AVG weighting: merge shard-level AVG values correctly.
-    // Each shard computes a shard-local AVG. To merge, we need weighted averaging.
+    // Compute AVG as SUM/COUNT
     for (int a = 0; a < numAggs; a++) {
-      if (!isAvg[a]) continue;
-      if (countColIdx >= 0) {
-        // Weighted merge: use companion COUNT column as weight.
-        // Correct merge: sum(avg_i * count_i) / sum(count_i).
-        double weightedSum = 0;
-        long totalCount = 0;
-        for (List<Page> pages : shardPages) {
-          for (Page page : pages) {
-            for (int pos = 0; pos < page.getPositionCount(); pos++) {
-              Block avgBlock = page.getBlock(a);
-              Block cntBlock = page.getBlock(countColIdx);
-              if (!avgBlock.isNull(pos) && !cntBlock.isNull(pos)) {
-                double avg = DoubleType.DOUBLE.getDouble(avgBlock, pos);
-                long cnt = BigintType.BIGINT.getLong(cntBlock, pos);
-                weightedSum += avg * cnt;
-                totalCount += cnt;
-              }
-            }
-          }
-        }
-        sumValues[a] = totalCount > 0 ? weightedSum / totalCount : 0.0;
-      } else {
-        // No companion COUNT column (e.g., SELECT AVG(col) FROM t).
-        // Simple average of shard AVGs — correct when shards have equal row counts,
-        // which is the default for evenly distributed OpenSearch indices.
-        int shardCount = 0;
-        for (List<Page> pages : shardPages) {
-          for (Page page : pages) {
-            shardCount += page.getPositionCount();
-          }
-        }
-        if (shardCount > 0) {
-          sumValues[a] = sumValues[a] / shardCount;
-        }
+      if (isAvg[a]) {
+        sumValues[a] = avgCount[a] > 0 ? (double) avgLongSum[a] / avgCount[a] : 0.0;
       }
     }
 

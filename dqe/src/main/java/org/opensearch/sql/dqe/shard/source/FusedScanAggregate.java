@@ -738,7 +738,8 @@ public final class FusedScanAggregate {
     int numCols = uniqueColumns.size();
     // Per-column accumulators: [sum, count, min, max] per column
     long[] colSum = new long[numCols];
-    double[] colDoubleSum = new double[numCols]; // For AVG to avoid long overflow
+    // Note: no double[] needed — all columns in this path are integer-family,
+    // and long accumulation is sufficient for SUM/AVG.
     long[] colCount = new long[numCols];
     long[] colMin = new long[numCols];
     long[] colMax = new long[numCols];
@@ -750,17 +751,15 @@ public final class FusedScanAggregate {
     String[] colArray = uniqueColumns.toArray(new String[0]);
 
     // Determine which aggregate types are actually needed to skip unnecessary work.
-    // Also track which columns need double accumulation (for AVG) to avoid long overflow
-    // when summing large values like UserID (~10^18) across 1M+ rows.
+    // Note: colNeedsDouble is always false within this path because DoubleType columns
+    // are excluded by the eligibility check above. For integer-family columns used with AVG,
+    // long accumulation is sufficient — the SUM fits in a long (e.g., short max 65535 * 100M
+    // rows = ~6.5e12, well within long range). The conversion to double happens only once
+    // in AvgDirectAccumulator.addLongSumCount().
     boolean needMin = false, needMax = false;
-    boolean[] colNeedsDouble = new boolean[numCols];
     for (AggSpec spec : specs) {
       if ("MIN".equals(spec.funcName())) needMin = true;
       if ("MAX".equals(spec.funcName())) needMax = true;
-      if ("AVG".equals(spec.funcName()) && !"*".equals(spec.arg())) {
-        int colIdx = uniqueColumns.indexOf(spec.arg());
-        if (colIdx >= 0) colNeedsDouble[colIdx] = true;
-      }
     }
 
     // Column-major iteration: process one column at a time across all docs per segment.
@@ -804,11 +803,11 @@ public final class FusedScanAggregate {
       // Capture effectively-final locals for lambda
       final int nc = numCols;
       final boolean needMinF = needMin, needMaxF = needMax;
-      final boolean[] colNeedsDoubleF = colNeedsDouble;
 
       // Each worker packs results into a long[]:
-      //   [totalDocs, colSum[0..nc-1], colDoubleSumBits[0..nc-1],
-      //    colCount[0..nc-1], colMin[0..nc-1], colMax[0..nc-1]]
+      //   [totalDocs, colSum[0..nc-1], colCount[0..nc-1], colMin[0..nc-1], colMax[0..nc-1]]
+      // No double accumulation needed: DoubleType columns are excluded by the eligibility
+      // check, and for integer-family columns, long accumulation is sufficient.
       @SuppressWarnings("unchecked")
       java.util.concurrent.CompletableFuture<long[]>[] futures =
           new java.util.concurrent.CompletableFuture[numWorkers];
@@ -818,9 +817,7 @@ public final class FusedScanAggregate {
         futures[w] =
             java.util.concurrent.CompletableFuture.supplyAsync(
                 () -> {
-                  long[] pack = new long[1 + nc * 5];
                   long[] wColSum = new long[nc];
-                  double[] wColDoubleSum = new double[nc];
                   long[] wColCount = new long[nc];
                   long[] wColMin = new long[nc];
                   long[] wColMax = new long[nc];
@@ -838,57 +835,31 @@ public final class FusedScanAggregate {
                       for (int c = 0; c < nc; c++) {
                         SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
                         if (dv == null) continue;
+                        long localSum = 0;
                         long localCount = 0;
 
-                        if (colNeedsDoubleF[c]) {
-                          double localDoubleSum = 0;
-                          if (needMinF || needMaxF) {
-                            long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
-                            int doc = dv.nextDoc();
-                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                              long val = dv.nextValue();
-                              localDoubleSum += val;
-                              localCount++;
-                              if (val < localMin) localMin = val;
-                              if (val > localMax) localMax = val;
-                              doc = dv.nextDoc();
-                            }
-                            if (localMin < wColMin[c]) wColMin[c] = localMin;
-                            if (localMax > wColMax[c]) wColMax[c] = localMax;
-                          } else {
-                            int doc = dv.nextDoc();
-                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                              localDoubleSum += dv.nextValue();
-                              localCount++;
-                              doc = dv.nextDoc();
-                            }
+                        if (needMinF || needMaxF) {
+                          long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
+                          int doc = dv.nextDoc();
+                          while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                            long val = dv.nextValue();
+                            localSum += val;
+                            localCount++;
+                            if (val < localMin) localMin = val;
+                            if (val > localMax) localMax = val;
+                            doc = dv.nextDoc();
                           }
-                          wColDoubleSum[c] += localDoubleSum;
+                          if (localMin < wColMin[c]) wColMin[c] = localMin;
+                          if (localMax > wColMax[c]) wColMax[c] = localMax;
                         } else {
-                          long localSum = 0;
-                          if (needMinF || needMaxF) {
-                            long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
-                            int doc = dv.nextDoc();
-                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                              long val = dv.nextValue();
-                              localSum += val;
-                              localCount++;
-                              if (val < localMin) localMin = val;
-                              if (val > localMax) localMax = val;
-                              doc = dv.nextDoc();
-                            }
-                            if (localMin < wColMin[c]) wColMin[c] = localMin;
-                            if (localMax > wColMax[c]) wColMax[c] = localMax;
-                          } else {
-                            int doc = dv.nextDoc();
-                            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                              localSum += dv.nextValue();
-                              localCount++;
-                              doc = dv.nextDoc();
-                            }
+                          int doc = dv.nextDoc();
+                          while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                            localSum += dv.nextValue();
+                            localCount++;
+                            doc = dv.nextDoc();
                           }
-                          wColSum[c] += localSum;
                         }
+                        wColSum[c] += localSum;
                         wColCount[c] += localCount;
                       }
                     }
@@ -897,17 +868,17 @@ public final class FusedScanAggregate {
                   }
 
                   // Pack results into long array
+                  long[] pack = new long[1 + nc * 4];
                   pack[0] = wTotalDocs;
                   for (int c = 0; c < nc; c++) {
                     pack[1 + c] = wColSum[c];
-                    pack[1 + nc + c] = Double.doubleToLongBits(wColDoubleSum[c]);
-                    pack[1 + 2 * nc + c] = wColCount[c];
-                    pack[1 + 3 * nc + c] = wColMin[c];
-                    pack[1 + 4 * nc + c] = wColMax[c];
+                    pack[1 + nc + c] = wColCount[c];
+                    pack[1 + 2 * nc + c] = wColMin[c];
+                    pack[1 + 3 * nc + c] = wColMax[c];
                   }
                   return pack;
                 },
-                java.util.concurrent.ForkJoinPool.commonPool());
+                FusedGroupByAggregate.getParallelPool());
       }
 
       // Merge worker results
@@ -917,10 +888,9 @@ public final class FusedScanAggregate {
         totalDocs += pack[0];
         for (int c = 0; c < numCols; c++) {
           colSum[c] += pack[1 + c];
-          colDoubleSum[c] += Double.longBitsToDouble(pack[1 + numCols + c]);
-          colCount[c] += pack[1 + 2 * numCols + c];
-          if (pack[1 + 3 * numCols + c] < colMin[c]) colMin[c] = pack[1 + 3 * numCols + c];
-          if (pack[1 + 4 * numCols + c] > colMax[c]) colMax[c] = pack[1 + 4 * numCols + c];
+          colCount[c] += pack[1 + numCols + c];
+          if (pack[1 + 2 * numCols + c] < colMin[c]) colMin[c] = pack[1 + 2 * numCols + c];
+          if (pack[1 + 3 * numCols + c] > colMax[c]) colMax[c] = pack[1 + 3 * numCols + c];
         }
       }
     } else {
@@ -934,59 +904,32 @@ public final class FusedScanAggregate {
           SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
           if (dv == null) continue;
 
+          long localSum = 0;
           long localCount = 0;
 
-          if (colNeedsDouble[c]) {
-            double localDoubleSum = 0;
-            if (needMin || needMax) {
-              long localMin = Long.MAX_VALUE;
-              long localMax = Long.MIN_VALUE;
-              int doc = dv.nextDoc();
-              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-                long val = dv.nextValue();
-                localDoubleSum += val;
-                localCount++;
-                if (val < localMin) localMin = val;
-                if (val > localMax) localMax = val;
-                doc = dv.nextDoc();
-              }
-              if (localMin < colMin[c]) colMin[c] = localMin;
-              if (localMax > colMax[c]) colMax[c] = localMax;
-            } else {
-              int doc = dv.nextDoc();
-              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-                localDoubleSum += dv.nextValue();
-                localCount++;
-                doc = dv.nextDoc();
-              }
+          if (needMin || needMax) {
+            long localMin = Long.MAX_VALUE;
+            long localMax = Long.MIN_VALUE;
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              long val = dv.nextValue();
+              localSum += val;
+              localCount++;
+              if (val < localMin) localMin = val;
+              if (val > localMax) localMax = val;
+              doc = dv.nextDoc();
             }
-            colDoubleSum[c] += localDoubleSum;
+            if (localMin < colMin[c]) colMin[c] = localMin;
+            if (localMax > colMax[c]) colMax[c] = localMax;
           } else {
-            long localSum = 0;
-            if (needMin || needMax) {
-              long localMin = Long.MAX_VALUE;
-              long localMax = Long.MIN_VALUE;
-              int doc = dv.nextDoc();
-              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-                long val = dv.nextValue();
-                localSum += val;
-                localCount++;
-                if (val < localMin) localMin = val;
-                if (val > localMax) localMax = val;
-                doc = dv.nextDoc();
-              }
-              if (localMin < colMin[c]) colMin[c] = localMin;
-              if (localMax > colMax[c]) colMax[c] = localMax;
-            } else {
-              int doc = dv.nextDoc();
-              while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-                localSum += dv.nextValue();
-                localCount++;
-                doc = dv.nextDoc();
-              }
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              localSum += dv.nextValue();
+              localCount++;
+              doc = dv.nextDoc();
             }
-            colSum[c] += localSum;
           }
+          colSum[c] += localSum;
           colCount[c] += localCount;
         }
       }
@@ -1015,11 +958,7 @@ public final class FusedScanAggregate {
             break;
           case "AVG":
             if (acc instanceof AvgDirectAccumulator aa) {
-              if (colNeedsDouble[colIdx]) {
-                aa.addDoubleSumCount(colDoubleSum[colIdx], colCount[colIdx]);
-              } else {
-                aa.addLongSumCount(colSum[colIdx], colCount[colIdx]);
-              }
+              aa.addLongSumCount(colSum[colIdx], colCount[colIdx]);
             }
             break;
           case "MIN":

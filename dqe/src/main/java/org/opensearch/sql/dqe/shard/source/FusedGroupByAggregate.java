@@ -4338,7 +4338,115 @@ public final class FusedGroupByAggregate {
             }
           }
 
-          if (liveDocs == null) {
+          if (liveDocs == null && dv0 != null) {
+            // Check for ultra-fast nextDoc() path: all aggs are COUNT(*) or all numeric
+            // aggs are dense. Sequential nextDoc() is ~2-3x faster than advanceExact()
+            // because it reads the compressed DocValues stream sequentially.
+            boolean allCountStar = true;
+            boolean hasApplyLen = false;
+            for (int i = 0; i < numAggs; i++) {
+              if (!isCountStar[i]) allCountStar = false;
+              if (aggApplyLength[i]) hasApplyLen = true;
+            }
+
+            if (allCountStar) {
+              // Ultra-fast path: only COUNT(*), use nextDoc() on key column
+              int doc = dv0.nextDoc();
+              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                long key0 = dv0.nextValue();
+                int slot = flatMap.findOrInsert(key0);
+                flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
+                doc = dv0.nextDoc();
+              }
+            } else if (!hasApplyLen) {
+              // Fast path: numeric aggs, use nextDoc() lockstep iteration.
+              boolean allAggDense = true;
+              for (int i = 0; i < numAggs; i++) {
+                if (!isCountStar[i] && numericAggDvs[i] == null) {
+                  allAggDense = false;
+                  break;
+                }
+              }
+              if (allAggDense) {
+                int[] aggDocPos = new int[numAggs];
+                for (int i = 0; i < numAggs; i++) {
+                  if (!isCountStar[i]) {
+                    aggDocPos[i] = numericAggDvs[i].nextDoc();
+                  }
+                }
+                int keyDoc = dv0.nextDoc();
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  long key0;
+                  if (keyDoc == doc) {
+                    key0 = dv0.nextValue();
+                    keyDoc = dv0.nextDoc();
+                  } else {
+                    key0 = 0;
+                  }
+                  int slot = flatMap.findOrInsert(key0);
+                  int base = slot * slotsPerGroup;
+                  for (int i = 0; i < numAggs; i++) {
+                    int off = base + accOffset[i];
+                    if (isCountStar[i]) {
+                      flatMap.accData[off]++;
+                      continue;
+                    }
+                    if (aggDocPos[i] == doc) {
+                      long rawVal = numericAggDvs[i].nextValue();
+                      aggDocPos[i] = numericAggDvs[i].nextDoc();
+                      switch (accType[i]) {
+                        case 0:
+                          flatMap.accData[off]++;
+                          break;
+                        case 1:
+                          flatMap.accData[off] += rawVal;
+                          break;
+                        case 2:
+                          flatMap.accData[off] += rawVal;
+                          flatMap.accData[off + 1]++;
+                          break;
+                      }
+                    }
+                  }
+                }
+              } else {
+                // Some agg columns missing — fall back to advanceExact
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  collectFlatSingleKeyDocWithLength(
+                      doc,
+                      dv0,
+                      flatMap,
+                      slotsPerGroup,
+                      numAggs,
+                      isCountStar,
+                      accType,
+                      accOffset,
+                      numericAggDvs,
+                      lengthVarcharDvs,
+                      ordLengthMaps,
+                      aggApplyLength);
+                }
+              }
+            } else {
+              // Has applyLength — use advanceExact
+              for (int doc = 0; doc < maxDoc; doc++) {
+                collectFlatSingleKeyDocWithLength(
+                    doc,
+                    dv0,
+                    flatMap,
+                    slotsPerGroup,
+                    numAggs,
+                    isCountStar,
+                    accType,
+                    accOffset,
+                    numericAggDvs,
+                    lengthVarcharDvs,
+                    ordLengthMaps,
+                    aggApplyLength);
+              }
+            }
+          } else if (liveDocs == null) {
+            // Key column is null — all keys are 0
             for (int doc = 0; doc < maxDoc; doc++) {
               collectFlatSingleKeyDocWithLength(
                   doc,

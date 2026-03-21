@@ -135,7 +135,11 @@ public class PlanFragmenter {
       }
       // Strip Sort, Limit, and Project above the aggregation.
       // Walk up from the aggregation to find it in the tree and return it as the root.
-      return stripAboveAggregation(plan);
+      DqePlanNode strippedPlan = stripAboveAggregation(plan);
+      // Decompose AVG into SUM + COUNT at the shard level for correct weighted merge
+      // at the coordinator. Without this, AVG-only queries (no companion COUNT) would
+      // produce a shard-local AVG that can't be correctly merged across shards.
+      return decomposeAvgInShardPlan(strippedPlan);
     }
     // SINGLE with GROUP BY: try shard-level dedup for COUNT(DISTINCT)-only queries.
     // Each shard performs GROUP BY (original_keys + distinct_columns) with COUNT(*),
@@ -388,6 +392,49 @@ public class PlanFragmenter {
       }
     }
     return false;
+  }
+
+  /**
+   * Decompose AVG aggregates into SUM + COUNT at the shard level for PARTIAL execution. When a
+   * shard computes AVG locally, the coordinator cannot correctly merge shard-local AVGs without
+   * knowing each shard's row count. By decomposing AVG(col) into SUM(col) + COUNT(col), the
+   * coordinator can compute the correct global AVG as SUM(sums) / SUM(counts).
+   *
+   * <p>If no AVG aggregates are present, returns the plan unchanged.
+   */
+  private static DqePlanNode decomposeAvgInShardPlan(DqePlanNode plan) {
+    if (!(plan instanceof AggregationNode aggNode)) {
+      return plan;
+    }
+    // Only decompose for scalar aggregations (no GROUP BY). GROUP BY queries use
+    // FusedGroupByAggregate which handles AVG natively and expects the original layout.
+    if (!aggNode.getGroupByKeys().isEmpty()) {
+      return plan;
+    }
+    boolean hasAvg = false;
+    for (String func : aggNode.getAggregateFunctions()) {
+      if (func.toUpperCase(Locale.ROOT).startsWith("AVG(")) {
+        hasAvg = true;
+        break;
+      }
+    }
+    if (!hasAvg) {
+      return plan;
+    }
+    // Decompose: AVG(col) → SUM(col) + COUNT(col)
+    List<String> shardAggs = new ArrayList<>();
+    for (String func : aggNode.getAggregateFunctions()) {
+      Matcher m = AGG_PATTERN.matcher(func);
+      if (m.matches() && "AVG".equalsIgnoreCase(m.group(1)) && m.group(2) == null) {
+        String arg = m.group(3).trim();
+        shardAggs.add("SUM(" + arg + ")");
+        shardAggs.add("COUNT(" + arg + ")");
+      } else {
+        shardAggs.add(func);
+      }
+    }
+    return new AggregationNode(
+        aggNode.getChild(), aggNode.getGroupByKeys(), shardAggs, aggNode.getStep());
   }
 
   /**

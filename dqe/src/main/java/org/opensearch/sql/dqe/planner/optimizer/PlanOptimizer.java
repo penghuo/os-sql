@@ -370,7 +370,7 @@ public class PlanOptimizer {
       DqePlanNode optimizedChild = node.getChild().accept(this, context);
       // For non-decomposable aggregates (COUNT(DISTINCT), AVG without COUNT),
       // force SINGLE step — coordinator will run the full aggregation over raw shard data
-      if (hasNonDecomposableAgg(node.getAggregateFunctions())) {
+      if (hasNonDecomposableAgg(node.getAggregateFunctions(), node.getGroupByKeys())) {
         return new AggregationNode(
             optimizedChild,
             node.getGroupByKeys(),
@@ -393,7 +393,7 @@ public class PlanOptimizer {
      * Check if the aggregate function list contains non-decomposable functions that can't be
      * correctly merged with PARTIAL/FINAL: COUNT(DISTINCT) or AVG without a companion COUNT.
      */
-    private boolean hasNonDecomposableAgg(List<String> aggFunctions) {
+    private boolean hasNonDecomposableAgg(List<String> aggFunctions, List<String> groupByKeys) {
       boolean hasAvg = false;
       boolean hasCount = false;
       boolean hasCountDistinct = false;
@@ -404,7 +404,11 @@ public class PlanOptimizer {
         else if (upper.startsWith("COUNT(")) hasCount = true;
       }
       if (hasCountDistinct) return true;
-      if (hasAvg && !hasCount) return true;
+      // For scalar aggregation (no GROUP BY), AVG is always decomposable because the
+      // PlanFragmenter decomposes AVG into SUM+COUNT at the shard level. But for GROUP BY
+      // queries, the FusedGroupByAggregate handles AVG natively and the coordinator merge
+      // needs a companion COUNT for correct weighted merge across shards.
+      if (hasAvg && !hasCount && !groupByKeys.isEmpty()) return true;
       return false;
     }
 

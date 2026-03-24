@@ -271,24 +271,185 @@ HTTP Request → TransportTrinoSqlAction (coordinator)
 
 7. **OrdinalMap build cost.** First query touching a VARCHAR field pays ~200ms (SearchPhrase) to ~3s (URL) for OrdinalMap construction. Subsequent queries reuse the cache (keyed by IndexReader + field name, max 64 entries).
 
-## 8. Environment Setup
+## 8. Environment & Test Setup
+
+### Current Environment (Pre-Configured)
+
+The current m5.8xlarge instance has everything running. Verify with:
 
 ```bash
-# OpenSearch install
-/opt/opensearch/          # OpenSearch 3.6.0-SNAPSHOT
-/opt/opensearch/data/     # Index data (100M rows in 'hits' index, 4 shards)
+# Check OpenSearch is up
+curl -sf http://localhost:9200/_cluster/health | jq .status      # → "yellow"
 
-# JVM settings
-/opt/opensearch/config/jvm.options.d/heap.options  # 32GB heap
+# Check data is loaded
+curl -sf http://localhost:9200/hits/_count | jq .count            # → 99997497 (100M full)
+curl -sf http://localhost:9200/hits_1m/_count | jq .count         # → 1000000 (1M subset)
 
-# ClickHouse (for correctness reference)
-clickhouse-client --port 9000  # Native protocol
+# Check ClickHouse (used for correctness reference)
+clickhouse-client -q "SELECT count() FROM hits"                  # → 99997497
+clickhouse-client -q "SELECT count() FROM hits_1m"               # → 1000000
+```
 
-# Benchmark scripts
+### Directory Layout
+
+```
+/home/ec2-user/oss/wukong/                    # Repository root
+├── dqe/src/main/java/.../dqe/                # DQE source code
+├── benchmarks/clickbench/
+│   ├── queries/queries_trino.sql             # 43 ClickBench queries (1-indexed, line N = Q(N-1))
+│   ├── run/run_opensearch.sh                 # DQE benchmark runner
+│   ├── run/run_clickhouse.sh                 # CH benchmark runner
+│   ├── run/run_all.sh                        # Unified orchestrator
+│   ├── setup/setup_opensearch.sh             # OS install + plugin build
+│   ├── setup/setup_clickhouse.sh             # CH install
+│   ├── setup/setup_common.sh                 # Shared vars (INDEX_NAME, ports, etc.)
+│   ├── data/download_data.sh                 # Download 100 Parquet files (~15GB)
+│   ├── data/load_opensearch.sh               # Bulk-load Parquet → OS via clickhouse-local
+│   ├── data/load_clickhouse.sh               # Load Parquet → CH MergeTree
+│   ├── data/snapshot.sh                      # EBS snapshot create/restore
+│   ├── data/parquet/hits_*.parquet           # 100 Parquet files (source data)
+│   ├── correctness/                          # Correctness check scripts + expected results
+│   ├── results/performance/
+│   │   ├── clickhouse_parquet_official/      # Official CH-Parquet baseline (DO NOT MODIFY)
+│   │   ├── opensearch_phaseD/                # Latest Phase D benchmark results
+│   │   └── opensearch_corrected/             # Earlier corrected results
+│   └── snapshots/                            # OpenSearch filesystem snapshot repo
+├── integ-test/src/test/resources/clickbench/
+│   └── mappings/clickbench_index_mapping.json  # Index mapping (103 fields, sorted by CounterID+EventDate+UserID+EventTime+WatchID)
+└── /opt/opensearch/                          # OpenSearch installation
+    ├── config/jvm.options.d/heap.options      # 32GB heap (-Xms32g -Xmx32g)
+    ├── config/opensearch.yml                  # single-node, path.repo for snapshots
+    └── data/                                  # Index data on disk
+```
+
+### Instance Specs
+
+| Component | Value |
+|-----------|-------|
+| Instance | m5.8xlarge |
+| vCPU | 32 |
+| RAM | 128 GB |
+| OS heap | 32 GB (`-Xms32g -Xmx32g`) |
+| Java | OpenJDK 21.0.8 (Corretto) |
+| OpenSearch | 3.6.0-SNAPSHOT (min distribution, no security) |
+| ClickHouse | Latest stable (used for correctness only) |
+| Index `hits` | 99,997,497 docs, 4 primary shards, 0 replicas |
+| Index `hits_1m` | 1,000,000 docs, 8 primary shards, 0 replicas |
+
+### Setting Up From Scratch (New Instance)
+
+If starting on a fresh instance, use the automated scripts:
+
+```bash
+# 1. Clone the repo
+git clone <repo-url> /home/ec2-user/oss/wukong
+cd /home/ec2-user/oss/wukong
+git checkout wukong
+
+# 2. Install OpenSearch + ClickHouse (idempotent)
+cd benchmarks/clickbench && bash run/run_all.sh setup
+
+# 3. Download Parquet data (~15GB, 100 files, parallel download)
+bash run/run_all.sh load-full
+# This does: download_data.sh → load_clickhouse.sh → load_opensearch.sh
+# OpenSearch bulk load takes ~45 min for 100M rows
+# After load, runs _forcemerge to 1 segment per shard
+
+# 4. Load 1M subset (for correctness testing)
+bash run/run_all.sh load-1m
+# Creates hits_1m in both CH and OS, generates expected results
+
+# 5. Override heap to 32GB (the setup script caps at 16GB)
+echo "-Xms32g" | sudo tee /opt/opensearch/config/jvm.options.d/heap.options
+echo "-Xmx32g" | sudo tee -a /opt/opensearch/config/jvm.options.d/heap.options
+# Restart OpenSearch to apply
+bash run/run_all.sh reload-plugin
+```
+
+### Restoring From EBS Snapshot (Fastest Path)
+
+If an EBS snapshot exists with data already loaded:
+
+```bash
+# 1. Check snapshot status
 cd /home/ec2-user/oss/wukong/benchmarks/clickbench
-cat queries/queries_trino.sql   # All 43 ClickBench queries
-ls run/                          # run_opensearch.sh, run_clickhouse.sh, run_all.sh
-ls results/performance/          # Benchmark result JSON files
+bash data/snapshot.sh status
+
+# 2. Restore EBS volumes from snapshot
+bash data/snapshot.sh restore
+# This creates new EBS volumes from snapshots, you attach & mount them
+
+# 3. Start services
+bash run/run_all.sh setup    # Ensures OS + CH installed
+# Start OpenSearch and ClickHouse manually or via reload-plugin
+```
+
+### Restoring 1M Index From OpenSearch Snapshot
+
+The 1M index has a filesystem-level snapshot for fast restore:
+
+```bash
+# Restore hits_1m from OpenSearch snapshot (seconds, not minutes)
+cd /home/ec2-user/oss/wukong/benchmarks/clickbench
+bash run/run_all.sh restore-1m
+
+# Verify
+curl -sf http://localhost:9200/hits_1m/_count | jq .count  # → 1000000
+```
+
+### Index Configuration Details
+
+The `hits` index uses sorted indexing for predicate pushdown:
+
+```json
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 4,
+      "number_of_replicas": 0,
+      "sort.field": ["CounterID", "EventDate", "UserID", "EventTime", "WatchID"],
+      "sort.order": ["desc", "desc", "desc", "desc", "desc"]
+    }
+  },
+  "mappings": {
+    "properties": { /* 103 fields — see clickbench_index_mapping.json */ }
+  }
+}
+```
+
+The sort order is critical for narrow-filter queries (Q37-Q42): CounterID=62 filter
+can use the sorted index to skip segments efficiently.
+
+### Data Source
+
+Parquet files are downloaded from the official ClickBench dataset:
+- URL pattern: `https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_N.parquet`
+- 100 files (hits_0.parquet through hits_99.parquet), ~150MB each, ~15GB total
+- Each file contains ~1M rows, totaling ~100M rows
+- The `load_opensearch.sh` script uses `clickhouse-local` to convert Parquet → JSONEachRow, then bulk-loads via `/_bulk` API
+
+### Dev Iteration Loop (After Environment is Ready)
+
+```bash
+# 1. Make code changes in dqe/src/main/java/...
+
+# 2. Compile (fast check, ~5s)
+cd /home/ec2-user/oss/wukong && ./gradlew :dqe:compileJava
+
+# 3. Deploy (rebuild plugin + restart OS, ~3 min)
+cd benchmarks/clickbench && bash run/run_all.sh reload-plugin
+
+# 4. Quick correctness check
+bash run/run_all.sh correctness --query 17    # Single query
+bash run/run_all.sh correctness               # Full suite (33/43 baseline)
+
+# 5. Benchmark specific query
+bash run/run_opensearch.sh --warmup 3 --num-tries 5 --query 17 --output-dir /tmp/q17
+
+# 6. Full benchmark (when ready)
+bash run/run_opensearch.sh --warmup 3 --num-tries 5 --output-dir /tmp/full
+
+# CRITICAL: Never run reload-plugin while a benchmark is running!
 ```
 
 ## 9. Recommended Next Steps (Priority Order)

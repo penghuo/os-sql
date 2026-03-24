@@ -108,7 +108,7 @@ public final class FusedScanAggregate {
     if (!(evalNode.getChild() instanceof TableScanNode)) {
       return false;
     }
-    // All aggregate functions must be SUM (non-distinct)
+    // All aggregate functions must be SUM, COUNT, or AVG (non-distinct)
     for (String func : aggNode.getAggregateFunctions()) {
       Matcher m = AGG_FUNCTION.matcher(func);
       if (!m.matches()) {
@@ -116,7 +116,10 @@ public final class FusedScanAggregate {
       }
       String funcName = m.group(1).toUpperCase(Locale.ROOT);
       boolean isDistinct = m.group(2) != null;
-      if (!"SUM".equals(funcName) || isDistinct) {
+      if (isDistinct) {
+        return false;
+      }
+      if (!"SUM".equals(funcName) && !"COUNT".equals(funcName) && !"AVG".equals(funcName)) {
         return false;
       }
     }
@@ -181,6 +184,19 @@ public final class FusedScanAggregate {
     }
 
     // Compute SUM and COUNT for each unique physical column
+    // Also include physical columns referenced directly by COUNT(col) and AVG(col) aggregates
+    for (String func : aggFunctions) {
+      Matcher m = AGG_FUNCTION.matcher(func);
+      if (m.matches()) {
+        String arg = m.group(3).trim();
+        if (!"*".equals(arg) && !nameToPhysical.containsKey(arg)) {
+          // Direct physical column reference (not through EvalNode)
+          nameToPhysical.put(arg, arg);
+          nameToOffset.put(arg, 0L);
+          uniquePhysicalColumns.add(arg);
+        }
+      }
+    }
     Map<String, long[]> colSumCount = new java.util.LinkedHashMap<>();
     for (String col : uniquePhysicalColumns) {
       colSumCount.put(col, new long[2]); // [sum, count]
@@ -365,10 +381,16 @@ public final class FusedScanAggregate {
     }
 
     // Derive results: SUM(col + k) = SUM(col) + k * COUNT(col)
+    // COUNT(*) = count of any physical column, AVG(col + k) = (SUM(col) + k * COUNT) / COUNT
     int numAggs = aggFunctions.size();
     BlockBuilder[] builders = new BlockBuilder[numAggs];
     for (int i = 0; i < numAggs; i++) {
-      builders[i] = BigintType.BIGINT.createBlockBuilder(null, 1);
+      Matcher m = AGG_FUNCTION.matcher(aggFunctions.get(i));
+      String funcName = m.matches() ? m.group(1).toUpperCase(Locale.ROOT) : "SUM";
+      builders[i] =
+          "AVG".equals(funcName)
+              ? DoubleType.DOUBLE.createBlockBuilder(null, 1)
+              : BigintType.BIGINT.createBlockBuilder(null, 1);
     }
 
     for (int i = 0; i < numAggs; i++) {
@@ -376,12 +398,42 @@ public final class FusedScanAggregate {
       if (!m.matches()) {
         throw new IllegalArgumentException("Unsupported aggregate: " + aggFunctions.get(i));
       }
-      String arg = m.group(3).trim(); // The eval column name (e.g., "(ResolutionWidth + 1)")
-      String physCol = nameToPhysical.get(arg);
-      long offset = nameToOffset.getOrDefault(arg, 0L);
-      long[] sc = colSumCount.get(physCol);
-      long result = sc[0] + offset * sc[1]; // SUM(col) + k * COUNT
-      BigintType.BIGINT.writeLong(builders[i], result);
+      String funcName = m.group(1).toUpperCase(Locale.ROOT);
+      String arg = m.group(3).trim(); // The eval column name or "*"
+
+      if ("COUNT".equals(funcName)) {
+        // COUNT(*) or COUNT(col): use count from any available physical column
+        if ("*".equals(arg)) {
+          // Use count from the first physical column
+          long count = 0;
+          for (long[] sc : colSumCount.values()) {
+            count = sc[1];
+            break;
+          }
+          BigintType.BIGINT.writeLong(builders[i], count);
+        } else {
+          String physCol = nameToPhysical.getOrDefault(arg, arg);
+          long[] sc = colSumCount.get(physCol);
+          BigintType.BIGINT.writeLong(builders[i], sc != null ? sc[1] : 0);
+        }
+      } else if ("AVG".equals(funcName)) {
+        String physCol = nameToPhysical.getOrDefault(arg, arg);
+        long offset = nameToOffset.getOrDefault(arg, 0L);
+        long[] sc = colSumCount.get(physCol);
+        if (sc != null && sc[1] > 0) {
+          double avg = (double) (sc[0] + offset * sc[1]) / sc[1];
+          DoubleType.DOUBLE.writeDouble(builders[i], avg);
+        } else {
+          builders[i].appendNull();
+        }
+      } else {
+        // SUM: original algebraic identity
+        String physCol = nameToPhysical.get(arg);
+        long offset = nameToOffset.getOrDefault(arg, 0L);
+        long[] sc = colSumCount.get(physCol);
+        long result = sc[0] + offset * sc[1]; // SUM(col) + k * COUNT
+        BigintType.BIGINT.writeLong(builders[i], result);
+      }
     }
 
     Block[] blocks = new Block[numAggs];
@@ -392,13 +444,18 @@ public final class FusedScanAggregate {
   }
 
   /**
-   * Resolve the output types for the fused eval-aggregate. All outputs are BigintType since we only
-   * support SUM on integer columns with integer offsets.
+   * Resolve the output types for the fused eval-aggregate. SUM and COUNT return BigintType, AVG
+   * returns DoubleType.
    */
   public static List<Type> resolveEvalAggOutputTypes(AggregationNode aggNode) {
     List<Type> types = new ArrayList<>();
-    for (int i = 0; i < aggNode.getAggregateFunctions().size(); i++) {
-      types.add(BigintType.BIGINT);
+    for (String func : aggNode.getAggregateFunctions()) {
+      Matcher m = AGG_FUNCTION.matcher(func);
+      if (m.matches() && "AVG".equalsIgnoreCase(m.group(1))) {
+        types.add(DoubleType.DOUBLE);
+      } else {
+        types.add(BigintType.BIGINT);
+      }
     }
     return types;
   }

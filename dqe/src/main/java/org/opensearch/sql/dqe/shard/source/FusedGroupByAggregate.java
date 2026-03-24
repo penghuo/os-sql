@@ -4305,236 +4305,84 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat")) {
 
-      if (query instanceof MatchAllDocsQuery) {
-        // Fast path: iterate all docs directly without Collector/Scorer overhead.
-        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-          LeafReader reader = leafCtx.reader();
-          int maxDoc = reader.maxDoc();
-          Bits liveDocs = reader.getLiveDocs();
-          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
+      java.util.List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = query instanceof MatchAllDocsQuery;
+      boolean canParallelize =
+          !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
 
-          final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
-          // For applyLength args: pre-compute ordinal→length map for O(1) per-doc lookup
-          final SortedSetDocValues[] lengthVarcharDvs = new SortedSetDocValues[numAggs];
-          final int[][] ordLengthMaps = new int[numAggs][];
-          final boolean[] aggApplyLength = new boolean[numAggs];
-          for (int i = 0; i < numAggs; i++) {
-            if (!isCountStar[i]) {
-              if (specs.get(i).applyLength) {
-                SortedSetDocValues varcharDv = reader.getSortedSetDocValues(specs.get(i).arg);
-                lengthVarcharDvs[i] = varcharDv;
-                aggApplyLength[i] = true;
-                if (varcharDv != null) {
-                  int ordCount = (int) Math.min(varcharDv.getValueCount(), 10_000_000);
-                  int[] ordLengths = new int[ordCount];
-                  for (int ord = 0; ord < ordCount; ord++) {
-                    ordLengths[ord] = varcharDv.lookupOrd(ord).length;
-                  }
-                  ordLengthMaps[i] = ordLengths;
-                }
-              } else {
-                numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
-              }
-            }
+      if (canParallelize) {
+        // Parallel path: partition segments across workers, each with own FlatSingleKeyMap
+        int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+        @SuppressWarnings("unchecked")
+        java.util.List<LeafReaderContext>[] workerSegments = new java.util.List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++)
+          workerSegments[i] = new java.util.ArrayList<>();
+        // Largest-first greedy assignment for balanced load
+        java.util.List<LeafReaderContext> sortedLeaves = new java.util.ArrayList<>(leaves);
+        sortedLeaves.sort(
+            (a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
           }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
 
-          if (liveDocs == null && dv0 != null) {
-            // Check for ultra-fast nextDoc() path: all aggs are COUNT(*) or all numeric
-            // aggs are dense. Sequential nextDoc() is ~2-3x faster than advanceExact()
-            // because it reads the compressed DocValues stream sequentially.
-            boolean allCountStar = true;
-            boolean hasApplyLen = false;
-            for (int i = 0; i < numAggs; i++) {
-              if (!isCountStar[i]) allCountStar = false;
-              if (aggApplyLength[i]) hasApplyLen = true;
-            }
+        final Weight weight;
+        if (!isMatchAll) {
+          IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+          weight =
+              luceneSearcher.createWeight(
+                  luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+        } else {
+          weight = null;
+        }
 
-            if (allCountStar) {
-              // Ultra-fast path: only COUNT(*), use nextDoc() on key column
-              int doc = dv0.nextDoc();
-              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                long key0 = dv0.nextValue();
-                int slot = flatMap.findOrInsert(key0);
-                flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
-                doc = dv0.nextDoc();
-              }
-            } else if (!hasApplyLen) {
-              // Fast path: numeric aggs, use nextDoc() lockstep iteration.
-              boolean allAggDense = true;
-              for (int i = 0; i < numAggs; i++) {
-                if (!isCountStar[i] && numericAggDvs[i] == null) {
-                  allAggDense = false;
-                  break;
-                }
-              }
-              if (allAggDense) {
-                int[] aggDocPos = new int[numAggs];
-                for (int i = 0; i < numAggs; i++) {
-                  if (!isCountStar[i]) {
-                    aggDocPos[i] = numericAggDvs[i].nextDoc();
-                  }
-                }
-                int keyDoc = dv0.nextDoc();
-                for (int doc = 0; doc < maxDoc; doc++) {
-                  long key0;
-                  if (keyDoc == doc) {
-                    key0 = dv0.nextValue();
-                    keyDoc = dv0.nextDoc();
-                  } else {
-                    key0 = 0;
-                  }
-                  int slot = flatMap.findOrInsert(key0);
-                  int base = slot * slotsPerGroup;
-                  for (int i = 0; i < numAggs; i++) {
-                    int off = base + accOffset[i];
-                    if (isCountStar[i]) {
-                      flatMap.accData[off]++;
-                      continue;
-                    }
-                    if (aggDocPos[i] == doc) {
-                      long rawVal = numericAggDvs[i].nextValue();
-                      aggDocPos[i] = numericAggDvs[i].nextDoc();
-                      switch (accType[i]) {
-                        case 0:
-                          flatMap.accData[off]++;
-                          break;
-                        case 1:
-                          flatMap.accData[off] += rawVal;
-                          break;
-                        case 2:
-                          flatMap.accData[off] += rawVal;
-                          flatMap.accData[off + 1]++;
-                          break;
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<FlatSingleKeyMap>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final java.util.List<LeafReaderContext> mySegments = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup);
+                    try {
+                      for (LeafReaderContext leafCtx : mySegments) {
+                        scanSegmentFlatSingleKey(
+                            leafCtx, weight, isMatchAll, localMap, keyInfos, specs,
+                            numAggs, isCountStar, accType, accOffset, slotsPerGroup);
                       }
+                    } catch (Exception e) {
+                      throw new RuntimeException(e);
                     }
-                  }
-                }
-              } else {
-                // Some agg columns missing — fall back to advanceExact
-                for (int doc = 0; doc < maxDoc; doc++) {
-                  collectFlatSingleKeyDocWithLength(
-                      doc,
-                      dv0,
-                      flatMap,
-                      slotsPerGroup,
-                      numAggs,
-                      isCountStar,
-                      accType,
-                      accOffset,
-                      numericAggDvs,
-                      lengthVarcharDvs,
-                      ordLengthMaps,
-                      aggApplyLength);
-                }
-              }
-            } else {
-              // Has applyLength — use advanceExact
-              for (int doc = 0; doc < maxDoc; doc++) {
-                collectFlatSingleKeyDocWithLength(
-                    doc,
-                    dv0,
-                    flatMap,
-                    slotsPerGroup,
-                    numAggs,
-                    isCountStar,
-                    accType,
-                    accOffset,
-                    numericAggDvs,
-                    lengthVarcharDvs,
-                    ordLengthMaps,
-                    aggApplyLength);
-              }
-            }
-          } else if (liveDocs == null) {
-            // Key column is null — all keys are 0
-            for (int doc = 0; doc < maxDoc; doc++) {
-              collectFlatSingleKeyDocWithLength(
-                  doc,
-                  dv0,
-                  flatMap,
-                  slotsPerGroup,
-                  numAggs,
-                  isCountStar,
-                  accType,
-                  accOffset,
-                  numericAggDvs,
-                  lengthVarcharDvs,
-                  ordLengthMaps,
-                  aggApplyLength);
-            }
-          } else {
-            for (int doc = 0; doc < maxDoc; doc++) {
-              if (liveDocs.get(doc)) {
-                collectFlatSingleKeyDocWithLength(
-                    doc,
-                    dv0,
-                    flatMap,
-                    slotsPerGroup,
-                    numAggs,
-                    isCountStar,
-                    accType,
-                    accOffset,
-                    numericAggDvs,
-                    lengthVarcharDvs,
-                    ordLengthMaps,
-                    aggApplyLength);
-              }
-            }
-          }
+                    return localMap;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+        for (var future : futures) {
+          FlatSingleKeyMap workerMap = future.join();
+          if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
         }
       } else {
-        // Filtered path: manual Weight+Scorer loop to skip empty segments early
-        IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
-        Weight weight =
-            luceneSearcher.createWeight(
-                luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
-
-        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-          Scorer scorer = weight.scorer(leafCtx);
-          if (scorer == null) continue; // No matching docs in this segment
-
-          LeafReader reader = leafCtx.reader();
-          SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
-
-          final SortedNumericDocValues[] numericAggDvs2 = new SortedNumericDocValues[numAggs];
-          final SortedSetDocValues[] lengthVarcharDvs2 = new SortedSetDocValues[numAggs];
-          final int[][] ordLengthMaps2 = new int[numAggs][];
-          final boolean[] aggApplyLength2 = new boolean[numAggs];
-          for (int i = 0; i < numAggs; i++) {
-            if (!isCountStar[i]) {
-              if (specs.get(i).applyLength) {
-                SortedSetDocValues vdv = reader.getSortedSetDocValues(specs.get(i).arg);
-                lengthVarcharDvs2[i] = vdv;
-                aggApplyLength2[i] = true;
-                if (vdv != null) {
-                  int oc = (int) Math.min(vdv.getValueCount(), 10_000_000);
-                  int[] ol = new int[oc];
-                  for (int o = 0; o < oc; o++) ol[o] = vdv.lookupOrd(o).length;
-                  ordLengthMaps2[i] = ol;
-                }
-              } else {
-                numericAggDvs2[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
-              }
-            }
-          }
-
-          DocIdSetIterator docIt = scorer.iterator();
-          int doc;
-          while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-            collectFlatSingleKeyDocWithLength(
-                doc,
-                dv0,
-                flatMap,
-                slotsPerGroup,
-                numAggs,
-                isCountStar,
-                accType,
-                accOffset,
-                numericAggDvs2,
-                lengthVarcharDvs2,
-                ordLengthMaps2,
-                aggApplyLength2);
-          }
+        // Sequential path: single FlatSingleKeyMap for all segments
+        Weight weight = null;
+        if (!isMatchAll) {
+          IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+          weight =
+              luceneSearcher.createWeight(
+                  luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+        }
+        for (LeafReaderContext leafCtx : leaves) {
+          scanSegmentFlatSingleKey(
+              leafCtx, weight, isMatchAll, flatMap, keyInfos, specs,
+              numAggs, isCountStar, accType, accOffset, slotsPerGroup);
         }
       }
     }
@@ -4763,6 +4611,171 @@ public final class FusedGroupByAggregate {
   }
 
   /**
+   * Scan a single segment for the flat single-key numeric GROUP BY path. Handles both MatchAll
+   * (direct DocValues iteration) and filtered (Weight+Scorer) paths. Accumulates into the provided
+   * FlatSingleKeyMap.
+   */
+  private static void scanSegmentFlatSingleKey(
+      LeafReaderContext leafCtx,
+      Weight weight,
+      boolean isMatchAll,
+      FlatSingleKeyMap flatMap,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      int slotsPerGroup)
+      throws Exception {
+    LeafReader reader = leafCtx.reader();
+    SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
+
+    final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+    final SortedSetDocValues[] lengthVarcharDvs = new SortedSetDocValues[numAggs];
+    final int[][] ordLengthMaps = new int[numAggs][];
+    final boolean[] aggApplyLength = new boolean[numAggs];
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i]) {
+        if (specs.get(i).applyLength) {
+          SortedSetDocValues varcharDv = reader.getSortedSetDocValues(specs.get(i).arg);
+          lengthVarcharDvs[i] = varcharDv;
+          aggApplyLength[i] = true;
+          if (varcharDv != null) {
+            int ordCount = (int) Math.min(varcharDv.getValueCount(), 10_000_000);
+            int[] ordLengths = new int[ordCount];
+            for (int ord = 0; ord < ordCount; ord++) {
+              ordLengths[ord] = varcharDv.lookupOrd(ord).length;
+            }
+            ordLengthMaps[i] = ordLengths;
+          }
+        } else {
+          numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+        }
+      }
+    }
+
+    if (isMatchAll) {
+      int maxDoc = reader.maxDoc();
+      Bits liveDocs = reader.getLiveDocs();
+
+      if (liveDocs == null && dv0 != null) {
+        boolean allCountStar = true;
+        boolean hasApplyLen = false;
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i]) allCountStar = false;
+          if (aggApplyLength[i]) hasApplyLen = true;
+        }
+
+        if (allCountStar) {
+          // Ultra-fast path: only COUNT(*), use nextDoc() on key column
+          int doc = dv0.nextDoc();
+          while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+            long key0 = dv0.nextValue();
+            int slot = flatMap.findOrInsert(key0);
+            flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
+            doc = dv0.nextDoc();
+          }
+        } else if (!hasApplyLen) {
+          // Fast path: numeric aggs, use nextDoc() lockstep iteration.
+          boolean allAggDense = true;
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i] && numericAggDvs[i] == null) {
+              allAggDense = false;
+              break;
+            }
+          }
+          if (allAggDense) {
+            int[] aggDocPos = new int[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              if (!isCountStar[i]) {
+                aggDocPos[i] = numericAggDvs[i].nextDoc();
+              }
+            }
+            int keyDoc = dv0.nextDoc();
+            for (int doc = 0; doc < maxDoc; doc++) {
+              long key0;
+              if (keyDoc == doc) {
+                key0 = dv0.nextValue();
+                keyDoc = dv0.nextDoc();
+              } else {
+                key0 = 0;
+              }
+              int slot = flatMap.findOrInsert(key0);
+              int base = slot * slotsPerGroup;
+              for (int i = 0; i < numAggs; i++) {
+                int off = base + accOffset[i];
+                if (isCountStar[i]) {
+                  flatMap.accData[off]++;
+                  continue;
+                }
+                if (aggDocPos[i] == doc) {
+                  long rawVal = numericAggDvs[i].nextValue();
+                  aggDocPos[i] = numericAggDvs[i].nextDoc();
+                  switch (accType[i]) {
+                    case 0:
+                      flatMap.accData[off]++;
+                      break;
+                    case 1:
+                      flatMap.accData[off] += rawVal;
+                      break;
+                    case 2:
+                      flatMap.accData[off] += rawVal;
+                      flatMap.accData[off + 1]++;
+                      break;
+                  }
+                }
+              }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              collectFlatSingleKeyDocWithLength(
+                  doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+                  accType, accOffset, numericAggDvs, lengthVarcharDvs,
+                  ordLengthMaps, aggApplyLength);
+            }
+          }
+        } else {
+          for (int doc = 0; doc < maxDoc; doc++) {
+            collectFlatSingleKeyDocWithLength(
+                doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+                accType, accOffset, numericAggDvs, lengthVarcharDvs,
+                ordLengthMaps, aggApplyLength);
+          }
+        }
+      } else if (liveDocs == null) {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          collectFlatSingleKeyDocWithLength(
+              doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+              accType, accOffset, numericAggDvs, lengthVarcharDvs,
+              ordLengthMaps, aggApplyLength);
+        }
+      } else {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (liveDocs.get(doc)) {
+            collectFlatSingleKeyDocWithLength(
+                doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+                accType, accOffset, numericAggDvs, lengthVarcharDvs,
+                ordLengthMaps, aggApplyLength);
+          }
+        }
+      }
+    } else {
+      // Filtered path
+      Scorer scorer = weight.scorer(leafCtx);
+      if (scorer == null) return;
+      DocIdSetIterator docIt = scorer.iterator();
+      int doc;
+      while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        collectFlatSingleKeyDocWithLength(
+            doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+            accType, accOffset, numericAggDvs, lengthVarcharDvs,
+            ordLengthMaps, aggApplyLength);
+      }
+    }
+  }
+
+  /**
    * Specialized fast path for GROUP BY with exactly two numeric keys. Uses an open-addressing hash
    * map with flat long-array accumulators, eliminating ALL per-group object allocation.
    *
@@ -4886,6 +4899,40 @@ public final class FusedGroupByAggregate {
       } else {
         // Multi-bucket partitioned aggregation: each pass aggregates only groups
         // whose hash falls into the current bucket, keeping map size under MAX_CAPACITY.
+        // Parallelize across buckets when possible.
+        int parallelBuckets = Math.min(numBuckets, THREADS_PER_SHARD);
+        if (parallelBuckets > 1 && !"off".equals(PARALLELISM_MODE)) {
+          @SuppressWarnings("unchecked")
+          java.util.concurrent.CompletableFuture<List<Page>>[] futures =
+              new java.util.concurrent.CompletableFuture[numBuckets];
+          for (int b = 0; b < numBuckets; b++) {
+            final int bkt = b;
+            futures[b] =
+                java.util.concurrent.CompletableFuture.supplyAsync(
+                    () -> {
+                      try {
+                        return executeTwoKeyNumericFlat(
+                            shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+                            numAggs, isCountStar, accType, sortAggIndex, sortAscending,
+                            topN, bkt, numBuckets);
+                      } catch (Exception e) {
+                        throw new RuntimeException(e);
+                      }
+                    },
+                    PARALLEL_POOL);
+          }
+          java.util.concurrent.CompletableFuture.allOf(futures).join();
+          List<Page> allBucketResults = new ArrayList<>();
+          for (var future : futures) {
+            allBucketResults.addAll(future.join());
+          }
+          if (allBucketResults.isEmpty()) return List.of();
+          if (allBucketResults.size() == 1) return allBucketResults;
+          return mergePartitionedPages(
+              allBucketResults, keyInfos, specs, columnTypeMap, groupByKeys,
+              numAggs, accType, sortAggIndex, sortAscending, topN);
+        }
+        // Sequential fallback
         List<Page> allBucketResults = new ArrayList<>();
         for (int bucket = 0; bucket < numBuckets; bucket++) {
           List<Page> bucketPages =
@@ -11926,6 +11973,19 @@ public final class FusedGroupByAggregate {
       this.accData = nacc;
       this.capacity = newCap;
       this.threshold = (int) (newCap * LOAD_FACTOR);
+    }
+
+    /** Merge all entries from another FlatSingleKeyMap into this one, adding accData element-wise. */
+    void mergeFrom(FlatSingleKeyMap other) {
+      for (int s = 0; s < other.capacity; s++) {
+        if (!other.occupied[s]) continue;
+        int slot = findOrInsert(other.keys[s]);
+        int dstBase = slot * slotsPerGroup;
+        int srcBase = s * other.slotsPerGroup;
+        for (int j = 0; j < slotsPerGroup; j++) {
+          accData[dstBase + j] += other.accData[srcBase + j];
+        }
+      }
     }
   }
 

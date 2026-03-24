@@ -366,24 +366,6 @@ echo "-Xmx32g" | sudo tee -a /opt/opensearch/config/jvm.options.d/heap.options
 bash run/run_all.sh reload-plugin
 ```
 
-### Restoring From EBS Snapshot (Fastest Path)
-
-If an EBS snapshot exists with data already loaded:
-
-```bash
-# 1. Check snapshot status
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench
-bash data/snapshot.sh status
-
-# 2. Restore EBS volumes from snapshot
-bash data/snapshot.sh restore
-# This creates new EBS volumes from snapshots, you attach & mount them
-
-# 3. Start services
-bash run/run_all.sh setup    # Ensures OS + CH installed
-# Start OpenSearch and ClickHouse manually or via reload-plugin
-```
-
 ### Restoring 1M Index From OpenSearch Snapshot
 
 The 1M index has a filesystem-level snapshot for fast restore:

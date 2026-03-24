@@ -57,3 +57,4 @@ http-client.env.json
 .clinerules
 memory-bankdqe/native/target/
 dqe/src/main/resources/libdqe_datafusion.so
+.ralph/

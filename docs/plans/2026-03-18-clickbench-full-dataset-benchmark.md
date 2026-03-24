@@ -9,7 +9,7 @@
 **Tech Stack:** OpenSearch 3.6.0-SNAPSHOT, repository-s3 plugin, AWS S3, bash scripts
 
 **Environment:**
-- Instance: m5.8xlarge (32 vCPUs, 124GB RAM, heap bumped to 32GB)
+- Instance: r5.4xlarge (16 vCPUs, 124GB RAM, heap bumped to 32GB)
 - Current `hits` index: 100M rows, 1 shard, 73.6GB (will be replaced)
 - S3 snapshot: `hits` index, 4 shards, ~85GB, from OS 3.2.0
 - ClickHouse baseline: official ClickBench c6a.4xlarge results (32GB RAM)
@@ -60,16 +60,24 @@ Expected: `-> Installed repository-s3`
 
 **Step 5: Configure AWS credentials for S3 access**
 
-```bash
-ACCESS_KEY=$(AWS_PROFILE=s3-read aws configure get aws_access_key_id)
-SECRET_KEY=$(AWS_PROFILE=s3-read aws configure get aws_secret_access_key)
-SESSION_TOKEN=$(AWS_PROFILE=s3-read aws configure get aws_session_token 2>/dev/null || true)
+```
+Used ada credentials update --account 924196221507 --provider isengard --role Admin --once (conduit provider didn't work, isengard did).
 
-echo "$ACCESS_KEY" | sudo /opt/opensearch/bin/opensearch-keystore add -f --stdin s3.client.default.access_key
-echo "$SECRET_KEY" | sudo /opt/opensearch/bin/opensearch-keystore add -f --stdin s3.client.default.secret_key
-if [ -n "$SESSION_TOKEN" ]; then
-    echo "$SESSION_TOKEN" | sudo /opt/opensearch/bin/opensearch-keystore add -f --stdin s3.client.default.session_token
-fi
+Contents of s3://flint-data-dp-us-west-2-beta/data/clickbench/:
+
+Directories:
+- 901001101001100/
+- _00110100111100/
+- g01100100011011/
+- indices/
+- k01010110111101/
+- snapshot_shard_paths/
+
+Files:
+- index-0 — 509 bytes (2025-09-13)
+- index.latest — 8 bytes (2025-09-13)
+- meta-RvDchkmgTHaJJRedztc_jQ.dat — 193 bytes (2025-09-13)
+- snap-RvDchkmgTHaJJRedztc_jQ.dat — 371 bytes (2025-09-13)
 ```
 
 **Step 6: Start OpenSearch and verify**

@@ -59,10 +59,10 @@ Q39: 16.9x (2.422s vs 0.143s) — CounterID=62 filtered, OFFSET, 5 keys + CASE W
 
 ```bash
 # Compile DQE module only (fast, ~5s)
-cd /home/ec2-user/oss/wukong && ./gradlew :dqe:compileJava
+cd ~/oss/wukong && ./gradlew :dqe:compileJava
 
 # Full rebuild + restart OpenSearch + reinstall plugin (~3 min)
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench && bash run/run_all.sh reload-plugin
+cd ~/oss/wukong/benchmarks/clickbench && bash run/run_all.sh reload-plugin
 
 # Verify OpenSearch is running
 curl -sf http://localhost:9200/_cluster/health | jq .status
@@ -77,7 +77,7 @@ curl -sf http://localhost:9200/hits/_count | jq .count
 
 ```bash
 # Full correctness suite (1M dataset, ~2 min)
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench && bash run/run_all.sh correctness
+cd ~/oss/wukong/benchmarks/clickbench && bash run/run_all.sh correctness
 
 # Single query correctness
 bash run/run_all.sh correctness --query 17
@@ -89,7 +89,7 @@ bash run/run_all.sh correctness --query 17
 
 ```bash
 # Single query (fast iteration, ~30s per query)
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench
+cd ~/oss/wukong/benchmarks/clickbench
 bash run/run_opensearch.sh --warmup 3 --num-tries 5 --query 17 --output-dir /tmp/q17_test
 
 # Extract results (note: query N in script = index N-1 in JSON)
@@ -293,7 +293,7 @@ clickhouse-client -q "SELECT count() FROM hits_1m"               # → 1000000
 ### Directory Layout
 
 ```
-/home/ec2-user/oss/wukong/                    # Repository root
+~/oss/wukong/                    # Repository root
 ├── dqe/src/main/java/.../dqe/                # DQE source code
 ├── benchmarks/clickbench/
 │   ├── queries/queries_trino.sql             # 43 ClickBench queries (1-indexed, line N = Q(N-1))
@@ -326,8 +326,8 @@ clickhouse-client -q "SELECT count() FROM hits_1m"               # → 1000000
 
 | Component | Value |
 |-----------|-------|
-| Instance | m5.8xlarge |
-| vCPU | 32 |
+| Instance | r5.4xlarge |
+| vCPU | 16 |
 | RAM | 128 GB |
 | OS heap | 32 GB (`-Xms32g -Xmx32g`) |
 | Java | OpenJDK 21.0.8 (Corretto) |
@@ -342,8 +342,8 @@ If starting on a fresh instance, use the automated scripts:
 
 ```bash
 # 1. Clone the repo
-git clone <repo-url> /home/ec2-user/oss/wukong
-cd /home/ec2-user/oss/wukong
+git clone <repo-url> ~/oss/wukong
+cd ~/oss/wukong
 git checkout wukong
 
 # 2. Install OpenSearch + ClickHouse (idempotent)
@@ -366,38 +366,9 @@ echo "-Xmx32g" | sudo tee -a /opt/opensearch/config/jvm.options.d/heap.options
 bash run/run_all.sh reload-plugin
 ```
 
-### Restoring 1M Index From OpenSearch Snapshot
+### Restoring OpenSearch Snapshot
 
-The 1M index has a filesystem-level snapshot for fast restore:
-
-```bash
-# Restore hits_1m from OpenSearch snapshot (seconds, not minutes)
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench
-bash run/run_all.sh restore-1m
-
-# Verify
-curl -sf http://localhost:9200/hits_1m/_count | jq .count  # → 1000000
-```
-
-### Index Configuration Details
-
-The `hits` index uses sorted indexing for predicate pushdown:
-
-```json
-{
-  "settings": {
-    "index": {
-      "number_of_shards": 4,
-      "number_of_replicas": 0,
-      "sort.field": ["CounterID", "EventDate", "UserID", "EventTime", "WatchID"],
-      "sort.order": ["desc", "desc", "desc", "desc", "desc"]
-    }
-  },
-  "mappings": {
-    "properties": { /* 103 fields — see clickbench_index_mapping.json */ }
-  }
-}
-```
+- Refer: /home/penghuo/oss/os-sql/docs/plans/2026-03-18-clickbench-full-dataset-benchmark.md
 
 The sort order is critical for narrow-filter queries (Q37-Q42): CounterID=62 filter
 can use the sorted index to skip segments efficiently.
@@ -416,7 +387,7 @@ Parquet files are downloaded from the official ClickBench dataset:
 # 1. Make code changes in dqe/src/main/java/...
 
 # 2. Compile (fast check, ~5s)
-cd /home/ec2-user/oss/wukong && ./gradlew :dqe:compileJava
+cd ~/oss/wukong && ./gradlew :dqe:compileJava
 
 # 3. Deploy (rebuild plugin + restart OS, ~3 min)
 cd benchmarks/clickbench && bash run/run_all.sh reload-plugin
@@ -452,7 +423,7 @@ Small targeted optimizations to close the remaining gap. Q31 needs only 3ms.
 Cache compiled `Pattern` objects. Hoist regex computation before the aggregation loop. This is the single heaviest remaining query (25.5s).
 
 ## 10. Reference Documents
-
+- Benchmark setup: `docs/plans/2026-03-18-clickbench-full-dataset-benchmark.md`
 - Design doc: `docs/plans/2026-03-20-phase-d-optimization-design.md`
 - Implementation plan: `docs/plans/2026-03-20-phase-d-impl-plan.md`
 - Phase C progress report: `docs/reports/2026-03-19-phase-c-progress.md`

@@ -28,6 +28,26 @@ OS_DATA_DIR="${OS_DATA_DIR:-${OS_INSTALL_DIR}/data}"
 # --- ClickHouse data dir ---
 CH_DATA_DIR="${CH_DATA_DIR:-/var/lib/clickhouse}"
 
+# --- OS process user (who runs OpenSearch) ---
+OS_USER="${OS_USER:-$(stat -c '%U' "$OS_INSTALL_DIR/bin/opensearch" 2>/dev/null || echo opensearch)}"
+
+# --- Privilege helper ---
+# If we are already the OS_USER, run directly; otherwise sudo.
+_os_run() {
+    if [ "$(id -un)" = "$OS_USER" ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+_os_run_as() {
+    if [ "$(id -un)" = "$OS_USER" ]; then
+        "$@"
+    else
+        sudo -u "$OS_USER" "$@"
+    fi
+}
+
 # --- Dataset ---
 DATASET_BASE_URL="https://datasets.clickhouse.com/hits_compatible/athena_partitioned"
 NUM_PARQUET_FILES=100
@@ -115,7 +135,8 @@ get_instance_type() {
 # Drop OS-level caches
 drop_caches() {
     sync
-    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || \
+        echo "[WARN] Cannot drop caches (no sudo). Benchmark cold-run times may be slightly optimistic."
 }
 
 # ---------------------------------------------------------------------------
@@ -138,7 +159,7 @@ reload_sql_plugin() {
     log "Stopping OpenSearch ..."
     local pid_file="$OS_INSTALL_DIR/opensearch.pid"
     if [ -f "$pid_file" ]; then
-        sudo -u opensearch kill "$(cat "$pid_file")" 2>/dev/null || true
+        _os_run_as kill "$(cat "$pid_file")" 2>/dev/null || true
         sleep 5
     fi
     # Wait until the process is actually gone
@@ -149,14 +170,16 @@ reload_sql_plugin() {
     done
 
     log "Removing old SQL plugin ..."
-    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" remove opensearch-sql 2>/dev/null || true
+    _os_run "$OS_INSTALL_DIR/bin/opensearch-plugin" remove opensearch-sql 2>/dev/null || true
 
     log "Installing new SQL plugin from $plugin_zip ..."
-    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$plugin_zip"
+    _os_run "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$plugin_zip"
 
     log "Starting OpenSearch ..."
-    sudo chown -R opensearch:opensearch "$OS_INSTALL_DIR"
-    sudo -u opensearch "$OS_INSTALL_DIR/bin/opensearch" -d -p "$pid_file"
+    if [ "$(id -un)" != "$OS_USER" ]; then
+        sudo chown -R "$OS_USER" "$OS_INSTALL_DIR"
+    fi
+    _os_run_as "$OS_INSTALL_DIR/bin/opensearch" -d -p "$pid_file"
     wait_for_opensearch 180
 
     log "SQL plugin reloaded successfully."
@@ -370,7 +393,7 @@ _try_restore_1m_snapshot() {
 _register_1m_snapshot_repo() {
     mkdir -p "$SNAPSHOT_DIR"
     # Ensure opensearch user can write to the directory
-    sudo chown -R opensearch:opensearch "$SNAPSHOT_DIR" 2>/dev/null || true
+    _os_run chown -R "$OS_USER:$OS_USER" "$SNAPSHOT_DIR" 2>/dev/null || true
 
     local resp
     resp=$(curl -sf -XPUT "${OS_URL}/_snapshot/${SNAPSHOT_REPO}" \

@@ -102,8 +102,12 @@ if [ "$WARMUP_PASSES" -gt 0 ]; then
         while IFS= read -r wq; do
             WP_NUM=$((WP_NUM + 1))
             [ -z "$wq" ] && continue
-            # Skip Q35 during warmup (can timeout)
-            [ "$WP_NUM" -eq 35 ] && continue
+            # When benchmarking a single query, only warm up that query
+            if [ -n "$ONLY_QUERY" ] && [ "$WP_NUM" -ne "$ONLY_QUERY" ]; then
+                continue
+            fi
+            # Skip Q35 during full warmup (can timeout)
+            [ -z "$ONLY_QUERY" ] && [ "$WP_NUM" -eq 35 ] && continue
             wq=$(echo "$wq" | sed 's/;[[:space:]]*$//')
             if [ "$DATASET" = "1m" ]; then
                 wq=$(echo "$wq" | sed "s/\bhits\b/${TARGET_INDEX}/g")

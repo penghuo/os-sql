@@ -70,6 +70,7 @@ normalize() {
     sed 's/[[:space:]]*$//' |
     sed '/^$/d' |
     sed 's/\\N/NULL/g; s/\bnull\b/NULL/gi' |
+    sed "s/\\\\'/'/g" |
     sed -E 's/([0-9]+\.[0-9]{6})[0-9]*/\1/g' |
     sort
 }
@@ -191,10 +192,18 @@ for i in $(seq 0 $((TOTAL - 1))); do
     fi
 
     # Extract result rows from OpenSearch JSON response
-    echo "$OS_RESPONSE" | jq -r '
-        .datarows[]? // .rows[]? // empty |
-        [.[] | tostring] | join("\t")
-    ' 2>/dev/null | normalize > "$OS_OUT"
+    # Use Python instead of jq to preserve full precision of large integers
+    # (jq uses IEEE 754 doubles internally, losing precision for longs > 2^53)
+    echo "$OS_RESPONSE" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    rows = d.get('datarows', d.get('rows', []))
+    for row in rows:
+        print('\t'.join(str(v) for v in row))
+except Exception:
+    pass
+" 2>/dev/null | normalize > "$OS_OUT"
 
     # ── Compare ──────────────────────────────────────────────────────────
 

@@ -27,15 +27,15 @@ install_opensearch() {
     fi
     log "Downloading OpenSearch 3.6.0-SNAPSHOT..."
     local tarball="/tmp/opensearch-snapshot.tar.gz"
-    wget -q --show-progress -O "$tarball" "$OS_SNAPSHOT_URL"
+    wget -q -O "$tarball" "$OS_SNAPSHOT_URL"
 
     log "Extracting to $OS_INSTALL_DIR..."
-    sudo mkdir -p "$OS_INSTALL_DIR"
-    sudo tar -xzf "$tarball" -C "$OS_INSTALL_DIR" --strip-components=1
+    mkdir -p "$OS_INSTALL_DIR"
+    tar -xzf "$tarball" -C "$OS_INSTALL_DIR" --strip-components=1
     rm -f "$tarball"
 
     # Configure for single-node benchmark (min distribution has no security plugin)
-    cat <<YAML | sudo tee "$OS_INSTALL_DIR/config/opensearch.yml" > /dev/null
+    cat <<YAML > "$OS_INSTALL_DIR/config/opensearch.yml"
 cluster.name: clickbench
 node.name: node-1
 network.host: 0.0.0.0
@@ -48,22 +48,16 @@ YAML
     total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local heap_mb=$(( total_mem_kb / 1024 / 2 ))
     if [ "$heap_mb" -gt 16384 ]; then heap_mb=16384; fi
-    echo "-Xms${heap_mb}m" | sudo tee "$OS_INSTALL_DIR/config/jvm.options.d/heap.options" > /dev/null
-    echo "-Xmx${heap_mb}m" | sudo tee -a "$OS_INSTALL_DIR/config/jvm.options.d/heap.options" > /dev/null
+    echo "-Xms${heap_mb}m" > "$OS_INSTALL_DIR/config/jvm.options.d/heap.options"
+    echo "-Xmx${heap_mb}m" >> "$OS_INSTALL_DIR/config/jvm.options.d/heap.options"
     log "OpenSearch heap set to ${heap_mb}m"
-
-    # Create opensearch user if needed
-    if ! id opensearch &>/dev/null; then
-        sudo useradd -r -s /bin/false opensearch
-    fi
-    sudo chown -R opensearch:opensearch "$OS_INSTALL_DIR"
 }
 
 # --- Install job-scheduler plugin (required dependency for SQL plugin) ---
 install_job_scheduler_plugin() {
     local js_zip
 
-    if sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" list 2>/dev/null | grep -q opensearch-job-scheduler; then
+    if "$OS_INSTALL_DIR/bin/opensearch-plugin" list 2>/dev/null | grep -q opensearch-job-scheduler; then
         log "Job-scheduler plugin already installed."
         return 0
     fi
@@ -83,7 +77,7 @@ install_job_scheduler_plugin() {
     fi
 
     log "Installing job-scheduler plugin from $js_zip..."
-    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$js_zip"
+    "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$js_zip"
 }
 
 # --- Build and install SQL plugin from local repo ---
@@ -91,7 +85,7 @@ install_sql_plugin() {
     local plugin_zip
 
     # Check if plugin already installed
-    if sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" list 2>/dev/null | grep -q opensearch-sql; then
+    if "$OS_INSTALL_DIR/bin/opensearch-plugin" list 2>/dev/null | grep -q opensearch-sql; then
         log "SQL plugin already installed."
         return 0
     fi
@@ -107,7 +101,7 @@ install_sql_plugin() {
     fi
 
     log "Installing SQL plugin from $plugin_zip..."
-    sudo "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$plugin_zip"
+    "$OS_INSTALL_DIR/bin/opensearch-plugin" install --batch "file://$plugin_zip"
 
     cd "$BENCH_DIR"
 }
@@ -120,7 +114,7 @@ start_opensearch() {
     fi
 
     log "Starting OpenSearch..."
-    sudo -u opensearch "$OS_INSTALL_DIR/bin/opensearch" -d -p "$OS_INSTALL_DIR/opensearch.pid"
+    "$OS_INSTALL_DIR/bin/opensearch" -d -p "$OS_INSTALL_DIR/opensearch.pid"
 
     wait_for_opensearch 180
 }

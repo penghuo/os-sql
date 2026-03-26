@@ -1,10 +1,10 @@
 {
-  "date": "2026-03-19",
+  "date": "2026-03-26",
   "dataset": "1m",
   "total": 43,
-  "pass": 32,
-  "fail": 11,
-  "skip": 0,
+  "pass": 38,
+  "fail": 0,
+  "skip": 5,
   "queries": [
     {
       "q": 1,
@@ -23,10 +23,8 @@
     },
     {
       "q": 4,
-      "status": "FAIL",
-      "reason": "content mismatch (1 rows, diff saved)",
-      "expected_rows": 1,
-      "actual_rows": 1
+      "status": "PASS",
+      "rows": 1
     },
     {
       "q": 5,
@@ -45,8 +43,8 @@
     },
     {
       "q": 8,
-      "status": "PASS",
-      "rows": 5
+      "status": "SKIP",
+      "reason": "OpenSearch query failed or timed out"
     },
     {
       "q": 9,
@@ -95,17 +93,13 @@
     },
     {
       "q": 18,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 19,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 20,
@@ -129,17 +123,13 @@
     },
     {
       "q": 24,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 25,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 26,
@@ -168,24 +158,18 @@
     },
     {
       "q": 31,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "SKIP",
+      "reason": "OpenSearch query failed or timed out"
     },
     {
       "q": 32,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "SKIP",
+      "reason": "OpenSearch query failed or timed out"
     },
     {
       "q": 33,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 34,
@@ -214,29 +198,23 @@
     },
     {
       "q": 39,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 40,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "PASS",
+      "rows": 10
     },
     {
       "q": 41,
-      "status": "FAIL",
-      "reason": "content mismatch (10 rows, diff saved)",
-      "expected_rows": 10,
-      "actual_rows": 10
+      "status": "SKIP",
+      "reason": "OpenSearch query failed or timed out"
     },
     {
       "q": 42,
-      "status": "PASS",
-      "rows": 0
+      "status": "SKIP",
+      "reason": "OpenSearch query failed or timed out"
     },
     {
       "q": 43,

@@ -394,6 +394,70 @@ public class TransportShardExecuteAction
             long topN = limitNode.getCount() + limitNode.getOffset();
             int numGroupByCols = innerAgg.getGroupByKeys().size();
 
+            // HAVING: when a FilterNode is present between SortNode and AggregationNode,
+            // we must aggregate all groups first, apply the HAVING filter, then sort+limit.
+            // Top-N pre-filtering cannot be used because HAVING may eliminate groups.
+            FilterNode havingFilter = extractFilterFromSortedLimit(plan);
+            if (havingFilter != null) {
+              boolean isExprKey = FusedGroupByAggregate.canFuseWithExpressionKey(innerAgg, colTypeMap);
+              List<Page> aggPages = isExprKey
+                  ? executeFusedExprGroupByAggregate(innerAgg, req)
+                  : executeFusedGroupByAggregate(innerAgg, req);
+              List<Type> aggColumnTypes = isExprKey
+                  ? resolveColumnTypes(innerAgg, colTypeMap)
+                  : FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
+              // Apply HAVING filter
+              aggPages = applyHavingFilter(havingFilter, aggPages, innerAgg, colTypeMap);
+              // Apply sort+limit
+              if (!aggPages.isEmpty()) {
+                final List<Page> sortInput = aggPages;
+                org.opensearch.sql.dqe.operator.SortOperator sortOp =
+                    new org.opensearch.sql.dqe.operator.SortOperator(
+                        new Operator() {
+                          int idx = 0;
+                          @Override public Page processNextBatch() {
+                            return idx < sortInput.size() ? sortInput.get(idx++) : null;
+                          }
+                          @Override public void close() {}
+                        },
+                        sortIndices, sortNode.getAscending(), sortNode.getNullsFirst(),
+                        aggColumnTypes, topN);
+                List<Page> sortedPages = new ArrayList<>();
+                Page p;
+                while ((p = sortOp.processNextBatch()) != null) {
+                  sortedPages.add(p);
+                }
+                aggPages = sortedPages;
+              }
+              // Apply projection
+              ProjectNode projNode = extractProjectNode(plan);
+              if (projNode != null) {
+                List<String> projColumns = projNode.getOutputColumns();
+                if (!projColumns.equals(aggOutputColumns)) {
+                  List<Integer> projIndices = new ArrayList<>();
+                  for (String col : projColumns) {
+                    int idx = aggOutputColumns.indexOf(col);
+                    projIndices.add(idx >= 0 ? idx : 0);
+                  }
+                  List<Page> projectedPages = new ArrayList<>();
+                  for (Page sp : aggPages) {
+                    Block[] newBlocks = new Block[projIndices.size()];
+                    for (int i = 0; i < projIndices.size(); i++) {
+                      newBlocks[i] = sp.getBlock(projIndices.get(i));
+                    }
+                    projectedPages.add(new Page(newBlocks));
+                  }
+                  aggPages = projectedPages;
+                  List<Type> projTypes = new ArrayList<>();
+                  for (int idx : projIndices) {
+                    projTypes.add(aggColumnTypes.get(idx));
+                  }
+                  aggColumnTypes = projTypes;
+                }
+              }
+              return new ShardExecuteResponse(aggPages, aggColumnTypes);
+            }
+
             // Try fused top-N: when sorting by a single aggregate column (BigintType),
             // the top-N selection can be done directly on the flat accData array inside
             // FusedGroupByAggregate, avoiding full ordinal resolution and Page construction
@@ -527,6 +591,90 @@ public class TransportShardExecuteAction
               FusedGroupByAggregate.resolveOutputTypes(limitedAgg, colTypeMap);
           return new ShardExecuteResponse(aggPages, aggColumnTypes);
         }
+      }
+    }
+
+    // Fast path: [ProjectNode] -> SortNode -> FilterNode -> AggregationNode (HAVING, no Limit).
+    // For queries like Q28 with HAVING clause where LIMIT is handled at the coordinator level.
+    // Runs fused GROUP BY aggregation, applies HAVING filter, then sort.
+    if (scanFactory == null) {
+      AggregationNode havingAgg = extractAggFromSortedFilter(plan);
+      if (havingAgg != null
+          && FusedGroupByAggregate.canFuse(
+              havingAgg, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
+        Map<String, Type> colTypeMap = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
+        boolean isExprKey = FusedGroupByAggregate.canFuseWithExpressionKey(havingAgg, colTypeMap);
+        List<Page> aggPages = isExprKey
+            ? executeFusedExprGroupByAggregate(havingAgg, req)
+            : executeFusedGroupByAggregate(havingAgg, req);
+        List<Type> aggColumnTypes = isExprKey
+            ? resolveColumnTypes(havingAgg, colTypeMap)
+            : FusedGroupByAggregate.resolveOutputTypes(havingAgg, colTypeMap);
+
+        // Apply HAVING filter
+        DqePlanNode current = plan;
+        if (current instanceof ProjectNode proj) current = proj.getChild();
+        SortNode sortNode = (SortNode) current;
+        FilterNode filterNode = (FilterNode) sortNode.getChild();
+        aggPages = applyHavingFilter(filterNode, aggPages, havingAgg, colTypeMap);
+
+        // Apply sort
+        List<String> aggOutputColumns = new ArrayList<>(havingAgg.getGroupByKeys());
+        aggOutputColumns.addAll(havingAgg.getAggregateFunctions());
+        List<Integer> sortIndices = new ArrayList<>();
+        boolean sortResolved = true;
+        for (String sortKey : sortNode.getSortKeys()) {
+          int idx = aggOutputColumns.indexOf(sortKey);
+          if (idx < 0) { sortResolved = false; break; }
+          sortIndices.add(idx);
+        }
+        if (sortResolved && !aggPages.isEmpty()) {
+          final List<Page> sortInput = aggPages;
+          org.opensearch.sql.dqe.operator.SortOperator sortOp =
+              new org.opensearch.sql.dqe.operator.SortOperator(
+                  new Operator() {
+                    int idx = 0;
+                    @Override public Page processNextBatch() {
+                      return idx < sortInput.size() ? sortInput.get(idx++) : null;
+                    }
+                    @Override public void close() {}
+                  },
+                  sortIndices, sortNode.getAscending(), sortNode.getNullsFirst(),
+                  aggColumnTypes, 0);
+          List<Page> sortedPages = new ArrayList<>();
+          Page p;
+          while ((p = sortOp.processNextBatch()) != null) {
+            sortedPages.add(p);
+          }
+          aggPages = sortedPages;
+        }
+
+        // Apply projection
+        if (plan instanceof ProjectNode projNode) {
+          List<String> projColumns = projNode.getOutputColumns();
+          if (!projColumns.equals(aggOutputColumns)) {
+            List<Integer> projIndices = new ArrayList<>();
+            for (String col : projColumns) {
+              int idx = aggOutputColumns.indexOf(col);
+              projIndices.add(idx >= 0 ? idx : 0);
+            }
+            List<Page> projectedPages = new ArrayList<>();
+            for (Page sp : aggPages) {
+              Block[] newBlocks = new Block[projIndices.size()];
+              for (int i = 0; i < projIndices.size(); i++) {
+                newBlocks[i] = sp.getBlock(projIndices.get(i));
+              }
+              projectedPages.add(new Page(newBlocks));
+            }
+            aggPages = projectedPages;
+            List<Type> projTypes = new ArrayList<>();
+            for (int idx : projIndices) {
+              projTypes.add(aggColumnTypes.get(idx));
+            }
+            aggColumnTypes = projTypes;
+          }
+        }
+        return new ShardExecuteResponse(aggPages, aggColumnTypes);
       }
     }
 
@@ -1972,7 +2120,7 @@ public class TransportShardExecuteAction
 
   /**
    * Extract the inner AggregationNode from a LimitNode -> [ProjectNode] -> SortNode ->
-   * AggregationNode pattern. Returns null if the plan doesn't match this pattern.
+   * [FilterNode] -> AggregationNode pattern. Returns null if the plan doesn't match this pattern.
    */
   private static AggregationNode extractAggFromSortedLimit(DqePlanNode plan) {
     if (!(plan instanceof LimitNode limit)) return null;
@@ -1981,7 +2129,85 @@ public class TransportShardExecuteAction
     if (!(child instanceof SortNode sort)) return null;
     DqePlanNode sortChild = sort.getChild();
     if (sortChild instanceof AggregationNode agg) return agg;
+    // HAVING: FilterNode wraps AggregationNode
+    if (sortChild instanceof FilterNode filter
+        && filter.getChild() instanceof AggregationNode agg2) return agg2;
     return null;
+  }
+
+  /**
+   * Extract the FilterNode (HAVING clause) from a LimitNode -> [ProjectNode] -> SortNode ->
+   * FilterNode -> AggregationNode pattern. Returns null if no FilterNode is present.
+   */
+  private static FilterNode extractFilterFromSortedLimit(DqePlanNode plan) {
+    if (!(plan instanceof LimitNode limit)) return null;
+    DqePlanNode child = limit.getChild();
+    if (child instanceof ProjectNode proj) child = proj.getChild();
+    if (!(child instanceof SortNode sort)) return null;
+    if (sort.getChild() instanceof FilterNode filter) return filter;
+    return null;
+  }
+
+  /**
+   * Extract the inner AggregationNode from a [ProjectNode] -> SortNode -> FilterNode ->
+   * AggregationNode pattern (no LimitNode). Used for HAVING queries where LIMIT is handled at the
+   * coordinator level.
+   */
+  private static AggregationNode extractAggFromSortedFilter(DqePlanNode plan) {
+    DqePlanNode current = plan;
+    if (current instanceof ProjectNode proj) current = proj.getChild();
+    if (!(current instanceof SortNode sort)) return null;
+    DqePlanNode sortChild = sort.getChild();
+    if (!(sortChild instanceof FilterNode filter)) return null;
+    if (filter.getChild() instanceof AggregationNode agg) return agg;
+    return null;
+  }
+
+  /**
+   * Apply a HAVING filter (FilterNode predicate) to aggregated pages. Compiles the predicate
+   * against the aggregation output columns and filters rows that don't match.
+   */
+  private List<Page> applyHavingFilter(
+      FilterNode filterNode, List<Page> pages, AggregationNode aggNode, Map<String, Type> colTypeMap) {
+    if (pages.isEmpty()) return pages;
+    // Build column index map from aggregation output columns
+    List<String> aggOutputCols = new ArrayList<>(aggNode.getGroupByKeys());
+    aggOutputCols.addAll(aggNode.getAggregateFunctions());
+    Map<String, Integer> columnIndexMap = new HashMap<>();
+    for (int i = 0; i < aggOutputCols.size(); i++) {
+      columnIndexMap.put(aggOutputCols.get(i), i);
+    }
+    // Build type map for aggregation output columns
+    List<Type> aggTypes = resolveColumnTypes(aggNode, colTypeMap);
+    Map<String, Type> aggTypeMap = new HashMap<>();
+    for (int i = 0; i < aggOutputCols.size(); i++) {
+      aggTypeMap.put(aggOutputCols.get(i), aggTypes.get(i));
+    }
+    // Compile the HAVING predicate
+    FunctionRegistry registry = BuiltinFunctions.createRegistry();
+    ExpressionCompiler compiler = new ExpressionCompiler(registry, columnIndexMap, aggTypeMap);
+    DqeSqlParser parser = new DqeSqlParser();
+    io.trino.sql.tree.Expression predicate = parser.parseExpression(filterNode.getPredicateString());
+    BlockExpression blockPredicate = compiler.compile(predicate);
+    // Apply filter using FilterOperator
+    final List<Page> inputPages = pages;
+    org.opensearch.sql.dqe.operator.FilterOperator filterOp =
+        new org.opensearch.sql.dqe.operator.FilterOperator(
+            new Operator() {
+              int idx = 0;
+              @Override public Page processNextBatch() {
+                return idx < inputPages.size() ? inputPages.get(idx++) : null;
+              }
+              @Override public void close() {}
+            },
+            blockPredicate);
+    List<Page> filtered = new ArrayList<>();
+    Page p;
+    while ((p = filterOp.processNextBatch()) != null) {
+      filtered.add(p);
+    }
+    filterOp.close();
+    return filtered;
   }
 
   /** Extract the SortNode from a LimitNode -> [ProjectNode] -> SortNode -> ... pattern. */

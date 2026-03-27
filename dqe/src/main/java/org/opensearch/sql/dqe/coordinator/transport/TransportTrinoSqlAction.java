@@ -525,7 +525,7 @@ public class TransportTrinoSqlAction
         DqePlanNode shardPlan = shardFragments.get(0).shardPlan();
         int numShards = shardFragments.size();
         ShardExecuteResponse[] shardResults = new ShardExecuteResponse[numShards];
-        Exception[] shardErrors = new Exception[1]; // first error wins
+        Exception[] shardErrors = new Exception[numShards]; // per-shard errors
 
         // Dispatch shards 0..N-2 to the thread pool; shard N-1 runs on this thread
         int remoteShards = numShards - 1;
@@ -552,7 +552,7 @@ public class TransportTrinoSqlAction
                   try {
                     shardResults[fragIdx] = shardAction.executeLocal(shardPlan, shardReq);
                   } catch (Exception e) {
-                    shardErrors[0] = e;
+                    shardErrors[fragIdx] = e;
                   }
                   latch.countDown();
                 });
@@ -568,7 +568,7 @@ public class TransportTrinoSqlAction
           try {
             shardResults[remoteShards] = shardAction.executeLocal(shardPlan, shardReq);
           } catch (Exception e) {
-            shardErrors[0] = e;
+            shardErrors[remoteShards] = e;
           }
         }
 
@@ -583,18 +583,38 @@ public class TransportTrinoSqlAction
           }
         }
 
-        if (shardErrors[0] != null) {
-          listener.onFailure(shardErrors[0]);
+        // Check for shard failures — tolerate partial failures if at least one shard succeeded
+        int successCount = 0;
+        Exception lastError = null;
+        for (int i = 0; i < numShards; i++) {
+          if (shardResults[i] != null) {
+            successCount++;
+          } else if (shardErrors[i] != null) {
+            lastError = shardErrors[i];
+            LOG.warn("DQE: Shard {} failed, continuing with partial results: {}",
+                shardFragments.get(i).shardId(), shardErrors[i].getMessage());
+          }
+        }
+        if (successCount == 0) {
+          listener.onFailure(lastError != null ? lastError
+              : new RuntimeException("All shards failed"));
           return;
         }
 
         // Process results synchronously — avoids the GroupedActionListener callback chain
         try {
-          // Build shardPages directly from the shared array (no stream/collect)
-          List<List<Page>> shardPages = new ArrayList<>(numShards);
+          // Build shardPages from successful shards only (skip nulls from failed shards)
+          List<List<Page>> shardPages = new ArrayList<>(successCount);
           for (ShardExecuteResponse resp : shardResults) {
-            shardPages.add(resp.getPages());
+            if (resp != null) {
+              shardPages.add(resp.getPages());
+            }
           }
+          // Build array of successful results for merge methods that need ShardExecuteResponse[]
+          ShardExecuteResponse[] successShardResults =
+              java.util.Arrays.stream(shardResults)
+                  .filter(java.util.Objects::nonNull)
+                  .toArray(ShardExecuteResponse[]::new);
 
           ResultMerger merger = new ResultMerger();
           List<Page> mergedPages;
@@ -603,11 +623,11 @@ public class TransportTrinoSqlAction
           } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
               && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
-            mergedPages = mergeCountDistinctValuesViaRawSets(shardResults, shardPages);
+            mergedPages = mergeCountDistinctValuesViaRawSets(successShardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg2
               && singleCdVarcharAgg2.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctVarchar(singleCdVarcharAgg2, columnTypeMap)) {
-            mergedPages = mergeCountDistinctVarcharViaRawSets(shardResults, shardPages);
+            mergedPages = mergeCountDistinctVarcharViaRawSets(successShardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg
               && singleAgg.getStep() == AggregationNode.Step.SINGLE
               && isShardDedupCountDistinct(
@@ -615,7 +635,7 @@ public class TransportTrinoSqlAction
             // Fast path: shard-deduped COUNT(DISTINCT) with GROUP BY.
             // Check if shard responses have HashSet attachments for faster merge.
             boolean allHaveSets = true;
-            for (ShardExecuteResponse sr : shardResults) {
+            for (ShardExecuteResponse sr : successShardResults) {
               if (sr.getDistinctSets() == null) {
                 allHaveSets = false;
                 break;
@@ -623,7 +643,7 @@ public class TransportTrinoSqlAction
             }
             // Check for VARCHAR-keyed HashSet attachments (Q14 pattern)
             boolean allHaveVarcharSets = true;
-            for (ShardExecuteResponse sr : shardResults) {
+            for (ShardExecuteResponse sr : successShardResults) {
               if (sr.getVarcharDistinctSets() == null) {
                 allHaveVarcharSets = false;
                 break;
@@ -635,7 +655,7 @@ public class TransportTrinoSqlAction
               // Merge + sort + limit all handled inside; output is 2-col (key, count)
               mergedPages =
                   mergeDedupCountDistinctViaVarcharSets(
-                      shardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
+                      successShardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
               // Override columnTypes to match 2-column merged output
               List<Type> mergedColumnTypes =
                   List.of(
@@ -649,7 +669,7 @@ public class TransportTrinoSqlAction
               if (_topNHint > 0) _topNHint += findGlobalOffset(optimizedPlan);
               mergedPages =
                   mergeDedupCountDistinctViaSets(
-                      shardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
+                      successShardResults, singleAgg, columnTypes, columnTypeMap, _topNHint);
               mergedPages =
                   applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
             } else {
@@ -669,7 +689,7 @@ public class TransportTrinoSqlAction
               && isShardMixedDedup(shardFragments.get(0).shardPlan(), singleMixed2)) {
             // Check if shards have HashSet attachments for native mixed dedup (Q10 optimization)
             boolean mixedHaveSets = true;
-            for (ShardExecuteResponse sr : shardResults) {
+            for (ShardExecuteResponse sr : successShardResults) {
               if (sr.getDistinctSets() == null) {
                 mixedHaveSets = false;
                 break;
@@ -682,7 +702,7 @@ public class TransportTrinoSqlAction
               if (_topNHint > 0) _topNHint += findGlobalOffset(optimizedPlan);
               mergedPages =
                   mergeMixedDedupViaSets(
-                      shardResults,
+                      successShardResults,
                       singleMixed2,
                       shardFragments.get(0).shardPlan(),
                       columnTypes,

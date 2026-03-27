@@ -270,14 +270,15 @@ public class TransportShardExecuteAction
       return applyTopProject(pages, columnTypes, topProject, aggEvalNode);
     }
 
-    // Fast path: COUNT(DISTINCT) dedup plan with 2 numeric keys and COUNT(*).
-    // Instead of GROUP BY (key0, key1) producing ~10K rows, builds per-group HashSets
-    // directly during DocValues iteration. Outputs compact pages (~450 rows) + attached
-    // HashSets for the coordinator to union across shards.
+    // Fast path: COUNT(DISTINCT) dedup plan with N numeric keys (N >= 2) and COUNT(*).
+    // Instead of GROUP BY (key0, ..., keyN-1) producing many rows, builds per-group HashSets
+    // directly during DocValues iteration. For 2 keys: outputs compact pages + attached
+    // HashSets for the coordinator to union across shards. For 3+ keys: outputs full dedup
+    // tuples for the coordinator's generic merge path.
     if (scanFactory == null
         && effectivePlan instanceof AggregationNode aggDedupNode
         && aggDedupNode.getStep() == AggregationNode.Step.PARTIAL
-        && aggDedupNode.getGroupByKeys().size() == 2
+        && aggDedupNode.getGroupByKeys().size() >= 2
         && FusedGroupByAggregate.canFuse(
             aggDedupNode, getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap())) {
       // Check if it's a pure COUNT(*)-only dedup (Q9) or mixed dedup (Q10)
@@ -291,28 +292,51 @@ public class TransportShardExecuteAction
                   .allMatch(f -> f.matches("(?i)^(sum|count)\\(.*\\)$"));
       if (isSingleCountStar) {
         Map<String, Type> ctm = getOrBuildIndexMeta(findIndexName(plan)).columnTypeMap();
-        String keyName0 = aggDedupNode.getGroupByKeys().get(0);
-        String keyName1 = aggDedupNode.getGroupByKeys().get(1);
-        Type t0 = ctm.get(keyName0);
-        Type t1 = ctm.get(keyName1);
-        if (t0 != null
-            && !(t0 instanceof io.trino.spi.type.VarcharType)
-            && t1 != null
-            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
-          // Execute with HashSet-per-group: single-key GROUP BY with LongOpenHashSet accumulators
-          ShardExecuteResponse resp =
-              executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
-          return resp;
+        List<String> keys = aggDedupNode.getGroupByKeys();
+        int numKeys = keys.size();
+        if (numKeys == 2) {
+          // Optimized 2-key path: compact output + attached HashSets
+          String keyName0 = keys.get(0);
+          String keyName1 = keys.get(1);
+          Type t0 = ctm.get(keyName0);
+          Type t1 = ctm.get(keyName1);
+          if (t0 != null
+              && !(t0 instanceof io.trino.spi.type.VarcharType)
+              && t1 != null
+              && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+            // Execute with HashSet-per-group: single-key GROUP BY with LongOpenHashSet accumulators
+            ShardExecuteResponse resp =
+                executeCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t0, t1);
+            return resp;
+          }
+          // VARCHAR key0 + numeric key1: Q14 pattern (GROUP BY SearchPhrase, COUNT(DISTINCT UserID))
+          if (t0 instanceof io.trino.spi.type.VarcharType
+              && t1 != null
+              && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+            ShardExecuteResponse resp =
+                executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
+            return resp;
+          }
+        } else {
+          // N-key path (3+ keys): GROUP BY (key0..keyN-2) with HashSet for keyN-1 (dedup key).
+          // Outputs full dedup tuples for the coordinator's generic merge path.
+          // All keys must be numeric (non-VARCHAR).
+          boolean allNumeric = true;
+          Type[] keyTypes = new Type[numKeys];
+          for (int i = 0; i < numKeys; i++) {
+            keyTypes[i] = ctm.get(keys.get(i));
+            if (keyTypes[i] == null || keyTypes[i] instanceof io.trino.spi.type.VarcharType) {
+              allNumeric = false;
+              break;
+            }
+          }
+          if (allNumeric) {
+            ShardExecuteResponse resp =
+                executeNKeyCountDistinctWithHashSets(aggDedupNode, req, keys, keyTypes);
+            return resp;
+          }
         }
-        // VARCHAR key0 + numeric key1: Q14 pattern (GROUP BY SearchPhrase, COUNT(DISTINCT UserID))
-        if (t0 instanceof io.trino.spi.type.VarcharType
-            && t1 != null
-            && !(t1 instanceof io.trino.spi.type.VarcharType)) {
-          ShardExecuteResponse resp =
-              executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
-          return resp;
-        }
-      } else if (isMixedDedup) {
+      } else if (isMixedDedup && aggDedupNode.getGroupByKeys().size() == 2) {
         // Q10 pattern: GROUP BY (key0, key1) with mixed SUM/COUNT aggregates.
         // Native path: GROUP BY key0 only with per-group HashSet for key1 + accumulators for
         // SUM/COUNT.
@@ -1212,6 +1236,295 @@ public class TransportShardExecuteAction
       if (srcKeys[i] != emptyMarker) {
         target.add(srcKeys[i]);
       }
+    }
+  }
+
+  /**
+   * Execute N-key COUNT(DISTINCT) with HashSet-per-composite-group accumulators (3+ keys).
+   * Groups by the first N-1 keys (original GROUP BY keys) with a LongOpenHashSet per group
+   * to collect the last key (dedup key) values. Outputs full dedup tuples (all N keys + COUNT(*)=1)
+   * for the coordinator's generic merge path. Uses parallel segment scanning.
+   */
+  private ShardExecuteResponse executeNKeyCountDistinctWithHashSets(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      List<String> keyNames,
+      Type[] keyTypes)
+      throws Exception {
+    int numKeys = keyNames.size();
+    int numGroupKeys = numKeys - 1; // first N-1 are GROUP BY keys, last is the dedup key
+
+    TableScanNode scanNode = findTableScanNode(aggNode);
+    String indexName = scanNode.getIndexName();
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    // Parallel segment scanning: each segment builds its own composite-group → HashSet map,
+    // then we merge across segments.
+    java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> finalSets;
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-nkey-count-distinct-hashset")) {
+      java.util.List<org.apache.lucene.index.LeafReaderContext> leaves =
+          engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+      org.apache.lucene.search.Weight weight =
+          isMatchAll
+              ? null
+              : engineSearcher.createWeight(
+                  engineSearcher.rewrite(luceneQuery),
+                  org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                  1.0f);
+
+      if (leaves.size() <= 1) {
+        finalSets =
+            scanSegmentForNKeyCountDistinct(
+                leaves.isEmpty() ? null : leaves.get(0),
+                weight,
+                keyNames,
+                numGroupKeys,
+                isMatchAll);
+      } else {
+        @SuppressWarnings("unchecked")
+        java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet>[]
+            segResults = new java.util.HashMap[leaves.size()];
+        java.util.concurrent.CountDownLatch segLatch =
+            new java.util.concurrent.CountDownLatch(leaves.size() - 1);
+        Exception[] segError = new Exception[1];
+
+        for (int s = 0; s < leaves.size() - 1; s++) {
+          final int segIdx = s;
+          final org.apache.lucene.index.LeafReaderContext leafCtx = leaves.get(s);
+          FusedGroupByAggregate.getParallelPool()
+              .execute(
+                  () -> {
+                    try {
+                      segResults[segIdx] =
+                          scanSegmentForNKeyCountDistinct(
+                              leafCtx, weight, keyNames, numGroupKeys, isMatchAll);
+                    } catch (Exception e) {
+                      segError[0] = e;
+                    }
+                    segLatch.countDown();
+                  });
+        }
+
+        segResults[leaves.size() - 1] =
+            scanSegmentForNKeyCountDistinct(
+                leaves.get(leaves.size() - 1), weight, keyNames, numGroupKeys, isMatchAll);
+
+        segLatch.await();
+        if (segError[0] != null) throw segError[0];
+
+        // Merge per-segment results: union LongOpenHashSets per composite group key
+        finalSets =
+            segResults[0] != null ? segResults[0] : new java.util.HashMap<>();
+        for (int s = 1; s < segResults.length; s++) {
+          if (segResults[s] == null) continue;
+          for (var entry : segResults[s].entrySet()) {
+            org.opensearch.sql.dqe.operator.LongOpenHashSet existing =
+                finalSets.get(entry.getKey());
+            if (existing == null) {
+              finalSets.put(entry.getKey(), entry.getValue());
+            } else {
+              org.opensearch.sql.dqe.operator.LongOpenHashSet other = entry.getValue();
+              if (other.size() > existing.size()) {
+                mergeHashSets(other, existing);
+                finalSets.put(entry.getKey(), other);
+              } else {
+                mergeHashSets(existing, other);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Build output pages: expand each (compositeKey, HashSet) into full dedup tuples.
+    // Output format: (key0, ..., keyN-1, COUNT(*)=1) — one row per unique N-key combination.
+    List<Type> colTypes = new java.util.ArrayList<>(numKeys + 1);
+    for (int i = 0; i < numKeys; i++) {
+      colTypes.add(
+          keyTypes[i] instanceof io.trino.spi.type.IntegerType
+              ? io.trino.spi.type.IntegerType.INTEGER
+              : io.trino.spi.type.BigintType.BIGINT);
+    }
+    colTypes.add(io.trino.spi.type.BigintType.BIGINT); // COUNT(*)
+
+    // Count total output rows
+    int totalRows = 0;
+    for (var entry : finalSets.entrySet()) {
+      totalRows += entry.getValue().size();
+    }
+
+    io.trino.spi.block.BlockBuilder[] builders = new io.trino.spi.block.BlockBuilder[numKeys + 1];
+    for (int i = 0; i <= numKeys; i++) {
+      builders[i] = colTypes.get(i).createBlockBuilder(null, totalRows);
+    }
+
+    for (var entry : finalSets.entrySet()) {
+      long[] groupKey = entry.getKey().keys;
+      org.opensearch.sql.dqe.operator.LongOpenHashSet dedupSet = entry.getValue();
+
+      // Iterate all distinct values in the dedup set
+      if (dedupSet.hasZeroValue()) {
+        for (int k = 0; k < numGroupKeys; k++) {
+          colTypes.get(k).writeLong(builders[k], groupKey[k]);
+        }
+        colTypes.get(numGroupKeys).writeLong(builders[numGroupKeys], 0L);
+        io.trino.spi.type.BigintType.BIGINT.writeLong(builders[numKeys], 1L);
+      }
+      long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
+      if (dedupSet.hasSentinelValue()) {
+        for (int k = 0; k < numGroupKeys; k++) {
+          colTypes.get(k).writeLong(builders[k], groupKey[k]);
+        }
+        colTypes.get(numGroupKeys).writeLong(builders[numGroupKeys], emptyMarker);
+        io.trino.spi.type.BigintType.BIGINT.writeLong(builders[numKeys], 1L);
+      }
+      long[] setKeys = dedupSet.keys();
+      for (int i = 0; i < setKeys.length; i++) {
+        if (setKeys[i] != emptyMarker) {
+          for (int k = 0; k < numGroupKeys; k++) {
+            colTypes.get(k).writeLong(builders[k], groupKey[k]);
+          }
+          colTypes.get(numGroupKeys).writeLong(builders[numGroupKeys], setKeys[i]);
+          io.trino.spi.type.BigintType.BIGINT.writeLong(builders[numKeys], 1L);
+        }
+      }
+    }
+
+    Block[] blocks = new Block[numKeys + 1];
+    for (int i = 0; i <= numKeys; i++) {
+      blocks[i] = builders[i].build();
+    }
+    Page page = new Page(blocks);
+    return new ShardExecuteResponse(List.of(page), colTypes);
+  }
+
+  /**
+   * Scan a single segment for N-key COUNT(DISTINCT): groups by the first N-1 keys with
+   * per-group LongOpenHashSet for the last key (dedup key). Returns a map from composite
+   * group key to its set of distinct dedup key values.
+   */
+  private static java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+      scanSegmentForNKeyCountDistinct(
+          org.apache.lucene.index.LeafReaderContext leafCtx,
+          org.apache.lucene.search.Weight weight,
+          List<String> keyNames,
+          int numGroupKeys,
+          boolean isMatchAll)
+          throws Exception {
+    if (leafCtx == null) return new java.util.HashMap<>();
+
+    int numKeys = keyNames.size();
+    org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+
+    // Open DocValues for all keys
+    org.apache.lucene.index.SortedNumericDocValues[] dvs =
+        new org.apache.lucene.index.SortedNumericDocValues[numKeys];
+    for (int i = 0; i < numKeys; i++) {
+      dvs[i] = reader.getSortedNumericDocValues(keyNames.get(i));
+    }
+
+    java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
+        new java.util.HashMap<>();
+    long[] tmpGroupKey = new long[numGroupKeys];
+
+    if (isMatchAll) {
+      // Check that at least one DV is non-null
+      boolean anyDv = false;
+      for (int i = 0; i < numKeys; i++) {
+        if (dvs[i] != null) {
+          anyDv = true;
+          break;
+        }
+      }
+      if (anyDv) {
+        int maxDoc = reader.maxDoc();
+        int[] dvDocs = new int[numKeys];
+        for (int i = 0; i < numKeys; i++) {
+          dvDocs[i] =
+              dvs[i] != null
+                  ? dvs[i].nextDoc()
+                  : org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+        }
+
+        for (int doc = 0; doc < maxDoc; doc++) {
+          long dedupVal = 0;
+          for (int i = 0; i < numKeys; i++) {
+            long val = 0;
+            if (dvDocs[i] == doc) {
+              val = dvs[i].nextValue();
+              dvDocs[i] = dvs[i].nextDoc();
+            }
+            if (i < numGroupKeys) {
+              tmpGroupKey[i] = val;
+            } else {
+              dedupVal = val;
+            }
+          }
+          LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
+          result.computeIfAbsent(
+                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
+              .add(dedupVal);
+        }
+      }
+    } else if (weight != null) {
+      org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+      if (scorer != null) {
+        org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+        int doc;
+        while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+          long dedupVal = 0;
+          for (int i = 0; i < numKeys; i++) {
+            long val = 0;
+            if (dvs[i] != null && dvs[i].advanceExact(doc)) val = dvs[i].nextValue();
+            if (i < numGroupKeys) {
+              tmpGroupKey[i] = val;
+            } else {
+              dedupVal = val;
+            }
+          }
+          LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
+          result.computeIfAbsent(
+                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
+              .add(dedupVal);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Composite key wrapper for long[] with proper hashCode/equals for use as HashMap keys.
+   * Used by the N-key COUNT(DISTINCT) path to group by multiple numeric keys.
+   */
+  private static final class LongArrayKey {
+    final long[] keys;
+    private final int hash;
+
+    LongArrayKey(long[] keys) {
+      this.keys = keys;
+      this.hash = java.util.Arrays.hashCode(keys);
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof LongArrayKey other)) return false;
+      return java.util.Arrays.equals(keys, other.keys);
     }
   }
 

@@ -4977,8 +4977,7 @@ public final class FusedGroupByAggregate {
       for (int i = 0; i < numAggs; i++) {
         if (aggApplyLength[i]) { hasApplyLen = true; break; }
       }
-      boolean useBitsetLockstep = estCount >= 0 && estCount < maxDoc / 2
-          && dv0 != null && !hasApplyLen;
+      boolean useBitsetLockstep = false; // Disabled: causes EOFException on some DocValues
 
       if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
@@ -5935,8 +5934,7 @@ public final class FusedGroupByAggregate {
       // Check selectivity: if filter matches <50% of docs, use bitset+nextDoc lockstep
       int maxDoc = reader.maxDoc();
       int estCount = weight.count(leafCtx);
-      boolean useBitsetLockstep = estCount >= 0 && estCount < maxDoc / 2
-          && dv0 != null && dv1 != null;
+      boolean useBitsetLockstep = false; // Disabled: causes EOFException on some DocValues
 
       if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
@@ -11956,7 +11954,7 @@ public final class FusedGroupByAggregate {
   private static final class TwoKeyHashMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 8_000_000;
+    private static final int MAX_CAPACITY = 16_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -12073,7 +12071,7 @@ public final class FusedGroupByAggregate {
   private static final class SingleKeyHashMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 8_000_000;
+    private static final int MAX_CAPACITY = 16_000_000;
 
     long[] keys;
     AccumulatorGroup[] groups;
@@ -12184,7 +12182,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatTwoKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 8_000_000;
+    private static final int MAX_CAPACITY = 16_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -12334,7 +12332,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatThreeKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 8_000_000;
+    private static final int MAX_CAPACITY = 16_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -12462,7 +12460,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatSingleKeyMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 8_000_000;
+    private static final int MAX_CAPACITY = 16_000_000;
 
     long[] keys;
     boolean[] occupied;

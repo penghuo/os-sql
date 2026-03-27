@@ -1,9 +1,9 @@
 {
-  "date": "2026-03-26",
-  "dataset": "1m",
+  "date": "2026-03-27",
+  "dataset": "full",
   "total": 43,
-  "pass": 38,
-  "fail": 0,
+  "pass": 31,
+  "fail": 7,
   "skip": 5,
   "queries": [
     {
@@ -93,8 +93,10 @@
     },
     {
       "q": 18,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 19,
@@ -104,7 +106,7 @@
     {
       "q": 20,
       "status": "PASS",
-      "rows": 0
+      "rows": 4
     },
     {
       "q": 21,
@@ -114,7 +116,7 @@
     {
       "q": 22,
       "status": "PASS",
-      "rows": 1
+      "rows": 10
     },
     {
       "q": 23,
@@ -123,13 +125,17 @@
     },
     {
       "q": 24,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 25,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 26,
@@ -144,12 +150,14 @@
     {
       "q": 28,
       "status": "PASS",
-      "rows": 2
+      "rows": 25
     },
     {
       "q": 29,
-      "status": "PASS",
-      "rows": 2
+      "status": "FAIL",
+      "reason": "content mismatch (25 rows, diff saved)",
+      "expected_rows": 25,
+      "actual_rows": 25
     },
     {
       "q": 30,
@@ -168,8 +176,10 @@
     },
     {
       "q": 33,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 34,
@@ -198,13 +208,17 @@
     },
     {
       "q": 39,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 40,
-      "status": "PASS",
-      "rows": 10
+      "status": "FAIL",
+      "reason": "content mismatch (10 rows, diff saved)",
+      "expected_rows": 10,
+      "actual_rows": 10
     },
     {
       "q": 41,

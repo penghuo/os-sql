@@ -289,7 +289,8 @@ public final class FusedScanAggregate {
                           throw new java.io.UncheckedIOException(e);
                         }
                         return pack;
-                      });
+                      },
+                      FusedGroupByAggregate.getParallelPool());
             }
 
             // Merge worker results
@@ -1508,22 +1509,23 @@ public final class FusedScanAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values-raw")) {
       if (query instanceof MatchAllDocsQuery) {
-        // Sequential scan: for high-cardinality columns like UserID (~18M distinct),
-        // parallel per-segment scanning creates too many large HashSets (6 segments * 8 shards)
-        // causing memory pressure and thread contention. Sequential is better here.
+        // Sequential scan using nextDoc() for dense columns — avoids binary search overhead
+        // of advanceExact(). For high-cardinality columns like UserID (~18M distinct),
+        // parallel per-segment scanning creates too many large HashSets causing memory pressure.
         for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
           LeafReader reader = leafCtx.reader();
-          int maxDoc = reader.maxDoc();
           Bits liveDocs = reader.getLiveDocs();
           SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
           if (dv == null) continue;
           if (liveDocs == null) {
-            for (int doc = 0; doc < maxDoc; doc++) {
-              if (dv.advanceExact(doc)) {
-                distinctSet.add(dv.nextValue());
-              }
+            // Dense column, no deletes: use nextDoc() for sequential access
+            int doc = dv.nextDoc();
+            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              distinctSet.add(dv.nextValue());
+              doc = dv.nextDoc();
             }
           } else {
+            int maxDoc = reader.maxDoc();
             for (int doc = 0; doc < maxDoc; doc++) {
               if (liveDocs.get(doc) && dv.advanceExact(doc)) {
                 distinctSet.add(dv.nextValue());

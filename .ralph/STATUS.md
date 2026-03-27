@@ -4,7 +4,7 @@ iteration: 7
 ## Current State
 Score: 18/43 within 2x of CH-Parquet on r5.4xlarge.
 5 queries FAILED due to corrupted Lucene DocValues files (in original data, not fixable by force-merge or snapshot restore).
-Partial shard failure tolerance added to coordinator.
+Partial shard failure tolerance added to coordinator (committed and pushed).
 
 ## Queries Within 2x (18)
 Q00(0.48x) Q01(0.27x) Q06(0.15x) Q10(1.91x) Q12(0.73x) Q17(0.01x) Q19(0.10x)
@@ -21,12 +21,17 @@ Q09: 11.43x need 5.71x | Q18: 11.83x need 5.92x | Q11: 14.29x need 7.14x
 Q15: 27.59x need 13.79x | Q39: 36.47x need 18.23x
 
 ## FAILED (5, corrupted data in original index)
-Q07, Q30, Q31, Q40, Q41
+Q07, Q30, Q31, Q40, Q41 — EOFException in Lucene DocValues on all 4 shards.
+Corruption exists in original data (snapshot from Sep 2025 has same issue).
+Force-merge was attempted but made things worse (spread corruption to single segment).
+Only fix: re-load data from Parquet files.
 
 ## Next Steps
-1. Focus on code optimizations for borderline queries (Q03, Q14, Q32, Q29)
-2. Optimize Q28 REGEXP_REPLACE (need 1.87x)
-3. Consider re-loading data from Parquet files to fix corruption
+1. Re-load data from Parquet to fix corruption (would recover 5 queries, ~45 min)
+2. Focus on code optimizations for borderline queries (Q03, Q14, Q32, Q29)
+3. Optimize Q28 REGEXP_REPLACE (need 1.87x)
+4. The COUNT(DISTINCT) queries (Q04-Q13) already have fast paths — bottleneck is Lucene DV overhead
 
 ## Evidence
 Full benchmark: /tmp/full_v3/r5.4xlarge.json (warmup=3, tries=5)
+Commit: 4c1fb6016 (partial shard failure tolerance)

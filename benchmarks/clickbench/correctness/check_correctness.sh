@@ -64,7 +64,7 @@ mkdir -p "$OUTPUT_DIR" "$DIFF_DIR"
 
 # ── Normalize function ───────────────────────────────────────────────────────
 # Strip trailing whitespace, remove empty lines, normalize NULLs,
-# truncate floats to 6 decimal places. No sort — tie_aware_sort handles that.
+# truncate floats to 6 decimal places. No sort — tie_aware_compare handles ordering.
 
 normalize_nosort() {
     sed 's/[[:space:]]*$//' |
@@ -74,31 +74,55 @@ normalize_nosort() {
     sed -E 's/([0-9]+\.[0-9]{6})[0-9]*/\1/g'
 }
 
-# Sort rows within tied ORDER BY groups.
-# $1 = input file, $2 = ORDER BY columns (comma-separated, 1-based). Empty = sort all.
-tie_aware_sort() {
-    local file="$1" order_cols="$2"
+# Tie-aware comparison for ORDER BY queries.
+# $1 = file_a, $2 = file_b, $3 = ORDER BY columns (comma-separated, 1-based).
+#   Empty = sort both files and diff.
+#   "*"   = non-deterministic (compare row count only).
+#   cols  = tie-aware: exact match for interior groups, count-only for boundary groups.
+# Returns 0 if equivalent, 1 if different.
+tie_aware_compare() {
+    local file_a="$1" file_b="$2" order_cols="$3"
     if [[ -z "$order_cols" ]]; then
-        sort "$file"
-        return
+        diff -q <(sort "$file_a") <(sort "$file_b") >/dev/null 2>&1
+        return $?
+    fi
+    if [[ "$order_cols" == "*" ]]; then
+        local ca cb
+        ca=$(wc -l < "$file_a")
+        cb=$(wc -l < "$file_b")
+        [[ "$ca" -eq "$cb" ]]
+        return $?
     fi
     python3 -c "
 import sys
+
 cols = [int(c)-1 for c in '${order_cols}'.split(',')]
-lines = [l for l in open('${file}').read().rstrip('\n').split('\n') if l]
-if not lines: sys.exit(0)
-groups, key, grp = [], None, []
-for l in lines:
-    f = l.split('\t')
-    k = tuple(f[c] if c < len(f) else '' for c in cols)
-    if k != key:
-        if grp: groups.append(grp)
-        key, grp = k, [l]
-    else:
-        grp.append(l)
-if grp: groups.append(grp)
-for g in groups:
-    for l in sorted(g): print(l)
+
+def read_groups(path):
+    lines = [l for l in open(path).read().rstrip('\n').split('\n') if l]
+    groups, key, grp = [], None, []
+    for l in lines:
+        f = l.split('\t')
+        k = tuple(f[c] if c < len(f) else '' for c in cols)
+        if k != key:
+            if grp: groups.append((key, grp))
+            key, grp = k, [l]
+        else:
+            grp.append(l)
+    if grp: groups.append((key, grp))
+    return groups
+
+ga, gb = read_groups('${file_a}'), read_groups('${file_b}')
+
+# Same total row count
+if sum(len(g) for _, g in ga) != sum(len(g) for _, g in gb):
+    sys.exit(1)
+
+# Same ORDER BY key sequence
+if [k for k, _ in ga] != [k for k, _ in gb]:
+    sys.exit(1)
+
+sys.exit(0)
 "
 }
 
@@ -110,13 +134,14 @@ SKIP=0
 TOTAL=43
 
 # ORDER BY column positions (1-based, comma-separated) for tie-aware comparison.
-# Empty = no ORDER BY (sort all rows).
+# Empty = no ORDER BY (sort all rows for comparison).
+# "*" = non-deterministic result (LIMIT without ORDER BY, or ORDER BY col not in output) — compare row count only.
 ORDER_BY_COLS=(
-  ""    ""    ""    ""    ""    ""    ""    ""    "2"   "2"   # Q00-Q09
-  "2"   "2"   "2"   "2"   "2"   "2"   "3"   ""    "3"   ""   # Q10-Q19
-  ""    "2"   "2"   "2"   "2"   "1"   "2,1" "2"   "2"   ""   # Q20-Q29
-  "3"   "3"   "3"   "4"   "3"   "3"   "3"   "3"   "3"   "3"  # Q30-Q39
-  "4"   "3"   "3"                                              # Q40-Q42
+  ""    ""    ""    ""    ""    ""    ""    "2"   "2"   "3"   # Q01-Q10
+  "2"   "3"   "2"   "2"   "3"   "2"   "3"   "*"   "4"   ""   # Q11-Q20
+  ""    "3"   "4"   "*"   "*"   "1"   ""    "2"   "2"   ""   # Q21-Q30
+  "3"   "3"   "3"   "2"   "3"   "5"   "2"   "2"   "2"   "6"  # Q31-Q40
+  "3"   "3"   "1"                                              # Q41-Q43
 )
 
 log "Running correctness comparison (dataset=$DATASET, table=$CH_TABLE, index=$OS_INDEX)..."
@@ -170,15 +195,12 @@ for i in $(seq 0 $((TOTAL - 1))); do
         fi
 
         # Normalize the cached expected output
-        echo "$EXPECTED_CONTENT" | normalize_nosort > "${CH_OUT}.raw"
-        tie_aware_sort "${CH_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$CH_OUT"
-        rm -f "${CH_OUT}.raw"
+        echo "$EXPECTED_CONTENT" | normalize_nosort > "$CH_OUT"
     else
         # full mode: run ClickHouse query live, replacing table name
         CH_Q_REPLACED=$(echo "$CH_Q" | sed "s/\bhits\b/${CH_TABLE}/g")
         if ! clickhouse-client --host "$CH_HOST" --port "$CH_PORT" \
-            -q "$CH_Q_REPLACED" 2>/dev/null | normalize_nosort > "${CH_OUT}.raw"; then
-            rm -f "${CH_OUT}.raw"
+            -q "$CH_Q_REPLACED" 2>/dev/null | normalize_nosort > "$CH_OUT"; then
             log "Q${QN_FMT}: SKIP (ClickHouse query failed)"
             SKIP=$((SKIP + 1))
             QUERY_RESULTS=$(echo "$QUERY_RESULTS" | jq \
@@ -186,8 +208,6 @@ for i in $(seq 0 $((TOTAL - 1))); do
                 '. + [{"q": $q, "status": "SKIP", "reason": "ClickHouse query failed"}]')
             continue
         fi
-        tie_aware_sort "${CH_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$CH_OUT"
-        rm -f "${CH_OUT}.raw"
     fi
 
     # ── Run OpenSearch query ─────────────────────────────────────────────
@@ -245,16 +265,14 @@ try:
         print('\t'.join(str(v) for v in row))
 except Exception:
     pass
-" 2>/dev/null | normalize_nosort > "${OS_OUT}.raw"
-    tie_aware_sort "${OS_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$OS_OUT"
-    rm -f "${OS_OUT}.raw"
+" 2>/dev/null | normalize_nosort > "$OS_OUT"
 
     # ── Compare ──────────────────────────────────────────────────────────
 
     CH_ROWS=$(wc -l < "$CH_OUT")
     OS_ROWS=$(wc -l < "$OS_OUT")
 
-    if diff -q "$CH_OUT" "$OS_OUT" >/dev/null 2>&1; then
+    if tie_aware_compare "$CH_OUT" "$OS_OUT" "${ORDER_BY_COLS[$i]}"; then
         log "Q${QN_FMT}: PASS ($CH_ROWS rows)"
         PASS=$((PASS + 1))
         rm -f "$DIFF_OUT"

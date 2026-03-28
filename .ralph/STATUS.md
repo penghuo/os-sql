@@ -129,3 +129,44 @@ Q30(2.22x) Q35(4.25x) Q36(5.91x) Q39(27.06x)
 ### Evidence
 - Full benchmark: /tmp/full_v8/r5.4xlarge.json (warmup=3, tries=5)
 - Timing logs: /opt/opensearch/logs/clickbench_server.json
+
+
+## Final State — Iteration 9
+
+status: WORKING
+iteration: 9
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (unchanged from baseline)
+- Correctness: 39/43 PASS (unchanged)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 4 shards, 4 segments/shard
+
+### Queries Within 2x (25)
+Q00(0.40x) Q01(0.16x) Q03(1.76x) Q06(0.15x) Q07(0.36x) Q10(1.40x) Q12(0.58x)
+Q17(0.01x) Q19(0.08x) Q20(0.01x) Q21(0.02x) Q22(0.04x) Q23(0.00x) Q24(0.06x)
+Q25(1.68x) Q26(0.04x) Q31(1.23x) Q32(1.98x) Q33(0.29x) Q34(0.31x) Q37(0.52x)
+Q38(0.64x) Q40(0.31x) Q41(0.92x) Q42(0.67x)
+
+### Queries Above 2x (18)
+Q02(3.26x) Q04(5.57x) Q05(5.13x) Q08(4.15x) Q09(5.57x) Q11(12.04x) Q13(7.96x)
+Q14(2.45x) Q15(26.91x) Q16(6.79x) Q18(9.70x) Q27(2.38x) Q28(3.13x) Q29(2.01x)
+Q30(2.44x) Q35(3.96x) Q36(5.83x) Q39(27.80x)
+
+### Key Findings from This Iteration
+1. **Timing instrumentation** revealed shard execution dominates (70-99% of total time)
+2. **Coordinator merge** is significant only for COUNT(DISTINCT): Q04 merge=674ms, Q05 merge=1992ms
+3. **Merge optimization** helped Q04 (-12%), Q05 (-5%), Q08 (-6%) but not enough to flip any query
+4. **Q29 at 2.01x** — just 1ms over the 2x threshold, within measurement noise
+5. **Fundamental gap**: Lucene DocValues access is 3-10x slower than ClickHouse columnar format
+6. **GC pressure** from Q16/Q18 (high-cardinality GROUP BY) can cause circuit breaker failures
+
+### Next Steps
+1. Target ≥38/43 requires 13 more queries within 2x — NOT achievable with code optimizations alone
+2. Borderline queries Q29(2.01x), Q14(2.45x), Q30(2.44x) are closest to flipping
+3. Architectural changes needed: columnar storage format, vectorized execution, or pre-aggregation
+4. Consider reducing target to ≥30/43 as a more realistic goal
+
+### Evidence
+- Full benchmark: /tmp/full_v9_final/r5.4xlarge.json (warmup=3, tries=5)
+- Correctness: 39/43 PASS (/tmp/correctness_v9.log)
+- Commit: f423f8d29 (merge optimization + timing instrumentation)

@@ -167,6 +167,7 @@ public class TransportTrinoSqlAction
 
   private void executeInternal(
       String queryStr, boolean isExplain, ActionListener<TrinoSqlResponse> listener) {
+    long t0 = System.nanoTime();
     try {
       // Check query plan cache first (skips parse/plan/optimize/fragment for repeated queries)
       long currentMetaVersion = clusterService.state().metadata().version();
@@ -312,6 +313,7 @@ public class TransportTrinoSqlAction
       }
 
       // 8. Dispatch to shards via transport
+      long t1 = System.nanoTime();
       List<PlanFragment> shardFragments = fragments.shardFragments();
       DqePlanNode coordinatorPlan = fragments.coordinatorPlan();
 
@@ -602,6 +604,7 @@ public class TransportTrinoSqlAction
         }
 
         // Process results synchronously — avoids the GroupedActionListener callback chain
+        long t2 = System.nanoTime();
         try {
           // Build shardPages from successful shards only (skip nulls from failed shards)
           List<List<Page>> shardPages = new ArrayList<>(successCount);
@@ -806,6 +809,11 @@ public class TransportTrinoSqlAction
           String responseJson =
               formatResponse(
                   mergedPages, columnNames, columnTypes, schemaJsonPrefix, columnTypeArray);
+          long t3 = System.nanoTime();
+          LOG.info("DQE timing [{}]: parse={}ms shard={}ms merge={}ms total={}ms",
+              queryStr.substring(0, Math.min(80, queryStr.length())),
+              (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000,
+              (t3 - t2) / 1_000_000, (t3 - t0) / 1_000_000);
           listener.onResponse(new TrinoSqlResponse(responseJson));
         } catch (Exception e) {
           listener.onFailure(e);
@@ -1973,6 +1981,10 @@ public class TransportTrinoSqlAction
    * Merge scalar COUNT(DISTINCT numericCol) using raw LongOpenHashSet attachments from shards. If
    * all shards have the raw set, unions them directly (no Page extraction). Falls back to
    * Page-based merge if any shard lacks the attachment.
+   *
+   * <p>Optimization: instead of mutating the largest set (which causes expensive rehashing),
+   * we merge all non-largest sets into a small temporary set, then use parallel read-only
+   * contains() checks against the largest set to count unique entries.
    */
   private static List<Page> mergeCountDistinctValuesViaRawSets(
       ShardExecuteResponse[] shardResults, List<List<Page>> shardPages) {
@@ -1988,41 +2000,69 @@ public class TransportTrinoSqlAction
       return mergeCountDistinctValues(shardPages);
     }
 
-    // Fast path: union raw LongOpenHashSets directly.
-    // Pick the largest shard set as the base and merge others into it.
+    // Find the largest set
     org.opensearch.sql.dqe.operator.LongOpenHashSet largest = null;
-    int largestSize = -1;
     int largestIdx = -1;
     for (int i = 0; i < shardResults.length; i++) {
       org.opensearch.sql.dqe.operator.LongOpenHashSet set = shardResults[i].getScalarDistinctSet();
-      if (set.size() > largestSize) {
+      if (largest == null || set.size() > largest.size()) {
         largest = set;
-        largestSize = set.size();
         largestIdx = i;
       }
     }
-    // Merge all other sets into the largest
+
+    // Merge all non-largest sets into a temporary set (dedup across shards)
+    org.opensearch.sql.dqe.operator.LongOpenHashSet others = null;
     for (int i = 0; i < shardResults.length; i++) {
       if (i == largestIdx) continue;
-      org.opensearch.sql.dqe.operator.LongOpenHashSet other =
-          shardResults[i].getScalarDistinctSet();
-      // Iterate the raw keys array to add all entries
-      if (other.hasZeroValue()) {
-        largest.add(0L);
-      }
-      if (other.hasSentinelValue()) {
-        largest.add(org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
-      }
-      long[] otherKeys = other.keys();
-      long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
-      for (int j = 0; j < otherKeys.length; j++) {
-        if (otherKeys[j] != emptyMarker) {
-          largest.add(otherKeys[j]);
-        }
+      org.opensearch.sql.dqe.operator.LongOpenHashSet set = shardResults[i].getScalarDistinctSet();
+      if (others == null) {
+        others = set; // reuse first non-largest set
+      } else {
+        others.addAll(set);
       }
     }
+
+    if (others == null) {
+      // Only one shard
+      io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+      BigintType.BIGINT.writeLong(builder, largest.size());
+      return List.of(new Page(builder.build()));
+    }
+
+    // Count entries in 'others' not present in 'largest' — read-only access to largest
+    long[] othersKeys = others.keys();
+    long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
+    final org.opensearch.sql.dqe.operator.LongOpenHashSet L = largest;
+
+    // Parallel counting: split othersKeys into chunks
+    int numWorkers = Math.min(Runtime.getRuntime().availableProcessors(), 8);
+    int chunkSize = (othersKeys.length + numWorkers - 1) / numWorkers;
+    java.util.concurrent.atomic.AtomicLong extraCount = new java.util.concurrent.atomic.AtomicLong(0);
+    java.util.concurrent.CompletableFuture<?>[] futures = new java.util.concurrent.CompletableFuture[numWorkers];
+
+    for (int w = 0; w < numWorkers; w++) {
+      final int start = w * chunkSize;
+      final int end = Math.min(start + chunkSize, othersKeys.length);
+      futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+        long localCount = 0;
+        for (int j = start; j < end; j++) {
+          if (othersKeys[j] != emptyMarker && !L.contains(othersKeys[j])) {
+            localCount++;
+          }
+        }
+        extraCount.addAndGet(localCount);
+      });
+    }
+    java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+    // Handle zero and sentinel values
+    long total = largest.size() + extraCount.get();
+    if (others.hasZeroValue() && !largest.hasZeroValue()) total++;
+    if (others.hasSentinelValue() && !largest.hasSentinelValue()) total++;
+
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
-    BigintType.BIGINT.writeLong(builder, largest.size());
+    BigintType.BIGINT.writeLong(builder, total);
     return List.of(new Page(builder.build()));
   }
 
@@ -2030,6 +2070,10 @@ public class TransportTrinoSqlAction
    * Merge scalar COUNT(DISTINCT varcharCol) using raw string set attachments from shards. If all
    * shards have the raw set, unions them directly (no Page extraction). Falls back to Page-based
    * merge if any shard lacks the attachment.
+   *
+   * <p>Optimization: instead of mutating the largest set, we merge all non-largest sets into a
+   * small temporary set, then use parallel read-only contains() checks against the largest set
+   * to count unique entries.
    */
   private static List<Page> mergeCountDistinctVarcharViaRawSets(
       ShardExecuteResponse[] shardResults, List<List<Page>> shardPages) {
@@ -2045,25 +2089,59 @@ public class TransportTrinoSqlAction
       return mergeCountDistinctVarcharValues(shardPages);
     }
 
-    // Fast path: union raw HashSet<String> directly.
-    // Pick the largest shard set as the base and merge others into it.
+    // Find the largest set
     java.util.Set<String> largest = null;
-    int largestSize = -1;
     int largestIdx = -1;
     for (int i = 0; i < shardResults.length; i++) {
       java.util.Set<String> set = shardResults[i].getScalarDistinctStrings();
-      if (set.size() > largestSize) {
+      if (largest == null || set.size() > largest.size()) {
         largest = set;
-        largestSize = set.size();
         largestIdx = i;
       }
     }
+
+    // Merge all non-largest sets into a temporary set (dedup across shards)
+    java.util.Set<String> others = null;
     for (int i = 0; i < shardResults.length; i++) {
       if (i == largestIdx) continue;
-      largest.addAll(shardResults[i].getScalarDistinctStrings());
+      java.util.Set<String> set = shardResults[i].getScalarDistinctStrings();
+      if (others == null) {
+        others = set;
+      } else {
+        others.addAll(set);
+      }
     }
+
+    if (others == null) {
+      io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+      BigintType.BIGINT.writeLong(builder, largest.size());
+      return List.of(new Page(builder.build()));
+    }
+
+    // Parallel count: entries in 'others' not in 'largest'
+    String[] othersArray = others.toArray(new String[0]);
+    final java.util.Set<String> L = largest;
+    int numWorkers = Math.min(Runtime.getRuntime().availableProcessors(), 8);
+    int chunkSize = (othersArray.length + numWorkers - 1) / numWorkers;
+    java.util.concurrent.atomic.AtomicLong extraCount = new java.util.concurrent.atomic.AtomicLong(0);
+    java.util.concurrent.CompletableFuture<?>[] futures = new java.util.concurrent.CompletableFuture[numWorkers];
+
+    for (int w = 0; w < numWorkers; w++) {
+      final int start = w * chunkSize;
+      final int end = Math.min(start + chunkSize, othersArray.length);
+      futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+        long localCount = 0;
+        for (int j = start; j < end; j++) {
+          if (!L.contains(othersArray[j])) localCount++;
+        }
+        extraCount.addAndGet(localCount);
+      });
+    }
+    java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+    long total = largest.size() + extraCount.get();
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
-    BigintType.BIGINT.writeLong(builder, largest.size());
+    BigintType.BIGINT.writeLong(builder, total);
     return List.of(new Page(builder.build()));
   }
 
@@ -2470,41 +2548,14 @@ public class TransportTrinoSqlAction
       candidateKeys = groupShardSets.keySet(); // merge all
     }
 
-    // Merge only candidate groups — take ownership of first shard's set (zero-copy)
-    java.util.HashMap<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet> merged =
-        new java.util.HashMap<>(candidateKeys.size() * 2);
+    // Merge candidate groups — take ownership of largest shard's set per group
+    java.util.HashMap<Long, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+        merged = new java.util.HashMap<>(candidateKeys.size() * 2);
     long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
 
     for (Long gk : candidateKeys) {
-      java.util.List<org.opensearch.sql.dqe.operator.LongOpenHashSet> sets = groupShardSets.get(gk);
-      if (sets == null || sets.isEmpty()) continue;
-
-      // Take ownership of the largest shard's set as the merge target (avoid copying its entries)
-      org.opensearch.sql.dqe.operator.LongOpenHashSet target = sets.get(0);
-      int largestIdx = 0;
-      int largestSize = target.size();
-      for (int s = 1; s < sets.size(); s++) {
-        if (sets.get(s).size() > largestSize) {
-          largestSize = sets.get(s).size();
-          largestIdx = s;
-          target = sets.get(s);
-        }
-      }
-
-      // Merge remaining shards into target
-      for (int s = 0; s < sets.size(); s++) {
-        if (s == largestIdx) continue;
-        org.opensearch.sql.dqe.operator.LongOpenHashSet source = sets.get(s);
-        if (source.hasZeroValue()) target.add(0);
-        if (source.hasSentinelValue()) target.add(emptyMarker);
-        long[] sourceTable = source.keys();
-        for (int i = 0; i < sourceTable.length; i++) {
-          if (sourceTable[i] != emptyMarker) {
-            target.add(sourceTable[i]);
-          }
-        }
-      }
-      merged.put(gk, target);
+      org.opensearch.sql.dqe.operator.LongOpenHashSet result = mergeGroupSets(groupShardSets.get(gk), emptyMarker);
+      if (result != null) merged.put(gk, result);
     }
 
     if (merged.isEmpty()) return List.of();
@@ -2542,6 +2593,57 @@ public class TransportTrinoSqlAction
    * shard provides a Map&lt;String, LongOpenHashSet&gt; of (groupKey → distinct values). The
    * coordinator unions sets across shards per group and computes the final distinct count.
    */
+  /** Merge a list of per-shard LongOpenHashSets for a single group key. */
+  private static org.opensearch.sql.dqe.operator.LongOpenHashSet mergeGroupSets(
+      java.util.List<org.opensearch.sql.dqe.operator.LongOpenHashSet> sets, long emptyMarker) {
+    if (sets == null || sets.isEmpty()) return null;
+    org.opensearch.sql.dqe.operator.LongOpenHashSet target = sets.get(0);
+    int largestIdx = 0;
+    for (int s = 1; s < sets.size(); s++) {
+      if (sets.get(s).size() > target.size()) {
+        target = sets.get(s);
+        largestIdx = s;
+      }
+    }
+    for (int s = 0; s < sets.size(); s++) {
+      if (s == largestIdx) continue;
+      org.opensearch.sql.dqe.operator.LongOpenHashSet source = sets.get(s);
+      if (source.hasZeroValue()) target.add(0);
+      if (source.hasSentinelValue()) target.add(emptyMarker);
+      long[] sourceTable = source.keys();
+      for (int i = 0; i < sourceTable.length; i++) {
+        if (sourceTable[i] != emptyMarker) target.add(sourceTable[i]);
+      }
+    }
+    return target;
+  }
+
+  /** Merge an array of per-shard LongOpenHashSets for a single group key. */
+  private static org.opensearch.sql.dqe.operator.LongOpenHashSet mergeGroupSetsArray(
+      org.opensearch.sql.dqe.operator.LongOpenHashSet[] shardSets, int numShards) {
+    long emptyMarker = org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker();
+    org.opensearch.sql.dqe.operator.LongOpenHashSet target = null;
+    int targetIdx = -1;
+    for (int s = 0; s < numShards; s++) {
+      if (shardSets[s] != null && (target == null || shardSets[s].size() > target.size())) {
+        target = shardSets[s];
+        targetIdx = s;
+      }
+    }
+    if (target == null) return null;
+    for (int s = 0; s < numShards; s++) {
+      if (s == targetIdx || shardSets[s] == null) continue;
+      org.opensearch.sql.dqe.operator.LongOpenHashSet src = shardSets[s];
+      if (src.hasZeroValue()) target.add(0);
+      if (src.hasSentinelValue()) target.add(emptyMarker);
+      long[] srcKeys = src.keys();
+      for (int i = 0; i < srcKeys.length; i++) {
+        if (srcKeys[i] != emptyMarker) target.add(srcKeys[i]);
+      }
+    }
+    return target;
+  }
+
   private static List<Page> mergeDedupCountDistinctViaVarcharSets(
       ShardExecuteResponse[] shardResults,
       AggregationNode singleAgg,
@@ -2614,36 +2716,14 @@ public class TransportTrinoSqlAction
       candidateGroups = perGroupSets.keySet();
     }
 
-    // Phase 3: Merge only candidate groups
-    java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> mergedSets =
-        new java.util.HashMap<>(candidateGroups.size() * 2);
+    // Phase 3: Merge candidate groups
+    java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>
+        mergedSets = new java.util.HashMap<>(candidateGroups.size() * 2);
 
     for (String key : candidateGroups) {
       org.opensearch.sql.dqe.operator.LongOpenHashSet[] shardSets = perGroupSets.get(key);
-      // Take ownership of the largest shard's set
-      org.opensearch.sql.dqe.operator.LongOpenHashSet merged = null;
-      int mergedIdx = -1;
-      for (int s = 0; s < numShards; s++) {
-        if (shardSets[s] != null && (merged == null || shardSets[s].size() > merged.size())) {
-          merged = shardSets[s];
-          mergedIdx = s;
-        }
-      }
-      if (merged == null) continue;
-
-      // Union remaining shards into the largest
-      for (int s = 0; s < numShards; s++) {
-        if (s == mergedIdx || shardSets[s] == null) continue;
-        org.opensearch.sql.dqe.operator.LongOpenHashSet src = shardSets[s];
-        long[] srcKeys = src.keys();
-        long empty = src.emptyMarker();
-        for (long v : srcKeys) {
-          if (v != empty) merged.add(v);
-        }
-        if (src.hasZeroValue()) merged.add(0L);
-        if (src.hasSentinelValue()) merged.add(Long.MIN_VALUE);
-      }
-      mergedSets.put(key, merged);
+      org.opensearch.sql.dqe.operator.LongOpenHashSet result = mergeGroupSetsArray(shardSets, numShards);
+      if (result != null) mergedSets.put(key, result);
     }
 
     int mergedGroupCount = mergedSets.size();

@@ -251,3 +251,29 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 - MAX_CAPACITY=4M caused Q27 regression (22s vs 4s), reverted to 16M
 - Remaining performance gap is fundamental: Lucene DocValues overhead vs ClickHouse columnar format
 - Performance target (≥38/43) NOT achievable with code optimizations alone on force-merged index
+
+## Iteration 9 — 2026-03-28T20:43-22:40Z
+
+### What I Did
+1. Added timing instrumentation to TransportTrinoSqlAction.java (parse/shard/merge/total breakdown)
+2. Discovered timing breakdown: shard execution dominates, merge is significant for COUNT(DISTINCT)
+3. Added `contains()` method to LongOpenHashSet for read-only probing
+4. Optimized scalar COUNT(DISTINCT) merge: parallel count-only merge instead of mutating largest set
+5. Attempted parallel grouped merge for Q08/Q09/Q11/Q13 — REVERTED due to GC pressure
+6. Ran 3 full benchmarks to validate changes
+
+### Results
+- Q04: 5.79x → 5.09x (-12% from merge optimization)
+- Q08: 4.39x → 3.19x (single-shot) but 4.45x in full benchmark (GC pressure from sequential queries)
+- Q14: 2.40x → 2.12x (improved but still above 2x)
+- Q16: 6.92x → 5.96x (improved)
+- Q29: 2.42x → 2.27x (improved, close to 2x boundary)
+- Q32: 1.89x → 2.12x (REGRESSED, lost from within 2x — run-to-run variance)
+- Overall: 25/43 → 24-25/43 (no net improvement due to Q32 regression)
+
+### Decisions
+1. Parallel grouped merge REVERTED: ConcurrentHashMap + parallel threads kept LongOpenHashSets alive longer, causing GC pressure and circuit breaker failures for subsequent queries
+2. Scalar merge optimization KEPT: parallel count-only merge for Q04/Q05 is safe (small temporary data structures)
+3. Timing instrumentation KEPT: valuable for understanding bottlenecks
+4. Fundamental finding: Lucene DocValues access is 3-10x slower than ClickHouse columnar for full-table scans. Code optimizations alone cannot close this gap for most queries.
+5. Borderline queries (Q14, Q29, Q30) are the most achievable targets — need 0.03-0.36s savings each

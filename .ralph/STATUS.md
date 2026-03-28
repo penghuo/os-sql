@@ -72,3 +72,60 @@ Q18(9.75x) Q11(12.57x) Q15(25.57x) Q39(26.59x)
 - Full benchmark: /tmp/full_v6_final/r5.4xlarge.json (warmup=3, tries=5)
 - Correctness: 39/43 PASS (4 FAIL: Q29, Q33, Q40, Q41 - engine bugs)
 - Code changes: parallelized collectDistinctStringsRaw, executeMixedDedupWithHashSets, executeVarcharCountDistinctWithHashSets
+
+## Iteration 9 — 2026-03-28T22:40Z
+
+status: WORKING
+iteration: 9
+
+### Current State
+- Score: 24-25/43 within 2x of CH-Parquet (run-to-run variance on Q32)
+- Correctness: 39/43 PASS (unchanged)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 4 shards, 4 segments/shard
+
+### Changes Made
+1. Added `contains()` method to LongOpenHashSet for read-only probing
+2. Optimized scalar COUNT(DISTINCT) merge (Q04, Q05): parallel count-only merge instead of mutating largest set
+3. Added timing instrumentation to coordinator (parse/shard/merge/total breakdown)
+4. Attempted parallel grouped merge for Q08/Q09/Q11/Q13 — REVERTED due to GC pressure causing circuit breaker failures
+
+### Timing Breakdown (key queries)
+| Query | Parse | Shard | Merge | Total | CH | Ratio |
+|-------|-------|-------|-------|-------|-----|-------|
+| Q02 | 0ms | 335ms | 0ms | 335ms | 105ms | 3.19x |
+| Q04 | 0ms | 1632ms | 674ms | 2211ms | 434ms | 5.09x |
+| Q05 | 0ms | 1819ms | 1992ms | 3622ms | 690ms | 5.25x |
+| Q08 | 0ms | 1942ms | 323ms | 2404ms | 540ms | 4.45x |
+| Q15 | 0ms | 13806ms | 1ms | 13809ms | 520ms | 26.6x |
+| Q29 | 0ms | 191ms | 0ms | 191ms | 96ms | 2.0x |
+
+### Key Findings
+1. Shard execution dominates for most queries — Lucene DocValues access is 3-10x slower than ClickHouse columnar
+2. Coordinator merge is significant for COUNT(DISTINCT): Q04 merge=674ms, Q05 merge=1992ms, Q08 merge=323ms
+3. Q29 is at the 2x boundary (191-231ms shard time vs 192ms target)
+4. Q14 improved to 2.12x (was 2.40x) — close to 2x
+5. GC pressure from Q16/Q18 (high-cardinality GROUP BY) causes circuit breaker failures for subsequent queries
+6. Plan caching eliminates parse overhead for repeated queries
+
+### Queries Within 2x (24-25)
+Q00(0.36x) Q01(0.16x) Q03(1.73x) Q06(0.14x) Q07(0.32x) Q10(1.42x) Q12(0.63x)
+Q17(0.01x) Q19(0.09x) Q20(0.01x) Q21(0.02x) Q22(0.03x) Q23(0.00x) Q24(0.02x)
+Q25(1.62x) Q26(0.03x) Q31(1.28x) Q33(0.30x) Q34(0.30x) Q37(0.42x)
+Q38(0.66x) Q40(0.30x) Q41(0.87x) Q42(0.74x)
+[Q32 borderline: 1.89x old, 2.12x new — run-to-run variance]
+
+### Queries Above 2x (18-19)
+Q02(3.19x) Q04(5.09x) Q05(5.25x) Q08(4.45x) Q09(5.38x) Q11(12.48x) Q13(7.58x)
+Q14(2.12x) Q15(27.29x) Q16(5.96x) Q18(9.66x) Q27(2.20x) Q28(3.05x) Q29(2.27x)
+Q30(2.22x) Q35(4.25x) Q36(5.91x) Q39(27.06x)
+
+### Next Steps
+1. Performance target NOT MET (24-25/43 vs ≥38/43)
+2. Remaining gap is fundamental: Lucene DocValues overhead vs ClickHouse columnar format
+3. Borderline queries Q14(2.12x), Q29(2.27x), Q30(2.22x) need small improvements
+4. High-cardinality GROUP BY (Q15, Q16, Q18) need architectural changes
+5. COUNT(DISTINCT) queries need both shard and merge optimization
+
+### Evidence
+- Full benchmark: /tmp/full_v8/r5.4xlarge.json (warmup=3, tries=5)
+- Timing logs: /opt/opensearch/logs/clickbench_server.json

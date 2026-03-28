@@ -486,3 +486,26 @@ Parallelize sequential COUNT(DISTINCT) paths, force-merge index, tune MAX_CAPACI
 - Force-merge was net negative but irreversible
 - Remaining gap is fundamental Lucene DocValues overhead
 - Performance target not achievable with code optimizations alone
+
+## Iteration 9 — 2026-03-28T20:43-22:40Z
+
+### Task: COUNT(DISTINCT) Fusion (Step 1 from plan)
+
+**Approach:** Instead of fusing the two-level Calcite plan (which already exists), focused on optimizing the coordinator merge which is a major bottleneck.
+
+**Changes:**
+1. `LongOpenHashSet.java`: Added `contains()` method for read-only probing
+2. `TransportTrinoSqlAction.java`: 
+   - Added timing instrumentation (parse/shard/merge/total)
+   - Optimized `mergeCountDistinctValuesViaRawSets` (Q04): parallel count-only merge
+   - Optimized `mergeCountDistinctVarcharViaRawSets` (Q05): parallel count-only merge
+   - Added `mergeGroupSets` and `mergeGroupSetsArray` helper methods
+   - Attempted parallel grouped merge — REVERTED due to GC pressure
+
+**Results:**
+- Q04 merge: 840ms → 674ms (-20%)
+- Q05 merge: 2263ms → 1992ms (-12%)
+- Q08 merge: 885ms → 323ms (-63%, single-shot test)
+- Overall score: 25/43 → 24-25/43 (no net improvement)
+
+**Key Finding:** COUNT(DISTINCT) fusion already exists in the codebase. The bottleneck is split between shard execution (Lucene DocValues scan) and coordinator merge (HashSet union). Optimizing merge alone is insufficient — shard execution dominates.

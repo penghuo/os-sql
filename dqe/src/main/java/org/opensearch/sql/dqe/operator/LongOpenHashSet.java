@@ -105,6 +105,30 @@ public final class LongOpenHashSet {
     return true;
   }
 
+  /**
+   * Check if a value is in the set.
+   * @param value the long value to check
+   * @return true if the set contains this value
+   */
+  public boolean contains(long value) {
+    if (value == 0) return hasZero;
+    if (value == EMPTY) return hasSentinel;
+    int mask = capacity - 1;
+    long h = value;
+    h ^= h >>> 33;
+    h *= 0xff51afd7ed558ccdL;
+    h ^= h >>> 33;
+    h *= 0xc4ceb9fe1a85ec53L;
+    h ^= h >>> 33;
+    int slot = (int) h & mask;
+    long k;
+    while ((k = keys[slot]) != EMPTY) {
+      if (k == value) return true;
+      slot = (slot + 1) & mask;
+    }
+    return false;
+  }
+
   /** Return the number of distinct values in the set. */
   public int size() {
     return size;

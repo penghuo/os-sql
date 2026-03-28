@@ -1,6 +1,0 @@
-7,8c7,8
-< go.mail	108.636096	8227493	http://go.mail/04/detskaia-moda-zhiensmed
-< google.ru	109.236262	2158346	http://google.ru/
----
-> go.mail	108.636097	8227489	http://go.mail/04/detskaia-moda-zhiensmed
-> google.ru	109.236289	2158345	http://google.ru/

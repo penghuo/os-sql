@@ -64,15 +64,42 @@ mkdir -p "$OUTPUT_DIR" "$DIFF_DIR"
 
 # ── Normalize function ───────────────────────────────────────────────────────
 # Strip trailing whitespace, remove empty lines, normalize NULLs,
-# truncate floats to 6 decimal places, sort lines.
+# truncate floats to 6 decimal places. No sort — tie_aware_sort handles that.
 
-normalize() {
+normalize_nosort() {
     sed 's/[[:space:]]*$//' |
     sed '/^$/d' |
     sed 's/\\N/NULL/g; s/\bnull\b/NULL/gi' |
     sed "s/\\\\'/'/g" |
-    sed -E 's/([0-9]+\.[0-9]{6})[0-9]*/\1/g' |
-    sort
+    sed -E 's/([0-9]+\.[0-9]{6})[0-9]*/\1/g'
+}
+
+# Sort rows within tied ORDER BY groups.
+# $1 = input file, $2 = ORDER BY columns (comma-separated, 1-based). Empty = sort all.
+tie_aware_sort() {
+    local file="$1" order_cols="$2"
+    if [[ -z "$order_cols" ]]; then
+        sort "$file"
+        return
+    fi
+    python3 -c "
+import sys
+cols = [int(c)-1 for c in '${order_cols}'.split(',')]
+lines = [l for l in open('${file}').read().rstrip('\n').split('\n') if l]
+if not lines: sys.exit(0)
+groups, key, grp = [], None, []
+for l in lines:
+    f = l.split('\t')
+    k = tuple(f[c] if c < len(f) else '' for c in cols)
+    if k != key:
+        if grp: groups.append(grp)
+        key, grp = k, [l]
+    else:
+        grp.append(l)
+if grp: groups.append(grp)
+for g in groups:
+    for l in sorted(g): print(l)
+"
 }
 
 # ── Main loop setup ──────────────────────────────────────────────────────────
@@ -81,6 +108,16 @@ PASS=0
 FAIL=0
 SKIP=0
 TOTAL=43
+
+# ORDER BY column positions (1-based, comma-separated) for tie-aware comparison.
+# Empty = no ORDER BY (sort all rows).
+ORDER_BY_COLS=(
+  ""    ""    ""    ""    ""    ""    ""    ""    "2"   "2"   # Q00-Q09
+  "2"   "2"   "2"   "2"   "2"   "2"   "3"   ""    "3"   ""   # Q10-Q19
+  ""    "2"   "2"   "2"   "2"   "1"   "2,1" "2"   "2"   ""   # Q20-Q29
+  "3"   "3"   "3"   "4"   "3"   "3"   "3"   "3"   "3"   "3"  # Q30-Q39
+  "4"   "3"   "3"                                              # Q40-Q42
+)
 
 log "Running correctness comparison (dataset=$DATASET, table=$CH_TABLE, index=$OS_INDEX)..."
 log "========================================"
@@ -133,12 +170,15 @@ for i in $(seq 0 $((TOTAL - 1))); do
         fi
 
         # Normalize the cached expected output
-        echo "$EXPECTED_CONTENT" | normalize > "$CH_OUT"
+        echo "$EXPECTED_CONTENT" | normalize_nosort > "${CH_OUT}.raw"
+        tie_aware_sort "${CH_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$CH_OUT"
+        rm -f "${CH_OUT}.raw"
     else
         # full mode: run ClickHouse query live, replacing table name
         CH_Q_REPLACED=$(echo "$CH_Q" | sed "s/\bhits\b/${CH_TABLE}/g")
         if ! clickhouse-client --host "$CH_HOST" --port "$CH_PORT" \
-            -q "$CH_Q_REPLACED" 2>/dev/null | normalize > "$CH_OUT"; then
+            -q "$CH_Q_REPLACED" 2>/dev/null | normalize_nosort > "${CH_OUT}.raw"; then
+            rm -f "${CH_OUT}.raw"
             log "Q${QN_FMT}: SKIP (ClickHouse query failed)"
             SKIP=$((SKIP + 1))
             QUERY_RESULTS=$(echo "$QUERY_RESULTS" | jq \
@@ -146,6 +186,8 @@ for i in $(seq 0 $((TOTAL - 1))); do
                 '. + [{"q": $q, "status": "SKIP", "reason": "ClickHouse query failed"}]')
             continue
         fi
+        tie_aware_sort "${CH_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$CH_OUT"
+        rm -f "${CH_OUT}.raw"
     fi
 
     # ── Run OpenSearch query ─────────────────────────────────────────────
@@ -203,7 +245,9 @@ try:
         print('\t'.join(str(v) for v in row))
 except Exception:
     pass
-" 2>/dev/null | normalize > "$OS_OUT"
+" 2>/dev/null | normalize_nosort > "${OS_OUT}.raw"
+    tie_aware_sort "${OS_OUT}.raw" "${ORDER_BY_COLS[$i]}" > "$OS_OUT"
+    rm -f "${OS_OUT}.raw"
 
     # ── Compare ──────────────────────────────────────────────────────────
 

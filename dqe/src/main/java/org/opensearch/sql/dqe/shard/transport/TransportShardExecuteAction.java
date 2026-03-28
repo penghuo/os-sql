@@ -1584,8 +1584,227 @@ public class TransportShardExecuteAction
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-mixed-dedup-hashset")) {
-      for (org.apache.lucene.index.LeafReaderContext leafCtx :
-          engineSearcher.getIndexReader().leaves()) {
+      java.util.List<org.apache.lucene.index.LeafReaderContext> leaves =
+          engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+
+      // Parallel MatchAll path: partition segments across workers
+      int numWorkers = Math.min(
+          Math.max(1,
+              Runtime.getRuntime().availableProcessors()
+                  / Integer.getInteger("dqe.numLocalShards", 4)),
+          leaves.size());
+
+      if (isMatchAll && numWorkers > 1 && leaves.size() > 1) {
+        // Partition segments: largest-first greedy assignment
+        @SuppressWarnings("unchecked")
+        java.util.List<org.apache.lucene.index.LeafReaderContext>[] workerSegments =
+            new java.util.List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) {
+          workerSegments[i] = new java.util.ArrayList<>();
+        }
+        java.util.List<org.apache.lucene.index.LeafReaderContext> sortedLeaves =
+            new java.util.ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (org.apache.lucene.index.LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        // Each worker returns: [workerGrpCap, workerGrpSize, grpKeys..., grpOcc(packed)...,
+        //                        grpAccs(flattened)...]
+        // Plus a LongOpenHashSet[] and the arrays themselves — use an Object[] per worker.
+        // Worker result: Object[] { long[] grpKeys, LongOpenHashSet[] grpSets,
+        //                           long[][] grpAccs, boolean[] grpOcc, int grpCap, int grpSize }
+        final int numAggsF = numAggs;
+        final boolean[] aggIsCountStarF = aggIsCountStar;
+        final boolean[] aggIsCountF = aggIsCount;
+        final String[] aggArgNamesF = aggArgNames;
+
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<Object[]>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final java.util.List<org.apache.lucene.index.LeafReaderContext> mySegments =
+              workerSegments[w];
+          futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            int wCap = 256;
+            long[] wKeys = new long[wCap];
+            org.opensearch.sql.dqe.operator.LongOpenHashSet[] wSets =
+                new org.opensearch.sql.dqe.operator.LongOpenHashSet[wCap];
+            long[][] wAccs = new long[wCap][numAggsF];
+            boolean[] wOcc = new boolean[wCap];
+            int wSize = 0;
+            int wThreshold = (int) (wCap * 0.7f);
+
+            try {
+              for (org.apache.lucene.index.LeafReaderContext leafCtx : mySegments) {
+                org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+                org.apache.lucene.index.SortedNumericDocValues dv0 =
+                    reader.getSortedNumericDocValues(keyName0);
+                org.apache.lucene.index.SortedNumericDocValues dv1 =
+                    reader.getSortedNumericDocValues(keyName1);
+                if (dv0 == null || dv1 == null) continue;
+
+                // Open aggregate argument DocValues
+                org.apache.lucene.index.SortedNumericDocValues[] aggDvs =
+                    new org.apache.lucene.index.SortedNumericDocValues[numAggsF];
+                for (int i = 0; i < numAggsF; i++) {
+                  if (!aggIsCountStarF[i]) {
+                    aggDvs[i] = reader.getSortedNumericDocValues(aggArgNamesF[i]);
+                  }
+                }
+
+                int maxDoc = reader.maxDoc();
+                int dvDoc0 = dv0.nextDoc();
+                int dvDoc1 = dv1.nextDoc();
+                // Advance all aggregate DV iterators
+                int[] aggDvDocs = new int[numAggsF];
+                for (int i = 0; i < numAggsF; i++) {
+                  if (aggDvs[i] != null) aggDvDocs[i] = aggDvs[i].nextDoc();
+                  else aggDvDocs[i] = org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+                }
+
+                for (int doc = 0; doc < maxDoc; doc++) {
+                  long k0 = 0;
+                  if (dvDoc0 == doc) {
+                    k0 = dv0.nextValue();
+                    dvDoc0 = dv0.nextDoc();
+                  }
+                  long k1 = 0;
+                  if (dvDoc1 == doc) {
+                    k1 = dv1.nextValue();
+                    dvDoc1 = dv1.nextDoc();
+                  }
+
+                  int gm = wCap - 1;
+                  int gs = Long.hashCode(k0) & gm;
+                  while (wOcc[gs] && wKeys[gs] != k0) gs = (gs + 1) & gm;
+                  if (!wOcc[gs]) {
+                    wKeys[gs] = k0;
+                    wSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                    wAccs[gs] = new long[numAggsF];
+                    wOcc[gs] = true;
+                    wSize++;
+                    if (wSize > wThreshold) {
+                      // Resize hash map
+                      int nc = wCap * 2;
+                      long[] nk = new long[nc];
+                      var ns = new org.opensearch.sql.dqe.operator.LongOpenHashSet[nc];
+                      long[][] na = new long[nc][numAggsF];
+                      boolean[] no = new boolean[nc];
+                      int nm = nc - 1;
+                      for (int g = 0; g < wCap; g++) {
+                        if (wOcc[g]) {
+                          int s = Long.hashCode(wKeys[g]) & nm;
+                          while (no[s]) s = (s + 1) & nm;
+                          nk[s] = wKeys[g];
+                          ns[s] = wSets[g];
+                          na[s] = wAccs[g];
+                          no[s] = true;
+                        }
+                      }
+                      wKeys = nk;
+                      wSets = ns;
+                      wAccs = na;
+                      wOcc = no;
+                      wCap = nc;
+                      wThreshold = (int) (nc * 0.7f);
+                      gm = wCap - 1;
+                      gs = Long.hashCode(k0) & gm;
+                      while (wOcc[gs] && wKeys[gs] != k0) gs = (gs + 1) & gm;
+                    }
+                  }
+                  wSets[gs].add(k1);
+
+                  // Accumulate SUM/COUNT for each aggregate
+                  for (int i = 0; i < numAggsF; i++) {
+                    if (aggIsCountStarF[i]) {
+                      wAccs[gs][i]++;
+                    } else if (aggDvDocs[i] == doc) {
+                      long val = aggDvs[i].nextValue();
+                      aggDvDocs[i] = aggDvs[i].nextDoc();
+                      wAccs[gs][i] += aggIsCountF[i] ? 1 : val;
+                    }
+                  }
+                }
+              }
+            } catch (java.io.IOException e) {
+              throw new java.io.UncheckedIOException(e);
+            }
+            return new Object[] { wKeys, wSets, wAccs, wOcc, wCap, wSize };
+          }, FusedGroupByAggregate.getParallelPool());
+        }
+
+        // Merge worker results into main hash map
+        for (var future : futures) {
+          Object[] result = future.join();
+          long[] wKeys = (long[]) result[0];
+          org.opensearch.sql.dqe.operator.LongOpenHashSet[] wSets =
+              (org.opensearch.sql.dqe.operator.LongOpenHashSet[]) result[1];
+          long[][] wAccs = (long[][]) result[2];
+          boolean[] wOcc = (boolean[]) result[3];
+          int wCap = (int) result[4];
+
+          for (int g = 0; g < wCap; g++) {
+            if (!wOcc[g]) continue;
+            long k0 = wKeys[g];
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (!grpOcc[gs]) {
+              // New key: adopt worker's data directly
+              grpKeys[gs] = k0;
+              grpSets[gs] = wSets[g];
+              grpAccs[gs] = wAccs[g];
+              grpOcc[gs] = true;
+              grpSize++;
+              if (grpSize > grpThreshold) {
+                int nc = grpCap * 2;
+                long[] nk = new long[nc];
+                var ns = new org.opensearch.sql.dqe.operator.LongOpenHashSet[nc];
+                long[][] na = new long[nc][numAggs];
+                boolean[] no = new boolean[nc];
+                int nm = nc - 1;
+                for (int gi = 0; gi < grpCap; gi++) {
+                  if (grpOcc[gi]) {
+                    int s = Long.hashCode(grpKeys[gi]) & nm;
+                    while (no[s]) s = (s + 1) & nm;
+                    nk[s] = grpKeys[gi];
+                    ns[s] = grpSets[gi];
+                    na[s] = grpAccs[gi];
+                    no[s] = true;
+                  }
+                }
+                grpKeys = nk;
+                grpSets = ns;
+                grpAccs = na;
+                grpOcc = no;
+                grpCap = nc;
+                grpThreshold = (int) (nc * 0.7f);
+                // Re-probe after resize
+                gm = grpCap - 1;
+                gs = Long.hashCode(k0) & gm;
+                while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+              }
+            } else {
+              // Existing key: merge LongOpenHashSets and accumulators
+              mergeHashSets(grpSets[gs], wSets[g]);
+              for (int i = 0; i < numAggs; i++) {
+                grpAccs[gs][i] += wAccs[g][i];
+              }
+            }
+          }
+        }
+      } else {
+      // Sequential path: single worker or filtered query
+      for (org.apache.lucene.index.LeafReaderContext leafCtx : leaves) {
         org.apache.lucene.index.LeafReader reader = leafCtx.reader();
         org.apache.lucene.index.SortedNumericDocValues dv0 =
             reader.getSortedNumericDocValues(keyName0);
@@ -1600,8 +1819,6 @@ public class TransportShardExecuteAction
             aggDvs[i] = reader.getSortedNumericDocValues(aggArgNames[i]);
           }
         }
-
-        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
 
         if (isMatchAll && dv0 != null && dv1 != null) {
           int maxDoc = reader.maxDoc();
@@ -1742,6 +1959,7 @@ public class TransportShardExecuteAction
           }
         }
       }
+      } // end sequential else block
     }
 
     // Build output page: (key0, key1_placeholder=0, agg0, agg1, ...)
@@ -1820,118 +2038,225 @@ public class TransportShardExecuteAction
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-varchar-count-distinct-hashset")) {
 
-      for (org.apache.lucene.index.LeafReaderContext leafCtx :
-          engineSearcher.getIndexReader().leaves()) {
-        org.apache.lucene.index.LeafReader reader = leafCtx.reader();
-        org.apache.lucene.index.SortedSetDocValues varcharDv =
-            reader.getSortedSetDocValues(varcharKeyName);
-        org.apache.lucene.index.SortedNumericDocValues numericDv =
-            reader.getSortedNumericDocValues(numericKeyName);
-        if (varcharDv == null) continue;
+      java.util.List<org.apache.lucene.index.LeafReaderContext> leaves =
+          engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
 
-        long ordCount = varcharDv.getValueCount();
-        // Ordinal-indexed array for this segment
-        org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
-            new org.opensearch.sql.dqe.operator.LongOpenHashSet
-                [(int) Math.min(ordCount, 10_000_000)];
+      // Parallel MatchAll path: partition segments across workers
+      int numWorkers = Math.min(
+          Math.max(1,
+              Runtime.getRuntime().availableProcessors()
+                  / Integer.getInteger("dqe.numLocalShards", 4)),
+          leaves.size());
 
-        boolean isMatchAll = luceneQuery instanceof org.apache.lucene.search.MatchAllDocsQuery;
+      if (isMatchAll && numWorkers > 1 && leaves.size() > 1) {
+        // Partition segments: largest-first greedy assignment
+        @SuppressWarnings("unchecked")
+        java.util.List<org.apache.lucene.index.LeafReaderContext>[] workerSegments =
+            new java.util.List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) {
+          workerSegments[i] = new java.util.ArrayList<>();
+        }
+        java.util.List<org.apache.lucene.index.LeafReaderContext> sortedLeaves =
+            new java.util.ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (org.apache.lucene.index.LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
 
-        if (isMatchAll) {
-          // Sequential scan: iterate DocValues directly
-          org.apache.lucene.index.SortedDocValues sdv =
-              org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
-          if (sdv != null) {
-            int doc;
-            while ((doc = sdv.nextDoc())
-                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              int ord = sdv.ordValue();
-              if (ordSets[ord] == null)
-                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
-              long val = 0;
-              if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-              ordSets[ord].add(val);
+        // Each worker builds its own local varcharDistinctSets map
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final java.util.List<org.apache.lucene.index.LeafReaderContext> mySegments =
+              workerSegments[w];
+          futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> localMap =
+                new java.util.HashMap<>();
+            try {
+              for (org.apache.lucene.index.LeafReaderContext leafCtx : mySegments) {
+                org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+                org.apache.lucene.index.SortedSetDocValues varcharDv =
+                    reader.getSortedSetDocValues(varcharKeyName);
+                org.apache.lucene.index.SortedNumericDocValues numericDv =
+                    reader.getSortedNumericDocValues(numericKeyName);
+                if (varcharDv == null) continue;
+
+                long ordCount = varcharDv.getValueCount();
+                // Ordinal-indexed array for this segment
+                org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
+                    new org.opensearch.sql.dqe.operator.LongOpenHashSet
+                        [(int) Math.min(ordCount, 10_000_000)];
+
+                // Sequential scan: iterate DocValues directly
+                org.apache.lucene.index.SortedDocValues sdv =
+                    org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
+                if (sdv != null) {
+                  int doc;
+                  while ((doc = sdv.nextDoc())
+                      != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                    int ord = sdv.ordValue();
+                    if (ordSets[ord] == null)
+                      ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                    long val = 0;
+                    if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+                    ordSets[ord].add(val);
+                  }
+                } else {
+                  int doc;
+                  while ((doc = varcharDv.nextDoc())
+                      != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                    int ord = (int) varcharDv.nextOrd();
+                    if (ordSets[ord] == null)
+                      ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                    long val = 0;
+                    if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+                    ordSets[ord].add(val);
+                  }
+                }
+
+                // Merge this segment's ordinal-indexed sets into the worker's local map
+                mergeOrdSetsIntoMap(varcharDv, ordSets, localMap);
+              }
+            } catch (Exception e) {
+              throw new RuntimeException(e);
             }
-          } else {
-            int doc;
-            while ((doc = varcharDv.nextDoc())
-                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              int ord = (int) varcharDv.nextOrd();
-              if (ordSets[ord] == null)
-                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
-              long val = 0;
-              if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-              ordSets[ord].add(val);
+            return localMap;
+          }, FusedGroupByAggregate.getParallelPool());
+        }
+
+        // Wait for all workers and merge their maps into the main varcharDistinctSets
+        for (java.util.concurrent.CompletableFuture<java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet>> f : futures) {
+          java.util.Map<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> workerMap = f.join();
+          for (java.util.Map.Entry<String, org.opensearch.sql.dqe.operator.LongOpenHashSet> entry : workerMap.entrySet()) {
+            org.opensearch.sql.dqe.operator.LongOpenHashSet existing = varcharDistinctSets.get(entry.getKey());
+            if (existing == null) {
+              varcharDistinctSets.put(entry.getKey(), entry.getValue());
+            } else {
+              mergeHashSets(existing, entry.getValue());
             }
           }
-        } else {
-          // Collect-then-sequential-scan: collect matching doc IDs first, then scan sequentially.
-          // This converts random advanceExact() into sequential nextDoc() iteration.
-          org.apache.lucene.search.Weight weight =
-              engineSearcher.createWeight(
-                  engineSearcher.rewrite(luceneQuery),
-                  org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
-                  1.0f);
-          org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
-          if (scorer == null) {
-            // Resolve ordinals for this segment and merge into varcharDistinctSets
-            mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
-            continue;
-          }
+        }
+      } else {
+        // Sequential path (single worker or non-MatchAll)
+        for (org.apache.lucene.index.LeafReaderContext leafCtx : leaves) {
+          org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+          org.apache.lucene.index.SortedSetDocValues varcharDv =
+              reader.getSortedSetDocValues(varcharKeyName);
+          org.apache.lucene.index.SortedNumericDocValues numericDv =
+              reader.getSortedNumericDocValues(numericKeyName);
+          if (varcharDv == null) continue;
 
-          // Step 1: Collect matching doc IDs into sorted array
-          org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
-          int[] matchDocs = new int[1024];
-          int matchCount = 0;
-          int doc;
-          while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-            if (matchCount == matchDocs.length) {
-              matchDocs = java.util.Arrays.copyOf(matchDocs, matchDocs.length * 2);
-            }
-            matchDocs[matchCount++] = doc;
-          }
+          long ordCount = varcharDv.getValueCount();
+          // Ordinal-indexed array for this segment
+          org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
+              new org.opensearch.sql.dqe.operator.LongOpenHashSet
+                  [(int) Math.min(ordCount, 10_000_000)];
 
-          // Step 2: Sequential scan of varchar DocValues, matching against collected doc IDs
-          org.apache.lucene.index.SortedDocValues sdv =
-              org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
-          if (sdv != null && matchCount > 0) {
-            int matchIdx = 0;
-            int dvDoc;
-            while ((dvDoc = sdv.nextDoc())
-                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              if (matchIdx >= matchCount) break;
-              if (dvDoc == matchDocs[matchIdx]) {
+          if (isMatchAll) {
+            // Sequential scan: iterate DocValues directly
+            org.apache.lucene.index.SortedDocValues sdv =
+                org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
+            if (sdv != null) {
+              int doc;
+              while ((doc = sdv.nextDoc())
+                  != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                 int ord = sdv.ordValue();
                 if (ordSets[ord] == null)
                   ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                 long val = 0;
-                if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
                 ordSets[ord].add(val);
-                matchIdx++;
               }
-            }
-          } else if (matchCount > 0) {
-            // Multi-valued path: use advanceExact for remaining unmatched docs
-            int matchIdx = 0;
-            int dvDoc;
-            while ((dvDoc = varcharDv.nextDoc())
-                != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              if (matchIdx >= matchCount) break;
-              if (dvDoc == matchDocs[matchIdx]) {
+            } else {
+              int doc;
+              while ((doc = varcharDv.nextDoc())
+                  != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                 int ord = (int) varcharDv.nextOrd();
                 if (ordSets[ord] == null)
                   ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                 long val = 0;
-                if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
                 ordSets[ord].add(val);
-                matchIdx++;
+              }
+            }
+          } else {
+            // Collect-then-sequential-scan: collect matching doc IDs first, then scan sequentially.
+            // This converts random advanceExact() into sequential nextDoc() iteration.
+            org.apache.lucene.search.Weight weight =
+                engineSearcher.createWeight(
+                    engineSearcher.rewrite(luceneQuery),
+                    org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES,
+                    1.0f);
+            org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+            if (scorer == null) {
+              // Resolve ordinals for this segment and merge into varcharDistinctSets
+              mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
+              continue;
+            }
+
+            // Step 1: Collect matching doc IDs into sorted array
+            org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
+            int[] matchDocs = new int[1024];
+            int matchCount = 0;
+            int doc;
+            while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+              if (matchCount == matchDocs.length) {
+                matchDocs = java.util.Arrays.copyOf(matchDocs, matchDocs.length * 2);
+              }
+              matchDocs[matchCount++] = doc;
+            }
+
+            // Step 2: Sequential scan of varchar DocValues, matching against collected doc IDs
+            org.apache.lucene.index.SortedDocValues sdv =
+                org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
+            if (sdv != null && matchCount > 0) {
+              int matchIdx = 0;
+              int dvDoc;
+              while ((dvDoc = sdv.nextDoc())
+                  != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                if (matchIdx >= matchCount) break;
+                if (dvDoc == matchDocs[matchIdx]) {
+                  int ord = sdv.ordValue();
+                  if (ordSets[ord] == null)
+                    ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                  long val = 0;
+                  if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                  ordSets[ord].add(val);
+                  matchIdx++;
+                }
+              }
+            } else if (matchCount > 0) {
+              // Multi-valued path: use advanceExact for remaining unmatched docs
+              int matchIdx = 0;
+              int dvDoc;
+              while ((dvDoc = varcharDv.nextDoc())
+                  != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+                if (matchIdx >= matchCount) break;
+                if (dvDoc == matchDocs[matchIdx]) {
+                  int ord = (int) varcharDv.nextOrd();
+                  if (ordSets[ord] == null)
+                    ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                  long val = 0;
+                  if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
+                  ordSets[ord].add(val);
+                  matchIdx++;
+                }
               }
             }
           }
-        }
 
-        // Merge this segment's ordinal-indexed sets into the cross-segment String-keyed map
-        mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
+          // Merge this segment's ordinal-indexed sets into the cross-segment String-keyed map
+          mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
+        }
       }
     }
 

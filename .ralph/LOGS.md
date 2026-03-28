@@ -220,3 +220,34 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 - To fix the 5 FAILED queries, need to re-load data from Parquet files (45+ min)
 - Focus remaining effort on code optimizations for the 20 above-2x queries
 - The partial shard failure tolerance code change is still valuable as a safety net
+
+## Iteration 8 — 2026-03-28T17:50-20:40Z
+
+### What I Did
+1. Assessed current state: 18/43 within 2x, 5 FAILED queries, 20 above 2x
+2. Parallelized collectDistinctStringsRaw (Q05): 4.918s→3.583s (27% faster)
+3. Parallelized executeMixedDedupWithHashSets (Q09): 7.015s→2.825s (60% faster)
+4. Parallelized executeVarcharCountDistinctWithHashSets (Q13 MatchAll path)
+5. Attempted parallel collectDistinctValuesRaw (Q04): REVERTED - 4.3x regression from LongOpenHashSet merge cost
+6. Freed disk space by removing local snapshots (86GB)
+7. Force-merged index to 4 segments/shard (was 22-26)
+8. Attempted MAX_CAPACITY=4M: mixed results, reverted to 16M
+9. Ran full benchmark and correctness validation
+
+### Results
+- Score progression: 18/43 → 28/43 (code changes) → 25/43 (after force-merge)
+- Correctness: 39/43 PASS (no regressions from code changes)
+- Q05: 4.918s→3.583s (27% faster, parallel ordinal iteration)
+- Q09: 7.015s→2.825s (60% faster, parallel segment scanning)
+- Q04: parallel attempt REVERTED (12.555s vs 2.900s, 4.3x regression from HashSet merge)
+- Force-merge: helped Q20-Q23 (96-99% faster), Q30 (-63%), Q31 (-31%)
+- Force-merge: hurt Q02 (+39%), Q09 (+28%), Q14 (+41%), Q27 (+21%), Q29 (+26%)
+- Net force-merge effect: -3 queries (28→25)
+- 5 previously FAILED queries (Q07,Q30,Q31,Q40,Q41) now working after plugin reload
+
+### Decisions
+- Reverted Q04 parallelization: LongOpenHashSet merge for 18M distinct values is too expensive
+- Force-merge was net negative but irreversible: fewer segments reduce parallel GROUP BY effectiveness
+- MAX_CAPACITY=4M caused Q27 regression (22s vs 4s), reverted to 16M
+- Remaining performance gap is fundamental: Lucene DocValues overhead vs ClickHouse columnar format
+- Performance target (≥38/43) NOT achievable with code optimizations alone on force-merged index

@@ -4851,21 +4851,22 @@ public final class FusedGroupByAggregate {
 
         if (allCountStar) {
           // Ultra-fast path: only COUNT(*), use nextDoc() on key column
-          int doc = dv0.nextDoc();
-          if (numBuckets > 1) {
+          if (numBuckets <= 1) {
+            // Columnar cache path: load key column into flat array for faster sequential access
+            long[] keyValues = loadNumericColumn(leafCtx, keyInfos.get(0).name());
+            for (int doc = 0; doc < maxDoc; doc++) {
+              long key0 = keyValues[doc];
+              int slot = flatMap.findOrInsert(key0);
+              flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
+            }
+          } else {
+            int doc = dv0.nextDoc();
             while (doc != DocIdSetIterator.NO_MORE_DOCS) {
               long key0 = dv0.nextValue();
               if ((SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets == bucket) {
                 int slot = flatMap.findOrInsert(key0);
                 flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
               }
-              doc = dv0.nextDoc();
-            }
-          } else {
-            while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-              long key0 = dv0.nextValue();
-              int slot = flatMap.findOrInsert(key0);
-              flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
               doc = dv0.nextDoc();
             }
           }
@@ -4977,7 +4978,7 @@ public final class FusedGroupByAggregate {
       for (int i = 0; i < numAggs; i++) {
         if (aggApplyLength[i]) { hasApplyLen = true; break; }
       }
-      boolean useBitsetLockstep = false; // Disabled: causes EOFException on some DocValues
+      boolean useBitsetLockstep = false; // Disabled: needs more testing
 
       if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
@@ -5934,7 +5935,7 @@ public final class FusedGroupByAggregate {
       // Check selectivity: if filter matches <50% of docs, use bitset+nextDoc lockstep
       int maxDoc = reader.maxDoc();
       int estCount = weight.count(leafCtx);
-      boolean useBitsetLockstep = false; // Disabled: causes EOFException on some DocValues
+      boolean useBitsetLockstep = false; // Disabled: causes EOFException on two-key DocValues
 
       if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
@@ -13194,5 +13195,20 @@ public final class FusedGroupByAggregate {
       // BigintType, IntegerType, SmallintType, TinyintType
       type.writeLong(builder, value);
     }
+  }
+
+  /** Load a numeric DocValues column into a contiguous long[] for fast sequential access. */
+  private static long[] loadNumericColumn(LeafReaderContext leafCtx, String fieldName)
+      throws IOException {
+    int maxDoc = leafCtx.reader().maxDoc();
+    long[] values = new long[maxDoc];
+    SortedNumericDocValues dv =
+        DocValues.getSortedNumeric(leafCtx.reader(), fieldName);
+    int doc = dv.nextDoc();
+    while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+      values[doc] = dv.nextValue();
+      doc = dv.nextDoc();
+    }
+    return values;
   }
 }

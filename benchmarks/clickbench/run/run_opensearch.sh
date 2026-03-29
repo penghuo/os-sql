@@ -194,6 +194,14 @@ while IFS= read -r query; do
         TIMES=$(echo "$TIMES" | jq ". + [$TIME]")
     done
 
+    # Clear caches after each query to help GC reclaim memory from heavy queries
+    curl -sf -XPOST "${OS_URL}/_cache/clear" >/dev/null 2>&1 || true
+
+    # If any run failed, sleep briefly to let GC reclaim before next query
+    if echo "$TIMES" | jq -e 'any(. == null)' >/dev/null 2>&1; then
+        sleep 3
+    fi
+
     RESULTS=$(echo "$RESULTS" | jq ". + [$TIMES]")
 done < "$QUERY_FILE"
 

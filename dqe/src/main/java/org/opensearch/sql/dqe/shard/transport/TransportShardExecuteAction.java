@@ -2162,6 +2162,10 @@ public class TransportShardExecuteAction
                   [(int) Math.min(ordCount, 10_000_000)];
 
           if (isMatchAll) {
+            // Pre-load numeric column for O(1) array access
+            long[] numericValues = (numericDv != null)
+                ? FusedGroupByAggregate.loadNumericColumn(leafCtx, numericKeyName)
+                : null;
             // Sequential scan: iterate DocValues directly
             org.apache.lucene.index.SortedDocValues sdv =
                 org.apache.lucene.index.DocValues.unwrapSingleton(varcharDv);
@@ -2172,8 +2176,7 @@ public class TransportShardExecuteAction
                 int ord = sdv.ordValue();
                 if (ordSets[ord] == null)
                   ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
-                long val = 0;
-                if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+                long val = (numericValues != null) ? numericValues[doc] : 0;
                 ordSets[ord].add(val);
               }
             } else {
@@ -2183,8 +2186,7 @@ public class TransportShardExecuteAction
                 int ord = (int) varcharDv.nextOrd();
                 if (ordSets[ord] == null)
                   ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
-                long val = 0;
-                if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
+                long val = (numericValues != null) ? numericValues[doc] : 0;
                 ordSets[ord].add(val);
               }
             }
@@ -2235,7 +2237,7 @@ public class TransportShardExecuteAction
                 }
               }
             } else if (matchCount > 0) {
-              // Multi-valued path: use advanceExact for remaining unmatched docs
+              // Multi-valued path
               int matchIdx = 0;
               int dvDoc;
               while ((dvDoc = varcharDv.nextDoc())

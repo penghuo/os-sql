@@ -20,6 +20,7 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -3241,7 +3242,7 @@ public final class FusedGroupByAggregate {
     // This is critical for high-cardinality GROUP BY (Q16: ~25K groups per shard).
     if (canUseFlatAccumulators) {
       // Estimate number of docs to decide if hash-partitioned aggregation is needed.
-      // When numGroups could exceed MAX_CAPACITY (8M), partition the key space into
+      // When numGroups could exceed MAX_CAPACITY, partition the key space into
       // multiple buckets and execute sequential passes, each aggregating only one bucket.
       int numBuckets;
       try (org.opensearch.index.engine.Engine.Searcher estSearcher =
@@ -4048,7 +4049,7 @@ public final class FusedGroupByAggregate {
       int[] heap = new int[n];
       int heapSize = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (!flatMap.occupied[slot]) continue;
+        if (flatMap.keys[slot] == FlatSingleKeyMap.EMPTY_KEY) continue;
         long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
         if (heapSize < n) {
           heap[heapSize] = slot;
@@ -4103,14 +4104,14 @@ public final class FusedGroupByAggregate {
       outputSlots = new int[n];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     } else {
       outputSlots = new int[flatMap.size];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -4482,7 +4483,72 @@ public final class FusedGroupByAggregate {
           !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
 
       if (canParallelize) {
-        // Parallel path: partition segments across workers, each with own FlatSingleKeyMap
+        // Check if doc-range parallelism applies: COUNT(*)-only, matchAll, no bucketing
+        boolean allCountStar = true;
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i]) { allCountStar = false; break; }
+        }
+
+        if (allCountStar && isMatchAll && numBuckets <= 1) {
+          // Doc-range parallel path: load columnar cache per segment, split doc ranges
+          // across THREADS_PER_SHARD workers for better cache locality on large segments.
+          java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
+          java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
+
+          // Load key columns and compute total docs
+          long totalDocs = 0;
+          for (LeafReaderContext leafCtx : leaves) {
+            long[] keyValues = loadNumericColumn(leafCtx, keyInfos.get(0).name());
+            segKeyArrays.add(keyValues);
+            segLiveDocs.add(leafCtx.reader().getLiveDocs());
+            totalDocs += keyValues.length;
+          }
+
+          // Build work units: split each segment's doc range into chunks
+          int numWorkers = THREADS_PER_SHARD;
+          long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
+          // Work units: (segIndex, startDoc, endDoc)
+          java.util.List<int[]> workUnits = new java.util.ArrayList<>();
+          for (int s = 0; s < leaves.size(); s++) {
+            int maxDoc = segKeyArrays.get(s).length;
+            if (maxDoc == 0) continue;
+            // Split this segment into chunks of ~docsPerWorker
+            for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
+              int end = (int) Math.min(start + docsPerWorker, maxDoc);
+              workUnits.add(new int[]{s, start, end});
+            }
+          }
+
+          int actualWorkers = workUnits.size();
+          @SuppressWarnings("unchecked")
+          java.util.concurrent.CompletableFuture<FlatSingleKeyMap>[] futures =
+              new java.util.concurrent.CompletableFuture[actualWorkers];
+
+          for (int w = 0; w < actualWorkers; w++) {
+            final int[] unit = workUnits.get(w);
+            final long[] keyValues = segKeyArrays.get(unit[0]);
+            final Bits liveDocs = segLiveDocs.get(unit[0]);
+            final int startDoc = unit[1];
+            final int endDoc = unit[2];
+            futures[w] =
+                java.util.concurrent.CompletableFuture.supplyAsync(
+                    () -> {
+                      FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup);
+                      scanDocRangeFlatSingleKeyCountStar(
+                          keyValues, startDoc, endDoc, liveDocs,
+                          localMap, accOffset[0], slotsPerGroup);
+                      return localMap;
+                    },
+                    PARALLEL_POOL);
+          }
+
+          java.util.concurrent.CompletableFuture.allOf(futures).join();
+          for (var future : futures) {
+            FlatSingleKeyMap workerMap = future.join();
+            if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+          }
+        } else {
+        // Segment-parallel path: partition segments across workers, each with own FlatSingleKeyMap
         int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
         @SuppressWarnings("unchecked")
         java.util.List<LeafReaderContext>[] workerSegments = new java.util.List[numWorkers];
@@ -4542,6 +4608,7 @@ public final class FusedGroupByAggregate {
           FlatSingleKeyMap workerMap = future.join();
           if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
         }
+        } // end segment-parallel else
       } else {
         // Sequential path: single FlatSingleKeyMap for all segments
         Weight weight = null;
@@ -4575,7 +4642,7 @@ public final class FusedGroupByAggregate {
       int[] heap = new int[n];
       int heapSize = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (!flatMap.occupied[slot]) continue;
+        if (flatMap.keys[slot] == FlatSingleKeyMap.EMPTY_KEY) continue;
         long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
         if (heapSize < n) {
           heap[heapSize] = slot;
@@ -4630,14 +4697,14 @@ public final class FusedGroupByAggregate {
       outputSlots = new int[n];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     } else {
       outputSlots = new int[flatMap.size];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -5041,71 +5108,16 @@ public final class FusedGroupByAggregate {
       for (int i = 0; i < numAggs; i++) {
         if (aggApplyLength[i]) { hasApplyLen = true; break; }
       }
-      boolean useBitsetLockstep = false; // Disabled: needs more testing
-
-      if (useBitsetLockstep) {
-        // Collect matching doc IDs into bitset
-        FixedBitSet matchingDocs = new FixedBitSet(maxDoc);
-        DocIdSetIterator disi = scorer.iterator();
-        for (int d = disi.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = disi.nextDoc()) {
-          matchingDocs.set(d);
-        }
-        boolean allAggDense = true;
-        for (int i = 0; i < numAggs; i++) {
-          if (!isCountStar[i] && numericAggDvs[i] == null) { allAggDense = false; break; }
-        }
-        if (allAggDense) {
-          int keyDoc = dv0.nextDoc();
-          int[] aggDocPos = new int[numAggs];
-          for (int i = 0; i < numAggs; i++) {
-            aggDocPos[i] = isCountStar[i] ? DocIdSetIterator.NO_MORE_DOCS : numericAggDvs[i].nextDoc();
-          }
-          for (int doc = matchingDocs.nextSetBit(0); doc >= 0;
-              doc = matchingDocs.nextSetBit(doc + 1)) {
-            while (keyDoc != DocIdSetIterator.NO_MORE_DOCS && keyDoc < doc) { keyDoc = dv0.nextDoc(); }
-            long key0 = 0;
-            if (keyDoc == doc) { key0 = dv0.nextValue(); keyDoc = dv0.nextDoc(); }
-            if (numBuckets > 1
-                && (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets != bucket) {
-              continue;
-            }
-            int slot = flatMap.findOrInsert(key0);
-            int base = slot * slotsPerGroup;
-            for (int i = 0; i < numAggs; i++) {
-              int off = base + accOffset[i];
-              if (isCountStar[i]) { flatMap.accData[off]++; continue; }
-              while (aggDocPos[i] != DocIdSetIterator.NO_MORE_DOCS && aggDocPos[i] < doc) {
-                aggDocPos[i] = numericAggDvs[i].nextDoc();
-              }
-              if (aggDocPos[i] == doc) {
-                long rawVal = numericAggDvs[i].nextValue();
-                aggDocPos[i] = numericAggDvs[i].nextDoc();
-                switch (accType[i]) {
-                  case 0: flatMap.accData[off]++; break;
-                  case 1: flatMap.accData[off] += rawVal; break;
-                  case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
-                }
-              }
-            }
-          }
-        } else {
-          for (int doc = matchingDocs.nextSetBit(0); doc >= 0;
-              doc = matchingDocs.nextSetBit(doc + 1)) {
-            collectFlatSingleKeyDocWithLength(
-                doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
-                accType, accOffset, numericAggDvs, lengthVarcharDvs,
-                ordLengthMaps, aggApplyLength, bucket, numBuckets);
-          }
-        }
-      } else {
-        DocIdSetIterator docIt = scorer.iterator();
-        int doc;
-        while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-          collectFlatSingleKeyDocWithLength(
-              doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
-              accType, accOffset, numericAggDvs, lengthVarcharDvs,
-              ordLengthMaps, aggApplyLength, bucket, numBuckets);
-        }
+      // For filtered queries, use simple per-doc iteration with advanceExact.
+      // Columnar cache (loadNumericColumn) is counterproductive here because it loads
+      // the full column even when the filter matches a small fraction of docs.
+      DocIdSetIterator docIt = scorer.iterator();
+      int doc;
+      while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        collectFlatSingleKeyDocWithLength(
+            doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+            accType, accOffset, numericAggDvs, lengthVarcharDvs,
+            ordLengthMaps, aggApplyLength, bucket, numBuckets);
       }
     }
   }
@@ -5203,8 +5215,7 @@ public final class FusedGroupByAggregate {
     // === Flat accumulator path for two-key numeric ===
     if (canUseFlatAccumulators) {
       // Estimate number of docs to decide if hash-partitioned aggregation is needed.
-      // When numGroups could exceed MAX_CAPACITY (8M), partition the key space into
-      // multiple buckets and execute sequential passes, each aggregating only one bucket.
+      // Using totalDocs as upper bound for unique groups (conservative but safe).
       int numBuckets;
       try (org.opensearch.index.engine.Engine.Searcher estSearcher =
           shard.acquireSearcher("dqe-fused-groupby-estimate")) {
@@ -6000,7 +6011,17 @@ public final class FusedGroupByAggregate {
       int estCount = weight.count(leafCtx);
       boolean useBitsetLockstep = false; // Disabled: causes EOFException on two-key DocValues
 
-      if (useBitsetLockstep) {
+      // Columnar cache is counterproductive for filtered queries (loads full column
+      // even when filter matches a small fraction). Use simple per-doc iteration.
+      if (!hasDvDuplicates && numBuckets <= 1) {
+        DocIdSetIterator docIt = scorer.iterator();
+        int doc;
+        while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+          collectFlatTwoKeyDoc(
+              doc, dv0, dv1, flatMap, slotsPerGroup, numAggs, isCountStar,
+              accType, accOffset, numericAggDvs, bucket, numBuckets);
+        }
+      } else if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
         FixedBitSet matchingDocs = new FixedBitSet(maxDoc);
         DocIdSetIterator disi = scorer.iterator();
@@ -12525,9 +12546,9 @@ public final class FusedGroupByAggregate {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
     private static final int MAX_CAPACITY = 16_000_000;
+    static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys;
-    boolean[] occupied;
     long[] accData; // contiguous: slot i's data at [i*slotsPerGroup .. (i+1)*slotsPerGroup)
     int size;
     int capacity;
@@ -12538,7 +12559,7 @@ public final class FusedGroupByAggregate {
       this.slotsPerGroup = slotsPerGroup;
       this.capacity = INITIAL_CAPACITY;
       this.keys = new long[capacity];
-      this.occupied = new boolean[capacity];
+      Arrays.fill(keys, EMPTY_KEY);
       this.accData = new long[capacity * slotsPerGroup];
       this.size = 0;
       this.threshold = (int) (capacity * LOAD_FACTOR);
@@ -12551,7 +12572,7 @@ public final class FusedGroupByAggregate {
     int findOrInsert(long key) {
       int mask = capacity - 1;
       int h = SingleKeyHashMap.hash1(key) & mask;
-      while (occupied[h]) {
+      while (keys[h] != EMPTY_KEY) {
         if (keys[h] == key) {
           return h;
         }
@@ -12559,7 +12580,6 @@ public final class FusedGroupByAggregate {
       }
       // New entry
       keys[h] = key;
-      occupied[h] = true;
       // accData[h*slotsPerGroup..] is already 0 from array init
       size++;
       if (size > threshold) {
@@ -12572,7 +12592,7 @@ public final class FusedGroupByAggregate {
     private int findExisting(long key) {
       int mask = capacity - 1;
       int h = SingleKeyHashMap.hash1(key) & mask;
-      while (occupied[h]) {
+      while (keys[h] != EMPTY_KEY) {
         if (keys[h] == key) return h;
         h = (h + 1) & mask;
       }
@@ -12591,20 +12611,18 @@ public final class FusedGroupByAggregate {
       }
       int newCap = capacity * 2;
       long[] nk = new long[newCap];
-      boolean[] nocc = new boolean[newCap];
+      Arrays.fill(nk, EMPTY_KEY);
       long[] nacc = new long[newCap * slotsPerGroup];
       int nm = newCap - 1;
       for (int s = 0; s < capacity; s++) {
-        if (occupied[s]) {
+        if (keys[s] != EMPTY_KEY) {
           int nh = SingleKeyHashMap.hash1(keys[s]) & nm;
-          while (nocc[nh]) nh = (nh + 1) & nm;
+          while (nk[nh] != EMPTY_KEY) nh = (nh + 1) & nm;
           nk[nh] = keys[s];
-          nocc[nh] = true;
           System.arraycopy(accData, s * slotsPerGroup, nacc, nh * slotsPerGroup, slotsPerGroup);
         }
       }
       this.keys = nk;
-      this.occupied = nocc;
       this.accData = nacc;
       this.capacity = newCap;
       this.threshold = (int) (newCap * LOAD_FACTOR);
@@ -12613,7 +12631,7 @@ public final class FusedGroupByAggregate {
     /** Merge all entries from another FlatSingleKeyMap into this one, adding accData element-wise. */
     void mergeFrom(FlatSingleKeyMap other) {
       for (int s = 0; s < other.capacity; s++) {
-        if (!other.occupied[s]) continue;
+        if (other.keys[s] == EMPTY_KEY) continue;
         int slot = findOrInsert(other.keys[s]);
         int dstBase = slot * slotsPerGroup;
         int srcBase = s * other.slotsPerGroup;
@@ -13260,8 +13278,29 @@ public final class FusedGroupByAggregate {
     }
   }
 
+  /**
+   * Scan a doc range [startDoc, endDoc) of a pre-loaded key column for COUNT(*) aggregation.
+   * Used by the doc-range parallel path to split a single segment across multiple workers.
+   */
+  private static void scanDocRangeFlatSingleKeyCountStar(
+      long[] keyValues, int startDoc, int endDoc, Bits liveDocs,
+      FlatSingleKeyMap flatMap, int accOffset0, int slotsPerGroup) {
+    if (liveDocs == null) {
+      for (int doc = startDoc; doc < endDoc; doc++) {
+        int slot = flatMap.findOrInsert(keyValues[doc]);
+        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      }
+    } else {
+      for (int doc = startDoc; doc < endDoc; doc++) {
+        if (!liveDocs.get(doc)) continue;
+        int slot = flatMap.findOrInsert(keyValues[doc]);
+        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      }
+    }
+  }
+
   /** Load a numeric DocValues column into a contiguous long[] for fast sequential access. */
-  private static long[] loadNumericColumn(LeafReaderContext leafCtx, String fieldName)
+  public static long[] loadNumericColumn(LeafReaderContext leafCtx, String fieldName)
       throws IOException {
     int maxDoc = leafCtx.reader().maxDoc();
     long[] values = new long[maxDoc];

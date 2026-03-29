@@ -448,3 +448,43 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. **MAX_CAPACITY increase REJECTED**: Larger maps cause cache thrashing. 16M is the right size for L3 cache.
 4. **Parallel multi-bucket ESSENTIAL**: Must keep parallel bucket execution — sequential is 1.6x slower.
 5. **Performance target (≥38/43) NOT achievable**: 12 iterations of optimization have exhausted code-level improvements. Remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar). Need architectural changes or more CPU (m5.8xlarge with 32 vCPU).
+
+## Iteration 14 — 2026-03-29T18:35-20:15Z
+
+### What I Did
+1. Assessed current state: wukong branch, clean working tree, build compiles, 25/43 within 2x
+2. Ran fresh full benchmark: confirmed 25/43 within 2x (same as iteration 13)
+3. Exhaustively analyzed all 6 handover optimization steps:
+   - Step 1 (COUNT(DISTINCT) fusion): All 7 dispatch paths already exist. Q04/Q05/Q08/Q09/Q13 all hit dedicated fused paths. Q11 was the only one falling through to generic path.
+   - Step 2 (Parallelize executeSingleKeyNumericFlat): Already parallelized across buckets and segments.
+   - Step 3 (Hash-partitioned aggregation): Already implemented with FlatSingleKeyMap + numBuckets.
+   - Step 4 (Borderline queries): All hit optimized fused paths. Bottleneck is Lucene DocValues overhead.
+4. Traced execution paths for Q02, Q14, Q27, Q29, Q30, Q35, Q39 through the full dispatch chain
+5. Identified Q11 optimization opportunity: 3-key mixed-type (numeric+varchar+numeric) COUNT(DISTINCT) falls through N-key path because allNumeric=false
+6. Implemented mixed-type N-key COUNT(DISTINCT) path:
+   - New dispatch branch after allNumeric check (line ~335)
+   - New ObjectArrayKey composite key class
+   - New executeMixedTypeCountDistinctWithHashSets method with parallel segment scanning
+   - Ordinal-based grouping within segments (avoids per-doc String allocation)
+   - Cross-segment merge via resolved String keys
+7. Reloaded plugin, verified correctness (39/43 PASS, no regression)
+8. Benchmarked Q11: 3.123s → 1.714s (12.53x → 6.40x)
+9. Ran full benchmark: 25/43 within 2x (no query crossed 2x threshold)
+
+### Results
+- Score: 25/43 within 2x (unchanged — Q11 improved but still above 2x)
+- Correctness: 39/43 PASS (no regression)
+- Q11: 3.123s → 1.714s (12.53x → 6.40x, 45% improvement)
+- Q29: 0.199s (2.07x, gap=7ms — within noise of 2x)
+- All other queries: no significant change
+- DQE timing breakdown (from OpenSearch logs):
+  - Q14: parse=0ms, shard=1825-2293ms, merge=0-1ms (100% shard time)
+  - Q27: parse=0ms, shard=4729ms, merge=3ms (100% shard time)
+  - Q02: parse=0ms, shard=326ms, merge=0ms (100% shard time)
+
+### Decisions
+1. **Mixed-type COUNT(DISTINCT) path IMPLEMENTED**: Handles Q11 pattern (numeric+varchar GROUP BY keys with numeric dedup key). Uses ordinal-based grouping within segments for efficiency.
+2. **All handover optimization steps already implemented**: 13 previous iterations have exhausted code-level optimizations. The remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar format).
+3. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: Need m5.8xlarge (32 vCPU) or architectural changes (columnar storage, vectorized execution).
+4. **Borderline queries (Q14, Q27, Q29, Q30) are within measurement noise of 2x**: Q29 at 2.07x with 7ms gap could flip on a good run. Q14 ranges 1.7-2.5s across runs.
+5. **No further code optimizations identified**: Every query above 2x hits an optimized fused path. The bottleneck is per-doc DocValues decode overhead (~15-20ns vs ClickHouse's ~2-5ns per value).

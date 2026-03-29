@@ -417,3 +417,34 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. Near-MatchAll bitset lockstep KEPT: for filters matching >90% of docs, collect into bitset and use MatchAll-style lockstep
 4. Performance target (≥38/43) NOT achievable with code optimizations alone — fundamental Lucene DV overhead
 5. Borderline queries (Q14, Q27, Q29, Q30) are within measurement noise of 2x threshold
+
+## Iteration 13 — 2026-03-29T16:07-18:32Z
+
+### What I Did
+1. Assessed environment: r5.4xlarge (16 vCPU, 124GB RAM), 48GB heap, OpenSearch green, 100M docs
+2. Ran fresh baseline benchmark: 25/43 within 2x (consistent with iteration 12)
+3. Analyzed all 18 above-2x queries — categorized by achievability
+4. Explored COUNT(DISTINCT) dispatch — fusion already exists with 4 specialized methods
+5. Attempted MAX_CAPACITY=32M for FlatSingleKeyMap — Q15 regressed 17s→67s (cache thrashing)
+6. Attempted single-pass numBuckets=1 — same cache thrashing issue
+7. Implemented cardinality sampling for numBuckets estimation — Q27 improved 4.2s→1.7s (0.93x!) but Q15 regressed 17s→78s (page cache eviction from sampling I/O)
+8. Attempted single-pass multi-bucket (executeSingleKeyNumericFlatMultiBucket) — Q15 137-148s, Q27 31.6s (catastrophic cache thrashing)
+9. Discovered that removing parallel multi-bucket caused Q15 regression 17s→27s — restored it
+10. Reverted all experimental changes, kept only sentinel optimization + LongOpenHashSet pre-sizing from iteration 12
+11. Ran full benchmark: 25/43 within 2x (no change)
+12. Ran correctness: 39/43 PASS (no regression)
+
+### Results
+- Score: 25/43 within 2x (unchanged)
+- Correctness: 39/43 PASS (unchanged)
+- Q27 cardinality sampling: 4.2s → 1.7s (0.93x) — WORKS but causes Q15 regression
+- Q15 MAX_CAPACITY=32M: 17s → 67s — FAILED (cache thrashing)
+- Q15 single-pass multi-bucket: 17s → 137s — FAILED (cache thrashing)
+- Q15 sequential multi-bucket: 17s → 27s — FAILED (lost parallelism)
+
+### Decisions
+1. **Cardinality sampling REVERTED**: Helps Q27 dramatically but causes Q15 regression via page cache eviction. Need a way to estimate cardinality without I/O.
+2. **Single-pass multi-bucket REJECTED**: Cache thrashing from all bucket maps in memory simultaneously. Sequential per-bucket with parallel execution is the right approach.
+3. **MAX_CAPACITY increase REJECTED**: Larger maps cause cache thrashing. 16M is the right size for L3 cache.
+4. **Parallel multi-bucket ESSENTIAL**: Must keep parallel bucket execution — sequential is 1.6x slower.
+5. **Performance target (≥38/43) NOT achievable**: 12 iterations of optimization have exhausted code-level improvements. Remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar). Need architectural changes or more CPU (m5.8xlarge with 32 vCPU).

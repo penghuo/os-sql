@@ -3242,6 +3242,7 @@ public final class FusedGroupByAggregate {
     // This is critical for high-cardinality GROUP BY (Q16: ~25K groups per shard).
     if (canUseFlatAccumulators) {
       // Estimate number of docs to decide if hash-partitioned aggregation is needed.
+      // Estimate number of docs to decide if hash-partitioned aggregation is needed.
       // When numGroups could exceed MAX_CAPACITY, partition the key space into
       // multiple buckets and execute sequential passes, each aggregating only one bucket.
       int numBuckets;
@@ -6217,7 +6218,7 @@ public final class FusedGroupByAggregate {
       int heapSize = 0;
 
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (!flatMap.occupied[slot]) continue;
+        if (flatMap.keys0[slot] == FlatTwoKeyMap.EMPTY_KEY) continue;
         long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
         if (heapSize < n) {
           heap[heapSize] = slot;
@@ -6276,14 +6277,14 @@ public final class FusedGroupByAggregate {
       outputSlots = new int[n];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys0[slot] != FlatTwoKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     } else {
       outputSlots = new int[flatMap.size];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys0[slot] != FlatTwoKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -8082,7 +8083,7 @@ public final class FusedGroupByAggregate {
                     long[] knownK0 = new long[numGroups];
                     int k0Count = 0;
                     for (int s = 0; s < flatMap.capacity; s++) {
-                      if (flatMap.occupied[s]) {
+                      if (flatMap.keys0[s] != FlatTwoKeyMap.EMPTY_KEY) {
                         // Deduplicate k0 values
                         long v = flatMap.keys0[s];
                         boolean found = false;
@@ -8536,7 +8537,7 @@ public final class FusedGroupByAggregate {
             int heapSize = 0;
 
             for (int slot = 0; slot < flatMap.capacity; slot++) {
-              if (!flatMap.occupied[slot]) continue;
+              if (flatMap.keys0[slot] == FlatTwoKeyMap.EMPTY_KEY) continue;
               long val = flatMap.accData[slot * flatSlotsPerGroup + sortAccOff];
               if (heapSize < n) {
                 heap[heapSize] = slot;
@@ -8622,7 +8623,7 @@ public final class FusedGroupByAggregate {
             outputSlots = new int[n];
             int idx = 0;
             for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-              if (flatMap.occupied[slot]) {
+              if (flatMap.keys0[slot] != FlatTwoKeyMap.EMPTY_KEY) {
                 outputSlots[idx++] = slot;
               }
             }
@@ -8632,7 +8633,7 @@ public final class FusedGroupByAggregate {
             outputSlots = new int[flatMap.size];
             int idx = 0;
             for (int slot = 0; slot < flatMap.capacity; slot++) {
-              if (flatMap.occupied[slot]) {
+              if (flatMap.keys0[slot] != FlatTwoKeyMap.EMPTY_KEY) {
                 outputSlots[idx++] = slot;
               }
             }
@@ -9672,7 +9673,7 @@ public final class FusedGroupByAggregate {
       int heapSize = 0;
 
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (!flatMap.occupied[slot]) continue;
+        if (flatMap.keys0[slot] == FlatThreeKeyMap.EMPTY_KEY) continue;
         long val = flatMap.accData[slot * flatSlotsPerGroup + sortAccOff];
         if (heapSize < n) {
           heap[heapSize] = slot;
@@ -9744,14 +9745,14 @@ public final class FusedGroupByAggregate {
       outputSlots = new int[n];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys0[slot] != FlatThreeKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     } else {
       outputSlots = new int[flatMap.size];
       int idx = 0;
       for (int slot = 0; slot < flatMap.capacity; slot++) {
-        if (flatMap.occupied[slot]) outputSlots[idx++] = slot;
+        if (flatMap.keys0[slot] != FlatThreeKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -11850,7 +11851,7 @@ public final class FusedGroupByAggregate {
 
       int written = 0;
       for (int slot = 0; slot < flatMap.capacity && written < outputCountEarly; slot++) {
-        if (!flatMap.occupied[slot]) continue;
+        if (flatMap.keys0[slot] == FlatTwoKeyMap.EMPTY_KEY) continue;
         long numericKey = flatMap.keys0[slot];
         long gOrd = flatMap.keys1[slot];
         int base = slot * flatSlotsPerGroup;
@@ -12059,7 +12060,7 @@ public final class FusedGroupByAggregate {
     for (int w = 1; w < numWorkers; w++) {
       FlatTwoKeyMap other = workerMaps[w];
       for (int slot = 0; slot < other.capacity; slot++) {
-        if (!other.occupied[slot]) continue;
+        if (other.keys0[slot] == FlatTwoKeyMap.EMPTY_KEY) continue;
         int mSlot = merged.findOrInsert(other.keys0[slot], other.keys1[slot]);
         int mBase = mSlot * flatSlotsPerGroup;
         int oBase = slot * flatSlotsPerGroup;
@@ -12086,7 +12087,7 @@ public final class FusedGroupByAggregate {
       int heapSize = 0;
       int sai = flatAccOffset[sortAggIndex];
       for (int slot = 0; slot < merged.capacity; slot++) {
-        if (!merged.occupied[slot]) continue;
+        if (merged.keys0[slot] == FlatTwoKeyMap.EMPTY_KEY) continue;
         long val = merged.accData[slot * flatSlotsPerGroup + sai];
         if (heapSize < n) {
           heapSlots[heapSize++] = slot;
@@ -12160,7 +12161,7 @@ public final class FusedGroupByAggregate {
       outputSlots = new int[merged.size];
       int idx = 0;
       for (int slot = 0; slot < merged.capacity; slot++) {
-        if (merged.occupied[slot]) outputSlots[idx++] = slot;
+        if (merged.keys0[slot] != FlatTwoKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
       }
       outputCount = idx;
     }
@@ -12850,10 +12851,10 @@ public final class FusedGroupByAggregate {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
     private static final int MAX_CAPACITY = 16_000_000;
+    static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys0;
     long[] keys1;
-    boolean[] occupied;
     long[] accData; // contiguous: slot i's data at [i*slotsPerGroup .. (i+1)*slotsPerGroup)
     int size;
     int capacity;
@@ -12864,8 +12865,8 @@ public final class FusedGroupByAggregate {
       this.slotsPerGroup = slotsPerGroup;
       this.capacity = INITIAL_CAPACITY;
       this.keys0 = new long[capacity];
+      Arrays.fill(keys0, EMPTY_KEY);
       this.keys1 = new long[capacity];
-      this.occupied = new boolean[capacity];
       this.accData = new long[capacity * slotsPerGroup];
       this.size = 0;
       this.threshold = (int) (capacity * LOAD_FACTOR);
@@ -12880,7 +12881,7 @@ public final class FusedGroupByAggregate {
     int findOrInsert(long key0, long key1) {
       int mask = capacity - 1;
       int h = TwoKeyHashMap.hash2(key0, key1) & mask;
-      while (occupied[h]) {
+      while (keys0[h] != EMPTY_KEY) {
         if (keys0[h] == key0 && keys1[h] == key1) {
           return h;
         }
@@ -12889,7 +12890,6 @@ public final class FusedGroupByAggregate {
       // New entry
       keys0[h] = key0;
       keys1[h] = key1;
-      occupied[h] = true;
       // accData[h*slotsPerGroup..] is already 0 from array init
       size++;
       if (size > threshold) {
@@ -12911,7 +12911,7 @@ public final class FusedGroupByAggregate {
     int findOrInsertCapped(long key0, long key1, int cap) {
       int mask = capacity - 1;
       int h = TwoKeyHashMap.hash2(key0, key1) & mask;
-      while (occupied[h]) {
+      while (keys0[h] != EMPTY_KEY) {
         if (keys0[h] == key0 && keys1[h] == key1) {
           return h;
         }
@@ -12923,7 +12923,6 @@ public final class FusedGroupByAggregate {
       }
       keys0[h] = key0;
       keys1[h] = key1;
-      occupied[h] = true;
       size++;
       if (size > threshold) {
         resize();
@@ -12935,7 +12934,7 @@ public final class FusedGroupByAggregate {
     private int findExisting(long key0, long key1) {
       int mask = capacity - 1;
       int h = TwoKeyHashMap.hash2(key0, key1) & mask;
-      while (occupied[h]) {
+      while (keys0[h] != EMPTY_KEY) {
         if (keys0[h] == key0 && keys1[h] == key1) return h;
         h = (h + 1) & mask;
       }
@@ -12954,23 +12953,21 @@ public final class FusedGroupByAggregate {
       }
       int newCap = capacity * 2;
       long[] nk0 = new long[newCap];
+      Arrays.fill(nk0, EMPTY_KEY);
       long[] nk1 = new long[newCap];
-      boolean[] nocc = new boolean[newCap];
       long[] nacc = new long[newCap * slotsPerGroup];
       int nm = newCap - 1;
       for (int s = 0; s < capacity; s++) {
-        if (occupied[s]) {
+        if (keys0[s] != EMPTY_KEY) {
           int nh = TwoKeyHashMap.hash2(keys0[s], keys1[s]) & nm;
-          while (nocc[nh]) nh = (nh + 1) & nm;
+          while (nk0[nh] != EMPTY_KEY) nh = (nh + 1) & nm;
           nk0[nh] = keys0[s];
           nk1[nh] = keys1[s];
-          nocc[nh] = true;
           System.arraycopy(accData, s * slotsPerGroup, nacc, nh * slotsPerGroup, slotsPerGroup);
         }
       }
       this.keys0 = nk0;
       this.keys1 = nk1;
-      this.occupied = nocc;
       this.accData = nacc;
       this.capacity = newCap;
       this.threshold = (int) (newCap * LOAD_FACTOR);
@@ -12979,7 +12976,7 @@ public final class FusedGroupByAggregate {
     /** Merge all entries from another FlatTwoKeyMap into this one, summing accumulator slots. */
     void mergeFrom(FlatTwoKeyMap other) {
       for (int s = 0; s < other.capacity; s++) {
-        if (!other.occupied[s]) continue;
+        if (other.keys0[s] == EMPTY_KEY) continue;
         int slot = findOrInsert(other.keys0[s], other.keys1[s]);
         int dstBase = slot * slotsPerGroup;
         int srcBase = s * other.slotsPerGroup;
@@ -13000,11 +12997,11 @@ public final class FusedGroupByAggregate {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
     private static final int MAX_CAPACITY = 16_000_000;
+    static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys0;
     long[] keys1;
     long[] keys2;
-    boolean[] occupied;
     long[] accData;
     int size;
     int capacity;
@@ -13015,9 +13012,9 @@ public final class FusedGroupByAggregate {
       this.slotsPerGroup = slotsPerGroup;
       this.capacity = INITIAL_CAPACITY;
       this.keys0 = new long[capacity];
+      Arrays.fill(keys0, EMPTY_KEY);
       this.keys1 = new long[capacity];
       this.keys2 = new long[capacity];
-      this.occupied = new boolean[capacity];
       this.accData = new long[capacity * slotsPerGroup];
       this.size = 0;
       this.threshold = (int) (capacity * LOAD_FACTOR);
@@ -13035,7 +13032,7 @@ public final class FusedGroupByAggregate {
     int findOrInsert(long key0, long key1, long key2) {
       int mask = capacity - 1;
       int h = hash3(key0, key1, key2) & mask;
-      while (occupied[h]) {
+      while (keys0[h] != EMPTY_KEY) {
         if (keys0[h] == key0 && keys1[h] == key1 && keys2[h] == key2) {
           return h;
         }
@@ -13044,7 +13041,6 @@ public final class FusedGroupByAggregate {
       keys0[h] = key0;
       keys1[h] = key1;
       keys2[h] = key2;
-      occupied[h] = true;
       size++;
       if (size > threshold) {
         resize();
@@ -13056,7 +13052,7 @@ public final class FusedGroupByAggregate {
     private int findExisting(long key0, long key1, long key2) {
       int mask = capacity - 1;
       int h = hash3(key0, key1, key2) & mask;
-      while (occupied[h]) {
+      while (keys0[h] != EMPTY_KEY) {
         if (keys0[h] == key0 && keys1[h] == key1 && keys2[h] == key2) return h;
         h = (h + 1) & mask;
       }
@@ -13075,26 +13071,24 @@ public final class FusedGroupByAggregate {
       }
       int newCap = capacity * 2;
       long[] nk0 = new long[newCap];
+      Arrays.fill(nk0, EMPTY_KEY);
       long[] nk1 = new long[newCap];
       long[] nk2 = new long[newCap];
-      boolean[] nocc = new boolean[newCap];
       long[] nacc = new long[newCap * slotsPerGroup];
       int nm = newCap - 1;
       for (int s = 0; s < capacity; s++) {
-        if (occupied[s]) {
+        if (keys0[s] != EMPTY_KEY) {
           int nh = hash3(keys0[s], keys1[s], keys2[s]) & nm;
-          while (nocc[nh]) nh = (nh + 1) & nm;
+          while (nk0[nh] != EMPTY_KEY) nh = (nh + 1) & nm;
           nk0[nh] = keys0[s];
           nk1[nh] = keys1[s];
           nk2[nh] = keys2[s];
-          nocc[nh] = true;
           System.arraycopy(accData, s * slotsPerGroup, nacc, nh * slotsPerGroup, slotsPerGroup);
         }
       }
       this.keys0 = nk0;
       this.keys1 = nk1;
       this.keys2 = nk2;
-      this.occupied = nocc;
       this.accData = nacc;
       this.capacity = newCap;
       this.threshold = (int) (newCap * LOAD_FACTOR);
@@ -13103,7 +13097,7 @@ public final class FusedGroupByAggregate {
     /** Merge all entries from another FlatThreeKeyMap into this one, summing accumulator slots. */
     void mergeFrom(FlatThreeKeyMap other) {
       for (int s = 0; s < other.capacity; s++) {
-        if (!other.occupied[s]) continue;
+        if (other.keys0[s] == EMPTY_KEY) continue;
         int slot = findOrInsert(other.keys0[s], other.keys1[s], other.keys2[s]);
         int dstBase = slot * slotsPerGroup;
         int srcBase = s * other.slotsPerGroup;

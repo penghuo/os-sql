@@ -1413,10 +1413,16 @@ public final class FusedScanAggregate {
    */
   public static List<Page> executeDistinctValues(String columnName, IndexShard shard, Query query)
       throws Exception {
-    LongOpenHashSet distinctSet = new LongOpenHashSet();
+    LongOpenHashSet distinctSet;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values")) {
+      // Pre-size based on maxDoc to avoid resize storms for high-cardinality columns
+      int totalDocs = engineSearcher.getIndexReader().maxDoc();
+      distinctSet =
+          totalDocs > 0
+              ? new LongOpenHashSet(Math.min(totalDocs, 32_000_000))
+              : new LongOpenHashSet();
       if (query instanceof MatchAllDocsQuery) {
         // Fast path: iterate all docs directly
         for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
@@ -1504,10 +1510,16 @@ public final class FusedScanAggregate {
    */
   public static LongOpenHashSet collectDistinctValuesRaw(
       String columnName, IndexShard shard, Query query) throws Exception {
-    LongOpenHashSet distinctSet = new LongOpenHashSet();
+    LongOpenHashSet distinctSet;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values-raw")) {
+      // Pre-size based on maxDoc to avoid resize storms for high-cardinality columns
+      int totalDocs = engineSearcher.getIndexReader().maxDoc();
+      distinctSet =
+          totalDocs > 0
+              ? new LongOpenHashSet(Math.min(totalDocs, 32_000_000))
+              : new LongOpenHashSet();
       if (query instanceof MatchAllDocsQuery) {
         // Sequential scan using nextDoc() for dense columns — avoids binary search overhead
         // of advanceExact(). For high-cardinality columns like UserID (~18M distinct),

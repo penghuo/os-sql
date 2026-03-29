@@ -3311,35 +3311,16 @@ public final class FusedGroupByAggregate {
         for (int bucket = 0; bucket < numBuckets; bucket++) {
           List<Page> bucketPages =
               executeSingleKeyNumericFlat(
-                  shard,
-                  query,
-                  keyInfos,
-                  specs,
-                  columnTypeMap,
-                  groupByKeys,
-                  numAggs,
-                  isCountStar,
-                  accType,
-                  sortAggIndex,
-                  sortAscending,
-                  topN,
-                  bucket,
-                  numBuckets);
+                  shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+                  numAggs, isCountStar, accType, sortAggIndex, sortAscending,
+                  topN, bucket, numBuckets);
           allBucketResults.addAll(bucketPages);
         }
         if (allBucketResults.isEmpty()) return List.of();
         if (allBucketResults.size() == 1) return allBucketResults;
         return mergePartitionedPages(
-            allBucketResults,
-            keyInfos,
-            specs,
-            columnTypeMap,
-            groupByKeys,
-            numAggs,
-            accType,
-            sortAggIndex,
-            sortAscending,
-            topN);
+            allBucketResults, keyInfos, specs, columnTypeMap, groupByKeys,
+            numAggs, accType, sortAggIndex, sortAscending, topN);
       }
     }
 
@@ -4421,6 +4402,426 @@ public final class FusedGroupByAggregate {
     for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
     return List.of(new Page(blocks));
   }
+  /**
+   * Single-pass multi-bucket aggregation for high-cardinality single numeric key GROUP BY.
+   * Instead of N passes over all docs (one per bucket), does ONE pass routing each doc
+   * to the correct bucket's FlatSingleKeyMap. Eliminates N-1 redundant full scans.
+   */
+  private static List<Page> executeSingleKeyNumericFlatMultiBucket(
+      IndexShard shard,
+      Query query,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      Map<String, Type> columnTypeMap,
+      List<String> groupByKeys,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      int numBuckets)
+      throws Exception {
+
+    final int[] accOffset = new int[numAggs];
+    int totalSlots = 0;
+    for (int i = 0; i < numAggs; i++) {
+      accOffset[i] = totalSlots;
+      switch (accType[i]) {
+        case 0: case 1: totalSlots += 1; break;
+        case 2: totalSlots += 2; break;
+        default: throw new IllegalStateException("Unsupported accType: " + accType[i]);
+      }
+    }
+    final int slotsPerGroup = totalSlots;
+
+    // Allocate one FlatSingleKeyMap per bucket
+    final FlatSingleKeyMap[] bucketMaps = new FlatSingleKeyMap[numBuckets];
+    for (int b = 0; b < numBuckets; b++) {
+      bucketMaps[b] = new FlatSingleKeyMap(slotsPerGroup);
+    }
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat-mb")) {
+
+      java.util.List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      boolean isMatchAll = query instanceof MatchAllDocsQuery;
+
+      Weight weight = null;
+      if (!isMatchAll) {
+        IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+        weight = luceneSearcher.createWeight(
+            luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+      }
+
+      boolean canParallelize =
+          !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
+
+      if (canParallelize) {
+        // Segment-parallel: each worker gets its own set of bucket maps
+        int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+        @SuppressWarnings("unchecked")
+        java.util.List<LeafReaderContext>[] workerSegments = new java.util.List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++)
+          workerSegments[i] = new java.util.ArrayList<>();
+        java.util.List<LeafReaderContext> sortedLeaves = new java.util.ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        final Weight fWeight = weight;
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<FlatSingleKeyMap[]>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final java.util.List<LeafReaderContext> mySegments = workerSegments[w];
+          futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            FlatSingleKeyMap[] localMaps = new FlatSingleKeyMap[numBuckets];
+            for (int b = 0; b < numBuckets; b++) localMaps[b] = new FlatSingleKeyMap(slotsPerGroup);
+            try {
+              for (LeafReaderContext leafCtx : mySegments) {
+                scanSegmentFlatSingleKeyMultiBucket(
+                    leafCtx, fWeight, isMatchAll, localMaps, keyInfos, specs,
+                    numAggs, isCountStar, accType, accOffset, slotsPerGroup, numBuckets);
+              }
+            } catch (Exception e) { throw new RuntimeException(e); }
+            return localMaps;
+          }, PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+        for (var future : futures) {
+          FlatSingleKeyMap[] workerMaps = future.join();
+          for (int b = 0; b < numBuckets; b++) {
+            if (workerMaps[b].size > 0) bucketMaps[b].mergeFrom(workerMaps[b]);
+          }
+        }
+      } else {
+        // Sequential: single set of bucket maps
+        for (LeafReaderContext leafCtx : leaves) {
+          scanSegmentFlatSingleKeyMultiBucket(
+              leafCtx, weight, isMatchAll, bucketMaps, keyInfos, specs,
+              numAggs, isCountStar, accType, accOffset, slotsPerGroup, numBuckets);
+        }
+      }
+    }
+
+    // Merge all bucket maps into bucketMaps[0]
+    for (int b = 1; b < numBuckets; b++) {
+      if (bucketMaps[b].size > 0) bucketMaps[0].mergeFrom(bucketMaps[b]);
+    }
+    FlatSingleKeyMap flatMap = bucketMaps[0];
+
+    if (flatMap.size == 0) return List.of();
+
+    // Output page construction (same as executeSingleKeyNumericFlat)
+    int numGroupKeys = groupByKeys.size();
+    int totalColumns = numGroupKeys + numAggs;
+    int[] outputSlots;
+    int outputCount;
+
+    if (sortAggIndex >= 0 && topN > 0 && topN < flatMap.size) {
+      int sortAccOff = accOffset[sortAggIndex];
+      int n = (int) Math.min(topN, flatMap.size);
+      int[] heap = new int[n];
+      int heapSize = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.keys[slot] == FlatSingleKeyMap.EMPTY_KEY) continue;
+        long val = flatMap.accData[slot * slotsPerGroup + sortAccOff];
+        if (heapSize < n) {
+          heap[heapSize] = slot;
+          heapSize++;
+          int k = heapSize - 1;
+          while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            long pVal = flatMap.accData[heap[parent] * slotsPerGroup + sortAccOff];
+            long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+            boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
+            if (swap) { int tmp = heap[parent]; heap[parent] = heap[k]; heap[k] = tmp; k = parent; }
+            else break;
+          }
+        } else {
+          long rootVal = flatMap.accData[heap[0] * slotsPerGroup + sortAccOff];
+          boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
+          if (better) {
+            heap[0] = slot;
+            int k = 0;
+            while (true) {
+              int left = 2 * k + 1;
+              if (left >= heapSize) break;
+              int right = left + 1;
+              int target = left;
+              if (right < heapSize) {
+                long lv = flatMap.accData[heap[left] * slotsPerGroup + sortAccOff];
+                long rv = flatMap.accData[heap[right] * slotsPerGroup + sortAccOff];
+                if (sortAscending ? (rv > lv) : (rv < lv)) target = right;
+              }
+              long kVal = flatMap.accData[heap[k] * slotsPerGroup + sortAccOff];
+              long tVal = flatMap.accData[heap[target] * slotsPerGroup + sortAccOff];
+              if (sortAscending ? (tVal > kVal) : (tVal < kVal)) {
+                int tmp = heap[k]; heap[k] = heap[target]; heap[target] = tmp; k = target;
+              } else break;
+            }
+          }
+        }
+      }
+      outputSlots = heap;
+      outputCount = heapSize;
+    } else if (topN > 0 && topN < flatMap.size) {
+      int n = (int) Math.min(topN, flatMap.size);
+      outputSlots = new int[n];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity && idx < n; slot++) {
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    } else {
+      outputSlots = new int[flatMap.size];
+      int idx = 0;
+      for (int slot = 0; slot < flatMap.capacity; slot++) {
+        if (flatMap.keys[slot] != FlatSingleKeyMap.EMPTY_KEY) outputSlots[idx++] = slot;
+      }
+      outputCount = idx;
+    }
+
+    BlockBuilder[] builders = new BlockBuilder[totalColumns];
+    builders[0] = keyInfos.get(0).type.createBlockBuilder(null, outputCount);
+    for (int i = 0; i < numAggs; i++) {
+      builders[numGroupKeys + i] =
+          resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
+    }
+    for (int o = 0; o < outputCount; o++) {
+      int slot = outputSlots[o];
+      writeNumericKeyValue(builders[0], keyInfos.get(0), flatMap.keys[slot]);
+      int base = slot * slotsPerGroup;
+      for (int a = 0; a < numAggs; a++) {
+        int off = base + accOffset[a];
+        switch (accType[a]) {
+          case 0: case 1:
+            BigintType.BIGINT.writeLong(builders[numGroupKeys + a], flatMap.accData[off]);
+            break;
+          case 2:
+            long sum = flatMap.accData[off];
+            long cnt = flatMap.accData[off + 1];
+            if (cnt == 0) builders[numGroupKeys + a].appendNull();
+            else DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+            break;
+        }
+      }
+    }
+    Block[] blocks = new Block[totalColumns];
+    for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+    return List.of(new Page(blocks));
+  }
+  /**
+   * Single-pass multi-bucket scan: routes each doc to the correct bucket's FlatSingleKeyMap.
+   * Eliminates the per-doc hash-partition filter skip that wastes DocValues reads.
+   */
+  private static void scanSegmentFlatSingleKeyMultiBucket(
+      LeafReaderContext leafCtx,
+      Weight weight,
+      boolean isMatchAll,
+      FlatSingleKeyMap[] bucketMaps,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      int slotsPerGroup,
+      int numBuckets)
+      throws Exception {
+    LeafReader reader = leafCtx.reader();
+    SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
+
+    final SortedNumericDocValues[] numericAggDvs = new SortedNumericDocValues[numAggs];
+    final SortedSetDocValues[] lengthVarcharDvs = new SortedSetDocValues[numAggs];
+    final int[][] ordLengthMaps = new int[numAggs][];
+    final boolean[] aggApplyLength = new boolean[numAggs];
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i]) {
+        if (specs.get(i).applyLength) {
+          SortedSetDocValues varcharDv = reader.getSortedSetDocValues(specs.get(i).arg);
+          lengthVarcharDvs[i] = varcharDv;
+          aggApplyLength[i] = true;
+          if (varcharDv != null) {
+            int ordCount = (int) Math.min(varcharDv.getValueCount(), 10_000_000);
+            int[] ordLengths = new int[ordCount];
+            for (int ord = 0; ord < ordCount; ord++) {
+              ordLengths[ord] = varcharDv.lookupOrd(ord).length;
+            }
+            ordLengthMaps[i] = ordLengths;
+          }
+        } else {
+          numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+        }
+      }
+    }
+
+    if (isMatchAll) {
+      int maxDoc = reader.maxDoc();
+      Bits liveDocs = reader.getLiveDocs();
+
+      boolean allCountStar = true;
+      boolean hasApplyLen = false;
+      for (int i = 0; i < numAggs; i++) {
+        if (!isCountStar[i]) allCountStar = false;
+        if (aggApplyLength[i]) hasApplyLen = true;
+      }
+
+      if (allCountStar && dv0 != null && liveDocs == null) {
+        // Ultra-fast COUNT(*)-only path: single scan routing to bucket maps
+        int doc = dv0.nextDoc();
+        while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+          long key0 = dv0.nextValue();
+          int bkt = (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets;
+          int slot = bucketMaps[bkt].findOrInsert(key0);
+          bucketMaps[bkt].accData[slot * slotsPerGroup + accOffset[0]]++;
+          doc = dv0.nextDoc();
+        }
+      } else if (!hasApplyLen && dv0 != null && liveDocs == null) {
+        // Numeric aggs path: lockstep iteration routing to bucket maps
+        boolean allAggDense = true;
+        for (int i = 0; i < numAggs; i++) {
+          if (!isCountStar[i] && numericAggDvs[i] == null) { allAggDense = false; break; }
+        }
+        if (allAggDense) {
+          int[] aggDocPos = new int[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) aggDocPos[i] = numericAggDvs[i].nextDoc();
+          }
+          int keyDoc = dv0.nextDoc();
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long key0;
+            if (keyDoc == doc) { key0 = dv0.nextValue(); keyDoc = dv0.nextDoc(); }
+            else { key0 = 0; }
+            int bkt = (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets;
+            FlatSingleKeyMap map = bucketMaps[bkt];
+            int slot = map.findOrInsert(key0);
+            int base = slot * slotsPerGroup;
+            for (int i = 0; i < numAggs; i++) {
+              int off = base + accOffset[i];
+              if (isCountStar[i]) { map.accData[off]++; continue; }
+              if (aggDocPos[i] == doc) {
+                long rawVal = numericAggDvs[i].nextValue();
+                aggDocPos[i] = numericAggDvs[i].nextDoc();
+                switch (accType[i]) {
+                  case 0: map.accData[off]++; break;
+                  case 1: map.accData[off] += rawVal; break;
+                  case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+                }
+              }
+            }
+          }
+        } else {
+          // Fallback: advanceExact per doc
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long key0 = 0;
+            if (dv0.advanceExact(doc)) key0 = dv0.nextValue();
+            int bkt = (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets;
+            FlatSingleKeyMap map = bucketMaps[bkt];
+            int slot = map.findOrInsert(key0);
+            int base = slot * slotsPerGroup;
+            for (int i = 0; i < numAggs; i++) {
+              int off = base + accOffset[i];
+              if (isCountStar[i]) { map.accData[off]++; continue; }
+              if (numericAggDvs[i] != null && numericAggDvs[i].advanceExact(doc)) {
+                long rawVal = numericAggDvs[i].nextValue();
+                switch (accType[i]) {
+                  case 0: map.accData[off]++; break;
+                  case 1: map.accData[off] += rawVal; break;
+                  case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // General fallback with liveDocs/applyLength
+        for (int doc = 0; doc < maxDoc; doc++) {
+          if (liveDocs != null && !liveDocs.get(doc)) continue;
+          long key0 = 0;
+          if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+          int bkt = (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets;
+          FlatSingleKeyMap map = bucketMaps[bkt];
+          int slot = map.findOrInsert(key0);
+          int base = slot * slotsPerGroup;
+          for (int i = 0; i < numAggs; i++) {
+            int off = base + accOffset[i];
+            if (isCountStar[i]) { map.accData[off]++; continue; }
+            if (aggApplyLength[i]) {
+              if (lengthVarcharDvs[i] != null && lengthVarcharDvs[i].advanceExact(doc)) {
+                int ord = (int) lengthVarcharDvs[i].nextOrd();
+                long rawVal = (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                    ? ordLengthMaps[i][ord] : lengthVarcharDvs[i].lookupOrd(ord).length;
+                switch (accType[i]) {
+                  case 0: map.accData[off]++; break;
+                  case 1: map.accData[off] += rawVal; break;
+                  case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+                }
+              }
+            } else {
+              if (numericAggDvs[i] != null && numericAggDvs[i].advanceExact(doc)) {
+                long rawVal = numericAggDvs[i].nextValue();
+                switch (accType[i]) {
+                  case 0: map.accData[off]++; break;
+                  case 1: map.accData[off] += rawVal; break;
+                  case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // Filtered path: use Weight+Scorer
+      Scorer scorer = weight.scorer(leafCtx);
+      if (scorer == null) return;
+      DocIdSetIterator it = scorer.iterator();
+      int doc;
+      while ((doc = it.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        long key0 = 0;
+        if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+        int bkt = (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets;
+        FlatSingleKeyMap map = bucketMaps[bkt];
+        int slot = map.findOrInsert(key0);
+        int base = slot * slotsPerGroup;
+        for (int i = 0; i < numAggs; i++) {
+          int off = base + accOffset[i];
+          if (isCountStar[i]) { map.accData[off]++; continue; }
+          if (aggApplyLength[i]) {
+            if (lengthVarcharDvs[i] != null && lengthVarcharDvs[i].advanceExact(doc)) {
+              int ord = (int) lengthVarcharDvs[i].nextOrd();
+              long rawVal = (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                  ? ordLengthMaps[i][ord] : lengthVarcharDvs[i].lookupOrd(ord).length;
+              switch (accType[i]) {
+                case 0: map.accData[off]++; break;
+                case 1: map.accData[off] += rawVal; break;
+                case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+              }
+            }
+          } else {
+            if (numericAggDvs[i] != null && numericAggDvs[i].advanceExact(doc)) {
+              long rawVal = numericAggDvs[i].nextValue();
+              switch (accType[i]) {
+                case 0: map.accData[off]++; break;
+                case 1: map.accData[off] += rawVal; break;
+                case 2: map.accData[off] += rawVal; map.accData[off + 1]++; break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
   /**
    * Flat accumulator path for single-key numeric GROUP BY. Stores all accumulator state in a
@@ -5108,16 +5509,141 @@ public final class FusedGroupByAggregate {
       for (int i = 0; i < numAggs; i++) {
         if (aggApplyLength[i]) { hasApplyLen = true; break; }
       }
-      // For filtered queries, use simple per-doc iteration with advanceExact.
-      // Columnar cache (loadNumericColumn) is counterproductive here because it loads
-      // the full column even when the filter matches a small fraction of docs.
+      // For filtered queries, use forward-only DV iteration (avoids advanceExact binary search).
+      // When selectivity > 90%, treat as near-MatchAll and use nextDoc lockstep.
       DocIdSetIterator docIt = scorer.iterator();
-      int doc;
-      while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-        collectFlatSingleKeyDocWithLength(
-            doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
-            accType, accOffset, numericAggDvs, lengthVarcharDvs,
-            ordLengthMaps, aggApplyLength, bucket, numBuckets);
+      int estCount2 = weight.count(leafCtx);
+      int maxDoc2 = reader.maxDoc();
+      boolean nearMatchAll = (estCount2 >= 0 && estCount2 > maxDoc2 * 9 / 10);
+
+      if (nearMatchAll && numBuckets <= 1) {
+        // Near-MatchAll optimization: collect matching docs into bitset, then use
+        // MatchAll-style lockstep iteration with bitset check. Avoids advanceExact.
+        org.apache.lucene.util.FixedBitSet matchBits = new org.apache.lucene.util.FixedBitSet(maxDoc2);
+        int d;
+        while ((d = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+          matchBits.set(d);
+        }
+        if (dv0 != null) {
+          // Initialize all DV iterators for lockstep
+          int[] aggDocPos2 = new int[numAggs];
+          int[] lenDocPos2 = new int[numAggs];
+          for (int i = 0; i < numAggs; i++) {
+            if (aggApplyLength[i] && lengthVarcharDvs[i] != null) {
+              lenDocPos2[i] = lengthVarcharDvs[i].nextDoc();
+              aggDocPos2[i] = DocIdSetIterator.NO_MORE_DOCS;
+            } else if (!isCountStar[i] && numericAggDvs[i] != null) {
+              aggDocPos2[i] = numericAggDvs[i].nextDoc();
+              lenDocPos2[i] = DocIdSetIterator.NO_MORE_DOCS;
+            } else {
+              aggDocPos2[i] = DocIdSetIterator.NO_MORE_DOCS;
+              lenDocPos2[i] = DocIdSetIterator.NO_MORE_DOCS;
+            }
+          }
+          int keyDoc = dv0.nextDoc();
+          for (int doc = 0; doc < maxDoc2; doc++) {
+            if (!matchBits.get(doc)) {
+              // Advance past non-matching docs
+              if (keyDoc == doc) { dv0.nextValue(); keyDoc = dv0.nextDoc(); }
+              for (int i = 0; i < numAggs; i++) {
+                if (aggDocPos2[i] == doc) { numericAggDvs[i].nextValue(); aggDocPos2[i] = numericAggDvs[i].nextDoc(); }
+                if (lenDocPos2[i] == doc) { lengthVarcharDvs[i].nextOrd(); lenDocPos2[i] = lengthVarcharDvs[i].nextDoc(); }
+              }
+              continue;
+            }
+            long key0 = (keyDoc == doc) ? dv0.nextValue() : 0;
+            if (keyDoc == doc) keyDoc = dv0.nextDoc();
+            int slot = flatMap.findOrInsert(key0);
+            int base = slot * slotsPerGroup;
+            for (int i = 0; i < numAggs; i++) {
+              int off = base + accOffset[i];
+              if (isCountStar[i]) { flatMap.accData[off]++; continue; }
+              if (aggApplyLength[i]) {
+                if (lenDocPos2[i] == doc) {
+                  int ord = (int) lengthVarcharDvs[i].nextOrd();
+                  long rawVal = (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                      ? ordLengthMaps[i][ord] : lengthVarcharDvs[i].lookupOrd(ord).length;
+                  lenDocPos2[i] = lengthVarcharDvs[i].nextDoc();
+                  switch (accType[i]) {
+                    case 0: flatMap.accData[off]++; break;
+                    case 1: flatMap.accData[off] += rawVal; break;
+                    case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+                  }
+                }
+              } else if (aggDocPos2[i] == doc) {
+                long rawVal = numericAggDvs[i].nextValue();
+                aggDocPos2[i] = numericAggDvs[i].nextDoc();
+                switch (accType[i]) {
+                  case 0: flatMap.accData[off]++; break;
+                  case 1: flatMap.accData[off] += rawVal; break;
+                  case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // Standard filtered path with forward-only DV advance
+        int dvPos0 = (dv0 != null) ? dv0.nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+        int[] aggDvPos = new int[numAggs];
+        int[] lenDvPos = new int[numAggs];
+        for (int i = 0; i < numAggs; i++) {
+          if (aggApplyLength[i] && lengthVarcharDvs[i] != null) {
+            lenDvPos[i] = lengthVarcharDvs[i].nextDoc();
+            aggDvPos[i] = DocIdSetIterator.NO_MORE_DOCS;
+          } else if (!isCountStar[i] && numericAggDvs[i] != null) {
+            aggDvPos[i] = numericAggDvs[i].nextDoc();
+            lenDvPos[i] = DocIdSetIterator.NO_MORE_DOCS;
+          } else {
+            aggDvPos[i] = DocIdSetIterator.NO_MORE_DOCS;
+            lenDvPos[i] = DocIdSetIterator.NO_MORE_DOCS;
+          }
+        }
+        int doc;
+        while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+          long key0 = 0;
+          if (dvPos0 != DocIdSetIterator.NO_MORE_DOCS && dvPos0 < doc) {
+            dvPos0 = dv0.advance(doc);
+          }
+          if (dvPos0 == doc) { key0 = dv0.nextValue(); dvPos0 = dv0.nextDoc(); }
+          if (numBuckets > 1 && (SingleKeyHashMap.hash1(key0) & 0x7FFFFFFF) % numBuckets != bucket) continue;
+          int slot = flatMap.findOrInsert(key0);
+          int base = slot * slotsPerGroup;
+          for (int i = 0; i < numAggs; i++) {
+            int off = base + accOffset[i];
+            if (isCountStar[i]) { flatMap.accData[off]++; continue; }
+            long rawVal = 0;
+            boolean hasValue = false;
+            if (aggApplyLength[i]) {
+              if (lenDvPos[i] != DocIdSetIterator.NO_MORE_DOCS && lenDvPos[i] < doc) {
+                lenDvPos[i] = lengthVarcharDvs[i].advance(doc);
+              }
+              if (lenDvPos[i] == doc) {
+                int ord = (int) lengthVarcharDvs[i].nextOrd();
+                rawVal = (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                    ? ordLengthMaps[i][ord] : lengthVarcharDvs[i].lookupOrd(ord).length;
+                hasValue = true;
+                lenDvPos[i] = lengthVarcharDvs[i].nextDoc();
+              }
+            } else {
+              if (aggDvPos[i] != DocIdSetIterator.NO_MORE_DOCS && aggDvPos[i] < doc) {
+                aggDvPos[i] = numericAggDvs[i].advance(doc);
+              }
+              if (aggDvPos[i] == doc) {
+                rawVal = numericAggDvs[i].nextValue();
+                hasValue = true;
+                aggDvPos[i] = numericAggDvs[i].nextDoc();
+              }
+            }
+            if (hasValue) {
+              switch (accType[i]) {
+                case 0: flatMap.accData[off]++; break;
+                case 1: flatMap.accData[off] += rawVal; break;
+                case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -6012,14 +6538,48 @@ public final class FusedGroupByAggregate {
       boolean useBitsetLockstep = false; // Disabled: causes EOFException on two-key DocValues
 
       // Columnar cache is counterproductive for filtered queries (loads full column
-      // even when filter matches a small fraction). Use simple per-doc iteration.
+      // even when filter matches a small fraction). Use forward-only DV iteration
+      // instead of advanceExact (avoids binary search per doc).
       if (!hasDvDuplicates && numBuckets <= 1) {
         DocIdSetIterator docIt = scorer.iterator();
+        // Initialize DV positions for forward-only advance
+        int dvPos0 = (dv0 != null) ? dv0.nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+        int dvPos1 = (dv1 != null) ? dv1.nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+        int[] aggDvPos = new int[numAggs];
+        for (int i = 0; i < numAggs; i++) {
+          aggDvPos[i] = (!isCountStar[i] && numericAggDvs[i] != null)
+              ? numericAggDvs[i].nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+        }
         int doc;
         while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-          collectFlatTwoKeyDoc(
-              doc, dv0, dv1, flatMap, slotsPerGroup, numAggs, isCountStar,
-              accType, accOffset, numericAggDvs, bucket, numBuckets);
+          long key0 = 0, key1 = 0;
+          // Forward-advance key DVs to current doc
+          if (dvPos0 != DocIdSetIterator.NO_MORE_DOCS && dvPos0 < doc) {
+            dvPos0 = dv0.advance(doc);
+          }
+          if (dvPos0 == doc) { key0 = dv0.nextValue(); dvPos0 = dv0.nextDoc(); }
+          if (dvPos1 != DocIdSetIterator.NO_MORE_DOCS && dvPos1 < doc) {
+            dvPos1 = dv1.advance(doc);
+          }
+          if (dvPos1 == doc) { key1 = dv1.nextValue(); dvPos1 = dv1.nextDoc(); }
+          int slot = flatMap.findOrInsert(key0, key1);
+          int base = slot * slotsPerGroup;
+          for (int i = 0; i < numAggs; i++) {
+            int off = base + accOffset[i];
+            if (isCountStar[i]) { flatMap.accData[off]++; continue; }
+            if (aggDvPos[i] != DocIdSetIterator.NO_MORE_DOCS && aggDvPos[i] < doc) {
+              aggDvPos[i] = numericAggDvs[i].advance(doc);
+            }
+            if (aggDvPos[i] == doc) {
+              long rawVal = numericAggDvs[i].nextValue();
+              aggDvPos[i] = numericAggDvs[i].nextDoc();
+              switch (accType[i]) {
+                case 0: flatMap.accData[off]++; break;
+                case 1: flatMap.accData[off] += rawVal; break;
+                case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+              }
+            }
+          }
         }
       } else if (useBitsetLockstep) {
         // Collect matching doc IDs into bitset
@@ -11401,6 +11961,15 @@ public final class FusedGroupByAggregate {
 
                     FlatTwoKeyMap flatMap = workerMaps[workerIdx];
 
+                    // Initialize DV positions for forward-only advance
+                    int numDvPos = (numericDv != null) ? numericDv.nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+                    int varDvPos = (varcharDv != null) ? varcharDv.nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+                    int[] aggDvPos = new int[numAggs];
+                    for (int i = 0; i < numAggs; i++) {
+                      aggDvPos[i] = (!isCountStar[i] && aggDvs[i] != null)
+                          ? aggDvs[i].nextDoc() : DocIdSetIterator.NO_MORE_DOCS;
+                    }
+
                     for (int idx = startIdx; idx < endIdx; idx++) {
                       // Check stop flag periodically
                       if (earlyTerminate && (idx & 0xFFF) == 0 && stopFlag.get()) break;
@@ -11409,12 +11978,22 @@ public final class FusedGroupByAggregate {
                       long numericKey = 0;
                       long globalOrd = 0;
 
-                      if (numericDv != null && numericDv.advanceExact(doc)) {
-                        numericKey = numericDv.nextValue();
+                      // Forward-advance numeric key DV
+                      if (numDvPos != DocIdSetIterator.NO_MORE_DOCS && numDvPos < doc) {
+                        numDvPos = numericDv.advance(doc);
                       }
-                      if (varcharDv != null && varcharDv.advanceExact(doc)) {
+                      if (numDvPos == doc) {
+                        numericKey = numericDv.nextValue();
+                        numDvPos = numericDv.nextDoc();
+                      }
+                      // Forward-advance varchar key DV
+                      if (varDvPos != DocIdSetIterator.NO_MORE_DOCS && varDvPos < doc) {
+                        varDvPos = varcharDv.advance(doc);
+                      }
+                      if (varDvPos == doc) {
                         long segOrd = varcharDv.nextOrd();
                         globalOrd = segToGlobal.get(segOrd);
+                        varDvPos = varcharDv.nextDoc();
                       }
 
                       // FlatTwoKeyMap keys: key0=numericKey, key1=globalOrd
@@ -11427,14 +12006,17 @@ public final class FusedGroupByAggregate {
                       }
                       int base = slot * flatSlotsPerGroup;
 
-                      // Inline accumulation
+                      // Inline accumulation with forward-only DV advance
                       for (int i = 0; i < numAggs; i++) {
                         if (isCountStar[i]) {
                           flatMap.accData[base + flatAccOffset[i]]++;
                         } else {
-                          SortedNumericDocValues aggDv = aggDvs[i];
-                          if (aggDv != null && aggDv.advanceExact(doc)) {
-                            long rawVal = aggDv.nextValue();
+                          if (aggDvPos[i] != DocIdSetIterator.NO_MORE_DOCS && aggDvPos[i] < doc) {
+                            aggDvPos[i] = aggDvs[i].advance(doc);
+                          }
+                          if (aggDvPos[i] == doc) {
+                            long rawVal = aggDvs[i].nextValue();
+                            aggDvPos[i] = aggDvs[i].nextDoc();
                             switch (accType[i]) {
                               case 0: // COUNT non-star
                                 flatMap.accData[base + flatAccOffset[i]]++;

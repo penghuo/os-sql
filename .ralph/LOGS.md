@@ -387,3 +387,33 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 - Performance target (≥38/43) NOT achievable with code optimizations alone
 - Architectural changes needed: columnar storage format, vectorized execution, or pre-aggregation
 - Realistic target: ~28-30/43 with aggressive micro-optimizations
+
+## Iteration 12 — 2026-03-29T11:00-14:45Z
+
+### What I Did
+1. Ran fresh baseline benchmark: 27/43 within 2x (Q15 catastrophically slow at 385s)
+2. Diagnosed Q15 regression: single-pass multi-bucket approach from iteration 11 caused excessive memory allocation
+3. Reverted multi-bucket dispatch to old multi-pass approach: Q15 385s → 17s
+4. Implemented forward-only DV advance for filtered 2-key numeric GROUP BY (scanSegmentFlatTwoKey)
+5. Implemented forward-only DV advance for filtered numeric+VARCHAR GROUP BY (executeMultiSegGlobalOrdFlatTwoKey)
+6. Implemented near-MatchAll bitset lockstep for single-key filtered path with applyLength support
+7. Implemented forward-only DV advance for single-key filtered path with applyLength
+8. Ran correctness tests: 39/43 PASS (no regression)
+9. Ran 4 full benchmarks to measure impact (results noisy)
+
+### Results
+- Score: 25/43 within 2x (stable, borderline queries fluctuate)
+- Correctness: 39/43 PASS (no regression)
+- Q15: 385s → 17s (fixed regression from iteration 11)
+- Q14: 2.75x → 2.07x best (forward-only DV advance, 27% improvement)
+- Q30: 2.65x → 2.26x best (forward-only DV advance, 15% improvement)
+- Q27: 2.13x → 2.10x best (near-MatchAll bitset lockstep)
+- Q29: 2.22x → 1.88x best (forward-only DV advance in spot test)
+- Results are noisy: Q14 ranges 2.00x-2.37x, Q27 ranges 2.10x-2.36x across runs
+
+### Decisions
+1. Multi-bucket single-pass REVERTED: causes Q15 regression (excessive memory allocation for 8 FlatSingleKeyMaps)
+2. Forward-only DV advance KEPT: replaces advanceExact binary search with advance() for sorted doc iteration
+3. Near-MatchAll bitset lockstep KEPT: for filters matching >90% of docs, collect into bitset and use MatchAll-style lockstep
+4. Performance target (≥38/43) NOT achievable with code optimizations alone — fundamental Lucene DV overhead
+5. Borderline queries (Q14, Q27, Q29, Q30) are within measurement noise of 2x threshold

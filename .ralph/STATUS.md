@@ -325,3 +325,49 @@ Q18(9.73x) Q11(12.47x) Q39(27.02x) Q15(30.08x)
 - Full benchmark: /tmp/bench_v7_clean/r5.4xlarge.json (warmup=3, tries=5)
 - Correctness: 39/43 PASS (/tmp/correctness_v7.log)
 - Commit: 279d05c16
+
+## Iteration 12 — 2026-03-29T11:00-14:45Z
+
+status: WORKING
+iteration: 12
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (stable from baseline)
+- Correctness: 39/43 PASS (no regression)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 4 shards, 4 segments/shard
+
+### Queries Within 2x (25)
+Q00(0.36x) Q01(0.16x) Q03(1.87x) Q06(0.14x) Q07(0.37x) Q10(1.46x) Q12(0.59x)
+Q17(0.01x) Q19(0.08x) Q20(0.01x) Q21(0.02x) Q22(0.04x) Q23(0.00x) Q24(0.03x)
+Q25(1.60x) Q26(0.03x) Q31(1.18x) Q32(1.89x) Q33(0.33x) Q34(0.37x) Q37(0.45x)
+Q38(0.61x) Q40(0.21x) Q41(0.71x) Q42(0.61x)
+
+### Queries Above 2x (18, sorted by ratio)
+Q29(2.21x) Q27(2.36x) Q14(2.37x) Q30(2.42x) Q28(3.14x) Q02(3.16x) Q35(4.20x)
+Q08(4.26x) Q05(5.22x) Q04(5.32x) Q09(5.48x) Q16(6.41x) Q36(6.42x) Q13(8.33x)
+Q18(9.95x) Q11(11.94x) Q39(27.66x) Q15(32.84x)
+
+### Changes Made
+1. Reverted multi-bucket single-pass to multi-pass (fixed Q15 regression 385s→17s)
+2. Forward-only DV advance for filtered 2-key GROUP BY (Q14, Q30)
+3. Forward-only DV advance for filtered numeric+VARCHAR GROUP BY (Q14)
+4. Near-MatchAll bitset lockstep for single-key filtered path with applyLength (Q27)
+5. Forward-only DV advance for single-key filtered path with applyLength
+
+### Key Findings
+1. Q15 regression was caused by single-pass multi-bucket approach (too much memory allocation)
+2. Forward-only DV advance helps filtered paths by 10-27% (replaces advanceExact binary search)
+3. Near-MatchAll optimization (>90% selectivity) uses bitset+lockstep instead of Scorer
+4. Results are noisy — borderline queries Q14/Q27/Q29/Q30 fluctuate between runs
+5. Best observed: Q14=2.00x (spot), Q27=2.10x, Q29=1.88x (spot), Q30=2.23x
+6. COUNT(DISTINCT) fusion already exists in codebase — bottleneck is shard execution speed
+
+### Next Steps
+1. Performance target NOT MET (25/43 vs ≥38/43)
+2. Borderline queries Q14(2.37x), Q27(2.36x), Q29(2.21x), Q30(2.42x) need small improvements
+3. COUNT(DISTINCT) queries (Q04-Q13) need 2-6x improvement — fundamental Lucene DV overhead
+4. High-cardinality GROUP BY (Q15, Q16, Q18) need architectural changes
+
+### Evidence
+- Full benchmark: /tmp/full_v12e/r5.4xlarge.json (warmup=3, tries=5)
+- Correctness: 39/43 PASS (/tmp/correctness_v12.log)

@@ -544,17 +544,21 @@ public final class FusedGroupByAggregate {
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-expr-groupby")) {
 
-      // Global groups keyed by the computed expression result string.
-      // Since Lucene processes segments sequentially in a single collector thread,
-      // we can safely accumulate into this global map without synchronization.
       HashMap<String, AccumulatorGroup> globalGroups = new HashMap<>();
 
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              LeafReader reader = context.reader();
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
+      boolean canParallelize =
+          !"off".equals(PARALLELISM_MODE) && numWorkers > 1 && leaves.size() > 1;
+
+      if (!canParallelize) {
+        // === Single-segment / sequential path (existing Collector approach) ===
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                LeafReader reader = context.reader();
               SortedSetDocValues dv = reader.getSortedSetDocValues(srcCol);
               if (dv == null) {
                 return new LeafCollector() {
@@ -823,11 +827,6 @@ public final class FusedGroupByAggregate {
                             if (rawVal > mxa.longVal) mxa.longVal = rawVal;
                           }
                           break;
-                        case 5:
-                          CountDistinctAccum cda = (CountDistinctAccum) acc;
-                          if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
-                          else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
-                          break;
                         case 6:
                           SumAccum sad = (SumAccum) acc;
                           sad.hasValue = true;
@@ -850,6 +849,77 @@ public final class FusedGroupByAggregate {
               return ScoreMode.COMPLETE_NO_SCORES;
             }
           });
+      } else {
+        // === Parallel multi-segment path ===
+        @SuppressWarnings("unchecked")
+        List<LeafReaderContext>[] workerSegments = new List[numWorkers];
+        long[] workerDocCounts = new long[numWorkers];
+        for (int i = 0; i < numWorkers; i++) workerSegments[i] = new ArrayList<>();
+        List<LeafReaderContext> sortedLeaves = new ArrayList<>(leaves);
+        sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
+        for (LeafReaderContext leaf : sortedLeaves) {
+          int lightest = 0;
+          for (int i = 1; i < numWorkers; i++) {
+            if (workerDocCounts[i] < workerDocCounts[lightest]) lightest = i;
+          }
+          workerSegments[lightest].add(leaf);
+          workerDocCounts[lightest] += leaf.reader().maxDoc();
+        }
+
+        IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
+        Weight weight =
+            luceneSearcher.createWeight(
+                luceneSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<HashMap<String, AccumulatorGroup>>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final List<LeafReaderContext> mySegments = workerSegments[w];
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    HashMap<String, AccumulatorGroup> workerGroups = new HashMap<>();
+                    try {
+                      for (LeafReaderContext leafCtx : mySegments) {
+                        processExprKeySegment(
+                            leafCtx,
+                            weight,
+                            srcCol,
+                            specs,
+                            numAggs,
+                            isCountStar,
+                            isComputedArg,
+                            isDoubleArg,
+                            isVarcharArg,
+                            accType,
+                            keyBlockExpr,
+                            computedArgBlockExprs,
+                            workerGroups);
+                      }
+                    } catch (IOException e) {
+                      throw new java.io.UncheckedIOException(e);
+                    }
+                    return workerGroups;
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+
+        for (var future : futures) {
+          HashMap<String, AccumulatorGroup> wMap = future.join();
+          for (Map.Entry<String, AccumulatorGroup> e : wMap.entrySet()) {
+            AccumulatorGroup existing = globalGroups.get(e.getKey());
+            if (existing == null) {
+              globalGroups.put(e.getKey(), e.getValue());
+            } else {
+              existing.merge(e.getValue());
+            }
+          }
+        }
+      }
 
       // Build output Page
       if (globalGroups.isEmpty()) {
@@ -876,6 +946,276 @@ public final class FusedGroupByAggregate {
       Block[] blocks = new Block[totalColumns];
       for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
       return List.of(new Page(blocks));
+    }
+  }
+
+  /**
+   * Process a single segment for the parallel expression-key GROUP BY path.
+   * Pre-computes ordinal caches and scans docs via scorer, accumulating into workerGroups.
+   */
+  private static void processExprKeySegment(
+      LeafReaderContext leafCtx,
+      Weight weight,
+      String srcCol,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      boolean[] isComputedArg,
+      boolean[] isDoubleArg,
+      boolean[] isVarcharArg,
+      int[] accType,
+      org.opensearch.sql.dqe.function.expression.BlockExpression keyBlockExpr,
+      org.opensearch.sql.dqe.function.expression.BlockExpression[] computedArgBlockExprs,
+      HashMap<String, AccumulatorGroup> workerGroups)
+      throws IOException {
+    Scorer scorer = weight.scorer(leafCtx);
+    if (scorer == null) return;
+    LeafReader reader = leafCtx.reader();
+    SortedSetDocValues dv = reader.getSortedSetDocValues(srcCol);
+    if (dv == null) return;
+    long ordCount = dv.getValueCount();
+    if (ordCount <= 0 || ordCount > 10_000_000) return;
+    int ordCountInt = (int) ordCount;
+
+    // Pre-compute expressions for each ordinal in this segment
+    String[] ordToGroupKey = new String[ordCountInt];
+    long[][] ordToComputedArg = new long[numAggs][];
+    for (int i = 0; i < numAggs; i++) {
+      if (isComputedArg[i]) {
+        ordToComputedArg[i] = new long[ordCountInt];
+      }
+    }
+
+    boolean[] isVarcharSameCol = new boolean[numAggs];
+    boolean needRawStringCache = false;
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i] && !isComputedArg[i] && isVarcharArg[i]
+          && specs.get(i).arg.equals(srcCol)) {
+        isVarcharSameCol[i] = true;
+        needRawStringCache = true;
+      }
+    }
+    String[] ordToRawString = needRawStringCache ? new String[ordCountInt] : null;
+
+    // Process ordinals in batches for expression evaluation
+    int batchSize = Math.min(ordCountInt, 4096);
+    for (int batchStart = 0; batchStart < ordCountInt; batchStart += batchSize) {
+      int batchEnd = Math.min(batchStart + batchSize, ordCountInt);
+      int batchLen = batchEnd - batchStart;
+
+      BlockBuilder inputBuilder = VarcharType.VARCHAR.createBlockBuilder(null, batchLen);
+      for (int ord = batchStart; ord < batchEnd; ord++) {
+        BytesRef bytes = dv.lookupOrd(ord);
+        VarcharType.VARCHAR.writeSlice(
+            inputBuilder, Slices.wrappedBuffer(bytes.bytes, bytes.offset, bytes.length));
+        if (ordToRawString != null) {
+          ordToRawString[ord] = bytes.utf8ToString();
+        }
+      }
+      Block inputBlock = inputBuilder.build();
+      Page inputPage = new Page(inputBlock);
+
+      Block keyResultBlock = keyBlockExpr.evaluate(inputPage);
+      for (int j = 0; j < batchLen; j++) {
+        if (keyResultBlock.isNull(j)) {
+          ordToGroupKey[batchStart + j] = null;
+        } else {
+          ordToGroupKey[batchStart + j] =
+              VarcharType.VARCHAR.getSlice(keyResultBlock, j).toStringUtf8();
+        }
+      }
+
+      for (int i = 0; i < numAggs; i++) {
+        if (isComputedArg[i]) {
+          Block argResultBlock = computedArgBlockExprs[i].evaluate(inputPage);
+          for (int j = 0; j < batchLen; j++) {
+            if (!argResultBlock.isNull(j)) {
+              ordToComputedArg[i][batchStart + j] =
+                  computedArgBlockExprs[i].getType().getLong(argResultBlock, j);
+            }
+          }
+        }
+      }
+    }
+
+    // Pre-wire ordinal -> AccumulatorGroup using worker-local map
+    AccumulatorGroup[] ordGroups = new AccumulatorGroup[ordCountInt];
+    for (int ord = 0; ord < ordCountInt; ord++) {
+      String gk = ordToGroupKey[ord];
+      if (gk != null) {
+        AccumulatorGroup existing = workerGroups.get(gk);
+        if (existing == null) {
+          existing = createAccumulatorGroup(specs);
+          workerGroups.put(gk, existing);
+        }
+        ordGroups[ord] = existing;
+      }
+    }
+
+    // Open doc values for physical aggregate args
+    SortedNumericDocValues[] colNumDvs = new SortedNumericDocValues[numAggs];
+    SortedSetDocValues[] colVarDvs = new SortedSetDocValues[numAggs];
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i] && !isComputedArg[i] && !isVarcharSameCol[i]) {
+        AggSpec spec = specs.get(i);
+        if (isVarcharArg[i]) {
+          colVarDvs[i] = reader.getSortedSetDocValues(spec.arg);
+        } else {
+          colNumDvs[i] = reader.getSortedNumericDocValues(spec.arg);
+        }
+      }
+    }
+
+    // Scan docs via scorer — same accumulation logic as the Collector path
+    DocIdSetIterator docIt = scorer.iterator();
+    int doc;
+    while ((doc = docIt.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      if (!dv.advanceExact(doc)) continue;
+      int ord = (int) dv.nextOrd();
+      if (ord >= ordGroups.length) continue;
+      AccumulatorGroup accGroup = ordGroups[ord];
+      if (accGroup == null) continue;
+
+      for (int i = 0; i < numAggs; i++) {
+        MergeableAccumulator acc = accGroup.accumulators[i];
+        if (isCountStar[i]) {
+          ((CountStarAccum) acc).count++;
+          continue;
+        }
+        if (isVarcharSameCol[i]) {
+          String val = ordToRawString[ord];
+          switch (accType[i]) {
+            case 5:
+              ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+              break;
+            case 3:
+              MinAccum ma = (MinAccum) acc;
+              if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                ma.objectVal = val;
+                ma.hasValue = true;
+              }
+              break;
+            case 4:
+              MaxAccum xa = (MaxAccum) acc;
+              if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                xa.objectVal = val;
+                xa.hasValue = true;
+              }
+              break;
+          }
+          continue;
+        }
+        if (isComputedArg[i]) {
+          long val = ordToComputedArg[i][ord];
+          switch (accType[i]) {
+            case 0: ((CountStarAccum) acc).count++; break;
+            case 1:
+              SumAccum sa = (SumAccum) acc;
+              sa.hasValue = true;
+              sa.longSum += val;
+              break;
+            case 2:
+              AvgAccum aa = (AvgAccum) acc;
+              aa.count++;
+              aa.longSum += val;
+              break;
+            case 3:
+              MinAccum mna = (MinAccum) acc;
+              mna.hasValue = true;
+              if (val < mna.longVal) mna.longVal = val;
+              break;
+            case 4:
+              MaxAccum mxa = (MaxAccum) acc;
+              mxa.hasValue = true;
+              if (val > mxa.longVal) mxa.longVal = val;
+              break;
+            case 5:
+              CountDistinctAccum cda = (CountDistinctAccum) acc;
+              if (cda.usePrimitiveLong) cda.longDistinctValues.add(val);
+              break;
+          }
+          continue;
+        }
+        if (isVarcharArg[i]) {
+          SortedSetDocValues varcharDv = colVarDvs[i];
+          if (varcharDv != null && varcharDv.advanceExact(doc)) {
+            BytesRef bytes = varcharDv.lookupOrd(varcharDv.nextOrd());
+            String val = bytes.utf8ToString();
+            switch (accType[i]) {
+              case 5:
+                ((CountDistinctAccum) acc).objectDistinctValues.add(val);
+                break;
+              case 3:
+                MinAccum ma = (MinAccum) acc;
+                if (!ma.hasValue || val.compareTo((String) ma.objectVal) < 0) {
+                  ma.objectVal = val;
+                  ma.hasValue = true;
+                }
+                break;
+              case 4:
+                MaxAccum xa = (MaxAccum) acc;
+                if (!xa.hasValue || val.compareTo((String) xa.objectVal) > 0) {
+                  xa.objectVal = val;
+                  xa.hasValue = true;
+                }
+                break;
+            }
+          }
+          continue;
+        }
+        SortedNumericDocValues aggDv = colNumDvs[i];
+        if (aggDv != null && aggDv.advanceExact(doc)) {
+          long rawVal = aggDv.nextValue();
+          switch (accType[i]) {
+            case 0: ((CountStarAccum) acc).count++; break;
+            case 1:
+              SumAccum sa = (SumAccum) acc;
+              sa.hasValue = true;
+              sa.longSum += rawVal;
+              break;
+            case 2:
+              AvgAccum aa = (AvgAccum) acc;
+              aa.count++;
+              aa.longSum += rawVal;
+              break;
+            case 3:
+              MinAccum mna = (MinAccum) acc;
+              mna.hasValue = true;
+              if (isDoubleArg[i]) {
+                double d = Double.longBitsToDouble(rawVal);
+                if (d < mna.doubleVal) mna.doubleVal = d;
+              } else {
+                if (rawVal < mna.longVal) mna.longVal = rawVal;
+              }
+              break;
+            case 4:
+              MaxAccum mxa = (MaxAccum) acc;
+              mxa.hasValue = true;
+              if (isDoubleArg[i]) {
+                double d = Double.longBitsToDouble(rawVal);
+                if (d > mxa.doubleVal) mxa.doubleVal = d;
+              } else {
+                if (rawVal > mxa.longVal) mxa.longVal = rawVal;
+              }
+              break;
+            case 5:
+              CountDistinctAccum cda = (CountDistinctAccum) acc;
+              if (cda.usePrimitiveLong) cda.longDistinctValues.add(rawVal);
+              else cda.objectDistinctValues.add(Double.longBitsToDouble(rawVal));
+              break;
+            case 6:
+              SumAccum sad = (SumAccum) acc;
+              sad.hasValue = true;
+              sad.doubleSum += Double.longBitsToDouble(rawVal);
+              break;
+            case 7:
+              AvgAccum aad = (AvgAccum) acc;
+              aad.count++;
+              aad.doubleSum += Double.longBitsToDouble(rawVal);
+              break;
+          }
+        }
+      }
     }
   }
 
@@ -1636,9 +1976,12 @@ public final class FusedGroupByAggregate {
       // Only parallelize when ordinal counts are manageable (< 500K per segment).
       // High-cardinality VARCHAR keys (e.g., URL with 18M unique values) create too many
       // BytesRefKey copies per worker, making merge overhead exceed the parallelism benefit.
+      // Exception: filtered queries (not MatchAllDocsQuery) touch only a small subset of docs,
+      // so per-segment ordinal arrays are feasible even with high cardinality — the merge
+      // only resolves ordinals that actually appear in matching docs.
       boolean canParallelize =
           !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
-      if (canParallelize) {
+      if (canParallelize && query instanceof MatchAllDocsQuery) {
         SortedSetDocValues checkDv = leaves.get(0).reader().getSortedSetDocValues(columnName);
         if (checkDv != null && checkDv.getValueCount() > 500_000) {
           canParallelize = false;

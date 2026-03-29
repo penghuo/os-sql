@@ -488,3 +488,36 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: Need m5.8xlarge (32 vCPU) or architectural changes (columnar storage, vectorized execution).
 4. **Borderline queries (Q14, Q27, Q29, Q30) are within measurement noise of 2x**: Q29 at 2.07x with 7ms gap could flip on a good run. Q14 ranges 1.7-2.5s across runs.
 5. **No further code optimizations identified**: Every query above 2x hits an optimized fused path. The bottleneck is per-doc DocValues decode overhead (~15-20ns vs ClickHouse's ~2-5ns per value).
+
+## Iteration 15 — 2026-03-29T21:25-23:22Z
+
+### What I Did
+1. Assessed uncommitted changes: parallel expr-key GROUP BY in FusedGroupByAggregate, removed System.gc() calls
+2. Compiled and deployed — BUILD SUCCESSFUL, correctness 39/43 PASS
+3. Ran baseline benchmark: 24/43 within 2x (Q03 dropped from 1.36x to 2.65x due to noise)
+4. Analyzed borderline queries: Q14(2.14x), Q27(2.17x), Q28(2.27x), Q29(2.30x), Q36(2.38x)
+5. Explored execution paths for Q03, Q14, Q29, Q36 — identified Q14 and Q36 lack parallelism
+6. Implemented Q14 N-key varchar parallelism: segment-level parallel processing with worker-local HashMaps
+7. Implemented Q36 filtered high-cardinality parallelism: modified `canParallelize` guard to allow parallelism for filtered queries even with >500K ordinals
+8. Benchmarked Q14: REGRESSED (1.589s → 2.345s) — HashMap merge overhead exceeds parallelism benefit
+9. Benchmarked Q36: IMPROVED (0.288s → 0.141s, 2.38x → 1.17x) — filtered parallelism works
+10. Reverted Q14 N-key varchar parallelism
+11. Tested System.gc() removal: caused OOM/GC storms during full benchmark (Q42/Q43 failed), reverted
+12. Ran clean full benchmark with Q36 fix + System.gc() restored: 26/43 within 2x
+13. Ran second full benchmark: hit Q16 OOM issue (Q17-Q24 failed), pre-existing problem
+
+### Results
+- Score: 26/43 within 2x (up from 25/43 in iter14, up from 24/43 in first iter15 benchmark)
+- Correctness: 39/43 PASS (no regression)
+- Q36: 0.288s → 0.139s (2.38x → 1.15x) — filtered high-cardinality parallelism WORKS
+- Q03: 0.294s → 0.195s (2.65x → 1.76x) — noise-dependent, crossed back within 2x
+- Q14 parallelism: REVERTED (1.589s → 2.345s regression)
+- System.gc() removal: REVERTED (caused OOM/GC storms)
+- Q16 OOM: pre-existing issue, causes Q17-Q24 failures in some benchmark runs
+
+### Decisions
+1. **Q36 filtered parallelism KEPT**: Minimal 2-line change — only disable the 500K ordinal limit for MatchAllDocsQuery, not filtered queries. Filtered queries touch few docs so per-segment ordinal arrays are feasible.
+2. **Q14 N-key varchar parallelism REVERTED**: HashMap<MergedGroupKey> merge overhead (BytesRefKey allocation, hash computation) exceeds the parallelism benefit for moderate-cardinality GROUP BY (~18K groups).
+3. **System.gc() removal REVERTED**: Without GC hints after large GROUP BY operations, old gen fills up and causes circuit breaker trips or OOM on subsequent queries.
+4. **Parallel expr-key GROUP BY KEPT**: Multi-segment parallelism for expression-key GROUP BY path. Uses Weight+Scorer per segment, ordinal pre-computation, and worker-local HashMap merge.
+5. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: 15 iterations of optimization have exhausted code-level improvements. Remaining gap is fundamental Lucene DocValues overhead. Need m5.8xlarge (32 vCPU) or architectural changes.

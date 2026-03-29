@@ -4942,11 +4942,74 @@ public final class FusedGroupByAggregate {
             }
           }
         } else {
-          for (int doc = 0; doc < maxDoc; doc++) {
-            collectFlatSingleKeyDocWithLength(
-                doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
-                accType, accOffset, numericAggDvs, lengthVarcharDvs,
-                ordLengthMaps, aggApplyLength, bucket, numBuckets);
+          // hasApplyLen path: check if we can use sequential nextDoc() lockstep
+          boolean allAggDense = true;
+          for (int i = 0; i < numAggs; i++) {
+            if (!isCountStar[i]) {
+              if (aggApplyLength[i] && lengthVarcharDvs[i] == null) { allAggDense = false; break; }
+              if (!aggApplyLength[i] && numericAggDvs[i] == null) { allAggDense = false; break; }
+            }
+          }
+          if (allAggDense && numBuckets <= 1) {
+            // Sequential lockstep for MatchAll + LENGTH aggs
+            int keyDoc = dv0.nextDoc();
+            int[] aggDocPos = new int[numAggs];
+            int[] lenDocPos = new int[numAggs];
+            for (int i = 0; i < numAggs; i++) {
+              if (isCountStar[i]) continue;
+              if (aggApplyLength[i]) {
+                lenDocPos[i] = lengthVarcharDvs[i].nextDoc();
+              } else {
+                aggDocPos[i] = numericAggDvs[i].nextDoc();
+              }
+            }
+            for (int doc = 0; doc < maxDoc; doc++) {
+              long key0 = 0;
+              if (keyDoc == doc) {
+                key0 = dv0.nextValue();
+                keyDoc = dv0.nextDoc();
+              }
+              int slot = flatMap.findOrInsert(key0);
+              int base = slot * slotsPerGroup;
+              for (int i = 0; i < numAggs; i++) {
+                int off = base + accOffset[i];
+                if (isCountStar[i]) {
+                  flatMap.accData[off]++;
+                  continue;
+                }
+                if (aggApplyLength[i]) {
+                  if (lenDocPos[i] == doc) {
+                    int ord = (int) lengthVarcharDvs[i].nextOrd();
+                    long rawVal = (ordLengthMaps[i] != null && ord < ordLengthMaps[i].length)
+                        ? ordLengthMaps[i][ord]
+                        : lengthVarcharDvs[i].lookupOrd(ord).length;
+                    lenDocPos[i] = lengthVarcharDvs[i].nextDoc();
+                    switch (accType[i]) {
+                      case 0: flatMap.accData[off]++; break;
+                      case 1: flatMap.accData[off] += rawVal; break;
+                      case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+                    }
+                  }
+                } else {
+                  if (aggDocPos[i] == doc) {
+                    long rawVal = numericAggDvs[i].nextValue();
+                    aggDocPos[i] = numericAggDvs[i].nextDoc();
+                    switch (accType[i]) {
+                      case 0: flatMap.accData[off]++; break;
+                      case 1: flatMap.accData[off] += rawVal; break;
+                      case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            for (int doc = 0; doc < maxDoc; doc++) {
+              collectFlatSingleKeyDocWithLength(
+                  doc, dv0, flatMap, slotsPerGroup, numAggs, isCountStar,
+                  accType, accOffset, numericAggDvs, lengthVarcharDvs,
+                  ordLengthMaps, aggApplyLength, bucket, numBuckets);
+            }
           }
         }
       } else if (liveDocs == null) {

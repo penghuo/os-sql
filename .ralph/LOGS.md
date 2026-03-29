@@ -277,3 +277,35 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. Timing instrumentation KEPT: valuable for understanding bottlenecks
 4. Fundamental finding: Lucene DocValues access is 3-10x slower than ClickHouse columnar for full-table scans. Code optimizations alone cannot close this gap for most queries.
 5. Borderline queries (Q14, Q29, Q30) are the most achievable targets — need 0.03-0.36s savings each
+
+## Iteration 10 — 2026-03-29T00:00-01:42Z
+
+### What I Did
+1. Ran fresh baseline benchmark: 20/43 within 2x (Q19-Q23 FAILED due to Q18 heap exhaustion)
+2. Fixed benchmark script: added cache clear after each query + 3s sleep after failed queries
+3. Re-ran benchmark: 25/43 within 2x (Q19-Q23 recovered)
+4. Analyzed all 18 above-2x queries: categorized as borderline (4), medium (9), hard (5)
+5. Explored COUNT(DISTINCT) dispatch logic — fusion already exists for 2-key numeric
+6. Explored executeSingleKeyNumericFlat — already parallel across segments, bottleneck is hash map
+7. Explored hash-partitioned aggregation — already exists for overflow cases
+8. Implemented count-only merge for grouped COUNT(DISTINCT):
+   - countMergedGroupSets: uses extras LongOpenHashSet for dedup across smaller sets
+   - countMergedGroupSetsArray: same for array-based sets
+   - Applied to both numeric-keyed and VARCHAR-keyed paths
+9. Fixed bug in initial count-only implementation (was double-counting across smaller sets)
+10. Attempted bitset lockstep for filtered GROUP BY — REVERTED (EOFException on two-key DocValues)
+11. Ran full correctness (39/43) and benchmark (25/43) validation
+
+### Results
+- Score: 25/43 within 2x (stable from baseline)
+- Correctness: 39/43 PASS (no regressions)
+- Q08 merge: 700ms → 520ms (-26%)
+- Q29 fluctuates between 1.98x and 2.21x (at 2x boundary)
+- Bitset lockstep causes EOFException on two-key DocValues — disabled
+
+### Decisions
+1. Count-only merge KEPT: reduces merge time but doesn't flip queries under 2x
+2. Bitset lockstep REVERTED: causes EOFException, needs deeper investigation
+3. Fundamental finding: Lucene DocValues access is 3-10x slower than ClickHouse columnar
+4. Shard execution dominates for all above-2x queries — code optimizations alone insufficient
+5. Need architectural changes (columnar cache, SIMD, pre-aggregation) to reach ≥38/43

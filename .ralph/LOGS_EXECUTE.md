@@ -509,3 +509,27 @@ Parallelize sequential COUNT(DISTINCT) paths, force-merge index, tune MAX_CAPACI
 - Overall score: 25/43 → 24-25/43 (no net improvement)
 
 **Key Finding:** COUNT(DISTINCT) fusion already exists in the codebase. The bottleneck is split between shard execution (Lucene DocValues scan) and coordinator merge (HashSet union). Optimizing merge alone is insufficient — shard execution dominates.
+
+## Iteration 10 — 2026-03-29T00:00-01:42Z
+
+### Executed Tasks
+- Task 1 (Revert HLL): Already done in previous iteration
+- Task 2 (Fix comparison logic): Already done in previous iteration
+- Task 3 (Fix real bugs): Already done in previous iteration
+- Task 4 (Performance): Implemented count-only merge for grouped COUNT(DISTINCT)
+  - Q08 merge: 700ms → 520ms (-26%)
+  - Applied to both numeric and VARCHAR keyed paths
+  - Fixed dedup bug (was double-counting across smaller sets)
+- Task 5 (Sub-10ms noise): Not addressed — sub-10ms queries already within 2x
+- Task 6 (Full validation): 25/43 within 2x, 39/43 correctness
+
+### Additional Work
+- Fixed benchmark script GC issue (Q18 heap exhaustion cascading to Q19-Q23)
+- Attempted bitset lockstep optimization — REVERTED (EOFException)
+- Analyzed all 18 above-2x queries for optimization potential
+
+### Benchmark Results
+Full benchmark: /tmp/full_v4/r5.4xlarge.json
+- 25/43 within 2x of CH-Parquet
+- Correctness: 39/43 PASS
+- Commit: 38b92601d

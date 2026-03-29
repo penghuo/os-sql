@@ -170,3 +170,68 @@ Q30(2.44x) Q35(3.96x) Q36(5.83x) Q39(27.80x)
 - Full benchmark: /tmp/full_v9_final/r5.4xlarge.json (warmup=3, tries=5)
 - Correctness: 39/43 PASS (/tmp/correctness_v9.log)
 - Commit: f423f8d29 (merge optimization + timing instrumentation)
+
+## Iteration 10 — 2026-03-29T01:42Z
+
+status: WORKING
+iteration: 10
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (stable from baseline)
+- Correctness: 39/43 PASS (unchanged)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 48GB heap, 4 shards, 4 segments/shard
+
+### Queries Within 2x (25)
+Q00(0.36x) Q01(0.16x) Q03(1.98x) Q06(0.14x) Q07(0.31x) Q10(1.29x) Q12(0.60x)
+Q17(0.01x) Q19(0.09x) Q20(0.01x) Q21(0.02x) Q22(0.09x) Q23(0.00x) Q24(0.03x)
+Q25(1.65x) Q26(0.04x) Q31(1.11x) Q32(1.74x) Q33(0.35x) Q34(0.38x) Q37(0.39x)
+Q38(0.69x) Q40(0.23x) Q41(0.81x) Q42(0.50x)
+
+### Queries Above 2x (18, sorted by ratio)
+Q27(2.16x) Q29(2.21x) Q14(2.21x) Q30(2.52x) Q28(3.05x) Q02(3.80x) Q08(4.36x)
+Q35(4.43x) Q05(4.43x) Q04(5.31x) Q09(5.44x) Q36(6.34x) Q16(7.37x) Q13(7.58x)
+Q18(10.16x) Q11(13.14x) Q15(25.13x) Q39(27.31x)
+
+### Changes Made
+1. Fixed benchmark script: added cache clear + sleep after failed queries to prevent Q18 heap exhaustion cascading
+2. Implemented count-only merge for grouped COUNT(DISTINCT): countMergedGroupSets/countMergedGroupSetsArray
+3. Attempted bitset lockstep for filtered GROUP BY — REVERTED (causes EOFException on two-key DocValues)
+
+### Key Findings
+1. Q18 heap exhaustion (50GB+) causes Q19-Q23 to fail in full benchmark — fixed with GC pause
+2. Count-only merge reduces Q08 merge time by 26% (700ms → 520ms) but doesn't flip any query under 2x
+3. Shard execution dominates for all above-2x queries (70-99% of total time)
+4. Fundamental gap: Lucene DocValues 3-10x slower than ClickHouse columnar for full-table scans
+5. Borderline queries Q14(2.21x), Q27(2.16x), Q29(2.21x) fluctuate near 2x boundary
+
+### Next Steps
+1. Performance target NOT MET (25/43 vs ≥38/43)
+2. Need architectural changes to close the Lucene DocValues gap
+3. Possible approaches: columnar cache, SIMD vectorization, pre-aggregation
+4. Borderline queries need consistent sub-2x performance
+
+## Iteration 10 Final — 2026-03-29T02:12Z
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (stable)
+- Correctness: 39/43 PASS
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 48GB heap, 4 shards, 4 segments/shard
+
+### Changes Made This Iteration
+1. Fixed benchmark script: cache clear + sleep after failed queries (prevents Q18 cascade)
+2. Count-only merge for grouped COUNT(DISTINCT): Q08 merge 700ms → 520ms (-26%)
+3. Columnar cache for single-key numeric COUNT(*) GROUP BY: Q15 ~4% improvement
+4. Attempted bitset lockstep for filtered GROUP BY: REVERTED (EOFException)
+
+### Key Finding
+The 25/43 → 38/43 gap requires 13 more queries within 2x. The remaining 18 queries are 2.06x-26.55x slower. The bottleneck is fundamental: Lucene DocValues access is 3-10x slower than ClickHouse columnar format for full-table scans. Code optimizations within the DQE can improve merge time and reduce overhead, but cannot close the per-thread DocValues throughput gap.
+
+### Achievable vs Not Achievable
+- Q29 (2.06x): At the boundary, fluctuates between 1.98x-2.21x. Could flip with noise.
+- Q27 (2.17x), Q14 (2.21x): Need 8-10% improvement. Possible with targeted optimizations.
+- Q30 (2.46x): Needs 19% improvement. Difficult without bitset lockstep fix.
+- Q02-Q39 (3.17x-26.55x): Need 37-93% improvement. NOT achievable with code optimizations alone.
+
+### Commits
+- 38b92601d: count-only merge + benchmark GC fix
+- 015b64bc5: columnar cache for single-key numeric COUNT(*)

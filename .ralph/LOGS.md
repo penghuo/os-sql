@@ -330,3 +330,60 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. Near-MatchAll REVERTED: SortedSetDocValues ordinal handling needs more investigation
 4. Performance target (≥38/43) NOT achievable with code optimizations alone on r5.4xlarge (16 vCPU)
 5. Fundamental bottleneck: Lucene DocValues 3-10x slower than ClickHouse columnar for full-table scans
+
+## Iteration 11 — 2026-03-29T04:46-09:10Z
+
+### What I Did
+1. Ran fresh baseline benchmark: 26/43 within 2x (Q27 was outlier at 0.98x, actually 2.13x)
+2. Explored COUNT(DISTINCT) dispatch logic — fusion already exists in codebase
+3. Explored Q15 execution path — bottleneck is FlatSingleKeyMap with 17M unique UserIDs
+4. Implemented FlatSingleKeyMap sentinel optimization (removed occupied[] array)
+5. Implemented doc-range parallelism for COUNT(*)-only MatchAll path
+6. Implemented columnar cache for MatchAll VARCHAR COUNT(DISTINCT) path
+7. Tested and reverted filtered path columnar cache (counterproductive)
+8. Tested MAX_CAPACITY=4M: Q15 6.9x but Q27 regressed 404%
+9. Tested MAX_CAPACITY=8M: Q15 16x but Q27 regressed
+10. Tested cardinality sampling: Q27 fixed but Q15 regressed to 88s
+11. Reverted to MAX_CAPACITY=16M with simple numBuckets calculation
+12. Ran correctness (39/43) and full benchmark (25/43)
+
+### Results
+- Q15: 101x → 30x (68% faster from FlatSingleKeyMap optimization)
+- Q14: 2.90x → 2.23x (23% faster)
+- Q30: 5.39x → 2.58x (52% faster)
+- Q32: 1.94x → 1.88x (3% faster)
+- Q16: 7.56x → 6.79x (10% faster)
+- Net score: 25/43 (stable, Q29 borderline fluctuation)
+- Correctness: 39/43 (no regression)
+
+### Decisions
+1. FlatSingleKeyMap sentinel optimization KEPT: removes occupied[] array, uses EMPTY_KEY
+2. Doc-range parallelism KEPT: helps when numBuckets=1 (low-cardinality keys)
+3. Columnar cache for MatchAll VARCHAR COUNT(DISTINCT) KEPT
+4. Filtered path columnar cache REVERTED: loads full column for selective filters
+5. MAX_CAPACITY changes REVERTED: 4M/8M help Q15 but break Q27
+6. Cardinality sampling REVERTED: overhead negates benefits
+7. Fundamental finding: Lucene DocValues 3-10x slower than ClickHouse columnar
+8. Performance target (≥38/43) NOT achievable with code optimizations alone
+
+## Iteration 11 Final — 2026-03-29T09:15Z
+
+### What I Did (continued)
+13. Verified Q27 regression is pre-existing (3.8s with original code too — baseline 1.76s was outlier)
+14. Analyzed Q29 timing: parse=0ms, shard=223ms, merge=0ms — all DocValues overhead
+15. Analyzed Q14 timing: parse=0ms, shard=2409ms, merge=0ms — filter evaluation + OrdinalMap overhead
+16. Confirmed fundamental bottleneck: Lucene DocValues 3-10x slower than ClickHouse columnar
+
+### Key Findings
+1. Q15 101x→30x improvement came from FlatSingleKeyMap occupied[] removal (sentinel optimization)
+2. MAX_CAPACITY tuning is a tradeoff: smaller = better cache locality for high-cardinality, worse for low-cardinality
+3. Cardinality sampling adds overhead that negates benefits
+4. Filtered path columnar cache is counterproductive (loads full column for selective filters)
+5. Q14's 2.4s for 10K matching docs is dominated by filter evaluation (scanning 100M docs)
+6. Q29's 223ms for 89 SUMs is dominated by DocValues reading (100M rows × 1 column)
+7. Remaining 18 above-2x queries are fundamentally limited by Lucene DocValues overhead
+
+### Decisions
+- Performance target (≥38/43) NOT achievable with code optimizations alone
+- Architectural changes needed: columnar storage format, vectorized execution, or pre-aggregation
+- Realistic target: ~28-30/43 with aggressive micro-optimizations

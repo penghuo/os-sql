@@ -533,3 +533,21 @@ Full benchmark: /tmp/full_v4/r5.4xlarge.json
 - 25/43 within 2x of CH-Parquet
 - Correctness: 39/43 PASS
 - Commit: 38b92601d
+
+## Iteration 11 — 2026-03-29T04:46-09:10Z
+
+### Executed Tasks
+- Task 0 (Baseline): DONE — 26/43 within 2x on r5.4xlarge
+- Task 1 (COUNT(DISTINCT) Fusion): EXPLORED — fusion already exists in codebase, bottleneck is shard execution speed
+- Task 2 (Parallelize executeSingleKeyNumericFlat): PARTIAL — doc-range parallelism implemented but only activates for numBuckets=1
+- Task 3-7: NOT STARTED
+
+### Code Changes
+- Commit 279d05c16: FlatSingleKeyMap sentinel optimization + doc-range parallelism + columnar cache
+- Files modified: FusedGroupByAggregate.java, TransportShardExecuteAction.java
+
+### Benchmark Results
+Full benchmark: /tmp/bench_v7_clean/r5.4xlarge.json
+- 25/43 within 2x of CH-Parquet (stable from baseline)
+- Correctness: 39/43 PASS (no regression)
+- Key improvements: Q15 101x→30x, Q14 2.90x→2.23x, Q30 5.39x→2.58x

@@ -275,3 +275,53 @@ Q18(9.69x) Q11(12.21x) Q15(26.02x) Q39(30.34x)
 - Full benchmark: /tmp/full_v6_final/r5.4xlarge.json (warmup=3, tries=5)
 - Correctness: 39/43 PASS (/tmp/correctness_final.log)
 - Commits: 38b92601d (merge optimization), 015b64bc5 (columnar cache), 3f32f8db5 (sequential lockstep)
+
+## Iteration 11 — 2026-03-29T09:10Z
+
+status: WORKING
+iteration: 11
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (stable from baseline)
+- Correctness: 39/43 PASS (no regression)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 4 shards, 4 segments/shard
+
+### Queries Within 2x (25)
+Q00(0.36x) Q01(0.14x) Q03(1.91x) Q06(0.14x) Q07(0.31x) Q10(1.40x) Q12(0.63x)
+Q17(0.01x) Q19(0.08x) Q20(0.01x) Q21(0.02x) Q22(0.04x) Q23(0.00x) Q24(0.02x)
+Q25(1.76x) Q26(0.04x) Q31(1.19x) Q32(1.88x) Q33(0.32x) Q34(0.33x) Q37(0.39x)
+Q38(0.57x) Q40(0.23x) Q41(0.74x) Q42(0.43x)
+
+### Queries Above 2x (18, sorted by ratio)
+Q27(2.13x) Q29(2.22x) Q14(2.23x) Q30(2.58x) Q28(3.25x) Q02(3.78x) Q35(4.14x)
+Q08(4.44x) Q09(5.16x) Q05(5.37x) Q04(5.42x) Q36(6.07x) Q16(6.79x) Q13(7.85x)
+Q18(9.73x) Q11(12.47x) Q39(27.02x) Q15(30.08x)
+
+### Changes Made
+1. FlatSingleKeyMap: removed occupied[] boolean array, using EMPTY_KEY sentinel
+2. Doc-range parallelism for COUNT(*)-only MatchAll path (not activated for Q15 since numBuckets=2)
+3. MatchAll VARCHAR COUNT(DISTINCT) columnar cache in TransportShardExecuteAction
+4. Reverted filtered path columnar cache (counterproductive for selective filters)
+5. Tested MAX_CAPACITY=4M (Q15: 3.6s/6.9x but Q27 regressed 404%)
+6. Tested MAX_CAPACITY=8M (Q15: 8.3s/16x but Q27 regressed)
+7. Tested cardinality sampling (Q27 fixed but Q15 regressed to 88s due to sampling overhead)
+8. Reverted to MAX_CAPACITY=16M with totalDocs/MAX_CAPACITY numBuckets
+
+### Key Findings
+1. Q15 improvement (101x → 30x) came from FlatSingleKeyMap occupied[] removal
+2. MAX_CAPACITY reduction helps Q15 dramatically (4M: 6.9x, 8M: 16x) but hurts low-cardinality queries
+3. Cardinality sampling adds overhead that negates benefits
+4. Filtered path columnar cache is counterproductive (loads full column for selective filters)
+5. Q27 baseline was 3.8s (not 1.76s as previously recorded — that was an outlier)
+6. Fundamental bottleneck: Lucene DocValues 3-10x slower than ClickHouse columnar
+
+### Next Steps
+1. Need adaptive MAX_CAPACITY without sampling overhead
+2. Borderline queries Q14(2.23x), Q29(2.22x), Q27(2.13x) need small improvements
+3. Q30(2.58x) improved 52% but still above 2x
+4. Performance target NOT MET (25/43 vs ≥38/43)
+
+### Evidence
+- Full benchmark: /tmp/bench_v7_clean/r5.4xlarge.json (warmup=3, tries=5)
+- Correctness: 39/43 PASS (/tmp/correctness_v7.log)
+- Commit: 279d05c16

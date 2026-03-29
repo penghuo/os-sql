@@ -309,3 +309,24 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. Fundamental finding: Lucene DocValues access is 3-10x slower than ClickHouse columnar
 4. Shard execution dominates for all above-2x queries — code optimizations alone insufficient
 5. Need architectural changes (columnar cache, SIMD, pre-aggregation) to reach ≥38/43
+
+## Iteration 10 Final — 2026-03-29T02:46Z
+
+### What I Did
+1. Implemented columnar cache for single-key numeric COUNT(*) GROUP BY (Q15: ~4% improvement)
+2. Implemented sequential lockstep for MatchAll + LENGTH aggregation path
+3. Attempted near-MatchAll optimization for filtered GROUP BY — REVERTED (ArrayIndexOutOfBoundsException)
+4. Ran final full benchmark (25/43) and correctness (39/43)
+
+### Results
+- Score: 25/43 within 2x (stable from baseline)
+- Correctness: 39/43 PASS (no regressions)
+- Q15: 13.5s → 12.5s (~4% from columnar cache, hash map operations dominate)
+- Near-MatchAll optimization caused ArrayIndexOutOfBoundsException in SortedSetDocValues ordinal lookup
+
+### Decisions
+1. Columnar cache KEPT: small improvement, enables future SIMD vectorization
+2. Sequential lockstep KEPT: helps MatchAll + LENGTH queries
+3. Near-MatchAll REVERTED: SortedSetDocValues ordinal handling needs more investigation
+4. Performance target (≥38/43) NOT achievable with code optimizations alone on r5.4xlarge (16 vCPU)
+5. Fundamental bottleneck: Lucene DocValues 3-10x slower than ClickHouse columnar for full-table scans

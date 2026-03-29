@@ -235,3 +235,43 @@ The 25/43 → 38/43 gap requires 13 more queries within 2x. The remaining 18 que
 ### Commits
 - 38b92601d: count-only merge + benchmark GC fix
 - 015b64bc5: columnar cache for single-key numeric COUNT(*)
+
+## Final State — Iteration 10
+
+status: WORKING
+iteration: 10
+
+### Current State
+- Score: 25/43 within 2x of CH-Parquet (unchanged from baseline)
+- Correctness: 39/43 PASS (unchanged)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 4 shards, 4 segments/shard
+
+### Queries Within 2x (25)
+Q00(0.44x) Q01(0.16x) Q03(1.74x) Q06(0.14x) Q07(0.36x) Q10(1.36x) Q12(0.60x)
+Q17(0.01x) Q19(0.08x) Q20(0.01x) Q21(0.02x) Q22(0.04x) Q23(0.00x) Q24(0.03x)
+Q25(1.62x) Q26(0.04x) Q31(1.14x) Q32(1.78x) Q33(0.31x) Q34(0.33x) Q37(0.47x)
+Q38(0.57x) Q40(0.23x) Q41(0.73x) Q42(0.59x)
+
+### Queries Above 2x (18, sorted by ratio)
+Q27(2.21x) Q29(2.28x) Q30(2.34x) Q14(2.57x) Q28(3.06x) Q02(3.34x) Q35(3.95x)
+Q08(4.38x) Q05(5.18x) Q09(5.28x) Q04(5.31x) Q16(6.21x) Q36(6.67x) Q13(7.87x)
+Q18(9.69x) Q11(12.21x) Q15(26.02x) Q39(30.34x)
+
+### Key Findings from This Iteration
+1. **Timing instrumentation** revealed shard execution dominates (70-99% of total time)
+2. **Coordinator merge** is significant only for COUNT(DISTINCT): Q04 merge=674ms, Q05 merge=1992ms
+3. **Merge optimization** helped Q04 (-12%), Q05 (-5%), Q08 (-6%) but not enough to flip any query
+4. **Q29 at 2.01x** — just 1ms over the 2x threshold, within measurement noise
+5. **Fundamental gap**: Lucene DocValues access is 3-10x slower than ClickHouse columnar format
+6. **GC pressure** from Q16/Q18 (high-cardinality GROUP BY) can cause circuit breaker failures
+
+### Next Steps
+1. Target ≥38/43 requires 13 more queries within 2x — NOT achievable with code optimizations alone
+2. Borderline queries Q29(2.28x), Q27(2.21x), Q30(2.34x) are closest to flipping
+3. Architectural changes needed: columnar storage format, vectorized execution, or pre-aggregation
+4. Consider reducing target to ≥30/43 as a more realistic goal
+
+### Evidence
+- Full benchmark: /tmp/full_v6_final/r5.4xlarge.json (warmup=3, tries=5)
+- Correctness: 39/43 PASS (/tmp/correctness_final.log)
+- Commits: 38b92601d (merge optimization), 015b64bc5 (columnar cache), 3f32f8db5 (sequential lockstep)

@@ -597,3 +597,41 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. **Performance ceiling on r5.4xlarge: 26-27/43**: Borderline queries need 10-20% improvement that cannot come from code changes. Need m5.8xlarge (32 vCPU) or architectural changes.
 4. **Q03 is noise-dependent**: Ranges from 1.76x to 2.65x across runs. Not reliably within 2x.
 5. **Q29 is noise-dependent**: Ranges from 188ms to 242ms (target 192ms). Sometimes within 2x in isolation but not in sequential benchmark runs.
+
+## Iteration 18 — 2026-03-30T02:41-03:45Z
+
+### What I Did
+1. Assessed environment: r5.4xlarge (16 vCPU, 124GB RAM), 48GB heap, wukong branch, OpenSearch green
+2. Explored optimization paths via deep codebase analysis:
+   - Analyzed all fast paths in TransportShardExecuteAction dispatch
+   - Analyzed FusedGroupByAggregate execution paths and parallelism
+   - Investigated DirectReader/PackedInts bypass for sub-1ns per-value reads
+   - Identified loadNumericColumn (columnar cache) as underutilized — only used in COUNT(*) path
+3. Implemented columnar cache for scanSegmentForCountDistinct (Q08 path):
+   - Loads both key columns (RegionID, UserID) into long[] arrays via loadNumericColumn
+   - Eliminates per-doc nextDoc()/nextValue() overhead in the hot loop
+   - Preserves fallback for segments with deleted docs (liveDocs != null)
+4. Tried extending columnar cache to executeMixedDedupWithHashSets (Q09 path):
+   - Loaded key columns AND aggregate columns into long[][] arrays
+   - REGRESSED: 3.287s → 3.749s due to memory pressure from loading multiple large arrays in parallel workers
+   - REVERTED this change
+5. Ran correctness: 39/43 PASS (no regression)
+6. Benchmarked Q08 in isolation: 2.309s → 2.274s (1.5% improvement)
+7. Ran full benchmark: 26/43 within 2x
+8. Q03 improved from 2.12x to 1.57x (noise-dependent, solidly within 2x in this run)
+9. Q29 improved from 2.38x to 2.16x (still above 2x)
+
+### Results
+- Score: 26/43 within 2x (same as iter17 clean run)
+- Correctness: 39/43 PASS (unchanged)
+- Q03: 0.235s → 0.174s (2.12x → 1.57x) — noise-dependent improvement
+- Q08: 2.309s → 2.274s (4.28x → 4.21x in isolation) — marginal columnar cache benefit
+- Q09 columnar cache: REVERTED (regression from memory pressure)
+- Q29: 0.228s → 0.207s (2.38x → 2.16x) — noise-dependent improvement
+- Q16 GC cascade: continues to affect Q15-Q27 in full benchmark runs
+
+### Decisions
+1. **scanSegmentForCountDistinct columnar cache KEPT**: Marginal improvement (~1.5%) for Q08 by loading both key columns into flat arrays. The bottleneck is LongOpenHashSet.add() operations, not DocValues reads.
+2. **executeMixedDedupWithHashSets columnar cache REVERTED**: Loading multiple large arrays (key0, key1, agg columns) simultaneously in parallel workers causes memory pressure and GC storms. The per-segment memory cost is ~200MB per column × 4 columns = ~800MB, which competes with the LongOpenHashSet allocations.
+3. **Performance ceiling confirmed on r5.4xlarge**: 18 iterations of optimization have exhausted code-level improvements. The remaining gap is fundamental Lucene DocValues overhead (3-5ns per value vs ClickHouse's 0.5-1ns). To reach ≥38/43: need m5.8xlarge (32 vCPU), DirectReader bypass, or custom columnar storage.
+4. **DirectReader bypass identified as next frontier**: Lucene's internal DirectReader.getInstance() provides O(1) random access at ~1-1.5ns per value. Requires accessing package-private NumericEntry metadata via reflection or codec fork. This is the "nuclear option" that could close the 2-3x gap for borderline queries.

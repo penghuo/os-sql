@@ -3584,87 +3584,32 @@ public final class FusedGroupByAggregate {
     // long[] array per hash map slot, eliminating ALL per-group object allocation.
     // This is critical for high-cardinality GROUP BY (Q16: ~25K groups per shard).
     if (canUseFlatAccumulators) {
-      // Estimate number of docs to decide if hash-partitioned aggregation is needed.
-      // Estimate number of docs to decide if hash-partitioned aggregation is needed.
-      // When numGroups could exceed MAX_CAPACITY, partition the key space into
-      // multiple buckets and execute sequential passes, each aggregating only one bucket.
-      int numBuckets;
-      try (org.opensearch.index.engine.Engine.Searcher estSearcher =
-          shard.acquireSearcher("dqe-fused-groupby-estimate")) {
-        long totalDocs = 0;
-        for (LeafReaderContext leaf : estSearcher.getIndexReader().leaves()) {
-          totalDocs += leaf.reader().maxDoc();
-        }
-        numBuckets = Math.max(1, (int) Math.ceil((double) totalDocs / FlatSingleKeyMap.MAX_CAPACITY));
-      }
-
-      if (numBuckets <= 1) {
+      // Try single-bucket first (fastest path: columnar + parallel doc-range).
+      // Only fall back to multi-bucket if the flat map overflows MAX_CAPACITY.
+      // Previous approach used totalDocs/MAX_CAPACITY which overestimates unique groups
+      // (e.g., 4.4M unique UserIDs in 25M docs would incorrectly trigger 2 buckets).
+      try {
         return executeSingleKeyNumericFlat(
-            shard,
-            query,
-            keyInfos,
-            specs,
-            columnTypeMap,
-            groupByKeys,
-            numAggs,
-            isCountStar,
-            accType,
-            sortAggIndex,
-            sortAscending,
-            topN,
-            0,
-            1);
-      } else {
-        // Multi-bucket partitioned aggregation: each pass aggregates only groups
-        // whose hash falls into the current bucket, keeping map size under MAX_CAPACITY.
-        // Parallelize across buckets when possible.
-        int parallelBuckets = Math.min(numBuckets, THREADS_PER_SHARD);
-        if (parallelBuckets > 1 && !"off".equals(PARALLELISM_MODE)) {
-          @SuppressWarnings("unchecked")
-          java.util.concurrent.CompletableFuture<List<Page>>[] futures =
-              new java.util.concurrent.CompletableFuture[numBuckets];
-          for (int b = 0; b < numBuckets; b++) {
-            final int bkt = b;
-            futures[b] =
-                java.util.concurrent.CompletableFuture.supplyAsync(
-                    () -> {
-                      try {
-                        return executeSingleKeyNumericFlat(
-                            shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
-                            numAggs, isCountStar, accType, sortAggIndex, sortAscending,
-                            topN, bkt, numBuckets);
-                      } catch (Exception e) {
-                        throw new RuntimeException(e);
-                      }
-                    },
-                    PARALLEL_POOL);
-          }
-          java.util.concurrent.CompletableFuture.allOf(futures).join();
-          List<Page> allBucketResults = new ArrayList<>();
-          for (var future : futures) {
-            allBucketResults.addAll(future.join());
-          }
-          if (allBucketResults.isEmpty()) return List.of();
-          if (allBucketResults.size() == 1) return allBucketResults;
-          return mergePartitionedPages(
-              allBucketResults, keyInfos, specs, columnTypeMap, groupByKeys,
-              numAggs, accType, sortAggIndex, sortAscending, topN);
+            shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+            numAggs, isCountStar, accType, sortAggIndex, sortAscending, topN, 0, 1);
+      } catch (RuntimeException overflowEx) {
+        if (overflowEx.getMessage() == null
+            || !overflowEx.getMessage().contains("GROUP BY exceeded memory limit")) {
+          throw overflowEx;
         }
-        // Sequential fallback
-        List<Page> allBucketResults = new ArrayList<>();
-        for (int bucket = 0; bucket < numBuckets; bucket++) {
-          List<Page> bucketPages =
-              executeSingleKeyNumericFlat(
-                  shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
-                  numAggs, isCountStar, accType, sortAggIndex, sortAscending,
-                  topN, bucket, numBuckets);
-          allBucketResults.addAll(bucketPages);
+        // Flat map overflowed — use single-pass multi-bucket (reads data once)
+        int numBuckets;
+        try (org.opensearch.index.engine.Engine.Searcher estSearcher =
+            shard.acquireSearcher("dqe-fused-groupby-estimate")) {
+          long totalDocs = 0;
+          for (LeafReaderContext leaf : estSearcher.getIndexReader().leaves()) {
+            totalDocs += leaf.reader().maxDoc();
+          }
+          numBuckets = Math.max(2, (int) Math.ceil((double) totalDocs / FlatSingleKeyMap.MAX_CAPACITY));
         }
-        if (allBucketResults.isEmpty()) return List.of();
-        if (allBucketResults.size() == 1) return allBucketResults;
-        return mergePartitionedPages(
-            allBucketResults, keyInfos, specs, columnTypeMap, groupByKeys,
-            numAggs, accType, sortAggIndex, sortAscending, topN);
+        return executeSingleKeyNumericFlatMultiBucket(
+            shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+            numAggs, isCountStar, accType, sortAggIndex, sortAscending, topN, numBuckets);
       }
     }
 
@@ -5278,7 +5223,10 @@ public final class FusedGroupByAggregate {
             futures[w] =
                 java.util.concurrent.CompletableFuture.supplyAsync(
                     () -> {
-                      FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup);
+                      // Pre-size to avoid resize cascades, capped at 1M to limit memory
+                      int docCount = endDoc - startDoc;
+                      int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 4_000_000);
+                      FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
                       scanDocRangeFlatSingleKeyCountStar(
                           keyValues, startDoc, endDoc, liveDocs,
                           localMap, accOffset[0], slotsPerGroup);
@@ -5329,10 +5277,13 @@ public final class FusedGroupByAggregate {
 
         for (int w = 0; w < numWorkers; w++) {
           final java.util.List<LeafReaderContext> mySegments = workerSegments[w];
+          final long myDocCount = workerDocCounts[w];
           futures[w] =
               java.util.concurrent.CompletableFuture.supplyAsync(
                   () -> {
-                    FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup);
+                    // Pre-size to avoid resize cascades, capped at 4M to limit memory
+                    int initCap = (int) Math.min(myDocCount * 10 / 7 + 1, 4_000_000);
+                    FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
                     try {
                       for (LeafReaderContext leafCtx : mySegments) {
                         scanSegmentFlatSingleKey(
@@ -6084,38 +6035,27 @@ public final class FusedGroupByAggregate {
 
     // === Flat accumulator path for two-key numeric ===
     if (canUseFlatAccumulators) {
-      // Estimate number of docs to decide if hash-partitioned aggregation is needed.
-      // Using totalDocs as upper bound for unique groups (conservative but safe).
-      int numBuckets;
-      try (org.opensearch.index.engine.Engine.Searcher estSearcher =
-          shard.acquireSearcher("dqe-fused-groupby-estimate")) {
-        long totalDocs = 0;
-        for (LeafReaderContext leaf : estSearcher.getIndexReader().leaves()) {
-          totalDocs += leaf.reader().maxDoc();
-        }
-        numBuckets = Math.max(1, (int) Math.ceil((double) totalDocs / FlatTwoKeyMap.MAX_CAPACITY));
-      }
-
-      if (numBuckets <= 1) {
+      // Try single-bucket first. Only fall back to multi-bucket on overflow.
+      // Previous approach used totalDocs/MAX_CAPACITY which overestimates unique groups.
+      try {
         return executeTwoKeyNumericFlat(
-            shard,
-            query,
-            keyInfos,
-            specs,
-            columnTypeMap,
-            groupByKeys,
-            numAggs,
-            isCountStar,
-            accType,
-            sortAggIndex,
-            sortAscending,
-            topN,
-            0,
-            1);
-      } else {
-        // Multi-bucket partitioned aggregation: each pass aggregates only groups
-        // whose hash falls into the current bucket, keeping map size under MAX_CAPACITY.
-        // Parallelize across buckets when possible.
+            shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+            numAggs, isCountStar, accType, sortAggIndex, sortAscending, topN, 0, 1);
+      } catch (RuntimeException overflowEx) {
+        if (overflowEx.getMessage() == null
+            || !overflowEx.getMessage().contains("GROUP BY exceeded memory limit")) {
+          throw overflowEx;
+        }
+        // Flat map overflowed — fall back to multi-bucket multi-pass
+        int numBuckets;
+        try (org.opensearch.index.engine.Engine.Searcher estSearcher =
+            shard.acquireSearcher("dqe-fused-groupby-estimate")) {
+          long totalDocs = 0;
+          for (LeafReaderContext leaf : estSearcher.getIndexReader().leaves()) {
+            totalDocs += leaf.reader().maxDoc();
+          }
+          numBuckets = Math.max(2, (int) Math.ceil((double) totalDocs / FlatTwoKeyMap.MAX_CAPACITY));
+        }
         int parallelBuckets = Math.min(numBuckets, THREADS_PER_SHARD);
         if (parallelBuckets > 1 && !"off".equals(PARALLELISM_MODE)) {
           @SuppressWarnings("unchecked")
@@ -6151,37 +6091,16 @@ public final class FusedGroupByAggregate {
         // Sequential fallback
         List<Page> allBucketResults = new ArrayList<>();
         for (int bucket = 0; bucket < numBuckets; bucket++) {
-          List<Page> bucketPages =
-              executeTwoKeyNumericFlat(
-                  shard,
-                  query,
-                  keyInfos,
-                  specs,
-                  columnTypeMap,
-                  groupByKeys,
-                  numAggs,
-                  isCountStar,
-                  accType,
-                  sortAggIndex,
-                  sortAscending,
-                  topN,
-                  bucket,
-                  numBuckets);
-          allBucketResults.addAll(bucketPages);
+          allBucketResults.addAll(executeTwoKeyNumericFlat(
+              shard, query, keyInfos, specs, columnTypeMap, groupByKeys,
+              numAggs, isCountStar, accType, sortAggIndex, sortAscending,
+              topN, bucket, numBuckets));
         }
         if (allBucketResults.isEmpty()) return List.of();
         if (allBucketResults.size() == 1) return allBucketResults;
         return mergePartitionedPages(
-            allBucketResults,
-            keyInfos,
-            specs,
-            columnTypeMap,
-            groupByKeys,
-            numAggs,
-            accType,
-            sortAggIndex,
-            sortAscending,
-            topN);
+            allBucketResults, keyInfos, specs, columnTypeMap, groupByKeys,
+            numAggs, accType, sortAggIndex, sortAscending, topN);
       }
     }
 
@@ -6501,10 +6420,12 @@ public final class FusedGroupByAggregate {
 
         for (int w = 0; w < numWorkers; w++) {
           final java.util.List<LeafReaderContext> mySegments = workerSegments[w];
+          final long myDocCount = workerDocCounts[w];
           futures[w] =
               java.util.concurrent.CompletableFuture.supplyAsync(
                   () -> {
-                    FlatTwoKeyMap localMap = new FlatTwoKeyMap(fSlotsPerGroup);
+                    int initCap = (int) Math.min(myDocCount * 10 / 7 + 1, 4_000_000);
+                    FlatTwoKeyMap localMap = new FlatTwoKeyMap(fSlotsPerGroup, initCap);
                     try {
                       for (LeafReaderContext leafCtx : mySegments) {
                         scanSegmentFlatTwoKey(
@@ -13205,8 +13126,14 @@ public final class FusedGroupByAggregate {
     final int slotsPerGroup;
 
     FlatTwoKeyMap(int slotsPerGroup) {
+      this(slotsPerGroup, INITIAL_CAPACITY);
+    }
+
+    FlatTwoKeyMap(int slotsPerGroup, int initialCapacity) {
       this.slotsPerGroup = slotsPerGroup;
-      this.capacity = INITIAL_CAPACITY;
+      int cap = Integer.highestOneBit(Math.max(initialCapacity, INITIAL_CAPACITY) - 1) << 1;
+      if (cap < INITIAL_CAPACITY) cap = INITIAL_CAPACITY;
+      this.capacity = cap;
       this.keys0 = new long[capacity];
       Arrays.fill(keys0, EMPTY_KEY);
       this.keys1 = new long[capacity];
@@ -13475,8 +13402,15 @@ public final class FusedGroupByAggregate {
     final int slotsPerGroup;
 
     FlatSingleKeyMap(int slotsPerGroup) {
+      this(slotsPerGroup, INITIAL_CAPACITY);
+    }
+
+    FlatSingleKeyMap(int slotsPerGroup, int initialCapacity) {
       this.slotsPerGroup = slotsPerGroup;
-      this.capacity = INITIAL_CAPACITY;
+      // Round up to next power of 2
+      int cap = Integer.highestOneBit(Math.max(initialCapacity, INITIAL_CAPACITY) - 1) << 1;
+      if (cap < INITIAL_CAPACITY) cap = INITIAL_CAPACITY;
+      this.capacity = cap;
       this.keys = new long[capacity];
       Arrays.fill(keys, EMPTY_KEY);
       this.accData = new long[capacity * slotsPerGroup];

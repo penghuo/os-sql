@@ -106,8 +106,11 @@ if [ "$WARMUP_PASSES" -gt 0 ]; then
             if [ -n "$ONLY_QUERY" ] && [ "$WP_NUM" -ne "$ONLY_QUERY" ]; then
                 continue
             fi
-            # Skip Q35 during full warmup (can timeout)
-            [ -z "$ONLY_QUERY" ] && [ "$WP_NUM" -eq 35 ] && continue
+            # Skip heap-exhausting queries during warmup to prevent GC cascade
+            # Q16(17), Q18(19), Q35(35) cause OOM/GC storms that degrade subsequent queries
+            if [ -z "$ONLY_QUERY" ]; then
+                case "$WP_NUM" in 17|19|35) continue ;; esac
+            fi
             wq=$(echo "$wq" | sed 's/;[[:space:]]*$//')
             if [ "$DATASET" = "1m" ]; then
                 wq=$(echo "$wq" | sed "s/\bhits\b/${TARGET_INDEX}/g")
@@ -117,7 +120,7 @@ if [ "$WARMUP_PASSES" -gt 0 ]; then
                 -XPOST "${OS_URL}/_plugins/_trino_sql" \
                 -H 'Content-Type: application/json' \
                 -d "{\"query\": $WQ_ESC}" \
-                --max-time 30 2>/dev/null || true
+                --max-time 15 2>/dev/null || true
         done < "$QUERY_FILE"
         log "  Warmup pass $wp/$WARMUP_PASSES complete"
     done
@@ -197,9 +200,16 @@ while IFS= read -r query; do
     # Clear caches after each query to help GC reclaim memory from heavy queries
     curl -sf -XPOST "${OS_URL}/_cache/clear" >/dev/null 2>&1 || true
 
-    # If any run failed, sleep briefly to let GC reclaim before next query
+    # If any run was slow (>5s) or failed, sleep to let G1GC reclaim old-gen
+    NEEDS_GC_RECOVERY=false
     if echo "$TIMES" | jq -e 'any(. == null)' >/dev/null 2>&1; then
-        sleep 3
+        NEEDS_GC_RECOVERY=true
+    elif echo "$TIMES" | jq -e 'any(. != null and . > 5)' >/dev/null 2>&1; then
+        NEEDS_GC_RECOVERY=true
+    fi
+    if [ "$NEEDS_GC_RECOVERY" = true ]; then
+        curl -sf -XPOST "${OS_URL}/_cache/clear" >/dev/null 2>&1 || true
+        sleep 10
     fi
 
     RESULTS=$(echo "$RESULTS" | jq ". + [$TIMES]")

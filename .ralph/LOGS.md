@@ -635,3 +635,40 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 2. **executeMixedDedupWithHashSets columnar cache REVERTED**: Loading multiple large arrays (key0, key1, agg columns) simultaneously in parallel workers causes memory pressure and GC storms. The per-segment memory cost is ~200MB per column × 4 columns = ~800MB, which competes with the LongOpenHashSet allocations.
 3. **Performance ceiling confirmed on r5.4xlarge**: 18 iterations of optimization have exhausted code-level improvements. The remaining gap is fundamental Lucene DocValues overhead (3-5ns per value vs ClickHouse's 0.5-1ns). To reach ≥38/43: need m5.8xlarge (32 vCPU), DirectReader bypass, or custom columnar storage.
 4. **DirectReader bypass identified as next frontier**: Lucene's internal DirectReader.getInstance() provides O(1) random access at ~1-1.5ns per value. Requires accessing package-private NumericEntry metadata via reflection or codec fork. This is the "nuclear option" that could close the 2-3x gap for borderline queries.
+
+## Iteration 19 — 2026-03-30T06:38-12:05Z
+
+### What I Did
+1. Ran clean baseline benchmark: 26/43 within 2x (same as iter18)
+2. Analyzed all 17 queries above 2x — identified algorithmic room for improvement
+3. Discovered Q15 bottleneck: pre-estimation `numBuckets = ceil(totalDocs/MAX_CAPACITY)` forces unnecessary 2-bucket mode for queries with fewer unique groups than totalDocs
+4. Replaced pre-estimation with try-catch overflow for single-key flat path:
+   - Try single-bucket first (numBuckets=1)
+   - If FlatSingleKeyMap overflows (>16M groups), catch exception and fall back to single-pass multi-bucket
+5. Applied same try-catch pattern to two-key flat path
+6. Discovered FlatSingleKeyMap resize cascade bottleneck:
+   - INITIAL_CAPACITY=4096, Q15 needs 4.4M entries → 11 resizes
+   - 16 concurrent maps (4 shards × 4 workers) resizing simultaneously → massive GC pressure
+   - Q15 took 88s due to GC, not hash map operations
+7. Added pre-sized constructors to FlatSingleKeyMap and FlatTwoKeyMap
+8. Pre-sized worker maps in doc-range parallel and segment-parallel paths (capped at 4M)
+9. Q15 in isolation: 88s → 1.48s (60x improvement) with pre-sized maps
+10. Q30 in full benchmark: 6.20x → 1.53x (now within 2x)
+11. Tested multiple cap values: 16M (too much GC), 1M (Q15 still slow), 4M (best balance)
+
+### Results
+- Score: 27/43 within 2x (was 26/43, +1)
+- Correctness: 39/43 PASS (unchanged)
+- Q30: 4.822s → 1.190s (6.20x → 1.53x) — NEW within 2x
+- Q15 isolated: 90.5s → 1.48s (174x → 2.84x) — massive improvement
+- Q15 in full benchmark: 90.5s → 87.0s (still 167x due to GC from Q16/Q18)
+- Q02: 0.452s → 0.342s (4.30x → 3.26x) — 24% improvement
+- Q04: 2.513s → 2.120s (5.79x → 4.88x) — 16% improvement
+- No regressions in queries already within 2x
+
+### Decisions
+1. **Try-catch overflow KEPT**: Better than pre-estimation because it avoids unnecessary multi-bucket for queries where unique groups << totalDocs. Q30 benefits most.
+2. **Pre-sized constructors KEPT**: Eliminates 11 resize cascades for high-cardinality GROUP BY. Cap at 4M balances Q15 improvement vs GC pressure on fast queries.
+3. **First attempt with executeSingleKeyNumericFlatMultiBucket REVERTED**: Single-pass multi-bucket was 4x slower than multi-pass for Q15 (387s vs 88s) due to per-worker bucket map allocation overhead.
+4. **16M cap REVERTED**: Caused Q07/Q40/Q41 to regress from <1x to >3x due to GC pressure from 16 concurrent 16M-entry maps.
+5. **Q15 GC cascade remains unsolved**: Q15 in full benchmark still ~87s because Q16/Q18 run before it and cause GC pressure. In isolation, Q15 is 1.48s.

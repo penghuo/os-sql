@@ -672,3 +672,39 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. **First attempt with executeSingleKeyNumericFlatMultiBucket REVERTED**: Single-pass multi-bucket was 4x slower than multi-pass for Q15 (387s vs 88s) due to per-worker bucket map allocation overhead.
 4. **16M cap REVERTED**: Caused Q07/Q40/Q41 to regress from <1x to >3x due to GC pressure from 16 concurrent 16M-entry maps.
 5. **Q15 GC cascade remains unsolved**: Q15 in full benchmark still ~87s because Q16/Q18 run before it and cause GC pressure. In isolation, Q15 is 1.48s.
+
+## Iteration 20 — 2026-03-30T12:09-13:20Z
+
+### What I Did
+1. Analyzed current state: 27/43 within 2x, 16 queries above 2x
+2. Identified two highest-ROI optimizations:
+   - Q15 GC cascade: TransportTrinoSqlAction has ZERO inter-query GC cleanup
+   - Q39 (26.76x): multi-segment BytesRefKey HashMap bottleneck in executeWithEvalKeys
+3. Added System.gc() hint in TransportTrinoSqlAction.java coordinator:
+   - After listener.onResponse() in both transport and local fast paths
+   - Gated by totalMergedRows > 10000 (matching shard executor pattern)
+4. Added global ordinals in FusedGroupByAggregate.java executeWithEvalKeys:
+   - Builds OrdinalMap for all VARCHAR keys (non-eval + inline eval) before segment loop
+   - Converts segment ordinals to global ordinals via segToGlobalMaps
+   - Enables flat long map path in multi-segment mode (zero BytesRefKey allocation)
+   - Uses lookupGlobalOrd for result-building phase
+5. Compiled: BUILD SUCCESSFUL
+6. Correctness: 39/43 PASS (no regression)
+7. Full benchmark: 27/43 within 2x (unchanged)
+
+### Results
+- Score: 27/43 within 2x (unchanged from iter19)
+- Correctness: 39/43 PASS (unchanged)
+- Q39: 3.83s → 2.14s (-44%, 26.76x → 14.98x) — global ordinals working
+- Q15: 87s → 88s (unchanged — GC hint helps subsequent queries, not Q15 itself)
+- Q25: 0.52s → 0.41s (-22%, 1.92x → 1.49x) — improved
+- Q30: 1.19s → 0.96s (-19%, 1.53x → 1.24x) — improved
+- Q31: 1.38s → 1.20s (-13%, 1.26x → 1.10x) — improved
+- Q12: 0.41s → 0.36s (-12%, 0.64x → 0.56x) — improved
+- No regressions in queries already within 2x
+
+### Decisions
+1. **Coordinator GC hint KEPT**: Helps queries running after heavy queries by reclaiming coordinator merge memory. Doesn't help Q15 itself (Q15 IS the heavy query).
+2. **Global ordinals for executeWithEvalKeys KEPT**: 44% improvement for Q39 by eliminating BytesRefKey allocation per doc in multi-segment mode. Enables flat long map path (zero-allocation open-addressing hash map) for all keys.
+3. **Q39 remaining bottleneck**: Even with global ordinals, Q39 is 14.98x. The URL column has 700K+ unique values within the filtered ~100K docs. The flat long map handles this but the sheer number of groups is the bottleneck.
+4. **Q15 GC cascade needs different approach**: The coordinator GC hint fires AFTER Q15 completes, which helps Q16+. But Q15 itself suffers from GC pressure during its own execution (4.4M groups × 16 concurrent maps). Need either: (a) streaming top-N during accumulation to bound memory, or (b) explicit GC before Q15 in benchmark runner.

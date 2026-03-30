@@ -25,6 +25,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.OrdinalMap;
 import org.apache.lucene.index.PointValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
@@ -1594,129 +1595,102 @@ public final class FusedScanAggregate {
       List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
 
       if (query instanceof MatchAllDocsQuery) {
-        // Separate segments with and without deletes
-        List<LeafReaderContext> noDeleteLeaves = new java.util.ArrayList<>();
-        List<LeafReaderContext> hasDeleteLeaves = new java.util.ArrayList<>();
+        // Global ordinals path: build OrdinalMap once (cached), iterate global ordinals
+        // to materialize each distinct string exactly once. Avoids duplicate String creation
+        // across segments (segment ordinals overlap → same string created N times in old path).
+        boolean hasDeletes = false;
         for (LeafReaderContext leafCtx : leaves) {
-          if (leafCtx.reader().getLiveDocs() == null) {
-            noDeleteLeaves.add(leafCtx);
-          } else {
-            hasDeleteLeaves.add(leafCtx);
+          if (leafCtx.reader().getLiveDocs() != null) {
+            hasDeletes = true;
+            break;
           }
         }
 
-        // Parallelize the no-deletes path across segments (ordinal iteration is O(valueCount))
-        int numWorkers =
-            Math.min(
-                Math.max(
-                    1,
-                    Runtime.getRuntime().availableProcessors()
-                        / Integer.getInteger("dqe.numLocalShards", 4)),
-                noDeleteLeaves.size());
-
-        if (numWorkers > 1 && noDeleteLeaves.size() > 1) {
-          // Parallel path: partition segments among workers using largest-first assignment
-          @SuppressWarnings("unchecked")
-          List<LeafReaderContext>[] workerSegments = new List[numWorkers];
-          long[] workerValueCounts = new long[numWorkers];
-          for (int i = 0; i < numWorkers; i++) {
-            workerSegments[i] = new java.util.ArrayList<>();
+        OrdinalMap ordinalMap = FusedGroupByAggregate.buildGlobalOrdinalMap(leaves, columnName);
+        if (ordinalMap != null && !hasDeletes) {
+          // No deletes + MatchAll: every global ordinal is used. Iterate once.
+          long globalOrdCount = ordinalMap.getValueCount();
+          SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+          for (int i = 0; i < leaves.size(); i++) {
+            segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
           }
+          distinctStrings = new java.util.HashSet<>((int) Math.min(globalOrdCount * 2, Integer.MAX_VALUE));
 
-          // Sort segments by valueCount descending, assign largest-first to lightest worker
-          java.util.List<LeafReaderContext> sortedLeaves =
-              new java.util.ArrayList<>(noDeleteLeaves);
-          sortedLeaves.sort(
-              (a, b) -> {
-                long vcA = 0, vcB = 0;
+          // Parallel resolution of global ordinals to strings
+          int numWorkers = Math.min(
+              Math.max(1, Runtime.getRuntime().availableProcessors()
+                  / Integer.getInteger("dqe.numLocalShards", 4)),
+              4);
+          if (numWorkers > 1 && globalOrdCount > 100_000) {
+            long chunkSize = (globalOrdCount + numWorkers - 1) / numWorkers;
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.CompletableFuture<String[]>[] futures =
+                new java.util.concurrent.CompletableFuture[numWorkers];
+            for (int w = 0; w < numWorkers; w++) {
+              final long start = w * chunkSize;
+              final long end = Math.min(start + chunkSize, globalOrdCount);
+              final int workerIdx = w;
+              futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
                 try {
-                  SortedSetDocValues dvA = a.reader().getSortedSetDocValues(columnName);
-                  if (dvA != null) vcA = dvA.getValueCount();
-                  SortedSetDocValues dvB = b.reader().getSortedSetDocValues(columnName);
-                  if (dvB != null) vcB = dvB.getValueCount();
+                  // Each worker needs its own DV instances (not thread-safe)
+                  SortedSetDocValues[] localDvs = new SortedSetDocValues[leaves.size()];
+                  for (int i = 0; i < leaves.size(); i++) {
+                    localDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+                  }
+                  String[] chunk = new String[(int)(end - start)];
+                  for (long g = start; g < end; g++) {
+                    int segIdx = ordinalMap.getFirstSegmentNumber(g);
+                    long segOrd = ordinalMap.getFirstSegmentOrd(g);
+                    BytesRef bytes = (localDvs[segIdx] != null)
+                        ? localDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+                    chunk[(int)(g - start)] = bytes.utf8ToString();
+                  }
+                  return chunk;
                 } catch (java.io.IOException e) {
                   throw new java.io.UncheckedIOException(e);
                 }
-                return Long.compare(vcB, vcA);
-              });
-          for (LeafReaderContext leaf : sortedLeaves) {
-            int lightest = 0;
-            for (int i = 1; i < numWorkers; i++) {
-              if (workerValueCounts[i] < workerValueCounts[lightest]) lightest = i;
+              }, FusedGroupByAggregate.getParallelPool());
             }
-            workerSegments[lightest].add(leaf);
-            try {
-              SortedSetDocValues dvLeaf = leaf.reader().getSortedSetDocValues(columnName);
-              if (dvLeaf != null) workerValueCounts[lightest] += dvLeaf.getValueCount();
-            } catch (java.io.IOException e) {
-              throw new java.io.UncheckedIOException(e);
+            java.util.concurrent.CompletableFuture.allOf(futures).join();
+            for (var future : futures) {
+              java.util.Collections.addAll(distinctStrings, future.join());
             }
-          }
-
-          // Each worker builds a local HashSet<String>, then we merge
-          @SuppressWarnings("unchecked")
-          java.util.concurrent.CompletableFuture<java.util.HashSet<String>>[] futures =
-              new java.util.concurrent.CompletableFuture[numWorkers];
-
-          for (int w = 0; w < numWorkers; w++) {
-            final List<LeafReaderContext> mySegments = workerSegments[w];
-            futures[w] =
-                java.util.concurrent.CompletableFuture.supplyAsync(
-                    () -> {
-                      java.util.HashSet<String> localSet = new java.util.HashSet<>();
-                      try {
-                        for (LeafReaderContext leafCtx : mySegments) {
-                          SortedSetDocValues dv =
-                              leafCtx.reader().getSortedSetDocValues(columnName);
-                          if (dv == null) continue;
-                          long valueCount = dv.getValueCount();
-                          for (long ord = 0; ord < valueCount; ord++) {
-                            localSet.add(dv.lookupOrd(ord).utf8ToString());
-                          }
-                        }
-                      } catch (java.io.IOException e) {
-                        throw new java.io.UncheckedIOException(e);
-                      }
-                      return localSet;
-                    },
-                    FusedGroupByAggregate.getParallelPool());
-          }
-
-          // Merge worker results
-          java.util.concurrent.CompletableFuture.allOf(futures).join();
-          for (var future : futures) {
-            distinctStrings.addAll(future.join());
+          } else {
+            for (long g = 0; g < globalOrdCount; g++) {
+              int segIdx = ordinalMap.getFirstSegmentNumber(g);
+              long segOrd = ordinalMap.getFirstSegmentOrd(g);
+              BytesRef bytes = (segDvs[segIdx] != null)
+                  ? segDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+              distinctStrings.add(bytes.utf8ToString());
+            }
           }
         } else {
-          // Sequential path for no-delete segments (single segment or single worker)
-          for (LeafReaderContext leafCtx : noDeleteLeaves) {
-            SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+          // Fallback: segments with deletes or no OrdinalMap — use per-segment ordinal iteration
+          for (LeafReaderContext leafCtx : leaves) {
+            LeafReader reader = leafCtx.reader();
+            Bits liveDocs = reader.getLiveDocs();
+            SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
             if (dv == null) continue;
             long valueCount = dv.getValueCount();
-            for (long ord = 0; ord < valueCount; ord++) {
-              distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+            if (liveDocs == null) {
+              // No deletes: all ordinals are used
+              for (long ord = 0; ord < valueCount; ord++) {
+                distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+              }
+            } else {
+              // Has deletes: track used ordinals via FixedBitSet
+              int maxDoc = reader.maxDoc();
+              FixedBitSet usedOrdinals = new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                  usedOrdinals.set((int) dv.nextOrd());
+                }
+              }
+              for (int ord = usedOrdinals.nextSetBit(0); ord != -1;
+                  ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+                distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
+              }
             }
-          }
-        }
-
-        // Sequential path for segments with deletes (liveDocs)
-        for (LeafReaderContext leafCtx : hasDeleteLeaves) {
-          LeafReader reader = leafCtx.reader();
-          Bits liveDocs = reader.getLiveDocs();
-          SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
-          if (dv == null) continue;
-          int maxDoc = reader.maxDoc();
-          FixedBitSet usedOrdinals =
-              new FixedBitSet((int) Math.min(dv.getValueCount(), Integer.MAX_VALUE));
-          for (int doc = 0; doc < maxDoc; doc++) {
-            if (liveDocs.get(doc) && dv.advanceExact(doc)) {
-              usedOrdinals.set((int) dv.nextOrd());
-            }
-          }
-          for (int ord = usedOrdinals.nextSetBit(0);
-              ord != -1;
-              ord = (ord + 1 < usedOrdinals.length()) ? usedOrdinals.nextSetBit(ord + 1) : -1) {
-            distinctStrings.add(dv.lookupOrd(ord).utf8ToString());
           }
         }
       } else {

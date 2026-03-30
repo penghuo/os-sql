@@ -12616,7 +12616,7 @@ public final class FusedGroupByAggregate {
   private static final java.util.concurrent.ConcurrentHashMap<Object, OrdinalMap>
       ORDINAL_MAP_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
-  private static OrdinalMap buildGlobalOrdinalMap(List<LeafReaderContext> leaves, String fieldName)
+  public static OrdinalMap buildGlobalOrdinalMap(List<LeafReaderContext> leaves, String fieldName)
       throws IOException {
     // Use the top-level IndexReader's CacheHelper key for collision-free identity.
     // LeafReaders don't change within a DirectoryReader's lifetime.

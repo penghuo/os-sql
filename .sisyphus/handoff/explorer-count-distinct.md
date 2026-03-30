@@ -1,87 +1,97 @@
-# COUNT(DISTINCT) Execution Path in DQE Engine
+# COUNT(DISTINCT) Dispatch Logic in TransportShardExecuteAction.java
 
-## 1. Plan Compilation & Step Assignment
+## 1. executePlan Dispatch Logic (line 194)
 
-**PlanOptimizer** (`PlanOptimizer.java:371-378`): `hasNonDecomposableAgg()` detects `COUNT(DISTINCT` in aggregate functions and forces `AggregationNode.Step.SINGLE`. This means shards do NOT run partial aggregation — they scan raw data.
+The `executePlan` method at line 194 unwraps `ProjectNode` → `AggregationNode` (line 204-210), then dispatches through these fast paths in order:
 
-**PlanFragmenter** (`PlanFragmenter.java:144-157`): For SINGLE step with GROUP BY + all-COUNT(DISTINCT) aggregates, builds a **dedup shard plan**:
-- Original: `GROUP BY (SearchPhrase) COUNT(DISTINCT UserID)` 
-- Shard plan: `GROUP BY (SearchPhrase, UserID) COUNT(*)` with `Step.PARTIAL`
-- Coordinator plan: `AggregationNode(SINGLE)` with original functions
+| Priority | Lines | Pattern | Method |
+|----------|-------|---------|--------|
+| 1 | 213-217 | Scalar COUNT(*) | `executeScalarCountStar` |
+| 2 | 222-232 | LimitNode→SortNode→TableScanNode | `executeSortedScan` |
+| 3 | 236-244 | Scalar agg (no GROUP BY), FusedScanAggregate.canFuse | `executeFusedScanAggregate` (line 930) |
+| 4 | 248-254 | Bare single numeric column scan | `executeDistinctValuesScanWithRawSet` (line 3005) |
+| 5 | 258-263 | Bare single VARCHAR column scan | `executeDistinctValuesScanVarcharWithRawSet` (line 3035) |
+| 6 | 267-274 | SUM(col+const) eval-agg | `executeFusedEvalAggregate` (line 952) |
+| 7 | 278-380 | **COUNT(DISTINCT) dedup plan** (N>=2 keys, PARTIAL step) | Multiple HashSet paths (see §3) |
+| 8 | 382-396 | Expression GROUP BY (REGEXP_REPLACE etc.) | `executeFusedExprGroupByAggregate` (line 2849) |
+| 9 | 399-407 | Ordinal-based GROUP BY | `executeFusedGroupByAggregate` (line 2816) |
+| 10 | 412-425 | GROUP BY with sort+limit | `executeFusedGroupByAggregateWithTopN` (line 2872) |
+| fallback | ~430+ | Generic operator pipeline | LucenePageSource → HashAggregationOperator |
 
-This dedup strategy reduces cross-shard data by eliminating duplicate (group_key, distinct_value) pairs per shard.
+## 2. Two-Level Calcite Plan Pattern for COUNT(DISTINCT)
 
-## 2. Shard Execution Dispatch
+Calcite decomposes `COUNT(DISTINCT x)` into two aggregation levels:
+- **Inner (PARTIAL)**: `GROUP BY (groupKeys..., x)` with `COUNT(*)` — produces dedup tuples
+- **Outer (FINAL)**: `GROUP BY (groupKeys...)` with `COUNT(*)` — counts distinct values
 
-**TransportShardExecuteAction** (`TransportShardExecuteAction.java:379-385`): The dedup shard plan is a `PARTIAL AggregationNode` with expanded GROUP BY keys. It hits the generic `FusedGroupByAggregate.canFuse()` check and routes to `executeFusedGroupByAggregate()`.
+The shard receives the **inner** plan (Step.PARTIAL) with N keys where the last key is the dedup key. The dispatch at line 278 checks:
+- `effectivePlan instanceof AggregationNode`
+- `aggNode.getStep() == Step.PARTIAL`
+- `aggNode.getGroupByKeys().size() >= 2`
+- `FusedGroupByAggregate.canFuse()`
 
-### Q13 Path (1 VARCHAR key: SearchPhrase + UserID)
-- Dedup keys: `[SearchPhrase, UserID]` → 1 VARCHAR key + 1 numeric key
-- Dispatch: `executeInternal()` → `hasVarchar=true` → `executeWithVarcharKeys()` (`FusedGroupByAggregate.java:1100`)
-- Aggregation: `COUNT(*)` only (accType=0), so `canUseFlatAccumulators=true` for the dedup plan
-- Data structure: flat `long[]` accumulators per ordinal group (no CountDistinctAccum at shard level)
+## 3. Existing Fast Paths for COUNT(DISTINCT)
 
-### Q11 Path (2 keys: MobilePhone numeric + MobilePhoneModel varchar + UserID)
-- Dedup keys: `[MobilePhone, MobilePhoneModel, UserID]` → has VARCHAR → `executeWithVarcharKeys()` (`FusedGroupByAggregate.java:1100`)
-- Aggregation: `COUNT(*)` only, `canUseFlatAccumulators=true` for the dedup plan
+### A. Scalar COUNT(DISTINCT numeric) — LongOpenHashSet (line 248-254)
+- Bare TableScanNode with single numeric column
+- Collects into `LongOpenHashSet`, attaches raw set to response
+- Method: `executeDistinctValuesScanWithRawSet` (line 3005)
 
-**Key insight**: Because PlanFragmenter decomposes COUNT(DISTINCT) into dedup GROUP BY + COUNT(*), the shard-level execution NEVER creates `CountDistinctAccum` objects. The accType=5 / `canUseFlatAccumulators=false` path is only relevant if the aggregation node retains `COUNT(DISTINCT)` directly (which doesn't happen for GROUP BY queries due to the dedup rewrite).
+### B. Scalar COUNT(DISTINCT varchar) — FixedBitSet ordinals (line 258-263)
+- Bare TableScanNode with single VARCHAR column
+- Uses `FixedBitSet` for ordinal-based dedup
+- Method: `executeDistinctValuesScanVarcharWithRawSet` (line 3035)
 
-## 3. Per-Group Data Structures (Shard Level)
+### C. 2-key numeric dedup — HashSet-per-group (line 307)
+- GROUP BY (key0, key1) where both numeric
+- Builds `Map<Long, LongOpenHashSet>` — key0 → set of key1 values
+- Method: `executeCountDistinctWithHashSets` (line 982)
 
-Since the shard plan is `GROUP BY (original_keys + distinct_col) COUNT(*)`:
-- **No HashSet/LongOpenHashSet per group** at shard level
-- Uses flat `long[]` accumulators (count only) or `CountStarAccum` depending on path
-- For Q13 with ~6M unique SearchPhrase values: the shard creates groups for unique `(SearchPhrase, UserID)` pairs, NOT 6M HashSets
+### D. 2-key VARCHAR+numeric dedup (line 316-322)
+- key0=VARCHAR, key1=numeric
+- Method: `executeVarcharCountDistinctWithHashSets` (line 2392)
 
-### CountDistinctAccum (only used in non-dedup path)
-Defined at `FusedGroupByAggregate.java:13094`:
-- For numeric non-double columns: `LongOpenHashSet` (initial capacity 16)
-- For VARCHAR/double columns: `HashSet<Object>`
-- Allocated per group via `createAccumulator()` at line 12610
+### E. N-key all-numeric dedup (line 330-342)
+- 3+ keys, all numeric
+- Outputs full dedup tuples for coordinator generic merge
+- Method: `executeNKeyCountDistinctWithHashSets` (line 1311)
 
-## 4. Top-N Optimization
+### F. N-key mixed-type dedup (line 344-360)
+- Last key (dedup) is numeric, some GROUP BY keys are VARCHAR
+- Uses `ObjectArrayKey` composite keys
+- Method: `executeMixedTypeCountDistinctWithHashSets` (line 1631)
 
-**No shard-level top-N for COUNT(DISTINCT) queries.** The dedup shard plan produces `GROUP BY (expanded_keys) COUNT(*)` which is a PARTIAL aggregation. The `buildShardPlanWithInflatedLimit()` path (`PlanFragmenter.java:287`) could apply inflated limits, but the dedup plan's expanded key set means the sort column (COUNT(DISTINCT)) doesn't exist at the shard level — it's computed at the coordinator.
+### G. Mixed dedup with SUM/COUNT accumulators (line 362-378)
+- 2-key with mixed SUM/COUNT aggregates (not just COUNT(*))
+- Method: `executeMixedDedupWithHashSets` (line 1913)
 
-The top-N heap selection (`FusedGroupByAggregate.java:3555-3610`) uses `getSortValue()` on `MergeableAccumulator`, which works for `CountDistinctAccum.getSortValue()` returning the set size. But this path is only hit when the shard plan has a Sort+Limit wrapping the aggregation, which the dedup rewrite doesn't produce.
+## 4. Fusion Intercept Point
 
-## 5. Coordinator Merge
+The COUNT(DISTINCT) dispatch block spans **lines 278-380**. The key decision tree:
+- Line 278: Entry guard (`AggregationNode`, `Step.PARTIAL`, `size >= 2`, `canFuse`)
+- Line 289: Branch on `isSingleCountStar` vs `isMixedDedup`
+- Line 296-342: Single COUNT(*) paths (2-key numeric → N-key numeric → mixed-type)
+- Line 362-378: Mixed dedup path
 
-**TransportTrinoSqlAction** (`TransportTrinoSqlAction.java:354-365`): Detects `isShardDedupCountDistinct()` and calls `mergeDedupCountDistinct()`.
+**Best intercept point for new fused paths**: Around **line 278-295** (before the existing sub-dispatch), or as new branches within the `isSingleCountStar` block at lines 296-342.
 
-**mergeDedupCountDistinct** (`TransportTrinoSqlAction.java:2109`):
-- **Stage 1**: FINAL merge across shards — deduplicates `(original_keys + distinct_col)` tuples, summing COUNT(*) values
-- **Stage 2**: Re-aggregate by original keys — counts distinct values per original group
+## 5. ClickBench SQL for Target Queries
 
-Fast paths:
-- All-numeric 2-key dedup: `mergeDedupCountDistinct2Key()` (line 2689) — flat `long[]` arrays, zero per-entry allocation
-- All-numeric N-key: open-addressing hash map with `long[]` keys (line 2163)
-- VARCHAR key: `mergeDedupCountDistinctVarcharKey()` (line 4182)
+| Query | SQL | COUNT(DISTINCT) Pattern |
+|-------|-----|------------------------|
+| Q04 | `SELECT AVG(UserID) FROM hits;` | No COUNT(DISTINCT) — scalar AVG |
+| Q05 | `SELECT COUNT(DISTINCT UserID) FROM hits;` | Scalar COUNT(DISTINCT numeric) — bare scan path |
+| Q08 | `SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC;` | No COUNT(DISTINCT) — GROUP BY with COUNT(*) |
+| Q09 | `SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10;` | 2-key numeric dedup: GROUP BY (RegionID, UserID) |
+| Q11 | `SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10;` | VARCHAR+numeric dedup: GROUP BY (MobilePhoneModel, UserID) |
+| Q13 | `SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;` | No COUNT(DISTINCT) — GROUP BY VARCHAR with COUNT(*) |
 
-For Q13: coordinator receives `(SearchPhrase, UserID, COUNT(*))` tuples from all shards, deduplicates them, then counts distinct UserIDs per SearchPhrase.
+### Queries with actual COUNT(DISTINCT): Q05, Q09, Q11
+- **Q05**: Scalar path (bare scan → LongOpenHashSet)
+- **Q09**: 2-key numeric path → `executeCountDistinctWithHashSets` (line 982)
+- **Q11**: VARCHAR key0 + numeric key1 → `executeVarcharCountDistinctWithHashSets` (line 2392)
 
-## 6. canUseFlatAccumulators for COUNT(DISTINCT)
-
-**Confirmed**: `accType[i] = 5` and `canUseFlatAccumulators = false` (`FusedGroupByAggregate.java:3200-3201`).
-
-However, this is **moot for Q11/Q13** because the PlanFragmenter rewrites the shard plan to use `COUNT(*)` (accType=0), which CAN use flat accumulators. The accType=5 path only triggers if someone bypasses the PlanFragmenter dedup rewrite.
-
-## 7. Memory Impact for Q13 (~6M unique SearchPhrase)
-
-At shard level: groups are `(SearchPhrase, UserID)` pairs with COUNT(*) — no per-group HashSet.
-At coordinator: builds a dedup hash map of all unique `(SearchPhrase, UserID)` pairs across shards, then re-aggregates. Memory is proportional to total unique pairs, not 6M × HashSet.
-
-## Summary Table
-
-| Aspect | Q11 (2 GROUP BY + COUNT(DISTINCT)) | Q13 (1 GROUP BY + COUNT(DISTINCT)) |
-|--------|-------------------------------------|-------------------------------------|
-| PlanOptimizer step | SINGLE | SINGLE |
-| Shard plan | GROUP BY (MobilePhone, MobilePhoneModel, UserID) COUNT(*) | GROUP BY (SearchPhrase, UserID) COUNT(*) |
-| Shard dispatch | executeWithVarcharKeys (has VARCHAR key) | executeWithVarcharKeys (has VARCHAR key) |
-| Shard accType | 0 (COUNT(*)) | 0 (COUNT(*)) |
-| canUseFlatAccumulators | true (COUNT(*) only) | true (COUNT(*) only) |
-| Per-group data structure | flat long[] or CountStarAccum | flat long[] or CountStarAccum |
-| Shard top-N | No | No |
-| Coordinator merge | mergeDedupCountDistinct → re-aggregate | mergeDedupCountDistinct → re-aggregate |
-| CountDistinctAccum used? | No (dedup rewrite) | No (dedup rewrite) |
+### Queries without COUNT(DISTINCT): Q04, Q08, Q13
+- **Q04**: Scalar AVG → `executeFusedScanAggregate` (line 930)
+- **Q08**: GROUP BY + COUNT(*) → `executeFusedGroupByAggregate` or sorted-limit path
+- **Q13**: GROUP BY VARCHAR + COUNT(*) → ordinal-based GROUP BY path

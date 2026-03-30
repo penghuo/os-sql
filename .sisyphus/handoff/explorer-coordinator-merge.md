@@ -1,139 +1,120 @@
-# Coordinator Merge Path for COUNT(DISTINCT) with GROUP BY
+# COUNT(DISTINCT) Pipeline: PlanOptimizer → PlanFragmenter → Coordinator Merge
 
-## File
-`dqe/src/main/java/org/opensearch/sql/dqe/coordinator/transport/TransportTrinoSqlAction.java`
+## 1. PlanOptimizer: Forces SINGLE Mode for COUNT(DISTINCT)
 
----
+**File:** `dqe/src/main/java/org/opensearch/sql/dqe/planner/optimizer/PlanOptimizer.java`
 
-## 1. Detection: `isShardDedupCountDistinct` (L2077)
+The `AggregationSplitVisitor.visitAggregation()` (line ~240) calls `hasNonDecomposableAgg()` which checks:
+- If any aggregate contains `COUNT(DISTINCT` → returns `true`
+- If AVG without companion COUNT in GROUP BY queries → returns `true`
 
-```java
-private static boolean isShardDedupCountDistinct(
-    DqePlanNode shardPlan, AggregationNode singleAgg, Map<String,Type> columnTypeMap)
-```
-
-Returns true when:
-- shardPlan is `AggregationNode` with `Step.PARTIAL`
-- singleAgg has non-empty GROUP BY keys
-- shard has **more** group-by keys than original (original keys + distinct columns)
-- shard has exactly 1 agg function: `COUNT(*)`
-
-For Q13: shard does `GROUP BY (SearchPhrase, UserID) COUNT(*)` → 2 dedup keys > 1 original key ✓
-
----
-
-## 2. Dispatch Logic (L633–690) — Three Fast Paths
-
-The coordinator checks shard responses in priority order:
-
-### Path A: `mergeDedupCountDistinctViaVarcharSets` (L657) — **PREFERRED for Q13**
-- **Condition**: All shards have `getVarcharDistinctSets() != null` AND single GROUP BY key
-- Shards attach `Map<String, LongOpenHashSet>` (SearchPhrase → set of UserIDs) as side-channel
-- **Top-N hint**: `findGlobalLimit(optimizedPlan)` + `findGlobalOffset(optimizedPlan)`
-- Output: 2-column Page `(VARCHAR key, BIGINT count)`
-
-### Path B: `mergeDedupCountDistinctViaSets` (L671)
-- **Condition**: All shards have `getDistinctSets() != null` (Long-keyed) AND single GROUP BY key
-- For numeric GROUP BY keys (e.g., RegionID)
-
-### Path C: `mergeDedupCountDistinct` (L681) — **FALLBACK**
-- Page-based two-stage merge (no side-channel sets)
-- Used when shard sets are unavailable (e.g., remote/transient shards)
-
----
-
-## 3. `mergeDedupCountDistinctViaVarcharSets` (L2545) — VARCHAR Key Path
+When `hasNonDecomposableAgg()` returns true, the step is forced to **`AggregationNode.Step.SINGLE`** (not PARTIAL).
 
 ```java
-private static List<Page> mergeDedupCountDistinctViaVarcharSets(
-    ShardExecuteResponse[] shardResults, AggregationNode singleAgg,
-    List<Type> columnTypes, Map<String,Type> columnTypeMap, long topN)
+if (hasNonDecomposableAgg(node.getAggregateFunctions(), node.getGroupByKeys())) {
+    return new AggregationNode(optimizedChild, node.getGroupByKeys(),
+        node.getAggregateFunctions(), AggregationNode.Step.SINGLE);
+}
 ```
 
-### Phase 1: Collect per-group per-shard sets
-- Builds `Map<String, LongOpenHashSet[]>` — each group key maps to array of per-shard sets
-- Data comes from `shardResults[s].getVarcharDistinctSets()` (side-channel, NOT from Pages)
+## 2. PlanFragmenter: Shard-Level Dedup for COUNT(DISTINCT)
 
-### Phase 2: Top-K Pruning (when `topN > 0 && topN * 10 < totalGroups`)
-- For each group: `upper_bound = sum(shard_sizes)`, `lower_bound = max(shard_sizes)`
-- Builds min-heap of top-K lower bounds → threshold
-- Prunes groups where `upper_bound < threshold`
-- **For Q13 with ORDER BY ... LIMIT 10**: only ~100 candidate groups merged instead of all ~700K
+**File:** `dqe/src/main/java/org/opensearch/sql/dqe/coordinator/fragment/PlanFragmenter.java`
 
-### Phase 3: Merge candidate groups
-- **Zero-copy ownership**: takes the largest shard's `LongOpenHashSet` as merge target
-- Unions remaining shards' sets into target (iterates raw `long[]` keys array)
-- Result: `Map<String, LongOpenHashSet>` with merged distinct UserIDs per SearchPhrase
+The PlanFragmenter receives the SINGLE-mode aggregation and applies **shard-level dedup optimization** in `buildShardPlan()`:
 
-### Phase 4: Build output
-- If `topN < mergedGroupCount`: sorts entries by `count DESC`, takes top-K
-- Builds 2-column Page: `(SearchPhrase VARCHAR, COUNT(DISTINCT UserID) BIGINT)`
-
----
-
-## 4. `mergeDedupCountDistinctVarcharKey` (L4182) — Page-Based VARCHAR Path
-
-```java
-private static List<Page> mergeDedupCountDistinctVarcharKey(
-    List<List<Page>> shardPages, List<Type> dedupTypes, int numCountDistinctAggs)
+### Case A: Pure COUNT(DISTINCT) with GROUP BY
+When all aggregates are `COUNT(DISTINCT col)`, `extractCountDistinctColumns()` succeeds. The shard plan becomes:
 ```
+AggregationNode(PARTIAL, GROUP BY [original_keys + distinct_columns], [COUNT(*)])
+```
+Example: `SELECT region, COUNT(DISTINCT user_id) FROM t GROUP BY region` →
+Shard plan: `GROUP BY (region, user_id) with COUNT(*)`
 
-Called from the fallback `mergeDedupCountDistinct` (L2109) when:
-- `numOriginalKeys == 1`, `numDedupKeys == 2`
-- First dedup key is VARCHAR, second is numeric
+### Case B: Mixed Aggregates (COUNT(DISTINCT) + SUM/AVG/etc.)
+`buildMixedDedupShardPlan()` handles queries like Q10. The shard plan becomes:
+```
+AggregationNode(PARTIAL, GROUP BY [original_keys + distinct_columns], [decomposed_aggs])
+```
+AVG(col) is decomposed to SUM(col) + COUNT(col). COUNT(DISTINCT) is omitted from shard aggs.
 
-### Stage 1: Global dedup via `SliceLongDedupMap`
-- Open-addressing hash set for `(Slice-range, long)` compound keys
-- XxHash64 on VARCHAR bytes combined with long value
-- Zero-copy: references original block's raw Slice
-- Iterates all shard Pages, inserts `(SearchPhrase, UserID)` pairs
+### Case C: Scalar COUNT(DISTINCT) (no GROUP BY)
+Falls through to `aggNode.getChild()` — shards just scan+filter, sending raw data.
 
-### Stage 2: Count per group via `SliceCountMap`
-- Calls `dedupMap.countPerGroup(groupCounts::increment)`
-- `SliceCountMap`: open-addressing `VARCHAR → long count` map
-- Builds output Page: `[SearchPhrase VARCHAR, COUNT(DISTINCT) BIGINT]`
+### Coordinator Plan
+`buildCoordinatorPlan()` creates `AggregationNode(SINGLE)` for the coordinator since the original step was SINGLE.
 
----
+## 3. Coordinator Merge Logic in TransportTrinoSqlAction
 
-## 5. Key Data Structures
+**File:** `dqe/src/main/java/org/opensearch/sql/dqe/coordinator/transport/TransportTrinoSqlAction.java`
 
-| Structure | File | Purpose |
-|-----------|------|---------|
-| `LongOpenHashSet` | `dqe/.../operator/LongOpenHashSet.java:20` | Open-addressing long hash set for distinct numeric values per group |
-| `SliceLongDedupMap` | `dqe/.../operator/SliceLongDedupMap.java:24` | (Slice+long) compound key dedup set, XxHash64, 65% load factor |
-| `SliceCountMap` | `dqe/.../operator/SliceCountMap.java:18` | VARCHAR→count map for group counting, 65% load factor |
+The coordinator dispatches to different merge paths based on the coordinator plan type:
 
----
+### 3a. Scalar COUNT(DISTINCT long_col) — `mergeCountDistinctValues()`
+- Each shard sends pre-deduped distinct long values as Pages
+- Coordinator unions via `LongOpenHashSet` (custom open-addressing hash set)
+- Returns single-row Page with `hashSet.size()`
 
-## 6. Data Transfer: Shards → Coordinator
+### 3b. Scalar COUNT(DISTINCT varchar_col) — `mergeCountDistinctVarcharValues()`
+- Each shard sends pre-deduped distinct string values as Pages
+- Coordinator unions via `SliceRangeHashSet` (zero-allocation, operates on raw byte ranges)
+- Returns single-row Page with `hashSet.size()`
 
-**Two channels per shard:**
-1. **Pages** (serialized): `(SearchPhrase, UserID, COUNT(*))` tuples — ~3.3M rows/shard
-2. **Side-channel** (transient, same-JVM only): `Map<String, LongOpenHashSet>` via `getVarcharDistinctSets()`
+### 3c. Local-node optimization: `mergeCountDistinctValuesViaRawSets()`
+- When all shards are local, `ShardExecuteResponse` carries **transient** `LongOpenHashSet` / `Set<String>` attachments
+- Coordinator unions raw sets directly (no Page extraction needed)
+- Uses parallel contains() checks: finds largest set, counts extras from smaller sets
 
-When side-channel is available (Path A), Pages are **not used** for the merge — the `LongOpenHashSet` maps are used directly. This avoids deserializing 13.2M rows.
+### 3d. GROUP BY + COUNT(DISTINCT) — `mergeDedupCountDistinct()`
+Two-stage merge:
+1. **Stage 1 (FINAL dedup):** Merge shard (key+distinct_col, COUNT(*)) tuples to remove cross-shard duplicates
+2. **Stage 2 (Re-aggregate):** GROUP BY original keys, count rows per group → COUNT(DISTINCT)
 
-When side-channel is unavailable (Path C → `mergeDedupCountDistinctVarcharKey`), all 13.2M rows flow through Page deserialization → `SliceLongDedupMap`.
+Fast paths:
+- **2-key numeric:** `mergeDedupCountDistinct2Key()` — flat long[] arrays, zero allocation
+- **VARCHAR key + numeric distinct:** `mergeDedupCountDistinctVarcharKey()` — uses `SliceLongDedupMap` + `SliceCountMap`
+- **Via HashSet attachments:** `mergeDedupCountDistinctViaSets()` — unions per-group `LongOpenHashSet` from shard responses
+- **Via VARCHAR HashSet attachments:** `mergeDedupCountDistinctViaVarcharSets()` — unions per-group sets with top-K pruning
 
----
+### 3e. Mixed Aggregates + COUNT(DISTINCT) — `mergeMixedDedup()`
+Three-stage merge:
+1. **Stage 1:** FINAL merge for dedup keys (removes cross-shard duplicates, sums partial aggs)
+2. **Stage 2:** Re-aggregate by original keys: SUM partials, compute weighted AVG, count rows for COUNT(DISTINCT)
 
-## 7. Top-N Optimization Summary
+Fast paths:
+- **2-key numeric:** `mergeMixedDedup2Key()` — flat long[] arrays
+- **Via HashSet attachments:** `mergeMixedDedupViaSets()` — merges accumulators + unions HashSets
 
-| Path | Top-N Support | Mechanism |
-|------|--------------|-----------|
-| VarcharSets (Path A) | ✅ Yes | Upper/lower bound pruning + partial sort |
-| LongSets (Path B) | ✅ Yes | Min-heap upper bound pruning |
-| Page-based VARCHAR (L4182) | ❌ No | Must dedup all rows, then count all groups |
-| Page-based fallback | ❌ No | Full two-stage merge |
+### 3f. Fallback: `runCoordinatorAggregation()`
+When no dedup optimization applies (e.g., SINGLE mode without shard dedup), raw pages from all shards are concatenated and fed through `HashAggregationOperator` at the coordinator.
 
----
+## 4. ShardExecuteResponse HashSet Attachments
 
-## Q13 Specific Analysis
+**File:** `dqe/src/main/java/org/opensearch/sql/dqe/shard/transport/ShardExecuteResponse.java`
 
-For `GROUP BY SearchPhrase COUNT(DISTINCT UserID) ORDER BY cnt DESC LIMIT 10`:
+Transient (local-only, not serialized) fields:
+- `Map<Long, LongOpenHashSet> distinctSets` — per-group distinct sets (numeric GROUP BY key)
+- `Map<String, LongOpenHashSet> varcharDistinctSets` — per-group distinct sets (VARCHAR GROUP BY key)
+- `LongOpenHashSet scalarDistinctSet` — scalar COUNT(DISTINCT numeric_col)
+- `Set<String> scalarDistinctStrings` — scalar COUNT(DISTINCT varchar_col)
 
-- **Preferred path**: `mergeDedupCountDistinctViaVarcharSets` (Path A, L2545)
-- **Condition**: shards must be local (same JVM) to have `varcharDistinctSets` attached
-- **Top-N hint**: `topN = 10 + offset` → prunes to ~100 candidate groups from ~700K
-- **Merge cost**: union of `LongOpenHashSet` for ~100 groups × 4 shards (zero-copy largest set)
-- **Fallback** (remote shards): `mergeDedupCountDistinctVarcharKey` (L4182) — processes all 13.2M rows through `SliceLongDedupMap`, no top-N pruning
+These are populated by `TransportShardExecuteAction` during local execution and consumed by the coordinator merge methods. For remote shards, these are null (not serialized), and the coordinator falls back to Page-based merge.
+
+## Summary: Mode Decision Flow
+
+```
+PlanOptimizer.splitAggregations()
+  └─ hasNonDecomposableAgg() detects COUNT(DISTINCT) → forces SINGLE step
+
+PlanFragmenter.buildShardPlan()
+  ├─ Pure COUNT(DISTINCT) + GROUP BY → PARTIAL dedup: GROUP BY (keys + distinct_cols), COUNT(*)
+  ├─ Mixed aggs + COUNT(DISTINCT) + GROUP BY → PARTIAL mixed dedup: GROUP BY (keys + distinct_cols), decomposed_aggs
+  └─ Scalar COUNT(DISTINCT) → raw scan (no shard aggregation)
+
+Coordinator merge (TransportTrinoSqlAction)
+  ├─ Scalar numeric → LongOpenHashSet union
+  ├─ Scalar varchar → SliceRangeHashSet union
+  ├─ GROUP BY dedup → 2-stage: FINAL dedup merge + row counting
+  ├─ Mixed dedup → 2-stage: FINAL dedup merge + re-aggregate
+  └─ Fallback → full HashAggregationOperator at coordinator
+```

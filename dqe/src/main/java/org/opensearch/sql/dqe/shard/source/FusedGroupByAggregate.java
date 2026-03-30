@@ -5182,9 +5182,6 @@ public final class FusedGroupByAggregate {
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat")) {
 
       java.util.List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
-      // Pre-size main map: use smaller cap to avoid excessive upfront allocation
-      int mainInitCap = 4_000_000;
-      flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
 
       boolean isMatchAll = query instanceof MatchAllDocsQuery;
       boolean canParallelize =
@@ -5198,12 +5195,10 @@ public final class FusedGroupByAggregate {
         }
 
         if (allCountStar && isMatchAll && numBuckets <= 1) {
-          // Doc-range parallel path: load columnar cache per segment, split doc ranges
-          // across THREADS_PER_SHARD workers for better cache locality on large segments.
+          // MatchAll COUNT(*) path: load columnar cache per segment, then scan.
           java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
           java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
 
-          // Load key columns and compute total docs
           long totalDocs = 0;
           for (LeafReaderContext leafCtx : leaves) {
             long[] keyValues = loadNumericColumn(leafCtx, keyInfos.get(0).name());
@@ -5212,15 +5207,26 @@ public final class FusedGroupByAggregate {
             totalDocs += keyValues.length;
           }
 
-          // Build work units: split each segment's doc range into chunks
+          // For high-cardinality keys (totalDocs > 10M), scan sequentially into main map.
+          // Parallel workers each build 4.4M-entry maps that thrash L3 cache and require
+          // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
+          if (totalDocs > 10_000_000) {
+            // Pre-size main map larger to reduce resize probability
+            flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
+            for (int s = 0; s < segKeyArrays.size(); s++) {
+              scanDocRangeFlatSingleKeyCountStar(
+                  segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
+                  segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+            }
+          } else {
+          // Doc-range parallel path for lower-cardinality keys
+          flatMap = new FlatSingleKeyMap(slotsPerGroup, 4_000_000);
           int numWorkers = THREADS_PER_SHARD;
           long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
-          // Work units: (segIndex, startDoc, endDoc)
           java.util.List<int[]> workUnits = new java.util.ArrayList<>();
           for (int s = 0; s < leaves.size(); s++) {
             int maxDoc = segKeyArrays.get(s).length;
             if (maxDoc == 0) continue;
-            // Split this segment into chunks of ~docsPerWorker
             for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
               int end = (int) Math.min(start + docsPerWorker, maxDoc);
               workUnits.add(new int[]{s, start, end});
@@ -5241,7 +5247,6 @@ public final class FusedGroupByAggregate {
             futures[w] =
                 java.util.concurrent.CompletableFuture.supplyAsync(
                     () -> {
-                      // Pre-size to avoid resize cascades, capped at 1M to limit memory
                       int docCount = endDoc - startDoc;
                       int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 4_000_000);
                       FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
@@ -5257,10 +5262,13 @@ public final class FusedGroupByAggregate {
           for (int fi = 0; fi < futures.length; fi++) {
             FlatSingleKeyMap workerMap = futures[fi].join();
             if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
-            futures[fi] = null; // release worker map for GC
+            futures[fi] = null;
           }
+          } // end else (parallel path)
         } else {
         // Segment-parallel path: partition segments across workers, each with own FlatSingleKeyMap
+        int mainInitCap = 4_000_000;
+        flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
         int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
         @SuppressWarnings("unchecked")
         java.util.List<LeafReaderContext>[] workerSegments = new java.util.List[numWorkers];
@@ -5327,6 +5335,7 @@ public final class FusedGroupByAggregate {
         } // end segment-parallel else
       } else {
         // Sequential path: single FlatSingleKeyMap for all segments
+        flatMap = new FlatSingleKeyMap(slotsPerGroup, 4_000_000);
         Weight weight = null;
         if (!isMatchAll) {
           IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());

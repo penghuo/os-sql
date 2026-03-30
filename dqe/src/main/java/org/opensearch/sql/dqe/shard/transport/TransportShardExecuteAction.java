@@ -1136,54 +1136,95 @@ public class TransportShardExecuteAction
 
     if (isMatchAll && dv0 != null && dv1 != null) {
       int maxDoc = reader.maxDoc();
-      int dvDoc0 = dv0.nextDoc();
-      int dvDoc1 = dv1.nextDoc();
-      for (int doc = 0; doc < maxDoc; doc++) {
-        long k0 = 0;
-        if (dvDoc0 == doc) {
-          k0 = dv0.nextValue();
-          dvDoc0 = dv0.nextDoc();
-        }
-        long k1 = 0;
-        if (dvDoc1 == doc) {
-          k1 = dv1.nextValue();
-          dvDoc1 = dv1.nextDoc();
-        }
-        int gm = grpCap - 1;
-        int gs = Long.hashCode(k0) & gm;
-        while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
-        if (!grpOcc[gs]) {
-          grpKeys[gs] = k0;
-          grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
-          grpOcc[gs] = true;
-          grpSize++;
-          if (grpSize > grpThreshold) {
-            int newGC = grpCap * 2;
-            long[] ngk = new long[newGC];
-            org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
-                new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
-            boolean[] ngo = new boolean[newGC];
-            int ngm = newGC - 1;
-            for (int g = 0; g < grpCap; g++) {
-              if (grpOcc[g]) {
-                int ns = Long.hashCode(grpKeys[g]) & ngm;
-                while (ngo[ns]) ns = (ns + 1) & ngm;
-                ngk[ns] = grpKeys[g];
-                ngs[ns] = grpSets[g];
-                ngo[ns] = true;
+      org.apache.lucene.util.Bits liveDocs = reader.getLiveDocs();
+      if (liveDocs == null) {
+        // Columnar cache: load both columns into flat arrays to avoid per-doc nextDoc() overhead
+        long[] key0Values = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName0);
+        long[] key1Values = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName1);
+        for (int doc = 0; doc < maxDoc; doc++) {
+          long k0 = key0Values[doc];
+          long k1 = key1Values[doc];
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(k0) & gm;
+          while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+          if (!grpOcc[gs]) {
+            grpKeys[gs] = k0;
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpOcc[gs] = true;
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              int newGC = grpCap * 2;
+              long[] ngk = new long[newGC];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int ns = Long.hashCode(grpKeys[g]) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  ngk[ns] = grpKeys[g];
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
               }
+              grpKeys = ngk;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              gm = grpCap - 1;
+              gs = Long.hashCode(k0) & gm;
+              while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
             }
-            grpKeys = ngk;
-            grpSets = ngs;
-            grpOcc = ngo;
-            grpCap = newGC;
-            grpThreshold = (int) (newGC * 0.7f);
-            gm = grpCap - 1;
-            gs = Long.hashCode(k0) & gm;
-            while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
           }
+          grpSets[gs].add(k1);
         }
-        grpSets[gs].add(k1);
+      } else {
+        // Fall back to per-doc nextDoc() for segments with deleted docs
+        int dvDoc0 = dv0.nextDoc();
+        int dvDoc1 = dv1.nextDoc();
+        for (int doc = 0; doc < maxDoc; doc++) {
+          long k0 = 0;
+          if (dvDoc0 == doc) { k0 = dv0.nextValue(); dvDoc0 = dv0.nextDoc(); }
+          long k1 = 0;
+          if (dvDoc1 == doc) { k1 = dv1.nextValue(); dvDoc1 = dv1.nextDoc(); }
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(k0) & gm;
+          while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+          if (!grpOcc[gs]) {
+            grpKeys[gs] = k0;
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpOcc[gs] = true;
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              int newGC = grpCap * 2;
+              long[] ngk = new long[newGC];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int ns = Long.hashCode(grpKeys[g]) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  ngk[ns] = grpKeys[g];
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
+              }
+              grpKeys = ngk;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              gm = grpCap - 1;
+              gs = Long.hashCode(k0) & gm;
+              while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            }
+          }
+          grpSets[gs].add(k1);
+        }
       }
     } else if (weight != null) {
       org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);

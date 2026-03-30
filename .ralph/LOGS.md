@@ -559,3 +559,41 @@ REJECTED: All 6 success criteria NOT MET — score unchanged at 25/43 (target >=
 3. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: 16 iterations of optimization have exhausted code-level improvements. The remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar format). Need m5.8xlarge (32 vCPU) or architectural changes (columnar storage, vectorized execution).
 4. **Borderline queries (Q03, Q14, Q28, Q29) are noise-dependent**: Q03 was 2.04x (was 1.76x in iter15), Q14 was 2.12x (was 2.29x in baseline). These may flip on good runs.
 5. **No further code optimizations identified**: Every query above 2x hits an optimized fused path. The bottleneck is per-doc DocValues decode overhead (~15-20ns vs ClickHouse's ~2-5ns per value).
+
+## Iteration 17 — 2026-03-30T01:07-02:40Z
+
+### What I Did
+1. Assessed environment: r5.4xlarge (16 vCPU, 124GB RAM), 49GB heap, wukong branch, OpenSearch green
+2. Ran correctness: 39/43 PASS (no regression)
+3. Ran first full benchmark: 20/43 within 2x (Q22-Q27 FAILED due to Q16/Q18 GC cascade)
+4. Ran clean full benchmark: 26/43 within 2x (Q03 at 1.86x, noise-dependent)
+5. Analyzed all borderline queries (Q28, Q29, Q27, Q30, Q14, Q02):
+   - Q28 (2.24x): REGEXP_REPLACE — Pattern cached, ordinal-based eval, ultra-fast group extraction. Bottleneck is GROUP BY hash map on high-cardinality Referer.
+   - Q29 (2.30x): 90× SUM — algebraic optimization already in place (reads column once). Best 188ms vs 192ms target. Noise-dependent.
+   - Q27 (2.39x): GROUP BY CounterID + AVG(length(URL)) — ordinal-based length precomputation. Bottleneck is per-doc DV iteration.
+   - Q30 (2.43x): GROUP BY WatchID,ClientIP filtered — executeTwoKeyNumericFlat with parallel segments. Bottleneck is DV decode.
+   - Q14 (2.44x): GROUP BY SearchEngineID,SearchPhrase filtered — executeNKeyVarcharParallelDocRange. Bottleneck is advanceExact + HashMap.
+   - Q02 (3.93x): SUM+COUNT+AVG scalar — tryFlatArrayPath with parallel segments. Bottleneck is 2-column DV decode (2ns/value vs CH's 0.5ns).
+6. Implemented segment-parallel optimization for N-key varchar path (Q14): distribute segments across workers instead of splitting docs within each segment
+7. Tested: Q14 REGRESSED (2.1-2.4s vs 1.5-2.3s before) — HashMap merge overhead exceeds parallelism benefit
+8. REVERTED segment-parallel optimization
+9. Verified all handover optimization steps already implemented in iterations 1-16:
+   - COUNT(DISTINCT) fusion: 5 specialized paths in TransportShardExecuteAction
+   - executeSingleKeyNumericFlat parallelism: doc-range + segment-level
+   - Hash-partitioned aggregation: for high-cardinality GROUP BY
+   - REGEXP_REPLACE caching: Pattern cached, ordinal-based eval
+10. Ran final full benchmark: 25/43 within 2x (Q03 dropped to 2.12x from noise)
+
+### Results
+- Score: 26/43 within 2x (clean run), 25/43 (noisy run with Q03 at boundary)
+- Correctness: 39/43 PASS (unchanged)
+- No code changes (segment-parallel optimization reverted)
+- Q16/Q18 GC cascade: causes Q19 to run at 35-40s (normally 3.5s), cascading failures to Q22-Q27
+- All borderline queries (Q28, Q29, Q27, Q30, Q14) are at 2.2-2.5x — gap is fundamental DV overhead
+
+### Decisions
+1. **Segment-parallel N-key varchar REVERTED**: HashMap<MergedGroupKey> merge overhead (string resolution, hash computation) exceeds the parallelism benefit for filtered queries with varchar keys.
+2. **All handover optimization steps already implemented**: 16 previous iterations exhausted code-level optimizations. The remaining gap is fundamental Lucene DocValues overhead (2-5ns per value vs ClickHouse's 0.5-1ns).
+3. **Performance ceiling on r5.4xlarge: 26-27/43**: Borderline queries need 10-20% improvement that cannot come from code changes. Need m5.8xlarge (32 vCPU) or architectural changes.
+4. **Q03 is noise-dependent**: Ranges from 1.76x to 2.65x across runs. Not reliably within 2x.
+5. **Q29 is noise-dependent**: Ranges from 188ms to 242ms (target 192ms). Sometimes within 2x in isolation but not in sequential benchmark runs.

@@ -908,8 +908,8 @@ public final class FusedGroupByAggregate {
 
         java.util.concurrent.CompletableFuture.allOf(futures).join();
 
-        for (var future : futures) {
-          HashMap<String, AccumulatorGroup> wMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          HashMap<String, AccumulatorGroup> wMap = futures[fi].join();
           for (Map.Entry<String, AccumulatorGroup> e : wMap.entrySet()) {
             AccumulatorGroup existing = globalGroups.get(e.getKey());
             if (existing == null) {
@@ -918,6 +918,7 @@ public final class FusedGroupByAggregate {
               existing.merge(e.getValue());
             }
           }
+          futures[fi] = null; // release worker map for GC
         }
       }
 
@@ -2091,8 +2092,8 @@ public final class FusedGroupByAggregate {
         java.util.concurrent.CompletableFuture.allOf(futures).join();
 
         HashMap<BytesRefKey, long[]> globalCounts = new HashMap<>();
-        for (var future : futures) {
-          HashMap<BytesRefKey, long[]> wMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          HashMap<BytesRefKey, long[]> wMap = futures[fi].join();
           for (Map.Entry<BytesRefKey, long[]> e : wMap.entrySet()) {
             long[] existing = globalCounts.get(e.getKey());
             if (existing == null) {
@@ -2101,6 +2102,7 @@ public final class FusedGroupByAggregate {
               existing[0] += e.getValue()[0];
             }
           }
+          futures[fi] = null; // release worker map for GC
         }
 
         if (globalCounts.isEmpty()) return List.of();
@@ -2987,8 +2989,8 @@ public final class FusedGroupByAggregate {
         java.util.concurrent.CompletableFuture.allOf(futures).join();
 
         HashMap<BytesRefKey, AccumulatorGroup> globalGroups = new HashMap<>();
-        for (var future : futures) {
-          HashMap<BytesRefKey, AccumulatorGroup> wMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          HashMap<BytesRefKey, AccumulatorGroup> wMap = futures[fi].join();
           for (Map.Entry<BytesRefKey, AccumulatorGroup> e : wMap.entrySet()) {
             AccumulatorGroup existing = globalGroups.get(e.getKey());
             if (existing == null) {
@@ -2997,6 +2999,7 @@ public final class FusedGroupByAggregate {
               existing.merge(e.getValue());
             }
           }
+          futures[fi] = null; // release worker map for GC
         }
 
         if (globalGroups.isEmpty()) return List.of();
@@ -4214,15 +4217,23 @@ public final class FusedGroupByAggregate {
     }
 
     final int slotsPerGroup = totalSlots;
-    final FlatSingleKeyMap flatMap = new FlatSingleKeyMap(slotsPerGroup);
+    final FlatSingleKeyMap flatMap;
     final String sourceCol = keyInfos.get(0).name();
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-derived-1key-flat")) {
 
+      // Pre-size main map based on total docs
+      long totalDocsEst = 0;
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      for (LeafReaderContext leaf : leaves) {
+        totalDocsEst += leaf.reader().maxDoc();
+      }
+      int mainInitCap = (int) Math.min(totalDocsEst * 10 / 7 + 1, 4_000_000);
+      flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
+
       boolean canParallelize =
           !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1;
-      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
       boolean isMatchAll = query instanceof MatchAllDocsQuery;
 
       if (canParallelize && leaves.size() > 1) {
@@ -4281,9 +4292,10 @@ public final class FusedGroupByAggregate {
         }
 
         java.util.concurrent.CompletableFuture.allOf(futures).join();
-        for (var future : futures) {
-          FlatSingleKeyMap workerMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          FlatSingleKeyMap workerMap = futures[fi].join();
           if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+          futures[fi] = null; // release worker map for GC
         }
       } else {
         // Sequential path: single FlatSingleKeyMap for all segments
@@ -4787,11 +4799,12 @@ public final class FusedGroupByAggregate {
         }
 
         java.util.concurrent.CompletableFuture.allOf(futures).join();
-        for (var future : futures) {
-          FlatSingleKeyMap[] workerMaps = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          FlatSingleKeyMap[] workerMaps = futures[fi].join();
           for (int b = 0; b < numBuckets; b++) {
             if (workerMaps[b].size > 0) bucketMaps[b].mergeFrom(workerMaps[b]);
           }
+          futures[fi] = null; // release worker maps for GC
         }
       } else {
         // Sequential: single set of bucket maps
@@ -4806,6 +4819,7 @@ public final class FusedGroupByAggregate {
     // Merge all bucket maps into bucketMaps[0]
     for (int b = 1; b < numBuckets; b++) {
       if (bucketMaps[b].size > 0) bucketMaps[0].mergeFrom(bucketMaps[b]);
+      bucketMaps[b] = null; // release merged bucket map for GC
     }
     FlatSingleKeyMap flatMap = bucketMaps[0];
 
@@ -5162,12 +5176,16 @@ public final class FusedGroupByAggregate {
     }
 
     final int slotsPerGroup = totalSlots;
-    final FlatSingleKeyMap flatMap = new FlatSingleKeyMap(slotsPerGroup);
+    final FlatSingleKeyMap flatMap;
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-groupby-numeric-1key-flat")) {
 
       java.util.List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+      // Pre-size main map: use smaller cap to avoid excessive upfront allocation
+      int mainInitCap = 4_000_000;
+      flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
+
       boolean isMatchAll = query instanceof MatchAllDocsQuery;
       boolean canParallelize =
           !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1;
@@ -5236,9 +5254,10 @@ public final class FusedGroupByAggregate {
           }
 
           java.util.concurrent.CompletableFuture.allOf(futures).join();
-          for (var future : futures) {
-            FlatSingleKeyMap workerMap = future.join();
+          for (int fi = 0; fi < futures.length; fi++) {
+            FlatSingleKeyMap workerMap = futures[fi].join();
             if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+            futures[fi] = null; // release worker map for GC
           }
         } else {
         // Segment-parallel path: partition segments across workers, each with own FlatSingleKeyMap
@@ -5281,7 +5300,7 @@ public final class FusedGroupByAggregate {
           futures[w] =
               java.util.concurrent.CompletableFuture.supplyAsync(
                   () -> {
-                    // Pre-size to avoid resize cascades, capped at 4M to limit memory
+                    // Pre-size to avoid resize cascades, capped at 1M to limit memory
                     int initCap = (int) Math.min(myDocCount * 10 / 7 + 1, 4_000_000);
                     FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
                     try {
@@ -5300,9 +5319,10 @@ public final class FusedGroupByAggregate {
         }
 
         java.util.concurrent.CompletableFuture.allOf(futures).join();
-        for (var future : futures) {
-          FlatSingleKeyMap workerMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          FlatSingleKeyMap workerMap = futures[fi].join();
           if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+          futures[fi] = null; // release worker map for GC
         }
         } // end segment-parallel else
       } else {
@@ -6442,9 +6462,10 @@ public final class FusedGroupByAggregate {
         }
 
         java.util.concurrent.CompletableFuture.allOf(futures).join();
-        for (var future : futures) {
-          FlatTwoKeyMap workerMap = future.join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          FlatTwoKeyMap workerMap = futures[fi].join();
           if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+          futures[fi] = null; // release worker map for GC
         }
       } else {
         // Sequential fallback: single FlatTwoKeyMap for all segments
@@ -9955,9 +9976,10 @@ public final class FusedGroupByAggregate {
       }
 
       java.util.concurrent.CompletableFuture.allOf(futures).join();
-      for (var future : futures) {
-        FlatThreeKeyMap workerMap = future.join();
+      for (int fi = 0; fi < futures.length; fi++) {
+        FlatThreeKeyMap workerMap = futures[fi].join();
         if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
+        futures[fi] = null; // release worker map for GC
       }
     } else {
       // Sequential fallback
@@ -11081,12 +11103,14 @@ public final class FusedGroupByAggregate {
         int largestIdx = 0;
         for (int i = 0; i < numWorkers; i++) {
           workerResults[i] = futures[i].join();
+          futures[i] = null; // release future for GC
           if (workerResults[i].size() > workerResults[largestIdx].size()) largestIdx = i;
         }
         Map<SegmentGroupKey, AccumulatorGroup> globalGroups = workerResults[largestIdx];
         for (int i = 0; i < numWorkers; i++) {
           if (i == largestIdx) continue;
           mergeGroupMaps(globalGroups, workerResults[i]);
+          workerResults[i] = null; // release merged worker map for GC
         }
 
         if (globalGroups.isEmpty()) {

@@ -169,6 +169,20 @@ public class TransportTrinoSqlAction
       String queryStr, boolean isExplain, ActionListener<TrinoSqlResponse> listener) {
     long t0 = System.nanoTime();
     try {
+      // Pre-query GC barrier at coordinator level: if heap is under pressure, trigger GC
+      // before allocating merge buffers. This complements the shard-level barrier.
+      Runtime rt = Runtime.getRuntime();
+      long used = rt.totalMemory() - rt.freeMemory();
+      if (used > rt.maxMemory() / 2) {
+        System.gc();
+        try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        used = rt.totalMemory() - rt.freeMemory();
+        if (used > rt.maxMemory() / 2) {
+          System.gc();
+          try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+      }
+
       // Check query plan cache first (skips parse/plan/optimize/fragment for repeated queries)
       long currentMetaVersion = clusterService.state().metadata().version();
 
@@ -476,6 +490,9 @@ public class TransportTrinoSqlAction
                         }
                       }
 
+                      // Release shard result memory before formatting
+                      shardPages = null;
+
                       // 10. Apply coordinator-level OFFSET + LIMIT
                       long globalOffset = findGlobalOffset(optimizedPlan);
                       if (globalOffset > 0) {
@@ -498,8 +515,10 @@ public class TransportTrinoSqlAction
                       // Hint GC to reclaim coordinator merge memory after heavy queries
                       int totalMergedRows = 0;
                       for (Page p : mergedPages) totalMergedRows += p.getPositionCount();
+                      mergedPages = null;
                       if (totalMergedRows > 10000) {
                           System.gc();
+                          try { Thread.sleep(50); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
                       }
                     } catch (Exception e) {
                       listener.onFailure(e);
@@ -804,6 +823,9 @@ public class TransportTrinoSqlAction
             }
           }
 
+          // Release shard result memory before formatting
+          shardPages = null;
+
           long globalOffset = findGlobalOffset(optimizedPlan);
           if (globalOffset > 0) {
             mergedPages = applyGlobalOffset(mergedPages, globalOffset);
@@ -824,8 +846,10 @@ public class TransportTrinoSqlAction
           // Hint GC to reclaim coordinator merge memory after heavy queries
           int totalMergedRows = 0;
           for (Page p : mergedPages) totalMergedRows += p.getPositionCount();
+          mergedPages = null;
           if (totalMergedRows > 10000) {
               System.gc();
+              try { Thread.sleep(50); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
           }
         } catch (Exception e) {
           listener.onFailure(e);

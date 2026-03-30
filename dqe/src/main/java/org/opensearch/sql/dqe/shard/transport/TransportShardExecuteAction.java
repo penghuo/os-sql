@@ -193,6 +193,24 @@ public class TransportShardExecuteAction
    */
   private ShardExecuteResponse executePlan(DqePlanNode plan, ShardExecuteRequest req)
       throws Exception {
+    // Pre-query GC barrier: if heap usage is high, trigger GC and wait for it to complete.
+    // This prevents GC cascades where heavy queries (e.g., Q14 with SearchPhrase COUNT(DISTINCT))
+    // leave garbage that causes the next heavy query (Q15 with 4.4M groups) to spend most of
+    // its time in GC pauses. The sleep gives G1GC time to complete the collection cycle.
+    Runtime rt = Runtime.getRuntime();
+    long used = rt.totalMemory() - rt.freeMemory();
+    long max = rt.maxMemory();
+    if (used > max / 2) {
+      System.gc();
+      try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+      // Re-check: if heap is still high after first GC, do another cycle
+      used = rt.totalMemory() - rt.freeMemory();
+      if (used > max / 2) {
+        System.gc();
+        try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+      }
+    }
+
     // Unwrap top-level ProjectNode for fused path dispatch.
     // For single-shard indices, the full optimized plan (ProjectNode -> AggregationNode -> ...)
     // becomes the shard plan. The ProjectNode prevents fused paths from firing because they

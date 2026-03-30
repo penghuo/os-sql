@@ -270,20 +270,19 @@ public final class FusedScanAggregate {
                         try {
                           for (LeafReaderContext leafCtx : mySegments) {
                             LeafReader reader = leafCtx.reader();
+                            long segCount = reader.maxDoc(); // MatchAll + no deletes
                             for (int i = 0; i < nc; i++) {
                               SortedNumericDocValues dv =
                                   reader.getSortedNumericDocValues(colArray[i]);
                               if (dv == null) continue;
                               long localSum = 0;
-                              long localCount = 0;
                               int doc = dv.nextDoc();
                               while (doc != DocIdSetIterator.NO_MORE_DOCS) {
                                 localSum += dv.nextValue();
-                                localCount++;
                                 doc = dv.nextDoc();
                               }
                               pack[i * 2] += localSum;
-                              pack[i * 2 + 1] += localCount;
+                              pack[i * 2 + 1] += segCount;
                             }
                           }
                         } catch (IOException e) {
@@ -306,19 +305,18 @@ public final class FusedScanAggregate {
             // Sequential fallback for single segment or single worker
             for (LeafReaderContext leafCtx : leaves) {
               LeafReader reader = leafCtx.reader();
+              long segCount = reader.maxDoc(); // MatchAll + no deletes
               for (int i = 0; i < colArray.length; i++) {
                 SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[i]);
                 if (dv == null) continue;
                 long localSum = 0;
-                long localCount = 0;
                 int doc = dv.nextDoc();
                 while (doc != DocIdSetIterator.NO_MORE_DOCS) {
                   localSum += dv.nextValue();
-                  localCount++;
                   doc = dv.nextDoc();
                 }
                 scArrays[i][0] += localSum;
-                scArrays[i][1] += localCount;
+                scArrays[i][1] += segCount;
               }
             }
           }
@@ -895,10 +893,10 @@ public final class FusedScanAggregate {
                         SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
                         if (dv == null) continue;
                         long localSum = 0;
-                        long localCount = 0;
 
                         if (needMinF || needMaxF) {
                           long localMin = Long.MAX_VALUE, localMax = Long.MIN_VALUE;
+                          long localCount = 0;
                           int doc = dv.nextDoc();
                           while (doc != DocIdSetIterator.NO_MORE_DOCS) {
                             long val = dv.nextValue();
@@ -910,16 +908,16 @@ public final class FusedScanAggregate {
                           }
                           if (localMin < wColMin[c]) wColMin[c] = localMin;
                           if (localMax > wColMax[c]) wColMax[c] = localMax;
+                          wColCount[c] += localCount;
                         } else {
                           int doc = dv.nextDoc();
                           while (doc != DocIdSetIterator.NO_MORE_DOCS) {
                             localSum += dv.nextValue();
-                            localCount++;
                             doc = dv.nextDoc();
                           }
+                          wColCount[c] += reader.maxDoc();
                         }
                         wColSum[c] += localSum;
-                        wColCount[c] += localCount;
                       }
                     }
                   } catch (java.io.IOException e) {
@@ -964,11 +962,11 @@ public final class FusedScanAggregate {
           if (dv == null) continue;
 
           long localSum = 0;
-          long localCount = 0;
 
           if (needMin || needMax) {
             long localMin = Long.MAX_VALUE;
             long localMax = Long.MIN_VALUE;
+            long localCount = 0;
             int doc = dv.nextDoc();
             while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
               long val = dv.nextValue();
@@ -980,16 +978,16 @@ public final class FusedScanAggregate {
             }
             if (localMin < colMin[c]) colMin[c] = localMin;
             if (localMax > colMax[c]) colMax[c] = localMax;
+            colCount[c] += localCount;
           } else {
             int doc = dv.nextDoc();
             while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
               localSum += dv.nextValue();
-              localCount++;
               doc = dv.nextDoc();
             }
+            colCount[c] += maxDoc;
           }
           colSum[c] += localSum;
-          colCount[c] += localCount;
         }
       }
     }

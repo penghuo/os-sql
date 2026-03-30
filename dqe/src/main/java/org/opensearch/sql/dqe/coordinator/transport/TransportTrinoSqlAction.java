@@ -495,6 +495,12 @@ public class TransportTrinoSqlAction
                               schemaJsonPrefix,
                               columnTypeArray);
                       listener.onResponse(new TrinoSqlResponse(responseJson));
+                      // Hint GC to reclaim coordinator merge memory after heavy queries
+                      int totalMergedRows = 0;
+                      for (Page p : mergedPages) totalMergedRows += p.getPositionCount();
+                      if (totalMergedRows > 10000) {
+                          System.gc();
+                      }
                     } catch (Exception e) {
                       listener.onFailure(e);
                     }
@@ -815,6 +821,12 @@ public class TransportTrinoSqlAction
               (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000,
               (t3 - t2) / 1_000_000, (t3 - t0) / 1_000_000);
           listener.onResponse(new TrinoSqlResponse(responseJson));
+          // Hint GC to reclaim coordinator merge memory after heavy queries
+          int totalMergedRows = 0;
+          for (Page p : mergedPages) totalMergedRows += p.getPositionCount();
+          if (totalMergedRows > 10000) {
+              System.gc();
+          }
         } catch (Exception e) {
           listener.onFailure(e);
         }

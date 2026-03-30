@@ -7504,6 +7504,43 @@ public final class FusedGroupByAggregate {
           engineSearcher.createWeight(
               engineSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
 
+      // Build global ordinal maps for multi-segment VARCHAR keys
+      // This converts segment ordinals to global ordinals (longs), enabling flat long map
+      List<LeafReaderContext> allLeaves = engineSearcher.getIndexReader().leaves();
+      boolean multiSegment = allLeaves.size() > 1;
+      OrdinalMap[] globalOrdMaps = null;
+      boolean useGlobalOrds = false;
+      SortedSetDocValues[][] segDvsForLookup = null;
+      if (multiSegment) {
+        globalOrdMaps = new OrdinalMap[numKeys];
+        useGlobalOrds = true;
+        for (int k = 0; k < numKeys; k++) {
+          if (keyIsVarchar[k] || (inlineEvalKey[k] && inlineResultIsVarchar[k])) {
+            String fieldName = keyIsVarchar[k] ? keyInfos.get(k).name : inlineResultColumn[k];
+            globalOrdMaps[k] = buildGlobalOrdinalMap(allLeaves, fieldName);
+            if (globalOrdMaps[k] == null) {
+              useGlobalOrds = false;
+              break;
+            }
+          }
+        }
+        if (useGlobalOrds) {
+          // Pre-build per-segment DVs for lookupGlobalOrd in result-building phase
+          segDvsForLookup = new SortedSetDocValues[numKeys][];
+          for (int k = 0; k < numKeys; k++) {
+            if (globalOrdMaps[k] != null) {
+              String fieldName = keyIsVarchar[k] ? keyInfos.get(k).name : inlineResultColumn[k];
+              segDvsForLookup[k] = new SortedSetDocValues[allLeaves.size()];
+              for (int s = 0; s < allLeaves.size(); s++) {
+                segDvsForLookup[k][s] = allLeaves.get(s).reader().getSortedSetDocValues(fieldName);
+              }
+            }
+          }
+        }
+      }
+      // Per-segment global ordinal mappings (populated inside segment loop)
+      LongValues[] curSegGlobalMaps = useGlobalOrds ? new LongValues[numKeys] : null;
+
       // Phase 1: Collect doc IDs per segment
       for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
         LeafReader reader = leafCtx.reader();
@@ -7524,9 +7561,18 @@ public final class FusedGroupByAggregate {
         }
         if (segDocCount == 0) continue;
 
-        // For single-segment indices, use ordinals for non-eval VARCHAR keys
-        // to avoid BytesRefKey allocation and byte-array copy per row.
-        boolean singleSegment = (engineSearcher.getIndexReader().leaves().size() == 1);
+        // Track segment index for global ordinal mapping
+        if (useGlobalOrds) {
+          int segIdx = allLeaves.indexOf(leafCtx);
+          for (int k = 0; k < numKeys; k++) {
+            if (globalOrdMaps[k] != null) {
+              curSegGlobalMaps[k] = globalOrdMaps[k].getGlobalOrds(segIdx);
+            }
+          }
+        }
+
+        // Treat as single-segment when global ordinals are available (all keys become longs)
+        boolean singleSegment = (engineSearcher.getIndexReader().leaves().size() == 1) || useGlobalOrds;
 
         // Open non-eval key DocValues for inline reading during grouping phase
         SortedSetDocValues[] varcharKeyDvs = new SortedSetDocValues[numKeys];
@@ -7693,7 +7739,8 @@ public final class FusedGroupByAggregate {
                 SortedSetDocValues dv = varcharKeyDvs[k];
                 if (dv != null && dv.advanceExact(docId)) {
                   if (singleSegment) {
-                    resolvedKeys[k] = dv.nextOrd();
+                    long ord = dv.nextOrd();
+                    resolvedKeys[k] = (useGlobalOrds && curSegGlobalMaps[k] != null) ? curSegGlobalMaps[k].get(ord) : ord;
                   } else {
                     BytesRef bytes = dv.lookupOrd(dv.nextOrd());
                     resolvedKeys[k] = new BytesRefKey(bytes);
@@ -7733,8 +7780,7 @@ public final class FusedGroupByAggregate {
                 if (dv != null && dv.advanceExact(docId)) {
                   long ord = dv.nextOrd();
                   if (singleSegment) {
-                    // Ordinal-based: avoids byte-array copy per row
-                    resolvedKeys[k] = ord;
+                    resolvedKeys[k] = (useGlobalOrds && curSegGlobalMaps[k] != null) ? curSegGlobalMaps[k].get(ord) : ord;
                   } else {
                     BytesRef bytes = dv.lookupOrd(ord);
                     resolvedKeys[k] = new BytesRefKey(bytes);
@@ -7932,10 +7978,17 @@ public final class FusedGroupByAggregate {
           for (int k = 0; k < numGroupKeys; k++) {
             long val = flatKeys[base + k];
             // Resolve ordinals to bytes for VARCHAR keys
-            if (keyIsVarchar[k] && !isEvalKey[k] && !inlineEvalKey[k] && savedVarcharDvs != null) {
-              if (val >= 0 && savedVarcharDvs[k] != null) {
+            if (keyIsVarchar[k] && !isEvalKey[k] && !inlineEvalKey[k]) {
+              if (val >= 0) {
                 try {
-                  BytesRef bytes = savedVarcharDvs[k].lookupOrd(val);
+                  BytesRef bytes;
+                  if (useGlobalOrds && globalOrdMaps[k] != null) {
+                    bytes = lookupGlobalOrd(globalOrdMaps[k], segDvsForLookup[k], val);
+                  } else if (savedVarcharDvs != null && savedVarcharDvs[k] != null) {
+                    bytes = savedVarcharDvs[k].lookupOrd(val);
+                  } else {
+                    bytes = new BytesRef("");
+                  }
                   writeKeyValueForMerged(builders[k], keyInfos.get(k), new BytesRefKey(bytes));
                 } catch (IOException e) {
                   writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
@@ -7944,21 +7997,25 @@ public final class FusedGroupByAggregate {
                 writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
               }
             } else if (inlineEvalKey[k]
-                && inlineResultIsVarchar[k]
-                && savedInlineResultDvs != null) {
+                && inlineResultIsVarchar[k]) {
               if (val == -1L) {
                 writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
               } else if (val == -2L) {
                 writeKeyValueForMerged(builders[k], keyInfos.get(k), inlineElseValue[k]);
-              } else if (savedInlineResultDvs[k] != null) {
+              } else {
                 try {
-                  BytesRef bytes = savedInlineResultDvs[k].lookupOrd(val);
+                  BytesRef bytes;
+                  if (useGlobalOrds && globalOrdMaps[k] != null) {
+                    bytes = lookupGlobalOrd(globalOrdMaps[k], segDvsForLookup[k], val);
+                  } else if (savedInlineResultDvs != null && savedInlineResultDvs[k] != null) {
+                    bytes = savedInlineResultDvs[k].lookupOrd(val);
+                  } else {
+                    bytes = new BytesRef("");
+                  }
                   writeKeyValueForMerged(builders[k], keyInfos.get(k), new BytesRefKey(bytes));
                 } catch (IOException e) {
                   writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
                 }
-              } else {
-                writeKeyValueForMerged(builders[k], keyInfos.get(k), emptyBytesRefKey);
               }
             } else {
               writeKeyValueForMerged(builders[k], keyInfos.get(k), val);

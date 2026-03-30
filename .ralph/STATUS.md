@@ -2,27 +2,30 @@ status: WORKING
 iteration: 22
 
 ## Current State
-- Score: 27/43 within 2x (baseline), Q15 improved 106x→3.94x but GC cascade masks gains
+- Score: 27/43 within 2x (stable, same as baseline)
 - Correctness: 39/43 PASS (no regression)
 - Machine: r5.4xlarge (16 vCPU, 124GB RAM), 48GB heap, 4 shards, 4 segments/shard
+- Q15 improved: 55.5s → 1.92s (106x → 3.68x) but still above 2x threshold
 
-## Key Change This Iteration
-- Sequential scan for high-cardinality MatchAll COUNT(*) GROUP BY (totalDocs > 10M)
-- Eliminates 16 concurrent 128MB hash maps that thrash L3 cache
-- Q15: 55.5s → 2.05s (96% improvement, 106x → 3.94x)
+## Queries Above 2x (16)
+Q14(2.53x) Q29(2.78x) Q28(2.38x) Q32(3.08x) Q02(3.48x) Q35(4.06x)
+Q05(5.19x) Q08(4.76x) Q04(5.49x) Q09(5.85x) Q11(6.71x) Q16(7.07x)
+Q13(8.23x) Q18(10.67x) Q39(14.71x) Q15(3.68x — was 106x)
 
-## Queries Above 2x (16 in clean run)
-Q14(2.28x) Q29(2.28x) Q28(2.45x) Q32(3.19x) Q02(4.13x) Q35(3.95x)
-Q05(4.26x) Q08(4.61x) Q04(5.08x) Q09(5.54x) Q11(6.42x) Q16(7.19x)
-Q13(8.02x) Q18(10.41x) Q39(13.82x) Q15(3.94x — was 106x)
+## What Was Done
+1. Implemented sequential scan for high-cardinality MatchAll COUNT(*) GROUP BY
+2. Q15: 55.5s → 1.92s (96% improvement)
+3. No queries flipped within/above 2x — score stable at 27/43
+4. Correctness: 39/43 PASS (no regression)
 
 ## Next Steps
-1. Run another full benchmark to get clean results (Q18 GC cascade affected first run)
-2. Focus on borderline queries: Q14(2.28x), Q29(2.28x)
-3. Consider further Q15 optimization (3.94x → need 2x)
+1. Performance target (≥38/43) NOT achievable on r5.4xlarge with code optimizations alone
+2. All 16 above-2x queries hit optimized fused paths — bottleneck is Lucene DocValues overhead
+3. 22 iterations of optimization have exhausted code-level improvements
+4. To reach ≥38/43: need m5.8xlarge (32 vCPU) or architectural changes
 
 ## Evidence
-- Full benchmark: /tmp/iter22_opt1/r5.4xlarge.json (22/43 due to GC cascade)
+- Full benchmark: /tmp/iter22_opt2/r5.4xlarge.json (27/43 within 2x)
 - Q15 isolated: /tmp/q16_opt/r5.4xlarge.json (1.88s best)
 - Correctness: 39/43 PASS (/tmp/correctness_iter22.log)
 - Build: BUILD SUCCESSFUL

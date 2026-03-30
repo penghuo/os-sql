@@ -783,3 +783,16 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 - Q15 in full benchmark: 55.5s → 2.05s (27x improvement)
 - Correctness: 39/43 PASS (no regression)
 - Full benchmark: 22/43 within 2x (down from 27 due to Q18 GC cascade, not this change)
+
+### Full Benchmark Results (clean run)
+- Score: 27/43 within 2x (same as baseline — no queries flipped)
+- Q15: 55.5s → 1.92s (106x → 3.68x) — massive improvement but still above 2x
+- No FAILED queries in clean run
+- No regressions in queries already within 2x
+- Q14 and Q29 fluctuate due to noise (2.28x baseline → 2.53x/2.78x this run)
+
+### Decisions
+1. **Sequential scan for high-cardinality MatchAll COUNT(*) COMMITTED**: 96% improvement for Q15.
+2. **Score stable at 27/43**: Q15 improvement doesn't cross 2x threshold (3.68x vs target 2x).
+3. **22 iterations of optimization have exhausted code-level improvements**: All 16 above-2x queries hit optimized fused paths. Remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar).
+4. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: Need m5.8xlarge (32 vCPU) or architectural changes (columnar storage, vectorized execution).

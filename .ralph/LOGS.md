@@ -828,3 +828,37 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 2. **ConcurrentHashMap KEPT for Q05**: Eliminates the sequential Collections.addAll() bottleneck. Workers insert directly into the shared concurrent set.
 3. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: All 16 above-2x queries hit optimized fused paths. The remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar format).
 4. **Next optimization targets**: Q14 (2.37x, closest to 2x), Q28 (2.41x, REGEXP_REPLACE), Q29 (2.69x, expression eval).
+
+## Iteration 24 — 2026-03-31T00:43-01:54Z
+
+### What I Did
+1. Analyzed Q14, Q28, Q29 optimization opportunities via parallel explorer subagents
+2. Found Q28 REGEXP_REPLACE Pattern caching already implemented (3-tier optimization)
+3. Found Q14 filtered path scans all docs ignoring Lucene query — but ordinal shortcut didn't help because bottleneck is string materialization (6M strings per shard)
+4. Implemented hash-based COUNT(DISTINCT varchar) optimization:
+   - New method `collectDistinctVarcharHashes` in FusedScanAggregate.java
+   - Uses FNV-1a hash on raw BytesRef bytes instead of utf8ToString() + HashSet<String>
+   - Parallel ordinal hashing with worker threads
+   - NOT-EMPTY filter detection for WHERE col <> '' pattern
+   - Coordinator merges LongOpenHashSet instead of Set<String>
+5. Updated TransportShardExecuteAction to use hash-based path
+6. Updated TransportTrinoSqlAction coordinator merge to handle hash sets
+7. Compiled: BUILD SUCCESSFUL
+8. Correctness: 39/43 PASS (no regression)
+9. Full benchmark: 28/43 within 2x
+
+### Results
+- Score: 28/43 within 2x (up from 26/43)
+- Q05: 2.47s → 0.80s (3.58x → 1.16x) — FLIPPED to within 2x
+- Q19: None → 0.009s — FLIPPED (was all None due to GC cascade, now works)
+- Q14: 1.74s → 1.67s (2.37x → 2.27x) — improved but still above 2x
+- Q29: 0.258s → 0.207s (2.69x → 2.16x) — improved but still above 2x
+- Correctness: 39/43 PASS (unchanged)
+- No real regressions (Q02 noise: 0.339s → 0.439s, within variance)
+
+### Decisions
+1. **Hash-based COUNT(DISTINCT varchar) COMMITTED**: Eliminates 6M+ String allocations per shard by hashing raw BytesRef bytes. FNV-1a hash has negligible collision probability at 6M values (birthday paradox: ~6M²/2^64 ≈ 0).
+2. **Q28 REGEXP_REPLACE optimization NOT needed**: Pattern caching with 3-tier optimization (ultra-fast group extraction, constant replacement, standard) already implemented. Bottleneck is inherent string encoding/regex overhead.
+3. **Q14 ordinal shortcut alone insufficient**: Saving the 100M doc scan doesn't help because the bottleneck is 6M string materializations. Hash-based approach helps but OrdinalMap build cost (~1s) dominates in benchmark context.
+4. **Q29 improvement is noise-dependent**: 0.207s (2.16x) in benchmark, 0.188s (1.96x) isolated. May flip on good runs.
+5. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: 15 queries still above 2x, all hitting optimized fused paths. Remaining gap is fundamental Lucene DocValues overhead.

@@ -1680,6 +1680,271 @@ public final class FusedScanAggregate {
   }
 
   /**
+   * Collect distinct varchar values as a LongOpenHashSet of hashes, avoiding string materialization.
+   * Uses FNV-1a hash on raw BytesRef bytes. For MatchAll with no deletes: iterates global ordinals
+   * (O(distinct_values)). For filtered queries: iterates matching docs via FixedBitSet.
+   */
+  public static LongOpenHashSet collectDistinctVarcharHashes(
+      String columnName, IndexShard shard, Query query) throws Exception {
+    LongOpenHashSet hashes = new LongOpenHashSet();
+
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-varchar-hashes")) {
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+
+      if (query instanceof MatchAllDocsQuery) {
+        boolean hasDeletes = false;
+        for (LeafReaderContext leafCtx : leaves) {
+          if (leafCtx.reader().getLiveDocs() != null) { hasDeletes = true; break; }
+        }
+        OrdinalMap ordinalMap = FusedGroupByAggregate.buildGlobalOrdinalMap(leaves, columnName);
+        if (ordinalMap != null && !hasDeletes) {
+          long globalOrdCount = ordinalMap.getValueCount();
+          hashes = new LongOpenHashSet((int) Math.min(globalOrdCount * 2, Integer.MAX_VALUE));
+          int numWorkers = Math.min(
+              Math.max(1, Runtime.getRuntime().availableProcessors()
+                  / Integer.getInteger("dqe.numLocalShards", 4)), 4);
+          if (numWorkers > 1 && globalOrdCount > 100_000) {
+            LongOpenHashSet[] workerSets = new LongOpenHashSet[numWorkers];
+            long chunkSize = (globalOrdCount + numWorkers - 1) / numWorkers;
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.CompletableFuture<?>[] futures =
+                new java.util.concurrent.CompletableFuture[numWorkers];
+            for (int w = 0; w < numWorkers; w++) {
+              final long start = w * chunkSize;
+              final long end = Math.min(start + chunkSize, globalOrdCount);
+              final int wIdx = w;
+              futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try {
+                  SortedSetDocValues[] localDvs = new SortedSetDocValues[leaves.size()];
+                  for (int i = 0; i < leaves.size(); i++) {
+                    localDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+                  }
+                  LongOpenHashSet localSet = new LongOpenHashSet(
+                      (int) Math.min(end - start + 16, Integer.MAX_VALUE));
+                  for (long g = start; g < end; g++) {
+                    int segIdx = ordinalMap.getFirstSegmentNumber(g);
+                    long segOrd = ordinalMap.getFirstSegmentOrd(g);
+                    BytesRef bytes = (localDvs[segIdx] != null)
+                        ? localDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+                    localSet.add(hashBytesRef(bytes));
+                  }
+                  workerSets[wIdx] = localSet;
+                } catch (java.io.IOException e) {
+                  throw new java.io.UncheckedIOException(e);
+                }
+              }, FusedGroupByAggregate.getParallelPool());
+            }
+            java.util.concurrent.CompletableFuture.allOf(futures).join();
+            int largestIdx = 0;
+            for (int i = 1; i < numWorkers; i++) {
+              if (workerSets[i] != null && (workerSets[largestIdx] == null
+                  || workerSets[i].size() > workerSets[largestIdx].size())) {
+                largestIdx = i;
+              }
+            }
+            hashes = workerSets[largestIdx];
+            for (int i = 0; i < numWorkers; i++) {
+              if (i != largestIdx && workerSets[i] != null) {
+                hashes.addAll(workerSets[i]);
+              }
+            }
+          } else {
+            SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+            for (int i = 0; i < leaves.size(); i++) {
+              segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+            }
+            for (long g = 0; g < globalOrdCount; g++) {
+              int segIdx = ordinalMap.getFirstSegmentNumber(g);
+              long segOrd = ordinalMap.getFirstSegmentOrd(g);
+              BytesRef bytes = (segDvs[segIdx] != null)
+                  ? segDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+              hashes.add(hashBytesRef(bytes));
+            }
+          }
+        } else {
+          for (LeafReaderContext leafCtx : leaves) {
+            LeafReader reader = leafCtx.reader();
+            Bits liveDocs = reader.getLiveDocs();
+            SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+            if (dv == null) continue;
+            long valueCount = dv.getValueCount();
+            if (liveDocs == null) {
+              for (long ord = 0; ord < valueCount; ord++) {
+                hashes.add(hashBytesRef(dv.lookupOrd(ord)));
+              }
+            } else {
+              int maxDoc = reader.maxDoc();
+              FixedBitSet usedOrdinals = new FixedBitSet(
+                  (int) Math.min(valueCount, Integer.MAX_VALUE));
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                  usedOrdinals.set((int) dv.nextOrd());
+                }
+              }
+              for (int ord = usedOrdinals.nextSetBit(0); ord != -1;
+                  ord = (ord + 1 < usedOrdinals.length())
+                      ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+                hashes.add(hashBytesRef(dv.lookupOrd(ord)));
+              }
+            }
+          }
+        }
+      } else {
+        // For NOT-EMPTY filter (WHERE col <> ''), use MatchAll ordinals path minus empty hash
+        if (isNotEmptyVarcharFilter(query, columnName)) {
+          long emptyHash = hashBytesRef(new BytesRef(""));
+          boolean hasDeletes = false;
+          for (LeafReaderContext leafCtx : leaves) {
+            if (leafCtx.reader().getLiveDocs() != null) { hasDeletes = true; break; }
+          }
+          OrdinalMap ordinalMap = FusedGroupByAggregate.buildGlobalOrdinalMap(leaves, columnName);
+          if (ordinalMap != null && !hasDeletes) {
+            long globalOrdCount = ordinalMap.getValueCount();
+            hashes = new LongOpenHashSet((int) Math.min(globalOrdCount * 2, Integer.MAX_VALUE));
+            int numWorkers = Math.min(
+                Math.max(1, Runtime.getRuntime().availableProcessors()
+                    / Integer.getInteger("dqe.numLocalShards", 4)), 4);
+            if (numWorkers > 1 && globalOrdCount > 100_000) {
+              LongOpenHashSet[] workerSets = new LongOpenHashSet[numWorkers];
+              long chunkSize = (globalOrdCount + numWorkers - 1) / numWorkers;
+              @SuppressWarnings("unchecked")
+              java.util.concurrent.CompletableFuture<?>[] futures =
+                  new java.util.concurrent.CompletableFuture[numWorkers];
+              for (int w = 0; w < numWorkers; w++) {
+                final long start = w * chunkSize;
+                final long end = Math.min(start + chunkSize, globalOrdCount);
+                final int wIdx = w;
+                futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+                  try {
+                    SortedSetDocValues[] localDvs = new SortedSetDocValues[leaves.size()];
+                    for (int i = 0; i < leaves.size(); i++) {
+                      localDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+                    }
+                    LongOpenHashSet localSet = new LongOpenHashSet(
+                        (int) Math.min(end - start + 16, Integer.MAX_VALUE));
+                    for (long g = start; g < end; g++) {
+                      int segIdx = ordinalMap.getFirstSegmentNumber(g);
+                      long segOrd = ordinalMap.getFirstSegmentOrd(g);
+                      BytesRef bytes = (localDvs[segIdx] != null)
+                          ? localDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+                      if (bytes.length > 0) { // skip empty string
+                        localSet.add(hashBytesRef(bytes));
+                      }
+                    }
+                    workerSets[wIdx] = localSet;
+                  } catch (java.io.IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                  }
+                }, FusedGroupByAggregate.getParallelPool());
+              }
+              java.util.concurrent.CompletableFuture.allOf(futures).join();
+              int largestIdx = 0;
+              for (int i = 1; i < numWorkers; i++) {
+                if (workerSets[i] != null && (workerSets[largestIdx] == null
+                    || workerSets[i].size() > workerSets[largestIdx].size())) {
+                  largestIdx = i;
+                }
+              }
+              hashes = workerSets[largestIdx];
+              for (int i = 0; i < numWorkers; i++) {
+                if (i != largestIdx && workerSets[i] != null) {
+                  hashes.addAll(workerSets[i]);
+                }
+              }
+            } else {
+              SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+              for (int i = 0; i < leaves.size(); i++) {
+                segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+              }
+              for (long g = 0; g < globalOrdCount; g++) {
+                int segIdx = ordinalMap.getFirstSegmentNumber(g);
+                long segOrd = ordinalMap.getFirstSegmentOrd(g);
+                BytesRef bytes = (segDvs[segIdx] != null)
+                    ? segDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+                if (bytes.length > 0) {
+                  hashes.add(hashBytesRef(bytes));
+                }
+              }
+            }
+          } else {
+            // Fallback for deletes: per-segment, skip empty
+            for (LeafReaderContext leafCtx : leaves) {
+              SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+              if (dv == null) continue;
+              long valueCount = dv.getValueCount();
+              for (long ord = 0; ord < valueCount; ord++) {
+                BytesRef bytes = dv.lookupOrd(ord);
+                if (bytes.length > 0) hashes.add(hashBytesRef(bytes));
+              }
+            }
+          }
+        } else {
+          // General filtered path
+          for (LeafReaderContext leafCtx : leaves) {
+            LeafReader reader = leafCtx.reader();
+            SortedSetDocValues dv = reader.getSortedSetDocValues(columnName);
+            if (dv == null) continue;
+            int maxDoc = reader.maxDoc();
+            Bits liveDocs = reader.getLiveDocs();
+            long valueCount = dv.getValueCount();
+            FixedBitSet usedOrdinals =
+                new FixedBitSet((int) Math.min(valueCount, Integer.MAX_VALUE));
+            for (int doc = 0; doc < maxDoc; doc++) {
+              boolean isLive = liveDocs == null || liveDocs.get(doc);
+              if (isLive && dv.advanceExact(doc)) {
+                usedOrdinals.set((int) dv.nextOrd());
+              }
+            }
+            for (int ord = usedOrdinals.nextSetBit(0); ord != -1;
+                ord = (ord + 1 < usedOrdinals.length())
+                    ? usedOrdinals.nextSetBit(ord + 1) : -1) {
+              hashes.add(hashBytesRef(dv.lookupOrd(ord)));
+            }
+          }
+        }
+      }
+    }
+    return hashes;
+  }
+
+  /** FNV-1a 64-bit hash for BytesRef. */
+  private static long hashBytesRef(BytesRef bytes) {
+    long h = 0xcbf29ce484222325L;
+    for (int i = bytes.offset; i < bytes.offset + bytes.length; i++) {
+      h ^= bytes.bytes[i] & 0xFF;
+      h *= 0x100000001b3L;
+    }
+    return h;
+  }
+
+  /**
+   * Detect if a query is a NOT-EQUAL-EMPTY filter on the given column.
+   * Matches: BooleanQuery(MUST MatchAll, MUST_NOT TermQuery(col, ""))
+   */
+  private static boolean isNotEmptyVarcharFilter(Query query, String columnName) {
+    if (!(query instanceof org.apache.lucene.search.BooleanQuery bq)) return false;
+    boolean hasMustNotEmpty = false;
+    for (org.apache.lucene.search.BooleanClause clause : bq.clauses()) {
+      if (clause.occur() == org.apache.lucene.search.BooleanClause.Occur.MUST
+          && clause.query() instanceof MatchAllDocsQuery) {
+        continue;
+      } else if (clause.occur() == org.apache.lucene.search.BooleanClause.Occur.MUST_NOT
+          && clause.query() instanceof org.apache.lucene.search.TermQuery tq) {
+        if (tq.getTerm().field().equals(columnName)
+            && tq.getTerm().bytes().length == 0) {
+          hasMustNotEmpty = true;
+        } else {
+          return false;
+        }
+      } else {
+        return false;
+      }
+    }
+    return hasMustNotEmpty;
+  }
+
+  /**
    * Execute a fused scan to collect distinct strings for a single VARCHAR column, returning the raw
    * HashSet directly (no Page construction). This avoids BlockBuilder overhead.
    *

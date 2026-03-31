@@ -42,6 +42,7 @@ import org.opensearch.sql.dqe.function.BuiltinFunctions;
 import org.opensearch.sql.dqe.function.FunctionRegistry;
 import org.opensearch.sql.dqe.function.expression.BlockExpression;
 import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
+import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
 import org.opensearch.sql.dqe.planner.plan.DqePlanNode;
@@ -3063,16 +3064,16 @@ public class TransportShardExecuteAction
     Query luceneQuery =
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
-    java.util.Set<String> rawStrings =
-        FusedScanAggregate.collectDistinctStringsRaw(columnName, shard, luceneQuery);
+    // Use hash-based counting to avoid string materialization overhead
+    LongOpenHashSet hashes =
+        FusedScanAggregate.collectDistinctVarcharHashes(columnName, shard, luceneQuery);
 
-    // Build a minimal 1-row Page with the count (fallback for non-local paths)
     BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
-    BigintType.BIGINT.writeLong(builder, rawStrings.size());
+    BigintType.BIGINT.writeLong(builder, hashes.size());
     List<Type> columnTypes = List.of(io.trino.spi.type.VarcharType.VARCHAR);
     ShardExecuteResponse resp =
         new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
-    resp.setScalarDistinctStrings(rawStrings);
+    resp.setScalarDistinctSet(hashes);
     return resp;
   }
 

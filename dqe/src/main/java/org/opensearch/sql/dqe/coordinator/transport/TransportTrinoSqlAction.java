@@ -66,6 +66,7 @@ import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteRequest;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteResponse;
 import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
+import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportException;
@@ -2113,7 +2114,35 @@ public class TransportTrinoSqlAction
    */
   private static List<Page> mergeCountDistinctVarcharViaRawSets(
       ShardExecuteResponse[] shardResults, List<List<Page>> shardPages) {
-    // Check if all shards have raw string sets
+    // Check if all shards have hash-based distinct sets (from varchar hash path)
+    boolean allHaveHashSets = true;
+    for (ShardExecuteResponse sr : shardResults) {
+      if (sr.getScalarDistinctSet() == null) {
+        allHaveHashSets = false;
+        break;
+      }
+    }
+    if (allHaveHashSets) {
+      // Hash-based merge: union LongOpenHashSets across shards
+      LongOpenHashSet largest = null;
+      int largestIdx = -1;
+      for (int i = 0; i < shardResults.length; i++) {
+        LongOpenHashSet set = shardResults[i].getScalarDistinctSet();
+        if (largest == null || set.size() > largest.size()) {
+          largest = set;
+          largestIdx = i;
+        }
+      }
+      for (int i = 0; i < shardResults.length; i++) {
+        if (i == largestIdx) continue;
+        largest.addAll(shardResults[i].getScalarDistinctSet());
+      }
+      io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+      BigintType.BIGINT.writeLong(builder, largest.size());
+      return List.of(new Page(builder.build()));
+    }
+
+    // Fallback: check for raw string sets (legacy path)
     boolean allHaveRawSets = true;
     for (ShardExecuteResponse sr : shardResults) {
       if (sr.getScalarDistinctStrings() == null) {
@@ -2126,20 +2155,20 @@ public class TransportTrinoSqlAction
     }
 
     // Find the largest set
-    java.util.Set<String> largest = null;
-    int largestIdx = -1;
+    java.util.Set<String> largest2 = null;
+    int largestIdx2 = -1;
     for (int i = 0; i < shardResults.length; i++) {
       java.util.Set<String> set = shardResults[i].getScalarDistinctStrings();
-      if (largest == null || set.size() > largest.size()) {
-        largest = set;
-        largestIdx = i;
+      if (largest2 == null || set.size() > largest2.size()) {
+        largest2 = set;
+        largestIdx2 = i;
       }
     }
 
     // Merge all non-largest sets into a temporary set (dedup across shards)
     java.util.Set<String> others = null;
     for (int i = 0; i < shardResults.length; i++) {
-      if (i == largestIdx) continue;
+      if (i == largestIdx2) continue;
       java.util.Set<String> set = shardResults[i].getScalarDistinctStrings();
       if (others == null) {
         others = set;
@@ -2150,13 +2179,13 @@ public class TransportTrinoSqlAction
 
     if (others == null) {
       io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
-      BigintType.BIGINT.writeLong(builder, largest.size());
+      BigintType.BIGINT.writeLong(builder, largest2.size());
       return List.of(new Page(builder.build()));
     }
 
     // Parallel count: entries in 'others' not in 'largest'
     String[] othersArray = others.toArray(new String[0]);
-    final java.util.Set<String> L = largest;
+    final java.util.Set<String> L = largest2;
     int numWorkers = Math.min(Runtime.getRuntime().availableProcessors(), 8);
     int chunkSize = (othersArray.length + numWorkers - 1) / numWorkers;
     java.util.concurrent.atomic.AtomicLong extraCount = new java.util.concurrent.atomic.AtomicLong(0);
@@ -2175,7 +2204,7 @@ public class TransportTrinoSqlAction
     }
     java.util.concurrent.CompletableFuture.allOf(futures).join();
 
-    long total = largest.size() + extraCount.get();
+    long total = largest2.size() + extraCount.get();
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
     BigintType.BIGINT.writeLong(builder, total);
     return List.of(new Page(builder.build()));

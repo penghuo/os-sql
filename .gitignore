@@ -58,3 +58,4 @@ http-client.env.json
 memory-bankdqe/native/target/
 dqe/src/main/resources/libdqe_datafusion.so
 .ralph/
+dqe/native/target/

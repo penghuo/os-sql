@@ -1160,36 +1160,37 @@ public class TransportShardExecuteAction
         // Columnar cache: load both columns into flat arrays to avoid per-doc nextDoc() overhead
         long[] key0Values = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName0);
         long[] key1Values = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName1);
+
+        // Pass 1: discover unique groups and count docs per group
+        // Reuse the open-addressing arrays for group discovery; store counts in grpSets index
+        int[] grpCounts = new int[grpCap];
         for (int doc = 0; doc < maxDoc; doc++) {
           long k0 = key0Values[doc];
-          long k1 = key1Values[doc];
           int gm = grpCap - 1;
           int gs = Long.hashCode(k0) & gm;
           while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
           if (!grpOcc[gs]) {
             grpKeys[gs] = k0;
-            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
             grpOcc[gs] = true;
             grpSize++;
             if (grpSize > grpThreshold) {
               int newGC = grpCap * 2;
               long[] ngk = new long[newGC];
-              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
-                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
               boolean[] ngo = new boolean[newGC];
+              int[] ngc = new int[newGC];
               int ngm = newGC - 1;
               for (int g = 0; g < grpCap; g++) {
                 if (grpOcc[g]) {
                   int ns = Long.hashCode(grpKeys[g]) & ngm;
                   while (ngo[ns]) ns = (ns + 1) & ngm;
                   ngk[ns] = grpKeys[g];
-                  ngs[ns] = grpSets[g];
                   ngo[ns] = true;
+                  ngc[ns] = grpCounts[g];
                 }
               }
               grpKeys = ngk;
-              grpSets = ngs;
               grpOcc = ngo;
+              grpCounts = ngc;
               grpCap = newGC;
               grpThreshold = (int) (newGC * 0.7f);
               gm = grpCap - 1;
@@ -1197,7 +1198,65 @@ public class TransportShardExecuteAction
               while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
             }
           }
-          grpSets[gs].add(k1);
+          grpCounts[gs]++;
+        }
+
+        if (grpSize < 10000) {
+          // Cache-friendly partitioned path: process one group at a time so each
+          // group's hash set stays in L2 cache during insertion.
+
+          // Allocate per-group k1 arrays and assign dense group indices
+          int[] grpIdx = new int[grpCap]; // slot -> dense index
+          long[][] perGroupK1 = new long[grpSize][];
+          int idx = 0;
+          for (int g = 0; g < grpCap; g++) {
+            if (grpOcc[g]) {
+              grpIdx[g] = idx;
+              perGroupK1[idx] = new long[grpCounts[g]];
+              idx++;
+            }
+          }
+
+          // Pass 2: scatter k1 values into per-group arrays
+          int[] fillPos = new int[grpSize];
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long k0 = key0Values[doc];
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            int gi = grpIdx[gs];
+            perGroupK1[gi][fillPos[gi]++] = key1Values[doc];
+          }
+
+          // Pass 3: process each group sequentially — hash set stays in L2 cache
+          grpSets = new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+          for (int g = 0; g < grpCap; g++) {
+            if (grpOcc[g]) {
+              int gi = grpIdx[g];
+              long[] k1Arr = perGroupK1[gi];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet set =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet(
+                      Math.max(1024, k1Arr.length));
+              for (int i = 0; i < k1Arr.length; i++) {
+                set.add(k1Arr[i]);
+              }
+              grpSets[g] = set;
+              perGroupK1[gi] = null; // release memory early
+            }
+          }
+        } else {
+          // High-cardinality fallback: round-robin insertion (original path)
+          grpSets = new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+          for (int doc = 0; doc < maxDoc; doc++) {
+            long k0 = key0Values[doc];
+            int gm = grpCap - 1;
+            int gs = Long.hashCode(k0) & gm;
+            while (grpKeys[gs] != k0) gs = (gs + 1) & gm;
+            if (grpSets[gs] == null) {
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
+            }
+            grpSets[gs].add(key1Values[doc]);
+          }
         }
       } else {
         // Fall back to per-doc nextDoc() for segments with deleted docs

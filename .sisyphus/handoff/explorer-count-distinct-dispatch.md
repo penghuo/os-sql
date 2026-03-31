@@ -1,87 +1,117 @@
-# COUNT(DISTINCT) Dispatch Logic — Exploration Findings
+# COUNT(DISTINCT) Dispatch Logic in TransportShardExecuteAction.java
 
-## 1. Dispatch Logic in TransportShardExecuteAction.java (lines 246-335)
+## File Overview
+- **File**: `TransportShardExecuteAction.java` (3759 lines)
+- **Dispatch hub**: `executePlan()` method, lines ~200-780
+- **Pattern**: Cascading `if` checks, first match wins, generic `LocalExecutionPlanner` pipeline as final fallback (line 771)
 
-The dispatch is a cascading series of `if` checks in the main `executeShardPlan` method. COUNT(DISTINCT) has **three fast paths**:
+---
 
-### Path A: Scalar COUNT(DISTINCT) — bare TableScanNode (lines 246-261)
-- **Numeric**: `isBareSingleNumericColumnScan(plan)` → `executeDistinctValuesScanWithRawSet()` — collects distinct values into raw `LongOpenHashSet`, attaches to response
-- **VARCHAR**: `isBareSingleVarcharColumnScan(plan)` → `executeDistinctValuesScanVarcharWithRawSet()` — ordinal-based dedup via `FixedBitSet`
+## 1. How COUNT(DISTINCT) Queries Are Dispatched
 
-### Path B: GROUP BY + COUNT(DISTINCT) — AggregationNode with 2 keys (lines 273-335)
-Detection conditions (line 277-282):
+The dispatch in `executePlan()` follows this priority order for COUNT(DISTINCT):
+
+### Path A: Bare TableScanNode (scalar COUNT(DISTINCT) — PlanFragmenter strips the AggNode)
+- **Lines 265-283**: For scalar `COUNT(DISTINCT col)`, the `PlanFragmenter` strips the `AggregationNode` entirely, leaving a bare `TableScanNode` with a single column.
+- **Numeric**: `isBareSingleNumericColumnScan(plan)` → `executeDistinctValuesScanWithRawSet()` (line 270)
+  - Collects distinct values into a `LongOpenHashSet`, attaches raw set to response via `resp.setScalarDistinctSet(rawSet)`
+- **VARCHAR**: `isBareSingleVarcharColumnScan(plan)` → `executeDistinctValuesScanVarcharWithRawSet()` (line 278)
+  - Uses ordinal-based dedup via `FixedBitSet`, attaches raw string set to response
+
+### Path B: AggregationNode with 2+ GROUP BY keys (Calcite's decomposed COUNT(DISTINCT))
+- **Lines 292-397**: Detects `AggregationNode` with `Step.PARTIAL`, 2+ group-by keys, and `FusedGroupByAggregate.canFuse()`.
+- **Condition**: `effectivePlan instanceof AggregationNode aggDedupNode && aggDedupNode.getStep() == PARTIAL && aggDedupNode.getGroupByKeys().size() >= 2 && FusedGroupByAggregate.canFuse(...)`
+- Sub-dispatch based on key count and types:
+
+| Keys | Types | Method | Line |
+|------|-------|--------|------|
+| 2 numeric | both non-VARCHAR | `executeCountDistinctWithHashSets()` | 328 |
+| 2 (VARCHAR + numeric) | key0=VARCHAR, key1=numeric | `executeVarcharCountDistinctWithHashSets()` | 338 |
+| 3+ all numeric | all non-VARCHAR | `executeNKeyCountDistinctWithHashSets()` | 355 |
+| 3+ mixed types | last key numeric | `executeMixedTypeCountDistinctWithHashSets()` | 375 |
+| 2 keys, mixed aggs | SUM/COUNT only | `executeMixedDedupWithHashSets()` | 393 |
+
+### Path C: Generic Pipeline Fallback
+- **Line 771**: `LocalExecutionPlanner` builds operator pipeline (`LucenePageSource → HashAggregationOperator`), much slower.
+
+---
+
+## 2. Two-Level Calcite Decomposition Detection
+
+**Calcite decomposes** `COUNT(DISTINCT y)` into:
+- **Outer**: `GROUP BY x, COUNT(*)`
+- **Inner**: `GROUP BY x, y`
+
+**The shard plan receives the inner `GROUP BY x, y` with `COUNT(*)`** as a `PARTIAL` `AggregationNode`.
+
+**Detection logic (lines 292-301)**:
 ```java
-scanFactory == null
-&& effectivePlan instanceof AggregationNode aggDedupNode
-&& aggDedupNode.getStep() == AggregationNode.Step.PARTIAL
-&& aggDedupNode.getGroupByKeys().size() == 2
-&& FusedGroupByAggregate.canFuse(aggDedupNode, columnTypeMap)
+if (scanFactory == null
+    && effectivePlan instanceof AggregationNode aggDedupNode
+    && aggDedupNode.getStep() == AggregationNode.Step.PARTIAL
+    && aggDedupNode.getGroupByKeys().size() >= 2
+    && FusedGroupByAggregate.canFuse(aggDedupNode, ...))
 ```
 
-Then sub-routes:
-- **isSingleCountStar** (line 284-286): exactly 1 agg function == `"COUNT(*)"` 
-  - Numeric key0 + Numeric key1 → `executeCountDistinctWithHashSets()` (line 304)
-  - VARCHAR key0 + Numeric key1 → `executeVarcharCountDistinctWithHashSets()` (line 312)
-- **isMixedDedup** (line 288-291): all aggs match `(sum|count)\(.*\)` pattern
-  - Numeric key0 + Numeric key1 → `executeMixedDedupWithHashSets()` (line 330)
+**Fusion**: YES — the code recognizes this two-level pattern and fuses it. Instead of materializing all `(x, y)` tuples, it builds per-group `LongOpenHashSet` accumulators during DocValues iteration. The shard outputs compact `(key0, placeholder=0, local_distinct_count)` rows + attached `HashSet` objects for the coordinator to union across shards.
 
-## 2. AggDedupNode Detection
+**Key insight**: The "fusion" happens implicitly — the code doesn't explicitly detect "this is a decomposed COUNT(DISTINCT)". Instead, it matches the structural pattern (PARTIAL AggNode with 2+ keys and COUNT(*)) and applies the HashSet optimization, which effectively fuses the two-level decomposition into a single pass.
 
-There is **no separate AggDedupNode class**. The "dedup" detection is done by checking an `AggregationNode` with:
-- `Step.PARTIAL` (shard-local)
-- Exactly 2 group-by keys (key0 = real group key, key1 = the DISTINCT column)
-- `FusedGroupByAggregate.canFuse()` returns true
+---
 
-This pattern arises because Calcite decomposes `GROUP BY x, COUNT(DISTINCT y)` into a two-level aggregation where the inner level does `GROUP BY (x, y)` with `COUNT(*)`, effectively deduplicating y per group x.
+## 3. Exact Code Paths for Q04, Q08, Q13
 
-**AggregationNode** (file: `dqe/src/main/java/org/opensearch/sql/dqe/planner/plan/AggregationNode.java`):
-- Fields: `child`, `groupByKeys` (List<String>), `aggregateFunctions` (List<String>), `step` (PARTIAL/FINAL/SINGLE)
+### Q04: Global COUNT(DISTINCT UserID) — scalar, no GROUP BY
+- **Calcite plan**: No outer GROUP BY, just `COUNT(DISTINCT UserID)`
+- **PlanFragmenter**: Strips the AggregationNode, sends bare `TableScanNode(columns=[UserID])` to shards
+- **Dispatch**: `isBareSingleNumericColumnScan(plan)` → TRUE (UserID is numeric)
+- **Method**: `executeDistinctValuesScanWithRawSet()` (line 270)
+- **Mechanism**: Collects all distinct UserID values into a `LongOpenHashSet` via `FusedScanAggregate.collectDistinctValuesRaw()`, attaches raw set to response
+- **Coordinator**: Unions raw sets from all shards, returns `set.size()`
 
-## 3. executeCountDistinctWithHashSets (line 936)
+### Q08: GROUP BY RegionID + COUNT(DISTINCT UserID)
+- **Calcite decomposition**: Inner `GROUP BY (RegionID, UserID)` with `COUNT(*)`
+- **Shard plan**: `AggregationNode(step=PARTIAL, keys=[RegionID, UserID], aggs=[COUNT(*)])`
+- **Dispatch**: 2 keys, both numeric, single COUNT(*) → `executeCountDistinctWithHashSets()` (line 328)
+- **Mechanism**: Iterates DocValues for (RegionID, UserID), builds `Map<Long(RegionID), LongOpenHashSet(UserID)>` with parallel segment scanning
+- **Output**: Compact page `(RegionID, 0, local_distinct_count)` + attached `distinctSets` map
+- **Coordinator**: Unions per-RegionID HashSets across shards
 
+### Q13: GROUP BY SearchPhrase + COUNT(DISTINCT UserID)
+- **Calcite decomposition**: Inner `GROUP BY (SearchPhrase, UserID)` with `COUNT(*)`
+- **Shard plan**: `AggregationNode(step=PARTIAL, keys=[SearchPhrase, UserID], aggs=[COUNT(*)])`
+- **Dispatch**: 2 keys, key0=VARCHAR (SearchPhrase), key1=numeric (UserID) → `executeVarcharCountDistinctWithHashSets()` (line 338)
+- **Mechanism**: Uses `SortedSetDocValues` for SearchPhrase ordinals + `SortedNumericDocValues` for UserID, builds `Map<String, LongOpenHashSet>` with global ordinals optimization for multi-segment
+- **Output**: Compact page + attached varchar distinct sets
+- **Coordinator**: Unions per-SearchPhrase HashSets across shards
+
+---
+
+## 4. executeCountDistinctWithHashSets — What It Does and Limitations
+
+**Location**: Line 1001
+
+**What it does**:
+1. Acquires Lucene searcher for the shard
+2. Compiles/caches Lucene query from DSL filter
+3. **Parallel segment scanning**: Each segment builds its own `Map<Long(key0), LongOpenHashSet(key1)>` via `scanSegmentForCountDistinct()`
+4. **Merge**: Unions per-segment maps (merges smaller set into larger for efficiency)
+5. **Output**: Builds compact page with `(key0, placeholder=0, local_distinct_count)` + attaches raw `distinctSets` map to `ShardExecuteResponse`
+
+**Key code (line 1118-1122)**:
 ```java
-private ShardExecuteResponse executeCountDistinctWithHashSets(
-    AggregationNode aggNode, ShardExecuteRequest req,
-    String keyName0, String keyName1, Type type0, Type type1)
+for (var entry : finalSets.entrySet()) {
+  colTypes.get(0).writeLong(b0, entry.getKey());
+  colTypes.get(1).writeLong(b1, 0L);  // placeholder for key1
+  BigintType.BIGINT.writeLong(b2, entry.getValue().size());
+}
+resp.setDistinctSets(finalSets);
 ```
 
-**Approach**:
-1. Acquires `Engine.Searcher` on the shard
-2. Builds Lucene query from `scanNode.getDslFilter()`
-3. **Parallel segment scanning**: each Lucene segment builds its own `Map<Long, LongOpenHashSet>` (key0 → set of key1 values)
-4. Single segment → direct scan; multi-segment → `ForkJoinPool` parallel dispatch
-5. Merges per-segment maps by unioning HashSets
-6. Outputs compact pages (~450 rows) + attached HashSets for coordinator to union across shards
-
-## 4. FusedGroupByAggregate COUNT(DISTINCT) Handling
-
-**File**: `dqe/src/main/java/org/opensearch/sql/dqe/shard/source/FusedGroupByAggregate.java`
-
-### canFuse() (line 196)
-Validates:
-- Group-by keys are non-empty
-- Child is a `TableScanNode` (possibly via `EvalNode`)
-- All group-by keys are supported types (VARCHAR, numeric, timestamp) or recognized expressions (DATE_TRUNC, EXTRACT, arithmetic)
-- All aggregate functions match `AGG_FUNCTION` regex: `(COUNT|SUM|MIN|MAX|AVG)((DISTINCT )?(.+?))`
-- Aggregate arguments are physical columns, `*`, or supported expressions like `length(col)`
-
-### CountDistinctAccum (line 12604)
-Inner class implementing `MergeableAccumulator`:
-- **Numeric non-double**: uses `LongOpenHashSet` (primitive, no boxing)
-- **VARCHAR/double**: falls back to `HashSet<Object>`
-- `merge()`: unions the sets
-- `writeTo()`: emits `set.size()` as BIGINT
-- Agg type code = `5` in switch statements (lines 3370, 3680, 7654, 7712, 12385)
-
-## Key File References
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `TransportShardExecuteAction.java` | 246-261 | Scalar COUNT(DISTINCT) bare scan dispatch |
-| `TransportShardExecuteAction.java` | 273-335 | GROUP BY + COUNT(DISTINCT) dedup dispatch |
-| `TransportShardExecuteAction.java` | 936-1000+ | `executeCountDistinctWithHashSets` implementation |
-| `TransportShardExecuteAction.java` | 1224 | `executeMixedDedupWithHashSets` |
-| `TransportShardExecuteAction.java` | 1485 | `executeVarcharCountDistinctWithHashSets` |
-| `FusedGroupByAggregate.java` | 196-293 | `canFuse()` validation |
-| `FusedGroupByAggregate.java` | 12600-12650 | `CountDistinctAccum` inner class |
-| `AggregationNode.java` | 1-70 | Plan node with groupByKeys, aggregateFunctions, step |
+**Limitations**:
+1. **Numeric keys only**: Both key0 and key1 must be non-VARCHAR. VARCHAR key0 routes to `executeVarcharCountDistinctWithHashSets()` instead.
+2. **2-key only**: Only handles exactly 2 GROUP BY keys. 3+ keys route to `executeNKeyCountDistinctWithHashSets()`.
+3. **COUNT(*) only**: Only handles single `COUNT(*)` aggregate. Mixed aggregates (SUM + COUNT) route to `executeMixedDedupWithHashSets()`.
+4. **Memory**: Builds full `LongOpenHashSet` per group in memory — for high-cardinality key0 with high-cardinality key1, this can consume significant heap (e.g., 4.4M groups × large sets).
+5. **No spill-to-disk**: All HashSets are in-memory; no overflow mechanism.
+6. **Long-only values**: Uses `LongOpenHashSet` which stores `long` values — cannot handle floating-point distinct values without casting.

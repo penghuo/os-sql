@@ -1677,8 +1677,16 @@ public final class FusedScanAggregate {
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values-raw")) {
-      // Pre-size small; the set will resize as needed (~4 resizes for 4.25M distinct values)
-      distinctSet = new LongOpenHashSet(65536);
+      // Pre-size based on total docs to minimize resizes. For high-cardinality columns
+      // (e.g., UserID with ~4.25M distinct per shard), starting at 65536 causes 7 resizes,
+      // each rehashing all entries. Pre-sizing to ~8M avoids all resizes.
+      long totalDocs = 0;
+      for (LeafReaderContext leaf : engineSearcher.getIndexReader().leaves()) {
+        totalDocs += leaf.reader().maxDoc();
+      }
+      // Estimate distinct count as min(totalDocs/4, 8M) — conservative for high-cardinality
+      int estimatedDistinct = (int) Math.min(totalDocs / 4, 8_000_000);
+      distinctSet = new LongOpenHashSet(Math.max(65536, estimatedDistinct));
       if (query instanceof MatchAllDocsQuery) {
         // Phase 1: Parallel columnar load — read DocValues into flat long[] arrays per segment.
         // Phase 2: Parallel per-segment hash set insertion, then merge.

@@ -9467,54 +9467,104 @@ public final class FusedGroupByAggregate {
         }
       }
     } else {
-      // Filtered path using Lucene collector
-      final boolean[] overflowFlag = {false};
-      final SortedSetDocValues fVarcharDv = varcharDv;
-      final SortedNumericDocValues fNumericDv = numericDv;
-      engineSearcher.search(
-          query,
-          new Collector() {
-            @Override
-            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-              return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) {}
+      // Filtered path: use bitset for selective filters (<50% docs) to avoid
+      // Collector virtual dispatch; fall back to Collector for broad filters.
+      Weight weight =
+          engineSearcher.createWeight(
+              engineSearcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+      int estCount = weight.count(leafCtx);
+      boolean useDirectBitset = (estCount >= 0 && estCount < maxDoc / 2);
 
-                @Override
-                public void collect(int doc) throws IOException {
-                  if (overflowFlag[0]) return;
-                  if (!fVarcharDv.advanceExact(doc)) return;
-                  long ord = fVarcharDv.nextOrd();
-                  if (!fNumericDv.advanceExact(doc)) return;
-                  long nk = fNumericDv.nextValue();
-                  int base = (int) ord * KEYS_PER_ORD;
-                  int n = numKeysPerOrd[(int) ord];
-                  int idx = -1;
-                  for (int j = 0; j < n; j++) {
-                    if (numericKeys[base + j] == nk) {
-                      idx = j;
-                      break;
+      if (useDirectBitset) {
+        // Selective filter: collect matching doc IDs into bitset, then iterate
+        // sequentially for forward-only DocValues access without Collector overhead.
+        FixedBitSet matchingDocs = new FixedBitSet(maxDoc);
+        Scorer scorer = weight.scorer(leafCtx);
+        if (scorer != null) {
+          DocIdSetIterator disi = scorer.iterator();
+          for (int doc = disi.nextDoc();
+              doc != DocIdSetIterator.NO_MORE_DOCS;
+              doc = disi.nextDoc()) {
+            matchingDocs.set(doc);
+          }
+        }
+        for (int doc = matchingDocs.nextSetBit(0);
+            doc != -1;
+            doc = matchingDocs.nextSetBit(doc + 1)) {
+          if (!varcharDv.advanceExact(doc)) continue;
+          long ord = varcharDv.nextOrd();
+          if (!numericDv.advanceExact(doc)) continue;
+          long nk = numericDv.nextValue();
+          int base = (int) ord * KEYS_PER_ORD;
+          int n = numKeysPerOrd[(int) ord];
+          int idx = -1;
+          for (int j = 0; j < n; j++) {
+            if (numericKeys[base + j] == nk) {
+              idx = j;
+              break;
+            }
+          }
+          if (idx >= 0) {
+            counts[base + idx]++;
+          } else if (n < KEYS_PER_ORD) {
+            numericKeys[base + n] = nk;
+            counts[base + n] = 1;
+            numKeysPerOrd[(int) ord]++;
+          } else {
+            overflowed = true;
+            break;
+          }
+        }
+      } else {
+        // Broad filter: use Collector-based path
+        final boolean[] overflowFlag = {false};
+        final SortedSetDocValues fVarcharDv = varcharDv;
+        final SortedNumericDocValues fNumericDv = numericDv;
+        engineSearcher.search(
+            query,
+            new Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    if (overflowFlag[0]) return;
+                    if (!fVarcharDv.advanceExact(doc)) return;
+                    long ord = fVarcharDv.nextOrd();
+                    if (!fNumericDv.advanceExact(doc)) return;
+                    long nk = fNumericDv.nextValue();
+                    int base = (int) ord * KEYS_PER_ORD;
+                    int n = numKeysPerOrd[(int) ord];
+                    int idx = -1;
+                    for (int j = 0; j < n; j++) {
+                      if (numericKeys[base + j] == nk) {
+                        idx = j;
+                        break;
+                      }
+                    }
+                    if (idx >= 0) {
+                      counts[base + idx]++;
+                    } else if (n < KEYS_PER_ORD) {
+                      numericKeys[base + n] = nk;
+                      counts[base + n] = 1;
+                      numKeysPerOrd[(int) ord]++;
+                    } else {
+                      overflowFlag[0] = true;
                     }
                   }
-                  if (idx >= 0) {
-                    counts[base + idx]++;
-                  } else if (n < KEYS_PER_ORD) {
-                    numericKeys[base + n] = nk;
-                    counts[base + n] = 1;
-                    numKeysPerOrd[(int) ord]++;
-                  } else {
-                    overflowFlag[0] = true;
-                  }
-                }
-              };
-            }
+                };
+              }
 
-            @Override
-            public ScoreMode scoreMode() {
-              return ScoreMode.COMPLETE_NO_SCORES;
-            }
-          });
-      overflowed = overflowFlag[0];
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+        overflowed = overflowFlag[0];
+      }
     }
 
     if (overflowed) {

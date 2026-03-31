@@ -13730,6 +13730,26 @@ public final class FusedGroupByAggregate {
       this.threshold = (int) (newCap * LOAD_FACTOR);
     }
 
+    /**
+     * Find or insert starting from a pre-computed hash slot. Used by prefetch-batched scan loops
+     * where the hash slot is computed ahead of time to trigger cache line loads before probing.
+     */
+    int findOrInsertFromSlot(long key, int startSlot) {
+      int mask = capacity - 1;
+      int h = startSlot;
+      while (keys[h] != EMPTY_KEY) {
+        if (keys[h] == key) return h;
+        h = (h + 1) & mask;
+      }
+      keys[h] = key;
+      size++;
+      if (size > threshold) {
+        resize();
+        return findExisting(key);
+      }
+      return h;
+    }
+
     /** Merge all entries from another FlatSingleKeyMap into this one, adding accData element-wise. */
     void mergeFrom(FlatSingleKeyMap other) {
       for (int s = 0; s < other.capacity; s++) {
@@ -14383,21 +14403,51 @@ public final class FusedGroupByAggregate {
   /**
    * Scan a doc range [startDoc, endDoc) of a pre-loaded key column for COUNT(*) aggregation.
    * Used by the doc-range parallel path to split a single segment across multiple workers.
+   *
+   * <p>Uses prefetch-batched hash probing: computes hash slots for a batch of keys ahead of time,
+   * touches the keys array to trigger cache line loads, then probes starting from the pre-computed
+   * slots. This overlaps DRAM latency (~100ns per cache miss) with computation when the hash table
+   * exceeds L3 cache.
    */
   private static void scanDocRangeFlatSingleKeyCountStar(
       long[] keyValues, int startDoc, int endDoc, Bits liveDocs,
       FlatSingleKeyMap flatMap, int accOffset0, int slotsPerGroup) {
-    if (liveDocs == null) {
-      for (int doc = startDoc; doc < endDoc; doc++) {
-        int slot = flatMap.findOrInsert(keyValues[doc]);
-        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
-      }
-    } else {
+    if (liveDocs != null) {
+      // liveDocs path: no prefetch batching (branch-heavy, less benefit)
       for (int doc = startDoc; doc < endDoc; doc++) {
         if (!liveDocs.get(doc)) continue;
         int slot = flatMap.findOrInsert(keyValues[doc]);
         flatMap.accData[slot * slotsPerGroup + accOffset0]++;
       }
+      return;
+    }
+
+    // Prefetch-batched path for the common no-deletes case.
+    // Process keys in batches: compute hash slots ahead of time to warm cache lines,
+    // then probe. This overlaps DRAM latency (~100ns) with hash computation.
+    final int BATCH = 16;
+    long prefetchSink = 0; // accumulator to prevent JIT from eliminating prefetch reads
+    int doc = startDoc;
+
+    for (; doc + BATCH <= endDoc; doc += BATCH) {
+      // Re-read keys array and mask each batch (may change after resize)
+      long[] mapKeys = flatMap.keys;
+      int mask = flatMap.capacity - 1;
+      // Phase 1: compute hash slots and prefetch cache lines
+      for (int j = 0; j < BATCH; j++) {
+        int slot = SingleKeyHashMap.hash1(keyValues[doc + j]) & mask;
+        prefetchSink += mapKeys[slot]; // force cache line load; accumulate to prevent DCE
+      }
+      // Phase 2: actual probe and insert (cache lines should now be loaded)
+      for (int j = 0; j < BATCH; j++) {
+        int slot = flatMap.findOrInsert(keyValues[doc + j]);
+        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      }
+    }
+    // Remainder
+    for (; doc < endDoc; doc++) {
+      int slot = flatMap.findOrInsert(keyValues[doc]);
+      flatMap.accData[slot * slotsPerGroup + accOffset0]++;
     }
   }
 

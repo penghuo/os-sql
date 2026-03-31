@@ -1677,12 +1677,8 @@ public final class FusedScanAggregate {
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-values-raw")) {
-      // Pre-size based on maxDoc to avoid resize storms for high-cardinality columns
-      int totalDocs = engineSearcher.getIndexReader().maxDoc();
-      distinctSet =
-          totalDocs > 0
-              ? new LongOpenHashSet(Math.min(totalDocs, 32_000_000))
-              : new LongOpenHashSet();
+      // Pre-size small; the set will resize as needed (~4 resizes for 4.25M distinct values)
+      distinctSet = new LongOpenHashSet(65536);
       if (query instanceof MatchAllDocsQuery) {
         // Phase 1: Parallel columnar load — read DocValues into flat long[] arrays per segment.
         // Phase 2: Parallel per-segment hash set insertion, then merge.
@@ -1735,31 +1731,42 @@ public final class FusedScanAggregate {
           }
           java.util.concurrent.CompletableFuture.allOf(futures).join();
         } else {
-          // Single segment — load directly
+          // Single segment — fused single-pass: read DocValues directly into hash set
+          // with inline run-length dedup, avoiding temp long[maxDoc] allocation.
           LeafReader reader = leaves.get(0).reader();
           SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
           if (dv != null) {
-            int maxDoc = reader.maxDoc();
-            long[] vals = new long[maxDoc];
             Bits liveDocs = reader.getLiveDocs();
-            int count = 0;
             if (liveDocs == null) {
+              // Fused single-pass: read DocValues directly into hash set with run-length dedup
+              long prev = Long.MIN_VALUE;
+              boolean hasPrev = false;
               int doc = dv.nextDoc();
               while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                vals[count++] = dv.nextValue();
+                long v = dv.nextValue();
+                if (!hasPrev || v != prev) {
+                  distinctSet.add(v);
+                  prev = v;
+                  hasPrev = true;
+                }
                 doc = dv.nextDoc();
               }
             } else {
+              // With liveDocs: advanceExact per live doc
+              int maxDoc = reader.maxDoc();
+              long prev = Long.MIN_VALUE;
+              boolean hasPrev = false;
               for (int doc = 0; doc < maxDoc; doc++) {
                 if (liveDocs.get(doc) && dv.advanceExact(doc)) {
-                  vals[count++] = dv.nextValue();
+                  long v = dv.nextValue();
+                  if (!hasPrev || v != prev) {
+                    distinctSet.add(v);
+                    prev = v;
+                    hasPrev = true;
+                  }
                 }
               }
             }
-            segArrays[0] = vals;
-            segCounts[0] = count;
-          } else {
-            segArrays[0] = new long[0];
           }
         }
         // Phase 2: Parallel per-segment hash insertion, then merge
@@ -1776,7 +1783,7 @@ public final class FusedScanAggregate {
                       if (vals == null || segCounts[segIdx] == 0) {
                         return new LongOpenHashSet();
                       }
-                      LongOpenHashSet set = new LongOpenHashSet(segCounts[segIdx]);
+                      LongOpenHashSet set = new LongOpenHashSet(Math.min(segCounts[segIdx], 1_000_000));
                       int count = segCounts[segIdx];
                       // Run-length dedup: skip consecutive duplicates (index is sorted by UserID)
                       long prev = Long.MIN_VALUE;
@@ -1809,19 +1816,7 @@ public final class FusedScanAggregate {
           }
           distinctSet = segSets[largestIdx];
         } else {
-          // Single segment — insert directly
-          long[] vals = segArrays[0];
-          if (vals != null) {
-            int count = segCounts[0];
-            long prev = Long.MIN_VALUE;
-            for (int i = 0; i < count; i++) {
-              long v = vals[i];
-              if (v != prev) {
-                distinctSet.add(v);
-                prev = v;
-              }
-            }
-          }
+          // Single segment — already inserted directly into distinctSet in fused Phase 1
         }
       } else {
         final LongOpenHashSet filteredSet = distinctSet;

@@ -796,3 +796,35 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 2. **Score stable at 27/43**: Q15 improvement doesn't cross 2x threshold (3.68x vs target 2x).
 3. **22 iterations of optimization have exhausted code-level improvements**: All 16 above-2x queries hit optimized fused paths. Remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar).
 4. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: Need m5.8xlarge (32 vCPU) or architectural changes (columnar storage, vectorized execution).
+
+## Iteration 23 — 2026-03-31T00:00-00:40Z
+
+### What I Did
+1. Explored COUNT(DISTINCT) dispatch paths in TransportShardExecuteAction — found all 6 queries already hit optimized fast paths
+2. Explored existing COUNT(DISTINCT) implementations — found per-group LongOpenHashSet in TransportShardExecuteAction and accType=5 in FusedGroupByAggregate
+3. Identified bottlenecks: Q04 has sequential hash insertion (Phase 2), Q05 has sequential Collections.addAll() for HashSet<String>
+4. Q04 optimization: Parallel per-segment LongOpenHashSet construction + merge-largest strategy
+   - Tested fused approach (DocValues read + hash insert in one pass) — 1.78s, SLOWER than two-phase (1.56s) due to cache interference
+   - Reverted to two-phase: parallel DocValues load → parallel hash set build → merge
+5. Q05 optimization: ConcurrentHashMap.newKeySet() with parallel direct insertion from workers
+   - Changed return type from HashSet<String> to Set<String> to avoid wasteful copy
+   - Workers insert directly into concurrent set instead of producing String[] chunks
+6. Compiled: BUILD SUCCESSFUL
+7. Correctness: 39/43 PASS (no regression)
+8. Benchmarked Q04 isolated: 2.38s → 1.56s (35% faster)
+9. Benchmarked Q05 isolated: 3.58s → 2.58s (28% faster)
+10. Full benchmark: 26/43 within 2x (same as baseline — no queries crossed 2x threshold)
+
+### Results
+- Score: 26/43 within 2x (unchanged)
+- Correctness: 39/43 PASS (unchanged)
+- Q04: 2.38s → 1.62s (32% faster, 5.49x → 3.73x) — still above 2x
+- Q05: 3.58s → 2.47s (31% faster, 5.19x → 3.58x) — still above 2x
+- No real regressions (noise only in sub-millisecond queries)
+- Fused approach (DocValues + hash in one pass) was 14% SLOWER than two-phase — cache interference from interleaving random hash probes with sequential DocValues reads
+
+### Decisions
+1. **Two-phase approach KEPT for Q04**: Separating DocValues load (sequential memory access) from hash insertion (random access) is faster than fusing them, because the CPU cache can optimize each phase independently.
+2. **ConcurrentHashMap KEPT for Q05**: Eliminates the sequential Collections.addAll() bottleneck. Workers insert directly into the shared concurrent set.
+3. **Performance target (≥38/43) NOT achievable on r5.4xlarge**: All 16 above-2x queries hit optimized fused paths. The remaining gap is fundamental Lucene DocValues overhead (3-10x slower than ClickHouse columnar format).
+4. **Next optimization targets**: Q14 (2.37x, closest to 2x), Q28 (2.41x, REGEXP_REPLACE), Q29 (2.69x, expression eval).

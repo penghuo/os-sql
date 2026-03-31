@@ -5208,7 +5208,7 @@ public final class FusedGroupByAggregate {
           }
 
           // For high-cardinality keys (totalDocs > 10M), scan sequentially into main map.
-          // Parallel workers each build 4.4M-entry maps that thrash L3 cache and require
+          // Parallel workers each build large maps that thrash L3 cache and require
           // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
           if (totalDocs > 10_000_000) {
             // Pre-size main map larger to reduce resize probability
@@ -6476,6 +6476,49 @@ public final class FusedGroupByAggregate {
           if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
           futures[fi] = null; // release worker map for GC
         }
+      } else if (!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1
+          && leaves.size() == 1 && isMatchAll && numBuckets <= 1) {
+        // Doc-range parallel for single-segment shards
+        LeafReaderContext leafCtx = leaves.get(0);
+        int maxDoc = leafCtx.reader().maxDoc();
+        int numWorkers = THREADS_PER_SHARD;
+        int docsPerWorker = (maxDoc + numWorkers - 1) / numWorkers;
+
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<FlatTwoKeyMap>[] futures =
+            new java.util.concurrent.CompletableFuture[numWorkers];
+
+        for (int w = 0; w < numWorkers; w++) {
+          final int startDoc = w * docsPerWorker;
+          final int endDoc = Math.min(startDoc + docsPerWorker, maxDoc);
+          if (startDoc >= maxDoc) {
+            futures[w] = java.util.concurrent.CompletableFuture.completedFuture(null);
+            continue;
+          }
+          futures[w] =
+              java.util.concurrent.CompletableFuture.supplyAsync(
+                  () -> {
+                    try {
+                      FlatTwoKeyMap localMap = new FlatTwoKeyMap(slotsPerGroup,
+                          (int) Math.min((long) (endDoc - startDoc) * 10 / 7 + 1, 4_000_000));
+                      scanDocRangeFlatTwoKey(
+                          leafCtx, startDoc, endDoc, localMap,
+                          keyInfos, specs, numAggs, isCountStar,
+                          accType, accOffset, slotsPerGroup);
+                      return localMap;
+                    } catch (Exception e) {
+                      throw new RuntimeException(e);
+                    }
+                  },
+                  PARALLEL_POOL);
+        }
+
+        java.util.concurrent.CompletableFuture.allOf(futures).join();
+        for (int fi = 0; fi < futures.length; fi++) {
+          FlatTwoKeyMap workerMap = futures[fi].join();
+          if (workerMap != null && workerMap.size > 0) flatMap.mergeFrom(workerMap);
+          futures[fi] = null;
+        }
       } else {
         // Sequential fallback: single FlatTwoKeyMap for all segments
         Weight weight = null;
@@ -7029,6 +7072,72 @@ public final class FusedGroupByAggregate {
             collectFlatTwoKeyDoc(
                 doc, dv0, dv1, flatMap, slotsPerGroup, numAggs, isCountStar,
                 accType, accOffset, numericAggDvs, bucket, numBuckets);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Scan a doc range [startDoc, endDoc) within a single segment for the flat two-key numeric
+   * GROUP BY path. Used by doc-range parallel execution for single-segment shards.
+   */
+  private static void scanDocRangeFlatTwoKey(
+      LeafReaderContext leafCtx,
+      int startDoc,
+      int endDoc,
+      FlatTwoKeyMap flatMap,
+      List<KeyInfo> keyInfos,
+      List<AggSpec> specs,
+      int numAggs,
+      boolean[] isCountStar,
+      int[] accType,
+      int[] accOffset,
+      int slotsPerGroup)
+      throws Exception {
+
+    LeafReader reader = leafCtx.reader();
+    SortedNumericDocValues dv0 = reader.getSortedNumericDocValues(keyInfos.get(0).name());
+    SortedNumericDocValues dv1 = reader.getSortedNumericDocValues(keyInfos.get(1).name());
+
+    boolean allCountStar = true;
+    for (int i = 0; i < numAggs; i++) {
+      if (!isCountStar[i]) { allCountStar = false; break; }
+    }
+
+    SortedNumericDocValues[] numericAggDvs = null;
+    if (!allCountStar) {
+      numericAggDvs = new SortedNumericDocValues[numAggs];
+      for (int i = 0; i < numAggs; i++) {
+        if (!isCountStar[i]) {
+          numericAggDvs[i] = reader.getSortedNumericDocValues(specs.get(i).arg);
+        }
+      }
+    }
+
+    Bits liveDocs = reader.getLiveDocs();
+
+    for (int doc = startDoc; doc < endDoc; doc++) {
+      if (liveDocs != null && !liveDocs.get(doc)) continue;
+      long key0 = 0, key1 = 0;
+      if (dv0 != null && dv0.advanceExact(doc)) key0 = dv0.nextValue();
+      if (dv1 != null && dv1.advanceExact(doc)) key1 = dv1.nextValue();
+      int slot = flatMap.findOrInsert(key0, key1);
+      if (allCountStar) {
+        flatMap.accData[slot * slotsPerGroup]++;
+      } else {
+        int base = slot * slotsPerGroup;
+        for (int i = 0; i < numAggs; i++) {
+          int off = base + accOffset[i];
+          if (isCountStar[i]) { flatMap.accData[off]++; continue; }
+          SortedNumericDocValues aggDv = numericAggDvs[i];
+          if (aggDv != null && aggDv.advanceExact(doc)) {
+            long rawVal = aggDv.nextValue();
+            switch (accType[i]) {
+              case 0: flatMap.accData[off]++; break;
+              case 1: flatMap.accData[off] += rawVal; break;
+              case 2: flatMap.accData[off] += rawVal; flatMap.accData[off + 1]++; break;
+            }
           }
         }
       }
@@ -13026,7 +13135,7 @@ public final class FusedGroupByAggregate {
   private static final class TwoKeyHashMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 16_000_000;
+    private static final int MAX_CAPACITY = 32_000_000;
 
     long[] keys0;
     long[] keys1;
@@ -13143,7 +13252,7 @@ public final class FusedGroupByAggregate {
   private static final class SingleKeyHashMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 16_000_000;
+    private static final int MAX_CAPACITY = 32_000_000;
 
     long[] keys;
     AccumulatorGroup[] groups;
@@ -13254,7 +13363,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatTwoKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 16_000_000;
+    private static final int MAX_CAPACITY = 32_000_000;
     static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys0;
@@ -13406,7 +13515,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatThreeKeyMap {
     private static final int INITIAL_CAPACITY = 8192;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 16_000_000;
+    private static final int MAX_CAPACITY = 32_000_000;
     static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys0;
@@ -13531,7 +13640,7 @@ public final class FusedGroupByAggregate {
   private static final class FlatSingleKeyMap {
     private static final int INITIAL_CAPACITY = 4096;
     private static final float LOAD_FACTOR = 0.7f;
-    private static final int MAX_CAPACITY = 16_000_000;
+    private static final int MAX_CAPACITY = 32_000_000;
     static final long EMPTY_KEY = Long.MIN_VALUE;
 
     long[] keys;

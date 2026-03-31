@@ -1168,7 +1168,7 @@ public class TransportShardExecuteAction
           while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
           if (!grpOcc[gs]) {
             grpKeys[gs] = k0;
-            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
             grpOcc[gs] = true;
             grpSize++;
             if (grpSize > grpThreshold) {
@@ -1213,7 +1213,7 @@ public class TransportShardExecuteAction
           while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
           if (!grpOcc[gs]) {
             grpKeys[gs] = k0;
-            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
             grpOcc[gs] = true;
             grpSize++;
             if (grpSize > grpThreshold) {
@@ -1260,7 +1260,7 @@ public class TransportShardExecuteAction
           while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
           if (!grpOcc[gs]) {
             grpKeys[gs] = k0;
-            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
             grpOcc[gs] = true;
             grpSize++;
             if (grpSize > grpThreshold) {
@@ -1309,6 +1309,7 @@ public class TransportShardExecuteAction
   private static void mergeHashSets(
       org.opensearch.sql.dqe.operator.LongOpenHashSet target,
       org.opensearch.sql.dqe.operator.LongOpenHashSet source) {
+    target.ensureCapacity(target.size() + source.size());
     if (source.hasZeroValue()) target.add(0L);
     if (source.hasSentinelValue())
       target.add(org.opensearch.sql.dqe.operator.LongOpenHashSet.emptyMarker());
@@ -1553,7 +1554,7 @@ public class TransportShardExecuteAction
           }
           LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
           result.computeIfAbsent(
-                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
+                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024))
               .add(dedupVal);
         }
       }
@@ -1575,7 +1576,7 @@ public class TransportShardExecuteAction
           }
           LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
           result.computeIfAbsent(
-                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet())
+                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024))
               .add(dedupVal);
         }
       }
@@ -1873,7 +1874,7 @@ public class TransportShardExecuteAction
         org.opensearch.sql.dqe.operator.LongOpenHashSet set = ordResult.get(key);
         if (set == null) {
           // Only allocate new key array on insert
-          set = new org.opensearch.sql.dqe.operator.LongOpenHashSet();
+          set = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
           ordResult.put(new ObjectArrayKey(probeKey.clone()), set);
         }
         set.add(dedupVal);

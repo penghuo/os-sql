@@ -1778,8 +1778,14 @@ public final class FusedScanAggregate {
                       }
                       LongOpenHashSet set = new LongOpenHashSet(segCounts[segIdx]);
                       int count = segCounts[segIdx];
+                      // Run-length dedup: skip consecutive duplicates (index is sorted by UserID)
+                      long prev = Long.MIN_VALUE;
                       for (int i = 0; i < count; i++) {
-                        set.add(vals[i]);
+                        long v = vals[i];
+                        if (v != prev) {
+                          set.add(v);
+                          prev = v;
+                        }
                       }
                       return set;
                     },
@@ -1807,8 +1813,13 @@ public final class FusedScanAggregate {
           long[] vals = segArrays[0];
           if (vals != null) {
             int count = segCounts[0];
+            long prev = Long.MIN_VALUE;
             for (int i = 0; i < count; i++) {
-              distinctSet.add(vals[i]);
+              long v = vals[i];
+              if (v != prev) {
+                distinctSet.add(v);
+                prev = v;
+              }
             }
           }
         }

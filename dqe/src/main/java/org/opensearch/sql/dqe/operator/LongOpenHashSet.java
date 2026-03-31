@@ -187,6 +187,38 @@ public final class LongOpenHashSet {
     }
   }
 
+  /**
+   * Pre-allocate capacity to hold at least {@code minCapacity} elements without resizing.
+   * Used before bulk merge operations to avoid incremental resize overhead.
+   */
+  public void ensureCapacity(int minCapacity) {
+    int needed = (int) Math.ceil(minCapacity / LOAD_FACTOR);
+    if (needed > capacity) {
+      int newCap = Integer.highestOneBit(needed - 1) << 1;
+      if (newCap < needed) newCap = needed;
+      long[] nk = new long[newCap];
+      java.util.Arrays.fill(nk, EMPTY);
+      int nm = newCap - 1;
+      for (int i = 0; i < capacity; i++) {
+        long k = keys[i];
+        if (k != EMPTY) {
+          long h = k;
+          h ^= h >>> 33;
+          h *= 0xff51afd7ed558ccdL;
+          h ^= h >>> 33;
+          h *= 0xc4ceb9fe1a85ec53L;
+          h ^= h >>> 33;
+          int slot = (int) h & nm;
+          while (nk[slot] != EMPTY) slot = (slot + 1) & nm;
+          nk[slot] = k;
+        }
+      }
+      this.keys = nk;
+      this.capacity = newCap;
+      this.threshold = (int) (newCap * LOAD_FACTOR);
+    }
+  }
+
   private void resize() {
     int newCapacity = capacity * 2;
     long[] newKeys = new long[newCapacity];

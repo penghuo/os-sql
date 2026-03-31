@@ -979,3 +979,37 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **Three-key GROUP BY with varchar causes OOM when parallelized**: Q18 (UserID × minute × SearchPhrase) has millions of unique groups. 4 workers × 4 shards × millions of groups = heap exhaustion.
 4. **Q19/Q20/Q21 failures are GC cascade from Q18**: They work fine independently. The sequential benchmark runs Q18 (31s, fills heap) right before them.
 5. **Remaining 10 queries need fundamentally different approaches**: Hash map cache misses are the bottleneck, not scan speed. Possible: approximate counting, two-pass aggregation, columnar bypass, or more shards.
+
+## Iteration 28 — 2026-03-31T19:57-21:15Z
+
+### What I Did
+1. Analyzed all 10 above-2x queries' dispatch paths and bottlenecks via explorer subagents
+2. Implemented fused DV scan for collectDistinctValuesRaw (Q04):
+   - Eliminated 800MB temp long[maxDoc] array by fusing DV read + hash insert
+   - Right-sized LongOpenHashSet from min(maxDoc, 32M) to 65536 initial
+   - Q04: 1.435s → 1.282s (10% improvement)
+3. Attempted doc-range parallelism for single-segment COUNT(DISTINCT) — REVERTED, no improvement
+4. Implemented prefetch-batched hash probing in scanDocRangeFlatSingleKeyCountStar:
+   - Compute hash slots for 16 keys ahead, touch cache lines, then probe
+   - Q15: 1.702s → 1.500s (12% improvement in isolation)
+   - Fixed resize bug (stale keys array reference after resize)
+   - Simplified to accumulator-based prefetch to prevent JIT dead code elimination
+5. Ran full benchmark: 32/43 within 2x
+6. Ran correctness: 36/43 PASS (no regression)
+7. Committed: cc0175dc0
+
+### Results
+- Score: 32/43 within 2x (up from 29/43 in iter27 full benchmark)
+- Q19/Q20/Q21/Q22: recovered from Q18 GC cascade (now work in full benchmark)
+- Q04: 1.435s → 1.282s (3.24x, was 3.31x)
+- Q15: 1.702s → 1.500s in isolation (2.88x), 1.882s in full benchmark (3.62x)
+- Q35: 1.230s → 1.157s (3.20x, was 3.32x)
+- Q14: 1.92x → 2.08x (borderline regression, noise)
+- Correctness: 36/43 PASS (no regression)
+
+### Decisions
+1. **Fused DV scan COMMITTED**: Eliminates 800MB temp array + reduces hash set from 512MB to 800KB initial. The amortized cost of ~4 resizes is negligible vs upfront waste.
+2. **Doc-range parallelism for COUNT(DISTINCT) REVERTED**: Each worker builds nearly-full-size hash set (same unique keys distributed across all doc ranges). Merge overhead adds to cost. Hash map cache misses are the bottleneck, not scan speed.
+3. **Prefetch-batched hash probing COMMITTED**: 12% improvement for Q15 in isolation. Uses accumulator sink to prevent JIT dead code elimination. Re-reads keys array each batch to handle resize correctly.
+4. **Remaining 11 above-2x queries are fundamentally limited**: All hit optimized fused paths. The 3-14x gap vs ClickHouse is due to: (a) hash table cache misses on high-cardinality data, (b) per-doc DocValues access vs columnar batch processing, (c) ClickHouse's two-level hash table and SIMD-friendly probing.
+5. **Q14 regression is noise**: Was 1.92x in iter27, now 2.08x. The 2-key varchar GROUP BY path was not modified. Variance is high (1.530s to 2.244s across runs).

@@ -1,0 +1,22 @@
+1,10c1,10
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirosomahachkakh-2/?type=0&choos&lr=65&model=417&oid=&top=1&lr=962	http://irr.ru/index.php?showalbum/login-kapusta-advert27256.html_params	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirosomahachkakh-2/?type=0&choos&lr=65&model=417&oid=&top=1&lr=962	http://irr.ru/index.php?showalbum/login-kupaljinik-2008-g-v-stroika/photo=1	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirosomaha.diary.ru/e-stichieies-radiorecord.ru	http://irr.ru/index.php?showalbum/login-kupaljinik-Internet Explorer&aV=4.0 (Windows)&bL=ru&cE=true&uA=Opera&aV=5.0 (Windows	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.rambler.ru/GameMain.asp?search&evLcK7yQygPnEU83	http://irr.ru/index.php?showalbum/logija/f:30841&pt=b&pd=6&pw=0&po_yers=0&with_video.yandex.ru	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.rambler.ru/page=91552&q=юрий&where	http://irr.ru/index.php	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru%2Fcomputers-card.php?action-4925	http://irr.ru/index.php?showalbum/login-leniya7777294,938303130	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru%2Findex.ru/yandex.ru/search/index	http://irr.ru/index.php?showalbum/login-leniya7777294,938303130	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/?countforum.mate=0&s_yers=0&po_yers	http://irr.ru/index.php?showalbum/login-leniya7777294,938303130	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/GameMain.aspx	http://irr.ru/index.php?showalbum/login-kapustic/product_name	5
+< -1	0	0	http://state=19945206/foto-4/login-2006/makumirostova.ru/GameMain.aspx?Topic,3254;84=206/	http://irr.ru/index.php?showalbum/login-leniya7777294,938303130	5
+---
+> 1	0	0	http://mysw.info/node/215455&text	http://irr.ru/index.php?showalbum/logabass.ru/cation&op_category_id=HOtbySdOiUw&where=all&film/4700	6
+> 1	0	0	http://mysw.info/node/215455&text=ликолаев&l10n	http://irr.ru/index.php	6
+> 1	0	0	http://smeshariki.ru/diary.ru/yandex.ru/credir=1	http://komme%2F27.0.1453.116	6
+> 1	0	0	http://video.yandex.ru/cars	http://komme%2F27.0.1453.116	6
+> 1	0	0	http://yandex.ru/world/photo_entry/r/afr.php?linkvac.php?gidcar=Volkswagen/baby-car.su/?search	http://irr.ru/index.php?showalbum/login-milead%26version=0&page2=55&type_id	6
+> 1	0	0	https://mysw.info=sw-131726275	http://komme%2F27.0.1453.116 Safari	6
+> 1	0	0	https://mysw.info=sw-131726275	http://komme%2F27.0.1453.116 Safari%2F8536.26 (KHTML	6
+> 3	123	0		http://komme%2F27.0.1453.116	6
+> 5	0	0	http://kinopoisk.ru/?state	http:%2F%2Fwwwwww.bonprix.ru/searchAutoSearch?text=велир	6
+> 5	0	0	http://kinopoisk.ru/?state	http://wildberries.aspx#location/group_cod_1s=53&butto_638_1360/3/women.aspx?naId=4lqwu0bF8gE&where=all&filmId=asVbQqOlUXI&where=all&filmId=QrUSlfQfs3M&where=all&film/4269/page=2&driver.ru/catalog/topic,8081e.21152008	6

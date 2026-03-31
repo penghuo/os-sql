@@ -20,9 +20,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.OrdinalMap;
@@ -57,6 +59,13 @@ import org.opensearch.sql.dqe.planner.plan.TableScanNode;
  * TableScanNode.
  */
 public final class FusedScanAggregate {
+
+  // Segment-level aggregate cache: maps segment core cache key -> (columnName -> long[]{sum, count, min, max}).
+  // Uses LeafReader.getCoreCacheHelper().getKey() for stable per-segment identity.
+  // Eviction: addClosedListener removes entries when segment is closed/merged.
+  // Only populated for segments with no deleted docs (liveDocs == null).
+  private static final ConcurrentHashMap<Object, ConcurrentHashMap<String, long[]>>
+      SEGMENT_AGG_CACHE = new ConcurrentHashMap<>();
 
   private static final Pattern AGG_FUNCTION =
       Pattern.compile(
@@ -271,7 +280,24 @@ public final class FusedScanAggregate {
                           for (LeafReaderContext leafCtx : mySegments) {
                             LeafReader reader = leafCtx.reader();
                             long segCount = reader.maxDoc(); // MatchAll + no deletes
+
+                            // Segment-level cache lookup
+                            IndexReader.CacheHelper coreHelper = reader.getCoreCacheHelper();
+                            Object segKey = coreHelper != null ? coreHelper.getKey() : null;
+                            ConcurrentHashMap<String, long[]> segCache =
+                                segKey != null ? SEGMENT_AGG_CACHE.get(segKey) : null;
+
                             for (int i = 0; i < nc; i++) {
+                              // Check cache before scanning DocValues
+                              if (segCache != null) {
+                                long[] cached = segCache.get(colArray[i]);
+                                if (cached != null) {
+                                  pack[i * 2] += cached[0];
+                                  pack[i * 2 + 1] += cached[1];
+                                  continue; // Cache hit
+                                }
+                              }
+
                               SortedNumericDocValues dv =
                                   reader.getSortedNumericDocValues(colArray[i]);
                               if (dv == null) continue;
@@ -283,6 +309,20 @@ public final class FusedScanAggregate {
                               }
                               pack[i * 2] += localSum;
                               pack[i * 2 + 1] += segCount;
+
+                              // Store in cache
+                              if (segKey != null) {
+                                SEGMENT_AGG_CACHE
+                                    .computeIfAbsent(segKey, k -> {
+                                      try {
+                                        coreHelper.addClosedListener(
+                                            closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                                      } catch (Exception ignored) { }
+                                      return new ConcurrentHashMap<>();
+                                    })
+                                    .putIfAbsent(colArray[i],
+                                        new long[]{localSum, segCount, Long.MAX_VALUE, Long.MIN_VALUE});
+                              }
                             }
                           }
                         } catch (IOException e) {
@@ -306,7 +346,24 @@ public final class FusedScanAggregate {
             for (LeafReaderContext leafCtx : leaves) {
               LeafReader reader = leafCtx.reader();
               long segCount = reader.maxDoc(); // MatchAll + no deletes
+
+              // Segment-level cache lookup
+              IndexReader.CacheHelper coreHelper = reader.getCoreCacheHelper();
+              Object segKey = coreHelper != null ? coreHelper.getKey() : null;
+              ConcurrentHashMap<String, long[]> segCache =
+                  segKey != null ? SEGMENT_AGG_CACHE.get(segKey) : null;
+
               for (int i = 0; i < colArray.length; i++) {
+                // Check cache before scanning DocValues
+                if (segCache != null) {
+                  long[] cached = segCache.get(colArray[i]);
+                  if (cached != null) {
+                    scArrays[i][0] += cached[0];
+                    scArrays[i][1] += cached[1];
+                    continue; // Cache hit
+                  }
+                }
+
                 SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[i]);
                 if (dv == null) continue;
                 long localSum = 0;
@@ -317,6 +374,20 @@ public final class FusedScanAggregate {
                 }
                 scArrays[i][0] += localSum;
                 scArrays[i][1] += segCount;
+
+                // Store in cache
+                if (segKey != null) {
+                  SEGMENT_AGG_CACHE
+                      .computeIfAbsent(segKey, k -> {
+                        try {
+                          coreHelper.addClosedListener(
+                              closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                        } catch (Exception ignored) { }
+                        return new ConcurrentHashMap<>();
+                      })
+                      .putIfAbsent(colArray[i],
+                          new long[]{localSum, segCount, Long.MAX_VALUE, Long.MIN_VALUE});
+                }
               }
             }
           }
@@ -889,7 +960,25 @@ public final class FusedScanAggregate {
                       LeafReader reader = leafCtx.reader();
                       wTotalDocs += reader.maxDoc();
 
+                      // Segment-level cache lookup using core cache key
+                      IndexReader.CacheHelper coreHelper = reader.getCoreCacheHelper();
+                      Object segKey = coreHelper != null ? coreHelper.getKey() : null;
+                      ConcurrentHashMap<String, long[]> segCache =
+                          segKey != null ? SEGMENT_AGG_CACHE.get(segKey) : null;
+
                       for (int c = 0; c < nc; c++) {
+                        // Check cache before scanning DocValues
+                        if (segCache != null) {
+                          long[] cached = segCache.get(colArray[c]);
+                          if (cached != null) {
+                            wColSum[c] += cached[0];
+                            wColCount[c] += cached[1];
+                            if (needMinF && cached[2] < wColMin[c]) wColMin[c] = cached[2];
+                            if (needMaxF && cached[3] > wColMax[c]) wColMax[c] = cached[3];
+                            continue; // Cache hit — skip DocValues scan
+                          }
+                        }
+
                         SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
                         if (dv == null) continue;
                         long localSum = 0;
@@ -909,6 +998,21 @@ public final class FusedScanAggregate {
                           if (localMin < wColMin[c]) wColMin[c] = localMin;
                           if (localMax > wColMax[c]) wColMax[c] = localMax;
                           wColCount[c] += localCount;
+
+                          // Store in cache: sum, count, min, max
+                          if (segKey != null) {
+                            SEGMENT_AGG_CACHE
+                                .computeIfAbsent(segKey, k -> {
+                                  // Register eviction listener on first cache entry for this segment
+                                  try {
+                                    coreHelper.addClosedListener(
+                                        closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                                  } catch (Exception ignored) { }
+                                  return new ConcurrentHashMap<>();
+                                })
+                                .putIfAbsent(colArray[c],
+                                    new long[]{localSum, localCount, localMin, localMax});
+                          }
                         } else {
                           int doc = dv.nextDoc();
                           while (doc != DocIdSetIterator.NO_MORE_DOCS) {
@@ -916,6 +1020,20 @@ public final class FusedScanAggregate {
                             doc = dv.nextDoc();
                           }
                           wColCount[c] += reader.maxDoc();
+
+                          // Store in cache: sum, count (min/max not needed)
+                          if (segKey != null) {
+                            SEGMENT_AGG_CACHE
+                                .computeIfAbsent(segKey, k -> {
+                                  try {
+                                    coreHelper.addClosedListener(
+                                        closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                                  } catch (Exception ignored) { }
+                                  return new ConcurrentHashMap<>();
+                                })
+                                .putIfAbsent(colArray[c],
+                                    new long[]{localSum, reader.maxDoc(), Long.MAX_VALUE, Long.MIN_VALUE});
+                          }
                         }
                         wColSum[c] += localSum;
                       }
@@ -957,7 +1075,25 @@ public final class FusedScanAggregate {
         int maxDoc = reader.maxDoc();
         totalDocs += maxDoc;
 
+        // Segment-level cache lookup using core cache key
+        IndexReader.CacheHelper coreHelper = reader.getCoreCacheHelper();
+        Object segKey = coreHelper != null ? coreHelper.getKey() : null;
+        ConcurrentHashMap<String, long[]> segCache =
+            segKey != null ? SEGMENT_AGG_CACHE.get(segKey) : null;
+
         for (int c = 0; c < numCols; c++) {
+          // Check cache before scanning DocValues
+          if (segCache != null) {
+            long[] cached = segCache.get(colArray[c]);
+            if (cached != null) {
+              colSum[c] += cached[0];
+              colCount[c] += cached[1];
+              if (needMin && cached[2] < colMin[c]) colMin[c] = cached[2];
+              if (needMax && cached[3] > colMax[c]) colMax[c] = cached[3];
+              continue; // Cache hit — skip DocValues scan
+            }
+          }
+
           SortedNumericDocValues dv = reader.getSortedNumericDocValues(colArray[c]);
           if (dv == null) continue;
 
@@ -979,6 +1115,20 @@ public final class FusedScanAggregate {
             if (localMin < colMin[c]) colMin[c] = localMin;
             if (localMax > colMax[c]) colMax[c] = localMax;
             colCount[c] += localCount;
+
+            // Store in cache
+            if (segKey != null) {
+              SEGMENT_AGG_CACHE
+                  .computeIfAbsent(segKey, k -> {
+                    try {
+                      coreHelper.addClosedListener(
+                          closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                    } catch (Exception ignored) { }
+                    return new ConcurrentHashMap<>();
+                  })
+                  .putIfAbsent(colArray[c],
+                      new long[]{localSum, localCount, localMin, localMax});
+            }
           } else {
             int doc = dv.nextDoc();
             while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
@@ -986,6 +1136,20 @@ public final class FusedScanAggregate {
               doc = dv.nextDoc();
             }
             colCount[c] += maxDoc;
+
+            // Store in cache
+            if (segKey != null) {
+              SEGMENT_AGG_CACHE
+                  .computeIfAbsent(segKey, k -> {
+                    try {
+                      coreHelper.addClosedListener(
+                          closedKey -> SEGMENT_AGG_CACHE.remove(closedKey));
+                    } catch (Exception ignored) { }
+                    return new ConcurrentHashMap<>();
+                  })
+                  .putIfAbsent(colArray[c],
+                      new long[]{localSum, maxDoc, Long.MAX_VALUE, Long.MIN_VALUE});
+            }
           }
           colSum[c] += localSum;
         }

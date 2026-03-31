@@ -1520,32 +1520,136 @@ public final class FusedScanAggregate {
               ? new LongOpenHashSet(Math.min(totalDocs, 32_000_000))
               : new LongOpenHashSet();
       if (query instanceof MatchAllDocsQuery) {
-        // Sequential scan using nextDoc() for dense columns — avoids binary search overhead
-        // of advanceExact(). For high-cardinality columns like UserID (~18M distinct),
-        // parallel per-segment scanning creates too many large HashSets causing memory pressure.
-        // Benchmarked: parallel with merge was 4.3x SLOWER due to LongOpenHashSet merge cost.
-        for (LeafReaderContext leafCtx : engineSearcher.getIndexReader().leaves()) {
-          LeafReader reader = leafCtx.reader();
-          Bits liveDocs = reader.getLiveDocs();
+        // Phase 1: Parallel columnar load — read DocValues into flat long[] arrays per segment.
+        // Phase 2: Parallel per-segment hash set insertion, then merge.
+        // Two-phase approach is faster than fused (DocValues read + hash insert) because
+        // Phase 1 has sequential memory access and Phase 2 has sequential array reads,
+        // while fused interleaves random hash probes with sequential DocValues reads.
+        java.util.List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+        long[][] segArrays = new long[leaves.size()][];
+        int[] segCounts = new int[leaves.size()];
+        if (leaves.size() > 1) {
+          java.util.concurrent.CompletableFuture<?>[] futures =
+              new java.util.concurrent.CompletableFuture[leaves.size()];
+          for (int s = 0; s < leaves.size(); s++) {
+            final int segIdx = s;
+            futures[s] =
+                java.util.concurrent.CompletableFuture.runAsync(
+                    () -> {
+                      try {
+                        LeafReader reader = leaves.get(segIdx).reader();
+                        SortedNumericDocValues dv =
+                            reader.getSortedNumericDocValues(columnName);
+                        if (dv == null) {
+                          segArrays[segIdx] = new long[0];
+                          return;
+                        }
+                        int maxDoc = reader.maxDoc();
+                        long[] vals = new long[maxDoc];
+                        Bits liveDocs = reader.getLiveDocs();
+                        int count = 0;
+                        if (liveDocs == null) {
+                          int doc = dv.nextDoc();
+                          while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                            vals[count++] = dv.nextValue();
+                            doc = dv.nextDoc();
+                          }
+                        } else {
+                          for (int doc = 0; doc < maxDoc; doc++) {
+                            if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                              vals[count++] = dv.nextValue();
+                            }
+                          }
+                        }
+                        segArrays[segIdx] = vals;
+                        segCounts[segIdx] = count;
+                      } catch (Exception e) {
+                        throw new RuntimeException(e);
+                      }
+                    },
+                    FusedGroupByAggregate.getParallelPool());
+          }
+          java.util.concurrent.CompletableFuture.allOf(futures).join();
+        } else {
+          // Single segment — load directly
+          LeafReader reader = leaves.get(0).reader();
           SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
-          if (dv == null) continue;
-          if (liveDocs == null) {
-            // Dense column, no deletes: use nextDoc() for sequential access
-            int doc = dv.nextDoc();
-            while (doc != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
-              distinctSet.add(dv.nextValue());
-              doc = dv.nextDoc();
-            }
-          } else {
+          if (dv != null) {
             int maxDoc = reader.maxDoc();
-            for (int doc = 0; doc < maxDoc; doc++) {
-              if (liveDocs.get(doc) && dv.advanceExact(doc)) {
-                distinctSet.add(dv.nextValue());
+            long[] vals = new long[maxDoc];
+            Bits liveDocs = reader.getLiveDocs();
+            int count = 0;
+            if (liveDocs == null) {
+              int doc = dv.nextDoc();
+              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                vals[count++] = dv.nextValue();
+                doc = dv.nextDoc();
               }
+            } else {
+              for (int doc = 0; doc < maxDoc; doc++) {
+                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                  vals[count++] = dv.nextValue();
+                }
+              }
+            }
+            segArrays[0] = vals;
+            segCounts[0] = count;
+          } else {
+            segArrays[0] = new long[0];
+          }
+        }
+        // Phase 2: Parallel per-segment hash insertion, then merge
+        if (leaves.size() > 1) {
+          @SuppressWarnings("unchecked")
+          java.util.concurrent.CompletableFuture<LongOpenHashSet>[] hashFutures =
+              new java.util.concurrent.CompletableFuture[leaves.size()];
+          for (int s = 0; s < leaves.size(); s++) {
+            final int segIdx = s;
+            hashFutures[s] =
+                java.util.concurrent.CompletableFuture.supplyAsync(
+                    () -> {
+                      long[] vals = segArrays[segIdx];
+                      if (vals == null || segCounts[segIdx] == 0) {
+                        return new LongOpenHashSet();
+                      }
+                      LongOpenHashSet set = new LongOpenHashSet(segCounts[segIdx]);
+                      int count = segCounts[segIdx];
+                      for (int i = 0; i < count; i++) {
+                        set.add(vals[i]);
+                      }
+                      return set;
+                    },
+                    FusedGroupByAggregate.getParallelPool());
+          }
+          LongOpenHashSet[] segSets = new LongOpenHashSet[leaves.size()];
+          for (int s = 0; s < leaves.size(); s++) {
+            segSets[s] = hashFutures[s].join();
+          }
+          // Merge: find largest set, addAll smaller sets into it
+          int largestIdx = 0;
+          for (int s = 1; s < segSets.length; s++) {
+            if (segSets[s].size() > segSets[largestIdx].size()) {
+              largestIdx = s;
+            }
+          }
+          for (int s = 0; s < segSets.length; s++) {
+            if (s != largestIdx) {
+              segSets[largestIdx].addAll(segSets[s]);
+            }
+          }
+          distinctSet = segSets[largestIdx];
+        } else {
+          // Single segment — insert directly
+          long[] vals = segArrays[0];
+          if (vals != null) {
+            int count = segCounts[0];
+            for (int i = 0; i < count; i++) {
+              distinctSet.add(vals[i]);
             }
           }
         }
       } else {
+        final LongOpenHashSet filteredSet = distinctSet;
         engineSearcher.search(
             query,
             new Collector() {
@@ -1559,7 +1663,7 @@ public final class FusedScanAggregate {
                   @Override
                   public void collect(int doc) throws IOException {
                     if (dv != null && dv.advanceExact(doc)) {
-                      distinctSet.add(dv.nextValue());
+                      filteredSet.add(dv.nextValue());
                     }
                   }
                 };
@@ -1584,9 +1688,9 @@ public final class FusedScanAggregate {
    * @param query the compiled Lucene query
    * @return the raw HashSet containing all distinct string values in this shard
    */
-  public static java.util.HashSet<String> collectDistinctStringsRaw(
+  public static java.util.Set<String> collectDistinctStringsRaw(
       String columnName, IndexShard shard, Query query) throws Exception {
-    java.util.HashSet<String> distinctStrings = new java.util.HashSet<>();
+    java.util.Set<String> distinctStrings = new java.util.HashSet<>();
 
     try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
         shard.acquireSearcher("dqe-fused-distinct-strings-raw")) {
@@ -1614,45 +1718,44 @@ public final class FusedScanAggregate {
           }
           distinctStrings = new java.util.HashSet<>((int) Math.min(globalOrdCount * 2, Integer.MAX_VALUE));
 
-          // Parallel resolution of global ordinals to strings
+          // Parallel resolution of global ordinals to strings.
+          // Workers insert directly into a ConcurrentHashMap-backed set to avoid
+          // the sequential Collections.addAll() bottleneck.
           int numWorkers = Math.min(
               Math.max(1, Runtime.getRuntime().availableProcessors()
                   / Integer.getInteger("dqe.numLocalShards", 4)),
               4);
           if (numWorkers > 1 && globalOrdCount > 100_000) {
+            java.util.Set<String> concurrentSet = java.util.concurrent.ConcurrentHashMap.newKeySet(
+                (int) Math.min(globalOrdCount * 2, Integer.MAX_VALUE));
             long chunkSize = (globalOrdCount + numWorkers - 1) / numWorkers;
             @SuppressWarnings("unchecked")
-            java.util.concurrent.CompletableFuture<String[]>[] futures =
+            java.util.concurrent.CompletableFuture<?>[] futures =
                 new java.util.concurrent.CompletableFuture[numWorkers];
             for (int w = 0; w < numWorkers; w++) {
               final long start = w * chunkSize;
               final long end = Math.min(start + chunkSize, globalOrdCount);
-              final int workerIdx = w;
-              futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
                 try {
                   // Each worker needs its own DV instances (not thread-safe)
                   SortedSetDocValues[] localDvs = new SortedSetDocValues[leaves.size()];
                   for (int i = 0; i < leaves.size(); i++) {
                     localDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
                   }
-                  String[] chunk = new String[(int)(end - start)];
                   for (long g = start; g < end; g++) {
                     int segIdx = ordinalMap.getFirstSegmentNumber(g);
                     long segOrd = ordinalMap.getFirstSegmentOrd(g);
                     BytesRef bytes = (localDvs[segIdx] != null)
                         ? localDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
-                    chunk[(int)(g - start)] = bytes.utf8ToString();
+                    concurrentSet.add(bytes.utf8ToString());
                   }
-                  return chunk;
                 } catch (java.io.IOException e) {
                   throw new java.io.UncheckedIOException(e);
                 }
               }, FusedGroupByAggregate.getParallelPool());
             }
             java.util.concurrent.CompletableFuture.allOf(futures).join();
-            for (var future : futures) {
-              java.util.Collections.addAll(distinctStrings, future.join());
-            }
+            distinctStrings = concurrentSet;
           } else {
             for (long g = 0; g < globalOrdCount; g++) {
               int segIdx = ordinalMap.getFirstSegmentNumber(g);

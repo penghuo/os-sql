@@ -3063,7 +3063,7 @@ public class TransportShardExecuteAction
     Query luceneQuery =
         compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
 
-    java.util.HashSet<String> rawStrings =
+    java.util.Set<String> rawStrings =
         FusedScanAggregate.collectDistinctStringsRaw(columnName, shard, luceneQuery);
 
     // Build a minimal 1-row Page with the count (fallback for non-local paths)

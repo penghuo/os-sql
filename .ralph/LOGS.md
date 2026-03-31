@@ -1013,3 +1013,25 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **Prefetch-batched hash probing COMMITTED**: 12% improvement for Q15 in isolation. Uses accumulator sink to prevent JIT dead code elimination. Re-reads keys array each batch to handle resize correctly.
 4. **Remaining 11 above-2x queries are fundamentally limited**: All hit optimized fused paths. The 3-14x gap vs ClickHouse is due to: (a) hash table cache misses on high-cardinality data, (b) per-doc DocValues access vs columnar batch processing, (c) ClickHouse's two-level hash table and SIMD-friendly probing.
 5. **Q14 regression is noise**: Was 1.92x in iter27, now 2.08x. The 2-key varchar GROUP BY path was not modified. Variance is high (1.530s to 2.244s across runs).
+
+### Additional Work (continued from iteration 28)
+
+6. Attempted pre-loaded DocValues for filtered queries (Q39):
+   - Pre-load all key column values into flat arrays using sequential advance() before grouping loop
+   - Q39: 2.037s → 1.870s (8% improvement) — REVERTED due to high code complexity for small gain
+   - Bottleneck is hash map operations with 5 keys and 300K+ unique groups, not DocValues access
+7. Q14 at 2.02x in full benchmark (1.484s best) but 2.57x in isolation (1.890s best)
+   - Borderline noise — the full benchmark had a lucky run
+   - The 2-key varchar GROUP BY path was not modified by our changes
+8. Final full benchmark: 32/43 within 2x (confirmed)
+9. Q18 GC cascade still present: Q18 takes 30s, fills heap, Q19-Q22 first runs are slow but recover
+
+### Final Assessment
+- Score improved from 29/43 (iter27 full benchmark) to 32/43
+- Q19/Q20/Q21/Q22 recovered from Q18 GC cascade
+- All remaining 11 above-2x queries are fundamentally limited by hash table cache misses
+- Reaching 38/43 on r5.4xlarge requires either:
+  (a) Two-level hash table implementation (major effort)
+  (b) DataFusionBridge JNI for native hash aggregation
+  (c) Hardware upgrade to m5.8xlarge (32 vCPU, 2x parallelism)
+  (d) Index restructuring (8 shards instead of 4)

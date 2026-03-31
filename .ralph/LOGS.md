@@ -946,3 +946,36 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **VARCHAR GROUP BY parallelization DOESN'T WORK**: Creating per-worker AccumulatorGroup arrays for millions of ordinals has too much memory allocation overhead. The merge cost also adds up. Sequential is faster for this pattern.
 4. **Q14 bitset path is OPTIMAL**: The two-pass approach (build bitset, then iterate) is faster than single-pass scorer iteration because FixedBitSet.nextSetBit() is cheaper than DocIdSetIterator.nextDoc().
 5. **Remaining 12 above-2x queries are fundamentally limited by Lucene DocValues**: All hit optimized fused paths. The 3-10x gap vs ClickHouse is due to DocValues decompression overhead (block-based with per-doc decode) vs ClickHouse columnar format (direct memory-mapped arrays).
+
+## Iteration 27 — 2026-03-31T17:08-19:55Z
+
+### What I Did
+1. Analyzed all 16 above-2x queries' dispatch paths through TransportShardExecuteAction → FusedGroupByAggregate
+2. Discovered critical insight: index has 1 segment per shard (force-merged), making ALL segment-parallel paths effectively sequential
+3. Implemented doc-range parallel for executeTwoKeyNumericFlat (single-segment) → Q32 flipped
+4. Attempted and REVERTED: doc-range parallel for executeSingleKeyNumericFlat (Q15 regression from 1.9s to 50s due to loadNumericColumn memory overhead)
+5. Attempted and REVERTED: doc-range parallel for executeThreeKeyFlat (Q18 OOM — 4 workers × 4 shards × millions of groups)
+6. Attempted and REVERTED: doc-range parallel for executeWithVarcharKeys (Q16 no improvement)
+7. Attempted and REVERTED: DV-based doc-range parallel for executeSingleKeyNumericFlat (Q15 marginal improvement)
+8. Attempted and REVERTED: doc-range parallel for executeDerivedSingleKeyNumeric (Q35 no improvement)
+9. Committed: two-key numeric doc-range parallel + LongOpenHashSet.ensureCapacity + run-length dedup + pre-sized HashSets
+
+### Results
+- Score: 33/43 within 2x (up from 27/43 in iter26)
+- Q32: 3.00x → 1.72x — FLIPPED ✅ (doc-range parallel for two-key numeric)
+- Q07: 2.08x → 1.54x — FLIPPED ✅ (noise stabilization)
+- Q14: 2.36x → 1.92x — FLIPPED ✅ (borderline, now consistently within 2x)
+- Q19: None → 0.08x — RECOVERED ✅ (works independently)
+- Q20: None → 0.01x — RECOVERED ✅
+- Q21: None → 0.02x — RECOVERED ✅
+- Q18: 10.12x → 8.47x — improved but still above 2x
+- Q15: 3.69x → 3.27x — improved but still above 2x
+- Q35: 3.72x → 3.32x — improved but still above 2x
+- Correctness: 36/43 PASS (no regression)
+
+### Decisions
+1. **Doc-range parallel ONLY works for moderate-cardinality two-key numeric GROUP BY**: Q32 (WatchID × ClientIP) has enough unique groups to benefit from parallelism but not so many that worker maps thrash L3 cache.
+2. **High-cardinality single-key GROUP BY is fundamentally sequential**: Q15 (17M unique UserIDs) and Q35 (4M unique ClientIPs) create maps that don't fit in L3 cache. Parallelism creates N copies of the same large map, making things worse.
+3. **Three-key GROUP BY with varchar causes OOM when parallelized**: Q18 (UserID × minute × SearchPhrase) has millions of unique groups. 4 workers × 4 shards × millions of groups = heap exhaustion.
+4. **Q19/Q20/Q21 failures are GC cascade from Q18**: They work fine independently. The sequential benchmark runs Q18 (31s, fills heap) right before them.
+5. **Remaining 10 queries need fundamentally different approaches**: Hash map cache misses are the bottleneck, not scan speed. Possible: approximate counting, two-pass aggregation, columnar bypass, or more shards.

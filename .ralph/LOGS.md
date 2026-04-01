@@ -1188,3 +1188,41 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **GC barrier at 40% prevents OOM cascades**: Q18 creates ~6GB of hash maps per shard. After Q18, the GC barrier triggers and collects garbage before the next query starts. Without it, Q19/Q20 OOM.
 4. **Full benchmark score is limited by GC pressure**: Q18 takes 30s and leaves 24GB+ of garbage. Even with GC barrier, subsequent queries are 20-30% slower than isolated runs. This is a fundamental limitation of sequential benchmark execution with a single JVM.
 5. **Remaining 11 above-2x queries are fundamentally limited by**: (a) hash table cache misses for 17M+ unique keys, (b) Lucene DocValues overhead vs columnar mmap, (c) Java hash tables vs SIMD probing, (d) GC pressure from sequential execution.
+
+## Iteration 33 — 2026-04-01T08:12-11:15Z
+
+### What I Did
+1. Analyzed uncommitted changes from iter32 (varchar CD columnar loading + slot reuse in prefetch batching) — benchmarked and found no improvement, stashed.
+2. Implemented run-length encoded scan for scanDocRangeFlatSingleKeyCountStar:
+   - Transition-batching RLE: scans ahead to find key transitions, prefetch-batches only unique keys
+   - Exploits sorted index (CounterID+EventDate+UserID) where consecutive docs share same key
+   - Average run length ~1.8 on ClickBench data → 44% fewer hash probes
+   - Q15 isolated: 1.225s → 0.928s (24% improvement)
+3. Tuned GC barrier: tested 40%/100ms+200ms, 60%/200ms+300ms, 40%/300ms+500ms
+   - 40%/100ms+200ms is optimal: triggers GC when needed without penalizing light queries
+   - Q14 crosses 2x threshold with this tuning
+4. Parallelized columnar loading in executeSingleKeyNumericFlat:
+   - Load all segments concurrently via CompletableFuture + PARALLEL_POOL
+   - Q15 isolated: 0.928s → 0.863s (7% improvement)
+   - Q15 crosses 2x threshold in full benchmark (1.87x)
+5. Parallelized columnar loading in executeDerivedSingleKeyNumeric:
+   - Same pattern for Q35 path
+   - Q35 isolated: 0.844s → 0.820s (3% improvement)
+6. Ran 3 full benchmarks to assess stability
+7. Committed 3 changes: c6e816097, e87b0bf22, 5c0dca97c
+
+### Results
+- Score: 34/43 best-of-3-runs (was 32/43 at iter32)
+- Q14: 2.33x → 1.92x-2.04x (borderline, crosses 2x in 2/3 runs)
+- Q15: 2.36x → 1.86x (solidly within 2x)
+- Q35: 3.12x → 2.55x (improved but still above 2x)
+- Q04: 3.24x → 3.12x (modest improvement)
+- Correctness: 36/43 PASS (no regression)
+- No queries that were within 2x crossed the threshold (no regressions)
+
+### Decisions
+1. **Transition-batching RLE is better than simple last-key cache**: The complex version that collects transitions and prefetch-batches them is 2.6% faster than the simple version. The overhead of transition detection is offset by avoiding redundant prefetches for run keys.
+2. **GC barrier at 40%/100ms+200ms is the sweet spot**: Lower threshold (40%) catches more GC pressure situations. Shorter sleep (100ms+200ms vs 200ms+300ms) reduces overhead for queries that don't need GC. The 60% threshold missed too many cases.
+3. **Parallel columnar loading provides 3-7% improvement**: Loading 4 segments concurrently instead of sequentially saves ~50-70ms for Q15. The improvement is modest because columnar loading is only ~10% of total execution time.
+4. **Q14 is noise-sensitive**: At 2.04x, it fluctuates above/below 2x across runs. Need ~10% more improvement to make it reliably within 2x.
+5. **Remaining 9 queries are fundamentally limited by hash table cache misses**: All code-level optimizations (RLE, prefetch, parallel loading, parallel scanning, merge optimization) have been applied. The 2.5-15x gap vs ClickHouse is structural: Lucene DocValues + Java hash tables vs columnar mmap + SIMD probing.

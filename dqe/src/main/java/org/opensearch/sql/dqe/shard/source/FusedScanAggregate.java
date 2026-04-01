@@ -1743,47 +1743,55 @@ public final class FusedScanAggregate {
           LeafReaderContext leafCtx = leaves.get(0);
           int maxDoc = leafCtx.reader().maxDoc();
           if (maxDoc > 1_000_000) {
-            // Large single segment — parallel doc-range scanning via columnar load.
-            // After force-merge to 1 segment, the sequential fused path is ~4x slower
-            // than the multi-segment parallel path. Recover by splitting the flat array
-            // into THREADS_PER_SHARD ranges with per-worker hash sets, then merging.
+            // Large single segment — hash-partitioned parallel insertion.
+            // Each worker scans ALL docs but only inserts keys whose hash maps to its partition.
+            // Partitions are disjoint, so the final merge is a simple concatenation (addAll
+            // into the largest partition set). Each partition set is ~1/N the size, improving
+            // cache locality during both insertion and merge.
             long[] column = FusedGroupByAggregate.loadNumericColumn(leafCtx, columnName);
             int numWorkers = FusedGroupByAggregate.THREADS_PER_SHARD;
-            int docsPerWorker = (maxDoc + numWorkers - 1) / numWorkers;
+            int numPartitions = Integer.highestOneBit(numWorkers);
+            if (numPartitions < 2) numPartitions = 2;
+            int partMask = numPartitions - 1;
             @SuppressWarnings("unchecked")
             java.util.concurrent.CompletableFuture<LongOpenHashSet>[] workerFutures =
-                new java.util.concurrent.CompletableFuture[numWorkers];
-            for (int w = 0; w < numWorkers; w++) {
-              final int start = w * docsPerWorker;
-              final int end = Math.min(start + docsPerWorker, maxDoc);
-              workerFutures[w] =
+                new java.util.concurrent.CompletableFuture[numPartitions];
+            for (int p = 0; p < numPartitions; p++) {
+              final int partId = p;
+              final int pm = partMask;
+              final int md = maxDoc;
+              workerFutures[p] =
                   java.util.concurrent.CompletableFuture.supplyAsync(
                       () -> {
-                        int rangeLen = end - start;
-                        LongOpenHashSet set =
-                            new LongOpenHashSet((int) Math.min(rangeLen / 4, 8_000_000));
-                        set.addAllBatched(column, start, rangeLen);
+                        int estSize = (int) Math.min((long) md / (pm + 1) / 4, 8_000_000);
+                        LongOpenHashSet set = new LongOpenHashSet(Math.max(65536, estSize));
+                        for (int doc = 0; doc < md; doc++) {
+                          long key = column[doc];
+                          if ((partitionHash(key) & pm) == partId) {
+                            set.add(key);
+                          }
+                        }
                         return set;
                       },
                       FusedGroupByAggregate.getParallelPool());
             }
-            // Merge worker sets: find largest, addAll smaller into largest
-            LongOpenHashSet[] workerSets = new LongOpenHashSet[numWorkers];
-            for (int w = 0; w < numWorkers; w++) {
-              workerSets[w] = workerFutures[w].join();
+            // Merge partition sets: find largest, addAll smaller into largest
+            LongOpenHashSet[] partSets = new LongOpenHashSet[numPartitions];
+            for (int p = 0; p < numPartitions; p++) {
+              partSets[p] = workerFutures[p].join();
             }
             int largestIdx = 0;
-            for (int w = 1; w < numWorkers; w++) {
-              if (workerSets[w].size() > workerSets[largestIdx].size()) {
-                largestIdx = w;
+            for (int p = 1; p < numPartitions; p++) {
+              if (partSets[p].size() > partSets[largestIdx].size()) {
+                largestIdx = p;
               }
             }
-            for (int w = 0; w < numWorkers; w++) {
-              if (w != largestIdx) {
-                workerSets[largestIdx].addAll(workerSets[w]);
+            for (int p = 0; p < numPartitions; p++) {
+              if (p != largestIdx) {
+                partSets[largestIdx].addAll(partSets[p]);
               }
             }
-            distinctSet = workerSets[largestIdx];
+            distinctSet = partSets[largestIdx];
           } else {
             // Small single segment — fused single-pass: read DocValues directly into hash set
             // with inline run-length dedup, avoiding temp long[maxDoc] allocation.
@@ -1824,45 +1832,68 @@ public final class FusedScanAggregate {
             }
           }
         }
-        // Phase 2: Parallel per-segment hash insertion, then merge
+        // Phase 2: Hash-partitioned parallel insertion, then merge.
+        // Concatenate all segment arrays into one flat array, then partition by hash.
+        // Each worker scans ALL values but only inserts keys matching its partition,
+        // giving disjoint sets that merge cheaply.
         if (leaves.size() > 1) {
+          // Compute total value count across all segments
+          int totalVals = 0;
+          for (int s = 0; s < leaves.size(); s++) {
+            totalVals += segCounts[s];
+          }
+          // Concatenate segment arrays into one flat array
+          long[] allVals = new long[totalVals];
+          int offset = 0;
+          for (int s = 0; s < leaves.size(); s++) {
+            if (segCounts[s] > 0) {
+              System.arraycopy(segArrays[s], 0, allVals, offset, segCounts[s]);
+              offset += segCounts[s];
+            }
+          }
+          final int totalCount = totalVals;
+          int numWorkers = FusedGroupByAggregate.THREADS_PER_SHARD;
+          int numPartitions = Integer.highestOneBit(numWorkers);
+          if (numPartitions < 2) numPartitions = 2;
+          int partMask = numPartitions - 1;
           @SuppressWarnings("unchecked")
           java.util.concurrent.CompletableFuture<LongOpenHashSet>[] hashFutures =
-              new java.util.concurrent.CompletableFuture[leaves.size()];
-          for (int s = 0; s < leaves.size(); s++) {
-            final int segIdx = s;
-            hashFutures[s] =
+              new java.util.concurrent.CompletableFuture[numPartitions];
+          for (int p = 0; p < numPartitions; p++) {
+            final int partId = p;
+            final int pm = partMask;
+            hashFutures[p] =
                 java.util.concurrent.CompletableFuture.supplyAsync(
                     () -> {
-                      long[] vals = segArrays[segIdx];
-                      if (vals == null || segCounts[segIdx] == 0) {
-                        return new LongOpenHashSet();
+                      int estSize = (int) Math.min((long) totalCount / (pm + 1) / 4, 8_000_000);
+                      LongOpenHashSet set = new LongOpenHashSet(Math.max(65536, estSize));
+                      for (int i = 0; i < totalCount; i++) {
+                        long key = allVals[i];
+                        if ((partitionHash(key) & pm) == partId) {
+                          set.add(key);
+                        }
                       }
-                      LongOpenHashSet set = new LongOpenHashSet(Math.min(segCounts[segIdx], 8_000_000));
-                      int count = segCounts[segIdx];
-                      // Use prefetch-batched insertion for better cache behavior
-                      set.addAllBatched(vals, 0, count);
                       return set;
                     },
                     FusedGroupByAggregate.getParallelPool());
           }
-          LongOpenHashSet[] segSets = new LongOpenHashSet[leaves.size()];
-          for (int s = 0; s < leaves.size(); s++) {
-            segSets[s] = hashFutures[s].join();
+          // Merge partition sets: find largest, addAll smaller into largest
+          LongOpenHashSet[] partSets = new LongOpenHashSet[numPartitions];
+          for (int p = 0; p < numPartitions; p++) {
+            partSets[p] = hashFutures[p].join();
           }
-          // Merge: find largest set, addAll smaller sets into it
           int largestIdx = 0;
-          for (int s = 1; s < segSets.length; s++) {
-            if (segSets[s].size() > segSets[largestIdx].size()) {
-              largestIdx = s;
+          for (int p = 1; p < numPartitions; p++) {
+            if (partSets[p].size() > partSets[largestIdx].size()) {
+              largestIdx = p;
             }
           }
-          for (int s = 0; s < segSets.length; s++) {
-            if (s != largestIdx) {
-              segSets[largestIdx].addAll(segSets[s]);
+          for (int p = 0; p < numPartitions; p++) {
+            if (p != largestIdx) {
+              partSets[largestIdx].addAll(partSets[p]);
             }
           }
-          distinctSet = segSets[largestIdx];
+          distinctSet = partSets[largestIdx];
         } else {
           // Single segment — already inserted directly into distinctSet in fused Phase 1
         }
@@ -2134,6 +2165,16 @@ public final class FusedScanAggregate {
       h *= 0x100000001b3L;
     }
     return h;
+  }
+
+  /** Murmur3 finalizer for hash-partitioning long keys. Same as SingleKeyHashMap.hash1. */
+  private static int partitionHash(long key) {
+    key ^= key >>> 33;
+    key *= 0xff51afd7ed558ccdL;
+    key ^= key >>> 33;
+    key *= 0xc4ceb9fe1a85ec53L;
+    key ^= key >>> 33;
+    return (int) key;
   }
 
   /**

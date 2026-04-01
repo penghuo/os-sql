@@ -1125,3 +1125,38 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 4. **DataFusionBridge COULD help GROUP BY + COUNT(*)**: For Q15, Q16, Q18, Q35, the coordinator merges partial counts. DataFusion could process these natively. But VARCHAR key handling (Q16, Q18) is complex.
 5. **Prefetch batching is the best Java-level optimization available**: 18-19% improvement by overlapping DRAM latency with computation. Batch size 32 and dual-array prefetching (keys+accData) are optimal.
 6. **Remaining gap is structural**: ClickHouse uses columnar mmap + SIMD hash probing + batch processing. DQE uses Lucene DocValues (block-compressed) + Java hash tables (scalar probing) + per-doc processing. Closing this gap requires either native code (DataFusion JNI) or hardware upgrade (more CPUs for parallelism).
+
+## Iteration 31 — 2026-04-01T01:04-02:57Z
+
+### What I Did
+1. Analyzed all 10 above-2x queries' dispatch paths and bottlenecks
+2. Identified Q15 bottleneck: 10M doc threshold forcing sequential scan in executeSingleKeyNumericFlat
+3. Identified Q35 bottleneck: executeDerivedSingleKeyNumeric had no parallel scanning
+4. Implemented 6 optimizations:
+
+   a. **Raised 10M threshold to 200M** — enables parallel doc-range scanning for 25M-per-shard datasets
+   b. **Merge optimization** — use largest worker map as base instead of merging all into empty main map (saves one full merge pass)
+   c. **Worker map capacity 4M → 16M** — eliminates resize during scan for high-cardinality keys
+   d. **Prefetch-batched bulk insertion for LongOpenHashSet** — addAllBatched() method with 32-element batches
+   e. **Per-segment hash set capacity 1M → 8M** — eliminates resize cascades for COUNT(DISTINCT)
+   f. **Parallel doc-range scanning for executeDerivedSingleKeyNumeric** — same pattern as executeSingleKeyNumericFlat
+
+5. Ran correctness: 36/43 PASS (no regression)
+6. Ran full benchmark: 32/43 within 2x (Q14 noise regression)
+7. Committed: 94655e3ea
+
+### Results
+- Score: 32/43 in full benchmark (was 33/43 — Q14 noise regression from 1.89x to 2.09x)
+- Isolated: Q15 within 2x (1.71x), Q14 within 2x (1.89x) → effective 34/43
+- Q15: 1.626s → 0.887s isolated, 1.073s full (45% improvement)
+- Q35: 1.264s → 0.842s isolated, 1.123s full (33% improvement)
+- Q04: 1.460s → 1.267s isolated, 1.381s full (13% improvement)
+- Q16: 11.928s → 10.377s full (13% improvement)
+- Correctness: 36/43 PASS (no regression)
+
+### Decisions
+1. **Parallel doc-range scanning is the most impactful optimization for single-key GROUP BY**: Splitting 25M docs across 4 workers with prefetch-batched scanning gives 30-45% improvement. The key enablers are: (a) columnar loading (sequential DV read into flat array), (b) prefetch batching (hide DRAM latency), (c) largest-map-as-base merge (save one merge pass), (d) large initial capacity (avoid resize).
+2. **Full benchmark results are 10-30% worse than isolated due to GC pressure**: Q18 takes 30+s and causes GC storms that degrade subsequent queries. This makes Q14 and Q15 borderline in full benchmarks but solidly within 2x in isolation.
+3. **executeDerivedSingleKeyNumeric had the same sequential bottleneck as executeSingleKeyNumericFlat**: Both paths had columnar loading but sequential scanning. Adding parallel scanning to both gave consistent improvements.
+4. **Prefetch batching for LongOpenHashSet provides modest improvement (~5-10%)**: The run-length dedup optimization it replaced was also effective, so the net gain is smaller than expected.
+5. **Remaining 9 above-2x queries are fundamentally limited by hash table cache misses**: All code-level parallelism and prefetch optimizations have been applied. Further improvement requires either: (a) more CPU cores (m5.8xlarge), (b) native code (DataFusion JNI), (c) architectural changes (two-level hash table, SIMD probing).

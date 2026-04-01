@@ -4230,14 +4230,36 @@ public final class FusedGroupByAggregate {
         totalDocsEst += leaf.reader().maxDoc();
       }
       int mainInitCap = (int) Math.min(totalDocsEst * 10 / 7 + 1, 4_000_000);
-      flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
 
       boolean canParallelize =
           !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1;
       boolean isMatchAll = query instanceof MatchAllDocsQuery;
 
-      if (canParallelize && leaves.size() > 1) {
+      // Fast path: MatchAll + COUNT(*) only → columnar loading + prefetch-batched hash probing.
+      // Avoids per-doc DocValues access and leverages sequential memory access patterns.
+      boolean allCountStar = true;
+      for (int i = 0; i < numAggs; i++) {
+        if (!isCountStar[i]) { allCountStar = false; break; }
+      }
+
+      if (allCountStar && isMatchAll) {
+        // Load all keys into flat arrays (columnar access)
+        java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
+        java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
+        for (LeafReaderContext leafCtx : leaves) {
+          segKeyArrays.add(loadNumericColumn(leafCtx, sourceCol));
+          segLiveDocs.add(leafCtx.reader().getLiveDocs());
+        }
+
+        flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
+        for (int s = 0; s < segKeyArrays.size(); s++) {
+          scanDocRangeFlatSingleKeyCountStar(
+              segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
+              segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+        }
+      } else if (canParallelize && leaves.size() > 1) {
         // Parallel path: partition segments across workers, each with own FlatSingleKeyMap
+        flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
         int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
         @SuppressWarnings("unchecked")
         java.util.List<LeafReaderContext>[] workerSegments = new java.util.List[numWorkers];
@@ -4299,6 +4321,7 @@ public final class FusedGroupByAggregate {
         }
       } else {
         // Sequential path: single FlatSingleKeyMap for all segments
+        flatMap = new FlatSingleKeyMap(slotsPerGroup, mainInitCap);
         Weight weight = null;
         if (!isMatchAll) {
           IndexSearcher luceneSearcher = new IndexSearcher(engineSearcher.getIndexReader());
@@ -5211,7 +5234,6 @@ public final class FusedGroupByAggregate {
           // Parallel workers each build large maps that thrash L3 cache and require
           // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
           if (totalDocs > 10_000_000) {
-            // Pre-size main map larger to reduce resize probability
             flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
             for (int s = 0; s < segKeyArrays.size(); s++) {
               scanDocRangeFlatSingleKeyCountStar(
@@ -14423,20 +14445,23 @@ public final class FusedGroupByAggregate {
     }
 
     // Prefetch-batched path for the common no-deletes case.
-    // Process keys in batches: compute hash slots ahead of time to warm cache lines,
-    // then probe. This overlaps DRAM latency (~100ns) with hash computation.
-    final int BATCH = 16;
+    // Process keys in batches: compute hash slots ahead of time to warm cache lines
+    // for BOTH keys[] and accData[], then probe. This overlaps DRAM latency (~100ns)
+    // with hash computation. Batch size 32 covers ~160ns of prefetch lead time.
+    final int BATCH = 32;
     long prefetchSink = 0; // accumulator to prevent JIT from eliminating prefetch reads
     int doc = startDoc;
 
     for (; doc + BATCH <= endDoc; doc += BATCH) {
-      // Re-read keys array and mask each batch (may change after resize)
+      // Re-read arrays and mask each batch (may change after resize)
       long[] mapKeys = flatMap.keys;
+      long[] mapAcc = flatMap.accData;
       int mask = flatMap.capacity - 1;
-      // Phase 1: compute hash slots and prefetch cache lines
+      // Phase 1: compute hash slots and prefetch cache lines for keys + accData
       for (int j = 0; j < BATCH; j++) {
         int slot = SingleKeyHashMap.hash1(keyValues[doc + j]) & mask;
-        prefetchSink += mapKeys[slot]; // force cache line load; accumulate to prevent DCE
+        prefetchSink += mapKeys[slot]; // force keys cache line load
+        prefetchSink += mapAcc[slot * slotsPerGroup]; // force accData cache line load
       }
       // Phase 2: actual probe and insert (cache lines should now be loaded)
       for (int j = 0; j < BATCH; j++) {

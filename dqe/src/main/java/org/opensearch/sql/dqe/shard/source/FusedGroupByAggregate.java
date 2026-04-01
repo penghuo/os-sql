@@ -1255,7 +1255,20 @@ public final class FusedGroupByAggregate {
       boolean sortAscending,
       long topN)
       throws Exception {
-    return executeInternal(aggNode, shard, query, columnTypeMap, sortAggIndex, sortAscending, topN);
+    return executeInternal(aggNode, shard, query, columnTypeMap, sortAggIndex, sortAscending, topN, -1);
+  }
+
+  public static List<Page> executeWithTopN(
+      AggregationNode aggNode,
+      IndexShard shard,
+      Query query,
+      Map<String, Type> columnTypeMap,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      int sortGroupKeyIndex)
+      throws Exception {
+    return executeInternal(aggNode, shard, query, columnTypeMap, sortAggIndex, sortAscending, topN, sortGroupKeyIndex);
   }
 
   /**
@@ -1273,7 +1286,7 @@ public final class FusedGroupByAggregate {
   public static List<Page> execute(
       AggregationNode aggNode, IndexShard shard, Query query, Map<String, Type> columnTypeMap)
       throws Exception {
-    return executeInternal(aggNode, shard, query, columnTypeMap, -1, false, 0);
+    return executeInternal(aggNode, shard, query, columnTypeMap, -1, false, 0, -1);
   }
 
   /** Internal implementation shared by execute() and executeWithTopN(). */
@@ -1284,7 +1297,8 @@ public final class FusedGroupByAggregate {
       Map<String, Type> columnTypeMap,
       int sortAggIndex,
       boolean sortAscending,
-      long topN)
+      long topN,
+      int sortGroupKeyIndex)
       throws Exception {
     TableScanNode scanNode = findChildTableScan(aggNode);
     List<String> groupByKeys = aggNode.getGroupByKeys();
@@ -1437,7 +1451,8 @@ public final class FusedGroupByAggregate {
             groupByKeys,
             sortAggIndex,
             sortAscending,
-            topN);
+            topN,
+            sortGroupKeyIndex);
       }
       return executeWithVarcharKeys(
           shard,
@@ -1448,7 +1463,8 @@ public final class FusedGroupByAggregate {
           groupByKeys,
           sortAggIndex,
           sortAscending,
-          topN);
+          topN,
+          sortGroupKeyIndex);
     } else {
       return executeNumericOnly(
           shard,
@@ -1459,7 +1475,8 @@ public final class FusedGroupByAggregate {
           groupByKeys,
           sortAggIndex,
           sortAscending,
-          topN);
+          topN,
+          sortGroupKeyIndex);
     }
   }
 
@@ -3165,7 +3182,8 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys,
       int sortAggIndex,
       boolean sortAscending,
-      long topN)
+      long topN,
+      int sortGroupKeyIndex)
       throws Exception {
 
     // Pre-compute which keys need DATE_TRUNC, arithmetic, or EXTRACT transformation
@@ -3404,21 +3422,27 @@ public final class FusedGroupByAggregate {
 
     // If top-N is requested and fewer than total groups, select top-N entries
     java.util.Collection<Map.Entry<SegmentGroupKey, AccumulatorGroup>> outputEntries;
-    if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+    if ((sortAggIndex >= 0 || sortGroupKeyIndex >= 0) && topN > 0 && topN < globalGroups.size()) {
       int n = (int) Math.min(topN, globalGroups.size());
       // Use a min-heap (for DESC) of map entries
       @SuppressWarnings("unchecked")
       Map.Entry<SegmentGroupKey, AccumulatorGroup>[] heap = new Map.Entry[n];
       int heapSize = 0;
       for (Map.Entry<SegmentGroupKey, AccumulatorGroup> entry : globalGroups.entrySet()) {
-        long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+        long val = sortGroupKeyIndex >= 0
+            ? entry.getKey().values[sortGroupKeyIndex]
+            : entry.getValue().accumulators[sortAggIndex].getSortValue();
         if (heapSize < n) {
           heap[heapSize++] = entry;
           int k = heapSize - 1;
           while (k > 0) {
             int parent = (k - 1) >>> 1;
-            long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
-            long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+            long pVal = sortGroupKeyIndex >= 0
+                ? heap[parent].getKey().values[sortGroupKeyIndex]
+                : heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+            long kVal = sortGroupKeyIndex >= 0
+                ? heap[k].getKey().values[sortGroupKeyIndex]
+                : heap[k].getValue().accumulators[sortAggIndex].getSortValue();
             boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
             if (swap) {
               var tmp = heap[parent];
@@ -3428,7 +3452,9 @@ public final class FusedGroupByAggregate {
             } else break;
           }
         } else {
-          long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+          long rootVal = sortGroupKeyIndex >= 0
+              ? heap[0].getKey().values[sortGroupKeyIndex]
+              : heap[0].getValue().accumulators[sortAggIndex].getSortValue();
           boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
           if (better) {
             heap[0] = entry;
@@ -3439,13 +3465,21 @@ public final class FusedGroupByAggregate {
               int right = left + 1;
               int target = left;
               if (right < heapSize) {
-                long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
-                long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                long lv = sortGroupKeyIndex >= 0
+                    ? heap[left].getKey().values[sortGroupKeyIndex]
+                    : heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                long rv = sortGroupKeyIndex >= 0
+                    ? heap[right].getKey().values[sortGroupKeyIndex]
+                    : heap[right].getValue().accumulators[sortAggIndex].getSortValue();
                 boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
                 if (pickRight) target = right;
               }
-              long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
-              long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+              long kVal = sortGroupKeyIndex >= 0
+                  ? heap[k].getKey().values[sortGroupKeyIndex]
+                  : heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+              long tVal = sortGroupKeyIndex >= 0
+                  ? heap[target].getKey().values[sortGroupKeyIndex]
+                  : heap[target].getValue().accumulators[sortAggIndex].getSortValue();
               boolean swap = sortAscending ? (tVal > kVal) : (tVal < kVal);
               if (swap) {
                 var tmp = heap[k];
@@ -7403,7 +7437,8 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys,
       int sortAggIndex,
       boolean sortAscending,
-      long topN)
+      long topN,
+      int sortGroupKeyIndex)
       throws Exception {
 
     EvalNode evalNode = (aggNode.getChild() instanceof EvalNode en) ? en : null;
@@ -8158,20 +8193,27 @@ public final class FusedGroupByAggregate {
         // Select top-N from flat map using heap
         int effectiveTopN = (topN > 0) ? (int) Math.min(topN, flatSize) : flatSize;
         int[] topSlots;
-        if (sortAggIndex >= 0 && topN > 0 && effectiveTopN < flatSize) {
+        boolean doHeapSelect = (sortAggIndex >= 0 || sortGroupKeyIndex >= 0) && topN > 0 && effectiveTopN < flatSize;
+        if (doHeapSelect) {
           int n = effectiveTopN;
           int[] heap = new int[n];
           int heapSize = 0;
           for (int s = 0; s < flatCap; s++) {
             if (flatValues[s] == null) continue;
-            long val = flatValues[s].accumulators[sortAggIndex].getSortValue();
+            long val = sortGroupKeyIndex >= 0
+                ? flatKeys[s * numKeys + sortGroupKeyIndex]
+                : flatValues[s].accumulators[sortAggIndex].getSortValue();
             if (heapSize < n) {
               heap[heapSize++] = s;
               int ki = heapSize - 1;
               while (ki > 0) {
                 int parent = (ki - 1) >>> 1;
-                long pVal = flatValues[heap[parent]].accumulators[sortAggIndex].getSortValue();
-                long kVal2 = flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
+                long pVal = sortGroupKeyIndex >= 0
+                    ? flatKeys[heap[parent] * numKeys + sortGroupKeyIndex]
+                    : flatValues[heap[parent]].accumulators[sortAggIndex].getSortValue();
+                long kVal2 = sortGroupKeyIndex >= 0
+                    ? flatKeys[heap[ki] * numKeys + sortGroupKeyIndex]
+                    : flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
                 boolean swap = sortAscending ? (kVal2 > pVal) : (kVal2 < pVal);
                 if (swap) {
                   int tmp = heap[parent];
@@ -8181,7 +8223,9 @@ public final class FusedGroupByAggregate {
                 } else break;
               }
             } else {
-              long rootVal = flatValues[heap[0]].accumulators[sortAggIndex].getSortValue();
+              long rootVal = sortGroupKeyIndex >= 0
+                  ? flatKeys[heap[0] * numKeys + sortGroupKeyIndex]
+                  : flatValues[heap[0]].accumulators[sortAggIndex].getSortValue();
               boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
               if (better) {
                 heap[0] = s;
@@ -8192,12 +8236,20 @@ public final class FusedGroupByAggregate {
                   int right = left + 1;
                   int target = left;
                   if (right < heapSize) {
-                    long lv = flatValues[heap[left]].accumulators[sortAggIndex].getSortValue();
-                    long rv = flatValues[heap[right]].accumulators[sortAggIndex].getSortValue();
+                    long lv = sortGroupKeyIndex >= 0
+                        ? flatKeys[heap[left] * numKeys + sortGroupKeyIndex]
+                        : flatValues[heap[left]].accumulators[sortAggIndex].getSortValue();
+                    long rv = sortGroupKeyIndex >= 0
+                        ? flatKeys[heap[right] * numKeys + sortGroupKeyIndex]
+                        : flatValues[heap[right]].accumulators[sortAggIndex].getSortValue();
                     if (sortAscending ? (rv > lv) : (rv < lv)) target = right;
                   }
-                  long kVal2 = flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
-                  long tVal = flatValues[heap[target]].accumulators[sortAggIndex].getSortValue();
+                  long kVal2 = sortGroupKeyIndex >= 0
+                      ? flatKeys[heap[ki] * numKeys + sortGroupKeyIndex]
+                      : flatValues[heap[ki]].accumulators[sortAggIndex].getSortValue();
+                  long tVal = sortGroupKeyIndex >= 0
+                      ? flatKeys[heap[target] * numKeys + sortGroupKeyIndex]
+                      : flatValues[heap[target]].accumulators[sortAggIndex].getSortValue();
                   if (sortAscending ? (tVal > kVal2) : (tVal < kVal2)) {
                     int tmp = heap[ki];
                     heap[ki] = heap[target];
@@ -8297,21 +8349,27 @@ public final class FusedGroupByAggregate {
       int totalColumns = numGroupKeys + numAggs;
 
       java.util.Collection<Map.Entry<Object, AccumulatorGroup>> outputEntries;
-      if (sortAggIndex >= 0 && topN > 0 && topN < globalGroups.size()) {
+      if ((sortAggIndex >= 0 || sortGroupKeyIndex >= 0) && topN > 0 && topN < globalGroups.size()) {
         int n = (int) Math.min(topN, globalGroups.size());
         // Use a min-heap (for DESC) or max-heap (for ASC) to select top-N entries
         @SuppressWarnings("unchecked")
         Map.Entry<Object, AccumulatorGroup>[] heap = new Map.Entry[n];
         int heapSize = 0;
         for (Map.Entry<Object, AccumulatorGroup> entry : globalGroups.entrySet()) {
-          long val = entry.getValue().accumulators[sortAggIndex].getSortValue();
+          long val = sortGroupKeyIndex >= 0
+              ? (Long) ((MergedGroupKey) entry.getKey()).values[sortGroupKeyIndex]
+              : entry.getValue().accumulators[sortAggIndex].getSortValue();
           if (heapSize < n) {
             heap[heapSize++] = entry;
             int k = heapSize - 1;
             while (k > 0) {
               int parent = (k - 1) >>> 1;
-              long pVal = heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
-              long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+              long pVal = sortGroupKeyIndex >= 0
+                  ? (Long) ((MergedGroupKey) heap[parent].getKey()).values[sortGroupKeyIndex]
+                  : heap[parent].getValue().accumulators[sortAggIndex].getSortValue();
+              long kVal = sortGroupKeyIndex >= 0
+                  ? (Long) ((MergedGroupKey) heap[k].getKey()).values[sortGroupKeyIndex]
+                  : heap[k].getValue().accumulators[sortAggIndex].getSortValue();
               boolean swap = sortAscending ? (kVal > pVal) : (kVal < pVal);
               if (swap) {
                 var tmp = heap[parent];
@@ -8321,7 +8379,9 @@ public final class FusedGroupByAggregate {
               } else break;
             }
           } else {
-            long rootVal = heap[0].getValue().accumulators[sortAggIndex].getSortValue();
+            long rootVal = sortGroupKeyIndex >= 0
+                ? (Long) ((MergedGroupKey) heap[0].getKey()).values[sortGroupKeyIndex]
+                : heap[0].getValue().accumulators[sortAggIndex].getSortValue();
             boolean better = sortAscending ? (val < rootVal) : (val > rootVal);
             if (better) {
               heap[0] = entry;
@@ -8332,13 +8392,21 @@ public final class FusedGroupByAggregate {
                 int right = left + 1;
                 int target = left;
                 if (right < heapSize) {
-                  long lv = heap[left].getValue().accumulators[sortAggIndex].getSortValue();
-                  long rv = heap[right].getValue().accumulators[sortAggIndex].getSortValue();
+                  long lv = sortGroupKeyIndex >= 0
+                      ? (Long) ((MergedGroupKey) heap[left].getKey()).values[sortGroupKeyIndex]
+                      : heap[left].getValue().accumulators[sortAggIndex].getSortValue();
+                  long rv = sortGroupKeyIndex >= 0
+                      ? (Long) ((MergedGroupKey) heap[right].getKey()).values[sortGroupKeyIndex]
+                      : heap[right].getValue().accumulators[sortAggIndex].getSortValue();
                   boolean pickRight = sortAscending ? (rv > lv) : (rv < lv);
                   if (pickRight) target = right;
                 }
-                long kVal = heap[k].getValue().accumulators[sortAggIndex].getSortValue();
-                long tVal = heap[target].getValue().accumulators[sortAggIndex].getSortValue();
+                long kVal = sortGroupKeyIndex >= 0
+                    ? (Long) ((MergedGroupKey) heap[k].getKey()).values[sortGroupKeyIndex]
+                    : heap[k].getValue().accumulators[sortAggIndex].getSortValue();
+                long tVal = sortGroupKeyIndex >= 0
+                    ? (Long) ((MergedGroupKey) heap[target].getKey()).values[sortGroupKeyIndex]
+                    : heap[target].getValue().accumulators[sortAggIndex].getSortValue();
                 boolean swp = sortAscending ? (tVal > kVal) : (tVal < kVal);
                 if (swp) {
                   var tmp = heap[k];
@@ -8450,7 +8518,8 @@ public final class FusedGroupByAggregate {
       List<String> groupByKeys,
       int sortAggIndex,
       boolean sortAscending,
-      long topN)
+      long topN,
+      int sortGroupKeyIndex)
       throws Exception {
 
     // Pre-compute DATE_TRUNC, arithmetic, and EXTRACT units for numeric keys in the varchar path

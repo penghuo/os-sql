@@ -577,7 +577,11 @@ public class TransportShardExecuteAction
                   executeFusedGroupByAggregateWithTopN(
                       innerAgg, req, primarySortAggIndex, primarySortAsc, topN);
             } else {
-              aggPages = executeFusedGroupByAggregate(innerAgg, req);
+              // Sort key is a GROUP BY column — use top-N with group key index
+              int sortGroupKeyIndex = sortIndices.get(0);
+              boolean primarySortAsc = sortNode.getAscending().get(0);
+              aggPages = executeFusedGroupByAggregateWithTopN(
+                  innerAgg, req, -1, primarySortAsc, topN, sortGroupKeyIndex);
             }
             List<Type> aggColumnTypes =
                 FusedGroupByAggregate.resolveOutputTypes(innerAgg, colTypeMap);
@@ -3183,6 +3187,17 @@ public class TransportShardExecuteAction
       boolean sortAscending,
       long topN)
       throws Exception {
+    return executeFusedGroupByAggregateWithTopN(aggNode, req, sortAggIndex, sortAscending, topN, -1);
+  }
+
+  private List<Page> executeFusedGroupByAggregateWithTopN(
+      AggregationNode aggNode,
+      ShardExecuteRequest req,
+      int sortAggIndex,
+      boolean sortAscending,
+      long topN,
+      int sortGroupKeyIndex)
+      throws Exception {
     TableScanNode scanNode = findTableScanNode(aggNode);
     String indexName = scanNode.getIndexName();
     CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
@@ -3201,7 +3216,8 @@ public class TransportShardExecuteAction
             cachedMeta.columnTypeMap(),
             sortAggIndex,
             sortAscending,
-            topN);
+            topN,
+            sortGroupKeyIndex);
     // Hint GC to collect large hash maps from old gen before next query arrives.
     // Without this, G1GC may not collect old gen promptly, causing circuit breaker
     // trips on the next query (observed with Q19 → Q20 on 100M rows).

@@ -15011,18 +15011,22 @@ public final class FusedGroupByAggregate {
       long[] keyValues, int startDoc, int endDoc, Bits liveDocs,
       FlatSingleKeyMap flatMap, int accOffset0, int slotsPerGroup,
       int partId, int partMask) {
+    // Use high bits of hash for partitioning to avoid correlation with the hash table's
+    // low-bit slot selection (hash1(key) & (capacity-1)). Without this, all keys in a
+    // partition would map to the same 1/N fraction of hash table slots, causing 4x more
+    // collisions and degrading performance.
     if (liveDocs != null) {
       for (int doc = startDoc; doc < endDoc; doc++) {
         if (!liveDocs.get(doc)) continue;
         long key = keyValues[doc];
-        if ((SingleKeyHashMap.hash1(key) & partMask) != partId) continue;
+        if (((SingleKeyHashMap.hash1(key) >>> 16) & partMask) != partId) continue;
         int slot = flatMap.findOrInsert(key);
         flatMap.accData[slot * slotsPerGroup + accOffset0]++;
       }
     } else {
       for (int doc = startDoc; doc < endDoc; doc++) {
         long key = keyValues[doc];
-        if ((SingleKeyHashMap.hash1(key) & partMask) != partId) continue;
+        if (((SingleKeyHashMap.hash1(key) >>> 16) & partMask) != partId) continue;
         int slot = flatMap.findOrInsert(key);
         flatMap.accData[slot * slotsPerGroup + accOffset0]++;
       }

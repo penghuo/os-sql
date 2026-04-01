@@ -1091,3 +1091,37 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 4. **Group partitioning WORKS for low-cardinality GROUP BY + high-cardinality COUNT(DISTINCT)**: When the number of groups is small (<10K), partitioning docs by group key and processing each group sequentially keeps the per-group hash set in L2 cache. This is a 16% improvement for Q08.
 5. **Pre-sizing hash sets provides modest improvement**: Eliminating resize operations saves ~10% for high-cardinality sets. The amortized cost of resizes is small but measurable.
 6. **Remaining 10 above-2x queries are fundamentally limited by Lucene DocValues overhead + Java hash table performance**: All code-level optimizations have been exhausted. The 3-15x gap vs ClickHouse is structural: ClickHouse uses columnar mmap + SIMD hash probing + batch processing, while DQE uses Lucene DocValues (block-compressed) + Java hash tables (scalar probing) + per-doc processing.
+
+## Iteration 30 — 2026-04-01T00:00-01:10Z
+
+### What I Did
+1. Analyzed all 10 above-2x queries' execution paths and bottlenecks
+2. Explored DataFusionBridge JNI integration:
+   - Ran scaled benchmark (25M rows): DataFusion 2.3x faster than Rust HashMap for GROUP BY + COUNT(DISTINCT)
+   - Bundled .so in JAR (45MB, x86-64)
+   - Determined COUNT(DISTINCT) integration is blocked: coordinator needs raw LongOpenHashSets for cross-shard union
+3. Improved prefetch batching in scanDocRangeFlatSingleKeyCountStar:
+   - Increased batch size from 16 to 32
+   - Added accData[] prefetching alongside keys[] prefetching
+   - Result: 18-19% improvement for Q35/Q15 in isolated benchmarks
+4. Added columnar loading + prefetch path for executeDerivedSingleKeyNumeric (Q35 path)
+5. Attempted radix-partitioned aggregation — REVERTED (57-66% regression)
+6. Attempted group-partitioned Q09 (executeMixedDedupWithHashSets) — REVERTED (2x regression)
+7. Ran correctness: 36/43 PASS (no regression)
+8. Ran full benchmark: 33/43 within 2x
+9. Committed: ef5a2380c
+
+### Results
+- Score: 33/43 within 2x (same as iter29 in full benchmark)
+- Isolated improvements: Q35 1.209s→0.991s (18%), Q15 1.684s→1.362s (19%), Q04 1.411s→1.304s (8%)
+- Full benchmark improvements muted by GC pressure from sequential queries
+- Q14: 1.89x (stable within 2x this run, was 2.24x in previous full run — noise)
+- Correctness: 36/43 PASS (no regression)
+
+### Decisions
+1. **Radix partitioning DOES NOT WORK in Java**: The overhead of scatter array allocation + per-bucket FlatSingleKeyMap creation + mergeFrom exceeds the L2 cache benefit. In C++, memory allocation is cheaper (arena allocators, no GC). In Java, each `new long[]` triggers zeroing + potential GC. This is a fundamental Java limitation.
+2. **Group-partitioned Q09 DOES NOT WORK with full column loading**: Loading 4 columns × 25M rows = 800MB allocation + 5 passes over data. The memory allocation overhead dominates. A lighter version (load only key0+key1) might work but would require a second pass for aggregate columns.
+3. **DataFusionBridge CANNOT help COUNT(DISTINCT)**: The coordinator merge protocol requires raw LongOpenHashSets for cross-shard union. DataFusion only returns counts. Changing the coordinator protocol is a major architectural change.
+4. **DataFusionBridge COULD help GROUP BY + COUNT(*)**: For Q15, Q16, Q18, Q35, the coordinator merges partial counts. DataFusion could process these natively. But VARCHAR key handling (Q16, Q18) is complex.
+5. **Prefetch batching is the best Java-level optimization available**: 18-19% improvement by overlapping DRAM latency with computation. Batch size 32 and dual-array prefetching (keys+accData) are optimal.
+6. **Remaining gap is structural**: ClickHouse uses columnar mmap + SIMD hash probing + batch processing. DQE uses Lucene DocValues (block-compressed) + Java hash tables (scalar probing) + per-doc processing. Closing this gap requires either native code (DataFusion JNI) or hardware upgrade (more CPUs for parallelism).

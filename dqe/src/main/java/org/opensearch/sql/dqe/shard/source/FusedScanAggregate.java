@@ -1739,38 +1739,85 @@ public final class FusedScanAggregate {
           }
           java.util.concurrent.CompletableFuture.allOf(futures).join();
         } else {
-          // Single segment — fused single-pass: read DocValues directly into hash set
-          // with inline run-length dedup, avoiding temp long[maxDoc] allocation.
-          LeafReader reader = leaves.get(0).reader();
-          SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
-          if (dv != null) {
-            Bits liveDocs = reader.getLiveDocs();
-            if (liveDocs == null) {
-              // Fused single-pass: read DocValues directly into hash set with run-length dedup
-              long prev = Long.MIN_VALUE;
-              boolean hasPrev = false;
-              int doc = dv.nextDoc();
-              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                long v = dv.nextValue();
-                if (!hasPrev || v != prev) {
-                  distinctSet.add(v);
-                  prev = v;
-                  hasPrev = true;
-                }
-                doc = dv.nextDoc();
+          // Single segment path
+          LeafReaderContext leafCtx = leaves.get(0);
+          int maxDoc = leafCtx.reader().maxDoc();
+          if (maxDoc > 1_000_000) {
+            // Large single segment — parallel doc-range scanning via columnar load.
+            // After force-merge to 1 segment, the sequential fused path is ~4x slower
+            // than the multi-segment parallel path. Recover by splitting the flat array
+            // into THREADS_PER_SHARD ranges with per-worker hash sets, then merging.
+            long[] column = FusedGroupByAggregate.loadNumericColumn(leafCtx, columnName);
+            int numWorkers = FusedGroupByAggregate.THREADS_PER_SHARD;
+            int docsPerWorker = (maxDoc + numWorkers - 1) / numWorkers;
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.CompletableFuture<LongOpenHashSet>[] workerFutures =
+                new java.util.concurrent.CompletableFuture[numWorkers];
+            for (int w = 0; w < numWorkers; w++) {
+              final int start = w * docsPerWorker;
+              final int end = Math.min(start + docsPerWorker, maxDoc);
+              workerFutures[w] =
+                  java.util.concurrent.CompletableFuture.supplyAsync(
+                      () -> {
+                        int rangeLen = end - start;
+                        LongOpenHashSet set =
+                            new LongOpenHashSet((int) Math.min(rangeLen / 4, 8_000_000));
+                        set.addAllBatched(column, start, rangeLen);
+                        return set;
+                      },
+                      FusedGroupByAggregate.getParallelPool());
+            }
+            // Merge worker sets: find largest, addAll smaller into largest
+            LongOpenHashSet[] workerSets = new LongOpenHashSet[numWorkers];
+            for (int w = 0; w < numWorkers; w++) {
+              workerSets[w] = workerFutures[w].join();
+            }
+            int largestIdx = 0;
+            for (int w = 1; w < numWorkers; w++) {
+              if (workerSets[w].size() > workerSets[largestIdx].size()) {
+                largestIdx = w;
               }
-            } else {
-              // With liveDocs: advanceExact per live doc
-              int maxDoc = reader.maxDoc();
-              long prev = Long.MIN_VALUE;
-              boolean hasPrev = false;
-              for (int doc = 0; doc < maxDoc; doc++) {
-                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+            }
+            for (int w = 0; w < numWorkers; w++) {
+              if (w != largestIdx) {
+                workerSets[largestIdx].addAll(workerSets[w]);
+              }
+            }
+            distinctSet = workerSets[largestIdx];
+          } else {
+            // Small single segment — fused single-pass: read DocValues directly into hash set
+            // with inline run-length dedup, avoiding temp long[maxDoc] allocation.
+            LeafReader reader = leafCtx.reader();
+            SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
+            if (dv != null) {
+              Bits liveDocs = reader.getLiveDocs();
+              if (liveDocs == null) {
+                // Fused single-pass: read DocValues directly into hash set with run-length dedup
+                long prev = Long.MIN_VALUE;
+                boolean hasPrev = false;
+                int doc = dv.nextDoc();
+                while (doc != DocIdSetIterator.NO_MORE_DOCS) {
                   long v = dv.nextValue();
                   if (!hasPrev || v != prev) {
                     distinctSet.add(v);
                     prev = v;
                     hasPrev = true;
+                  }
+                  doc = dv.nextDoc();
+                }
+              } else {
+                // With liveDocs: advanceExact per live doc
+                int smallMaxDoc = reader.maxDoc();
+                long prev = Long.MIN_VALUE;
+                boolean hasPrev = false;
+                for (int doc = 0; doc < smallMaxDoc; doc++) {
+                  if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                    long v = dv.nextValue();
+                    if (!hasPrev || v != prev) {
+                      distinctSet.add(v);
+                      prev = v;
+                      hasPrev = true;
+                    }
                   }
                 }
               }

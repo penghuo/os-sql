@@ -109,17 +109,23 @@ public final class LongOpenHashSet {
    * Bulk-add values from an array using prefetch batching to hide DRAM latency.
    * Processes values in batches: Phase 1 computes hash slots and reads the target
    * cache lines (warming them), Phase 2 does actual probe+insert.
+   * Includes run-length dedup: skips consecutive duplicate values, which is effective
+   * when the source data is sorted (e.g., DocValues from a sorted index).
    */
   public void addAllBatched(long[] values, int offset, int length) {
     final int BATCH = 32;
     int i = offset;
+    long prev = EMPTY; // sentinel — won't match any real value on first iteration
+    boolean hasPrev = false;
     for (; i + BATCH <= offset + length; i += BATCH) {
-      // Phase 1: prefetch — read keys[slot] to warm cache lines
+      // Phase 1: prefetch — read keys[slot] to warm cache lines (skip consecutive dupes)
       int mask = capacity - 1;
       long sink = 0;
       for (int j = 0; j < BATCH; j++) {
         long v = values[i + j];
         if (v == 0 || v == EMPTY) continue;
+        // Skip consecutive duplicates — common in sorted DocValues
+        if (hasPrev && v == prev) continue;
         long h = v;
         h ^= h >>> 33;
         h *= 0xff51afd7ed558ccdL;
@@ -129,14 +135,22 @@ public final class LongOpenHashSet {
         int slot = (int) h & mask;
         sink += keys[slot]; // force cache line load
       }
-      // Phase 2: actual insert
+      // Phase 2: actual insert (skip consecutive dupes)
       for (int j = 0; j < BATCH; j++) {
-        add(values[i + j]);
+        long v = values[i + j];
+        if (hasPrev && v == prev) continue;
+        prev = v;
+        hasPrev = true;
+        add(v);
       }
     }
     // Remainder
     for (; i < offset + length; i++) {
-      add(values[i]);
+      long v = values[i];
+      if (hasPrev && v == prev) continue;
+      prev = v;
+      hasPrev = true;
+      add(v);
     }
   }
 

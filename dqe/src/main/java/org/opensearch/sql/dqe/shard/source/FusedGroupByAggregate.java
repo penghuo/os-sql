@@ -116,7 +116,7 @@ public final class FusedGroupByAggregate {
 
   // === Intra-shard parallelism configuration ===
   private static final String PARALLELISM_MODE = System.getProperty("dqe.parallelism", "docrange");
-  private static final int THREADS_PER_SHARD =
+  static final int THREADS_PER_SHARD =
       Math.max(
           1,
           Runtime.getRuntime().availableProcessors() / Integer.getInteger("dqe.numLocalShards", 4));

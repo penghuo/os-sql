@@ -1160,3 +1160,31 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **executeDerivedSingleKeyNumeric had the same sequential bottleneck as executeSingleKeyNumericFlat**: Both paths had columnar loading but sequential scanning. Adding parallel scanning to both gave consistent improvements.
 4. **Prefetch batching for LongOpenHashSet provides modest improvement (~5-10%)**: The run-length dedup optimization it replaced was also effective, so the net gain is smaller than expected.
 5. **Remaining 9 above-2x queries are fundamentally limited by hash table cache misses**: All code-level parallelism and prefetch optimizations have been applied. Further improvement requires either: (a) more CPU cores (m5.8xlarge), (b) native code (DataFusion JNI), (c) architectural changes (two-level hash table, SIMD probing).
+
+## Iteration 32 — 2026-04-01T03:48-06:04Z
+
+### What I Did
+1. Found and fixed varchar COUNT(DISTINCT) OOM: `executeVarcharCountDistinctWithHashSets` was creating `LongOpenHashSet(1024)` per unique SearchPhrase (6M unique values × 8KB = 48GB → OOM). Changed to `LongOpenHashSet(16)` for varchar CD path.
+2. Implemented NKey COUNT(DISTINCT) columnar loading + open-addressing: replaced `HashMap<LongArrayKey, LongOpenHashSet>` with flat `grpKeyStore[]`/`grpOcc[]`/`grpSets[]` arrays, eliminated per-doc `LongArrayKey.clone()` allocation.
+3. Added columnar loading for mixed dedup (Q09) key columns.
+4. Implemented prefetch-batched merge for FlatSingleKeyMap/FlatTwoKeyMap/FlatThreeKeyMap: pre-compute target hash slots in batches of 32 to warm cache lines before probing. Uses `findOrInsertFromSlot` to avoid double hash computation.
+5. Tuned GC barrier threshold from 50% to 40% with 200ms+300ms sleep for better full-benchmark stability.
+6. Ran correctness: 36/43 PASS (no regression)
+7. Ran full benchmark: 32/43 within 2x
+
+### Results
+- Score: 32/43 within 2x (full benchmark)
+- Q15 isolated: 1.132s → 0.965s (15% improvement from prefetch-batched merge)
+- Q15 full: 1.225s (2.36x) — degraded by GC pressure from Q18
+- Q13 varchar CD: no longer OOMs (was crashing, now 7.34x at 7.020s)
+- Q05: 4.0s → 0.679s (83% improvement from NKey columnar loading)
+- Q36: 0.5s → 0.120s (76% improvement)
+- Q37: 0.3s → 0.040s (87% improvement)
+- Correctness: 36/43 PASS (no regression)
+
+### Decisions
+1. **Varchar CD path needs small initial capacity**: With 6M unique SearchPhrases, each `LongOpenHashSet(1024)` = 8KB → 48GB total. Changed to 16 (128 bytes) → 768MB total. The resize cost is acceptable since most groups have few distinct values.
+2. **Prefetch-batched merge is the most impactful optimization for parallel GROUP BY**: 15% improvement for Q15 by overlapping DRAM latency with hash computation during the merge phase. The merge was the bottleneck because it does random access into a 192MB hash table.
+3. **GC barrier at 40% prevents OOM cascades**: Q18 creates ~6GB of hash maps per shard. After Q18, the GC barrier triggers and collects garbage before the next query starts. Without it, Q19/Q20 OOM.
+4. **Full benchmark score is limited by GC pressure**: Q18 takes 30s and leaves 24GB+ of garbage. Even with GC barrier, subsequent queries are 20-30% slower than isolated runs. This is a fundamental limitation of sequential benchmark execution with a single JVM.
+5. **Remaining 11 above-2x queries are fundamentally limited by**: (a) hash table cache misses for 17M+ unique keys, (b) Lucene DocValues overhead vs columnar mmap, (c) Java hash tables vs SIMD probing, (d) GC pressure from sequential execution.

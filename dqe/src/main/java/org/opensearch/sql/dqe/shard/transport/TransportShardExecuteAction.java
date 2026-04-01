@@ -201,14 +201,13 @@ public class TransportShardExecuteAction
     Runtime rt = Runtime.getRuntime();
     long used = rt.totalMemory() - rt.freeMemory();
     long max = rt.maxMemory();
-    if (used > max / 2) {
+    if (used > max * 2 / 5) {
       System.gc();
       try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
-      // Re-check: if heap is still high after first GC, do another cycle
       used = rt.totalMemory() - rt.freeMemory();
-      if (used > max / 2) {
+      if (used > max * 2 / 5) {
         System.gc();
-        try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        try { Thread.sleep(300); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
       }
     }
 

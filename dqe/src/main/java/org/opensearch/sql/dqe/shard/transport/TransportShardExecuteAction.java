@@ -331,8 +331,13 @@ public class TransportShardExecuteAction
           if (t0 instanceof io.trino.spi.type.VarcharType
               && t1 != null
               && !(t1 instanceof io.trino.spi.type.VarcharType)) {
+            // Extract topN from the plan tree if a LimitNode is present (single-shard indices
+            // keep the full plan). For multi-shard indices the shard plan is just the
+            // AggregationNode, so fall back to the system property dqe.varcharDistinctTopN
+            // (default 10) to enable shard-level pruning.
+            long shardTopN = extractTopNFromPlan(plan);
             ShardExecuteResponse resp =
-                executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1);
+                executeVarcharCountDistinctWithHashSets(aggDedupNode, req, keyName0, keyName1, t1, shardTopN);
             return resp;
           }
         } else {
@@ -2705,7 +2710,8 @@ public class TransportShardExecuteAction
       ShardExecuteRequest req,
       String varcharKeyName,
       String numericKeyName,
-      Type numericKeyType)
+      Type numericKeyType,
+      long topN)
       throws Exception {
     TableScanNode scanNode = findTableScanNode(aggNode);
     String indexName = scanNode.getIndexName();
@@ -2737,8 +2743,16 @@ public class TransportShardExecuteAction
       if (ordinalMap != null) {
         // Global ordinals path: scan with global ordinal-indexed arrays, resolve strings once at end
         long globalOrdCount = ordinalMap.getValueCount();
+        int globalOrdLen = (int) Math.min(globalOrdCount, 10_000_000);
+        // Inline single-value optimization: store first distinct value directly, only allocate
+        // LongOpenHashSet when a second distinct value is seen. Eliminates millions of set
+        // allocations for groups with 1 distinct value.
+        final long SENTINEL = Long.MIN_VALUE; // same as LongOpenHashSet's EMPTY marker
+        long[] globalFirstValues = new long[globalOrdLen];
+        java.util.Arrays.fill(globalFirstValues, SENTINEL);
+        boolean[] globalHasMinValue = new boolean[globalOrdLen]; // tracks real Long.MIN_VALUE
         org.opensearch.sql.dqe.operator.LongOpenHashSet[] globalOrdSets =
-            new org.opensearch.sql.dqe.operator.LongOpenHashSet[(int) Math.min(globalOrdCount, 10_000_000)];
+            new org.opensearch.sql.dqe.operator.LongOpenHashSet[globalOrdLen];
 
         int numWorkers = Math.min(
             Math.max(1, Runtime.getRuntime().availableProcessors()
@@ -2779,16 +2793,22 @@ public class TransportShardExecuteAction
           }
 
           final org.apache.lucene.index.OrdinalMap om = ordinalMap;
+          final int workerArrLen = globalOrdLen;
+          // Each worker returns Object[]{long[] firstVals, boolean[] hasMin, LongOpenHashSet[] overflow}
           @SuppressWarnings("unchecked")
-          java.util.concurrent.CompletableFuture<org.opensearch.sql.dqe.operator.LongOpenHashSet[]>[] futures =
+          java.util.concurrent.CompletableFuture<Object[]>[] futures =
               new java.util.concurrent.CompletableFuture[numWorkers];
 
           for (int w = 0; w < numWorkers; w++) {
             final java.util.List<org.apache.lucene.index.LeafReaderContext> mySegs = workerSegments[w];
             final java.util.List<Integer> mySegIdxs = workerSegIdxList.get(w);
             futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-              org.opensearch.sql.dqe.operator.LongOpenHashSet[] localSets =
-                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[(int) globalOrdCount];
+              // Inline single-value optimization per worker
+              long[] localFirst = new long[workerArrLen];
+              java.util.Arrays.fill(localFirst, SENTINEL);
+              boolean[] localHasMin = new boolean[workerArrLen];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] localOverflow =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[workerArrLen];
               try {
                 // Build Weight for filtered queries (once per worker)
                 org.apache.lucene.search.IndexSearcher localSearcher =
@@ -2815,21 +2835,45 @@ public class TransportShardExecuteAction
                       int doc;
                       while ((doc = sdv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                         int gOrd = (int) segToGlobal.get(sdv.ordValue());
-                        if (localSets[gOrd] == null)
-                          localSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                         long val = 0;
                         if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                        localSets[gOrd].add(val);
+                        // Inline optimization: avoid LongOpenHashSet allocation for single-value groups
+                        if (val == SENTINEL) {
+                          localHasMin[gOrd] = true;
+                        } else if (localFirst[gOrd] == SENTINEL && !localHasMin[gOrd]) {
+                          localFirst[gOrd] = val; // First value, no allocation
+                        } else if (localOverflow[gOrd] == null) {
+                          if ((localFirst[gOrd] != SENTINEL && localFirst[gOrd] != val) || (localHasMin[gOrd] && val != SENTINEL)) {
+                            // Second distinct value — promote to set
+                            localOverflow[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                            if (localFirst[gOrd] != SENTINEL) localOverflow[gOrd].add(localFirst[gOrd]);
+                            if (localHasMin[gOrd]) localOverflow[gOrd].add(SENTINEL);
+                            localOverflow[gOrd].add(val);
+                          }
+                        } else {
+                          localOverflow[gOrd].add(val);
+                        }
                       }
                     } else {
                       int doc;
                       while ((doc = varcharDv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                         int gOrd = (int) segToGlobal.get(varcharDv.nextOrd());
-                        if (localSets[gOrd] == null)
-                          localSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                         long val = 0;
                         if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                        localSets[gOrd].add(val);
+                        if (val == SENTINEL) {
+                          localHasMin[gOrd] = true;
+                        } else if (localFirst[gOrd] == SENTINEL && !localHasMin[gOrd]) {
+                          localFirst[gOrd] = val;
+                        } else if (localOverflow[gOrd] == null) {
+                          if ((localFirst[gOrd] != SENTINEL && localFirst[gOrd] != val) || (localHasMin[gOrd] && val != SENTINEL)) {
+                            localOverflow[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                            if (localFirst[gOrd] != SENTINEL) localOverflow[gOrd].add(localFirst[gOrd]);
+                            if (localHasMin[gOrd]) localOverflow[gOrd].add(SENTINEL);
+                            localOverflow[gOrd].add(val);
+                          }
+                        } else {
+                          localOverflow[gOrd].add(val);
+                        }
                       }
                     }
                   } else {
@@ -2841,11 +2885,22 @@ public class TransportShardExecuteAction
                     while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                       if (varcharDv.advanceExact(doc)) {
                         int gOrd = (int) segToGlobal.get(varcharDv.nextOrd());
-                        if (localSets[gOrd] == null)
-                          localSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                         long val = 0;
                         if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                        localSets[gOrd].add(val);
+                        if (val == SENTINEL) {
+                          localHasMin[gOrd] = true;
+                        } else if (localFirst[gOrd] == SENTINEL && !localHasMin[gOrd]) {
+                          localFirst[gOrd] = val;
+                        } else if (localOverflow[gOrd] == null) {
+                          if ((localFirst[gOrd] != SENTINEL && localFirst[gOrd] != val) || (localHasMin[gOrd] && val != SENTINEL)) {
+                            localOverflow[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                            if (localFirst[gOrd] != SENTINEL) localOverflow[gOrd].add(localFirst[gOrd]);
+                            if (localHasMin[gOrd]) localOverflow[gOrd].add(SENTINEL);
+                            localOverflow[gOrd].add(val);
+                          }
+                        } else {
+                          localOverflow[gOrd].add(val);
+                        }
                       }
                     }
                   }
@@ -2853,19 +2908,64 @@ public class TransportShardExecuteAction
               } catch (Exception e) {
                 throw new RuntimeException(e);
               }
-              return localSets;
+              return new Object[]{localFirst, localHasMin, localOverflow};
             }, FusedGroupByAggregate.getParallelPool());
           }
 
-          // Merge worker results into globalOrdSets
+          // Merge worker results into global arrays
           for (var f : futures) {
-            org.opensearch.sql.dqe.operator.LongOpenHashSet[] workerSets = f.join();
-            for (int g = 0; g < globalOrdCount; g++) {
-              if (workerSets[g] == null) continue;
-              if (globalOrdSets[g] == null) {
-                globalOrdSets[g] = workerSets[g];
+            Object[] result = f.join();
+            long[] wFirst = (long[]) result[0];
+            boolean[] wHasMin = (boolean[]) result[1];
+            org.opensearch.sql.dqe.operator.LongOpenHashSet[] wOverflow =
+                (org.opensearch.sql.dqe.operator.LongOpenHashSet[]) result[2];
+            for (int g = 0; g < globalOrdLen; g++) {
+              boolean workerHasData = wFirst[g] != SENTINEL || wHasMin[g];
+              if (!workerHasData) continue;
+              if (wOverflow[g] != null) {
+                // Worker already has a set — merge into global
+                if (globalOrdSets[g] != null) {
+                  globalOrdSets[g].addAll(wOverflow[g]);
+                } else if (globalFirstValues[g] == SENTINEL && !globalHasMinValue[g]) {
+                  globalOrdSets[g] = wOverflow[g];
+                } else {
+                  // Promote global single value + worker set
+                  globalOrdSets[g] = wOverflow[g];
+                  if (globalFirstValues[g] != SENTINEL) globalOrdSets[g].add(globalFirstValues[g]);
+                  if (globalHasMinValue[g]) globalOrdSets[g].add(SENTINEL);
+                }
               } else {
-                globalOrdSets[g].addAll(workerSets[g]);
+                // Worker has single value(s) only (firstValue and/or hasMin)
+                if (globalOrdSets[g] != null) {
+                  if (wFirst[g] != SENTINEL) globalOrdSets[g].add(wFirst[g]);
+                  if (wHasMin[g]) globalOrdSets[g].add(SENTINEL);
+                } else if (globalFirstValues[g] == SENTINEL && !globalHasMinValue[g]) {
+                  // Global is empty — just copy
+                  globalFirstValues[g] = wFirst[g];
+                  globalHasMinValue[g] = wHasMin[g];
+                } else {
+                  // Both global and worker have single values — check if promotion needed
+                  boolean needsPromotion = false;
+                  int distinctCount = 0;
+                  long v1 = globalFirstValues[g], v2 = wFirst[g];
+                  if (v1 != SENTINEL) distinctCount++;
+                  if (globalHasMinValue[g]) distinctCount++;
+                  if (v2 != SENTINEL && v2 != v1) distinctCount++;
+                  else if (v2 != SENTINEL) {} // same as v1, no new distinct
+                  if (wHasMin[g] && !globalHasMinValue[g]) distinctCount++;
+                  if (distinctCount > 1) needsPromotion = true;
+                  if (needsPromotion) {
+                    globalOrdSets[g] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                    if (v1 != SENTINEL) globalOrdSets[g].add(v1);
+                    if (globalHasMinValue[g]) globalOrdSets[g].add(SENTINEL);
+                    if (v2 != SENTINEL) globalOrdSets[g].add(v2);
+                    if (wHasMin[g]) globalOrdSets[g].add(SENTINEL);
+                  } else {
+                    // Still single value — update global
+                    if (v2 != SENTINEL) globalFirstValues[g] = v2;
+                    if (wHasMin[g]) globalHasMinValue[g] = true;
+                  }
+                }
               }
             }
           }
@@ -2893,21 +2993,44 @@ public class TransportShardExecuteAction
                 int doc;
                 while ((doc = sdv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                   int gOrd = (int) segToGlobal.get(sdv.ordValue());
-                  if (globalOrdSets[gOrd] == null)
-                    globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                   long val = 0;
                   if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                  globalOrdSets[gOrd].add(val);
+                  // Inline single-value optimization
+                  if (val == SENTINEL) {
+                    globalHasMinValue[gOrd] = true;
+                  } else if (globalFirstValues[gOrd] == SENTINEL && !globalHasMinValue[gOrd]) {
+                    globalFirstValues[gOrd] = val;
+                  } else if (globalOrdSets[gOrd] == null) {
+                    if ((globalFirstValues[gOrd] != SENTINEL && globalFirstValues[gOrd] != val) || (globalHasMinValue[gOrd] && val != SENTINEL)) {
+                      globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                      if (globalFirstValues[gOrd] != SENTINEL) globalOrdSets[gOrd].add(globalFirstValues[gOrd]);
+                      if (globalHasMinValue[gOrd]) globalOrdSets[gOrd].add(SENTINEL);
+                      globalOrdSets[gOrd].add(val);
+                    }
+                  } else {
+                    globalOrdSets[gOrd].add(val);
+                  }
                 }
               } else {
                 int doc;
                 while ((doc = varcharDv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                   int gOrd = (int) segToGlobal.get(varcharDv.nextOrd());
-                  if (globalOrdSets[gOrd] == null)
-                    globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                   long val = 0;
                   if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                  globalOrdSets[gOrd].add(val);
+                  if (val == SENTINEL) {
+                    globalHasMinValue[gOrd] = true;
+                  } else if (globalFirstValues[gOrd] == SENTINEL && !globalHasMinValue[gOrd]) {
+                    globalFirstValues[gOrd] = val;
+                  } else if (globalOrdSets[gOrd] == null) {
+                    if ((globalFirstValues[gOrd] != SENTINEL && globalFirstValues[gOrd] != val) || (globalHasMinValue[gOrd] && val != SENTINEL)) {
+                      globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                      if (globalFirstValues[gOrd] != SENTINEL) globalOrdSets[gOrd].add(globalFirstValues[gOrd]);
+                      if (globalHasMinValue[gOrd]) globalOrdSets[gOrd].add(SENTINEL);
+                      globalOrdSets[gOrd].add(val);
+                    }
+                  } else {
+                    globalOrdSets[gOrd].add(val);
+                  }
                 }
               }
             } else {
@@ -2918,11 +3041,22 @@ public class TransportShardExecuteAction
               while ((doc = disi.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
                 if (varcharDv.advanceExact(doc)) {
                   int gOrd = (int) segToGlobal.get(varcharDv.nextOrd());
-                  if (globalOrdSets[gOrd] == null)
-                    globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                   long val = 0;
                   if (numericDv != null && numericDv.advanceExact(doc)) val = numericDv.nextValue();
-                  globalOrdSets[gOrd].add(val);
+                  if (val == SENTINEL) {
+                    globalHasMinValue[gOrd] = true;
+                  } else if (globalFirstValues[gOrd] == SENTINEL && !globalHasMinValue[gOrd]) {
+                    globalFirstValues[gOrd] = val;
+                  } else if (globalOrdSets[gOrd] == null) {
+                    if ((globalFirstValues[gOrd] != SENTINEL && globalFirstValues[gOrd] != val) || (globalHasMinValue[gOrd] && val != SENTINEL)) {
+                      globalOrdSets[gOrd] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                      if (globalFirstValues[gOrd] != SENTINEL) globalOrdSets[gOrd].add(globalFirstValues[gOrd]);
+                      if (globalHasMinValue[gOrd]) globalOrdSets[gOrd].add(SENTINEL);
+                      globalOrdSets[gOrd].add(val);
+                    }
+                  } else {
+                    globalOrdSets[gOrd].add(val);
+                  }
                 }
               }
             }
@@ -2935,16 +3069,41 @@ public class TransportShardExecuteAction
         for (int i = 0; i < leaves.size(); i++) {
           segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(varcharKeyName);
         }
+
+        // Shard-level top-N pruning: only resolve and send the top-K groups by distinct count
+        // to the coordinator, avoiding millions of LongOpenHashSet allocations and HashMap entries.
+        // The coordinator's mergeDedupCountDistinctViaVarcharSets handles final top-N selection.
+        final int SHARD_MULTIPLIER = 200;
+        java.util.BitSet topKOrdinals = null;
+        if (topN > 0) {
+          long K = Math.min(globalOrdCount, topN * SHARD_MULTIPLIER);
+          topKOrdinals = computeTopKOrdinals(globalOrdSets, globalFirstValues, globalHasMinValue,
+              (int) globalOrdCount, SENTINEL, (int) K);
+        }
+
         for (int g = 0; g < globalOrdCount; g++) {
-          if (globalOrdSets[g] == null) continue;
+          // Skip groups with no data
+          if (globalOrdSets[g] == null && globalFirstValues[g] == SENTINEL && !globalHasMinValue[g]) continue;
+          // Skip groups not in top-K when pruning is active
+          if (topKOrdinals != null && !topKOrdinals.get(g)) continue;
           int segIdx = ordinalMap.getFirstSegmentNumber(g);
           long segOrd = ordinalMap.getFirstSegmentOrd(g);
           String key = (segDvs[segIdx] != null)
               ? segDvs[segIdx].lookupOrd(segOrd).utf8ToString() : "";
-          varcharDistinctSets.put(key, globalOrdSets[g]);
+          if (globalOrdSets[g] != null) {
+            varcharDistinctSets.put(key, globalOrdSets[g]);
+          } else {
+            // Single-value group: create a minimal set for the response contract
+            org.opensearch.sql.dqe.operator.LongOpenHashSet singleSet =
+                new org.opensearch.sql.dqe.operator.LongOpenHashSet(1);
+            if (globalFirstValues[g] != SENTINEL) singleSet.add(globalFirstValues[g]);
+            if (globalHasMinValue[g]) singleSet.add(SENTINEL);
+            varcharDistinctSets.put(key, singleSet);
+          }
         }
       } else if (isMatchAll) {
         // Single-segment MatchAll fallback (no OrdinalMap available)
+        final long SENTINEL = Long.MIN_VALUE;
         for (org.apache.lucene.index.LeafReaderContext leafCtx : leaves) {
           org.apache.lucene.index.LeafReader reader = leafCtx.reader();
           org.apache.lucene.index.SortedSetDocValues varcharDv =
@@ -2954,9 +3113,13 @@ public class TransportShardExecuteAction
           if (varcharDv == null) continue;
 
           long ordCount = varcharDv.getValueCount();
+          int ordLen = (int) Math.min(ordCount, 10_000_000);
+          // Inline single-value optimization for fallback path
+          long[] firstVals = new long[ordLen];
+          java.util.Arrays.fill(firstVals, SENTINEL);
+          boolean[] hasMin = new boolean[ordLen];
           org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
-              new org.opensearch.sql.dqe.operator.LongOpenHashSet
-                  [(int) Math.min(ordCount, 10_000_000)];
+              new org.opensearch.sql.dqe.operator.LongOpenHashSet[ordLen];
 
           long[] numericValues = (numericDv != null)
               ? FusedGroupByAggregate.loadNumericColumn(leafCtx, numericKeyName)
@@ -2968,26 +3131,66 @@ public class TransportShardExecuteAction
             while ((doc = sdv.nextDoc())
                 != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
               int ord = sdv.ordValue();
-              if (ordSets[ord] == null)
-                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
               long val = (numericValues != null) ? numericValues[doc] : 0;
-              ordSets[ord].add(val);
+              if (val == SENTINEL) {
+                hasMin[ord] = true;
+              } else if (firstVals[ord] == SENTINEL && !hasMin[ord]) {
+                firstVals[ord] = val;
+              } else if (ordSets[ord] == null) {
+                if ((firstVals[ord] != SENTINEL && firstVals[ord] != val) || (hasMin[ord] && val != SENTINEL)) {
+                  ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                  if (firstVals[ord] != SENTINEL) ordSets[ord].add(firstVals[ord]);
+                  if (hasMin[ord]) ordSets[ord].add(SENTINEL);
+                  ordSets[ord].add(val);
+                }
+              } else {
+                ordSets[ord].add(val);
+              }
             }
           } else {
             int doc;
             while ((doc = varcharDv.nextDoc())
                 != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
               int ord = (int) varcharDv.nextOrd();
-              if (ordSets[ord] == null)
-                ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
               long val = (numericValues != null) ? numericValues[doc] : 0;
-              ordSets[ord].add(val);
+              if (val == SENTINEL) {
+                hasMin[ord] = true;
+              } else if (firstVals[ord] == SENTINEL && !hasMin[ord]) {
+                firstVals[ord] = val;
+              } else if (ordSets[ord] == null) {
+                if ((firstVals[ord] != SENTINEL && firstVals[ord] != val) || (hasMin[ord] && val != SENTINEL)) {
+                  ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                  if (firstVals[ord] != SENTINEL) ordSets[ord].add(firstVals[ord]);
+                  if (hasMin[ord]) ordSets[ord].add(SENTINEL);
+                  ordSets[ord].add(val);
+                }
+              } else {
+                ordSets[ord].add(val);
+              }
+            }
+          }
+          // Shard-level top-N pruning for single-segment MatchAll fallback
+          if (topN > 0) {
+            final int SHARD_MULTIPLIER = 200;
+            int K = (int) Math.min(ordLen, topN * SHARD_MULTIPLIER);
+            java.util.BitSet topK = computeTopKOrdinals(ordSets, firstVals, hasMin, ordLen, SENTINEL, K);
+            for (int i = 0; i < ordLen; i++) {
+              if (!topK.get(i)) { ordSets[i] = null; firstVals[i] = SENTINEL; hasMin[i] = false; }
+            }
+          }
+          // Promote single-value entries to LongOpenHashSet before merging into map
+          for (int i = 0; i < ordLen; i++) {
+            if (ordSets[i] == null && (firstVals[i] != SENTINEL || hasMin[i])) {
+              ordSets[i] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1);
+              if (firstVals[i] != SENTINEL) ordSets[i].add(firstVals[i]);
+              if (hasMin[i]) ordSets[i].add(SENTINEL);
             }
           }
           mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
         }
       } else {
         // Non-MatchAll (filtered) path: per-segment ordinal scan with collect-then-scan
+        final long SENTINEL = Long.MIN_VALUE;
         for (org.apache.lucene.index.LeafReaderContext leafCtx : leaves) {
           org.apache.lucene.index.LeafReader reader = leafCtx.reader();
           org.apache.lucene.index.SortedSetDocValues varcharDv =
@@ -2997,9 +3200,13 @@ public class TransportShardExecuteAction
           if (varcharDv == null) continue;
 
           long ordCount = varcharDv.getValueCount();
+          int ordLen = (int) Math.min(ordCount, 10_000_000);
+          // Inline single-value optimization for filtered path
+          long[] firstVals = new long[ordLen];
+          java.util.Arrays.fill(firstVals, SENTINEL);
+          boolean[] hasMin = new boolean[ordLen];
           org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets =
-              new org.opensearch.sql.dqe.operator.LongOpenHashSet
-                  [(int) Math.min(ordCount, 10_000_000)];
+              new org.opensearch.sql.dqe.operator.LongOpenHashSet[ordLen];
 
           // Collect-then-sequential-scan: collect matching doc IDs first, then scan sequentially.
             // This converts random advanceExact() into sequential nextDoc() iteration.
@@ -3038,11 +3245,22 @@ public class TransportShardExecuteAction
                 if (matchIdx >= matchCount) break;
                 if (dvDoc == matchDocs[matchIdx]) {
                   int ord = sdv.ordValue();
-                  if (ordSets[ord] == null)
-                    ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                   long val = 0;
                   if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
-                  ordSets[ord].add(val);
+                  if (val == SENTINEL) {
+                    hasMin[ord] = true;
+                  } else if (firstVals[ord] == SENTINEL && !hasMin[ord]) {
+                    firstVals[ord] = val;
+                  } else if (ordSets[ord] == null) {
+                    if ((firstVals[ord] != SENTINEL && firstVals[ord] != val) || (hasMin[ord] && val != SENTINEL)) {
+                      ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                      if (firstVals[ord] != SENTINEL) ordSets[ord].add(firstVals[ord]);
+                      if (hasMin[ord]) ordSets[ord].add(SENTINEL);
+                      ordSets[ord].add(val);
+                    }
+                  } else {
+                    ordSets[ord].add(val);
+                  }
                   matchIdx++;
                 }
               }
@@ -3055,15 +3273,44 @@ public class TransportShardExecuteAction
                 if (matchIdx >= matchCount) break;
                 if (dvDoc == matchDocs[matchIdx]) {
                   int ord = (int) varcharDv.nextOrd();
-                  if (ordSets[ord] == null)
-                    ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
                   long val = 0;
                   if (numericDv != null && numericDv.advanceExact(dvDoc)) val = numericDv.nextValue();
-                  ordSets[ord].add(val);
+                  if (val == SENTINEL) {
+                    hasMin[ord] = true;
+                  } else if (firstVals[ord] == SENTINEL && !hasMin[ord]) {
+                    firstVals[ord] = val;
+                  } else if (ordSets[ord] == null) {
+                    if ((firstVals[ord] != SENTINEL && firstVals[ord] != val) || (hasMin[ord] && val != SENTINEL)) {
+                      ordSets[ord] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                      if (firstVals[ord] != SENTINEL) ordSets[ord].add(firstVals[ord]);
+                      if (hasMin[ord]) ordSets[ord].add(SENTINEL);
+                      ordSets[ord].add(val);
+                    }
+                  } else {
+                    ordSets[ord].add(val);
+                  }
                   matchIdx++;
                 }
               }
             }
+
+          // Shard-level top-N pruning for filtered path
+          if (topN > 0) {
+            final int SHARD_MULTIPLIER = 200;
+            int K = (int) Math.min(ordLen, topN * SHARD_MULTIPLIER);
+            java.util.BitSet topK = computeTopKOrdinals(ordSets, firstVals, hasMin, ordLen, SENTINEL, K);
+            for (int i = 0; i < ordLen; i++) {
+              if (!topK.get(i)) { ordSets[i] = null; firstVals[i] = SENTINEL; hasMin[i] = false; }
+            }
+          }
+          // Promote single-value entries before merging into cross-segment map
+          for (int i = 0; i < ordLen; i++) {
+            if (ordSets[i] == null && (firstVals[i] != SENTINEL || hasMin[i])) {
+              ordSets[i] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1);
+              if (firstVals[i] != SENTINEL) ordSets[i].add(firstVals[i]);
+              if (hasMin[i]) ordSets[i].add(SENTINEL);
+            }
+          }
 
           // Merge this segment's ordinal-indexed sets into the cross-segment String-keyed map
           mergeOrdSetsIntoMap(varcharDv, ordSets, varcharDistinctSets);
@@ -3122,6 +3369,45 @@ public class TransportShardExecuteAction
         if (ordSets[ord].hasSentinelValue()) existing.add(Long.MIN_VALUE);
       }
     }
+  }
+
+  /**
+   * Compute the top-K ordinals by distinct count using a min-heap. Returns a BitSet with the
+   * top-K ordinals set. Used for shard-level pruning to avoid sending all groups to the coordinator.
+   */
+  private static java.util.BitSet computeTopKOrdinals(
+      org.opensearch.sql.dqe.operator.LongOpenHashSet[] ordSets,
+      long[] firstValues,
+      boolean[] hasMinValue,
+      int ordCount,
+      long sentinel,
+      int K) {
+    if (K >= ordCount) {
+      // No pruning needed — all ordinals fit within K
+      java.util.BitSet all = new java.util.BitSet(ordCount);
+      all.set(0, ordCount);
+      return all;
+    }
+    // Min-heap of (distinctCount, ordinal) — keeps the K largest by distinct count
+    java.util.PriorityQueue<long[]> heap = new java.util.PriorityQueue<>(K + 1,
+        (a, b) -> Long.compare(a[0], b[0]));
+    for (int g = 0; g < ordCount; g++) {
+      int dc;
+      if (ordSets[g] != null) {
+        dc = ordSets[g].size();
+      } else if (firstValues[g] != sentinel || hasMinValue[g]) {
+        dc = 1;
+      } else {
+        continue; // no data
+      }
+      heap.offer(new long[]{dc, g});
+      if (heap.size() > K) heap.poll();
+    }
+    java.util.BitSet topK = new java.util.BitSet(ordCount);
+    for (long[] entry : heap) {
+      topK.set((int) entry[1]);
+    }
+    return topK;
   }
 
   private List<Page> executeFusedGroupByAggregate(AggregationNode aggNode, ShardExecuteRequest req)
@@ -3683,6 +3969,24 @@ public class TransportShardExecuteAction
   /** Extract the LimitNode if the plan root is a LimitNode. */
   private static LimitNode extractLimitNode(DqePlanNode plan) {
     return plan instanceof LimitNode limit ? limit : null;
+  }
+
+  /**
+   * Extract topN from the plan tree by walking down to find a LimitNode.
+   * Falls back to system property dqe.varcharDistinctTopN (default 10) when no LimitNode is found
+   * (e.g., multi-shard dedup plans where the PlanFragmenter strips Sort/Limit).
+   * Returns 0 to disable pruning if the system property is set to 0.
+   */
+  private static long extractTopNFromPlan(DqePlanNode plan) {
+    DqePlanNode node = plan;
+    while (node != null) {
+      if (node instanceof LimitNode limitNode) {
+        return limitNode.getCount() + limitNode.getOffset();
+      }
+      List<DqePlanNode> children = node.getChildren();
+      node = (children != null && !children.isEmpty()) ? children.get(0) : null;
+    }
+    return Long.getLong("dqe.varcharDistinctTopN", 10);
   }
 
   /** Extract the ProjectNode from a LimitNode -> ProjectNode -> ... pattern. */

@@ -5269,27 +5269,44 @@ public final class FusedGroupByAggregate {
         }
 
         if (allCountStar && isMatchAll && numBuckets <= 1) {
-          // MatchAll COUNT(*) path: load columnar cache per segment, then scan.
-          java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
-          java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
+          // MatchAll COUNT(*) path: load columnar cache per segment in parallel, then scan.
+          int numSegs = leaves.size();
+          long[][] segKeyArrays = new long[numSegs][];
+          Bits[] segLiveDocs = new Bits[numSegs];
+
+          // Parallel columnar loading: each segment's DocValues are independent
+          if (numSegs > 1) {
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.CompletableFuture<Void>[] loadFutures =
+                new java.util.concurrent.CompletableFuture[numSegs];
+            for (int s = 0; s < numSegs; s++) {
+              final int segIdx = s;
+              final LeafReaderContext leafCtx = leaves.get(s);
+              loadFutures[s] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try {
+                  segKeyArrays[segIdx] = loadNumericColumn(leafCtx, keyInfos.get(0).name());
+                  segLiveDocs[segIdx] = leafCtx.reader().getLiveDocs();
+                } catch (Exception e) { throw new RuntimeException(e); }
+              }, PARALLEL_POOL);
+            }
+            java.util.concurrent.CompletableFuture.allOf(loadFutures).join();
+          } else {
+            segKeyArrays[0] = loadNumericColumn(leaves.get(0), keyInfos.get(0).name());
+            segLiveDocs[0] = leaves.get(0).reader().getLiveDocs();
+          }
 
           long totalDocs = 0;
-          for (LeafReaderContext leafCtx : leaves) {
-            long[] keyValues = loadNumericColumn(leafCtx, keyInfos.get(0).name());
-            segKeyArrays.add(keyValues);
-            segLiveDocs.add(leafCtx.reader().getLiveDocs());
-            totalDocs += keyValues.length;
-          }
+          for (long[] arr : segKeyArrays) totalDocs += arr.length;
 
           // For high-cardinality keys (totalDocs > 10M), scan sequentially into main map.
           // Parallel workers each build large maps that thrash L3 cache and require
           // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
           if (totalDocs > 200_000_000) {
             flatMap = new FlatSingleKeyMap(slotsPerGroup, 16_000_000);
-            for (int s = 0; s < segKeyArrays.size(); s++) {
+            for (int s = 0; s < segKeyArrays.length; s++) {
               scanDocRangeFlatSingleKeyCountStar(
-                  segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
-                  segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+                  segKeyArrays[s], 0, segKeyArrays[s].length,
+                  segLiveDocs[s], flatMap, accOffset[0], slotsPerGroup);
             }
           } else {
           // Doc-range parallel path: split docs across workers, merge results.
@@ -5298,8 +5315,8 @@ public final class FusedGroupByAggregate {
           int numWorkers = THREADS_PER_SHARD;
           long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
           java.util.List<int[]> workUnits = new java.util.ArrayList<>();
-          for (int s = 0; s < leaves.size(); s++) {
-            int maxDoc = segKeyArrays.get(s).length;
+          for (int s = 0; s < segKeyArrays.length; s++) {
+            int maxDoc = segKeyArrays[s].length;
             if (maxDoc == 0) continue;
             for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
               int end = (int) Math.min(start + docsPerWorker, maxDoc);
@@ -5314,8 +5331,8 @@ public final class FusedGroupByAggregate {
 
           for (int w = 0; w < actualWorkers; w++) {
             final int[] unit = workUnits.get(w);
-            final long[] keyValues = segKeyArrays.get(unit[0]);
-            final Bits liveDocs = segLiveDocs.get(unit[0]);
+            final long[] keyValues = segKeyArrays[unit[0]];
+            final Bits liveDocs = segLiveDocs[unit[0]];
             final int startDoc = unit[1];
             final int endDoc = unit[2];
             futures[w] =

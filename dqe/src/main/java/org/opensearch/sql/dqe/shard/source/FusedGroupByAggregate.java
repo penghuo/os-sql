@@ -4243,16 +4243,33 @@ public final class FusedGroupByAggregate {
       }
 
       if (allCountStar && isMatchAll) {
-        // Load all keys into flat arrays (columnar access)
-        java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
-        java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
-        long totalDocs = 0;
-        for (LeafReaderContext leafCtx : leaves) {
-          long[] keyValues = loadNumericColumn(leafCtx, sourceCol);
-          segKeyArrays.add(keyValues);
-          segLiveDocs.add(leafCtx.reader().getLiveDocs());
-          totalDocs += keyValues.length;
+        // Load all keys into flat arrays (columnar access) — parallel across segments
+        int numSegs = leaves.size();
+        long[][] segKeyArrays = new long[numSegs][];
+        Bits[] segLiveDocs = new Bits[numSegs];
+        if (numSegs > 1 && canParallelize) {
+          @SuppressWarnings("unchecked")
+          java.util.concurrent.CompletableFuture<Void>[] loadFutures =
+              new java.util.concurrent.CompletableFuture[numSegs];
+          for (int s = 0; s < numSegs; s++) {
+            final int segIdx = s;
+            final LeafReaderContext leafCtx = leaves.get(s);
+            loadFutures[s] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+              try {
+                segKeyArrays[segIdx] = loadNumericColumn(leafCtx, sourceCol);
+                segLiveDocs[segIdx] = leafCtx.reader().getLiveDocs();
+              } catch (Exception e) { throw new RuntimeException(e); }
+            }, PARALLEL_POOL);
+          }
+          java.util.concurrent.CompletableFuture.allOf(loadFutures).join();
+        } else {
+          for (int s = 0; s < numSegs; s++) {
+            segKeyArrays[s] = loadNumericColumn(leaves.get(s), sourceCol);
+            segLiveDocs[s] = leaves.get(s).reader().getLiveDocs();
+          }
         }
+        long totalDocs = 0;
+        for (long[] arr : segKeyArrays) totalDocs += arr.length;
 
         if (canParallelize && leaves.size() > 1 && totalDocs <= 200_000_000) {
           // Parallel doc-range path: split docs across workers, merge results
@@ -4260,7 +4277,7 @@ public final class FusedGroupByAggregate {
           long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
           java.util.List<int[]> workUnits = new java.util.ArrayList<>();
           for (int s = 0; s < leaves.size(); s++) {
-            int maxDoc = segKeyArrays.get(s).length;
+            int maxDoc = segKeyArrays[s].length;
             if (maxDoc == 0) continue;
             for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
               int end = (int) Math.min(start + docsPerWorker, maxDoc);
@@ -4273,8 +4290,8 @@ public final class FusedGroupByAggregate {
               new java.util.concurrent.CompletableFuture[actualWorkers];
           for (int w = 0; w < actualWorkers; w++) {
             final int[] unit = workUnits.get(w);
-            final long[] keyValues = segKeyArrays.get(unit[0]);
-            final Bits liveDocs = segLiveDocs.get(unit[0]);
+            final long[] keyValues = segKeyArrays[unit[0]];
+            final Bits liveDocs = segLiveDocs[unit[0]];
             final int startDoc = unit[1];
             final int endDoc = unit[2];
             futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
@@ -4302,10 +4319,10 @@ public final class FusedGroupByAggregate {
         } else {
           // Sequential path
           flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
-          for (int s = 0; s < segKeyArrays.size(); s++) {
+          for (int s = 0; s < segKeyArrays.length; s++) {
             scanDocRangeFlatSingleKeyCountStar(
-                segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
-                segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+                segKeyArrays[s], 0, segKeyArrays[s].length,
+                segLiveDocs[s], flatMap, accOffset[0], slotsPerGroup);
           }
         }
       } else if (canParallelize && leaves.size() > 1) {

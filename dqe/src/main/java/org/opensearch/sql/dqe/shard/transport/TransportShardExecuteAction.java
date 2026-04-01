@@ -1236,9 +1236,7 @@ public class TransportShardExecuteAction
               org.opensearch.sql.dqe.operator.LongOpenHashSet set =
                   new org.opensearch.sql.dqe.operator.LongOpenHashSet(
                       Math.max(1024, k1Arr.length));
-              for (int i = 0; i < k1Arr.length; i++) {
-                set.add(k1Arr[i]);
-              }
+              set.addAllBatched(k1Arr, 0, k1Arr.length);
               grpSets[g] = set;
               perGroupK1[gi] = null; // release memory early
             }
@@ -2023,8 +2021,128 @@ public class TransportShardExecuteAction
 
     int numKeys = keyNames.size();
     org.apache.lucene.index.LeafReader reader = leafCtx.reader();
+    int maxDoc = reader.maxDoc();
 
-    // Open DocValues: SortedSetDocValues for VARCHAR, SortedNumericDocValues for numeric
+    if (isMatchAll) {
+      // Columnar loading: load all columns into flat arrays for sequential access
+      long[][] keyColumns = new long[numKeys][];
+      org.apache.lucene.index.SortedSetDocValues[] varcharDvsForResolve =
+          new org.apache.lucene.index.SortedSetDocValues[numKeys];
+      for (int i = 0; i < numKeys; i++) {
+        if (i < numGroupKeys && isVarchar[i]) {
+          keyColumns[i] = FusedGroupByAggregate.loadOrdinalColumn(leafCtx, keyNames.get(i));
+          varcharDvsForResolve[i] = reader.getSortedSetDocValues(keyNames.get(i));
+        } else {
+          keyColumns[i] = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyNames.get(i));
+        }
+      }
+
+      // Open-addressing map: grpKeyStore holds numGroupKeys longs per slot
+      int grpCap = 256;
+      long[] grpKeyStore = new long[grpCap * numGroupKeys];
+      org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
+          new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+      boolean[] grpOcc = new boolean[grpCap];
+      int grpSize = 0;
+      int grpThreshold = (int) (grpCap * 0.7f);
+
+      int dedupIdx = numKeys - 1; // last key is dedup key
+      for (int doc = 0; doc < maxDoc; doc++) {
+        long h = keyColumns[0][doc];
+        for (int k = 1; k < numGroupKeys; k++) {
+          h = h * 31 + keyColumns[k][doc];
+        }
+        int gm = grpCap - 1;
+        int gs = Long.hashCode(h) & gm;
+
+        while (grpOcc[gs]) {
+          int base = gs * numGroupKeys;
+          boolean match = true;
+          for (int k = 0; k < numGroupKeys; k++) {
+            if (grpKeyStore[base + k] != keyColumns[k][doc]) { match = false; break; }
+          }
+          if (match) break;
+          gs = (gs + 1) & gm;
+        }
+
+        if (!grpOcc[gs]) {
+          grpOcc[gs] = true;
+          int base = gs * numGroupKeys;
+          for (int k = 0; k < numGroupKeys; k++) {
+            grpKeyStore[base + k] = keyColumns[k][doc];
+          }
+          grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+          grpSize++;
+          if (grpSize > grpThreshold) {
+            int newGC = grpCap * 2;
+            long[] ngks = new long[newGC * numGroupKeys];
+            org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+            boolean[] ngo = new boolean[newGC];
+            int ngm = newGC - 1;
+            for (int g = 0; g < grpCap; g++) {
+              if (grpOcc[g]) {
+                int oldBase = g * numGroupKeys;
+                long rh = grpKeyStore[oldBase];
+                for (int k = 1; k < numGroupKeys; k++) {
+                  rh = rh * 31 + grpKeyStore[oldBase + k];
+                }
+                int ns = Long.hashCode(rh) & ngm;
+                while (ngo[ns]) ns = (ns + 1) & ngm;
+                int newBase = ns * numGroupKeys;
+                System.arraycopy(grpKeyStore, oldBase, ngks, newBase, numGroupKeys);
+                ngs[ns] = grpSets[g];
+                ngo[ns] = true;
+              }
+            }
+            grpKeyStore = ngks;
+            grpSets = ngs;
+            grpOcc = ngo;
+            grpCap = newGC;
+            gm = grpCap - 1;
+            grpThreshold = (int) (grpCap * 0.7f);
+            // Re-probe for current doc
+            gs = Long.hashCode(h) & gm;
+            while (grpOcc[gs]) {
+              int base2 = gs * numGroupKeys;
+              boolean match2 = true;
+              for (int k = 0; k < numGroupKeys; k++) {
+                if (grpKeyStore[base2 + k] != keyColumns[k][doc]) { match2 = false; break; }
+              }
+              if (match2) break;
+              gs = (gs + 1) & gm;
+            }
+          }
+        }
+        grpSets[gs].add(keyColumns[dedupIdx][doc]);
+      }
+
+      // Resolve ordinals to Strings for cross-segment merge
+      java.util.HashMap<ObjectArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
+          new java.util.HashMap<>(grpSize);
+      for (int g = 0; g < grpCap; g++) {
+        if (!grpOcc[g]) continue;
+        int base = g * numGroupKeys;
+        Object[] resolvedKeys = new Object[numGroupKeys];
+        for (int k = 0; k < numGroupKeys; k++) {
+          if (isVarchar[k]) {
+            long ord = grpKeyStore[base + k];
+            if (ord >= 0 && varcharDvsForResolve[k] != null) {
+              org.apache.lucene.util.BytesRef bytes = varcharDvsForResolve[k].lookupOrd(ord);
+              resolvedKeys[k] = bytes.utf8ToString();
+            } else {
+              resolvedKeys[k] = "";
+            }
+          } else {
+            resolvedKeys[k] = grpKeyStore[base + k];
+          }
+        }
+        result.put(new ObjectArrayKey(resolvedKeys), grpSets[g]);
+      }
+      return result;
+    }
+
+    // Filtered path: use per-doc advanceExact (columnar loading wastes memory for selective filters)
     org.apache.lucene.index.SortedSetDocValues[] varcharDvs =
         new org.apache.lucene.index.SortedSetDocValues[numKeys];
     org.apache.lucene.index.SortedNumericDocValues[] numericDvs =
@@ -2037,12 +2155,9 @@ public class TransportShardExecuteAction
       }
     }
 
-    // Use ordinal-based grouping within the segment to avoid per-doc String allocation.
-    // Map: ordinal-based composite key -> LongOpenHashSet for dedup values.
-    // For VARCHAR keys, use ordinal (long) within the segment; resolve to String at the end.
     java.util.HashMap<ObjectArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> ordResult =
         new java.util.HashMap<>();
-    Object[] probeKey = new Object[numGroupKeys]; // reusable probe buffer
+    Object[] probeKey = new Object[numGroupKeys];
 
     java.util.function.IntConsumer processDoc = (int doc) -> {
       try {
@@ -2065,8 +2180,7 @@ public class TransportShardExecuteAction
         ObjectArrayKey key = new ObjectArrayKey(probeKey);
         org.opensearch.sql.dqe.operator.LongOpenHashSet set = ordResult.get(key);
         if (set == null) {
-          // Only allocate new key array on insert
-          set = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
+          set = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
           ordResult.put(new ObjectArrayKey(probeKey.clone()), set);
         }
         set.add(dedupVal);
@@ -2075,12 +2189,7 @@ public class TransportShardExecuteAction
       }
     };
 
-    if (isMatchAll) {
-      int maxDoc = reader.maxDoc();
-      for (int doc = 0; doc < maxDoc; doc++) {
-        processDoc.accept(doc);
-      }
-    } else if (weight != null) {
+    if (weight != null) {
       org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
       if (scorer != null) {
         org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
@@ -2091,7 +2200,7 @@ public class TransportShardExecuteAction
       }
     }
 
-    // Resolve ordinals to Strings for cross-segment merge compatibility
+    // Resolve ordinals to Strings for cross-segment merge
     java.util.HashMap<ObjectArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
         new java.util.HashMap<>(ordResult.size());
     for (var entry : ordResult.entrySet()) {

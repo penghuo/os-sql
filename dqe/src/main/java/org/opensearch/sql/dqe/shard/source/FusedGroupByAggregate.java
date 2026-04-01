@@ -14652,4 +14652,23 @@ public final class FusedGroupByAggregate {
     }
     return values;
   }
+
+  /**
+   * Load SortedSetDocValues ordinals into a contiguous long[] array for columnar access.
+   * Documents without a value get ordinal -1. Only the first ordinal is loaded (single-valued).
+   */
+  public static long[] loadOrdinalColumn(LeafReaderContext leafCtx, String fieldName)
+      throws IOException {
+    int maxDoc = leafCtx.reader().maxDoc();
+    long[] ordinals = new long[maxDoc];
+    java.util.Arrays.fill(ordinals, -1L);
+    SortedSetDocValues dv =
+        DocValues.getSortedSet(leafCtx.reader(), fieldName);
+    int doc = dv.nextDoc();
+    while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+      ordinals[doc] = dv.nextOrd();
+      doc = dv.nextDoc();
+    }
+    return ordinals;
+  }
 }

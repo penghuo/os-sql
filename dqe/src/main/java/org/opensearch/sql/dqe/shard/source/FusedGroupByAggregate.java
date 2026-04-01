@@ -5285,7 +5285,7 @@ public final class FusedGroupByAggregate {
           // Parallel workers each build large maps that thrash L3 cache and require
           // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
           if (totalDocs > 200_000_000) {
-            flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
+            flatMap = new FlatSingleKeyMap(slotsPerGroup, 16_000_000);
             for (int s = 0; s < segKeyArrays.size(); s++) {
               scanDocRangeFlatSingleKeyCountStar(
                   segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
@@ -13577,15 +13577,49 @@ public final class FusedGroupByAggregate {
 
     /** Merge all entries from another FlatTwoKeyMap into this one, summing accumulator slots. */
     void mergeFrom(FlatTwoKeyMap other) {
+      // Prefetch-batched merge: compute target hash slots ahead of time to warm cache lines
+      final int BATCH = 32;
+      int[] batchSrcSlots = new int[BATCH];
+      int[] batchTargetSlots = new int[BATCH];
+      int batchLen = 0;
+      long prefetchSink = 0;
+      int mask = capacity - 1;
+
       for (int s = 0; s < other.capacity; s++) {
         if (other.keys0[s] == EMPTY_KEY) continue;
-        int slot = findOrInsert(other.keys0[s], other.keys1[s]);
-        int dstBase = slot * slotsPerGroup;
-        int srcBase = s * other.slotsPerGroup;
-        for (int j = 0; j < slotsPerGroup; j++) {
-          accData[dstBase + j] += other.accData[srcBase + j];
+        batchSrcSlots[batchLen] = s;
+        batchTargetSlots[batchLen] = TwoKeyHashMap.hash2(other.keys0[s], other.keys1[s]) & mask;
+        batchLen++;
+        if (batchLen == BATCH) {
+          // Phase 1: prefetch target hash slots
+          for (int j = 0; j < BATCH; j++) {
+            prefetchSink += keys0[batchTargetSlots[j]];
+          }
+          // Phase 2: actual merge
+          for (int j = 0; j < BATCH; j++) {
+            int srcSlot = batchSrcSlots[j];
+            int slot = findOrInsert(other.keys0[srcSlot], other.keys1[srcSlot]);
+            int dstBase = slot * slotsPerGroup;
+            int srcBase = srcSlot * other.slotsPerGroup;
+            for (int k = 0; k < slotsPerGroup; k++) {
+              accData[dstBase + k] += other.accData[srcBase + k];
+            }
+          }
+          mask = capacity - 1; // update after potential resize
+          batchLen = 0;
         }
       }
+      // Remainder
+      for (int j = 0; j < batchLen; j++) {
+        int srcSlot = batchSrcSlots[j];
+        int slot = findOrInsert(other.keys0[srcSlot], other.keys1[srcSlot]);
+        int dstBase = slot * slotsPerGroup;
+        int srcBase = srcSlot * other.slotsPerGroup;
+        for (int k = 0; k < slotsPerGroup; k++) {
+          accData[dstBase + k] += other.accData[srcBase + k];
+        }
+      }
+      if (prefetchSink == Long.MIN_VALUE) System.nanoTime(); // prevent dead code elimination
     }
   }
 
@@ -13698,15 +13732,46 @@ public final class FusedGroupByAggregate {
 
     /** Merge all entries from another FlatThreeKeyMap into this one, summing accumulator slots. */
     void mergeFrom(FlatThreeKeyMap other) {
+      // Prefetch-batched merge
+      final int BATCH = 32;
+      int[] batchSrcSlots = new int[BATCH];
+      int[] batchTargetSlots = new int[BATCH];
+      int batchLen = 0;
+      long prefetchSink = 0;
+      int mask = capacity - 1;
+
       for (int s = 0; s < other.capacity; s++) {
         if (other.keys0[s] == EMPTY_KEY) continue;
-        int slot = findOrInsert(other.keys0[s], other.keys1[s], other.keys2[s]);
-        int dstBase = slot * slotsPerGroup;
-        int srcBase = s * other.slotsPerGroup;
-        for (int j = 0; j < slotsPerGroup; j++) {
-          accData[dstBase + j] += other.accData[srcBase + j];
+        batchSrcSlots[batchLen] = s;
+        batchTargetSlots[batchLen] = hash3(other.keys0[s], other.keys1[s], other.keys2[s]) & mask;
+        batchLen++;
+        if (batchLen == BATCH) {
+          for (int j = 0; j < BATCH; j++) {
+            prefetchSink += keys0[batchTargetSlots[j]];
+          }
+          for (int j = 0; j < BATCH; j++) {
+            int srcSlot = batchSrcSlots[j];
+            int slot = findOrInsert(other.keys0[srcSlot], other.keys1[srcSlot], other.keys2[srcSlot]);
+            int dstBase = slot * slotsPerGroup;
+            int srcBase = srcSlot * other.slotsPerGroup;
+            for (int k = 0; k < slotsPerGroup; k++) {
+              accData[dstBase + k] += other.accData[srcBase + k];
+            }
+          }
+          mask = capacity - 1;
+          batchLen = 0;
         }
       }
+      for (int j = 0; j < batchLen; j++) {
+        int srcSlot = batchSrcSlots[j];
+        int slot = findOrInsert(other.keys0[srcSlot], other.keys1[srcSlot], other.keys2[srcSlot]);
+        int dstBase = slot * slotsPerGroup;
+        int srcBase = srcSlot * other.slotsPerGroup;
+        for (int k = 0; k < slotsPerGroup; k++) {
+          accData[dstBase + k] += other.accData[srcBase + k];
+        }
+      }
+      if (prefetchSink == Long.MIN_VALUE) System.nanoTime();
     }
   }
 
@@ -13835,15 +13900,51 @@ public final class FusedGroupByAggregate {
 
     /** Merge all entries from another FlatSingleKeyMap into this one, adding accData element-wise. */
     void mergeFrom(FlatSingleKeyMap other) {
+      // Prefetch-batched merge: compute target hash slots ahead of time to warm cache lines
+      final int BATCH = 32;
+      int[] batchSrcSlots = new int[BATCH];
+      int[] batchTargetSlots = new int[BATCH];
+      int batchLen = 0;
+      long prefetchSink = 0;
+      int mask = capacity - 1;
+
       for (int s = 0; s < other.capacity; s++) {
         if (other.keys[s] == EMPTY_KEY) continue;
-        int slot = findOrInsert(other.keys[s]);
-        int dstBase = slot * slotsPerGroup;
-        int srcBase = s * other.slotsPerGroup;
-        for (int j = 0; j < slotsPerGroup; j++) {
-          accData[dstBase + j] += other.accData[srcBase + j];
+        batchSrcSlots[batchLen] = s;
+        batchTargetSlots[batchLen] = SingleKeyHashMap.hash1(other.keys[s]) & mask;
+        batchLen++;
+        if (batchLen == BATCH) {
+          // Phase 1: prefetch target hash slots for keys and accData
+          for (int j = 0; j < BATCH; j++) {
+            prefetchSink += keys[batchTargetSlots[j]];
+            prefetchSink += accData[batchTargetSlots[j] * slotsPerGroup];
+          }
+          // Phase 2: actual merge using pre-computed start slots
+          for (int j = 0; j < BATCH; j++) {
+            int srcSlot = batchSrcSlots[j];
+            int slot = findOrInsertFromSlot(other.keys[srcSlot], batchTargetSlots[j]);
+            int dstBase = slot * slotsPerGroup;
+            int srcBase = srcSlot * other.slotsPerGroup;
+            for (int k = 0; k < slotsPerGroup; k++) {
+              accData[dstBase + k] += other.accData[srcBase + k];
+            }
+          }
+          // Update mask in case resize happened
+          mask = capacity - 1;
+          batchLen = 0;
         }
       }
+      // Remainder
+      for (int j = 0; j < batchLen; j++) {
+        int srcSlot = batchSrcSlots[j];
+        int slot = findOrInsertFromSlot(other.keys[srcSlot], batchTargetSlots[j]);
+        int dstBase = slot * slotsPerGroup;
+        int srcBase = srcSlot * other.slotsPerGroup;
+        for (int k = 0; k < slotsPerGroup; k++) {
+          accData[dstBase + k] += other.accData[srcBase + k];
+        }
+      }
+      if (prefetchSink == Long.MIN_VALUE) System.nanoTime(); // prevent dead code elimination
     }
   }
 

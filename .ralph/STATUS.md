@@ -1,40 +1,35 @@
 status: WORKING
-iteration: 33
+iteration: 34
 
 ## Current State
-- Score: 34/43 within 2x (best-of-3-runs); 33/43 in single run (Q14 borderline at 2.04x)
-- Correctness: 36/43 PASS (no regression)
-- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 32GB heap, 4 shards, 4 segments/shard
-- Optimizations committed this iteration:
-  1. Run-length encoded scan (scanDocRangeFlatSingleKeyCountStar): transition-batching RLE
-     that detects runs of identical keys in sorted data and skips hash probes. Avg run length ~1.8.
-  2. GC barrier tuning: 40% threshold with 100ms+200ms sleep (was 200ms+300ms)
-  3. Parallel columnar loading for executeSingleKeyNumericFlat (Q15 path)
-  4. Parallel columnar loading for executeDerivedSingleKeyNumeric (Q35 path)
+- Score: 34/43 within 2x (best-of-3-runs from iter33 baseline, pending re-benchmark with new optimizations)
+- Correctness: 36/43 PASS (no regression from any changes this iteration)
+- Machine: r5.4xlarge (16 vCPU, 124GB RAM), 32GB heap, 4 shards
+- **LIMITATION**: Only hits_1m (1M) index available on this machine. No 100M hits index for performance benchmarking.
+- Optimizations committed this iteration (4 commits):
+  1. Top-N pruning for GROUP BY key sort columns (21bf3363c)
+  2. Hash-partitioned aggregation for executeDerivedSingleKeyNumeric / Q35 path (b05fc30fe)
+  3. Hash-partitioned aggregation for executeSingleKeyNumericFlat / Q15 path (9b8f8b6e7)
+  4. Hash-partitioned COUNT(DISTINCT) for collectDistinctValuesRaw / Q04 path (7a341ca50)
 
-## Queries Above 2x (9 remaining, best-of-3-runs)
+## Queries Above 2x (9 remaining, from iter33 baseline — needs re-benchmark on 100M)
 Q35(2.55x) Q04(3.12x) Q08(3.42x) Q09(4.95x) Q11(5.99x)
 Q16(5.87x) Q13(7.22x) Q18(8.22x) Q39(14.45x)
 
-## Key Improvements This Iteration (vs iter32)
-- Q14: 2.33x → 1.92x-2.04x (crosses 2x threshold, borderline noise)
-- Q15: 2.36x → 1.86x (solidly within 2x)
-- Q35: 3.12x → 2.55x (improved but still above 2x)
-- Q04: 3.24x → 3.12x (modest improvement)
+## Expected Impact of Hash-Partitioned Optimizations
+- Q35: Eliminates merge step (was ~2x scan cost). Expected ~30-40% improvement → potentially crosses 2x threshold
+- Q15: Same pattern, stabilizes borderline query (was 1.86x-2.04x)
+- Q04: Smaller partition sets fit in L3 cache during insertion. Expected ~20-30% improvement
+- Q14: May benefit from Q15 path improvement (same execution path)
 
 ## Next Steps
-1. Q35 needs ~22% more improvement (0.944s → 0.740s) — explore hash table compaction or SIMD
-2. Q04 needs ~38% improvement — scalar COUNT(DISTINCT) already well-optimized
-3. Q08 needs ~43% improvement — GROUP BY RegionID + COUNT(DISTINCT UserID)
-4. Q09 needs ~60% improvement — mixed aggs + COUNT(DISTINCT)
-5. Remaining 5 queries (Q11, Q13, Q16, Q18, Q39) need 67-93% reduction — likely requires architectural changes
-6. Key bottleneck: hash table cache misses for 17M+ unique keys don't fit in L3 cache (25MB)
-7. Q14 needs stabilization — borderline at 2.04x, sometimes crosses 2x
+1. **Load 100M hits index** to benchmark the hash-partitioned optimizations
+2. **Q08/Q09/Q11**: Apply hash-partitioned approach to executeCountDistinctWithHashSets
+3. **Q16/Q18**: Hash-partitioned aggregation for multi-key GROUP BY with varchar keys
+4. **Q39**: Investigate why 14.45x — complex filtered VARCHAR GROUP BY with CASE WHEN
+5. **Q13**: VARCHAR GROUP BY + COUNT(DISTINCT) optimization
 
 ## Evidence
-- Full benchmark: /tmp/full_derived/r5.4xlarge.json (33/43 single run, 34/43 best-of-3)
-- Isolated Q15: 0.863s (1.66x)
-- Isolated Q35: 0.820s (2.22x)
-- Correctness: 36/43 PASS
-- Build: BUILD SUCCESSFUL
-- Git: 5c0dca97c on wukong branch
+- Correctness: 36/43 PASS (same as iter33 baseline)
+- Build: BUILD SUCCESSFUL for all 4 commits
+- Git: 7a341ca50 on wukong branch

@@ -1226,3 +1226,33 @@ Q15 (GROUP BY UserID, 4.4M unique keys) created 16 concurrent FlatSingleKeyMaps 
 3. **Parallel columnar loading provides 3-7% improvement**: Loading 4 segments concurrently instead of sequentially saves ~50-70ms for Q15. The improvement is modest because columnar loading is only ~10% of total execution time.
 4. **Q14 is noise-sensitive**: At 2.04x, it fluctuates above/below 2x across runs. Need ~10% more improvement to make it reliably within 2x.
 5. **Remaining 9 queries are fundamentally limited by hash table cache misses**: All code-level optimizations (RLE, prefetch, parallel loading, parallel scanning, merge optimization) have been applied. The 2.5-15x gap vs ClickHouse is structural: Lucene DocValues + Java hash tables vs columnar mmap + SIMD probing.
+
+## Iteration 34 — 2026-04-01T14:26-15:30Z
+
+### What I Did
+1. Analyzed all 9 above-2x queries' dispatch paths and bottlenecks via explorer subagents
+2. Discovered Q39's actual query sorts by COUNT(*) (aggregate), not a GROUP BY key — the earlier analysis was wrong about PageViews being a GROUP BY key
+3. Implemented 4 optimizations:
+
+   a. **Top-N pruning for GROUP BY key sort columns** (21bf3363c): Added `sortGroupKeyIndex` parameter through the execution chain (TransportShardExecuteAction → FusedGroupByAggregate). When ORDER BY references a GROUP BY key (not an aggregate), the heap selection now uses `flatKeys[slot * numKeys + sortGroupKeyIndex]` instead of requiring all groups to be materialized. Affects executeWithEvalKeys flat map and HashMap paths.
+
+   b. **Hash-partitioned aggregation for executeDerivedSingleKeyNumeric** (b05fc30fe): Replaced the merge-based parallel path (N workers each build full FlatSingleKeyMap, then merge N-1 into largest) with hash-partitioned approach (N workers each scan ALL docs but only insert keys matching their hash partition). Eliminates the expensive merge step entirely. Added `scanDocRangePartitioned` method.
+
+   c. **Hash-partitioned aggregation for executeSingleKeyNumericFlat** (9b8f8b6e7): Same pattern applied to the Q15 execution path. Reuses `scanDocRangePartitioned`.
+
+   d. **Hash-partitioned COUNT(DISTINCT) for collectDistinctValuesRaw** (7a341ca50): Applied to both single-segment and multi-segment paths in FusedScanAggregate. Each partition worker scans all docs but only inserts keys matching its hash partition. Partition sets are smaller (~1/N of unique keys) and more cache-friendly. Still merges partitions into one set for coordinator compatibility.
+
+4. Ran correctness after each change: 36/43 PASS consistently (no regression)
+5. **Could not benchmark on 100M** — only hits_1m (1M) index available on this machine
+
+### Results
+- Correctness: 36/43 PASS (no regression from any change)
+- Build: All 4 commits compile successfully
+- Performance: Cannot verify on 100M (no hits index). 1M dataset too small to show hash table cache miss improvements.
+- Q39 correctness: Was already failing before changes (one of the 7 failing queries in baseline)
+
+### Decisions
+1. **Hash-partitioned aggregation is the key optimization pattern**: Instead of N workers building full maps and merging, partition the key space so each worker owns a disjoint subset. Benefits: (a) no merge needed for GROUP BY paths, (b) each partition's hash map is ~1/N the size → fits in L3 cache, (c) merge for COUNT(DISTINCT) is cheaper because partition sets are disjoint (no duplicate probing).
+2. **Top-N for GROUP BY key sort is a valid optimization but doesn't help ClickBench**: All 43 ClickBench queries sort by aggregates (COUNT(*), SUM, etc.), not GROUP BY keys. The optimization is still useful for general SQL queries.
+3. **Q39 bottleneck is NOT the sort key**: It's the high-cardinality VARCHAR GROUP BY (Referer, URL) on ~40M filtered rows. The CASE WHEN expression and OFFSET 1000 add overhead but aren't the primary bottleneck.
+4. **Need 100M index to validate**: Hash-partitioned optimizations primarily help when hash tables exceed L3 cache (>25MB). On 1M data, hash tables are small enough to fit in cache, so the optimization shows no benefit.

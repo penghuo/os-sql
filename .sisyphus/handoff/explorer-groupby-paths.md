@@ -1,131 +1,150 @@
-# FusedGroupByAggregate.java — Execution Path Analysis
+# FusedGroupByAggregate GROUP BY Execution Paths
 
-**File**: `dqe/src/main/java/org/opensearch/sql/dqe/shard/source/FusedGroupByAggregate.java` (13,200 lines)
+**File**: `dqe/src/main/java/org/opensearch/sql/dqe/shard/source/FusedGroupByAggregate.java` (14,493 lines)
 
-## 1. Parallelism Infrastructure (lines 116-134)
+## 1. Parallelism Infrastructure (L118-135)
 
+- `PARALLELISM_MODE` = `System.getProperty("dqe.parallelism", "docrange")` — default "docrange"
+- `THREADS_PER_SHARD` = `availableProcessors / dqe.numLocalShards(default 4)`
+- `PARALLEL_POOL` = shared `ForkJoinPool` with `asyncMode=true` (work-stealing), sized to `availableProcessors`
+- Guard: `canParallelize = !"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1`
+
+## 2. executeSingleKeyNumericFlat (L5166-5600)
+
+**Signature** (L5166):
 ```java
-PARALLELISM_MODE = System.getProperty("dqe.parallelism", "docrange");  // "off" disables
-THREADS_PER_SHARD = availableProcessors / numLocalShards(default=4);
-PARALLEL_POOL = new ForkJoinPool(availableProcessors, ..., asyncMode=true);
+private static List<Page> executeSingleKeyNumericFlat(
+    IndexShard shard, Query query, List<KeyInfo> keyInfos, List<AggSpec> specs,
+    Map<String,Type> columnTypeMap, List<String> groupByKeys, int numAggs,
+    boolean[] isCountStar, int[] accType, int sortAggIndex, boolean sortAscending,
+    long topN, int bucket, int numBuckets)
 ```
 
-Guard pattern used everywhere: `!"off".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1 && leaves.size() > 1`
+**Data structure**: `FlatSingleKeyMap` (L13662) — open-addressing hash map with `long[] keys` + `long[] accData` (contiguous slots per group). Max 32M groups.
 
-## 2. executeInternal Dispatch Tree (line 938)
+**Three execution branches** (all inside a single `acquireSearcher` block):
 
-```
-executeInternal(line 938)
-├── hasVarchar?
-│   ├── 1 VARCHAR key + COUNT(*) only → executeSingleVarcharCountStar (line 1274)
-│   ├── 1 VARCHAR key + general aggs → executeSingleVarcharGeneric (line 1947)
-│   ├── has eval key → executeWithEvalKeys (line 6232)
-│   └── else → executeWithVarcharKeys (line 7223)
-│       ├── single-segment 2-key → tryOrdinalIndexedTwoKeyCountStar / FlatTwoKeyMap
-│       ├── 3 keys → executeThreeKeyFlat (line 8893)
-│       ├── multi-seg global-ord 2-key → executeMultiSegGlobalOrdFlatTwoKey (line 11068)
-│       └── else → executeNKeyVarcharParallelDocRange (line 10733)
-└── numeric only → executeNumericOnly (line 2812)
-    ├── 1 key, no expr → executeSingleKeyNumeric (line 3172)
-    │   ├── canUseFlatAccumulators → executeSingleKeyNumericFlat (line 4438)
-    │   └── else → HashMap<SingleKeyHashMap, AccumulatorGroup> path
-    ├── 2 keys, no expr → executeTwoKeyNumeric (line 5071)
-    │   ├── canUseFlatAccumulators → executeTwoKeyNumericFlat (line 5435)
-    │   └── else → HashMap path
-    ├── all keys from same col (derived) → executeDerivedSingleKeyNumeric (line 3799)
-    └── else (N keys with expressions) → Collector/Weight+Scorer HashMap path (line 2920)
-```
+### Branch A: Parallel doc-range for COUNT(*) + MatchAll (L5218-5287)
+- Condition: `allCountStar && isMatchAll && numBuckets <= 1`
+- Loads columnar key arrays per segment via `loadNumericColumn()`
+- **High cardinality (>10M docs)**: Falls back to **sequential** scan into single map (L5237) — comment says "parallel workers each build large maps that thrash L3 cache"
+- **Low cardinality (≤10M docs)**: Splits docs across `THREADS_PER_SHARD` workers via `CompletableFuture.supplyAsync` on `PARALLEL_POOL`. Each worker builds local `FlatSingleKeyMap`, then merged via `flatMap.mergeFrom(workerMap)` (L5286)
 
-## 3. executeSingleKeyNumericFlat (line 4438) — ALREADY HAS PARALLELISM
+### Branch B: Segment-parallel for general aggs (L5290-5355)
+- Condition: `canParallelize` but not COUNT(*)-only
+- Greedy largest-first segment assignment to workers for load balancing (L5305-5315)
+- Each worker calls `scanSegmentFlatSingleKey()` (L5612) per assigned segment
+- Workers build local `FlatSingleKeyMap`, merged into main map via `mergeFrom()` (L5354)
 
-**Signature**: `executeSingleKeyNumericFlat(shard, query, keyInfos, specs, ..., bucket, numBuckets)`
+### Branch C: Sequential fallback (L5358-5375)
+- Condition: `!canParallelize` (single segment or parallelism off)
+- Single `FlatSingleKeyMap`, iterates all segments sequentially
 
-**Data structure**: `FlatSingleKeyMap` (line 12462) — open-addressing hash map with:
-- `long[] keys` — group key values
-- `boolean[] occupied` — slot occupancy
-- `long[] accData` — contiguous accumulator array, `slotsPerGroup` longs per slot
-- `mergeFrom(other)` — element-wise addition of accData for matching keys
+**Key insight for Q15**: The >10M doc threshold at L5237 forces sequential execution. This is the bottleneck for 100M row scans.
 
-**Parallel pattern (lines 4481-4543)**:
-1. Check `canParallelize` guard
-2. Partition segments via largest-first greedy assignment to `numWorkers` buckets
-3. Each worker gets own `FlatSingleKeyMap localMap`
-4. Workers scan their segments via `scanSegmentFlatSingleKey()` into localMap
-5. `CompletableFuture.supplyAsync(..., PARALLEL_POOL)` for each worker
-6. `CompletableFuture.allOf(futures).join()` to wait
-7. Sequential merge: `flatMap.mergeFrom(workerMap)` for each worker result
+## 3. executeWithTopN (L1249-1258)
 
-**Sequential fallback (lines 4548-4558)**: Single FlatSingleKeyMap, iterate all leaves.
-
-**Multi-bucket partitioning** (in `executeSingleKeyNumeric`, lines 3247-3330):
-When estimated groups > `MAX_CAPACITY` (8M), partitions key space into buckets.
-Each bucket call to `executeSingleKeyNumericFlat` passes `bucket` and `numBuckets`.
-Buckets themselves can be parallelized via CompletableFuture when `parallelBuckets > 1`.
-
-## 4. Parallel Patterns Summary (all use same template)
-
-| Method | Line | Data Structure | Parallel Strategy |
-|--------|------|---------------|-------------------|
-| executeSingleVarcharCountStar | 1634 | `HashMap<BytesRefKey, long[]>` | Segment-partitioned workers, merge maps |
-| executeSingleVarcharGeneric | 2528 | `HashMap<BytesRefKey, AccumulatorGroup>` | Segment-partitioned workers, merge maps |
-| executeSingleKeyNumericFlat | 4481 | `FlatSingleKeyMap` | Segment-partitioned workers, `mergeFrom()` |
-| executeDerivedSingleKeyNumeric | 3952 | `FlatSingleKeyMap` | Segment-partitioned workers, `mergeFrom()` |
-| executeTwoKeyNumericFlat | 5516 | `FlatTwoKeyMap` | Segment-partitioned workers, `mergeFrom()` |
-| executeNKeyVarcharParallelDocRange | 10733 | `Map<MergedGroupKey, AccumulatorGroup>[]` | Doc-range split per segment |
-
-**Common parallel template** (segment-partitioned):
+**Signature**:
 ```java
-int numWorkers = Math.min(THREADS_PER_SHARD, leaves.size());
-List<LeafReaderContext>[] workerSegments = new List[numWorkers];
-// Largest-first greedy assignment for balanced load
-sortedLeaves.sort((a, b) -> Integer.compare(b.reader().maxDoc(), a.reader().maxDoc()));
-for (leaf : sortedLeaves) { assign to lightest worker }
-// Submit to PARALLEL_POOL
-CompletableFuture<LocalMapType>[] futures = ...;
-for (w : workers) { futures[w] = CompletableFuture.supplyAsync(() -> { scan segments }, PARALLEL_POOL); }
-CompletableFuture.allOf(futures).join();
-// Sequential merge
-for (future : futures) { mainMap.mergeFrom(future.join()); }
+public static List<Page> executeWithTopN(
+    AggregationNode aggNode, IndexShard shard, Query query,
+    Map<String,Type> columnTypeMap, int sortAggIndex, boolean sortAscending, long topN)
 ```
 
-**Doc-range pattern** (executeNKeyVarcharParallelDocRange, line 10733):
-- Collects matching doc IDs per segment
-- Splits doc ID array among workers (chunk-based)
-- Each worker opens own DocValues readers for the same segment
-- Uses `Map<MergedGroupKey, AccumulatorGroup>[]` per worker
+Simply delegates to `executeInternal()` (L1280) with sort parameters. TopN is handled **post-aggregation** inside each execution path:
 
-## 5. Data Structure Paths
+**TopN selection** (L5393-5440 in executeSingleKeyNumericFlat):
+- Uses a **min/max heap** of size N over the flat map slots
+- Heap compares `accData[slot * slotsPerGroup + sortAccOff]` values
+- After heap selection, sorts the N winners and builds output page
+- Same pattern replicated in other paths (executeTwoKeyNumericFlat, etc.)
 
-| Path | Data Structure | When Used |
-|------|---------------|-----------|
-| Flat array | `FlatSingleKeyMap` (long[] keys + long[] accData) | 1 numeric key, COUNT/SUM/AVG of longs |
-| Flat array | `FlatTwoKeyMap` (long[] key1, long[] key2 + long[] accData) | 2 numeric keys, COUNT/SUM/AVG of longs |
-| Flat array | `FlatThreeKeyMap` (line 12334) | 3 keys in varchar path |
-| HashMap | `HashMap<BytesRefKey, long[]>` | Single VARCHAR key + COUNT(*) |
-| HashMap | `HashMap<BytesRefKey, AccumulatorGroup>` | Single VARCHAR key + general aggs |
-| HashMap | `HashMap<SegmentGroupKey, AccumulatorGroup>` | N numeric keys with expressions |
-| HashMap | `Map<MergedGroupKey, AccumulatorGroup>` | N-key varchar path |
+**Early termination** in `executeNKeyVarcharParallelDocRange` (L11943):
+- `earlyTerminate = (sortAggIndex < 0 && topN > 0)` — LIMIT without ORDER BY
+- Uses `AtomicBoolean stopFlag` checked every 4096 docs
+- Workers stop once total groups across all workers ≥ topN
 
-## 6. Key Inner Loop: scanSegmentFlatSingleKey (line 4798)
+## 4. Hash-Partitioned Aggregation (Multi-Bucket)
 
-Handles both MatchAll and filtered paths. For MatchAll + COUNT(*) only:
+**Trigger** (L3590-3615 in `executeSingleKeyNumeric`):
+- First tries single-bucket `executeSingleKeyNumericFlat` with `bucket=0, numBuckets=1`
+- On overflow (`"GROUP BY exceeded memory limit"` exception), computes `numBuckets = ceil(totalDocs / MAX_CAPACITY)`
+- Falls back to `executeSingleKeyNumericFlatMultiBucket` (L4734)
+
+**executeSingleKeyNumericFlatMultiBucket** (L4734-4860):
+- Allocates `FlatSingleKeyMap[numBuckets]` — one map per hash bucket
+- Hash partitioning: `bkt = (SingleKeyHashMap.hash1(key) & 0x7FFFFFFF) % numBuckets` (L5011)
+- Parallel: each worker gets own `FlatSingleKeyMap[numBuckets]`, merged per-bucket via `mergeFrom()`
+- Final merge: `bucketMaps[1..N]` merged into `bucketMaps[0]` (L4843)
+- Dedicated scan method: `scanSegmentFlatSingleKeyMultiBucket` (L4952) — avoids per-doc hash-partition filter skip
+
+**Important**: This pattern exists ONLY for single numeric key. No multi-bucket path for varchar or multi-key.
+
+## 5. executeNKeyVarcharParallelDocRange (L11912-12240)
+
+**Signature**:
 ```java
-// Ultra-fast: nextDoc() on key column, no agg DV reads
-while (doc != NO_MORE_DOCS) {
-    long key0 = dv0.nextValue();
-    int slot = flatMap.findOrInsert(key0);
-    flatMap.accData[slot * slotsPerGroup + accOffset[0]]++;
-    doc = dv0.nextDoc();
-}
+private static List<Page> executeNKeyVarcharParallelDocRange(
+    Engine.Searcher engineSearcher, Query query, List<KeyInfo> keyInfos,
+    List<AggSpec> specs, int numAggs, boolean[] isCountStar, boolean[] isDoubleArg,
+    boolean[] isVarcharArg, int[] accType, String[] truncUnits, String[] arithUnits,
+    List<String> groupByKeys, int sortAggIndex, boolean sortAscending, long topN,
+    Map<String,Type> columnTypeMap)
 ```
 
-For filtered queries: uses `Weight.scorer(leafCtx)` → `DocIdSetIterator` loop.
+**Architecture**: Per-segment doc-range parallelism with ordinal resolution
+1. For each segment: collect all matching doc IDs into `int[] matchedDocs`
+2. Split doc IDs into chunks across `numWorkers`
+3. Each worker opens its own DocValues readers (L12001-12015)
+4. Workers build local `Map<SegmentGroupKey, AccumulatorGroup>` using `NumericProbeKey` for hashing
+5. After scanning, workers resolve segment-local ordinals to strings via `dv.lookupOrd()` (L12185)
+6. Workers merge resolved keys into per-worker global `Map<MergedGroupKey, AccumulatorGroup>` (L12196)
+7. After all segments: merge all worker maps via `mergeMergedGroupMaps()` (L12219)
 
-## 7. Key Finding: executeSingleKeyNumericFlat IS ALREADY PARALLEL
+**Merge** (`mergeMergedGroupMaps` at L12788): Simple iterate-and-merge into target map using `AccumulatorGroup.merge()`.
 
-The task description says "executeSingleKeyNumericFlat (currently sequential)" — but the code at lines 4481-4543 shows it **already has a parallel path**. The parallel path:
-- Partitions segments across workers using greedy load balancing
-- Each worker scans into a local `FlatSingleKeyMap`
-- Results merged via `flatMap.mergeFrom(workerMap)`
+**Dispatch** (L11489 in `executeNKeyVarcharPath`):
+- Condition: `"docrange".equals(PARALLELISM_MODE) && THREADS_PER_SHARD > 1`
+- Falls through from `executeMultiSegGlobalOrdFlatTwoKey` (tried first for 2-key numeric+varchar)
 
-The sequential path is only used as a fallback when `canParallelize` is false (parallelism off, single thread, or single segment).
+## 6. executeMultiSegGlobalOrdFlatTwoKey (L12247+)
+
+- Specialized for 2-key (numeric + varchar) using global ordinals + `FlatTwoKeyMap`
+- Avoids per-group object allocation AND per-segment ordinal resolution
+- Only resolves ordinals to strings for final top-N output groups
+- Returns `null` if not applicable (too many global ordinals), falling through to doc-range path
+
+## 7. Dispatch Flow Summary
+
+```
+executeWithTopN / execute
+  └─ executeInternal (L1280)
+       ├─ hasVarchar?
+       │   ├─ 1 varchar key + COUNT(*) → executeSingleVarcharCountStar (L1616)
+       │   ├─ 1 varchar key + general → executeSingleVarcharGeneric (L2293)
+       │   ├─ has eval key → executeWithEvalKeys (L7301)
+       │   └─ multi-key/varchar → executeWithVarcharKeys (L8349)
+       │       └─ executeNKeyVarcharPath (L10549)
+       │           ├─ 2-key global ord → executeMultiSegGlobalOrdFlatTwoKey (L12247)
+       │           ├─ 3-key flat → executeThreeKeyFlat (L10069)
+       │           └─ parallel doc-range → executeNKeyVarcharParallelDocRange (L11912)
+       └─ numeric only → executeNumericOnly (L3159)
+           ├─ 1 key → executeSingleKeyNumeric (L3519)
+           │   ├─ flat → executeSingleKeyNumericFlat (L5166)
+           │   └─ overflow → executeSingleKeyNumericFlatMultiBucket (L4734)
+           ├─ 2 keys → executeTwoKeyNumeric (L6018)
+           │   └─ flat → executeTwoKeyNumericFlat (L6349)
+           └─ derived → executeDerivedSingleKeyNumeric (L4073)
+```
+
+## 8. Key Patterns for Extension
+
+| Pattern | Where | How |
+|---------|-------|-----|
+| Segment-parallel with greedy assignment | L5290-5355 | Largest-first segment→worker, local maps, mergeFrom |
+| Doc-range parallel | L5246-5287, L11912+ | Split docs across workers, each builds local map |
+| Hash-partitioned buckets | L4734-4860 | `hash(key) % numBuckets`, per-bucket FlatMap |
+| FlatMap mergeFrom | L13776 | Element-wise `accData[j] += other.accData[j]` |
+| AccumulatorGroup merge | L14119 | Per-accumulator polymorphic merge |
+| Early termination | L11943 | AtomicBoolean stopFlag for LIMIT without ORDER BY |
+| TopN heap selection | L5393-5440 | Min/max heap over flat map slots post-aggregation |

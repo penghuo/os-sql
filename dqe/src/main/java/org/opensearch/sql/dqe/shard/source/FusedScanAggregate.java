@@ -1791,17 +1791,10 @@ public final class FusedScanAggregate {
                       if (vals == null || segCounts[segIdx] == 0) {
                         return new LongOpenHashSet();
                       }
-                      LongOpenHashSet set = new LongOpenHashSet(Math.min(segCounts[segIdx], 1_000_000));
+                      LongOpenHashSet set = new LongOpenHashSet(Math.min(segCounts[segIdx], 8_000_000));
                       int count = segCounts[segIdx];
-                      // Run-length dedup: skip consecutive duplicates (index is sorted by UserID)
-                      long prev = Long.MIN_VALUE;
-                      for (int i = 0; i < count; i++) {
-                        long v = vals[i];
-                        if (v != prev) {
-                          set.add(v);
-                          prev = v;
-                        }
-                      }
+                      // Use prefetch-batched insertion for better cache behavior
+                      set.addAllBatched(vals, 0, count);
                       return set;
                     },
                     FusedGroupByAggregate.getParallelPool());

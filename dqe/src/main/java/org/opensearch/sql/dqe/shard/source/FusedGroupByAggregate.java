@@ -4246,16 +4246,67 @@ public final class FusedGroupByAggregate {
         // Load all keys into flat arrays (columnar access)
         java.util.List<long[]> segKeyArrays = new java.util.ArrayList<>();
         java.util.List<Bits> segLiveDocs = new java.util.ArrayList<>();
+        long totalDocs = 0;
         for (LeafReaderContext leafCtx : leaves) {
-          segKeyArrays.add(loadNumericColumn(leafCtx, sourceCol));
+          long[] keyValues = loadNumericColumn(leafCtx, sourceCol);
+          segKeyArrays.add(keyValues);
           segLiveDocs.add(leafCtx.reader().getLiveDocs());
+          totalDocs += keyValues.length;
         }
 
-        flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
-        for (int s = 0; s < segKeyArrays.size(); s++) {
-          scanDocRangeFlatSingleKeyCountStar(
-              segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
-              segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+        if (canParallelize && leaves.size() > 1 && totalDocs <= 200_000_000) {
+          // Parallel doc-range path: split docs across workers, merge results
+          int numWorkers = THREADS_PER_SHARD;
+          long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
+          java.util.List<int[]> workUnits = new java.util.ArrayList<>();
+          for (int s = 0; s < leaves.size(); s++) {
+            int maxDoc = segKeyArrays.get(s).length;
+            if (maxDoc == 0) continue;
+            for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
+              int end = (int) Math.min(start + docsPerWorker, maxDoc);
+              workUnits.add(new int[]{s, start, end});
+            }
+          }
+          int actualWorkers = workUnits.size();
+          @SuppressWarnings("unchecked")
+          java.util.concurrent.CompletableFuture<FlatSingleKeyMap>[] futures =
+              new java.util.concurrent.CompletableFuture[actualWorkers];
+          for (int w = 0; w < actualWorkers; w++) {
+            final int[] unit = workUnits.get(w);
+            final long[] keyValues = segKeyArrays.get(unit[0]);
+            final Bits liveDocs = segLiveDocs.get(unit[0]);
+            final int startDoc = unit[1];
+            final int endDoc = unit[2];
+            futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              int docCount = endDoc - startDoc;
+              int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 16_000_000);
+              FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
+              scanDocRangeFlatSingleKeyCountStar(
+                  keyValues, startDoc, endDoc, liveDocs,
+                  localMap, accOffset[0], slotsPerGroup);
+              return localMap;
+            }, PARALLEL_POOL);
+          }
+          java.util.concurrent.CompletableFuture.allOf(futures).join();
+          FlatSingleKeyMap[] workerMaps = new FlatSingleKeyMap[actualWorkers];
+          int largestIdx = 0;
+          for (int fi = 0; fi < actualWorkers; fi++) {
+            workerMaps[fi] = futures[fi].join();
+            if (workerMaps[fi].size > workerMaps[largestIdx].size) largestIdx = fi;
+          }
+          flatMap = workerMaps[largestIdx];
+          for (int fi = 0; fi < actualWorkers; fi++) {
+            if (fi != largestIdx && workerMaps[fi].size > 0) flatMap.mergeFrom(workerMaps[fi]);
+            workerMaps[fi] = null;
+          }
+        } else {
+          // Sequential path
+          flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
+          for (int s = 0; s < segKeyArrays.size(); s++) {
+            scanDocRangeFlatSingleKeyCountStar(
+                segKeyArrays.get(s), 0, segKeyArrays.get(s).length,
+                segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
+          }
         }
       } else if (canParallelize && leaves.size() > 1) {
         // Parallel path: partition segments across workers, each with own FlatSingleKeyMap
@@ -5233,7 +5284,7 @@ public final class FusedGroupByAggregate {
           // For high-cardinality keys (totalDocs > 10M), scan sequentially into main map.
           // Parallel workers each build large maps that thrash L3 cache and require
           // expensive mergeFrom. Sequential scan uses ONE map with better cache locality.
-          if (totalDocs > 10_000_000) {
+          if (totalDocs > 200_000_000) {
             flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
             for (int s = 0; s < segKeyArrays.size(); s++) {
               scanDocRangeFlatSingleKeyCountStar(
@@ -5241,8 +5292,9 @@ public final class FusedGroupByAggregate {
                   segLiveDocs.get(s), flatMap, accOffset[0], slotsPerGroup);
             }
           } else {
-          // Doc-range parallel path for lower-cardinality keys
-          flatMap = new FlatSingleKeyMap(slotsPerGroup, 4_000_000);
+          // Doc-range parallel path: split docs across workers, merge results.
+          // Each worker builds a local FlatSingleKeyMap, then we merge smaller maps
+          // into the largest (saves one full merge vs merging all into an empty main map).
           int numWorkers = THREADS_PER_SHARD;
           long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
           java.util.List<int[]> workUnits = new java.util.ArrayList<>();
@@ -5270,7 +5322,7 @@ public final class FusedGroupByAggregate {
                 java.util.concurrent.CompletableFuture.supplyAsync(
                     () -> {
                       int docCount = endDoc - startDoc;
-                      int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 4_000_000);
+                      int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 16_000_000);
                       FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
                       scanDocRangeFlatSingleKeyCountStar(
                           keyValues, startDoc, endDoc, liveDocs,
@@ -5281,10 +5333,19 @@ public final class FusedGroupByAggregate {
           }
 
           java.util.concurrent.CompletableFuture.allOf(futures).join();
-          for (int fi = 0; fi < futures.length; fi++) {
-            FlatSingleKeyMap workerMap = futures[fi].join();
-            if (workerMap.size > 0) flatMap.mergeFrom(workerMap);
-            futures[fi] = null;
+          // Use the largest worker map as the base to save one merge pass
+          FlatSingleKeyMap[] workerMaps = new FlatSingleKeyMap[actualWorkers];
+          int largestIdx = 0;
+          for (int fi = 0; fi < actualWorkers; fi++) {
+            workerMaps[fi] = futures[fi].join();
+            if (workerMaps[fi].size > workerMaps[largestIdx].size) largestIdx = fi;
+          }
+          flatMap = workerMaps[largestIdx];
+          for (int fi = 0; fi < actualWorkers; fi++) {
+            if (fi != largestIdx && workerMaps[fi].size > 0) {
+              flatMap.mergeFrom(workerMaps[fi]);
+            }
+            workerMaps[fi] = null;
           }
           } // end else (parallel path)
         } else {

@@ -106,6 +106,41 @@ public final class LongOpenHashSet {
   }
 
   /**
+   * Bulk-add values from an array using prefetch batching to hide DRAM latency.
+   * Processes values in batches: Phase 1 computes hash slots and reads the target
+   * cache lines (warming them), Phase 2 does actual probe+insert.
+   */
+  public void addAllBatched(long[] values, int offset, int length) {
+    final int BATCH = 32;
+    int i = offset;
+    for (; i + BATCH <= offset + length; i += BATCH) {
+      // Phase 1: prefetch — read keys[slot] to warm cache lines
+      int mask = capacity - 1;
+      long sink = 0;
+      for (int j = 0; j < BATCH; j++) {
+        long v = values[i + j];
+        if (v == 0 || v == EMPTY) continue;
+        long h = v;
+        h ^= h >>> 33;
+        h *= 0xff51afd7ed558ccdL;
+        h ^= h >>> 33;
+        h *= 0xc4ceb9fe1a85ec53L;
+        h ^= h >>> 33;
+        int slot = (int) h & mask;
+        sink += keys[slot]; // force cache line load
+      }
+      // Phase 2: actual insert
+      for (int j = 0; j < BATCH; j++) {
+        add(values[i + j]);
+      }
+    }
+    // Remainder
+    for (; i < offset + length; i++) {
+      add(values[i]);
+    }
+  }
+
+  /**
    * Check if a value is in the set.
    * @param value the long value to check
    * @return true if the set contains this value

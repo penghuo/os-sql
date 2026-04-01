@@ -203,11 +203,11 @@ public class TransportShardExecuteAction
     long max = rt.maxMemory();
     if (used > max * 2 / 5) {
       System.gc();
-      try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+      try { Thread.sleep(100); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
       used = rt.totalMemory() - rt.freeMemory();
-      if (used > max * 2 / 5) {
+      if (used > max / 3) {
         System.gc();
-        try { Thread.sleep(300); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        try { Thread.sleep(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
       }
     }
 

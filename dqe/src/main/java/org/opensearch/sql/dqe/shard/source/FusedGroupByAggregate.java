@@ -14597,44 +14597,74 @@ public final class FusedGroupByAggregate {
       long[] keyValues, int startDoc, int endDoc, Bits liveDocs,
       FlatSingleKeyMap flatMap, int accOffset0, int slotsPerGroup) {
     if (liveDocs != null) {
-      // liveDocs path: no prefetch batching (branch-heavy, less benefit)
+      // liveDocs path: run-length cached (skip hash probe for consecutive identical keys)
+      long lastKey = FlatSingleKeyMap.EMPTY_KEY;
+      int lastSlot = -1;
       for (int doc = startDoc; doc < endDoc; doc++) {
         if (!liveDocs.get(doc)) continue;
-        int slot = flatMap.findOrInsert(keyValues[doc]);
-        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+        long key = keyValues[doc];
+        if (key == lastKey) {
+          flatMap.accData[lastSlot * slotsPerGroup + accOffset0]++;
+        } else {
+          lastSlot = flatMap.findOrInsert(key);
+          flatMap.accData[lastSlot * slotsPerGroup + accOffset0]++;
+          lastKey = key;
+        }
       }
       return;
     }
 
-    // Prefetch-batched path for the common no-deletes case.
-    // Process keys in batches: compute hash slots ahead of time to warm cache lines
-    // for BOTH keys[] and accData[], then probe. This overlaps DRAM latency (~100ns)
-    // with hash computation. Batch size 32 covers ~160ns of prefetch lead time.
-    final int BATCH = 32;
-    long prefetchSink = 0; // accumulator to prevent JIT from eliminating prefetch reads
+    // Run-length optimized path: the index is sorted by CounterID+EventDate+UserID,
+    // so consecutive docs within a segment often share the same key (avg run length ~1.8).
+    // We collect unique-key transitions and prefetch-batch only those, skipping redundant
+    // prefetches for run keys. Phase 1 scans ahead to find transitions, Phase 2 probes
+    // and counts runs between transitions.
+    long lastKey = FlatSingleKeyMap.EMPTY_KEY;
+    int lastSlot = -1;
     int doc = startDoc;
 
-    for (; doc + BATCH <= endDoc; doc += BATCH) {
-      // Re-read arrays and mask each batch (may change after resize)
+    final int BATCH = 32;
+    int[] transitionDocs = new int[BATCH];
+    for (; doc < endDoc; ) {
+      int numTransitions = 0;
+      int scanEnd = Math.min(doc + BATCH * 8, endDoc);
+      int d = doc;
+      for (; d < scanEnd && numTransitions < BATCH; d++) {
+        long key = keyValues[d];
+        if (key != lastKey) {
+          transitionDocs[numTransitions++] = d;
+          lastKey = key;
+        }
+      }
+      if (numTransitions == 0) {
+        if (lastSlot >= 0) {
+          flatMap.accData[lastSlot * slotsPerGroup + accOffset0] += (d - doc);
+        }
+        doc = d;
+        continue;
+      }
+      if (lastSlot >= 0 && transitionDocs[0] > doc) {
+        flatMap.accData[lastSlot * slotsPerGroup + accOffset0] += (transitionDocs[0] - doc);
+      }
       long[] mapKeys = flatMap.keys;
       long[] mapAcc = flatMap.accData;
       int mask = flatMap.capacity - 1;
-      // Phase 1: compute hash slots and prefetch cache lines for keys + accData
-      for (int j = 0; j < BATCH; j++) {
-        int slot = SingleKeyHashMap.hash1(keyValues[doc + j]) & mask;
-        prefetchSink += mapKeys[slot]; // force keys cache line load
-        prefetchSink += mapAcc[slot * slotsPerGroup]; // force accData cache line load
+      long prefetchSink = 0;
+      for (int t = 0; t < numTransitions; t++) {
+        int slot = SingleKeyHashMap.hash1(keyValues[transitionDocs[t]]) & mask;
+        prefetchSink += mapKeys[slot];
+        prefetchSink += mapAcc[slot * slotsPerGroup];
       }
-      // Phase 2: actual probe and insert (cache lines should now be loaded)
-      for (int j = 0; j < BATCH; j++) {
-        int slot = flatMap.findOrInsert(keyValues[doc + j]);
-        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      for (int t = 0; t < numTransitions; t++) {
+        int tDoc = transitionDocs[t];
+        int nextDoc = (t + 1 < numTransitions) ? transitionDocs[t + 1] : d;
+        int runLen = nextDoc - tDoc;
+        lastSlot = flatMap.findOrInsert(keyValues[tDoc]);
+        flatMap.accData[lastSlot * slotsPerGroup + accOffset0] += runLen;
       }
-    }
-    // Remainder
-    for (; doc < endDoc; doc++) {
-      int slot = flatMap.findOrInsert(keyValues[doc]);
-      flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      lastKey = keyValues[transitionDocs[numTransitions - 1]];
+      if (prefetchSink == Long.MIN_VALUE) System.nanoTime();
+      doc = d;
     }
   }
 

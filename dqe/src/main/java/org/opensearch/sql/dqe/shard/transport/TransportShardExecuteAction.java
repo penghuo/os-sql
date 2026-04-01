@@ -1567,57 +1567,116 @@ public class TransportShardExecuteAction
     int numKeys = keyNames.size();
     org.apache.lucene.index.LeafReader reader = leafCtx.reader();
 
-    // Open DocValues for all keys
-    org.apache.lucene.index.SortedNumericDocValues[] dvs =
-        new org.apache.lucene.index.SortedNumericDocValues[numKeys];
-    for (int i = 0; i < numKeys; i++) {
-      dvs[i] = reader.getSortedNumericDocValues(keyNames.get(i));
-    }
-
-    java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
-        new java.util.HashMap<>();
-    long[] tmpGroupKey = new long[numGroupKeys];
+    // Open-addressing map: grpKeyStore holds numGroupKeys longs per slot contiguously
+    int grpCap = 256;
+    long[] grpKeyStore = new long[grpCap * numGroupKeys];
+    org.opensearch.sql.dqe.operator.LongOpenHashSet[] grpSets =
+        new org.opensearch.sql.dqe.operator.LongOpenHashSet[grpCap];
+    boolean[] grpOcc = new boolean[grpCap];
+    int grpSize = 0;
+    int grpThreshold = (int) (grpCap * 0.7f);
 
     if (isMatchAll) {
       // Check that at least one DV is non-null
       boolean anyDv = false;
+      org.apache.lucene.index.SortedNumericDocValues[] dvs =
+          new org.apache.lucene.index.SortedNumericDocValues[numKeys];
       for (int i = 0; i < numKeys; i++) {
-        if (dvs[i] != null) {
-          anyDv = true;
-          break;
-        }
+        dvs[i] = reader.getSortedNumericDocValues(keyNames.get(i));
+        if (dvs[i] != null) anyDv = true;
       }
       if (anyDv) {
         int maxDoc = reader.maxDoc();
-        int[] dvDocs = new int[numKeys];
+
+        // Columnar load: load all columns into flat long[] arrays
+        long[][] keyColumns = new long[numKeys][];
         for (int i = 0; i < numKeys; i++) {
-          dvDocs[i] =
-              dvs[i] != null
-                  ? dvs[i].nextDoc()
-                  : org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+          keyColumns[i] = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyNames.get(i));
         }
 
         for (int doc = 0; doc < maxDoc; doc++) {
-          long dedupVal = 0;
-          for (int i = 0; i < numKeys; i++) {
-            long val = 0;
-            if (dvDocs[i] == doc) {
-              val = dvs[i].nextValue();
-              dvDocs[i] = dvs[i].nextDoc();
+          // Compute composite hash from group key columns (no allocation)
+          long h = keyColumns[0][doc];
+          for (int k = 1; k < numGroupKeys; k++) {
+            h = h * 31 + keyColumns[k][doc];
+          }
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(h) & gm;
+
+          // Probe open-addressing map
+          while (grpOcc[gs]) {
+            int base = gs * numGroupKeys;
+            boolean match = true;
+            for (int k = 0; k < numGroupKeys; k++) {
+              if (grpKeyStore[base + k] != keyColumns[k][doc]) { match = false; break; }
             }
-            if (i < numGroupKeys) {
-              tmpGroupKey[i] = val;
-            } else {
-              dedupVal = val;
+            if (match) break;
+            gs = (gs + 1) & gm;
+          }
+
+          if (!grpOcc[gs]) {
+            grpOcc[gs] = true;
+            int base = gs * numGroupKeys;
+            for (int k = 0; k < numGroupKeys; k++) {
+              grpKeyStore[base + k] = keyColumns[k][doc];
+            }
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              // Resize: double capacity and rehash all entries
+              int newGC = grpCap * 2;
+              long[] ngks = new long[newGC * numGroupKeys];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int oldBase = g * numGroupKeys;
+                  long rh = grpKeyStore[oldBase];
+                  for (int k = 1; k < numGroupKeys; k++) {
+                    rh = rh * 31 + grpKeyStore[oldBase + k];
+                  }
+                  int ns = Long.hashCode(rh) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  int newBase = ns * numGroupKeys;
+                  System.arraycopy(grpKeyStore, oldBase, ngks, newBase, numGroupKeys);
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
+              }
+              grpKeyStore = ngks;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              // Re-probe for current doc after resize
+              gm = grpCap - 1;
+              gs = Long.hashCode(h) & gm;
+              while (grpOcc[gs]) {
+                int base2 = gs * numGroupKeys;
+                boolean match = true;
+                for (int k = 0; k < numGroupKeys; k++) {
+                  if (grpKeyStore[base2 + k] != keyColumns[k][doc]) { match = false; break; }
+                }
+                if (match) break;
+                gs = (gs + 1) & gm;
+              }
             }
           }
-          LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
-          result.computeIfAbsent(
-                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024))
-              .add(dedupVal);
+          // Dedup key is the last column
+          grpSets[gs].add(keyColumns[numGroupKeys][doc]);
         }
       }
     } else if (weight != null) {
+      // Filtered path: use advanceExact with open-addressing (no per-doc allocation)
+      org.apache.lucene.index.SortedNumericDocValues[] dvs =
+          new org.apache.lucene.index.SortedNumericDocValues[numKeys];
+      for (int i = 0; i < numKeys; i++) {
+        dvs[i] = reader.getSortedNumericDocValues(keyNames.get(i));
+      }
+      long[] tmpGroupKey = new long[numGroupKeys];
+
       org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
       if (scorer != null) {
         org.apache.lucene.search.DocIdSetIterator disi = scorer.iterator();
@@ -1633,14 +1692,89 @@ public class TransportShardExecuteAction
               dedupVal = val;
             }
           }
-          LongArrayKey key = new LongArrayKey(tmpGroupKey.clone());
-          result.computeIfAbsent(
-                  key, k -> new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024))
-              .add(dedupVal);
+
+          // Compute composite hash from tmpGroupKey (no allocation)
+          long h = tmpGroupKey[0];
+          for (int k = 1; k < numGroupKeys; k++) {
+            h = h * 31 + tmpGroupKey[k];
+          }
+          int gm = grpCap - 1;
+          int gs = Long.hashCode(h) & gm;
+
+          // Probe open-addressing map
+          while (grpOcc[gs]) {
+            int base = gs * numGroupKeys;
+            boolean match = true;
+            for (int k = 0; k < numGroupKeys; k++) {
+              if (grpKeyStore[base + k] != tmpGroupKey[k]) { match = false; break; }
+            }
+            if (match) break;
+            gs = (gs + 1) & gm;
+          }
+
+          if (!grpOcc[gs]) {
+            grpOcc[gs] = true;
+            int base = gs * numGroupKeys;
+            System.arraycopy(tmpGroupKey, 0, grpKeyStore, base, numGroupKeys);
+            grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
+            grpSize++;
+            if (grpSize > grpThreshold) {
+              // Resize: double capacity and rehash all entries
+              int newGC = grpCap * 2;
+              long[] ngks = new long[newGC * numGroupKeys];
+              org.opensearch.sql.dqe.operator.LongOpenHashSet[] ngs =
+                  new org.opensearch.sql.dqe.operator.LongOpenHashSet[newGC];
+              boolean[] ngo = new boolean[newGC];
+              int ngm = newGC - 1;
+              for (int g = 0; g < grpCap; g++) {
+                if (grpOcc[g]) {
+                  int oldBase = g * numGroupKeys;
+                  long rh = grpKeyStore[oldBase];
+                  for (int k = 1; k < numGroupKeys; k++) {
+                    rh = rh * 31 + grpKeyStore[oldBase + k];
+                  }
+                  int ns = Long.hashCode(rh) & ngm;
+                  while (ngo[ns]) ns = (ns + 1) & ngm;
+                  int newBase = ns * numGroupKeys;
+                  System.arraycopy(grpKeyStore, oldBase, ngks, newBase, numGroupKeys);
+                  ngs[ns] = grpSets[g];
+                  ngo[ns] = true;
+                }
+              }
+              grpKeyStore = ngks;
+              grpSets = ngs;
+              grpOcc = ngo;
+              grpCap = newGC;
+              grpThreshold = (int) (newGC * 0.7f);
+              // Re-probe for current key after resize
+              gm = grpCap - 1;
+              gs = Long.hashCode(h) & gm;
+              while (grpOcc[gs]) {
+                int base2 = gs * numGroupKeys;
+                boolean match = true;
+                for (int k = 0; k < numGroupKeys; k++) {
+                  if (grpKeyStore[base2 + k] != tmpGroupKey[k]) { match = false; break; }
+                }
+                if (match) break;
+                gs = (gs + 1) & gm;
+              }
+            }
+          }
+          grpSets[gs].add(dedupVal);
         }
       }
     }
 
+    // Convert open-addressing arrays back to HashMap for return
+    java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> result =
+        new java.util.HashMap<>(grpSize * 2);
+    for (int g = 0; g < grpCap; g++) {
+      if (grpOcc[g]) {
+        long[] keys = new long[numGroupKeys];
+        System.arraycopy(grpKeyStore, g * numGroupKeys, keys, 0, numGroupKeys);
+        result.put(new LongArrayKey(keys), grpSets[g]);
+      }
+    }
     return result;
   }
 
@@ -2117,9 +2251,10 @@ public class TransportShardExecuteAction
                 }
 
                 int maxDoc = reader.maxDoc();
-                int dvDoc0 = dv0.nextDoc();
-                int dvDoc1 = dv1.nextDoc();
-                // Advance all aggregate DV iterators
+                // Columnar loading for key columns only (not agg columns to save memory)
+                long[] k0Vals = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName0);
+                long[] k1Vals = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName1);
+                // Advance all aggregate DV iterators (keep per-doc for agg columns)
                 int[] aggDvDocs = new int[numAggsF];
                 for (int i = 0; i < numAggsF; i++) {
                   if (aggDvs[i] != null) aggDvDocs[i] = aggDvs[i].nextDoc();
@@ -2127,23 +2262,15 @@ public class TransportShardExecuteAction
                 }
 
                 for (int doc = 0; doc < maxDoc; doc++) {
-                  long k0 = 0;
-                  if (dvDoc0 == doc) {
-                    k0 = dv0.nextValue();
-                    dvDoc0 = dv0.nextDoc();
-                  }
-                  long k1 = 0;
-                  if (dvDoc1 == doc) {
-                    k1 = dv1.nextValue();
-                    dvDoc1 = dv1.nextDoc();
-                  }
+                  long k0 = k0Vals[doc];
+                  long k1 = k1Vals[doc];
 
                   int gm = wCap - 1;
                   int gs = Long.hashCode(k0) & gm;
                   while (wOcc[gs] && wKeys[gs] != k0) gs = (gs + 1) & gm;
                   if (!wOcc[gs]) {
                     wKeys[gs] = k0;
-                    wSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+                    wSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
                     wAccs[gs] = new long[numAggsF];
                     wOcc[gs] = true;
                     wSize++;
@@ -2277,9 +2404,10 @@ public class TransportShardExecuteAction
 
         if (isMatchAll && dv0 != null && dv1 != null) {
           int maxDoc = reader.maxDoc();
-          int dvDoc0 = dv0.nextDoc();
-          int dvDoc1 = dv1.nextDoc();
-          // Advance all aggregate DV iterators
+          // Columnar loading for key columns only (not agg columns to save memory)
+          long[] k0Vals = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName0);
+          long[] k1Vals = FusedGroupByAggregate.loadNumericColumn(leafCtx, keyName1);
+          // Advance all aggregate DV iterators (keep per-doc for agg columns)
           int[] aggDvDocs = new int[numAggs];
           for (int i = 0; i < numAggs; i++) {
             if (aggDvs[i] != null) aggDvDocs[i] = aggDvs[i].nextDoc();
@@ -2287,23 +2415,15 @@ public class TransportShardExecuteAction
           }
 
           for (int doc = 0; doc < maxDoc; doc++) {
-            long k0 = 0;
-            if (dvDoc0 == doc) {
-              k0 = dv0.nextValue();
-              dvDoc0 = dv0.nextDoc();
-            }
-            long k1 = 0;
-            if (dvDoc1 == doc) {
-              k1 = dv1.nextValue();
-              dvDoc1 = dv1.nextDoc();
-            }
+            long k0 = k0Vals[doc];
+            long k1 = k1Vals[doc];
 
             int gm = grpCap - 1;
             int gs = Long.hashCode(k0) & gm;
             while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
             if (!grpOcc[gs]) {
               grpKeys[gs] = k0;
-              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
               grpAccs[gs] = new long[numAggs];
               grpOcc[gs] = true;
               grpSize++;
@@ -2371,7 +2491,7 @@ public class TransportShardExecuteAction
             while (grpOcc[gs] && grpKeys[gs] != k0) gs = (gs + 1) & gm;
             if (!grpOcc[gs]) {
               grpKeys[gs] = k0;
-              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(16);
+              grpSets[gs] = new org.opensearch.sql.dqe.operator.LongOpenHashSet(1024);
               grpAccs[gs] = new long[numAggs];
               grpOcc[gs] = true;
               grpSize++;

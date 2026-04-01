@@ -4306,50 +4306,178 @@ public final class FusedGroupByAggregate {
         for (long[] arr : segKeyArrays) totalDocs += arr.length;
 
         if (canParallelize && leaves.size() > 1 && totalDocs <= 200_000_000) {
-          // Parallel doc-range path: split docs across workers, merge results
+          // Hash-partitioned parallel path: each worker owns a hash partition of the key space
+          // and scans ALL docs, inserting only keys whose hash prefix matches its partition.
+          // Result: N smaller maps (each ~totalUnique/N entries, fits in L3), NO merge needed.
           int numWorkers = THREADS_PER_SHARD;
-          long docsPerWorker = Math.max(1, (totalDocs + numWorkers - 1) / numWorkers);
-          java.util.List<int[]> workUnits = new java.util.ArrayList<>();
-          for (int s = 0; s < leaves.size(); s++) {
-            int maxDoc = segKeyArrays[s].length;
-            if (maxDoc == 0) continue;
-            for (int start = 0; start < maxDoc; start += (int) docsPerWorker) {
-              int end = (int) Math.min(start + docsPerWorker, maxDoc);
-              workUnits.add(new int[]{s, start, end});
-            }
-          }
-          int actualWorkers = workUnits.size();
+          int numPartitions = Integer.highestOneBit(numWorkers); // round down to power of 2
+          int partMask = numPartitions - 1;
+          int partCapacity = (int) Math.min(totalDocs / numPartitions * 10 / 7 + 1, 8_000_000);
+
           @SuppressWarnings("unchecked")
           java.util.concurrent.CompletableFuture<FlatSingleKeyMap>[] futures =
-              new java.util.concurrent.CompletableFuture[actualWorkers];
-          for (int w = 0; w < actualWorkers; w++) {
-            final int[] unit = workUnits.get(w);
-            final long[] keyValues = segKeyArrays[unit[0]];
-            final Bits liveDocs = segLiveDocs[unit[0]];
-            final int startDoc = unit[1];
-            final int endDoc = unit[2];
-            futures[w] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-              int docCount = endDoc - startDoc;
-              int initCap = (int) Math.min((long) docCount * 10 / 7 + 1, 16_000_000);
-              FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, initCap);
-              scanDocRangeFlatSingleKeyCountStar(
-                  keyValues, startDoc, endDoc, liveDocs,
-                  localMap, accOffset[0], slotsPerGroup);
+              new java.util.concurrent.CompletableFuture[numPartitions];
+          for (int p = 0; p < numPartitions; p++) {
+            final int partId = p;
+            final int cap = partCapacity;
+            futures[p] = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              FlatSingleKeyMap localMap = new FlatSingleKeyMap(slotsPerGroup, cap);
+              for (int seg = 0; seg < segKeyArrays.length; seg++) {
+                scanDocRangePartitioned(
+                    segKeyArrays[seg], 0, segKeyArrays[seg].length,
+                    segLiveDocs[seg], localMap, accOffset[0], slotsPerGroup,
+                    partId, partMask);
+              }
               return localMap;
             }, PARALLEL_POOL);
           }
           java.util.concurrent.CompletableFuture.allOf(futures).join();
-          FlatSingleKeyMap[] workerMaps = new FlatSingleKeyMap[actualWorkers];
-          int largestIdx = 0;
-          for (int fi = 0; fi < actualWorkers; fi++) {
-            workerMaps[fi] = futures[fi].join();
-            if (workerMaps[fi].size > workerMaps[largestIdx].size) largestIdx = fi;
+
+          // No merge needed — partitions are disjoint by hash prefix.
+          FlatSingleKeyMap[] partMaps = new FlatSingleKeyMap[numPartitions];
+          int totalSize = 0;
+          for (int p = 0; p < numPartitions; p++) {
+            partMaps[p] = futures[p].join();
+            totalSize += partMaps[p].size;
           }
-          flatMap = workerMaps[largestIdx];
-          for (int fi = 0; fi < actualWorkers; fi++) {
-            if (fi != largestIdx && workerMaps[fi].size > 0) flatMap.mergeFrom(workerMaps[fi]);
-            workerMaps[fi] = null;
+
+          if (totalSize == 0) return List.of();
+
+          // Build output directly from partition maps (early return to avoid single-flatMap code)
+          int numGroupKeys = groupByKeys.size();
+          int totalColumns = numGroupKeys + numAggs;
+          int effectiveTopN = (topN > 0 && topN < totalSize) ? (int) topN : totalSize;
+
+          // Top-N heap selection across all partitions
+          int[] heapSlots = new int[effectiveTopN];
+          int[] heapParts = new int[effectiveTopN];
+          long[] heapVals = new long[effectiveTopN];
+          int heapSize = 0;
+          int sortAccOff = (sortAggIndex >= 0) ? accOffset[sortAggIndex] : accOffset[0];
+          boolean useHeap = sortAggIndex >= 0 && topN > 0 && topN < totalSize;
+
+          if (useHeap) {
+            for (int p = 0; p < numPartitions; p++) {
+              FlatSingleKeyMap pm = partMaps[p];
+              for (int s = 0; s < pm.capacity; s++) {
+                if (pm.keys[s] == FlatSingleKeyMap.EMPTY_KEY) continue;
+                long val = pm.accData[s * slotsPerGroup + sortAccOff];
+                if (heapSize < effectiveTopN) {
+                  heapSlots[heapSize] = s;
+                  heapParts[heapSize] = p;
+                  heapVals[heapSize] = val;
+                  heapSize++;
+                  // sift up
+                  int k = heapSize - 1;
+                  while (k > 0) {
+                    int parent = (k - 1) >>> 1;
+                    boolean swap = sortAscending
+                        ? (heapVals[k] > heapVals[parent])
+                        : (heapVals[k] < heapVals[parent]);
+                    if (swap) {
+                      int ts = heapSlots[parent]; heapSlots[parent] = heapSlots[k]; heapSlots[k] = ts;
+                      int tp = heapParts[parent]; heapParts[parent] = heapParts[k]; heapParts[k] = tp;
+                      long tv = heapVals[parent]; heapVals[parent] = heapVals[k]; heapVals[k] = tv;
+                      k = parent;
+                    } else break;
+                  }
+                } else {
+                  boolean better = sortAscending ? (val < heapVals[0]) : (val > heapVals[0]);
+                  if (better) {
+                    heapSlots[0] = s;
+                    heapParts[0] = p;
+                    heapVals[0] = val;
+                    // sift down
+                    int k = 0;
+                    while (true) {
+                      int left = 2 * k + 1;
+                      if (left >= heapSize) break;
+                      int right = left + 1;
+                      int target = left;
+                      if (right < heapSize) {
+                        boolean pickRight = sortAscending
+                            ? (heapVals[right] > heapVals[left])
+                            : (heapVals[right] < heapVals[left]);
+                        if (pickRight) target = right;
+                      }
+                      boolean swap = sortAscending
+                          ? (heapVals[target] > heapVals[k])
+                          : (heapVals[target] < heapVals[k]);
+                      if (swap) {
+                        int ts = heapSlots[k]; heapSlots[k] = heapSlots[target]; heapSlots[target] = ts;
+                        int tp = heapParts[k]; heapParts[k] = heapParts[target]; heapParts[target] = tp;
+                        long tv = heapVals[k]; heapVals[k] = heapVals[target]; heapVals[target] = tv;
+                        k = target;
+                      } else break;
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            // Collect all entries across partitions (no sort or topN <= totalSize)
+            heapSlots = new int[totalSize];
+            heapParts = new int[totalSize];
+            heapSize = 0;
+            for (int p = 0; p < numPartitions; p++) {
+              FlatSingleKeyMap pm = partMaps[p];
+              for (int s = 0; s < pm.capacity; s++) {
+                if (pm.keys[s] == FlatSingleKeyMap.EMPTY_KEY) continue;
+                heapSlots[heapSize] = s;
+                heapParts[heapSize] = p;
+                heapSize++;
+              }
+            }
           }
+
+          int outputCount = heapSize;
+          BlockBuilder[] builders = new BlockBuilder[totalColumns];
+          for (int i = 0; i < numGroupKeys; i++) {
+            Type keyType = (arithUnits[i] != null) ? BigintType.BIGINT : keyInfos.get(i).type;
+            builders[i] = keyType.createBlockBuilder(null, outputCount);
+          }
+          for (int i = 0; i < numAggs; i++) {
+            builders[numGroupKeys + i] =
+                resolveAggOutputType(specs.get(i), columnTypeMap).createBlockBuilder(null, outputCount);
+          }
+          for (int o = 0; o < outputCount; o++) {
+            FlatSingleKeyMap pm = partMaps[heapParts[o]];
+            int slot = heapSlots[o];
+            long sourceVal = pm.keys[slot];
+            // Write all group-by keys from the single source value
+            for (int k = 0; k < numGroupKeys; k++) {
+              long keyVal = sourceVal;
+              if (arithUnits[k] != null) {
+                keyVal = applyArith(sourceVal, arithUnits[k]);
+                BigintType.BIGINT.writeLong(builders[k], keyVal);
+              } else {
+                writeNumericKeyValue(builders[k], keyInfos.get(k), keyVal);
+              }
+            }
+            // Write aggregate results
+            int base = slot * slotsPerGroup;
+            for (int a = 0; a < numAggs; a++) {
+              int off = base + accOffset[a];
+              switch (accType[a]) {
+                case 0:
+                case 1:
+                  BigintType.BIGINT.writeLong(builders[numGroupKeys + a], pm.accData[off]);
+                  break;
+                case 2:
+                  long sum = pm.accData[off];
+                  long cnt = pm.accData[off + 1];
+                  if (cnt == 0) {
+                    builders[numGroupKeys + a].appendNull();
+                  } else {
+                    DoubleType.DOUBLE.writeDouble(builders[numGroupKeys + a], (double) sum / cnt);
+                  }
+                  break;
+              }
+            }
+          }
+          Block[] blocks = new Block[totalColumns];
+          for (int i = 0; i < totalColumns; i++) blocks[i] = builders[i].build();
+          return List.of(new Page(blocks));
         } else {
           // Sequential path
           flatMap = new FlatSingleKeyMap(slotsPerGroup, 8_000_000);
@@ -14768,6 +14896,33 @@ public final class FusedGroupByAggregate {
       lastKey = keyValues[transitionDocs[numTransitions - 1]];
       if (prefetchSink == Long.MIN_VALUE) System.nanoTime();
       doc = d;
+    }
+  }
+
+  /**
+   * Hash-partitioned scan: processes all docs but only inserts keys whose hash prefix matches
+   * the given partition. Used by the hash-partitioned parallel path to produce disjoint maps
+   * that require no merge step.
+   */
+  private static void scanDocRangePartitioned(
+      long[] keyValues, int startDoc, int endDoc, Bits liveDocs,
+      FlatSingleKeyMap flatMap, int accOffset0, int slotsPerGroup,
+      int partId, int partMask) {
+    if (liveDocs != null) {
+      for (int doc = startDoc; doc < endDoc; doc++) {
+        if (!liveDocs.get(doc)) continue;
+        long key = keyValues[doc];
+        if ((SingleKeyHashMap.hash1(key) & partMask) != partId) continue;
+        int slot = flatMap.findOrInsert(key);
+        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      }
+    } else {
+      for (int doc = startDoc; doc < endDoc; doc++) {
+        long key = keyValues[doc];
+        if ((SingleKeyHashMap.hash1(key) & partMask) != partId) continue;
+        int slot = flatMap.findOrInsert(key);
+        flatMap.accData[slot * slotsPerGroup + accOffset0]++;
+      }
     }
   }
 

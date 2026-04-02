@@ -1,122 +1,59 @@
-# Task: Execute Phase D Handover — DQE Optimization 25/43 → 43/43
+# DQE vs Elasticsearch — Q04 & Q05 HyperLogLog Optimization
 
-Execute the plan in `docs/handover/2026-03-24-phase-d-handover.md` to optimize the DQE (Direct Query Engine) for the ClickBench benchmark. The goal is to bring all 43 queries within 2x of ClickHouse-Parquet performance.
+## Problem
 
-## Current State
-- **Score:** 25/43 queries within 2x of ClickHouse-Parquet
-- **Branch:** `wukong`
-- **Correctness:** 33/43 pass on 1M dataset
-- **Hardware:** OpenSearch on m5.8xlarge (32 vCPU, 128GB RAM), 4 shards, ~100M docs
+Q04: `SELECT COUNT(DISTINCT UserID) FROM hits`
+- DQE: 1.448s (exact, LongOpenHashSet dedup across 4 shards)
+- ES: 0.287s (approximate, HyperLogLog++ with ~2% error)
+- Ratio: 5.05x — largest gap among actionable queries
 
-## Success Criteria
-1. **Primary:** ≥38/43 queries within 2x of CH-Parquet (stretch: 43/43)
-2. **No regressions:** Correctness must stay ≥33/43
-3. **No regressions:** Queries already within 2x must stay within 2x
-4. **Evidence:** Full benchmark run with comparison output after each optimization
+Q05: `SELECT COUNT(DISTINCT SearchPhrase) FROM hits WHERE SearchPhrase <> ''`
+- DQE: 0.694s (exact, ordinal-based FixedBitSet dedup)
+- ES: 0.517s (approximate, HyperLogLog++)
+- Ratio: 1.34x
 
-## Priority Order (from handover)
+## Root Cause
 
-### Step 1: COUNT(DISTINCT) Fusion (Q04, Q05, Q08, Q09, Q11, Q13 — 6 queries)
-Intercept the two-level Calcite plan at `TransportShardExecuteAction` dispatch level. Detect pattern: outer Aggregate(GROUP BY x, COUNT(*)) + inner Aggregate(GROUP BY x, y, COUNT(*)). Route to fused GROUP BY with per-group `LongOpenHashSet` accumulator. Key file: `TransportShardExecuteAction.java:280-360`.
-
-### Step 2: Parallelize executeSingleKeyNumericFlat (Q15 + similar)
-Q15 scans 100M rows sequentially. Split across parallel workers like `executeWithEval` already does.
-
-### Step 3: Hash-Partitioned Aggregation (Q16, Q18, Q32)
-Partition group-key space into buckets, process one bucket at a time, merge. Proven pattern from Q33/Q34.
-
-### Step 4: Borderline Queries (Q02, Q30, Q31, Q37)
-Small targeted optimizations. Q31 needs only 3ms improvement.
-
-### Step 5: Q28 REGEXP_REPLACE
-Cache compiled Pattern objects. Hoist regex computation before aggregation loop.
-
-### Step 6: Full-Table High-Cardinality VARCHAR (Q35, Q36, Q39)
-Hash-partitioned aggregation + parallel segment scanning.
-
-## Key Architecture
-Read the full handover doc at `docs/handover/2026-03-24-phase-d-handover.md` for:
-- Complete query status table with ratios
-- Code map and key source files
-- Known issues and pitfalls (query numbering, JIT warmup, plugin reload)
-- Build/test/benchmark commands
-
-## Build & Test Commands
-```bash
-# Compile DQE only (~5s)
-cd /home/ec2-user/oss/wukong && ./gradlew :dqe:compileJava
-
-# Full rebuild + restart + reinstall (~3 min)
-cd /home/ec2-user/oss/wukong/benchmarks/clickbench && bash run/run_all.sh reload-plugin
-
-# Correctness (1M dataset)
-bash run/run_all.sh correctness
-
-# Single query benchmark
-bash run/run_opensearch.sh --warmup 3 --num-tries 5 --query N --output-dir /tmp/qN_test
-
-# Full benchmark
-bash run/run_opensearch.sh --warmup 3 --num-tries 5 --output-dir /tmp/full_bench
-```
-
-## CRITICAL WARNINGS
-- Query numbering: run script is 1-based, JSON results are 0-based
-- Always benchmark on full 100M `hits` index, NOT 1M `hits_1m`
-- Always use `--warmup 3` for JIT compilation
-- Compare against CH-Parquet official baseline, NOT native MergeTree
-- Baseline file: `benchmarks/clickbench/results/performance/clickhouse_parquet_official/c6a.4xlarge.json`
-- Never run benchmarks and `reload-plugin` concurrently
+DQE computes exact COUNT(DISTINCT) by materializing all distinct values into hash sets (~64-96MB/shard for Q04). ES uses HyperLogLog++ (precision=14, ~16KB/shard sketch, O(1) memory, ~2% error). Shard merge is a register-wise max — O(16K) time, no raw value transfer.
 
 ## Approach
-Work one step at a time. After each optimization:
-1. Compile and verify no build errors
-2. Run correctness tests — must not regress below 33/43
-3. Benchmark affected queries
-4. Run full benchmark to check for regressions
-5. Git commit with descriptive message
 
----
+Add an HLL-based fast path for scalar COUNT(DISTINCT). OpenSearch's `HyperLogLogPlusPlus` is already on DQE's classpath via `compileOnly 'org.opensearch:opensearch'` — no new dependency needed. Keep the exact path as fallback.
 
-## Instructions
+## Success Criteria
 
-You are executing one iteration of a ralph loop.
+- [ ] Q04 DQE/ES ratio drops below 1.0x (target: <0.3s)
+- [ ] Q05 DQE/ES ratio drops below 1.0x (target: <0.5s)
+- [ ] Correctness gate passes (>= 36/43 — Q04/Q05 results may differ by ~2% from exact, which is expected since ES also returns approximate)
+- [ ] No regressions on other queries
+- [ ] DQE faster than ES: >= 32/43 (gain Q04 + Q05 from current 31/43)
 
-1. Read `.ralph/STATUS.md` for current state (if it exists)
-2. Read the tail of `.ralph/LOGS.md` for recent history (if it exists)
-3. Do the work described above
-4. When done with this iteration, update both files:
+## Detailed Plan
 
-### STATUS.md (overwrite entirely)
-Write current state with this structure:
+See: docs/plans/20260402_q04_hll_optimization.md
+
+## Key Implementation Notes
+
+1. `HyperLogLogPlusPlus` is in `org.opensearch.search.aggregations.metrics` — already on classpath
+2. It requires `BigArrays` — obtain from `SearchContext` or create via `BigArrays.NON_RECYCLING_INSTANCE`
+3. HLL instances MUST be closed (they allocate off-heap via BigArrays). Use try-with-resources or explicit close in finally blocks.
+4. For numeric: hash values with MurmurHash3 before feeding to HLL (check CardinalityAggregator.DirectCollector for the exact pattern)
+5. For VARCHAR: hash term bytes with MurmurHash3.hash128, cache ordinal→hash mapping
+6. The existing exact paths stay untouched as fallback.
+
+## Execution Path (Q04)
+
 ```
-status: WORKING | COMPLETE
-iteration: N
-
-## Current State
-[What's the situation right now]
-
-## Next Steps
-[What needs to happen next — omit if COMPLETE]
-
-## Evidence
-[Test results, benchmark numbers, build output — whatever proves progress]
-```
-
-Set `status: COMPLETE` only when ALL success criteria from the task are met with evidence.
-
-### LOGS.md (append a section)
-Append to the end:
-```
-## Iteration N — [date/time]
-
-### What I Did
-[Actions taken]
-
-### Results
-[Outcomes, test results, errors]
-
-### Decisions
-[Any architectural or approach decisions made and why]
+PlanFragmenter strips AggregationNode (SINGLE mode)
+→ shard receives bare TableScanNode(UserID)
+→ dispatch: isBareSingleNumericColumnScan → executeDistinctValuesScanWithRawSet
+→ FusedScanAggregate.collectDistinctValuesRaw (parallel 2-phase DocValues → LongOpenHashSet)
+→ coordinator: mergeCountDistinctValuesViaRawSets (union raw sets)
 ```
 
-5. Git commit with a descriptive message and push
+Target: replace shard collection with HLL sketch, replace coordinator merge with HLL sketch merge.
+
+## Execution Path (Q05)
+
+VARCHAR scalar COUNT(DISTINCT) with WHERE filter. Currently uses ordinal-based FixedBitSet dedup.
+Target: replace with HLL sketch collection + merge.

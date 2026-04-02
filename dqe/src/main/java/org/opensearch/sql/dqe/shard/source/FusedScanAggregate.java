@@ -42,6 +42,8 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.NumericUtils;
+import org.opensearch.common.hash.MurmurHash3;
+import org.opensearch.common.util.BitMixer;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.sql.dqe.planner.plan.AggregationNode;
@@ -1898,6 +1900,130 @@ public final class FusedScanAggregate {
   }
 
   /**
+   * Collect numeric values into an HLL++ sketch for approximate COUNT(DISTINCT).
+   * Caller owns the HLL lifecycle — this method does not close it.
+   */
+  public static void collectDistinctValuesHLL(
+      String columnName, IndexShard shard, Query query,
+      org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus hll) throws Exception {
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-hll")) {
+      if (query instanceof MatchAllDocsQuery) {
+        List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+        int numWorkers = Math.min(
+            Math.max(1, Runtime.getRuntime().availableProcessors()
+                / Integer.getInteger("dqe.numLocalShards", 4)), 4);
+        if (numWorkers > 1 && leaves.size() > 1) {
+          // Parallel: each worker processes a subset of segments with a thread-local HLL
+          org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus[] workerHlls =
+              new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus[numWorkers];
+          int chunkSize = (leaves.size() + numWorkers - 1) / numWorkers;
+          java.util.concurrent.CompletableFuture<?>[] futures =
+              new java.util.concurrent.CompletableFuture[numWorkers];
+          for (int w = 0; w < numWorkers; w++) {
+            final int startSeg = w * chunkSize;
+            final int endSeg = Math.min(startSeg + chunkSize, leaves.size());
+            final int wIdx = w;
+            if (startSeg >= endSeg) {
+              futures[w] = java.util.concurrent.CompletableFuture.completedFuture(null);
+              continue;
+            }
+            futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+              org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus localHll =
+                  new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus(
+                      14, org.opensearch.common.util.BigArrays.NON_RECYCLING_INSTANCE, 1);
+              try {
+                for (int s = startSeg; s < endSeg; s++) {
+                  LeafReader reader = leaves.get(s).reader();
+                  SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
+                  if (dv == null) continue;
+                  Bits liveDocs = reader.getLiveDocs();
+                  if (liveDocs == null) {
+                    int doc = dv.nextDoc();
+                    while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                      localHll.collect(0, BitMixer.mix64(dv.nextValue()));
+                      doc = dv.nextDoc();
+                    }
+                  } else {
+                    for (int doc = 0; doc < reader.maxDoc(); doc++) {
+                      if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                        localHll.collect(0, BitMixer.mix64(dv.nextValue()));
+                      }
+                    }
+                  }
+                }
+                workerHlls[wIdx] = localHll;
+              } catch (Exception e) {
+                localHll.close();
+                throw new RuntimeException(e);
+              }
+            }, FusedGroupByAggregate.getParallelPool());
+          }
+          try {
+            java.util.concurrent.CompletableFuture.allOf(futures).join();
+          } finally {
+            for (int i = 0; i < numWorkers; i++) {
+              if (workerHlls[i] != null) {
+                try {
+                  hll.merge(0, workerHlls[i], 0);
+                } finally {
+                  workerHlls[i].close();
+                }
+              }
+            }
+          }
+        } else {
+          // Single-threaded fallback
+          for (LeafReaderContext leafCtx : leaves) {
+            LeafReader reader = leafCtx.reader();
+            SortedNumericDocValues dv = reader.getSortedNumericDocValues(columnName);
+            if (dv == null) continue;
+            Bits liveDocs = reader.getLiveDocs();
+            if (liveDocs == null) {
+              int doc = dv.nextDoc();
+              while (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                hll.collect(0, BitMixer.mix64(dv.nextValue()));
+                doc = dv.nextDoc();
+              }
+            } else {
+              for (int doc = 0; doc < reader.maxDoc(); doc++) {
+                if (liveDocs.get(doc) && dv.advanceExact(doc)) {
+                  hll.collect(0, BitMixer.mix64(dv.nextValue()));
+                }
+              }
+            }
+          }
+        }
+      } else {
+        engineSearcher.search(
+            query,
+            new org.apache.lucene.search.Collector() {
+              @Override
+              public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                SortedNumericDocValues dv = context.reader().getSortedNumericDocValues(columnName);
+                return new LeafCollector() {
+                  @Override
+                  public void setScorer(org.apache.lucene.search.Scorable scorer) {}
+
+                  @Override
+                  public void collect(int doc) throws IOException {
+                    if (dv != null && dv.advanceExact(doc)) {
+                      hll.collect(0, BitMixer.mix64(dv.nextValue()));
+                    }
+                  }
+                };
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+      }
+    }
+  }
+
+  /**
    * Collect distinct varchar values as a LongOpenHashSet of hashes, avoiding string materialization.
    * Uses FNV-1a hash on raw BytesRef bytes. For MatchAll with no deletes: iterates global ordinals
    * (O(distinct_values)). For filtered queries: iterates matching docs via FixedBitSet.
@@ -2134,6 +2260,167 @@ public final class FusedScanAggregate {
       h *= 0x100000001b3L;
     }
     return h;
+  }
+
+  /**
+   * Collect varchar values into an HLL++ sketch for approximate COUNT(DISTINCT).
+   * Uses MurmurHash3 on raw BytesRef bytes. Caller owns the HLL lifecycle.
+   */
+  public static void collectDistinctVarcharHLL(
+      String columnName, IndexShard shard, Query query,
+      org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus hll) throws Exception {
+    try (org.opensearch.index.engine.Engine.Searcher engineSearcher =
+        shard.acquireSearcher("dqe-fused-distinct-varchar-hll")) {
+      List<LeafReaderContext> leaves = engineSearcher.getIndexReader().leaves();
+
+      // Optimization: "WHERE col <> ''" just means skip the empty-string ordinal
+      boolean isNotEmptyFilter = isNotEmptyVarcharFilter(query, columnName);
+
+      if (query instanceof MatchAllDocsQuery || isNotEmptyFilter) {
+        // Use global ordinal map with parallel workers — matches existing collectDistinctVarcharHashes pattern
+        OrdinalMap ordinalMap = FusedGroupByAggregate.buildGlobalOrdinalMap(leaves, columnName);
+        if (ordinalMap != null) {
+          long globalOrdCount = ordinalMap.getValueCount();
+          int numWorkers = Math.min(
+              Math.max(1, Runtime.getRuntime().availableProcessors()
+                  / Integer.getInteger("dqe.numLocalShards", 4)), 4);
+          if (numWorkers > 1 && globalOrdCount > 100_000) {
+            // Parallel: each worker hashes a chunk of global ordinals into a thread-local HLL
+            org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus[] workerHlls =
+                new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus[numWorkers];
+            long chunkSize = (globalOrdCount + numWorkers - 1) / numWorkers;
+            java.util.concurrent.CompletableFuture<?>[] futures =
+                new java.util.concurrent.CompletableFuture[numWorkers];
+            for (int w = 0; w < numWorkers; w++) {
+              final long start = (long) w * chunkSize;
+              final long end = Math.min(start + chunkSize, globalOrdCount);
+              final int wIdx = w;
+              final boolean skipEmpty = isNotEmptyFilter;
+              futures[w] = java.util.concurrent.CompletableFuture.runAsync(() -> {
+                org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus localHll =
+                    new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus(
+                        14, org.opensearch.common.util.BigArrays.NON_RECYCLING_INSTANCE, 1);
+                try {
+                  SortedSetDocValues[] localDvs = new SortedSetDocValues[leaves.size()];
+                  for (int i = 0; i < leaves.size(); i++) {
+                    localDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+                  }
+                  MurmurHash3.Hash128 hash128 = new MurmurHash3.Hash128();
+                  for (long g = start; g < end; g++) {
+                    int segIdx = ordinalMap.getFirstSegmentNumber(g);
+                    long segOrd = ordinalMap.getFirstSegmentOrd(g);
+                    BytesRef bytes = (localDvs[segIdx] != null)
+                        ? localDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+                    if (skipEmpty && bytes.length == 0) continue;
+                    MurmurHash3.hash128(bytes.bytes, bytes.offset, bytes.length, 0, hash128);
+                    localHll.collect(0, hash128.h1);
+                  }
+                  workerHlls[wIdx] = localHll;
+                } catch (Exception e) {
+                  localHll.close();
+                  throw new RuntimeException(e);
+                }
+              }, FusedGroupByAggregate.getParallelPool());
+            }
+            try {
+              java.util.concurrent.CompletableFuture.allOf(futures).join();
+            } finally {
+              // Merge worker HLLs into the main HLL (always close even on exception)
+              for (int i = 0; i < numWorkers; i++) {
+                if (workerHlls[i] != null) {
+                  try {
+                    hll.merge(0, workerHlls[i], 0);
+                  } finally {
+                    workerHlls[i].close();
+                  }
+                }
+              }
+            }
+          } else {
+            // Single-threaded global ordinal iteration
+            SortedSetDocValues[] segDvs = new SortedSetDocValues[leaves.size()];
+            for (int i = 0; i < leaves.size(); i++) {
+              segDvs[i] = leaves.get(i).reader().getSortedSetDocValues(columnName);
+            }
+            MurmurHash3.Hash128 hash128 = new MurmurHash3.Hash128();
+            for (long g = 0; g < globalOrdCount; g++) {
+              int segIdx = ordinalMap.getFirstSegmentNumber(g);
+              long segOrd = ordinalMap.getFirstSegmentOrd(g);
+              BytesRef term = (segDvs[segIdx] != null)
+                  ? segDvs[segIdx].lookupOrd(segOrd) : new BytesRef("");
+              if (isNotEmptyFilter && term.length == 0) continue;
+              MurmurHash3.hash128(term.bytes, term.offset, term.length, 0, hash128);
+              hll.collect(0, hash128.h1);
+            }
+          }
+        } else {
+          // Single segment fallback
+          for (LeafReaderContext leafCtx : leaves) {
+            SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+            if (dv == null) continue;
+            long valueCount = dv.getValueCount();
+            MurmurHash3.Hash128 hash128 = new MurmurHash3.Hash128();
+            for (long ord = 0; ord < valueCount; ord++) {
+              BytesRef term = dv.lookupOrd(ord);
+              if (isNotEmptyFilter && term.length == 0) continue;
+              MurmurHash3.hash128(term.bytes, term.offset, term.length, 0, hash128);
+              hll.collect(0, hash128.h1);
+            }
+          }
+        }
+      } else {
+        // Filtered: collect matching ordinals into a bitset per segment, then hash unique ordinals
+        for (LeafReaderContext leafCtx : leaves) {
+          SortedSetDocValues dv = leafCtx.reader().getSortedSetDocValues(columnName);
+          if (dv == null) continue;
+          long valueCount = dv.getValueCount();
+          if (valueCount == 0) continue;
+
+          // Guard: if ordinal space too large, hash on-the-fly per doc instead of bitset
+          if (valueCount > 10_000_000L) {
+            org.apache.lucene.search.IndexSearcher searcher = engineSearcher;
+            org.apache.lucene.search.Weight weight = searcher.createWeight(
+                searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+            org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+            if (scorer == null) continue;
+            MurmurHash3.Hash128 hash128 = new MurmurHash3.Hash128();
+            DocIdSetIterator disi = scorer.iterator();
+            int doc;
+            while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+              if (dv.advanceExact(doc)) {
+                BytesRef term = dv.lookupOrd(dv.nextOrd());
+                MurmurHash3.hash128(term.bytes, term.offset, term.length, 0, hash128);
+                hll.collect(0, hash128.h1);
+              }
+            }
+            continue;
+          }
+
+          org.apache.lucene.util.FixedBitSet seenOrdinals =
+              new org.apache.lucene.util.FixedBitSet((int) valueCount);
+          org.apache.lucene.search.IndexSearcher searcher = engineSearcher;
+          org.apache.lucene.search.Weight weight = searcher.createWeight(
+              searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+          org.apache.lucene.search.Scorer scorer = weight.scorer(leafCtx);
+          if (scorer == null) continue;
+          DocIdSetIterator disi = scorer.iterator();
+          int doc;
+          while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+            if (dv.advanceExact(doc)) {
+              seenOrdinals.set((int) dv.nextOrd());
+            }
+          }
+
+          MurmurHash3.Hash128 hash128 = new MurmurHash3.Hash128();
+          for (int ord = seenOrdinals.nextSetBit(0); ord != DocIdSetIterator.NO_MORE_DOCS;
+               ord = ord + 1 >= seenOrdinals.length() ? DocIdSetIterator.NO_MORE_DOCS : seenOrdinals.nextSetBit(ord + 1)) {
+            BytesRef term = dv.lookupOrd(ord);
+            MurmurHash3.hash128(term.bytes, term.offset, term.length, 0, hash128);
+            hll.collect(0, hash128.h1);
+          }
+        }
+      }
+    }
   }
 
   /**

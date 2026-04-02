@@ -64,6 +64,13 @@ public class ShardExecuteResponse extends ActionResponse {
    */
   @lombok.Setter private transient java.util.Set<String> scalarDistinctStrings;
 
+  /**
+   * Optional HyperLogLog++ sketch for scalar COUNT(DISTINCT) optimization.
+   * Carries the shard-local HLL sketch so the coordinator can merge sketches
+   * instead of unioning raw sets. Only populated for local execution.
+   */
+  @lombok.Setter private transient org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus scalarDistinctHll;
+
   public ShardExecuteResponse(List<Page> pages, List<Type> columnTypes) {
     this.pages = pages;
     this.columnTypes = columnTypes;

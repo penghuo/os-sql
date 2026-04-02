@@ -652,11 +652,23 @@ public class TransportTrinoSqlAction
           } else if (coordinatorPlan instanceof AggregationNode singleCdAgg
               && singleCdAgg.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctLong(singleCdAgg, columnTypeMap)) {
-            mergedPages = mergeCountDistinctValuesViaRawSets(successShardResults, shardPages);
+            boolean hasHll = false;
+            for (ShardExecuteResponse sr : successShardResults) {
+              if (sr.getScalarDistinctHll() != null) { hasHll = true; break; }
+            }
+            mergedPages = hasHll
+                ? mergeCountDistinctValuesViaHLL(successShardResults)
+                : mergeCountDistinctValuesViaRawSets(successShardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleCdVarcharAgg2
               && singleCdVarcharAgg2.getStep() == AggregationNode.Step.SINGLE
               && isScalarCountDistinctVarchar(singleCdVarcharAgg2, columnTypeMap)) {
-            mergedPages = mergeCountDistinctVarcharViaRawSets(successShardResults, shardPages);
+            boolean hasHll = false;
+            for (ShardExecuteResponse sr : successShardResults) {
+              if (sr.getScalarDistinctHll() != null) { hasHll = true; break; }
+            }
+            mergedPages = hasHll
+                ? mergeCountDistinctValuesViaHLL(successShardResults)
+                : mergeCountDistinctVarcharViaRawSets(successShardResults, shardPages);
           } else if (coordinatorPlan instanceof AggregationNode singleAgg
               && singleAgg.getStep() == AggregationNode.Step.SINGLE
               && isShardDedupCountDistinct(
@@ -2101,6 +2113,39 @@ public class TransportTrinoSqlAction
     io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
     BigintType.BIGINT.writeLong(builder, total);
     return List.of(new Page(builder.build()));
+  }
+
+  /**
+   * Merge scalar COUNT(DISTINCT) using HyperLogLog++ sketches from shards.
+   * Merges all shard HLL sketches into one, returns cardinality estimate.
+   * Closes all HLL instances (merged + shard) in finally block.
+   */
+  private static List<Page> mergeCountDistinctValuesViaHLL(
+      ShardExecuteResponse[] shardResults) {
+    org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus merged =
+        new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus(
+            14, org.opensearch.common.util.BigArrays.NON_RECYCLING_INSTANCE, 1);
+    try {
+      for (ShardExecuteResponse sr : shardResults) {
+        org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus shardHll =
+            sr.getScalarDistinctHll();
+        if (shardHll != null) {
+          merged.merge(0, shardHll, 0);
+        }
+      }
+      long count = merged.cardinality(0);
+      io.trino.spi.block.BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+      BigintType.BIGINT.writeLong(builder, count);
+      return List.of(new Page(builder.build()));
+    } finally {
+      merged.close();
+      for (ShardExecuteResponse sr : shardResults) {
+        if (sr.getScalarDistinctHll() != null) {
+          sr.getScalarDistinctHll().close();
+          sr.setScalarDistinctHll(null);
+        }
+      }
+    }
   }
 
   /**

@@ -267,7 +267,7 @@ public class TransportShardExecuteAction
     // values into a raw LongOpenHashSet and attaches it to the response, avoiding Page
     // construction overhead for millions of entries. The coordinator unions the raw sets.
     if (scanFactory == null && isBareSingleNumericColumnScan(plan)) {
-      ShardExecuteResponse resp = executeDistinctValuesScanWithRawSet(plan, req);
+      ShardExecuteResponse resp = executeDistinctValuesScanWithHLL(plan, req);
       return resp;
     }
 
@@ -275,7 +275,7 @@ public class TransportShardExecuteAction
     // Uses ordinal-based dedup via FixedBitSet for fast ordinal collection, then attaches the
     // raw string set to the response for direct coordinator merge.
     if (scanFactory == null && isBareSingleVarcharColumnScan(plan)) {
-      ShardExecuteResponse resp = executeDistinctValuesScanVarcharWithRawSet(plan, req);
+      ShardExecuteResponse resp = executeDistinctValuesScanVarcharWithHLL(plan, req);
       return resp;
     }
 
@@ -354,8 +354,9 @@ public class TransportShardExecuteAction
             }
           }
           if (allNumeric) {
+            long shardTopN = extractTopNFromPlan(plan);
             ShardExecuteResponse resp =
-                executeNKeyCountDistinctWithHashSets(aggDedupNode, req, keys, keyTypes);
+                executeNKeyCountDistinctWithHashSets(aggDedupNode, req, keys, keyTypes, shardTopN);
             return resp;
           }
           // Mixed-type path: last key (dedup) is numeric but some GROUP BY keys are VARCHAR.
@@ -374,9 +375,10 @@ public class TransportShardExecuteAction
               }
             }
             if (allResolved) {
+              long shardTopN = extractTopNFromPlan(plan);
               ShardExecuteResponse resp =
                   executeMixedTypeCountDistinctWithHashSets(
-                      aggDedupNode, req, keys, mixedKeyTypes);
+                      aggDedupNode, req, keys, mixedKeyTypes, shardTopN);
               return resp;
             }
           }
@@ -1397,7 +1399,8 @@ public class TransportShardExecuteAction
       AggregationNode aggNode,
       ShardExecuteRequest req,
       List<String> keyNames,
-      Type[] keyTypes)
+      Type[] keyTypes,
+      long topN)
       throws Exception {
     int numKeys = keyNames.size();
     int numGroupKeys = numKeys - 1; // first N-1 are GROUP BY keys, last is the dedup key
@@ -1491,6 +1494,28 @@ public class TransportShardExecuteAction
           }
         }
       }
+    }
+
+    // Shard-level top-N pruning: keep only top-K groups by distinct count
+    if (topN > 0 && finalSets.size() > topN * 200) {
+      int K = (int) Math.min(topN * 200, finalSets.size());
+      // Min-heap of (distinctCount, key) — keeps K largest
+      java.util.PriorityQueue<java.util.Map.Entry<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet>> heap =
+          new java.util.PriorityQueue<>(K, java.util.Comparator.comparingInt(e -> e.getValue().size()));
+      for (var entry : finalSets.entrySet()) {
+        if (heap.size() < K) {
+          heap.offer(entry);
+        } else if (entry.getValue().size() > heap.peek().getValue().size()) {
+          heap.poll();
+          heap.offer(entry);
+        }
+      }
+      java.util.HashMap<LongArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> pruned =
+          new java.util.HashMap<>(K * 2);
+      for (var entry : heap) {
+        pruned.put(entry.getKey(), entry.getValue());
+      }
+      finalSets = pruned;
     }
 
     // Build output pages: expand each (compositeKey, HashSet) into full dedup tuples.
@@ -1851,7 +1876,8 @@ public class TransportShardExecuteAction
       AggregationNode aggNode,
       ShardExecuteRequest req,
       List<String> keyNames,
-      Type[] keyTypes)
+      Type[] keyTypes,
+      long topN)
       throws Exception {
     int numKeys = keyNames.size();
     int numGroupKeys = numKeys - 1;
@@ -1948,6 +1974,27 @@ public class TransportShardExecuteAction
           }
         }
       }
+    }
+
+    // Shard-level top-N pruning: keep only top-K groups by distinct count
+    if (topN > 0 && finalSets.size() > topN * 200) {
+      int K = (int) Math.min(topN * 200, finalSets.size());
+      java.util.PriorityQueue<java.util.Map.Entry<ObjectArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet>> heap =
+          new java.util.PriorityQueue<>(K, java.util.Comparator.comparingInt(e -> e.getValue().size()));
+      for (var entry : finalSets.entrySet()) {
+        if (heap.size() < K) {
+          heap.offer(entry);
+        } else if (entry.getValue().size() > heap.peek().getValue().size()) {
+          heap.poll();
+          heap.offer(entry);
+        }
+      }
+      java.util.HashMap<ObjectArrayKey, org.opensearch.sql.dqe.operator.LongOpenHashSet> pruned =
+          new java.util.HashMap<>(K * 2);
+      for (var entry : heap) {
+        pruned.put(entry.getKey(), entry.getValue());
+      }
+      finalSets = pruned;
     }
 
     // Build output pages: expand each (compositeKey, HashSet) into full dedup tuples.
@@ -3664,6 +3711,74 @@ public class TransportShardExecuteAction
     ShardExecuteResponse resp =
         new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
     resp.setScalarDistinctSet(hashes);
+    return resp;
+  }
+
+  /**
+   * Execute a distinct-values scan for a single VARCHAR column using HyperLogLog++ sketch.
+   * Returns an approximate count and attaches the HLL sketch for coordinator merge.
+   */
+  private ShardExecuteResponse executeDistinctValuesScanVarcharWithHLL(
+      DqePlanNode plan, ShardExecuteRequest req) throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus hll =
+        new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus(
+            14, org.opensearch.common.util.BigArrays.NON_RECYCLING_INSTANCE, 1);
+    try {
+      FusedScanAggregate.collectDistinctVarcharHLL(columnName, shard, luceneQuery, hll);
+    } catch (Exception e) {
+      hll.close();
+      throw e;
+    }
+
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, hll.cardinality(0));
+    List<Type> columnTypes = List.of(BigintType.BIGINT);
+    ShardExecuteResponse resp =
+        new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
+    resp.setScalarDistinctHll(hll);
+    return resp;
+  }
+
+  /**
+   * Execute a distinct-values scan for a single numeric column using HyperLogLog++ sketch.
+   * Returns an approximate count and attaches the HLL sketch for coordinator merge.
+   */
+  private ShardExecuteResponse executeDistinctValuesScanWithHLL(
+      DqePlanNode plan, ShardExecuteRequest req) throws Exception {
+    TableScanNode scanNode = (TableScanNode) plan;
+    String indexName = scanNode.getIndexName();
+    String columnName = scanNode.getColumns().get(0);
+    CachedIndexMeta cachedMeta = getOrBuildIndexMeta(indexName);
+    IndexMetadata indexMeta = clusterService.state().metadata().index(indexName);
+    IndexShard shard = indicesService.indexService(indexMeta.getIndex()).getShard(req.getShardId());
+    Query luceneQuery =
+        compileOrCacheLuceneQuery(scanNode.getDslFilter(), cachedMeta.fieldTypeMap());
+
+    org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus hll =
+        new org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus(
+            14, org.opensearch.common.util.BigArrays.NON_RECYCLING_INSTANCE, 1);
+    try {
+      FusedScanAggregate.collectDistinctValuesHLL(columnName, shard, luceneQuery, hll);
+    } catch (Exception e) {
+      hll.close();
+      throw e;
+    }
+
+    BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, 1);
+    BigintType.BIGINT.writeLong(builder, hll.cardinality(0));
+    List<Type> columnTypes = List.of(BigintType.BIGINT);
+    ShardExecuteResponse resp =
+        new ShardExecuteResponse(List.of(new Page(builder.build())), columnTypes);
+    resp.setScalarDistinctHll(hll);
     return resp;
   }
 

@@ -66,6 +66,9 @@ import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
+import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.SpanCreationContext;
+import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -220,11 +223,36 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel, tracer)) {
             ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
             long execTime = System.nanoTime();
-            ResultSet result = statement.executeQuery();
-            QueryResponse response =
-                buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit());
-            metric.add(System.nanoTime() - execTime);
-            listener.onResponse(response);
+
+            // Execute span
+            ResultSet result;
+            Span executeSpan =
+                tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.execute"));
+            try (SpanScope scope = tracer.withSpanInScope(executeSpan)) {
+              result = statement.executeQuery();
+            } catch (Exception e) {
+              executeSpan.setError(e);
+              throw e;
+            } finally {
+              executeSpan.endSpan();
+            }
+
+            // Materialize span
+            Span materializeSpan =
+                tracer.startSpan(
+                    SpanCreationContext.internal().name("opensearch.query.materialize"));
+            try (SpanScope scope = tracer.withSpanInScope(materializeSpan)) {
+              QueryResponse response =
+                  buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit());
+              metric.add(System.nanoTime() - execTime);
+              listener.onResponse(response);
+            } catch (Exception e) {
+              materializeSpan.setError(e);
+              throw e;
+            } finally {
+              materializeSpan.endSpan();
+            }
+
           } catch (Throwable t) {
             if (t instanceof VirtualMachineError) {
               throw (VirtualMachineError) t;

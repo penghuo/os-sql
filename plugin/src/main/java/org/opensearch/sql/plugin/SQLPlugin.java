@@ -16,6 +16,7 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -256,6 +257,11 @@ public class SQLPlugin extends Plugin
             TransportWriteDirectQueryResourcesRequestAction.class));
   }
 
+  /**
+   * Called by OpenSearch when telemetry feature flag is enabled. Stores the Tracer for use by
+   * components created in the base createComponents(). Returns empty — all components are created
+   * by Plugin.createComponents() which OpenSearch calls separately.
+   */
   @Override
   public Collection<Object> createComponents(
       Client client,
@@ -272,18 +278,7 @@ public class SQLPlugin extends Plugin
       Tracer tracer,
       MetricsRegistry metricsRegistry) {
     this.tracer = tracer;
-    return createComponents(
-        client,
-        clusterService,
-        threadPool,
-        resourceWatcherService,
-        scriptService,
-        contentRegistry,
-        environment,
-        nodeEnvironment,
-        namedWriteableRegistry,
-        indexNameResolver,
-        repositoriesServiceSupplier);
+    return Collections.emptyList();
   }
 
   @Override

@@ -130,13 +130,16 @@ public class OpenSearchPluginModule extends AbstractModule {
   /** {@link QueryPlanFactory}. */
   @Provides
   public QueryPlanFactory queryPlanFactory(
-      DataSourceService dataSourceService, ExecutionEngine executionEngine, Settings settings) {
+      DataSourceService dataSourceService,
+      ExecutionEngine executionEngine,
+      Settings settings,
+      Tracer tracer) {
     Analyzer analyzer =
         new Analyzer(
             new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
     Planner planner = new Planner(LogicalPlanOptimizer.create());
     QueryService queryService =
-        new QueryService(analyzer, executionEngine, planner, dataSourceService, settings);
+        new QueryService(analyzer, executionEngine, planner, dataSourceService, settings, tracer);
     return new QueryPlanFactory(queryService);
   }
 }

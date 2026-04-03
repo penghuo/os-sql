@@ -28,6 +28,7 @@ import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.QueryId;
 import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.QueryType;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
@@ -104,7 +105,7 @@ class QueryPlanTest {
             queryType,
             mock(UnresolvedPlan.class),
             10,
-            new QueryService(null, new DefaultExecutionEngine(), null),
+            new QueryService(null, new DefaultExecutionEngine(), null, NoopTracer.INSTANCE),
             listener);
     plan.execute();
   }

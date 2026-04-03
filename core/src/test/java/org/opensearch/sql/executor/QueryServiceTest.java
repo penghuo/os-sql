@@ -31,6 +31,7 @@ import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.split.Split;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 @ExtendWith(MockitoExtension.class)
 class QueryServiceTest {
@@ -116,7 +117,8 @@ class QueryServiceTest {
     lenient().when(settings.getSettingValue(Key.CALCITE_ENGINE_ENABLED)).thenReturn(false);
     lenient().when(analyzer.analyze(any(), any())).thenThrow(v2Exception);
 
-    QueryService service = new QueryService(analyzer, executionEngine, planner, null, settings);
+    QueryService service =
+        new QueryService(analyzer, executionEngine, planner, null, settings, NoopTracer.INSTANCE);
     service.executeWithLegacy(ast, queryType, responseListener, Optional.of(calciteException));
   }
 
@@ -145,7 +147,8 @@ class QueryServiceTest {
     lenient().when(settings.getSettingValue(Key.CALCITE_ENGINE_ENABLED)).thenReturn(false);
     lenient().when(analyzer.analyze(any(), any())).thenThrow(v2Exception);
 
-    QueryService service = new QueryService(analyzer, executionEngine, planner, null, settings);
+    QueryService service =
+        new QueryService(analyzer, executionEngine, planner, null, settings, NoopTracer.INSTANCE);
     service.explainWithLegacy(
         ast, queryType, responseListener, ExplainMode.STANDARD, Optional.of(calciteException));
   }
@@ -175,7 +178,8 @@ class QueryServiceTest {
     lenient().when(settings.getSettingValue(Key.CALCITE_ENGINE_ENABLED)).thenReturn(false);
     lenient().when(analyzer.analyze(any(), any())).thenThrow(v2Exception);
 
-    QueryService service = new QueryService(analyzer, executionEngine, planner, null, settings);
+    QueryService service =
+        new QueryService(analyzer, executionEngine, planner, null, settings, NoopTracer.INSTANCE);
     service.executeWithLegacy(ast, queryType, responseListener, Optional.of(calciteError));
   }
 
@@ -204,7 +208,8 @@ class QueryServiceTest {
     lenient().when(settings.getSettingValue(Key.CALCITE_ENGINE_ENABLED)).thenReturn(false);
     lenient().when(analyzer.analyze(any(), any())).thenThrow(v2Exception);
 
-    QueryService service = new QueryService(analyzer, executionEngine, planner, null, settings);
+    QueryService service =
+        new QueryService(analyzer, executionEngine, planner, null, settings, NoopTracer.INSTANCE);
     service.explainWithLegacy(
         ast, queryType, responseListener, ExplainMode.STANDARD, Optional.of(calciteError));
   }
@@ -224,7 +229,8 @@ class QueryServiceTest {
       lenient().when(settings.getSettingValue(Key.QUERY_BUCKET_SIZE)).thenReturn(1000);
       lenient().when(settings.getSettingValue(Key.CALCITE_ENGINE_ENABLED)).thenReturn(false);
 
-      queryService = new QueryService(analyzer, executionEngine, planner, null, settings);
+      queryService =
+          new QueryService(analyzer, executionEngine, planner, null, settings, NoopTracer.INSTANCE);
     }
 
     Helper executeSuccess() {

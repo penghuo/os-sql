@@ -69,11 +69,13 @@ dependencies {
     annotationProcessor('org.immutables:value:2.8.8')
     compileOnly 'org.immutables:value-annotations:2.8.8'
     compileOnlyApi 'com.google.code.findbugs:jsr305:3.0.2'
+    compileOnly group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"
     testImplementation group: 'org.mockito', name: 'mockito-core', version: "${mockito_version}"
     testImplementation group: 'org.mockito', name: 'mockito-junit-jupiter', version: "${mockito_version}"
+    testImplementation group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
 }
 
 spotless {

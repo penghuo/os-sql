@@ -50,6 +50,10 @@ import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.logical.LogicalPaginate;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
+import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.SpanCreationContext;
+import org.opensearch.telemetry.tracing.SpanScope;
+import org.opensearch.telemetry.tracing.Tracer;
 
 /** The low level interface of core engine. */
 @RequiredArgsConstructor
@@ -61,6 +65,7 @@ public class QueryService {
   private final Planner planner;
   private DataSourceService dataSourceService;
   private Settings settings;
+  private final Tracer tracer;
 
   @Getter(lazy = true)
   private final CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor(dataSourceService);
@@ -139,13 +144,26 @@ public class QueryService {
                 QueryProfiling.activate(QueryContext.isProfileEnabled());
             ProfileMetric analyzeMetric = profileContext.getOrCreateMetric(MetricName.ANALYZE);
             long analyzeStart = System.nanoTime();
-            CalcitePlanContext context =
-                CalcitePlanContext.create(
-                    buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
-            context.setHighlightConfig(highlightConfig);
-            RelNode relNode = analyze(plan, context);
-            RelNode calcitePlan = convertToCalcitePlan(relNode, context);
-            analyzeMetric.set(System.nanoTime() - analyzeStart);
+
+            CalcitePlanContext context;
+            RelNode calcitePlan;
+
+            Span analyzeSpan =
+                tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.analyze"));
+            try (SpanScope scope = tracer.withSpanInScope(analyzeSpan)) {
+              context =
+                  CalcitePlanContext.create(
+                      buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
+              context.setHighlightConfig(highlightConfig);
+              RelNode relNode = analyze(plan, context);
+              calcitePlan = convertToCalcitePlan(relNode, context);
+              analyzeMetric.set(System.nanoTime() - analyzeStart);
+            } catch (Exception e) {
+              analyzeSpan.setError(e);
+              throw e;
+            } finally {
+              analyzeSpan.endSpan();
+            }
             executionEngine.execute(calcitePlan, context, listener);
           } catch (Throwable t) {
             if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {
@@ -173,13 +191,23 @@ public class QueryService {
                 CalcitePlanContext.create(
                     buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
             context.setHighlightConfig(highlightConfig);
-            context.run(
-                () -> {
-                  RelNode relNode = analyze(plan, context);
-                  RelNode calcitePlan = convertToCalcitePlan(relNode, context);
-                  executionEngine.explain(calcitePlan, mode, context, listener);
-                },
-                settings);
+
+            Span analyzeSpan =
+                tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.analyze"));
+            try (SpanScope scope = tracer.withSpanInScope(analyzeSpan)) {
+              context.run(
+                  () -> {
+                    RelNode relNode = analyze(plan, context);
+                    RelNode calcitePlan = convertToCalcitePlan(relNode, context);
+                    executionEngine.explain(calcitePlan, mode, context, listener);
+                  },
+                  settings);
+            } catch (Exception e) {
+              analyzeSpan.setError(e);
+              throw e;
+            } finally {
+              analyzeSpan.endSpan();
+            }
           } catch (Throwable t) {
             if (isCalciteFallbackAllowed(t)) {
               log.warn("Fallback to V2 query engine since got exception", t);

@@ -12,6 +12,7 @@ import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.
 
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilters;
@@ -47,7 +48,11 @@ import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
 import org.opensearch.sql.protocol.response.format.YamlResponseFormatter;
 import org.opensearch.tasks.Task;
+import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.SpanCreationContext;
+import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.attributes.Attributes;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -56,6 +61,8 @@ public class TransportPPLQueryAction
     extends HandledTransportAction<ActionRequest, TransportPPLQueryResponse> {
 
   private final Injector injector;
+
+  private final Tracer tracer;
 
   private final Supplier<Boolean> pplEnabled;
 
@@ -82,6 +89,7 @@ public class TransportPPLQueryAction
           b.bind(DataSourceService.class).toInstance(dataSourceService);
         });
     this.injector = Guice.createInjector(modules);
+    this.tracer = tracer;
     this.pplEnabled =
         () ->
             MULTI_ALLOW_EXPLICIT_INDEX.get(clusterSettings)
@@ -122,20 +130,80 @@ public class TransportPPLQueryAction
 
     QueryContext.addRequestId();
 
-    PPLService pplService = injector.getInstance(PPLService.class);
     // in order to use PPL service, we need to convert TransportPPLQueryRequest to PPLQueryRequest
     PPLQueryRequest transformedRequest = transportRequest.toPPLQueryRequest();
     QueryContext.setProfile(transformedRequest.profile());
-    ActionListener<TransportPPLQueryResponse> clearingListener = wrapWithProfilingClear(listener);
 
-    if (transformedRequest.isExplainRequest()) {
-      pplService.explain(
-          transformedRequest, createExplainResponseListener(transformedRequest, clearingListener));
-    } else {
-      pplService.execute(
-          transformedRequest,
-          createListener(transformedRequest, clearingListener),
-          createExplainResponseListener(transformedRequest, clearingListener));
+    // Start root span with OTel DB semantic convention attributes
+    Span rootSpan =
+        tracer.startSpan(
+            SpanCreationContext.client()
+                .name("opensearch.query")
+                .attributes(
+                    Attributes.create()
+                        .addAttribute("db.system.name", "opensearch")
+                        .addAttribute("db.query.type", "ppl")
+                        .addAttribute("db.query.id", QueryContext.getRequestId())
+                        .addAttribute(
+                            "db.operation.name",
+                            transformedRequest.isExplainRequest() ? "EXPLAIN" : "EXECUTE")));
+
+    // Put span in scope so ThreadContext propagation captures it
+    SpanScope spanScope = tracer.withSpanInScope(rootSpan);
+
+    try {
+      // Wrap listener: Span ends in async callback, not on this thread
+      ActionListener<TransportPPLQueryResponse> tracedListener =
+          new ActionListener<>() {
+            private final AtomicBoolean ended = new AtomicBoolean(false);
+
+            @Override
+            public void onResponse(TransportPPLQueryResponse response) {
+              try {
+                listener.onResponse(response);
+              } finally {
+                endSpan();
+              }
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+              try {
+                rootSpan.setError(e);
+                listener.onFailure(e);
+              } finally {
+                endSpan();
+              }
+            }
+
+            private void endSpan() {
+              if (ended.compareAndSet(false, true)) {
+                rootSpan.endSpan();
+              }
+            }
+          };
+
+      ActionListener<TransportPPLQueryResponse> clearingListener =
+          wrapWithProfilingClear(tracedListener);
+
+      PPLService pplService = injector.getInstance(PPLService.class);
+      if (transformedRequest.isExplainRequest()) {
+        pplService.explain(
+            transformedRequest,
+            createExplainResponseListener(transformedRequest, clearingListener));
+      } else {
+        pplService.execute(
+            transformedRequest,
+            createListener(transformedRequest, clearingListener),
+            createExplainResponseListener(transformedRequest, clearingListener));
+      }
+    } catch (Exception e) {
+      rootSpan.setError(e);
+      rootSpan.endSpan();
+      listener.onFailure(e);
+    } finally {
+      // Close scope on transport thread — span context already captured
+      spanScope.close();
     }
   }
 

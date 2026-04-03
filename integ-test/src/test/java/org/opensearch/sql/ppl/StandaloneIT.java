@@ -63,6 +63,7 @@ import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.DataSourceFactory;
 import org.opensearch.sql.storage.StorageEngine;
 import org.opensearch.sql.util.ExecuteOnCallerThreadQueryManager;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 /**
  * Run PPL with query engine outside OpenSearch cluster. This IT doesn't require our plugin
@@ -218,7 +219,7 @@ public class StandaloneIT extends PPLIntegTestCase {
     @Provides
     public ExecutionEngine executionEngine(
         OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-      return new OpenSearchExecutionEngine(client, protector, planSerializer);
+      return new OpenSearchExecutionEngine(client, protector, planSerializer, NoopTracer.INSTANCE);
     }
 
     @Provides
@@ -239,7 +240,8 @@ public class StandaloneIT extends PPLIntegTestCase {
 
     @Provides
     public PPLService pplService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
-      return new PPLService(new PPLSyntaxParser(), queryManager, queryPlanFactory, settings);
+      return new PPLService(
+          new PPLSyntaxParser(), queryManager, queryPlanFactory, settings, NoopTracer.INSTANCE);
     }
 
     @Provides
@@ -258,7 +260,8 @@ public class StandaloneIT extends PPLIntegTestCase {
           new Analyzer(
               new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
       Planner planner = new Planner(LogicalPlanOptimizer.create());
-      QueryService queryService = new QueryService(analyzer, executionEngine, planner);
+      QueryService queryService =
+          new QueryService(analyzer, executionEngine, planner, NoopTracer.INSTANCE);
       return new QueryPlanFactory(queryService);
     }
   }

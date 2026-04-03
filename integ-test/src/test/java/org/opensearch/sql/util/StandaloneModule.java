@@ -35,6 +35,7 @@ import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.sql.SQLService;
 import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.StorageEngine;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 /**
  * A utility class which registers SQL engine singletons as `OpenSearchPluginModule` does. It is
@@ -68,7 +69,7 @@ public class StandaloneModule extends AbstractModule {
   @Provides
   public ExecutionEngine executionEngine(
       OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-    return new OpenSearchExecutionEngine(client, protector, planSerializer);
+    return new OpenSearchExecutionEngine(client, protector, planSerializer, NoopTracer.INSTANCE);
   }
 
   @Provides
@@ -89,7 +90,8 @@ public class StandaloneModule extends AbstractModule {
 
   @Provides
   public PPLService pplService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
-    return new PPLService(new PPLSyntaxParser(), queryManager, queryPlanFactory, settings);
+    return new PPLService(
+        new PPLSyntaxParser(), queryManager, queryPlanFactory, settings, NoopTracer.INSTANCE);
   }
 
   @Provides
@@ -114,6 +116,6 @@ public class StandaloneModule extends AbstractModule {
         new Analyzer(
             new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
     Planner planner = new Planner(LogicalPlanOptimizer.create());
-    return new QueryService(analyzer, executionEngine, planner);
+    return new QueryService(analyzer, executionEngine, planner, NoopTracer.INSTANCE);
   }
 }

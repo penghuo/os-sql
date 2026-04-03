@@ -69,6 +69,7 @@ import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.DataSourceFactory;
 import org.opensearch.sql.storage.StorageEngine;
 import org.opensearch.sql.util.ExecuteOnCallerThreadQueryManager;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 /**
  * This abstract test case provide a standalone env to run PPL query, IT extends this class could
@@ -312,7 +313,7 @@ public abstract class CalcitePPLIntegTestCase extends PPLIntegTestCase {
     @Provides
     public ExecutionEngine executionEngine(
         OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
-      return new OpenSearchExecutionEngine(client, protector, planSerializer);
+      return new OpenSearchExecutionEngine(client, protector, planSerializer, NoopTracer.INSTANCE);
     }
 
     @Provides
@@ -333,7 +334,8 @@ public abstract class CalcitePPLIntegTestCase extends PPLIntegTestCase {
 
     @Provides
     public PPLService pplService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
-      return new PPLService(new PPLSyntaxParser(), queryManager, queryPlanFactory, settings);
+      return new PPLService(
+          new PPLSyntaxParser(), queryManager, queryPlanFactory, settings, NoopTracer.INSTANCE);
     }
 
     @Provides
@@ -353,7 +355,8 @@ public abstract class CalcitePPLIntegTestCase extends PPLIntegTestCase {
               new ExpressionAnalyzer(functionRepository), dataSourceService, functionRepository);
       Planner planner = new Planner(LogicalPlanOptimizer.create());
       QueryService queryService =
-          new QueryService(analyzer, executionEngine, planner, dataSourceService, settings);
+          new QueryService(
+              analyzer, executionEngine, planner, dataSourceService, settings, NoopTracer.INSTANCE);
       return new QueryPlanFactory(queryService);
     }
   }

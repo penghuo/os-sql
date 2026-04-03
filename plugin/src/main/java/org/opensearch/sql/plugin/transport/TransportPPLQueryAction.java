@@ -47,6 +47,7 @@ import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
 import org.opensearch.sql.protocol.response.format.YamlResponseFormatter;
+import org.opensearch.sql.utils.QuerySummaryExtractor;
 import org.opensearch.tasks.Task;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanCreationContext;
@@ -66,6 +67,10 @@ public class TransportPPLQueryAction
 
   private final Supplier<Boolean> pplEnabled;
 
+  private final ClusterService clusterService;
+
+  private final TransportService transportService;
+
   /** Constructor of TransportPPLQueryAction. */
   @Inject
   public TransportPPLQueryAction(
@@ -78,6 +83,9 @@ public class TransportPPLQueryAction
       EngineExtensionsHolder extensionsHolder,
       Tracer tracer) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
+
+    this.clusterService = clusterService;
+    this.transportService = transportService;
 
     ModulesBuilder modules = new ModulesBuilder();
     modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
@@ -146,7 +154,18 @@ public class TransportPPLQueryAction
                         .addAttribute("db.query.id", QueryContext.getRequestId())
                         .addAttribute(
                             "db.operation.name",
-                            transformedRequest.isExplainRequest() ? "EXPLAIN" : "EXECUTE")));
+                            transformedRequest.isExplainRequest() ? "EXPLAIN" : "EXECUTE")
+                        .addAttribute("db.query.text", transformedRequest.getRequest())
+                        .addAttribute(
+                            "db.query.summary",
+                            QuerySummaryExtractor.extractPPLSummary(
+                                transformedRequest.getRequest()))
+                        .addAttribute("db.namespace", clusterService.getClusterName().value())
+                        .addAttribute(
+                            "server.address", transportService.getLocalNode().getHostAddress())
+                        .addAttribute(
+                            "server.port",
+                            transportService.getLocalNode().getAddress().getPort())));
 
     // Put span in scope so ThreadContext propagation captures it
     SpanScope spanScope = tracer.withSpanInScope(rootSpan);

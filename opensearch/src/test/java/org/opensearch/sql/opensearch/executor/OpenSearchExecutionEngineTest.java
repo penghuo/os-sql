@@ -54,6 +54,7 @@ import org.opensearch.sql.planner.SerializablePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
 import org.opensearch.sql.storage.split.Split;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
@@ -91,7 +92,8 @@ class OpenSearchExecutionEngineTest {
     when(protector.protect(plan)).thenReturn(plan);
 
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     List<ExprValue> actual = new ArrayList<>();
     executor.execute(
         plan,
@@ -121,7 +123,8 @@ class OpenSearchExecutionEngineTest {
     when(protector.protect(plan)).thenReturn(plan);
 
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     List<ExprValue> actual = new ArrayList<>();
     executor.execute(
         plan,
@@ -149,7 +152,8 @@ class OpenSearchExecutionEngineTest {
     when(protector.protect(plan)).thenReturn(plan);
 
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     AtomicReference<Exception> actual = new AtomicReference<>();
     executor.execute(
         plan,
@@ -171,7 +175,8 @@ class OpenSearchExecutionEngineTest {
   @Test
   void explain_successfully() {
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     Settings settings = mock(Settings.class);
     when(settings.getSettingValue(SQL_CURSOR_KEEP_ALIVE)).thenReturn(TimeValue.timeValueMinutes(1));
 
@@ -206,7 +211,8 @@ class OpenSearchExecutionEngineTest {
   @Test
   void explain_with_failure() {
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     PhysicalPlan plan = mock(PhysicalPlan.class);
     when(plan.accept(any(), any())).thenThrow(IllegalStateException.class);
 
@@ -239,7 +245,8 @@ class OpenSearchExecutionEngineTest {
     when(executionContext.getQuerySizeLimit()).thenReturn(null);
 
     OpenSearchExecutionEngine executor =
-        new OpenSearchExecutionEngine(client, protector, new PlanSerializer(null));
+        new OpenSearchExecutionEngine(
+            client, protector, new PlanSerializer(null), NoopTracer.INSTANCE);
     List<ExprValue> actual = new ArrayList<>();
     executor.execute(
         plan,

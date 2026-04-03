@@ -77,9 +77,12 @@ public class OpenSearchPluginModule extends AbstractModule {
   @Provides
   @Singleton
   public ExecutionEngine executionEngine(
-      OpenSearchClient client, ExecutionProtector protector, PlanSerializer planSerializer) {
+      OpenSearchClient client,
+      ExecutionProtector protector,
+      PlanSerializer planSerializer,
+      Tracer tracer) {
     ExecutionEngine defaultEngine =
-        new OpenSearchExecutionEngine(client, protector, planSerializer);
+        new OpenSearchExecutionEngine(client, protector, planSerializer, tracer);
     if (executionEngineExtensions.isEmpty()) {
       return defaultEngine;
     }

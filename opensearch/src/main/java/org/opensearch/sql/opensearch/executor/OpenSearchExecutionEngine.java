@@ -66,6 +66,7 @@ import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch execution engine implementation. */
@@ -76,14 +77,17 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
 
   private final ExecutionProtector executionProtector;
   private final PlanSerializer planSerializer;
+  private final Tracer tracer;
 
   public OpenSearchExecutionEngine(
       OpenSearchClient client,
       ExecutionProtector executionProtector,
-      PlanSerializer planSerializer) {
+      PlanSerializer planSerializer,
+      Tracer tracer) {
     this.client = client;
     this.executionProtector = executionProtector;
     this.planSerializer = planSerializer;
+    this.tracer = tracer;
     registerOpenSearchFunctions();
   }
 
@@ -194,7 +198,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                   CalcitePlanContext.skipEncoding.set(true);
                 }
                 // triggers the hook
-                OpenSearchRelRunners.run(context, rel);
+                OpenSearchRelRunners.run(context, rel, tracer);
               }
               listener.onResponse(
                   new ExplainResponse(
@@ -213,7 +217,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
-          try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+          try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel, tracer)) {
             ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
             long execTime = System.nanoTime();
             ResultSet result = statement.executeQuery();

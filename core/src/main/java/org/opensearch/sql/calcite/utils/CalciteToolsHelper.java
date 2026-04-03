@@ -108,6 +108,10 @@ import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.monitor.profile.ProfileContext;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
+import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.SpanCreationContext;
+import org.opensearch.telemetry.tracing.SpanScope;
+import org.opensearch.telemetry.tracing.Tracer;
 
 /**
  * Calcite Tools Helper. This class is used to create customized: 1. Connection 2. JavaTypeFactory
@@ -402,33 +406,50 @@ public class CalciteToolsHelper {
      * Runs a relational expression by existing connection. This class copied from {@link
      * org.apache.calcite.tools.RelRunners#run(RelNode)}
      */
-    public static PreparedStatement run(CalcitePlanContext context, RelNode rel) {
+    public static PreparedStatement run(CalcitePlanContext context, RelNode rel, Tracer tracer) {
       ProfileMetric optimizeTime = QueryProfiling.current().getOrCreateMetric(OPTIMIZE);
       long startTime = System.nanoTime();
-      // Optimize the plan by Calcite's HepPlanner before using VolcanoPlanner in prepareStatement.
-      rel = CalciteToolsHelper.optimize(rel, context);
-      final RelShuttle shuttle =
-          new RelHomogeneousShuttle() {
-            @Override
-            public RelNode visit(TableScan scan) {
-              final RelOptTable table = scan.getTable();
-              if (scan instanceof LogicalTableScan
-                  && Bindables.BindableTableScan.canHandle(table)) {
-                // Always replace the LogicalTableScan with BindableTableScan
-                // because it's implementation does not require a "schema" as context.
-                return Bindables.BindableTableScan.create(scan.getCluster(), table);
+
+      // Optimize span
+      Span optimizeSpan =
+          tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.optimize"));
+      try (SpanScope scope = tracer.withSpanInScope(optimizeSpan)) {
+        // Optimize the plan by Calcite's HepPlanner before using VolcanoPlanner in
+        // prepareStatement.
+        rel = CalciteToolsHelper.optimize(rel, context);
+        final RelShuttle shuttle =
+            new RelHomogeneousShuttle() {
+              @Override
+              public RelNode visit(TableScan scan) {
+                final RelOptTable table = scan.getTable();
+                if (scan instanceof LogicalTableScan
+                    && Bindables.BindableTableScan.canHandle(table)) {
+                  // Always replace the LogicalTableScan with BindableTableScan
+                  // because it's implementation does not require a "schema" as context.
+                  return Bindables.BindableTableScan.create(scan.getCluster(), table);
+                }
+                return super.visit(scan);
               }
-              return super.visit(scan);
-            }
-          };
-      rel = rel.accept(shuttle);
-      // the line we changed here
-      try (Connection connection = context.connection) {
+            };
+        rel = rel.accept(shuttle);
+      } catch (Exception e) {
+        optimizeSpan.setError(e);
+        throw e;
+      } finally {
+        optimizeSpan.endSpan();
+      }
+
+      // Compile span
+      Span compileSpan =
+          tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.compile"));
+      try (SpanScope scope = tracer.withSpanInScope(compileSpan);
+          Connection connection = context.connection) {
         final RelRunner runner = connection.unwrap(RelRunner.class);
         PreparedStatement preparedStatement = runner.prepareStatement(rel);
         optimizeTime.set(System.nanoTime() - startTime);
         return preparedStatement;
       } catch (SQLException e) {
+        compileSpan.setError(e);
         // Detect if error is due to window functions in unsupported context (bins on time fields)
         String errorMsg = e.getMessage();
         if (errorMsg != null
@@ -441,6 +462,8 @@ public class CalciteToolsHelper {
                   + " count() by @timestamp').");
         }
         throw Util.throwAsRuntime(e);
+      } finally {
+        compileSpan.endSpan();
       }
     }
   }

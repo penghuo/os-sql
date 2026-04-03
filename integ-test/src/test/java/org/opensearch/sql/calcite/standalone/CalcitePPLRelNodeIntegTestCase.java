@@ -27,6 +27,7 @@ import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
 import org.opensearch.sql.executor.QueryType;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 /** Base class for integration test based on RelNode tree. Mainly for testing internal functions */
 public abstract class CalcitePPLRelNodeIntegTestCase extends CalcitePPLIntegTestCase {
@@ -87,7 +88,8 @@ public abstract class CalcitePPLRelNodeIntegTestCase extends CalcitePPLIntegTest
   protected void executeRelNodeAndVerify(
       CalcitePlanContext planContext, RelNode relNode, ResultVerifier verifier)
       throws SQLException {
-    try (PreparedStatement statement = OpenSearchRelRunners.run(planContext, relNode)) {
+    try (PreparedStatement statement =
+        OpenSearchRelRunners.run(planContext, relNode, NoopTracer.INSTANCE)) {
       ResultSet resultSet = statement.executeQuery();
       verifier.verify(resultSet);
     }

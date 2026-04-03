@@ -47,6 +47,7 @@ import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
 import org.opensearch.sql.protocol.response.format.YamlResponseFormatter;
 import org.opensearch.tasks.Task;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -67,11 +68,12 @@ public class TransportPPLQueryAction
       ClusterService clusterService,
       DataSourceServiceImpl dataSourceService,
       org.opensearch.common.settings.Settings clusterSettings,
-      EngineExtensionsHolder extensionsHolder) {
+      EngineExtensionsHolder extensionsHolder,
+      Tracer tracer) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
 
     ModulesBuilder modules = new ModulesBuilder();
-    modules.add(new OpenSearchPluginModule(extensionsHolder.engines()));
+    modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
     modules.add(
         b -> {
           b.bind(NodeClient.class).toInstance(client);

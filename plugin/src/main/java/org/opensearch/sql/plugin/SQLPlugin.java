@@ -50,6 +50,7 @@ import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
+import org.opensearch.plugins.TelemetryAwarePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
@@ -121,6 +122,9 @@ import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
+import org.opensearch.telemetry.metrics.MetricsRegistry;
+import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -133,10 +137,12 @@ public class SQLPlugin extends Plugin
         ScriptPlugin,
         SystemIndexPlugin,
         JobSchedulerExtension,
-        ExtensiblePlugin {
+        ExtensiblePlugin,
+        TelemetryAwarePlugin {
 
   private static final Logger LOGGER = LogManager.getLogger(SQLPlugin.class);
 
+  private Tracer tracer = NoopTracer.INSTANCE;
   private List<ExecutionEngine> executionEngineExtensions = List.of();
   private ClusterService clusterService;
 
@@ -262,6 +268,36 @@ public class SQLPlugin extends Plugin
       NodeEnvironment nodeEnvironment,
       NamedWriteableRegistry namedWriteableRegistry,
       IndexNameExpressionResolver indexNameResolver,
+      Supplier<RepositoriesService> repositoriesServiceSupplier,
+      Tracer tracer,
+      MetricsRegistry metricsRegistry) {
+    this.tracer = tracer;
+    return createComponents(
+        client,
+        clusterService,
+        threadPool,
+        resourceWatcherService,
+        scriptService,
+        contentRegistry,
+        environment,
+        nodeEnvironment,
+        namedWriteableRegistry,
+        indexNameResolver,
+        repositoriesServiceSupplier);
+  }
+
+  @Override
+  public Collection<Object> createComponents(
+      Client client,
+      ClusterService clusterService,
+      ThreadPool threadPool,
+      ResourceWatcherService resourceWatcherService,
+      ScriptService scriptService,
+      NamedXContentRegistry contentRegistry,
+      Environment environment,
+      NodeEnvironment nodeEnvironment,
+      NamedWriteableRegistry namedWriteableRegistry,
+      IndexNameExpressionResolver indexNameResolver,
       Supplier<RepositoriesService> repositoriesServiceSupplier) {
     this.clusterService = clusterService;
     this.pluginSettings = new OpenSearchSettings(clusterService.getClusterSettings());
@@ -272,7 +308,7 @@ public class SQLPlugin extends Plugin
     LocalClusterState.state().setPluginSettings((OpenSearchSettings) pluginSettings);
     LocalClusterState.state().setClient(client);
     ModulesBuilder modules = new ModulesBuilder();
-    modules.add(new OpenSearchPluginModule(executionEngineExtensions));
+    modules.add(new OpenSearchPluginModule(executionEngineExtensions, tracer));
     modules.add(
         b -> {
           b.bind(NodeClient.class).toInstance((NodeClient) client);

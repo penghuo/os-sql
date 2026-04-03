@@ -38,16 +38,24 @@ import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.sql.SQLService;
 import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.StorageEngine;
+import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.transport.client.node.NodeClient;
 
 @RequiredArgsConstructor
 public class OpenSearchPluginModule extends AbstractModule {
 
   private final List<ExecutionEngine> executionEngineExtensions;
+  private final Tracer tracer;
 
   /** Default constructor for when no engines are available. */
   public OpenSearchPluginModule() {
-    this(List.of());
+    this(List.of(), NoopTracer.INSTANCE);
+  }
+
+  /** Constructor with engines but no tracer. */
+  public OpenSearchPluginModule(List<ExecutionEngine> executionEngineExtensions) {
+    this(executionEngineExtensions, NoopTracer.INSTANCE);
   }
 
   private final BuiltinFunctionRepository functionRepository =
@@ -108,6 +116,12 @@ public class OpenSearchPluginModule extends AbstractModule {
   @Provides
   public SQLService sqlService(QueryManager queryManager, QueryPlanFactory queryPlanFactory) {
     return new SQLService(new SQLSyntaxParser(), queryManager, queryPlanFactory);
+  }
+
+  @Provides
+  @Singleton
+  public Tracer tracer() {
+    return tracer;
   }
 
   /** {@link QueryPlanFactory}. */

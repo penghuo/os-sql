@@ -56,6 +56,7 @@ dependencies {
     implementation group: 'com.google.guava', name: 'guava', version: "${guava_version}"
     api group: 'org.json', name: 'json', version: '20231013'
     implementation group: 'org.apache.logging.log4j', name: 'log4j-core', version:"${versions.log4j}"
+    compileOnly group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
     api project(':common')
     api project(':core')
     api project(':protocol')
@@ -64,6 +65,7 @@ dependencies {
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"
     testImplementation group: 'org.mockito', name: 'mockito-core', version: "${mockito_version}"
     testImplementation group: 'org.apache.calcite', name: 'calcite-testkit', version: '1.41.0'
+    testImplementation group: 'org.opensearch', name: 'opensearch', version: "${opensearch_version}"
     testImplementation(testFixtures(project(":core")))
 }
 

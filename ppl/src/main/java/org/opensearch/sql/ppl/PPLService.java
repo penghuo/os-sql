@@ -24,6 +24,10 @@ import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.sql.ppl.parser.AstBuilder;
 import org.opensearch.sql.ppl.parser.AstStatementBuilder;
 import org.opensearch.sql.ppl.utils.PPLQueryDataAnonymizer;
+import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.SpanCreationContext;
+import org.opensearch.telemetry.tracing.SpanScope;
+import org.opensearch.telemetry.tracing.Tracer;
 
 /** PPLService. */
 @Log4j2
@@ -40,16 +44,20 @@ public class PPLService {
 
   private final PPLQueryDataAnonymizer anonymizer;
 
+  private final Tracer tracer;
+
   public PPLService(
       PPLSyntaxParser parser,
       QueryManager queryManager,
       QueryPlanFactory queryExecutionFactory,
-      Settings settings) {
+      Settings settings,
+      Tracer tracer) {
     this.parser = parser;
     this.queryManager = queryManager;
     this.queryExecutionFactory = queryExecutionFactory;
     this.settings = settings;
     this.anonymizer = new PPLQueryDataAnonymizer(settings);
+    this.tracer = tracer;
   }
 
   /**
@@ -89,25 +97,34 @@ public class PPLService {
       PPLQueryRequest request,
       ResponseListener<QueryResponse> queryListener,
       ResponseListener<ExplainResponse> explainListener) {
-    // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
-    ParseTree cst = parser.parse(request.getRequest());
-    Statement statement =
-        cst.accept(
-            new AstStatementBuilder(
-                new AstBuilder(request.getRequest(), settings),
-                AstStatementBuilder.StatementBuilderContext.builder()
-                    .isExplain(request.isExplainRequest())
-                    .fetchSize(request.getFetchSize())
-                    .highlightConfig(request.getHighlightConfig())
-                    .format(request.getFormat())
-                    .explainMode(request.getExplainMode())
-                    .build()));
+    Span parseSpan =
+        tracer.startSpan(SpanCreationContext.internal().name("opensearch.query.parse"));
+    try (SpanScope scope = tracer.withSpanInScope(parseSpan)) {
+      // 1.Parse query and convert parse tree (CST) to abstract syntax tree (AST)
+      ParseTree cst = parser.parse(request.getRequest());
+      Statement statement =
+          cst.accept(
+              new AstStatementBuilder(
+                  new AstBuilder(request.getRequest(), settings),
+                  AstStatementBuilder.StatementBuilderContext.builder()
+                      .isExplain(request.isExplainRequest())
+                      .fetchSize(request.getFetchSize())
+                      .highlightConfig(request.getHighlightConfig())
+                      .format(request.getFormat())
+                      .explainMode(request.getExplainMode())
+                      .build()));
 
-    log.info(
-        "[{}] Incoming request {}",
-        QueryContext.getRequestId(),
-        anonymizer.anonymizeStatement(statement));
+      log.info(
+          "[{}] Incoming request {}",
+          QueryContext.getRequestId(),
+          anonymizer.anonymizeStatement(statement));
 
-    return queryExecutionFactory.create(statement, queryListener, explainListener);
+      return queryExecutionFactory.create(statement, queryListener, explainListener);
+    } catch (Exception e) {
+      parseSpan.setError(e);
+      throw e;
+    } finally {
+      parseSpan.endSpan();
+    }
   }
 }

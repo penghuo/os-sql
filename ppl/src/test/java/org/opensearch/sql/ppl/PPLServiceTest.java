@@ -29,6 +29,7 @@ import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.executor.pagination.Cursor;
 import org.opensearch.sql.ppl.antlr.PPLSyntaxParser;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 @RunWith(MockitoJUnitRunner.class)
 public class PPLServiceTest {
@@ -54,7 +55,11 @@ public class PPLServiceTest {
 
     pplService =
         new PPLService(
-            new PPLSyntaxParser(), queryManager, new QueryPlanFactory(queryService), settings);
+            new PPLSyntaxParser(),
+            queryManager,
+            new QueryPlanFactory(queryService),
+            settings,
+            NoopTracer.INSTANCE);
   }
 
   @After

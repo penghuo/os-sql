@@ -163,6 +163,7 @@ task trinoTest(type: StandaloneRestIntegTestTask) {
 
     include '**/TestTrinoQueries.class'
     include '**/TestTrinoAggregations.class'
+    include '**/TestTrinoJoinQueries.class'
     exclude '**/*NoExternalServer*.class'
 
     jvmArgs '-Xmx4g', '-XX:+UseG1GC'

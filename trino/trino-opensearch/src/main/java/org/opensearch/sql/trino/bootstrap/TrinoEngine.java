@@ -11,12 +11,12 @@ import io.trino.metadata.SessionPropertyManager;
 import io.trino.plugin.memory.MemoryPlugin;
 import io.trino.plugin.tpch.TpchPlugin;
 import io.trino.spi.QueryId;
-import io.trino.spi.security.Identity;
 import io.trino.spi.TrinoException;
+import io.trino.spi.security.Identity;
 import io.trino.spi.type.Type;
+import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
-import io.trino.testing.StandaloneQueryRunner;
 import java.io.Closeable;
 import java.time.temporal.Temporal;
 import java.util.Collections;
@@ -29,25 +29,26 @@ import org.apache.logging.log4j.Logger;
 /**
  * Embedded Trino SQL execution engine using the real Trino query engine.
  *
- * <p>Uses {@link StandaloneQueryRunner} to run an in-process Trino engine with the TPCH catalog for
- * testing. Queries are executed directly through the Trino engine API (no external HTTP server).
- * Results are serialized to Trino client protocol JSON format for the REST endpoint.
+ * <p>Uses {@link DistributedQueryRunner} to run an in-process Trino engine with coordinator and
+ * worker on a single node. This supports both DDL (CREATE TABLE, DROP TABLE) and DML (INSERT,
+ * SELECT) operations, unlike StandaloneQueryRunner which deadlocks on DML.
+ *
+ * <p>The DistributedQueryRunner starts an internal HTTP server on an ephemeral localhost port.
+ * All external access is still through the OpenSearch REST API — the internal HTTP server is
+ * an implementation detail not exposed to users.
  */
 public class TrinoEngine implements Closeable {
 
   private static final Logger LOG = LogManager.getLogger(TrinoEngine.class);
 
-  private final StandaloneQueryRunner queryRunner;
+  private final DistributedQueryRunner queryRunner;
 
   public TrinoEngine() {
-    LOG.info("Initializing real Trino engine via StandaloneQueryRunner");
+    LOG.info("Initializing real Trino engine via DistributedQueryRunner");
     try {
       Session session = createDefaultSession();
-      // Use the builder overload to set task.max-worker-threads explicitly.
-      // This prevents Trino's TaskManagerConfig from calling oshi's
-      // MachineInfo.getAvailablePhysicalProcessorCount() which reads
-      // /proc/self/auxv — blocked by OpenSearch's Java Agent.
-      StandaloneQueryRunner runner = new StandaloneQueryRunner(session);
+      DistributedQueryRunner runner =
+          DistributedQueryRunner.builder(session).setNodeCount(1).build();
       runner.installPlugin(new TpchPlugin());
       runner.createCatalog("tpch", "tpch", Map.of());
       runner.installPlugin(new MemoryPlugin());
@@ -62,7 +63,7 @@ public class TrinoEngine implements Closeable {
 
   private static Session createDefaultSession() {
     // Use the constructor with empty properties to avoid SystemSessionProperties
-    // hardware detection. The StandaloneQueryRunner initializes its own session
+    // hardware detection. The DistributedQueryRunner initializes its own session
     // properties during server bootstrap.
     SessionPropertyManager spm =
         new SessionPropertyManager(Collections.emptySet(), CatalogServiceProvider.fail());
@@ -131,8 +132,13 @@ public class TrinoEngine implements Closeable {
     sb.append("{");
     sb.append("\"id\":\"").append(queryId).append("\",");
 
-    // Columns
-    List<String> columnNames = result.getColumnNames();
+    // Columns — DDL statements may not have column names
+    List<String> columnNames;
+    try {
+      columnNames = result.getColumnNames();
+    } catch (IllegalStateException e) {
+      columnNames = null;
+    }
     List<? extends Type> types = result.getTypes();
     sb.append("\"columns\":[");
     for (int i = 0; i < types.size(); i++) {

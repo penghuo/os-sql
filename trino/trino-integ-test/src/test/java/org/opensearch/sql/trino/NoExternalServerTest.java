@@ -141,13 +141,9 @@ public class NoExternalServerTest extends OpenSearchRestTestCase {
 
   /**
    * Verify that CREATE TABLE, INSERT, SELECT, and DROP TABLE work via the REST endpoint using the
-   * Memory connector.
-   *
-   * <p>DISABLED: Memory connector DDL hangs on StandaloneQueryRunner because the single-node
-   * server's distributed task scheduler deadlocks when coordinator and worker share thread pools.
-   * Requires migration to DistributedQueryRunner to fix.
+   * Memory connector. Works with DistributedQueryRunner which supports full distributed execution.
    */
-  public void DISABLED_testMemoryConnectorDdlDml() throws IOException {
+  public void testMemoryConnectorDdlDml() throws IOException {
     String tableName = "memory.default.ddl_test_" + System.nanoTime();
 
     // DROP TABLE IF EXISTS (cleanup from previous runs)

@@ -36,6 +36,22 @@ dependencies {
     shade "io.trino:trino-plugin-toolkit:${trinoVersion}"
     shade "io.trino:trino-tpch:${trinoVersion}"
     shade "io.trino:trino-memory:${trinoVersion}"
+    shade("io.trino:trino-testing:${trinoVersion}") {
+        // Exclude testcontainers — only needed for Docker-based tests, not for
+        // DistributedQueryRunner. Its shaded bouncycastle causes jar-hell with
+        // OpenSearch's bc-fips.
+        exclude group: 'org.testcontainers'
+        exclude group: 'org.rnorth.duct-tape'
+        // Exclude test frameworks — they cause jar-hell with test classpath
+        exclude group: 'org.junit.jupiter'
+        exclude group: 'org.junit.platform'
+        exclude group: 'org.opentest4j'
+        exclude group: 'org.assertj'
+        exclude group: 'org.hamcrest'
+        exclude group: 'net.sf.jopt-simple'
+        // Exclude Docker-related deps
+        exclude group: 'com.github.docker-java'
+    }
 
     // OpenTelemetry SDK needed by Trino at runtime
     shade "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
@@ -46,6 +62,7 @@ dependencies {
     compileOnly "io.trino:trino-spi:${trinoVersion}"
     compileOnly "io.trino:trino-tpch:${trinoVersion}"
     compileOnly "io.trino:trino-memory:${trinoVersion}"
+    compileOnly "io.trino:trino-testing:${trinoVersion}"
     compileOnly "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
 
     // OpenSearch APIs (provided by plugin runtime)
@@ -67,6 +84,7 @@ def shadedPrefix = 'org.opensearch.sql.trino.shaded'
 shadowJar {
     configurations = [project.configurations.shade]
     archiveClassifier.set('')  // Replace main jar
+    zip64 = true  // trino-testing pushes entry count above 65535
 
     // Relocate every package that could conflict.
     // The shadow plugin will rewrite bytecode references automatically.
@@ -137,6 +155,10 @@ shadowJar {
     relocate 'dev', "${shadedPrefix}.dev"
     relocate 'oauth2', "${shadedPrefix}.oauth2"
 
+    // Packages from trino-testing transitive deps
+    relocate 'joptsimple', "${shadedPrefix}.joptsimple"
+    relocate 'junit', "${shadedPrefix}.junit"
+
     // SLF4J — Trino uses it, relocate to avoid conflict
     relocate 'org.slf4j', "${shadedPrefix}.slf4j"
 
@@ -172,9 +194,11 @@ shadowJar {
     // library loading requires the original class names. Oshi (unrelocated)
     // will find JNA core via the parent classloader.
     // But KEEP com/sun/jna/platform/** — these are in jna-platform (not in OpenSearch core).
+    // Also exclude BouncyCastle classes — they conflict with OpenSearch core's bc-fips jar.
     exclude { element ->
         def path = element.relativePath.pathString
-        path.startsWith('com/sun/jna/') && !path.startsWith('com/sun/jna/platform/')
+        (path.startsWith('com/sun/jna/') && !path.startsWith('com/sun/jna/platform/')) ||
+        path.contains('org/bouncycastle/')
     }
 
     // Exclude files that cause conflicts

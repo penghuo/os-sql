@@ -59,6 +59,63 @@ public class NoExternalServerTest extends OpenSearchRestTestCase {
   }
 
   /**
+   * Verify that SELECT 1 returns the correct result through the REST endpoint using the real
+   * TrinoEngine (not a stub).
+   */
+  public void testSelectOneReturnsCorrectResult() throws IOException {
+    Request request = new Request("POST", "/_plugins/_trino_sql/v1/statement");
+    request.setJsonEntity("{\"query\": \"SELECT 1\"}");
+    Response response = client().performRequest(request);
+    assertEquals(200, response.getStatusLine().getStatusCode());
+
+    String body =
+        new String(
+            response.getEntity().getContent().readAllBytes(),
+            java.nio.charset.StandardCharsets.UTF_8);
+    LOG.info("SELECT 1 response: {}", body);
+
+    // Verify columns are present
+    assertTrue("Response should contain 'columns' field", body.contains("\"columns\""));
+    assertTrue(
+        "Response should contain column name '_col0'", body.contains("\"name\":\"_col0\""));
+    assertTrue(
+        "Response should contain column type 'integer'", body.contains("\"type\":\"integer\""));
+
+    // Verify data is present with value 1
+    assertTrue("Response should contain 'data' field", body.contains("\"data\""));
+    assertTrue("Response should contain data [[1]]", body.contains("[1]"));
+
+    // Verify state is FINISHED
+    assertTrue(
+        "Response should contain FINISHED state", body.contains("\"state\":\"FINISHED\""));
+  }
+
+  /**
+   * Verify that SELECT with multiple columns returns correct results.
+   */
+  public void testSelectMultipleConstants() throws IOException {
+    Request request = new Request("POST", "/_plugins/_trino_sql/v1/statement");
+    request.setJsonEntity("{\"query\": \"SELECT 1, 'hello', true\"}");
+    Response response = client().performRequest(request);
+    assertEquals(200, response.getStatusLine().getStatusCode());
+
+    String body =
+        new String(
+            response.getEntity().getContent().readAllBytes(),
+            java.nio.charset.StandardCharsets.UTF_8);
+    LOG.info("SELECT multiple constants response: {}", body);
+
+    assertTrue("Response should contain 'columns' field", body.contains("\"columns\""));
+    assertTrue("Response should contain 'data' field", body.contains("\"data\""));
+    assertTrue(
+        "Response should contain FINISHED state", body.contains("\"state\":\"FINISHED\""));
+    // Verify data contains the integer 1
+    assertTrue("Response should contain integer value 1", body.contains("1"));
+    // Verify data contains the string "hello"
+    assertTrue("Response should contain string 'hello'", body.contains("\"hello\""));
+  }
+
+  /**
    * Verify that the trino_query, trino_exchange, and trino_scheduler thread pools are registered
    * and visible via /_cat/thread_pool.
    */

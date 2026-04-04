@@ -121,6 +121,7 @@ import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
+import org.opensearch.sql.trino.bootstrap.TrinoEngine;
 import org.opensearch.sql.trino.plugin.TrinoSettings;
 import org.opensearch.sql.trino.rest.RestTrinoQueryAction;
 import org.opensearch.threadpool.ExecutorBuilder;
@@ -154,6 +155,7 @@ public class SQLPlugin extends Plugin
   private DataSourceServiceImpl dataSourceService;
   private OpenSearchAsyncQueryScheduler asyncQueryScheduler;
   private Injector injector;
+  private TrinoEngine trinoEngine;
 
   public String name() {
     return "sql";
@@ -200,7 +202,7 @@ public class SQLPlugin extends Plugin
         new RestAsyncQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings),
-        new RestTrinoQueryAction());
+        new RestTrinoQueryAction(trinoEngine));
   }
 
   /** Register action and handler so that transportClient can find proxy for action. */
@@ -316,6 +318,15 @@ public class SQLPlugin extends Plugin
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);
 
     EngineExtensionsHolder extensionsHolder = new EngineExtensionsHolder(executionEngineExtensions);
+
+    // Initialize Trino engine if enabled
+    boolean trinoEnabled = TrinoSettings.TRINO_ENABLED.get(environment.settings());
+    if (trinoEnabled) {
+      LOGGER.info("Trino engine is enabled, initializing TrinoEngine");
+      this.trinoEngine = new TrinoEngine();
+    } else {
+      LOGGER.info("Trino engine is disabled (plugins.trino.enabled=false)");
+    }
 
     return ImmutableList.of(
         dataSourceService,

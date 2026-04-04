@@ -188,8 +188,7 @@ dependencies {
     api project(':async-query')
     api project(':direct-query')
     api(project(':trino:trino-opensearch')) {
-        // Only need TrinoSettings and RestTrinoQueryAction (OpenSearch-only APIs).
-        // Exclude Trino engine deps -- they are not needed at plugin runtime for Task 3.
+        // Exclude Trino engine deps -- loaded via isolated classloader at runtime.
         exclude group: 'io.trino'
         exclude group: 'io.airlift'
     }

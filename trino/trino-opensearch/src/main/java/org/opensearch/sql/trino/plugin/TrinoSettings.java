@@ -12,7 +12,7 @@ public class TrinoSettings {
   public static final Setting<Boolean> TRINO_ENABLED =
       Setting.boolSetting(
           "plugins.trino.enabled",
-          false,
+          true,
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 

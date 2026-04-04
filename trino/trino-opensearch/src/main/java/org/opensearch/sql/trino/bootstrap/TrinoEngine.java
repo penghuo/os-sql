@@ -9,6 +9,7 @@ import io.trino.Session;
 import io.trino.connector.CatalogServiceProvider;
 import io.trino.metadata.SessionPropertyManager;
 import io.trino.hadoop.HadoopNative;
+import io.trino.plugin.hive.HivePlugin;
 import io.trino.plugin.iceberg.IcebergPlugin;
 import io.trino.plugin.memory.MemoryPlugin;
 import io.trino.plugin.tpch.TpchPlugin;
@@ -74,11 +75,22 @@ public class TrinoEngine implements Closeable {
               "iceberg.catalog.type", "TESTING_FILE_METASTORE",
               "hive.metastore.catalog.dir",
               warehouseDir.toUri().toString()));
+      // Hive catalog for reading raw Parquet files from local filesystem.
+      // Used for data loading: CTAS from hive.default.hits INTO iceberg.clickbench.hits
+      runner.installPlugin(new HivePlugin());
+      Path hiveWarehouse = Files.createTempDirectory("trino-hive-warehouse");
+      runner.createCatalog(
+          "hive",
+          "hive",
+          Map.of(
+              "hive.metastore", "file",
+              "hive.metastore.catalog.dir",
+              hiveWarehouse.toUri().toString()));
       this.queryRunner = runner;
       LOG.info(
-          "Trino engine initialized with TPCH, Memory, and Iceberg catalogs"
-              + " (warehouse: {})",
-          warehouseDir);
+          "Trino engine initialized with TPCH, Memory, Iceberg, and Hive catalogs"
+              + " (iceberg warehouse: {}, hive warehouse: {})",
+          warehouseDir, hiveWarehouse);
     } catch (Exception e) {
       LOG.error("Failed to initialize Trino engine", e);
       throw new RuntimeException("Failed to initialize Trino engine", e);
@@ -354,11 +366,28 @@ public class TrinoEngine implements Closeable {
     if (s == null) {
       return "";
     }
-    return s.replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t");
+    StringBuilder sb = new StringBuilder(s.length());
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      switch (c) {
+        case '\\' -> sb.append("\\\\");
+        case '"' -> sb.append("\\\"");
+        case '\n' -> sb.append("\\n");
+        case '\r' -> sb.append("\\r");
+        case '\t' -> sb.append("\\t");
+        case '\b' -> sb.append("\\b");
+        case '\f' -> sb.append("\\f");
+        default -> {
+          if (c < 0x20) {
+            // Escape all other control characters as unicode escape sequences
+            sb.append("\\u").append(String.format("%04x", (int) c));
+          } else {
+            sb.append(c);
+          }
+        }
+      }
+    }
+    return sb.toString();
   }
 
   @Override

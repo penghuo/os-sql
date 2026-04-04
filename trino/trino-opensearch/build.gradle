@@ -1,6 +1,18 @@
+buildscript {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.gradleup.shadow:shadow-gradle-plugin:9.3.1'
+    }
+}
+
 plugins {
     id 'java-library'
 }
+
+apply plugin: 'com.gradleup.shadow'
 
 repositories {
     mavenCentral()
@@ -11,17 +23,181 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+// Use 'shade' configuration so transitive deps do NOT leak to consumers
+configurations {
+    shade
+}
+
 dependencies {
-    // Trino engine — used as library, NEVER as server
-    implementation "io.trino:trino-main:${trinoVersion}"
-    implementation "io.trino:trino-parser:${trinoVersion}"
-    implementation "io.trino:trino-spi:${trinoVersion}"
-    implementation "io.trino:trino-plugin-toolkit:${trinoVersion}"
+    // Trino engine — shaded into the shadow jar, NOT exposed to consumers
+    shade "io.trino:trino-main:${trinoVersion}"
+    shade "io.trino:trino-parser:${trinoVersion}"
+    shade "io.trino:trino-spi:${trinoVersion}"
+    shade "io.trino:trino-plugin-toolkit:${trinoVersion}"
+    shade "io.trino:trino-tpch:${trinoVersion}"
+
+    // OpenTelemetry SDK needed by Trino at runtime
+    shade "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
+    shade "io.opentelemetry:opentelemetry-sdk:${versions.opentelemetry}"
+
+    // We need Trino on the compile classpath to compile TrinoEngine.java
+    compileOnly "io.trino:trino-main:${trinoVersion}"
+    compileOnly "io.trino:trino-spi:${trinoVersion}"
+    compileOnly "io.trino:trino-tpch:${trinoVersion}"
+    compileOnly "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
 
     // OpenSearch APIs (provided by plugin runtime)
     compileOnly "org.opensearch:opensearch:${opensearch_version}"
 
+    testImplementation "io.trino:trino-main:${trinoVersion}"
+    testImplementation "io.trino:trino-spi:${trinoVersion}"
+    testImplementation "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
+
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     testImplementation "org.mockito:mockito-core:${versions.mockito}"
+}
+
+// Collect all top-level packages from shaded dependencies and relocate them
+def shadedPrefix = 'org.opensearch.sql.trino.shaded'
+
+shadowJar {
+    configurations = [project.configurations.shade]
+    archiveClassifier.set('')  // Replace main jar
+
+    // Relocate every package that could conflict.
+    // The shadow plugin will rewrite bytecode references automatically.
+    // Our own code (org.opensearch.sql.trino.*) references io.trino etc
+    // in source, and the plugin rewrites those references in the output.
+
+    // --- Top-level Java ecosystem packages ---
+    relocate 'io.trino', "${shadedPrefix}.trino"
+    relocate 'io.airlift', "${shadedPrefix}.airlift"
+    relocate 'io.opentelemetry', "${shadedPrefix}.opentelemetry"
+    relocate 'io.jsonwebtoken', "${shadedPrefix}.jsonwebtoken"
+
+    relocate 'com.google.inject', "${shadedPrefix}.guice"
+    relocate 'com.google.common', "${shadedPrefix}.guava"
+    relocate 'com.google.errorprone', "${shadedPrefix}.errorprone"
+    relocate 'com.google.j2objc', "${shadedPrefix}.j2objc"
+    relocate 'com.google.thirdparty', "${shadedPrefix}.thirdparty"
+    relocate 'com.fasterxml.jackson', "${shadedPrefix}.jackson"
+    relocate 'com.fasterxml.classmate', "${shadedPrefix}.classmate"
+    relocate 'com.esri', "${shadedPrefix}.esri"
+    relocate 'com.clearspring', "${shadedPrefix}.clearspring"
+    relocate 'com.nimbusds', "${shadedPrefix}.nimbusds"
+    relocate 'com.dynatrace', "${shadedPrefix}.dynatrace"
+    // Do NOT relocate com.sun.jna — JNA native library loading requires exact package name.
+    // JNA is in OpenSearch core lib, so we exclude it from the shadow jar.
+    // oshi.* is also not relocated, so it can call into JNA with correct class names.
+
+    relocate 'javax.inject', "${shadedPrefix}.javax.inject"
+    relocate 'javax.annotation', "${shadedPrefix}.javax.annotation"
+    relocate 'javax.validation', "${shadedPrefix}.javax.validation"
+    relocate 'javax.ws', "${shadedPrefix}.javax.ws"
+
+    relocate 'jakarta', "${shadedPrefix}.jakarta"
+
+    relocate 'org.antlr', "${shadedPrefix}.antlr"
+    relocate 'org.objectweb.asm', "${shadedPrefix}.asm"
+    relocate 'org.weakref', "${shadedPrefix}.weakref"
+    relocate 'org.openjdk.jol', "${shadedPrefix}.jol"
+    relocate 'org.joda', "${shadedPrefix}.joda"
+    relocate 'org.pcollections', "${shadedPrefix}.pcollections"
+    relocate 'org.checkerframework', "${shadedPrefix}.checkerframework"
+    relocate 'org.apache.commons', "${shadedPrefix}.commons"
+    relocate 'org.roaringbitmap', "${shadedPrefix}.roaringbitmap"
+    relocate 'org.eclipse.jetty', "${shadedPrefix}.jetty"
+    relocate 'org.glassfish', "${shadedPrefix}.glassfish"
+    relocate 'org.HdrHistogram', "${shadedPrefix}.hdrhistogram"
+    relocate 'org.javassist', "${shadedPrefix}.javassist"
+    relocate 'org.hibernate', "${shadedPrefix}.hibernate"
+    relocate 'org.iq80', "${shadedPrefix}.iq80"
+
+    relocate 'net.minidev', "${shadedPrefix}.minidev"
+    // Do NOT relocate net.java.dev.jna — excluded from jar, uses OpenSearch core JNA
+
+    relocate 'it.unimi.dsi', "${shadedPrefix}.fastutil"
+
+    relocate 'ch.qos.logback', "${shadedPrefix}.logback"
+
+    relocate 'joda', "${shadedPrefix}.jodatime"
+    relocate 'jersey', "${shadedPrefix}.jersey_res"
+    relocate 'javassist', "${shadedPrefix}.javassist2"
+
+    relocate 'okhttp3', "${shadedPrefix}.okhttp3"
+    relocate 'okio', "${shadedPrefix}.okio"
+    relocate 'kotlin', "${shadedPrefix}.kotlin"
+    // Do NOT relocate oshi — it calls JNA which requires unrelocated package names
+    // oshi is not in OpenSearch's classpath, so no jar hell
+    relocate 'dev', "${shadedPrefix}.dev"
+    relocate 'oauth2', "${shadedPrefix}.oauth2"
+
+    // SLF4J — Trino uses it, relocate to avoid conflict
+    relocate 'org.slf4j', "${shadedPrefix}.slf4j"
+
+    // Log4j classes bundled by trino deps
+    relocate 'org.apache.logging', "${shadedPrefix}.logging"
+    relocate 'org.apache.log4j', "${shadedPrefix}.log4j"
+    relocate 'org.apache.http', "${shadedPrefix}.http"
+
+    // Additional packages found in transitive deps
+    // Do NOT relocate com.sun.jna — JNA native library loading needs exact package name.
+    // Only relocate non-JNA com.sun packages.
+    relocate 'com.sun.research', "${shadedPrefix}.sun.research"
+    relocate 'com.sun.istack', "${shadedPrefix}.sun.istack"
+    relocate 'com.sun.xml', "${shadedPrefix}.sun.xml"
+    relocate 'net.bytebuddy', "${shadedPrefix}.bytebuddy"
+    relocate 'net.jcip', "${shadedPrefix}.jcip"
+    relocate 'org.aopalliance', "${shadedPrefix}.aopalliance"
+    relocate 'org.gaul', "${shadedPrefix}.gaul"
+    relocate 'org.jboss', "${shadedPrefix}.jboss"
+    relocate 'org.jetbrains', "${shadedPrefix}.jetbrains"
+    relocate 'org.json', "${shadedPrefix}.json"
+    relocate 'org.locationtech', "${shadedPrefix}.locationtech"
+    relocate 'org.tartarus', "${shadedPrefix}.tartarus"
+    relocate 'org.jvnet', "${shadedPrefix}.jvnet"
+    relocate 'org.intellij', "${shadedPrefix}.intellij"
+    relocate 'org.apache.lucene', "${shadedPrefix}.lucene"
+    relocate 'org.eclipse', "${shadedPrefix}.eclipse"
+
+    // Merge service loader files (critical for Trino plugin discovery)
+    mergeServiceFiles()
+
+    // Exclude JNA core classes — JNA is in OpenSearch core lib, and its native
+    // library loading requires the original class names. Oshi (unrelocated)
+    // will find JNA core via the parent classloader.
+    // But KEEP com/sun/jna/platform/** — these are in jna-platform (not in OpenSearch core).
+    exclude { element ->
+        def path = element.relativePath.pathString
+        path.startsWith('com/sun/jna/') && !path.startsWith('com/sun/jna/platform/')
+    }
+
+    // Exclude files that cause conflicts
+    exclude 'META-INF/MANIFEST.MF'
+    exclude 'META-INF/LICENSE*'
+    exclude 'META-INF/NOTICE*'
+    exclude 'META-INF/DEPENDENCIES'
+    exclude 'module-info.class'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+// Wire shadow jar into the build lifecycle
+jar.enabled = false
+assemble.dependsOn shadowJar
+
+// Make the shadow jar the default artifact for project dependencies
+configurations {
+    apiElements {
+        outgoing.artifacts.clear()
+        outgoing.artifact(shadowJar)
+    }
+    runtimeElements {
+        outgoing.artifacts.clear()
+        outgoing.artifact(shadowJar)
+    }
 }

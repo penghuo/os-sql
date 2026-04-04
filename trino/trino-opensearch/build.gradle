@@ -36,6 +36,14 @@ dependencies {
     shade "io.trino:trino-plugin-toolkit:${trinoVersion}"
     shade "io.trino:trino-tpch:${trinoVersion}"
     shade "io.trino:trino-memory:${trinoVersion}"
+    shade("io.trino:trino-iceberg:${trinoVersion}") {
+        exclude group: 'org.testcontainers'
+        exclude group: 'com.github.docker-java'
+    }
+    shade("io.trino:trino-hdfs:${trinoVersion}") {
+        exclude group: 'org.testcontainers'
+        exclude group: 'com.github.docker-java'
+    }
     shade("io.trino:trino-testing:${trinoVersion}") {
         // Exclude testcontainers — only needed for Docker-based tests, not for
         // DistributedQueryRunner. Its shaded bouncycastle causes jar-hell with
@@ -62,6 +70,8 @@ dependencies {
     compileOnly "io.trino:trino-spi:${trinoVersion}"
     compileOnly "io.trino:trino-tpch:${trinoVersion}"
     compileOnly "io.trino:trino-memory:${trinoVersion}"
+    compileOnly "io.trino:trino-iceberg:${trinoVersion}"
+    compileOnly "io.trino:trino-hdfs:${trinoVersion}"
     compileOnly "io.trino:trino-testing:${trinoVersion}"
     compileOnly "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
 
@@ -95,15 +105,26 @@ shadowJar {
     relocate 'io.trino', "${shadedPrefix}.trino"
     relocate 'io.airlift', "${shadedPrefix}.airlift"
     relocate 'io.opentelemetry', "${shadedPrefix}.opentelemetry"
+    relocate 'io.grpc', "${shadedPrefix}.grpc"
     relocate 'io.jsonwebtoken', "${shadedPrefix}.jsonwebtoken"
+    relocate 'io.leangen', "${shadedPrefix}.leangen"
+    relocate 'io.minio', "${shadedPrefix}.minio"
+    relocate 'io.netty', "${shadedPrefix}.netty"
+    relocate 'io.opencensus', "${shadedPrefix}.opencensus"
+    relocate 'io.perfmark', "${shadedPrefix}.perfmark"
+    relocate 'io.prometheus', "${shadedPrefix}.prometheus"
+    relocate 'io.swagger', "${shadedPrefix}.swagger"
 
-    relocate 'com.google.inject', "${shadedPrefix}.guice"
-    relocate 'com.google.common', "${shadedPrefix}.guava"
-    relocate 'com.google.errorprone', "${shadedPrefix}.errorprone"
-    relocate 'com.google.j2objc', "${shadedPrefix}.j2objc"
-    relocate 'com.google.thirdparty', "${shadedPrefix}.thirdparty"
+    relocate 'com.google', "${shadedPrefix}.google"
     relocate 'com.fasterxml.jackson', "${shadedPrefix}.jackson"
     relocate 'com.fasterxml.classmate', "${shadedPrefix}.classmate"
+    relocate 'com.amazonaws', "${shadedPrefix}.amazonaws"
+    relocate 'com.azure', "${shadedPrefix}.azure"
+    relocate 'com.codahale', "${shadedPrefix}.codahale"
+    relocate 'com.ctc', "${shadedPrefix}.ctc"
+    relocate 'com.github', "${shadedPrefix}.github"
+    relocate 'com.linkedin', "${shadedPrefix}.linkedin"
+    relocate 'com.microsoft', "${shadedPrefix}.microsoft"
     relocate 'com.esri', "${shadedPrefix}.esri"
     relocate 'com.clearspring', "${shadedPrefix}.clearspring"
     relocate 'com.nimbusds', "${shadedPrefix}.nimbusds"
@@ -138,8 +159,12 @@ shadowJar {
     relocate 'org.iq80', "${shadedPrefix}.iq80"
 
     relocate 'net.minidev', "${shadedPrefix}.minidev"
+    relocate 'net.jpountz', "${shadedPrefix}.jpountz"
+    relocate 'net.openhft', "${shadedPrefix}.openhft"
     // Do NOT relocate net.java.dev.jna — excluded from jar, uses OpenSearch core JNA
 
+    relocate 'alluxio', "${shadedPrefix}.alluxio"
+    relocate 'android', "${shadedPrefix}.android"
     relocate 'it.unimi.dsi', "${shadedPrefix}.fastutil"
 
     relocate 'ch.qos.logback', "${shadedPrefix}.logback"
@@ -154,6 +179,9 @@ shadowJar {
     // oshi is relocated above to run in plugin's protection domain
     relocate 'dev', "${shadedPrefix}.dev"
     relocate 'oauth2', "${shadedPrefix}.oauth2"
+    relocate 'reactor', "${shadedPrefix}.reactor"
+    relocate 'shaded', "${shadedPrefix}.shaded_internal"
+    relocate 'software.amazon', "${shadedPrefix}.software.amazon"
 
     // Packages from trino-testing transitive deps
     relocate 'joptsimple', "${shadedPrefix}.joptsimple"
@@ -184,7 +212,33 @@ shadowJar {
     relocate 'org.tartarus', "${shadedPrefix}.tartarus"
     relocate 'org.jvnet', "${shadedPrefix}.jvnet"
     relocate 'org.intellij', "${shadedPrefix}.intellij"
+    relocate 'org.codehaus', "${shadedPrefix}.codehaus"
+    relocate 'org.conscrypt', "${shadedPrefix}.conscrypt"
+    relocate 'org.h2', "${shadedPrefix}.h2"
+    relocate 'org.ishugaliy', "${shadedPrefix}.ishugaliy"
+    relocate 'org.jdbi', "${shadedPrefix}.jdbi"
+    relocate 'org.postgresql', "${shadedPrefix}.postgresql"
+    relocate 'org.projectnessie', "${shadedPrefix}.projectnessie"
+    relocate 'org.reactivestreams', "${shadedPrefix}.reactivestreams"
+    relocate 'org.reflections', "${shadedPrefix}.reflections"
+    relocate 'org.rocksdb', "${shadedPrefix}.rocksdb"
+    relocate 'org.simpleframework', "${shadedPrefix}.simpleframework"
+    relocate 'org.threeten', "${shadedPrefix}.threeten"
+    relocate 'org.apache.calcite', "${shadedPrefix}.calcite"
+    relocate 'org.apache.hc', "${shadedPrefix}.hc"
+    relocate 'org.apache.yetus', "${shadedPrefix}.yetus"
     relocate 'org.apache.lucene', "${shadedPrefix}.lucene"
+    // Do NOT relocate org.apache.hadoop — Hadoop uses XML config files with class
+    // name references (core-default.xml etc.) that the shadow plugin cannot update.
+    // Hadoop is not in OpenSearch's classpath, so no jar-hell risk.
+    relocate 'org.apache.parquet', "${shadedPrefix}.parquet"
+    relocate 'org.apache.iceberg', "${shadedPrefix}.iceberg"
+    relocate 'org.apache.hive', "${shadedPrefix}.hive"
+    relocate 'org.apache.avro', "${shadedPrefix}.avro"
+    relocate 'org.apache.thrift', "${shadedPrefix}.thrift"
+    relocate 'org.apache.orc', "${shadedPrefix}.orc"
+    relocate 'org.apache.datasketches', "${shadedPrefix}.datasketches"
+    relocate 'org.xerial.snappy', "${shadedPrefix}.snappy"
     relocate 'org.eclipse', "${shadedPrefix}.eclipse"
 
     // Merge service loader files (critical for Trino plugin discovery)

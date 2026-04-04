@@ -29,13 +29,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * ClickBench integration test. Runs all 43 ClickBench queries against a real
- * {@code memory.default.hits} table via the {@code /_plugins/_trino_sql/v1/statement} REST
- * endpoint.
+ * ClickBench integration test. Runs all 43 ClickBench queries against a real Iceberg table
+ * {@code iceberg.clickbench.hits} with Parquet format via the
+ * {@code /_plugins/_trino_sql/v1/statement} REST endpoint.
  *
- * <p>The table is created using the Memory connector's DDL/DML, which works with the
- * DistributedQueryRunner-based TrinoEngine. Sample data (3 rows) is inserted via INSERT
- * statements, and all 43 ClickBench queries run against the real table.
+ * <p>The table is created using the Iceberg connector with TESTING_FILE_METASTORE catalog and
+ * Parquet storage format. Sample data (3 rows) is inserted via INSERT statements, and all 43
+ * ClickBench queries run against the real Iceberg/Parquet table.
  *
  * <p>The test verifies that each query parses, plans, and executes successfully (no errors).
  * Result correctness is not validated since we use a tiny sample dataset rather than the full
@@ -49,102 +49,108 @@ public class ClickBenchIT {
   private static String baseUrl;
   private static HttpClient httpClient;
 
-  private static final String TABLE_NAME = "memory.default.hits";
+  private static final String CATALOG = "iceberg";
+  private static final String SCHEMA = "clickbench";
+  private static final String TABLE_NAME = CATALOG + "." + SCHEMA + ".hits";
 
-  /** DDL to create the ClickBench hits table in the Memory connector. */
+  /** DDL to create the schema in Iceberg. */
+  private static final String CREATE_SCHEMA_SQL =
+      "CREATE SCHEMA IF NOT EXISTS " + CATALOG + "." + SCHEMA;
+
+  /** DDL to create the ClickBench hits table in the Iceberg connector with Parquet format. */
   private static final String CREATE_TABLE_SQL =
       "CREATE TABLE " + TABLE_NAME + " (\n"
           + "  WatchID BIGINT,\n"
-          + "  JavaEnable SMALLINT,\n"
+          + "  JavaEnable INTEGER,\n"
           + "  Title VARCHAR,\n"
-          + "  GoodEvent SMALLINT,\n"
+          + "  GoodEvent INTEGER,\n"
           + "  EventTime TIMESTAMP,\n"
           + "  EventDate DATE,\n"
           + "  CounterID INTEGER,\n"
           + "  ClientIP INTEGER,\n"
           + "  RegionID INTEGER,\n"
           + "  UserID BIGINT,\n"
-          + "  CounterClass SMALLINT,\n"
-          + "  OS SMALLINT,\n"
-          + "  UserAgent SMALLINT,\n"
+          + "  CounterClass INTEGER,\n"
+          + "  OS INTEGER,\n"
+          + "  UserAgent INTEGER,\n"
           + "  URL VARCHAR,\n"
           + "  Referer VARCHAR,\n"
-          + "  IsRefresh SMALLINT,\n"
-          + "  RefererCategoryID SMALLINT,\n"
+          + "  IsRefresh INTEGER,\n"
+          + "  RefererCategoryID INTEGER,\n"
           + "  RefererRegionID INTEGER,\n"
-          + "  URLCategoryID SMALLINT,\n"
+          + "  URLCategoryID INTEGER,\n"
           + "  URLRegionID INTEGER,\n"
-          + "  ResolutionWidth SMALLINT,\n"
-          + "  ResolutionHeight SMALLINT,\n"
-          + "  ResolutionDepth SMALLINT,\n"
-          + "  FlashMajor SMALLINT,\n"
-          + "  FlashMinor SMALLINT,\n"
+          + "  ResolutionWidth INTEGER,\n"
+          + "  ResolutionHeight INTEGER,\n"
+          + "  ResolutionDepth INTEGER,\n"
+          + "  FlashMajor INTEGER,\n"
+          + "  FlashMinor INTEGER,\n"
           + "  FlashMinor2 VARCHAR,\n"
-          + "  NetMajor SMALLINT,\n"
-          + "  NetMinor SMALLINT,\n"
-          + "  UserAgentMajor SMALLINT,\n"
+          + "  NetMajor INTEGER,\n"
+          + "  NetMinor INTEGER,\n"
+          + "  UserAgentMajor INTEGER,\n"
           + "  UserAgentMinor VARCHAR,\n"
-          + "  CookieEnable SMALLINT,\n"
-          + "  JavascriptEnable SMALLINT,\n"
-          + "  IsMobile SMALLINT,\n"
-          + "  MobilePhone SMALLINT,\n"
+          + "  CookieEnable INTEGER,\n"
+          + "  JavascriptEnable INTEGER,\n"
+          + "  IsMobile INTEGER,\n"
+          + "  MobilePhone INTEGER,\n"
           + "  MobilePhoneModel VARCHAR,\n"
           + "  Params VARCHAR,\n"
           + "  IPNetworkID INTEGER,\n"
-          + "  TraficSourceID SMALLINT,\n"
-          + "  SearchEngineID SMALLINT,\n"
+          + "  TraficSourceID INTEGER,\n"
+          + "  SearchEngineID INTEGER,\n"
           + "  SearchPhrase VARCHAR,\n"
-          + "  AdvEngineID SMALLINT,\n"
-          + "  IsArtifical SMALLINT,\n"
-          + "  WindowClientWidth SMALLINT,\n"
-          + "  WindowClientHeight SMALLINT,\n"
-          + "  ClientTimeZone SMALLINT,\n"
+          + "  AdvEngineID INTEGER,\n"
+          + "  IsArtifical INTEGER,\n"
+          + "  WindowClientWidth INTEGER,\n"
+          + "  WindowClientHeight INTEGER,\n"
+          + "  ClientTimeZone INTEGER,\n"
           + "  ClientEventTime TIMESTAMP,\n"
-          + "  SilverlightVersion1 SMALLINT,\n"
-          + "  SilverlightVersion2 SMALLINT,\n"
+          + "  SilverlightVersion1 INTEGER,\n"
+          + "  SilverlightVersion2 INTEGER,\n"
           + "  SilverlightVersion3 INTEGER,\n"
-          + "  SilverlightVersion4 SMALLINT,\n"
+          + "  SilverlightVersion4 INTEGER,\n"
           + "  PageCharset VARCHAR,\n"
           + "  CodeVersion INTEGER,\n"
-          + "  IsLink SMALLINT,\n"
-          + "  IsDownload SMALLINT,\n"
-          + "  IsNotBounce SMALLINT,\n"
+          + "  IsLink INTEGER,\n"
+          + "  IsDownload INTEGER,\n"
+          + "  IsNotBounce INTEGER,\n"
           + "  FUniqID BIGINT,\n"
           + "  OriginalURL VARCHAR,\n"
           + "  HID INTEGER,\n"
-          + "  IsOldCounter SMALLINT,\n"
-          + "  IsEvent SMALLINT,\n"
-          + "  IsParameter SMALLINT,\n"
-          + "  DontCountHits SMALLINT,\n"
-          + "  WithHash SMALLINT,\n"
+          + "  IsOldCounter INTEGER,\n"
+          + "  IsEvent INTEGER,\n"
+          + "  IsParameter INTEGER,\n"
+          + "  DontCountHits INTEGER,\n"
+          + "  WithHash INTEGER,\n"
           + "  HitColor VARCHAR,\n"
           + "  LocalEventTime TIMESTAMP,\n"
-          + "  Age SMALLINT,\n"
-          + "  Sex SMALLINT,\n"
-          + "  Income SMALLINT,\n"
-          + "  Interests SMALLINT,\n"
-          + "  Robotness SMALLINT,\n"
+          + "  Age INTEGER,\n"
+          + "  Sex INTEGER,\n"
+          + "  Income INTEGER,\n"
+          + "  Interests INTEGER,\n"
+          + "  Robotness INTEGER,\n"
           + "  RemoteIP INTEGER,\n"
           + "  WindowName INTEGER,\n"
           + "  OpenerName INTEGER,\n"
-          + "  HistoryLength SMALLINT,\n"
+          + "  HistoryLength INTEGER,\n"
           + "  BrowserLanguage VARCHAR,\n"
           + "  BrowserCountry VARCHAR,\n"
           + "  SocialNetwork VARCHAR,\n"
           + "  SocialAction VARCHAR,\n"
-          + "  HTTPError SMALLINT,\n"
+          + "  HTTPError INTEGER,\n"
           + "  SendTiming INTEGER,\n"
           + "  DNSTiming INTEGER,\n"
           + "  ConnectTiming INTEGER,\n"
           + "  ResponseStartTiming INTEGER,\n"
           + "  ResponseEndTiming INTEGER,\n"
           + "  FetchTiming INTEGER,\n"
-          + "  SocialSourceNetworkID SMALLINT,\n"
+          + "  SocialSourceNetworkID INTEGER,\n"
           + "  SocialSourcePage VARCHAR,\n"
           + "  ParamPrice BIGINT,\n"
           + "  ParamOrderID VARCHAR,\n"
           + "  ParamCurrency VARCHAR,\n"
-          + "  ParamCurrencyID SMALLINT,\n"
+          + "  ParamCurrencyID INTEGER,\n"
           + "  OpenstatServiceName VARCHAR,\n"
           + "  OpenstatCampaignID VARCHAR,\n"
           + "  OpenstatAdID VARCHAR,\n"
@@ -155,90 +161,90 @@ public class ClickBenchIT {
           + "  UTMContent VARCHAR,\n"
           + "  UTMTerm VARCHAR,\n"
           + "  FromTag VARCHAR,\n"
-          + "  HasGCLID SMALLINT,\n"
+          + "  HasGCLID INTEGER,\n"
           + "  RefererHash BIGINT,\n"
           + "  URLHash BIGINT,\n"
           + "  CLID INTEGER\n"
-          + ")";
+          + ") WITH (format = 'PARQUET')";
 
   /** INSERT statement with 3 sample rows covering all 105 columns. */
   private static final String INSERT_DATA_SQL =
       "INSERT INTO " + TABLE_NAME + " VALUES\n"
-          + "  (BIGINT '6842488688498454842', SMALLINT '1', 'Google Search Result',"
-          + " SMALLINT '1', TIMESTAMP '2013-07-15 10:30:00', DATE '2013-07-15',"
-          + " 62, 1234567, 229, BIGINT '435090932899640449', SMALLINT '0', SMALLINT '4',"
-          + " SMALLINT '2', 'http://www.google.com/search?q=test',"
-          + " 'http://www.google.com/', SMALLINT '0', SMALLINT '0', 229,"
-          + " SMALLINT '0', 229, SMALLINT '1920', SMALLINT '1080', SMALLINT '24',"
-          + " SMALLINT '11', SMALLINT '0', '', SMALLINT '3', SMALLINT '5',"
-          + " SMALLINT '48', '5.0', SMALLINT '1', SMALLINT '1', SMALLINT '0',"
-          + " SMALLINT '0', 'iPhone', '', 12345, SMALLINT '2',"
-          + " SMALLINT '2', 'test search phrase', SMALLINT '2', SMALLINT '0',"
-          + " SMALLINT '1920', SMALLINT '1080', SMALLINT '3',"
-          + " TIMESTAMP '2013-07-15 10:30:00', SMALLINT '5', SMALLINT '1', 1970,"
-          + " SMALLINT '0', 'utf-8', 223, SMALLINT '0', SMALLINT '0',"
-          + " SMALLINT '1', BIGINT '5765412345678901234',"
+          + "  (BIGINT '6842488688498454842', INTEGER '1', 'Google Search Result',"
+          + " INTEGER '1', TIMESTAMP '2013-07-15 10:30:00', DATE '2013-07-15',"
+          + " 62, 1234567, 229, BIGINT '435090932899640449', INTEGER '0', INTEGER '4',"
+          + " INTEGER '2', 'http://www.google.com/search?q=test',"
+          + " 'http://www.google.com/', INTEGER '0', INTEGER '0', 229,"
+          + " INTEGER '0', 229, INTEGER '1920', INTEGER '1080', INTEGER '24',"
+          + " INTEGER '11', INTEGER '0', '', INTEGER '3', INTEGER '5',"
+          + " INTEGER '48', '5.0', INTEGER '1', INTEGER '1', INTEGER '0',"
+          + " INTEGER '0', 'iPhone', '', 12345, INTEGER '2',"
+          + " INTEGER '2', 'test search phrase', INTEGER '2', INTEGER '0',"
+          + " INTEGER '1920', INTEGER '1080', INTEGER '3',"
+          + " TIMESTAMP '2013-07-15 10:30:00', INTEGER '5', INTEGER '1', 1970,"
+          + " INTEGER '0', 'utf-8', 223, INTEGER '0', INTEGER '0',"
+          + " INTEGER '1', BIGINT '5765412345678901234',"
           + " 'http://www.google.com/search?q=test', 12345,"
-          + " SMALLINT '0', SMALLINT '0', SMALLINT '0', SMALLINT '0', SMALLINT '0',"
-          + " 'W', TIMESTAMP '2013-07-15 13:30:00', SMALLINT '25', SMALLINT '1',"
-          + " SMALLINT '3', SMALLINT '10', SMALLINT '0', 167772161, 0, 0,"
-          + " SMALLINT '5', 'en', 'US', '', '',"
-          + " SMALLINT '0', 100, 50, 30, 200, 300, 350, SMALLINT '0', '',"
-          + " BIGINT '0', '', '', SMALLINT '0', '',"
+          + " INTEGER '0', INTEGER '0', INTEGER '0', INTEGER '0', INTEGER '0',"
+          + " 'W', TIMESTAMP '2013-07-15 13:30:00', INTEGER '25', INTEGER '1',"
+          + " INTEGER '3', INTEGER '10', INTEGER '0', 167772161, 0, 0,"
+          + " INTEGER '5', 'en', 'US', '', '',"
+          + " INTEGER '0', 100, 50, 30, 200, 300, 350, INTEGER '0', '',"
+          + " BIGINT '0', '', '', INTEGER '0', '',"
           + " '', '', '', '', '',"
-          + " '', '', '', '', SMALLINT '0',"
+          + " '', '', '', '', INTEGER '0',"
           + " BIGINT '3594120000172545465', BIGINT '2868770270353813622', 42),\n"
-          + "  (BIGINT '6842488688498454843', SMALLINT '0', 'Yandex Main Page',"
-          + " SMALLINT '1', TIMESTAMP '2013-07-15 11:45:00', DATE '2013-07-15',"
-          + " 62, 9876543, 1, BIGINT '435090932899640450', SMALLINT '0', SMALLINT '7',"
-          + " SMALLINT '1', 'http://yandex.ru/',"
-          + " 'http://example.com/', SMALLINT '0', SMALLINT '0', 1,"
-          + " SMALLINT '0', 1, SMALLINT '1366', SMALLINT '768', SMALLINT '24',"
-          + " SMALLINT '0', SMALLINT '0', '', SMALLINT '0', SMALLINT '0',"
-          + " SMALLINT '37', '4.0', SMALLINT '1', SMALLINT '1', SMALLINT '1',"
-          + " SMALLINT '1', 'Samsung Galaxy', '', 54321, SMALLINT '-1',"
-          + " SMALLINT '0', '', SMALLINT '0', SMALLINT '0',"
-          + " SMALLINT '1366', SMALLINT '768', SMALLINT '5',"
-          + " TIMESTAMP '2013-07-15 11:45:00', SMALLINT '0', SMALLINT '0', 0,"
-          + " SMALLINT '0', 'windows-1251', 100, SMALLINT '1', SMALLINT '0',"
-          + " SMALLINT '0', BIGINT '1234567890123456789',"
+          + "  (BIGINT '6842488688498454843', INTEGER '0', 'Yandex Main Page',"
+          + " INTEGER '1', TIMESTAMP '2013-07-15 11:45:00', DATE '2013-07-15',"
+          + " 62, 9876543, 1, BIGINT '435090932899640450', INTEGER '0', INTEGER '7',"
+          + " INTEGER '1', 'http://yandex.ru/',"
+          + " 'http://example.com/', INTEGER '0', INTEGER '0', 1,"
+          + " INTEGER '0', 1, INTEGER '1366', INTEGER '768', INTEGER '24',"
+          + " INTEGER '0', INTEGER '0', '', INTEGER '0', INTEGER '0',"
+          + " INTEGER '37', '4.0', INTEGER '1', INTEGER '1', INTEGER '1',"
+          + " INTEGER '1', 'Samsung Galaxy', '', 54321, INTEGER '-1',"
+          + " INTEGER '0', '', INTEGER '0', INTEGER '0',"
+          + " INTEGER '1366', INTEGER '768', INTEGER '5',"
+          + " TIMESTAMP '2013-07-15 11:45:00', INTEGER '0', INTEGER '0', 0,"
+          + " INTEGER '0', 'windows-1251', 100, INTEGER '1', INTEGER '0',"
+          + " INTEGER '0', BIGINT '1234567890123456789',"
           + " 'http://yandex.ru/', 54321,"
-          + " SMALLINT '0', SMALLINT '1', SMALLINT '0', SMALLINT '0', SMALLINT '0',"
-          + " 'R', TIMESTAMP '2013-07-15 16:45:00', SMALLINT '30', SMALLINT '2',"
-          + " SMALLINT '5', SMALLINT '15', SMALLINT '1', 167772162, 0, 0,"
-          + " SMALLINT '3', 'ru', 'RU', 'Facebook',"
-          + " 'share', SMALLINT '0', 200, 60, 40, 250, 400, 500,"
-          + " SMALLINT '1', 'http://facebook.com/page',"
-          + " BIGINT '100', 'order123', 'USD', SMALLINT '1',"
+          + " INTEGER '0', INTEGER '1', INTEGER '0', INTEGER '0', INTEGER '0',"
+          + " 'R', TIMESTAMP '2013-07-15 16:45:00', INTEGER '30', INTEGER '2',"
+          + " INTEGER '5', INTEGER '15', INTEGER '1', 167772162, 0, 0,"
+          + " INTEGER '3', 'ru', 'RU', 'Facebook',"
+          + " 'share', INTEGER '0', 200, 60, 40, 250, 400, 500,"
+          + " INTEGER '1', 'http://facebook.com/page',"
+          + " BIGINT '100', 'order123', 'USD', INTEGER '1',"
           + " 'service1', 'camp1', 'ad1', 'src1',"
           + " 'google', 'cpc', 'campaign1',"
-          + " 'content1', 'term1', 'tag1', SMALLINT '1',"
+          + " 'content1', 'term1', 'tag1', INTEGER '1',"
           + " BIGINT '7594120000172545465', BIGINT '3868770270353813622', 100),\n"
-          + "  (BIGINT '6842488688498454844', SMALLINT '1', 'OpenSearch Dashboard',"
-          + " SMALLINT '1', TIMESTAMP '2013-07-14 09:15:00', DATE '2013-07-14',"
-          + " 62, 5555555, 100, BIGINT '435090932899640451', SMALLINT '1', SMALLINT '2',"
-          + " SMALLINT '3', 'http://opensearch.org/docs',"
-          + " 'http://www.google.com/search?q=opensearch', SMALLINT '0',"
-          + " SMALLINT '0', 100, SMALLINT '0', 100, SMALLINT '2560', SMALLINT '1440',"
-          + " SMALLINT '32', SMALLINT '11', SMALLINT '0', '11.2',"
-          + " SMALLINT '4', SMALLINT '0', SMALLINT '52', '6.0',"
-          + " SMALLINT '1', SMALLINT '1', SMALLINT '0', SMALLINT '0', '',"
-          + " '', 67890, SMALLINT '6', SMALLINT '1',"
-          + " 'opensearch documentation', SMALLINT '0', SMALLINT '0',"
-          + " SMALLINT '2560', SMALLINT '1440', SMALLINT '-5',"
-          + " TIMESTAMP '2013-07-14 09:15:00', SMALLINT '5', SMALLINT '2', 2000,"
-          + " SMALLINT '0', 'utf-8', 500, SMALLINT '0', SMALLINT '0',"
-          + " SMALLINT '1', BIGINT '876543210987654321',"
+          + "  (BIGINT '6842488688498454844', INTEGER '1', 'OpenSearch Dashboard',"
+          + " INTEGER '1', TIMESTAMP '2013-07-14 09:15:00', DATE '2013-07-14',"
+          + " 62, 5555555, 100, BIGINT '435090932899640451', INTEGER '1', INTEGER '2',"
+          + " INTEGER '3', 'http://opensearch.org/docs',"
+          + " 'http://www.google.com/search?q=opensearch', INTEGER '0',"
+          + " INTEGER '0', 100, INTEGER '0', 100, INTEGER '2560', INTEGER '1440',"
+          + " INTEGER '32', INTEGER '11', INTEGER '0', '11.2',"
+          + " INTEGER '4', INTEGER '0', INTEGER '52', '6.0',"
+          + " INTEGER '1', INTEGER '1', INTEGER '0', INTEGER '0', '',"
+          + " '', 67890, INTEGER '6', INTEGER '1',"
+          + " 'opensearch documentation', INTEGER '0', INTEGER '0',"
+          + " INTEGER '2560', INTEGER '1440', INTEGER '-5',"
+          + " TIMESTAMP '2013-07-14 09:15:00', INTEGER '5', INTEGER '2', 2000,"
+          + " INTEGER '0', 'utf-8', 500, INTEGER '0', INTEGER '0',"
+          + " INTEGER '1', BIGINT '876543210987654321',"
           + " 'http://opensearch.org/docs', 67890,"
-          + " SMALLINT '1', SMALLINT '0', SMALLINT '1', SMALLINT '0', SMALLINT '1',"
-          + " 'G', TIMESTAMP '2013-07-14 04:15:00', SMALLINT '35', SMALLINT '1',"
-          + " SMALLINT '4', SMALLINT '20', SMALLINT '0', 167772163, 0, 0,"
-          + " SMALLINT '10', 'en', 'GB', '', '',"
-          + " SMALLINT '0', 150, 45, 25, 180, 280, 320, SMALLINT '0', '',"
-          + " BIGINT '50', '', '', SMALLINT '0', '',"
+          + " INTEGER '1', INTEGER '0', INTEGER '1', INTEGER '0', INTEGER '1',"
+          + " 'G', TIMESTAMP '2013-07-14 04:15:00', INTEGER '35', INTEGER '1',"
+          + " INTEGER '4', INTEGER '20', INTEGER '0', 167772163, 0, 0,"
+          + " INTEGER '10', 'en', 'GB', '', '',"
+          + " INTEGER '0', 150, 45, 25, 180, 280, 320, INTEGER '0', '',"
+          + " BIGINT '50', '', '', INTEGER '0', '',"
           + " '', '', '', 'bing',"
           + " 'organic', '', '', 'opensearch',"
-          + " '', SMALLINT '0', BIGINT '3594120000172545465',"
+          + " '', INTEGER '0', BIGINT '3594120000172545465',"
           + " BIGINT '2868770270353813622', 200)";
 
   @BeforeAll
@@ -258,13 +264,21 @@ public class ClickBenchIT {
     baseUrl = firstHost;
     httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
 
-    // Create table and insert data
-    System.out.println("Setting up ClickBench table: " + TABLE_NAME);
+    // Create schema, table, and insert data
+    System.out.println("Setting up ClickBench Iceberg table: " + TABLE_NAME);
 
     // Drop table if it exists from a previous run
     executeTrinoSql("DROP TABLE IF EXISTS " + TABLE_NAME);
 
-    // Create the hits table
+    // Create the Iceberg schema
+    JsonNode schemaResult = executeTrinoSql(CREATE_SCHEMA_SQL);
+    assertEquals(
+        "FINISHED",
+        getState(schemaResult),
+        "CREATE SCHEMA should succeed: " + getErrorMessage(schemaResult));
+    System.out.println("  CREATE SCHEMA: OK");
+
+    // Create the hits table with Parquet format
     JsonNode createResult = executeTrinoSql(CREATE_TABLE_SQL);
     assertEquals(
         "FINISHED",
@@ -289,12 +303,14 @@ public class ClickBenchIT {
   @AfterAll
   static void tearDown() throws Exception {
     if (httpClient != null && baseUrl != null) {
-      System.out.println("Cleaning up ClickBench table: " + TABLE_NAME);
+      System.out.println("Cleaning up ClickBench Iceberg table: " + TABLE_NAME);
       try {
         executeTrinoSql("DROP TABLE IF EXISTS " + TABLE_NAME);
         System.out.println("  DROP TABLE: OK");
+        executeTrinoSql("DROP SCHEMA IF EXISTS " + CATALOG + "." + SCHEMA);
+        System.out.println("  DROP SCHEMA: OK");
       } catch (Exception e) {
-        System.out.println("  DROP TABLE failed (non-fatal): " + e.getMessage());
+        System.out.println("  Cleanup failed (non-fatal): " + e.getMessage());
       }
     }
   }
@@ -317,7 +333,7 @@ public class ClickBenchIT {
 
       long startMs = System.currentTimeMillis();
       try {
-        JsonNode result = executeTrinoSql(query, "memory", "default");
+        JsonNode result = executeTrinoSql(query, CATALOG, SCHEMA);
         long elapsedMs = System.currentTimeMillis() - startMs;
 
         String state = getState(result);
@@ -357,7 +373,7 @@ public class ClickBenchIT {
 
   private static JsonNode executeTrinoSql(String sql)
       throws IOException, InterruptedException {
-    return executeTrinoSql(sql, "memory", "default");
+    return executeTrinoSql(sql, CATALOG, SCHEMA);
   }
 
   private static JsonNode executeTrinoSql(String sql, String catalog, String schema)

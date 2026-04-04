@@ -8,6 +8,8 @@ package org.opensearch.sql.trino.bootstrap;
 import io.trino.Session;
 import io.trino.connector.CatalogServiceProvider;
 import io.trino.metadata.SessionPropertyManager;
+import io.trino.hadoop.HadoopNative;
+import io.trino.plugin.iceberg.IcebergPlugin;
 import io.trino.plugin.memory.MemoryPlugin;
 import io.trino.plugin.tpch.TpchPlugin;
 import io.trino.spi.QueryId;
@@ -18,6 +20,9 @@ import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
 import java.io.Closeable;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.temporal.Temporal;
 import java.util.Collections;
 import java.util.List;
@@ -46,6 +51,13 @@ public class TrinoEngine implements Closeable {
   public TrinoEngine() {
     LOG.info("Initializing real Trino engine via DistributedQueryRunner");
     try {
+      // Pre-initialize Hadoop native library.  In a shadow-jar environment the
+      // CodeSource.getLocation() can return null which causes HadoopNative to
+      // fail with a NullPointerException.  We catch that and mark the native
+      // library as "loaded" via reflection so the Iceberg connector can proceed
+      // without native Hadoop codecs.
+      initHadoopNative();
+
       Session session = createDefaultSession();
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session).setNodeCount(1).build();
@@ -53,11 +65,56 @@ public class TrinoEngine implements Closeable {
       runner.createCatalog("tpch", "tpch", Map.of());
       runner.installPlugin(new MemoryPlugin());
       runner.createCatalog("memory", "memory", Map.of());
+      runner.installPlugin(new IcebergPlugin());
+      Path warehouseDir = Files.createTempDirectory("trino-iceberg-warehouse");
+      runner.createCatalog(
+          "iceberg",
+          "iceberg",
+          Map.of(
+              "iceberg.catalog.type", "TESTING_FILE_METASTORE",
+              "hive.metastore.catalog.dir",
+              warehouseDir.toUri().toString()));
       this.queryRunner = runner;
-      LOG.info("Trino engine initialized with TPCH and Memory catalogs");
+      LOG.info(
+          "Trino engine initialized with TPCH, Memory, and Iceberg catalogs"
+              + " (warehouse: {})",
+          warehouseDir);
     } catch (Exception e) {
       LOG.error("Failed to initialize Trino engine", e);
       throw new RuntimeException("Failed to initialize Trino engine", e);
+    }
+  }
+
+  /**
+   * Pre-initialize Hadoop native library for shadow-jar environments. In a shaded jar the
+   * {@code CodeSource.getLocation()} can return null which causes {@code HadoopNative} to fail
+   * with a NullPointerException. We try the normal path first; if it fails we mark the native
+   * library as "loaded" and clear the error via reflection so that downstream code (e.g. the
+   * Iceberg connector's HdfsEnvironment) does not throw.
+   */
+  @SuppressWarnings("JavaReflectionMemberAccess")
+  private static void initHadoopNative() {
+    try {
+      HadoopNative.requireHadoopNative();
+      LOG.info("Hadoop native library loaded successfully");
+    } catch (Throwable t) {
+      LOG.warn(
+          "Hadoop native library failed to load ({}); "
+              + "bypassing via reflection for shadow-jar compatibility",
+          t.getMessage());
+      try {
+        // Set HadoopNative.loaded = true and HadoopNative.error = null
+        // so subsequent calls to requireHadoopNative() succeed.
+        Field loadedField = HadoopNative.class.getDeclaredField("loaded");
+        loadedField.setAccessible(true);
+        loadedField.setBoolean(null, true);
+        Field errorField = HadoopNative.class.getDeclaredField("error");
+        errorField.setAccessible(true);
+        errorField.set(null, null);
+        LOG.info("Hadoop native library bypass applied via reflection");
+      } catch (Exception reflectionEx) {
+        LOG.warn("Failed to bypass Hadoop native library check", reflectionEx);
+      }
     }
   }
 

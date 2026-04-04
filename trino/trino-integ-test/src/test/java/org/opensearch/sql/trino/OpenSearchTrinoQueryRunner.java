@@ -44,7 +44,14 @@ import io.trino.transaction.TransactionManager;
 import io.trino.execution.FailureInjector.InjectedFailureType;
 import io.opentelemetry.sdk.trace.data.SpanData;
 
+import io.trino.spi.type.DecimalType;
+
 import java.io.IOException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.math.BigDecimal;
+import java.math.MathContext;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -58,6 +65,7 @@ import java.util.Optional;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -70,7 +78,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  */
 public class OpenSearchTrinoQueryRunner implements QueryRunner {
 
-  private static final ObjectMapper MAPPER = new ObjectMapper();
+  private static final ObjectMapper MAPPER = new ObjectMapper()
+      .configure(JsonParser.Feature.ALLOW_NON_NUMERIC_NUMBERS, true);
 
   private final String baseUrl;
   private final HttpClient httpClient;
@@ -140,6 +149,7 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
     JsonNode root = MAPPER.readTree(response.body());
 
     List<Type> columnTypes = new ArrayList<>();
+    List<String> columnTypeNames = new ArrayList<>(); // raw type name strings
     List<String> columnNames = new ArrayList<>();
     List<MaterializedRow> rows = new ArrayList<>();
 
@@ -147,12 +157,14 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
     if (root.has("columns")) {
       for (JsonNode col : root.get("columns")) {
         columnNames.add(col.get("name").asText());
-        columnTypes.add(parseTrinoType(col.get("type").asText()));
+        String typeName = col.get("type").asText();
+        columnTypeNames.add(typeName);
+        columnTypes.add(parseTrinoType(typeName));
       }
     }
 
     // Collect data from first response
-    collectRows(root, columnTypes, rows);
+    collectRows(root, columnTypes, columnTypeNames, rows);
 
     // Follow nextUri pagination until query completes
     while (root.has("nextUri")) {
@@ -172,11 +184,13 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
       if (columnTypes.isEmpty() && root.has("columns")) {
         for (JsonNode col : root.get("columns")) {
           columnNames.add(col.get("name").asText());
-          columnTypes.add(parseTrinoType(col.get("type").asText()));
+          String typeName = col.get("type").asText();
+          columnTypeNames.add(typeName);
+          columnTypes.add(parseTrinoType(typeName));
         }
       }
 
-      collectRows(root, columnTypes, rows);
+      collectRows(root, columnTypes, columnTypeNames, rows);
     }
 
     // Check for error
@@ -208,7 +222,8 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
         Optional.of(columnNames));
   }
 
-  private void collectRows(JsonNode root, List<Type> columnTypes, List<MaterializedRow> rows) {
+  private void collectRows(JsonNode root, List<Type> columnTypes,
+      List<String> columnTypeNames, List<MaterializedRow> rows) {
     if (!root.has("data")) {
       return;
     }
@@ -217,7 +232,8 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
       for (int i = 0; i < dataRow.size(); i++) {
         JsonNode val = dataRow.get(i);
         Type type = i < columnTypes.size() ? columnTypes.get(i) : VarcharType.VARCHAR;
-        values.add(parseValue(val, type));
+        String typeName = i < columnTypeNames.size() ? columnTypeNames.get(i) : "varchar";
+        values.add(parseValue(val, type, typeName));
       }
       rows.add(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, values));
     }
@@ -240,7 +256,19 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
       return VarcharType.VARCHAR; // simplify char to varchar
     }
     if (normalized.startsWith("decimal")) {
-      return DoubleType.DOUBLE; // simplify decimal to double
+      // Parse decimal(precision, scale)
+      try {
+        String params = normalized.substring("decimal".length()).trim();
+        if (params.startsWith("(") && params.endsWith(")")) {
+          String[] parts = params.substring(1, params.length() - 1).split(",");
+          int precision = Integer.parseInt(parts[0].trim());
+          int scale = Integer.parseInt(parts[1].trim());
+          return DecimalType.createDecimalType(precision, scale);
+        }
+      } catch (Exception e) {
+        // fall through
+      }
+      return DoubleType.DOUBLE; // fallback for unparseable decimal
     }
     if (normalized.startsWith("timestamp")) {
       return TimestampType.TIMESTAMP_MILLIS;
@@ -279,8 +307,9 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
 
   /**
    * Parse a JSON value into a Java object matching the given Trino type.
+   * The returned Java types must match what Trino's test framework expects.
    */
-  private static Object parseValue(JsonNode node, Type type) {
+  private static Object parseValue(JsonNode node, Type type, String typeName) {
     if (node == null || node.isNull()) {
       return null;
     }
@@ -301,13 +330,163 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
     if (type instanceof DoubleType) {
       return node.asDouble();
     }
+    if (type instanceof DecimalType decimalType) {
+      String text = node.isTextual() ? node.asText() : node.toString();
+      try {
+        BigDecimal bd = new BigDecimal(text);
+        bd = bd.setScale(decimalType.getScale(), java.math.RoundingMode.HALF_UP);
+        return new io.trino.spi.type.SqlDecimal(
+            bd.unscaledValue(), decimalType.getPrecision(), decimalType.getScale());
+      } catch (Exception e) {
+        return node.asDouble();
+      }
+    }
     if (type instanceof DateType) {
-      return node.asText();
+      return LocalDate.parse(node.asText());
+    }
+    if (type instanceof TimestampType) {
+      String text = node.asText();
+      try {
+        return java.time.LocalDateTime.parse(text.replace(" ", "T"));
+      } catch (Exception e) {
+        return text;
+      }
     }
     if (type instanceof VarbinaryType) {
       return node.asText();
     }
+
+    // Handle complex types using the raw type name for element type info
+    String normalizedTypeName = typeName != null ? typeName.toLowerCase().trim() : "";
+
+    // Array types: array(element_type)
+    if (normalizedTypeName.startsWith("array(") && node.isArray()) {
+      String elementTypeName = extractInnerType(normalizedTypeName, "array(");
+      Type elementType = parseTrinoType(elementTypeName);
+      List<Object> list = new ArrayList<>();
+      for (JsonNode element : node) {
+        list.add(parseValue(element, elementType, elementTypeName));
+      }
+      return list;
+    }
+
+    // Map types: map(key_type, value_type)
+    if (normalizedTypeName.startsWith("map(") && node.isObject()) {
+      String innerTypes = normalizedTypeName.substring(4, normalizedTypeName.length() - 1);
+      String[] kvTypes = splitMapTypes(innerTypes);
+      String keyTypeName = kvTypes[0];
+      String valueTypeName = kvTypes[1];
+      Type keyType = parseTrinoType(keyTypeName);
+      Type valueType = parseTrinoType(valueTypeName);
+      java.util.LinkedHashMap<Object, Object> map = new java.util.LinkedHashMap<>();
+      node.fields().forEachRemaining(entry -> {
+        // JSON keys are always strings — parse them according to the key type
+        Object key = parseTypedString(entry.getKey(), keyType);
+        Object val = parseValue(entry.getValue(), valueType, valueTypeName);
+        map.put(key, val);
+      });
+      return map;
+    }
+
+    // For any unrecognized complex type, try to preserve JSON structure
+    if (node.isArray()) {
+      List<Object> list = new ArrayList<>();
+      for (JsonNode element : node) {
+        list.add(parseGenericValue(element));
+      }
+      return list;
+    }
+    if (node.isObject()) {
+      java.util.LinkedHashMap<Object, Object> map = new java.util.LinkedHashMap<>();
+      node.fields().forEachRemaining(entry ->
+          map.put(entry.getKey(), parseGenericValue(entry.getValue())));
+      return map;
+    }
+
     // Default: return as string
+    return node.asText();
+  }
+
+  /**
+   * Extract the inner type from a parameterized type like "array(bigint)" -> "bigint".
+   */
+  private static String extractInnerType(String typeName, String prefix) {
+    // Remove prefix and trailing ")"
+    return typeName.substring(prefix.length(), typeName.length() - 1).trim();
+  }
+
+  /**
+   * Split "key_type, value_type" for map types, handling nested parentheses.
+   */
+  private static String[] splitMapTypes(String inner) {
+    int depth = 0;
+    for (int i = 0; i < inner.length(); i++) {
+      char c = inner.charAt(i);
+      if (c == '(') {
+        depth++;
+      } else if (c == ')') {
+        depth--;
+      } else if (c == ',' && depth == 0) {
+        return new String[]{inner.substring(0, i).trim(), inner.substring(i + 1).trim()};
+      }
+    }
+    return new String[]{inner, "varchar"}; // fallback
+  }
+
+  /**
+   * Parse a string value according to a specific type (used for JSON map keys).
+   */
+  private static Object parseTypedString(String value, Type type) {
+    if (type instanceof BigintType) {
+      return Long.parseLong(value);
+    }
+    if (type instanceof IntegerType) {
+      return Integer.parseInt(value);
+    }
+    if (type instanceof SmallintType || type instanceof TinyintType) {
+      return Integer.parseInt(value);
+    }
+    if (type instanceof DoubleType) {
+      return Double.parseDouble(value);
+    }
+    if (type instanceof RealType) {
+      return Float.parseFloat(value);
+    }
+    if (type instanceof BooleanType) {
+      return Boolean.parseBoolean(value);
+    }
+    return value;
+  }
+
+  /**
+   * Parse a JSON value into its natural Java type (for array/map elements).
+   */
+  private static Object parseGenericValue(JsonNode node) {
+    if (node == null || node.isNull()) {
+      return null;
+    }
+    if (node.isBoolean()) {
+      return node.asBoolean();
+    }
+    if (node.isIntegralNumber()) {
+      return node.asLong();
+    }
+    if (node.isFloatingPointNumber()) {
+      return node.asDouble();
+    }
+    if (node.isArray()) {
+      List<Object> list = new ArrayList<>();
+      for (JsonNode element : node) {
+        list.add(parseGenericValue(element));
+      }
+      return list;
+    }
+    if (node.isObject()) {
+      java.util.LinkedHashMap<Object, Object> map = new java.util.LinkedHashMap<>();
+      node.fields().forEachRemaining(entry ->
+          map.put(entry.getKey(), parseGenericValue(entry.getValue())));
+      return map;
+    }
     return node.asText();
   }
 

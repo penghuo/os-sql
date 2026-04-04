@@ -113,6 +113,7 @@ testClusters {
         plugin ':opensearch-sql-plugin'
         testDistribution = 'archive'
         setting 'plugins.trino.enabled', 'true'
+        jvmArgs '-Xms2g', '-Xmx2g'
     }
 }
 
@@ -161,6 +162,7 @@ task trinoTest(type: StandaloneRestIntegTestTask) {
     classpath = sourceSets.test.runtimeClasspath
 
     include '**/TestTrinoQueries.class'
+    include '**/TestTrinoAggregations.class'
     exclude '**/*NoExternalServer*.class'
 
     jvmArgs '-Xmx4g', '-XX:+UseG1GC'

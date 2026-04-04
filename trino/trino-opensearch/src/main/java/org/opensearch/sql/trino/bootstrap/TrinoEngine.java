@@ -19,6 +19,9 @@ import io.trino.testing.StandaloneQueryRunner;
 import java.io.Closeable;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.temporal.Temporal;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -174,15 +177,7 @@ public class TrinoEngine implements Closeable {
           sb.append(",");
         }
         Object val = fields.get(c);
-        if (val == null) {
-          sb.append("null");
-        } else if (val instanceof String s) {
-          sb.append("\"").append(escapeJson(s)).append("\"");
-        } else if (val instanceof Boolean) {
-          sb.append(val.toString());
-        } else {
-          sb.append(val.toString());
-        }
+        appendJsonValue(sb, val);
       }
       sb.append("]");
     }
@@ -249,6 +244,59 @@ public class TrinoEngine implements Closeable {
         + escapeJson(errorType)
         + "\""
         + "}}";
+  }
+
+  /**
+   * Append a value as valid JSON to the StringBuilder. Handles null, String, Boolean, Number
+   * (including NaN/Infinity), Date/Time types, List (arrays), and Map types. Falls back to quoted
+   * toString() for unknown types.
+   */
+  @SuppressWarnings("unchecked")
+  private static void appendJsonValue(StringBuilder sb, Object val) {
+    if (val == null) {
+      sb.append("null");
+    } else if (val instanceof String s) {
+      sb.append("\"").append(escapeJson(s)).append("\"");
+    } else if (val instanceof Boolean) {
+      sb.append(val.toString());
+    } else if (val instanceof Number) {
+      // Numbers (including NaN and Infinity) are written as-is. The client-side
+      // ObjectMapper must have ALLOW_NON_NUMERIC_NUMBERS enabled to parse NaN/Infinity.
+      sb.append(val);
+    } else if (val instanceof Temporal) {
+      // LocalDate, LocalTime, LocalDateTime, etc. — quote as strings
+      sb.append("\"").append(val).append("\"");
+    } else if (val instanceof List<?> list) {
+      sb.append("[");
+      for (int i = 0; i < list.size(); i++) {
+        if (i > 0) {
+          sb.append(",");
+        }
+        appendJsonValue(sb, list.get(i));
+      }
+      sb.append("]");
+    } else if (val instanceof Map<?, ?> map) {
+      sb.append("{");
+      boolean first = true;
+      for (Map.Entry<?, ?> entry : map.entrySet()) {
+        if (!first) {
+          sb.append(",");
+        }
+        first = false;
+        // JSON object keys must be strings
+        sb.append("\"").append(escapeJson(String.valueOf(entry.getKey()))).append("\":");
+        appendJsonValue(sb, entry.getValue());
+      }
+      sb.append("}");
+    } else if (val instanceof byte[] bytes) {
+      // Base64 encode binary data
+      sb.append("\"")
+          .append(java.util.Base64.getEncoder().encodeToString(bytes))
+          .append("\"");
+    } else {
+      // Unknown type: quote as string to ensure valid JSON
+      sb.append("\"").append(escapeJson(val.toString())).append("\"");
+    }
   }
 
   private static String escapeJson(String s) {

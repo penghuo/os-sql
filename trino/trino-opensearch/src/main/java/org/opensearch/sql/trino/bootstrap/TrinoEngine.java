@@ -8,6 +8,7 @@ package org.opensearch.sql.trino.bootstrap;
 import io.trino.Session;
 import io.trino.connector.CatalogServiceProvider;
 import io.trino.metadata.SessionPropertyManager;
+import io.trino.plugin.memory.MemoryPlugin;
 import io.trino.plugin.tpch.TpchPlugin;
 import io.trino.spi.QueryId;
 import io.trino.spi.security.Identity;
@@ -57,9 +58,11 @@ public class TrinoEngine implements Closeable {
                     StandaloneQueryRunner runner = new StandaloneQueryRunner(session);
                     runner.installPlugin(new TpchPlugin());
                     runner.createCatalog("tpch", "tpch", Map.of());
+                    runner.installPlugin(new MemoryPlugin());
+                    runner.createCatalog("memory", "memory", Map.of());
                     return runner;
                   });
-      LOG.info("Trino engine initialized with TPCH catalog");
+      LOG.info("Trino engine initialized with TPCH and Memory catalogs");
     } catch (Exception e) {
       LOG.error("Failed to initialize Trino engine", e);
       throw new RuntimeException("Failed to initialize Trino engine", e);

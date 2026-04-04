@@ -35,6 +35,7 @@ dependencies {
     shade "io.trino:trino-spi:${trinoVersion}"
     shade "io.trino:trino-plugin-toolkit:${trinoVersion}"
     shade "io.trino:trino-tpch:${trinoVersion}"
+    shade "io.trino:trino-memory:${trinoVersion}"
 
     // OpenTelemetry SDK needed by Trino at runtime
     shade "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
@@ -44,6 +45,7 @@ dependencies {
     compileOnly "io.trino:trino-main:${trinoVersion}"
     compileOnly "io.trino:trino-spi:${trinoVersion}"
     compileOnly "io.trino:trino-tpch:${trinoVersion}"
+    compileOnly "io.trino:trino-memory:${trinoVersion}"
     compileOnly "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
 
     // OpenSearch APIs (provided by plugin runtime)

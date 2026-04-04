@@ -74,6 +74,7 @@ dependencies {
     }
     testImplementation "io.trino:trino-spi:${trinoVersion}"
     testImplementation "io.trino:trino-tpch:${trinoVersion}"
+    testImplementation "io.trino:trino-memory:${trinoVersion}"
     testImplementation "io.trino:trino-iceberg:${trinoVersion}"
     testImplementation "io.trino:trino-hive:${trinoVersion}"
     testImplementation "io.trino:trino-exchange-filesystem:${trinoVersion}"
@@ -164,6 +165,7 @@ task trinoTest(type: StandaloneRestIntegTestTask) {
     include '**/TestTrinoQueries.class'
     include '**/TestTrinoAggregations.class'
     include '**/TestTrinoJoinQueries.class'
+    include '**/ClickBenchIT.class'
     exclude '**/*NoExternalServer*.class'
 
     jvmArgs '-Xmx4g', '-XX:+UseG1GC'

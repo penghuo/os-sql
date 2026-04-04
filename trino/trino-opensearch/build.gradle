@@ -1,0 +1,27 @@
+plugins {
+    id 'java-library'
+}
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+dependencies {
+    // Trino engine — used as library, NEVER as server
+    api "io.trino:trino-main:${trinoVersion}"
+    api "io.trino:trino-parser:${trinoVersion}"
+    api "io.trino:trino-spi:${trinoVersion}"
+    api "io.trino:trino-plugin-toolkit:${trinoVersion}"
+
+    // OpenSearch APIs (provided by plugin runtime)
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
+    testImplementation "org.mockito:mockito-core:${versions.mockito}"
+}

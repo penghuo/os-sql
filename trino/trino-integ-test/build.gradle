@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+dependencies {
+    testImplementation project(':trino:trino-opensearch')
+
+    // Trino test framework
+    testImplementation "io.trino:trino-testing:${trinoVersion}"
+    testImplementation("io.trino:trino-main:${trinoVersion}") {
+        artifact { classifier = 'tests' }
+    }
+    testImplementation "io.trino:trino-tpch:${trinoVersion}"
+    testImplementation "io.trino:trino-iceberg:${trinoVersion}"
+    testImplementation "io.trino:trino-hive:${trinoVersion}"
+    testImplementation "io.trino:trino-exchange-filesystem:${trinoVersion}"
+    testImplementation "io.trino:trino-jdbc:${trinoVersion}"
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
+    testImplementation 'org.assertj:assertj-core:3.24.2'
+}
+
+test {
+    useJUnitPlatform()
+    jvmArgs '-Xmx4g', '-XX:+UseG1GC'
+    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+             '--add-opens=java.base/java.nio=ALL-UNNAMED'
+}

@@ -1,0 +1,7 @@
+subprojects {
+    ext {
+        // Trino 440 is approximately the last Java 21 compatible version.
+        // If compilation fails, try 439, 438, etc.
+        trinoVersion = '440'
+    }
+}

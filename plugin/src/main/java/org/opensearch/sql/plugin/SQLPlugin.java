@@ -121,8 +121,11 @@ import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
+import org.opensearch.sql.trino.plugin.TrinoSettings;
+import org.opensearch.sql.trino.rest.RestTrinoQueryAction;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
+import org.opensearch.threadpool.ScalingExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
@@ -136,6 +139,10 @@ public class SQLPlugin extends Plugin
         ExtensiblePlugin {
 
   private static final Logger LOGGER = LogManager.getLogger(SQLPlugin.class);
+
+  public static final String TRINO_QUERY_THREAD_POOL_NAME = "trino_query";
+  public static final String TRINO_EXCHANGE_THREAD_POOL_NAME = "trino_exchange";
+  public static final String TRINO_SCHEDULER_THREAD_POOL_NAME = "trino_scheduler";
 
   private List<ExecutionEngine> executionEngineExtensions = List.of();
   private ClusterService clusterService;
@@ -192,7 +199,8 @@ public class SQLPlugin extends Plugin
         new RestDataSourceQueryAction((OpenSearchSettings) pluginSettings),
         new RestAsyncQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryManagementAction((OpenSearchSettings) pluginSettings),
-        new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings));
+        new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings),
+        new RestTrinoQueryAction());
   }
 
   /** Register action and handler so that transportClient can find proxy for action. */
@@ -344,20 +352,37 @@ public class SQLPlugin extends Plugin
     // pool is a separate queue for asynchronous requests to other nodes. We keep them separate to
     // prevent deadlocks during async fetches on small node counts. Tasks in the background pool
     // should do no work except I/O to other services.
+    int processors = OpenSearchExecutors.allocatedProcessors(settings);
     return List.of(
         new FixedExecutorBuilder(
             settings,
             SQL_WORKER_THREAD_POOL_NAME,
-            OpenSearchExecutors.allocatedProcessors(settings),
+            processors,
             1000,
             "thread_pool." + SQL_WORKER_THREAD_POOL_NAME),
         new FixedExecutorBuilder(
             settings,
             SQL_BACKGROUND_THREAD_POOL_NAME,
-            settings.getAsInt(
-                "thread_pool.search.size", OpenSearchExecutors.allocatedProcessors(settings)),
+            settings.getAsInt("thread_pool.search.size", processors),
             1000,
-            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME));
+            "thread_pool." + SQL_BACKGROUND_THREAD_POOL_NAME),
+        new FixedExecutorBuilder(
+            settings,
+            TRINO_QUERY_THREAD_POOL_NAME,
+            processors * 2,
+            1000,
+            "thread_pool." + TRINO_QUERY_THREAD_POOL_NAME),
+        new ScalingExecutorBuilder(
+            TRINO_EXCHANGE_THREAD_POOL_NAME,
+            1,
+            processors,
+            org.opensearch.common.unit.TimeValue.timeValueMinutes(5)),
+        new FixedExecutorBuilder(
+            settings,
+            TRINO_SCHEDULER_THREAD_POOL_NAME,
+            4,
+            1000,
+            "thread_pool." + TRINO_SCHEDULER_THREAD_POOL_NAME));
   }
 
   @Override
@@ -365,6 +390,7 @@ public class SQLPlugin extends Plugin
     return new ImmutableList.Builder<Setting<?>>()
         .addAll(OpenSearchSettings.pluginSettings())
         .addAll(OpenSearchSettings.pluginNonDynamicSettings())
+        .addAll(TrinoSettings.settings())
         .build();
   }
 

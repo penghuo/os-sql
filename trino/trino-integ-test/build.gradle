@@ -1,6 +1,12 @@
+import java.util.concurrent.Callable
+
+import org.opensearch.gradle.testclusters.StandaloneRestIntegTestTask
+
 plugins {
     id 'java'
 }
+
+apply plugin: 'opensearch.testclusters'
 
 repositories {
     mavenCentral()
@@ -11,28 +17,134 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+configurations {
+    zipArchive
+    // Separate configuration for OpenSearch REST integration tests
+    // Excludes Trino deps which cause jar hell with OpenSearch test framework
+    integTestImpl.extendsFrom(testImplementation)
+    integTestImpl {
+        exclude group: 'io.trino'
+        exclude group: 'io.airlift'
+        exclude group: 'org.apache.parquet'
+        exclude group: 'io.opentelemetry'
+    }
+}
+
+configurations.all {
+    // Exclude log4j-to-slf4j brought by Trino — conflicts with log4j-slf4j-impl used by OpenSearch
+    exclude group: 'org.apache.logging.log4j', module: 'log4j-to-slf4j'
+    // Exclude parquet-hadoop — trino-parquet shadows these classes, causing jar hell
+    exclude group: 'org.apache.parquet', module: 'parquet-hadoop'
+    resolutionStrategy.force "commons-logging:commons-logging:${commons_logging_version}"
+    resolutionStrategy.force "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+    resolutionStrategy.force "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-smile:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${versions.jackson}"
+    resolutionStrategy.force "commons-codec:commons-codec:${commons_codec_version}"
+    resolutionStrategy.force "com.google.guava:guava:${guava_version}"
+    resolutionStrategy.force "com.google.guava:failureaccess:1.0.2"
+    resolutionStrategy.force "com.squareup.okhttp3:okhttp:4.12.0"
+    resolutionStrategy.force "joda-time:joda-time:2.10.12"
+    resolutionStrategy.force "org.slf4j:slf4j-api:1.7.36"
+    resolutionStrategy.force "org.apache.httpcomponents:httpcore:4.4.15"
+    resolutionStrategy.force "org.apache.httpcomponents:httpclient:4.5.13"
+    resolutionStrategy.force "org.apache.httpcomponents.client5:httpclient5:${versions.httpclient5}"
+    resolutionStrategy.force "org.apache.httpcomponents.core5:httpcore5:${versions.httpcore5}"
+    resolutionStrategy.force "org.apache.httpcomponents.core5:httpcore5-h2:${versions.httpcore5}"
+    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
+    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
+    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+}
+
 dependencies {
     testImplementation project(':trino:trino-opensearch')
+    testImplementation project(':opensearch-sql-plugin')
+
+    // OpenSearch test framework (provides OpenSearchRestTestCase)
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+    testImplementation "org.opensearch.client:opensearch-rest-client:${opensearch_version}"
 
     // Trino test framework
     testImplementation "io.trino:trino-testing:${trinoVersion}"
+    testImplementation "io.trino:trino-main:${trinoVersion}"
     testImplementation("io.trino:trino-main:${trinoVersion}") {
         artifact { classifier = 'tests' }
     }
+    testImplementation "io.trino:trino-spi:${trinoVersion}"
     testImplementation "io.trino:trino-tpch:${trinoVersion}"
     testImplementation "io.trino:trino-iceberg:${trinoVersion}"
     testImplementation "io.trino:trino-hive:${trinoVersion}"
     testImplementation "io.trino:trino-exchange-filesystem:${trinoVersion}"
     testImplementation "io.trino:trino-jdbc:${trinoVersion}"
 
+    // Trino and its tests need opentelemetry SDK for tracing
+    testImplementation "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
+    testImplementation "io.opentelemetry:opentelemetry-sdk:${versions.opentelemetry}"
+
     testImplementation 'org.junit.jupiter:junit-jupiter:5.9.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     testImplementation 'org.assertj:assertj-core:3.24.2'
+
+    // Needed for test cluster plugin
+    zipArchive group: 'org.opensearch.plugin', name:'opensearch-job-scheduler', version: "${opensearch_build}"
 }
 
+def getJobSchedulerPlugin() {
+    provider(new Callable<RegularFile>() {
+        @Override
+        RegularFile call() throws Exception {
+            return new RegularFile() {
+                @Override
+                File getAsFile() {
+                    return configurations.zipArchive.asFileTree.matching {
+                        include '**/opensearch-job-scheduler*'
+                    }.singleFile
+                }
+            }
+        }
+    })
+}
+
+testClusters {
+    integTest {
+        plugin(getJobSchedulerPlugin())
+        plugin ':opensearch-sql-plugin'
+        testDistribution = 'archive'
+        setting 'plugins.trino.enabled', 'true'
+    }
+}
+
+task integTest(type: StandaloneRestIntegTestTask) {
+    useCluster testClusters.integTest
+    dependsOn ':opensearch-sql-plugin:bundlePlugin'
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'tests.jarhell.check', 'false'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.output + configurations.integTestImpl
+
+    filter {
+        includeTestsMatching 'org.opensearch.sql.trino.NoExternalServerTest'
+    }
+
+    doFirst {
+        String allHttpSocketURI = testClusters.integTest.nodes.stream().flatMap { node ->
+            node.getAllHttpSocketURI().stream()
+        }.collect(java.util.stream.Collectors.joining(","))
+        systemProperty 'tests.rest.cluster', allHttpSocketURI
+        systemProperty 'tests.cluster', allHttpSocketURI
+        systemProperty 'tests.clustername', 'integTest'
+    }
+}
+
+// Separate task for Trino QueryRunner tests (JUnit5, no cluster needed)
 test {
     useJUnitPlatform()
     jvmArgs '-Xmx4g', '-XX:+UseG1GC'
     jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
              '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    // Only include Trino query runner tests, not the OpenSearch integ tests
+    include '**/*TestTrino*.class'
+    exclude '**/*NoExternalServer*.class'
 }

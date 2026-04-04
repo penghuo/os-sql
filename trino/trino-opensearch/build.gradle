@@ -13,10 +13,10 @@ java {
 
 dependencies {
     // Trino engine — used as library, NEVER as server
-    api "io.trino:trino-main:${trinoVersion}"
-    api "io.trino:trino-parser:${trinoVersion}"
-    api "io.trino:trino-spi:${trinoVersion}"
-    api "io.trino:trino-plugin-toolkit:${trinoVersion}"
+    implementation "io.trino:trino-main:${trinoVersion}"
+    implementation "io.trino:trino-parser:${trinoVersion}"
+    implementation "io.trino:trino-spi:${trinoVersion}"
+    implementation "io.trino:trino-plugin-toolkit:${trinoVersion}"
 
     // OpenSearch APIs (provided by plugin runtime)
     compileOnly "org.opensearch:opensearch:${opensearch_version}"

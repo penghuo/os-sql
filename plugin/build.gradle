@@ -120,6 +120,27 @@ configurations.all {
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
     resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+    // Trino transitive dependency conflicts
+    resolutionStrategy.force "com.fasterxml.jackson.datatype:jackson-datatype-guava:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.datatype:jackson-datatype-jdk8:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.datatype:jackson-datatype-joda:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${versions.jackson}"
+    resolutionStrategy.force "com.fasterxml.jackson.module:jackson-module-parameter-names:${versions.jackson}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-api:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-context:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-common:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-trace:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-metrics:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-logs:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-testing:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-exporter-otlp:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-exporter-otlp-common:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-exporter-sender-okhttp:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-exporter-common:${versions.opentelemetry}"
+    resolutionStrategy.force "io.opentelemetry:opentelemetry-sdk-extension-autoconfigure-spi:${versions.opentelemetry}"
+    resolutionStrategy.force "org.ow2.asm:asm:${versions.asm}"
+    resolutionStrategy.force "it.unimi.dsi:fastutil:${versions.fastutil}"
 }
 
 configurations {
@@ -166,6 +187,12 @@ dependencies {
     api project(':datasources')
     api project(':async-query')
     api project(':direct-query')
+    api(project(':trino:trino-opensearch')) {
+        // Only need TrinoSettings and RestTrinoQueryAction (OpenSearch-only APIs).
+        // Exclude Trino engine deps -- they are not needed at plugin runtime for Task 3.
+        exclude group: 'io.trino'
+        exclude group: 'io.airlift'
+    }
 
     testImplementation group: 'net.bytebuddy', name: 'byte-buddy-agent', version: '1.15.11'
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"

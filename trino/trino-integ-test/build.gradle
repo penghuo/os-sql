@@ -147,4 +147,32 @@ test {
     // Only include Trino query runner tests, not the OpenSearch integ tests
     include '**/*TestTrino*.class'
     exclude '**/*NoExternalServer*.class'
+    // When run standalone (without cluster), skip; use trinoTest task instead
+    enabled = false
+}
+
+// Trino AbstractTestQueries integration test — runs TestTrinoQueries against the integTest cluster
+task trinoTest(type: StandaloneRestIntegTestTask) {
+    useJUnitPlatform()
+    useCluster testClusters.integTest
+    dependsOn ':opensearch-sql-plugin:bundlePlugin'
+
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+
+    include '**/TestTrinoQueries.class'
+    exclude '**/*NoExternalServer*.class'
+
+    jvmArgs '-Xmx4g', '-XX:+UseG1GC'
+    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+             '--add-opens=java.base/java.nio=ALL-UNNAMED'
+
+    systemProperty 'tests.security.manager', 'false'
+
+    doFirst {
+        String allHttpSocketURI = testClusters.integTest.nodes.stream().flatMap { node ->
+            node.getAllHttpSocketURI().stream()
+        }.collect(java.util.stream.Collectors.joining(","))
+        systemProperty 'tests.rest.cluster', allHttpSocketURI
+    }
 }

@@ -89,6 +89,8 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
         .setIdentity(identity)
         .setOriginalIdentity(identity)
         .setSource("opensearch-trino-test")
+        .setCatalog("tpch")
+        .setSchema("tiny")
         .setQueryId(QueryId.valueOf("test"))
         .build();
   }
@@ -103,6 +105,9 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
   public MaterializedResult execute(Session session, String sql) {
     try {
       return executeViaHttp(sql);
+    } catch (io.trino.spi.TrinoException e) {
+      // Preserve TrinoException unwrapped so test framework can detect it
+      throw e;
     } catch (Exception e) {
       throw new RuntimeException("Failed to execute query: " + sql, e);
     }
@@ -122,9 +127,11 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
 
     HttpRequest request = HttpRequest.newBuilder()
         .uri(URI.create(statementUrl))
-        .header("Content-Type", "text/plain")
+        .header("Content-Type", "application/json")
         .header("X-Trino-User", "trino-test")
         .header("X-Trino-Source", "opensearch-trino-test")
+        .header("X-Trino-Catalog", "tpch")
+        .header("X-Trino-Schema", "tiny")
         .POST(HttpRequest.BodyPublishers.ofString(sql))
         .timeout(Duration.ofSeconds(60))
         .build();
@@ -176,7 +183,18 @@ public class OpenSearchTrinoQueryRunner implements QueryRunner {
     if (root.has("error")) {
       JsonNode error = root.get("error");
       String message = error.has("message") ? error.get("message").asText() : "Unknown error";
-      throw new RuntimeException("Query failed: " + message);
+
+      // Map errorName/errorType to a StandardErrorCode when possible
+      io.trino.spi.StandardErrorCode errorCode = io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
+      if (error.has("errorName")) {
+        String errorName = error.get("errorName").asText();
+        try {
+          errorCode = io.trino.spi.StandardErrorCode.valueOf(errorName);
+        } catch (IllegalArgumentException ignored) {
+          // fall back to GENERIC_INTERNAL_ERROR
+        }
+      }
+      throw new io.trino.spi.TrinoException(errorCode, message);
     }
 
     // Parse update type and count if present

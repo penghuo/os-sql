@@ -84,8 +84,12 @@ public class RestTrinoQueryAction extends BaseRestHandler {
     LOG.debug("Trino: received query [{}]", query);
 
     if (engine != null) {
+      // Read optional catalog/schema from Trino client headers
+      String catalog = request.header("X-Trino-Catalog");
+      String schema = request.header("X-Trino-Schema");
+
       // Real execution via TrinoEngine
-      String responseBody = engine.executeAndSerializeJson(query);
+      String responseBody = engine.executeAndSerializeJson(query, catalog, schema);
       return channel ->
           channel.sendResponse(new BytesRestResponse(OK, "application/json", responseBody));
     }

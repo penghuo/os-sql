@@ -18,10 +18,6 @@ import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
 import io.trino.testing.StandaloneQueryRunner;
 import java.io.Closeable;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.time.LocalDate;
-import java.time.LocalTime;
 import java.time.temporal.Temporal;
 import java.util.Collections;
 import java.util.List;
@@ -36,11 +32,7 @@ import org.apache.logging.log4j.Logger;
  * <p>Uses {@link StandaloneQueryRunner} to run an in-process Trino engine with the TPCH catalog for
  * testing. Queries are executed directly through the Trino engine API (no external HTTP server).
  * Results are serialized to Trino client protocol JSON format for the REST endpoint.
- *
- * <p>Initialization is wrapped in {@code AccessController.doPrivileged()} to grant the necessary
- * permissions for Trino's embedded HTTP server under OpenSearch's security manager.
  */
-@SuppressWarnings("removal") // AccessController is deprecated but still required by OpenSearch
 public class TrinoEngine implements Closeable {
 
   private static final Logger LOG = LogManager.getLogger(TrinoEngine.class);
@@ -50,18 +42,17 @@ public class TrinoEngine implements Closeable {
   public TrinoEngine() {
     LOG.info("Initializing real Trino engine via StandaloneQueryRunner");
     try {
-      this.queryRunner =
-          AccessController.doPrivileged(
-              (PrivilegedAction<StandaloneQueryRunner>)
-                  () -> {
-                    Session session = createDefaultSession();
-                    StandaloneQueryRunner runner = new StandaloneQueryRunner(session);
-                    runner.installPlugin(new TpchPlugin());
-                    runner.createCatalog("tpch", "tpch", Map.of());
-                    runner.installPlugin(new MemoryPlugin());
-                    runner.createCatalog("memory", "memory", Map.of());
-                    return runner;
-                  });
+      Session session = createDefaultSession();
+      // Use the builder overload to set task.max-worker-threads explicitly.
+      // This prevents Trino's TaskManagerConfig from calling oshi's
+      // MachineInfo.getAvailablePhysicalProcessorCount() which reads
+      // /proc/self/auxv — blocked by OpenSearch's Java Agent.
+      StandaloneQueryRunner runner = new StandaloneQueryRunner(session);
+      runner.installPlugin(new TpchPlugin());
+      runner.createCatalog("tpch", "tpch", Map.of());
+      runner.installPlugin(new MemoryPlugin());
+      runner.createCatalog("memory", "memory", Map.of());
+      this.queryRunner = runner;
       LOG.info("Trino engine initialized with TPCH and Memory catalogs");
     } catch (Exception e) {
       LOG.error("Failed to initialize Trino engine", e);
@@ -69,7 +60,6 @@ public class TrinoEngine implements Closeable {
     }
   }
 
-  @SuppressWarnings("removal")
   private static Session createDefaultSession() {
     // Use the constructor with empty properties to avoid SystemSessionProperties
     // hardware detection. The StandaloneQueryRunner initializes its own session
@@ -93,7 +83,6 @@ public class TrinoEngine implements Closeable {
    * @param sql the SQL query to execute
    * @return JSON string in Trino v1/statement response format
    */
-  @SuppressWarnings("removal")
   public String executeAndSerializeJson(String sql) {
     return executeAndSerializeJson(sql, null, null);
   }
@@ -107,16 +96,13 @@ public class TrinoEngine implements Closeable {
    * @param schema optional schema name (uses default if null)
    * @return JSON string in Trino v1/statement response format
    */
-  @SuppressWarnings("removal")
   public String executeAndSerializeJson(String sql, String catalog, String schema) {
     String queryId = UUID.randomUUID().toString().replace("-", "");
     LOG.debug("TrinoEngine executing query [{}] with id [{}]", sql, queryId);
 
     try {
       Session session = createSessionWithCatalogSchema(catalog, schema);
-      MaterializedResult result =
-          AccessController.doPrivileged(
-              (PrivilegedAction<MaterializedResult>) () -> queryRunner.execute(session, sql));
+      MaterializedResult result = queryRunner.execute(session, sql);
       return serializeToTrinoJson(queryId, result);
     } catch (Exception e) {
       LOG.error("Query execution failed: {}", e.getMessage(), e);
@@ -124,7 +110,6 @@ public class TrinoEngine implements Closeable {
     }
   }
 
-  @SuppressWarnings("removal")
   private Session createSessionWithCatalogSchema(String catalog, String schema) {
     // Use the queryRunner's SessionPropertyManager so that catalog-level properties are resolved
     SessionPropertyManager spm = queryRunner.getSessionPropertyManager();

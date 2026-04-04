@@ -92,7 +92,9 @@ shadowJar {
     relocate 'com.dynatrace', "${shadedPrefix}.dynatrace"
     // Do NOT relocate com.sun.jna — JNA native library loading requires exact package name.
     // JNA is in OpenSearch core lib, so we exclude it from the shadow jar.
-    // oshi.* is also not relocated, so it can call into JNA with correct class names.
+    // Relocate oshi so it runs in the plugin's protection domain, allowing
+    // /proc and /sys access per plugin-security.policy.
+    relocate 'oshi', "${shadedPrefix}.oshi"
 
     relocate 'javax.inject', "${shadedPrefix}.javax.inject"
     relocate 'javax.annotation', "${shadedPrefix}.javax.annotation"
@@ -131,8 +133,7 @@ shadowJar {
     relocate 'okhttp3', "${shadedPrefix}.okhttp3"
     relocate 'okio', "${shadedPrefix}.okio"
     relocate 'kotlin', "${shadedPrefix}.kotlin"
-    // Do NOT relocate oshi — it calls JNA which requires unrelocated package names
-    // oshi is not in OpenSearch's classpath, so no jar hell
+    // oshi is relocated above to run in plugin's protection domain
     relocate 'dev', "${shadedPrefix}.dev"
     relocate 'oauth2', "${shadedPrefix}.oauth2"
 

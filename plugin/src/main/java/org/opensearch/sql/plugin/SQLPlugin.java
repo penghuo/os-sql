@@ -139,6 +139,21 @@ public class SQLPlugin extends Plugin
         JobSchedulerExtension,
         ExtensiblePlugin {
 
+  static {
+    // Prevent oshi from reading /proc/self/auxv which is blocked by OpenSearch's
+    // Java Agent. oshi is relocated in the shadow jar. We call GlobalConfig via
+    // reflection since the classes are shaded.
+    try {
+      Class<?> globalConfig =
+          Class.forName("org.opensearch.sql.trino.shaded.oshi.util.GlobalConfig");
+      globalConfig
+          .getMethod("set", String.class, Object.class)
+          .invoke(null, "org.opensearch.sql.trino.shaded.oshi.util.proc.path", "/dev/null");
+    } catch (Exception e) {
+      // oshi not on classpath — fine, no Trino engine to worry about
+    }
+  }
+
   private static final Logger LOGGER = LogManager.getLogger(SQLPlugin.class);
 
   public static final String TRINO_QUERY_THREAD_POOL_NAME = "trino_query";

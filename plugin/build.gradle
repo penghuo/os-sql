@@ -187,11 +187,8 @@ dependencies {
     api project(':datasources')
     api project(':async-query')
     api project(':direct-query')
-    api(project(':trino:trino-opensearch')) {
-        // Exclude Trino engine deps -- loaded via isolated classloader at runtime.
-        exclude group: 'io.trino'
-        exclude group: 'io.airlift'
-    }
+    // Shadow jar — all Trino/Airlift deps are relocated, no conflicts
+    api project(':trino:trino-opensearch')
 
     testImplementation group: 'net.bytebuddy', name: 'byte-buddy-agent', version: '1.15.11'
     testImplementation group: 'org.hamcrest', name: 'hamcrest-library', version: "${hamcrest_version}"

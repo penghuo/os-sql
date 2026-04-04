@@ -28,4 +28,13 @@ grant {
   // Calcite
   permission java.util.PropertyPermission "*", "read,write";
   permission java.lang.RuntimePermission "*";
+
+  // Trino engine: oshi needs to read /proc for hardware detection,
+  // Trino needs temp dirs for spill and server, socket for in-process server
+  permission java.io.FilePermission "/proc/-", "read";
+  permission java.io.FilePermission "/sys/-", "read";
+  permission java.io.FilePermission "${java.io.tmpdir}/-", "read,write,delete";
+  permission java.io.FilePermission "/tmp/-", "read,write,delete,execute";
+  permission java.net.SocketPermission "localhost:0", "listen,resolve";
+  permission java.lang.RuntimePermission "accessClassInPackage.*";
 };

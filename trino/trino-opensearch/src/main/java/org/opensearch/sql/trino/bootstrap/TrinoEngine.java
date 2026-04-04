@@ -60,8 +60,23 @@ public class TrinoEngine implements Closeable {
       initHadoopNative();
 
       Session session = createDefaultSession();
+      // Configure Trino memory adaptively based on available heap.
+      // Use 70% of heap for queries, 15% for headroom, rest for OS overhead.
+      long maxHeap = Runtime.getRuntime().maxMemory();
+      long queryMem = (long) (maxHeap * 0.70);
+      long headroom = (long) (maxHeap * 0.15);
+      String queryMemStr = (queryMem / (1024 * 1024)) + "MB";
+      String headroomStr = (headroom / (1024 * 1024)) + "MB";
+      LOG.info("Trino memory config: heap={}MB, queryMem={}, headroom={}",
+          maxHeap / (1024 * 1024), queryMemStr, headroomStr);
+
       DistributedQueryRunner runner =
-          DistributedQueryRunner.builder(session).setNodeCount(1).build();
+          DistributedQueryRunner.builder(session)
+              .setNodeCount(1)
+              .addExtraProperty("query.max-memory-per-node", queryMemStr)
+              .addExtraProperty("query.max-memory", queryMemStr)
+              .addExtraProperty("memory.heap-headroom-per-node", headroomStr)
+              .build();
       runner.installPlugin(new TpchPlugin());
       runner.createCatalog("tpch", "tpch", Map.of());
       runner.installPlugin(new MemoryPlugin());

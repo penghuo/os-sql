@@ -331,6 +331,12 @@ testClusters.integTest {
     plugin(project.tasks.bundlePlugin.archiveFile)
     testDistribution = "ARCHIVE"
 
+    // Enable Trino engine when running with -DenableTrino
+    if (System.getProperty("enableTrino") != null) {
+        setting 'plugins.trino.enabled', 'true'
+        jvmArgs '-Xms4g', '-Xmx4g'
+    }
+
     // debug with command, ./gradlew opensearch-sql:run -DdebugJVM. --debug-jvm does not work with keystore.
     if (System.getProperty("debugJVM") != null) {
         jvmArgs '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005'

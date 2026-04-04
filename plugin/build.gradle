@@ -334,7 +334,13 @@ testClusters.integTest {
     // Enable Trino engine when running with -DenableTrino
     if (System.getProperty("enableTrino") != null) {
         setting 'plugins.trino.enabled', 'true'
-        jvmArgs '-Xms4g', '-Xmx4g'
+        def heap = System.getProperty("trinoHeap", "4g")
+        jvmArgs "-Xms${heap}", "-Xmx${heap}"
+        // Pass Iceberg warehouse path as system property
+        def warehouse = System.getProperty("trinoWarehouse", "")
+        if (warehouse) {
+            systemProperty 'trino.iceberg.warehouse', warehouse
+        }
     }
 
     // debug with command, ./gradlew opensearch-sql:run -DdebugJVM. --debug-jvm does not work with keystore.

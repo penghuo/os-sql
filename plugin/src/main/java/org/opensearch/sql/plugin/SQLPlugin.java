@@ -338,7 +338,9 @@ public class SQLPlugin extends Plugin
     boolean trinoEnabled = TrinoSettings.TRINO_ENABLED.get(environment.settings());
     if (trinoEnabled) {
       LOGGER.info("Trino engine is enabled, initializing TrinoEngine");
-      this.trinoEngine = new TrinoEngine();
+      String icebergWarehouse =
+          TrinoSettings.TRINO_CATALOG_WAREHOUSE.get(environment.settings());
+      this.trinoEngine = new TrinoEngine(icebergWarehouse);
     } else {
       LOGGER.info("Trino engine is disabled (plugins.trino.enabled=false)");
     }

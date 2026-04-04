@@ -49,7 +49,26 @@ public class TrinoEngine implements Closeable {
 
   private final DistributedQueryRunner queryRunner;
 
+  /**
+   * Create a TrinoEngine with default temp warehouse directories.
+   */
   public TrinoEngine() {
+    this("");
+  }
+
+  /**
+   * Create a TrinoEngine with a configurable Iceberg warehouse path.
+   *
+   * @param icebergWarehouse path to Iceberg warehouse directory. If empty, checks the system
+   *     property {@code trino.iceberg.warehouse} as a fallback. If both are empty, a temp
+   *     directory is created. The path should match the warehouse used by external tools
+   *     (e.g. Spark) that create Iceberg tables.
+   */
+  public TrinoEngine(String icebergWarehouse) {
+    // Allow system property override (useful for ./gradlew run)
+    if (icebergWarehouse == null || icebergWarehouse.isEmpty()) {
+      icebergWarehouse = System.getProperty("trino.iceberg.warehouse", "");
+    }
     LOG.info("Initializing real Trino engine via DistributedQueryRunner");
     try {
       // Pre-initialize Hadoop native library.  In a shadow-jar environment the
@@ -81,17 +100,33 @@ public class TrinoEngine implements Closeable {
       runner.createCatalog("tpch", "tpch", Map.of());
       runner.installPlugin(new MemoryPlugin());
       runner.createCatalog("memory", "memory", Map.of());
+
+      // Iceberg catalog: use configured warehouse or create temp directory.
+      // When a warehouse path is provided (e.g. from plugins.trino.catalog.iceberg.warehouse),
+      // use Hadoop catalog type so Trino can read tables created by external tools like Spark.
       runner.installPlugin(new IcebergPlugin());
-      Path warehouseDir = Files.createTempDirectory("trino-iceberg-warehouse");
+      Path warehouseDir;
+      String catalogType;
+      if (icebergWarehouse != null && !icebergWarehouse.isEmpty()) {
+        warehouseDir = Path.of(icebergWarehouse);
+        if (!Files.exists(warehouseDir)) {
+          Files.createDirectories(warehouseDir);
+        }
+        catalogType = "TESTING_FILE_METASTORE";
+        LOG.info("Using configured Iceberg warehouse: {}", warehouseDir);
+      } else {
+        warehouseDir = Files.createTempDirectory("trino-iceberg-warehouse");
+        catalogType = "TESTING_FILE_METASTORE";
+        LOG.info("Using temp Iceberg warehouse: {} (TESTING_FILE_METASTORE)", warehouseDir);
+      }
       runner.createCatalog(
           "iceberg",
           "iceberg",
           Map.of(
-              "iceberg.catalog.type", "TESTING_FILE_METASTORE",
+              "iceberg.catalog.type", catalogType,
               "hive.metastore.catalog.dir",
               warehouseDir.toUri().toString()));
       // Hive catalog for reading raw Parquet files from local filesystem.
-      // Used for data loading: CTAS from hive.default.hits INTO iceberg.clickbench.hits
       runner.installPlugin(new HivePlugin());
       Path hiveWarehouse = Files.createTempDirectory("trino-hive-warehouse");
       runner.createCatalog(

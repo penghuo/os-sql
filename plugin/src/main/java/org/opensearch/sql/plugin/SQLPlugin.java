@@ -122,7 +122,6 @@ import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
-import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.sql.trino.plugin.TrinoSettings;
 import org.opensearch.sql.trino.rest.RestTrinoQueryAction;
 import org.opensearch.sql.trino.transport.TransportTrinoTaskCancelAction;
@@ -138,6 +137,9 @@ import org.opensearch.sql.trino.transport.TrinoTaskResultsAction;
 import org.opensearch.sql.trino.transport.TrinoTaskResultsResponse;
 import org.opensearch.sql.trino.transport.TrinoTaskStatusAction;
 import org.opensearch.sql.trino.transport.TrinoTaskStatusResponse;
+import org.opensearch.sql.trino.transport.TrinoQueryForwardAction;
+import org.opensearch.sql.trino.transport.TrinoQueryForwardResponse;
+import org.opensearch.sql.trino.transport.TransportTrinoQueryForwardAction;
 import org.opensearch.sql.trino.transport.TrinoTaskUpdateAction;
 import org.opensearch.sql.trino.transport.TrinoTaskUpdateResponse;
 import org.opensearch.threadpool.ExecutorBuilder;
@@ -233,7 +235,7 @@ public class SQLPlugin extends Plugin
         new RestAsyncQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings),
-        new RestTrinoQueryAction(trinoEngine));
+        new RestTrinoQueryAction(trinoEngine, clusterService));
   }
 
   /** Register action and handler so that transportClient can find proxy for action. */
@@ -304,7 +306,10 @@ public class SQLPlugin extends Plugin
             TransportTrinoTaskResultsAction.class),
         new ActionHandler<>(
             new ActionType<>(TrinoTaskResultsAckAction.NAME, TrinoTaskResultsAckResponse::new),
-            TransportTrinoTaskResultsAckAction.class));
+            TransportTrinoTaskResultsAckAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoQueryForwardAction.NAME, TrinoQueryForwardResponse::new),
+            TransportTrinoQueryForwardAction.class));
   }
 
   @Override
@@ -374,11 +379,11 @@ public class SQLPlugin extends Plugin
           TrinoSettings.TRINO_CATALOG_WAREHOUSE.get(environment.settings());
       this.trinoEngine = new TrinoEngine(icebergWarehouse);
 
-      // Initialize transport action infrastructure for cross-node distributed execution.
-      // Uses initializeDefault() to create components inside the shadow jar classloader,
-      // avoiding Jackson class conflicts between OpenSearch's Jackson and Trino's shaded Jackson.
-      TrinoServiceHolder.initializeDefault();
-      LOGGER.info("Trino transport actions initialized via TrinoServiceHolder");
+      // Initialize transport actions backed by the real SqlTaskManager.
+      // This enables cross-node task dispatch: when a remote coordinator sends a
+      // trino:task/update, our local SqlTaskManager creates Trino drivers and executes splits.
+      // Called on the engine to stay within the shadow jar classloader.
+      this.trinoEngine.initializeTransportServices();
     } else {
       LOGGER.info("Trino engine is disabled (plugins.trino.enabled=false)");
     }

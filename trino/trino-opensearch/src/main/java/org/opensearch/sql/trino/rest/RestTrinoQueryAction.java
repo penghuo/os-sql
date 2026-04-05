@@ -8,16 +8,26 @@ package org.opensearch.sql.trino.rest;
 import static org.opensearch.core.rest.RestStatus.NOT_FOUND;
 import static org.opensearch.core.rest.RestStatus.OK;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
 import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
+import org.opensearch.sql.trino.transport.TrinoQueryForwardAction;
+import org.opensearch.sql.trino.transport.TrinoQueryForwardRequest;
+import org.opensearch.sql.trino.transport.TrinoQueryForwardResponse;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -37,14 +47,21 @@ public class RestTrinoQueryAction extends BaseRestHandler {
   private static final Logger LOG = LogManager.getLogger(RestTrinoQueryAction.class);
 
   private final TrinoEngine engine;
+  private final ClusterService clusterService;
+  private final AtomicInteger queryCounter = new AtomicInteger(0);
 
   public RestTrinoQueryAction() {
-    this(null);
+    this(null, null);
   }
 
   public RestTrinoQueryAction(TrinoEngine engine) {
+    this(engine, null);
+  }
+
+  public RestTrinoQueryAction(TrinoEngine engine, ClusterService clusterService) {
     super();
     this.engine = engine;
+    this.clusterService = clusterService;
   }
 
   @Override
@@ -68,7 +85,7 @@ public class RestTrinoQueryAction extends BaseRestHandler {
       return handleNodeStats(request);
     }
     return switch (request.method()) {
-      case POST -> handlePost(request);
+      case POST -> handlePost(request, client);
       case GET -> handleGet(request);
       case DELETE -> handleDelete(request);
       default ->
@@ -79,23 +96,69 @@ public class RestTrinoQueryAction extends BaseRestHandler {
   }
 
   /**
-   * POST /_plugins/_trino_sql/v1/statement Submit a query. If TrinoEngine is available, execute the
-   * query and return real results. Otherwise, return a stub response.
+   * POST /_plugins/_trino_sql/v1/statement Submit a query. Distributes queries across cluster nodes
+   * via round-robin using the trino:query/forward transport action. If only 1 node or cluster
+   * service unavailable, executes locally.
    */
-  private RestChannelConsumer handlePost(RestRequest request) {
+  private RestChannelConsumer handlePost(RestRequest request, NodeClient client) {
     String body = request.content().utf8ToString();
-
-    // The Trino client protocol sends the SQL as the raw body (text/plain),
-    // but some clients may wrap it in JSON: {"query": "SELECT 1"}
     String query = extractQuery(body);
     LOG.debug("Trino: received query [{}]", query);
 
     if (engine != null) {
-      // Read optional catalog/schema from Trino client headers
       String catalog = request.header("X-Trino-Catalog");
       String schema = request.header("X-Trino-Schema");
 
-      // Real execution via TrinoEngine
+      // Try to forward to a remote node for cross-node distribution
+      DiscoveryNode targetNode = pickRemoteNode();
+      if (targetNode != null && TrinoServiceHolder.isInitialized()
+          && TrinoServiceHolder.getInstance().getTransportService() != null) {
+        LOG.debug("Forwarding query to remote node [{}]", targetNode.getName());
+        TransportService ts = TrinoServiceHolder.getInstance().getTransportService();
+        TrinoQueryForwardRequest forwardReq =
+            new TrinoQueryForwardRequest(
+                query,
+                catalog != null ? catalog : "tpch",
+                schema != null ? schema : "tiny");
+        return channel -> {
+          ts.sendRequest(
+              targetNode,
+              TrinoQueryForwardAction.NAME,
+              forwardReq,
+              new org.opensearch.transport.TransportResponseHandler<TrinoQueryForwardResponse>() {
+                @Override
+                public TrinoQueryForwardResponse read(
+                    org.opensearch.core.common.io.stream.StreamInput in)
+                    throws java.io.IOException {
+                  return new TrinoQueryForwardResponse(in);
+                }
+
+                @Override
+                public void handleResponse(TrinoQueryForwardResponse response) {
+                  channel.sendResponse(
+                      new BytesRestResponse(OK, "application/json", response.getResultJson()));
+                }
+
+                @Override
+                public void handleException(org.opensearch.transport.TransportException exp) {
+                  LOG.warn(
+                      "Forward to {} failed, executing locally: {}",
+                      targetNode.getName(),
+                      exp.getMessage());
+                  String responseBody = engine.executeAndSerializeJson(query, catalog, schema);
+                  channel.sendResponse(
+                      new BytesRestResponse(OK, "application/json", responseBody));
+                }
+
+                @Override
+                public String executor() {
+                  return ThreadPool.Names.SAME;
+                }
+              });
+        };
+      }
+
+      // Execute locally (single node or this node's turn in round-robin)
       String responseBody = engine.executeAndSerializeJson(query, catalog, schema);
       return channel ->
           channel.sendResponse(new BytesRestResponse(OK, "application/json", responseBody));
@@ -204,7 +267,9 @@ public class RestTrinoQueryAction extends BaseRestHandler {
                 + "\"resultsFetched\":"
                 + tm.getResultsFetched()
                 + ","
-                + "\"engineStatus\":\"RUNNING\""
+                + "\"engineStatus\":\"RUNNING\","
+                + "\"queriesForwardedToThisNode\":"
+                + tm.getPagesProduced()
                 + "}";
       } else {
         responseBody = "{\"trinoEnabled\":false,\"engineStatus\":\"NOT_INITIALIZED\"}";
@@ -233,5 +298,36 @@ public class RestTrinoQueryAction extends BaseRestHandler {
     return channel ->
         channel.sendResponse(
             new BytesRestResponse(RestStatus.NO_CONTENT, "application/json", ""));
+  }
+
+  /**
+   * Pick a remote node for query forwarding using round-robin. Returns null if there are no remote
+   * nodes (single-node cluster) or cluster service is unavailable. Every Nth query (where N =
+   * cluster size) executes locally.
+   */
+  private DiscoveryNode pickRemoteNode() {
+    if (clusterService == null) {
+      return null;
+    }
+    DiscoveryNodes nodes = clusterService.state().nodes();
+    if (nodes.getSize() <= 1) {
+      return null; // Single-node cluster — no forwarding
+    }
+
+    // Collect all data nodes
+    List<DiscoveryNode> dataNodes = new ArrayList<>();
+    for (DiscoveryNode node : nodes) {
+      dataNodes.add(node);
+    }
+
+    // Round-robin: pick node based on counter
+    int idx = Math.abs(queryCounter.getAndIncrement() % dataNodes.size());
+    DiscoveryNode target = dataNodes.get(idx);
+
+    // If we picked the local node, execute locally (return null)
+    if (target.getId().equals(nodes.getLocalNodeId())) {
+      return null;
+    }
+    return target;
   }
 }

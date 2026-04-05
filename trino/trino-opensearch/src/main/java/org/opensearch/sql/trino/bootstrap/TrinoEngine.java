@@ -7,6 +7,7 @@ package org.opensearch.sql.trino.bootstrap;
 
 import io.trino.Session;
 import io.trino.connector.CatalogServiceProvider;
+import io.trino.execution.SqlTaskManager;
 import io.trino.metadata.SessionPropertyManager;
 import io.trino.hadoop.HadoopNative;
 import io.trino.plugin.hive.HivePlugin;
@@ -232,6 +233,25 @@ public class TrinoEngine implements Closeable {
   /** Get the underlying query runner for access to internal components. */
   public DistributedQueryRunner getQueryRunner() {
     return queryRunner;
+  }
+
+  /**
+   * Get the coordinator's SqlTaskManager. Used to back the OpenSearchSqlTaskManager so that
+   * incoming transport requests (from remote coordinators) are handled by the local Trino engine.
+   */
+  public SqlTaskManager getCoordinatorTaskManager() {
+    return queryRunner.getCoordinator().getTaskManager();
+  }
+
+  /**
+   * Initialize the TrinoServiceHolder with this engine and its SqlTaskManager. Must be called from
+   * within the shadow jar classloader to avoid class conflicts. After this call, transport actions
+   * can dispatch queries to this node's local Trino engine.
+   */
+  public void initializeTransportServices() {
+    org.opensearch.sql.trino.plugin.TrinoServiceHolder.initializeWithEngine(this);
+    LOG.info("Trino transport services initialized — engine and SqlTaskManager available for "
+        + "cross-node dispatch");
   }
 
   private String serializeToTrinoJson(String queryId, MaterializedResult result) {

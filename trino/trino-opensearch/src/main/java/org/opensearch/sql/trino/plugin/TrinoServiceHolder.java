@@ -5,8 +5,11 @@
 
 package org.opensearch.sql.trino.plugin;
 
+import io.trino.execution.SqlTaskManager;
+import org.opensearch.sql.trino.bootstrap.TrinoEngine;
 import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
 import org.opensearch.sql.trino.transport.TrinoJsonCodec;
+import org.opensearch.transport.TransportService;
 
 /**
  * Holds references to Trino-specific services that are initialized in {@code
@@ -22,24 +25,31 @@ public final class TrinoServiceHolder {
 
   private final OpenSearchSqlTaskManager taskManager;
   private final TrinoJsonCodec codec;
+  private final TrinoEngine engine;
+  private volatile TransportService transportService;
 
-  private TrinoServiceHolder(OpenSearchSqlTaskManager taskManager, TrinoJsonCodec codec) {
+  private TrinoServiceHolder(
+      OpenSearchSqlTaskManager taskManager, TrinoJsonCodec codec, TrinoEngine engine) {
     this.taskManager = taskManager;
     this.codec = codec;
+    this.engine = engine;
   }
 
   public static void initialize(OpenSearchSqlTaskManager taskManager, TrinoJsonCodec codec) {
-    instance = new TrinoServiceHolder(taskManager, codec);
+    instance = new TrinoServiceHolder(taskManager, codec, null);
   }
 
   /**
-   * Initialize with default components. Creates OpenSearchSqlTaskManager and TrinoJsonCodec
-   * internally to avoid classloader issues (shadow jar relocation).
+   * Initialize with the engine's real SqlTaskManager and TrinoEngine reference. This enables
+   * cross-node query dispatch: incoming transport requests are handled by the local Trino engine.
+   *
+   * @param trinoEngine the local TrinoEngine
    */
-  public static void initializeDefault() {
-    OpenSearchSqlTaskManager taskManager = new OpenSearchSqlTaskManager();
+  public static void initializeWithEngine(TrinoEngine trinoEngine) {
+    SqlTaskManager sqlTaskManager = trinoEngine.getCoordinatorTaskManager();
+    OpenSearchSqlTaskManager taskManager = new OpenSearchSqlTaskManager(sqlTaskManager);
     TrinoJsonCodec codec = new TrinoJsonCodec();
-    instance = new TrinoServiceHolder(taskManager, codec);
+    instance = new TrinoServiceHolder(taskManager, codec, trinoEngine);
   }
 
   public static TrinoServiceHolder getInstance() {
@@ -60,5 +70,20 @@ public final class TrinoServiceHolder {
 
   public TrinoJsonCodec getCodec() {
     return codec;
+  }
+
+  public TrinoEngine getEngine() {
+    return engine;
+  }
+
+  public TransportService getTransportService() {
+    return transportService;
+  }
+
+  /** Set the TransportService after the transport layer is available. */
+  public static void setTransportService(TransportService ts) {
+    if (instance != null) {
+      instance.transportService = ts;
+    }
   }
 }

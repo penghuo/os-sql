@@ -95,11 +95,13 @@ public class TrinoEngine implements Closeable {
       LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
           processors, taskConcurrency);
 
-      // Use 2 nodes for distributed execution: doubles parallelism for
-      // partitioned exchanges (GROUP BY, JOIN) on a multi-core machine.
+      // Scale node count for distributed execution parallelism.
+      // 4 nodes on a 32-CPU machine gives good parallelism for GROUP BY/JOIN.
+      int nodeCount = Math.max(2, Math.min(4, processors / 8));
+      LOG.info("Trino node count: {} (processors={})", nodeCount, processors);
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session)
-              .setNodeCount(2)
+              .setNodeCount(nodeCount)
               .addExtraProperty("query.max-memory-per-node", queryMemStr)
               .addExtraProperty("query.max-memory", queryMemStr)
               .addExtraProperty("memory.heap-headroom-per-node", headroomStr)

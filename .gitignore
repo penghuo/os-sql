@@ -55,4 +55,5 @@ http-client.env.json
 # Coding agent files (could be symlinks)
 .claude
 .clinerules
-memory-bank
+memory-banktrino/benchmark/data/
+trino/benchmark/docker/*.zip

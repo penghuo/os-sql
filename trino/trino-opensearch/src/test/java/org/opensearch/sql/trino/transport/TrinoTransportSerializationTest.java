@@ -140,4 +140,86 @@ class TrinoTransportSerializationTest {
 
     assertArrayEquals(taskInfo, deserialized.getTaskInfoJson());
   }
+
+  // --- TrinoTaskResultsRequest ---
+
+  @Test
+  void taskResultsRequestRoundTrip() throws IOException {
+    TrinoTaskResultsRequest original =
+        new TrinoTaskResultsRequest("query.0.0.0", 3, 42L, 1048576L);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+    TrinoTaskResultsRequest deserialized = new TrinoTaskResultsRequest(out.bytes().streamInput());
+
+    assertEquals("query.0.0.0", deserialized.getTaskId());
+    assertEquals(3, deserialized.getBufferId());
+    assertEquals(42L, deserialized.getToken());
+    assertEquals(1048576L, deserialized.getMaxSizeBytes());
+  }
+
+  // --- TrinoTaskResultsResponse ---
+
+  @Test
+  void taskResultsResponseRoundTrip() throws IOException {
+    byte[] pages = new byte[1024];
+    for (int i = 0; i < pages.length; i++) {
+      pages[i] = (byte) (i % 256);
+    }
+    TrinoTaskResultsResponse original =
+        new TrinoTaskResultsResponse("instance-1", 42L, 43L, false, pages);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+    TrinoTaskResultsResponse deserialized =
+        new TrinoTaskResultsResponse(out.bytes().streamInput());
+
+    assertEquals("instance-1", deserialized.getTaskInstanceId());
+    assertEquals(42L, deserialized.getToken());
+    assertEquals(43L, deserialized.getNextToken());
+    assertEquals(false, deserialized.isBufferComplete());
+    assertArrayEquals(pages, deserialized.getPages());
+  }
+
+  @Test
+  void taskResultsResponseBufferComplete() throws IOException {
+    TrinoTaskResultsResponse original =
+        new TrinoTaskResultsResponse("instance-2", 99L, 100L, true, new byte[0]);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+    TrinoTaskResultsResponse deserialized =
+        new TrinoTaskResultsResponse(out.bytes().streamInput());
+
+    assertEquals(true, deserialized.isBufferComplete());
+    assertEquals(0, deserialized.getPages().length);
+  }
+
+  // --- TrinoTaskResultsAckRequest ---
+
+  @Test
+  void taskResultsAckRequestRoundTrip() throws IOException {
+    TrinoTaskResultsAckRequest original = new TrinoTaskResultsAckRequest("query.0.0.0", 2, 55L);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+    TrinoTaskResultsAckRequest deserialized =
+        new TrinoTaskResultsAckRequest(out.bytes().streamInput());
+
+    assertEquals("query.0.0.0", deserialized.getTaskId());
+    assertEquals(2, deserialized.getBufferId());
+    assertEquals(55L, deserialized.getToken());
+  }
+
+  // --- TrinoTaskResultsAckResponse ---
+
+  @Test
+  void taskResultsAckResponseRoundTrip() throws IOException {
+    TrinoTaskResultsAckResponse original = new TrinoTaskResultsAckResponse();
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+    // Should not throw — empty payload
+    new TrinoTaskResultsAckResponse(out.bytes().streamInput());
+  }
 }

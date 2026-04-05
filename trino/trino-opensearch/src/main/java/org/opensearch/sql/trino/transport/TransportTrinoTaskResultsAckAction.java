@@ -13,7 +13,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -27,19 +27,14 @@ public class TransportTrinoTaskResultsAckAction
   private static final Logger LOG =
       LogManager.getLogger(TransportTrinoTaskResultsAckAction.class);
 
-  private final OpenSearchSqlTaskManager taskManager;
-
   @Inject
   public TransportTrinoTaskResultsAckAction(
-      TransportService transportService,
-      ActionFilters actionFilters,
-      OpenSearchSqlTaskManager taskManager) {
+      TransportService transportService, ActionFilters actionFilters) {
     super(
         TrinoTaskResultsAckAction.NAME,
         transportService,
         actionFilters,
         TrinoTaskResultsAckRequest::new);
-    this.taskManager = taskManager;
   }
 
   @Override
@@ -48,10 +43,16 @@ public class TransportTrinoTaskResultsAckAction
       TrinoTaskResultsAckRequest request,
       ActionListener<TrinoTaskResultsAckResponse> listener) {
     try {
-      taskManager.acknowledgeTaskResults(
-          TaskId.valueOf(request.getTaskId()),
-          new OutputBufferId(request.getBufferId()),
-          request.getToken());
+      if (!TrinoServiceHolder.isInitialized()) {
+        listener.onFailure(new IllegalStateException("Trino engine not initialized"));
+        return;
+      }
+      TrinoServiceHolder.getInstance()
+          .getTaskManager()
+          .acknowledgeTaskResults(
+              TaskId.valueOf(request.getTaskId()),
+              new OutputBufferId(request.getBufferId()),
+              request.getToken());
       listener.onResponse(new TrinoTaskResultsAckResponse());
     } catch (Exception e) {
       LOG.error(

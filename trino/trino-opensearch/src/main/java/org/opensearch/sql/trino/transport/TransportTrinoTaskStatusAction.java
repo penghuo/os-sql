@@ -13,7 +13,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -23,22 +23,14 @@ public class TransportTrinoTaskStatusAction
 
   private static final Logger LOG = LogManager.getLogger(TransportTrinoTaskStatusAction.class);
 
-  private final OpenSearchSqlTaskManager taskManager;
-  private final TrinoJsonCodec codec;
-
   @Inject
   public TransportTrinoTaskStatusAction(
-      TransportService transportService,
-      ActionFilters actionFilters,
-      OpenSearchSqlTaskManager taskManager,
-      TrinoJsonCodec codec) {
+      TransportService transportService, ActionFilters actionFilters) {
     super(
         TrinoTaskStatusAction.NAME,
         transportService,
         actionFilters,
         TrinoTaskStatusRequest::new);
-    this.taskManager = taskManager;
-    this.codec = codec;
   }
 
   @Override
@@ -47,8 +39,17 @@ public class TransportTrinoTaskStatusAction
       TrinoTaskStatusRequest request,
       ActionListener<TrinoTaskStatusResponse> listener) {
     try {
-      TaskInfo info = taskManager.getTaskInfo(TaskId.valueOf(request.getTaskId()));
-      listener.onResponse(new TrinoTaskStatusResponse(codec.serializeTaskInfo(info)));
+      if (!TrinoServiceHolder.isInitialized()) {
+        listener.onFailure(new IllegalStateException("Trino engine not initialized"));
+        return;
+      }
+      TaskInfo info =
+          TrinoServiceHolder.getInstance()
+              .getTaskManager()
+              .getTaskInfo(TaskId.valueOf(request.getTaskId()));
+      listener.onResponse(
+          new TrinoTaskStatusResponse(
+              TrinoServiceHolder.getInstance().getCodec().serializeTaskInfo(info)));
     } catch (Exception e) {
       LOG.error("Failed to get task status for taskId={}", request.getTaskId(), e);
       listener.onFailure(e);

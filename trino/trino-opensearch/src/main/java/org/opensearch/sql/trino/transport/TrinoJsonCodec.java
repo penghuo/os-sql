@@ -33,8 +33,14 @@ public class TrinoJsonCodec {
 
   private final ObjectMapper objectMapper;
 
+  /** Create with a provided ObjectMapper (must have Trino type serializers registered). */
   public TrinoJsonCodec(ObjectMapper objectMapper) {
     this.objectMapper = objectMapper;
+  }
+
+  /** Create with a default ObjectMapper. Suitable for basic serialization. */
+  public TrinoJsonCodec() {
+    this.objectMapper = new ObjectMapper();
   }
 
   public byte[] serializePlanFragment(PlanFragment fragment) {

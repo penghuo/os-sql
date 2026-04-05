@@ -17,6 +17,7 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -31,6 +32,7 @@ import org.opensearch.transport.client.node.NodeClient;
 public class RestTrinoQueryAction extends BaseRestHandler {
 
   public static final String STATEMENT_API_ENDPOINT = "/_plugins/_trino_sql/v1/statement";
+  public static final String NODE_STATS_ENDPOINT = "/_plugins/_trino_sql/v1/node/stats";
 
   private static final Logger LOG = LogManager.getLogger(RestTrinoQueryAction.class);
 
@@ -55,11 +57,16 @@ public class RestTrinoQueryAction extends BaseRestHandler {
     return List.of(
         new Route(RestRequest.Method.POST, STATEMENT_API_ENDPOINT),
         new Route(RestRequest.Method.GET, STATEMENT_API_ENDPOINT + "/{queryId}/{token}"),
-        new Route(RestRequest.Method.DELETE, STATEMENT_API_ENDPOINT + "/{queryId}"));
+        new Route(RestRequest.Method.DELETE, STATEMENT_API_ENDPOINT + "/{queryId}"),
+        new Route(RestRequest.Method.GET, NODE_STATS_ENDPOINT));
   }
 
   @Override
   protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
+    // Route node stats endpoint
+    if (request.path().equals(NODE_STATS_ENDPOINT)) {
+      return handleNodeStats(request);
+    }
     return switch (request.method()) {
       case POST -> handlePost(request);
       case GET -> handleGet(request);
@@ -171,6 +178,39 @@ public class RestTrinoQueryAction extends BaseRestHandler {
       }
     }
     return -1;
+  }
+
+  /** GET /_plugins/_trino_sql/v1/node/stats — diagnostic counters for distribution proof. */
+  private RestChannelConsumer handleNodeStats(RestRequest request) {
+    return channel -> {
+      String responseBody;
+      if (TrinoServiceHolder.isInitialized()) {
+        var tm = TrinoServiceHolder.getInstance().getTaskManager();
+        responseBody =
+            "{"
+                + "\"trinoEnabled\":true,"
+                + "\"tasksReceived\":"
+                + tm.getTasksReceived()
+                + ","
+                + "\"taskUpdatesReceived\":"
+                + tm.getTaskUpdatesReceived()
+                + ","
+                + "\"splitsProcessed\":"
+                + tm.getSplitsProcessed()
+                + ","
+                + "\"pagesProduced\":"
+                + tm.getPagesProduced()
+                + ","
+                + "\"resultsFetched\":"
+                + tm.getResultsFetched()
+                + ","
+                + "\"engineStatus\":\"RUNNING\""
+                + "}";
+      } else {
+        responseBody = "{\"trinoEnabled\":false,\"engineStatus\":\"NOT_INITIALIZED\"}";
+      }
+      channel.sendResponse(new BytesRestResponse(OK, "application/json", responseBody));
+    };
   }
 
   /** GET /_plugins/_trino_sql/v1/statement/{queryId}/{token} Fetch next results. Stub: 404. */

@@ -20,6 +20,7 @@ import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -32,28 +33,27 @@ public class TransportTrinoTaskUpdateAction
 
   private static final Logger LOG = LogManager.getLogger(TransportTrinoTaskUpdateAction.class);
 
-  private final OpenSearchSqlTaskManager taskManager;
-  private final TrinoJsonCodec codec;
-
   @Inject
   public TransportTrinoTaskUpdateAction(
-      TransportService transportService,
-      ActionFilters actionFilters,
-      OpenSearchSqlTaskManager taskManager,
-      TrinoJsonCodec codec) {
+      TransportService transportService, ActionFilters actionFilters) {
     super(
         TrinoTaskUpdateAction.NAME,
         transportService,
         actionFilters,
         TrinoTaskUpdateRequest::new);
-    this.taskManager = taskManager;
-    this.codec = codec;
   }
 
   @Override
   protected void doExecute(
       Task task, TrinoTaskUpdateRequest request, ActionListener<TrinoTaskUpdateResponse> listener) {
     try {
+      if (!TrinoServiceHolder.isInitialized()) {
+        listener.onFailure(new IllegalStateException("Trino engine not initialized"));
+        return;
+      }
+      OpenSearchSqlTaskManager taskManager = TrinoServiceHolder.getInstance().getTaskManager();
+      TrinoJsonCodec codec = TrinoServiceHolder.getInstance().getCodec();
+
       byte[] fragmentJson = request.getPlanFragmentJson();
       Optional<PlanFragment> fragment =
           (fragmentJson != null && fragmentJson.length > 0)
@@ -64,12 +64,9 @@ public class TransportTrinoTaskUpdateAction
           codec.deserializeSplitAssignments(request.getSplitAssignmentsJson());
       OutputBuffers buffers = codec.deserializeOutputBuffers(request.getOutputBuffersJson());
 
-      // TODO: deserialize session from sessionJson when full engine is wired (Task 17)
-      // For now, session is passed via the plan fragment's session representation
-
       TaskInfo info =
           taskManager.updateTask(
-              null, // session — wired in Task 17
+              null, // session — wired when full cross-node execution is enabled
               TaskId.valueOf(request.getTaskId()),
               fragment,
               splits,

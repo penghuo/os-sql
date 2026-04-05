@@ -13,7 +13,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -23,22 +23,14 @@ public class TransportTrinoTaskCancelAction
 
   private static final Logger LOG = LogManager.getLogger(TransportTrinoTaskCancelAction.class);
 
-  private final OpenSearchSqlTaskManager taskManager;
-  private final TrinoJsonCodec codec;
-
   @Inject
   public TransportTrinoTaskCancelAction(
-      TransportService transportService,
-      ActionFilters actionFilters,
-      OpenSearchSqlTaskManager taskManager,
-      TrinoJsonCodec codec) {
+      TransportService transportService, ActionFilters actionFilters) {
     super(
         TrinoTaskCancelAction.NAME,
         transportService,
         actionFilters,
         TrinoTaskCancelRequest::new);
-    this.taskManager = taskManager;
-    this.codec = codec;
   }
 
   @Override
@@ -47,8 +39,17 @@ public class TransportTrinoTaskCancelAction
       TrinoTaskCancelRequest request,
       ActionListener<TrinoTaskCancelResponse> listener) {
     try {
-      TaskInfo info = taskManager.cancelTask(TaskId.valueOf(request.getTaskId()));
-      listener.onResponse(new TrinoTaskCancelResponse(codec.serializeTaskInfo(info)));
+      if (!TrinoServiceHolder.isInitialized()) {
+        listener.onFailure(new IllegalStateException("Trino engine not initialized"));
+        return;
+      }
+      TaskInfo info =
+          TrinoServiceHolder.getInstance()
+              .getTaskManager()
+              .cancelTask(TaskId.valueOf(request.getTaskId()));
+      listener.onResponse(
+          new TrinoTaskCancelResponse(
+              TrinoServiceHolder.getInstance().getCodec().serializeTaskInfo(info)));
     } catch (Exception e) {
       LOG.error("Failed to cancel task for taskId={}", request.getTaskId(), e);
       listener.onFailure(e);

@@ -20,7 +20,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -33,19 +33,14 @@ public class TransportTrinoTaskResultsAction
 
   private static final Logger LOG = LogManager.getLogger(TransportTrinoTaskResultsAction.class);
 
-  private final OpenSearchSqlTaskManager taskManager;
-
   @Inject
   public TransportTrinoTaskResultsAction(
-      TransportService transportService,
-      ActionFilters actionFilters,
-      OpenSearchSqlTaskManager taskManager) {
+      TransportService transportService, ActionFilters actionFilters) {
     super(
         TrinoTaskResultsAction.NAME,
         transportService,
         actionFilters,
         TrinoTaskResultsRequest::new);
-    this.taskManager = taskManager;
   }
 
   @Override
@@ -54,17 +49,22 @@ public class TransportTrinoTaskResultsAction
       TrinoTaskResultsRequest request,
       ActionListener<TrinoTaskResultsResponse> listener) {
     try {
+      if (!TrinoServiceHolder.isInitialized()) {
+        listener.onFailure(new IllegalStateException("Trino engine not initialized"));
+        return;
+      }
+
       TaskId taskId = TaskId.valueOf(request.getTaskId());
       OutputBufferId bufferId = new OutputBufferId(request.getBufferId());
       DataSize maxSize = DataSize.ofBytes(request.getMaxSizeBytes());
 
       SqlTaskWithResults taskWithResults =
-          taskManager.getTaskResults(taskId, bufferId, request.getToken(), maxSize);
+          TrinoServiceHolder.getInstance()
+              .getTaskManager()
+              .getTaskResults(taskId, bufferId, request.getToken(), maxSize);
 
-      // Get the results future — may block briefly until pages are available
       ListenableFuture<BufferResult> resultsFuture = taskWithResults.getResultsFuture();
 
-      // Use a callback to avoid blocking the transport thread
       resultsFuture.addListener(
           () -> {
             try {
@@ -80,12 +80,14 @@ public class TransportTrinoTaskResultsAction
                       pagesBytes));
             } catch (ExecutionException e) {
               listener.onFailure(
-                  e.getCause() != null ? new RuntimeException(e.getCause()) : new RuntimeException(e));
+                  e.getCause() != null
+                      ? new RuntimeException(e.getCause())
+                      : new RuntimeException(e));
             } catch (Exception e) {
               listener.onFailure(e);
             }
           },
-          Runnable::run); // Execute on the same thread that completes the future
+          Runnable::run);
 
     } catch (Exception e) {
       LOG.error("Failed to get task results for taskId={}", request.getTaskId(), e);
@@ -94,10 +96,8 @@ public class TransportTrinoTaskResultsAction
   }
 
   /**
-   * Concatenate serialized Trino pages (Slice list) into a single byte array. Each Slice contains
-   * TRINO_PAGES binary — we concatenate them with a length prefix for reconstruction.
-   *
-   * <p>Format: [4-byte length][page bytes][4-byte length][page bytes]...
+   * Concatenate serialized Trino pages (Slice list) into a single byte array. Format: [4-byte
+   * length][page bytes][4-byte length][page bytes]...
    */
   static byte[] serializePages(List<Slice> serializedPages) {
     if (serializedPages.isEmpty()) {
@@ -105,7 +105,7 @@ public class TransportTrinoTaskResultsAction
     }
     int totalSize = 0;
     for (Slice page : serializedPages) {
-      totalSize += 4 + page.length(); // 4-byte length prefix + page data
+      totalSize += 4 + page.length();
     }
     byte[] result = new byte[totalSize];
     int offset = 0;

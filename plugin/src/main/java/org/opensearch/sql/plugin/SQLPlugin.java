@@ -122,8 +122,24 @@ import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
+import org.opensearch.sql.trino.plugin.TrinoServiceHolder;
 import org.opensearch.sql.trino.plugin.TrinoSettings;
 import org.opensearch.sql.trino.rest.RestTrinoQueryAction;
+import org.opensearch.sql.trino.transport.TransportTrinoTaskCancelAction;
+import org.opensearch.sql.trino.transport.TransportTrinoTaskResultsAckAction;
+import org.opensearch.sql.trino.transport.TransportTrinoTaskResultsAction;
+import org.opensearch.sql.trino.transport.TransportTrinoTaskStatusAction;
+import org.opensearch.sql.trino.transport.TransportTrinoTaskUpdateAction;
+import org.opensearch.sql.trino.transport.TrinoTaskCancelAction;
+import org.opensearch.sql.trino.transport.TrinoTaskCancelResponse;
+import org.opensearch.sql.trino.transport.TrinoTaskResultsAckAction;
+import org.opensearch.sql.trino.transport.TrinoTaskResultsAckResponse;
+import org.opensearch.sql.trino.transport.TrinoTaskResultsAction;
+import org.opensearch.sql.trino.transport.TrinoTaskResultsResponse;
+import org.opensearch.sql.trino.transport.TrinoTaskStatusAction;
+import org.opensearch.sql.trino.transport.TrinoTaskStatusResponse;
+import org.opensearch.sql.trino.transport.TrinoTaskUpdateAction;
+import org.opensearch.sql.trino.transport.TrinoTaskUpdateResponse;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ScalingExecutorBuilder;
@@ -272,7 +288,23 @@ public class SQLPlugin extends Plugin
             new ActionType<>(
                 TransportWriteDirectQueryResourcesRequestAction.NAME,
                 WriteDirectQueryResourcesActionResponse::new),
-            TransportWriteDirectQueryResourcesRequestAction.class));
+            TransportWriteDirectQueryResourcesRequestAction.class),
+        // Trino distributed execution transport actions
+        new ActionHandler<>(
+            new ActionType<>(TrinoTaskUpdateAction.NAME, TrinoTaskUpdateResponse::new),
+            TransportTrinoTaskUpdateAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoTaskStatusAction.NAME, TrinoTaskStatusResponse::new),
+            TransportTrinoTaskStatusAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoTaskCancelAction.NAME, TrinoTaskCancelResponse::new),
+            TransportTrinoTaskCancelAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoTaskResultsAction.NAME, TrinoTaskResultsResponse::new),
+            TransportTrinoTaskResultsAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoTaskResultsAckAction.NAME, TrinoTaskResultsAckResponse::new),
+            TransportTrinoTaskResultsAckAction.class));
   }
 
   @Override
@@ -341,6 +373,12 @@ public class SQLPlugin extends Plugin
       String icebergWarehouse =
           TrinoSettings.TRINO_CATALOG_WAREHOUSE.get(environment.settings());
       this.trinoEngine = new TrinoEngine(icebergWarehouse);
+
+      // Initialize transport action infrastructure for cross-node distributed execution.
+      // Uses initializeDefault() to create components inside the shadow jar classloader,
+      // avoiding Jackson class conflicts between OpenSearch's Jackson and Trino's shaded Jackson.
+      TrinoServiceHolder.initializeDefault();
+      LOGGER.info("Trino transport actions initialized via TrinoServiceHolder");
     } else {
       LOGGER.info("Trino engine is disabled (plugins.trino.enabled=false)");
     }

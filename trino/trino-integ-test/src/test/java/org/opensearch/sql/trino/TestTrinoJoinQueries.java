@@ -47,10 +47,11 @@ public class TestTrinoJoinQueries extends AbstractTestJoinQueries {
 
   @Test
   @Override
-  @Disabled("Requires DistributedQueryRunner; HTTP-based OpenSearchTrinoQueryRunner "
-      + "does not implement that interface")
+  @Disabled("This test casts QueryRunner to DistributedQueryRunner which is not supported "
+      + "by HTTP-based OpenSearchTrinoQueryRunner. Will be re-enabled when transport "
+      + "engine provides equivalent getNodeCount() support.")
   public void testOutputDuplicatesInsensitiveJoin() {
-    // This test casts the QueryRunner to DistributedQueryRunner
+    // TODO: Re-enable once transport engine is fully wired with multi-node support
   }
 
   @Test

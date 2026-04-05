@@ -141,7 +141,7 @@ public class NoExternalServerTest extends OpenSearchRestTestCase {
 
   /**
    * Verify that CREATE TABLE, INSERT, SELECT, and DROP TABLE work via the REST endpoint using the
-   * Memory connector. Works with DistributedQueryRunner which supports full distributed execution.
+   * Memory connector. Works with TestingTrinoServer which supports full distributed execution.
    */
   public void testMemoryConnectorDdlDml() throws IOException {
     String tableName = "memory.default.ddl_test_" + System.nanoTime();

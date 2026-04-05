@@ -45,7 +45,8 @@ dependencies {
         exclude group: 'com.github.docker-java'
     }
     shade("io.trino:trino-testing:${trinoVersion}") {
-        // Provides TestingTrinoServer and TestingTrinoClient for the embedded engine.
+        // Provides DistributedQueryRunner for intra-JVM distributed execution
+        // and TestingTrinoServer/TestingTrinoClient for the embedded engine.
         // Exclude testcontainers — only needed for Docker-based tests.
         // Its shaded bouncycastle causes jar-hell with OpenSearch's bc-fips.
         exclude group: 'org.testcontainers'

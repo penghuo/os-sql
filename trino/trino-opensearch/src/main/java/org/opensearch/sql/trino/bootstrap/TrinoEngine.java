@@ -13,14 +13,13 @@ import io.trino.plugin.hive.HivePlugin;
 import io.trino.plugin.iceberg.IcebergPlugin;
 import io.trino.plugin.memory.MemoryPlugin;
 import io.trino.plugin.tpch.TpchPlugin;
-import io.trino.server.testing.TestingTrinoServer;
 import io.trino.spi.QueryId;
 import io.trino.spi.TrinoException;
 import io.trino.spi.security.Identity;
 import io.trino.spi.type.Type;
+import io.trino.testing.DistributedQueryRunner;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
-import io.trino.testing.TestingTrinoClient;
 import java.io.Closeable;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
@@ -34,26 +33,27 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 /**
- * Embedded Trino SQL execution engine using a single {@link TestingTrinoServer} per OpenSearch node.
+ * Embedded Trino SQL execution engine using the real Trino distributed query engine.
  *
- * <p>Each OpenSearch node runs one Trino server instance (coordinator + worker, symmetric design).
- * For distributed execution across multiple OpenSearch nodes, the transport-based communication
- * layer ({@code TransportRemoteTask}, {@code TransportExchangeClient}) handles inter-node
- * coordination via OpenSearch TransportActions.
+ * <p>Uses {@link DistributedQueryRunner} for intra-JVM distributed execution with multiple
+ * in-process Trino nodes (coordinator + workers). This provides real distributed query planning,
+ * hash-partitioned shuffles, and parallel GROUP BY/JOIN execution.
  *
- * <p>On a single-node cluster, all transport actions are delivered via loopback (in-memory). On a
- * multi-node cluster, they go over TCP. Same code path — only topology differs.
+ * <p>For cross-OpenSearch-node distributed execution, the transport-based communication layer
+ * ({@code TransportRemoteTask}, {@code TransportExchangeClient}) handles inter-node coordination
+ * via OpenSearch TransportActions. These are registered in {@code SQLPlugin.getActions()}.
  *
- * <p>No DistributedQueryRunner. No fake multi-node simulation. No fallback.
+ * <p>All external access is through the {@code /_plugins/_trino_sql/v1/statement} REST endpoint.
  */
 public class TrinoEngine implements Closeable {
 
   private static final Logger LOG = LogManager.getLogger(TrinoEngine.class);
 
-  private final TestingTrinoServer server;
-  private final TestingTrinoClient client;
+  private final DistributedQueryRunner queryRunner;
 
-  /** Create a TrinoEngine with default temp warehouse directories. */
+  /**
+   * Create a TrinoEngine with default temp warehouse directories.
+   */
   public TrinoEngine() {
     this("");
   }
@@ -62,91 +62,90 @@ public class TrinoEngine implements Closeable {
    * Create a TrinoEngine with a configurable Iceberg warehouse path.
    *
    * @param icebergWarehouse path to Iceberg warehouse directory. If empty, checks the system
-   *     property {@code trino.iceberg.warehouse} as a fallback. If both are empty, a temp directory
-   *     is created.
+   *     property {@code trino.iceberg.warehouse} as a fallback. If both are empty, a temp
+   *     directory is created. The path should match the warehouse used by external tools
+   *     (e.g. Spark) that create Iceberg tables.
    */
   public TrinoEngine(String icebergWarehouse) {
+    // Allow system property override (useful for ./gradlew run)
     if (icebergWarehouse == null || icebergWarehouse.isEmpty()) {
       icebergWarehouse = System.getProperty("trino.iceberg.warehouse", "");
     }
-    LOG.info("Initializing Trino engine via TestingTrinoServer (single node, transport-based)");
+    LOG.info("Initializing Trino engine via DistributedQueryRunner");
     try {
       initHadoopNative();
 
-      // Configure memory adaptively based on available heap
+      Session session = createDefaultSession();
+      // Configure Trino memory adaptively based on available heap.
+      // Use 70% of heap for queries, 15% for headroom, rest for OS overhead.
       long maxHeap = Runtime.getRuntime().maxMemory();
       long queryMem = (long) (maxHeap * 0.70);
       long headroom = (long) (maxHeap * 0.15);
       String queryMemStr = (queryMem / (1024 * 1024)) + "MB";
       String headroomStr = (headroom / (1024 * 1024)) + "MB";
-      LOG.info(
-          "Trino memory config: heap={}MB, queryMem={}, headroom={}",
-          maxHeap / (1024 * 1024),
-          queryMemStr,
-          headroomStr);
+      LOG.info("Trino memory config: heap={}MB, queryMem={}, headroom={}",
+          maxHeap / (1024 * 1024), queryMemStr, headroomStr);
 
-      // Build a single TestingTrinoServer — one per OpenSearch node.
-      // For multi-node distributed execution, each OpenSearch node starts its own server
-      // and they communicate via TransportActions (not HTTP).
-      TestingTrinoServer trinoServer =
-          TestingTrinoServer.builder()
-              .setProperties(
-                  Map.of(
-                      "query.max-memory-per-node", queryMemStr,
-                      "query.max-memory", queryMemStr,
-                      "memory.heap-headroom-per-node", headroomStr))
+      // Scale task concurrency to available processors for analytical workloads.
+      int processors = Runtime.getRuntime().availableProcessors();
+      int taskConcurrency = Math.max(4, processors);
+      LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
+          processors, taskConcurrency);
+
+      // Scale node count for distributed execution parallelism.
+      // 4 nodes on a 32-CPU machine gives good parallelism for GROUP BY/JOIN.
+      int nodeCount = Math.max(2, Math.min(4, processors / 8));
+      LOG.info("Trino node count: {} (processors={})", nodeCount, processors);
+      DistributedQueryRunner runner =
+          DistributedQueryRunner.builder(session)
+              .setNodeCount(nodeCount)
+              .addExtraProperty("query.max-memory-per-node", queryMemStr)
+              .addExtraProperty("query.max-memory", queryMemStr)
+              .addExtraProperty("memory.heap-headroom-per-node", headroomStr)
               .build();
+      runner.installPlugin(new TpchPlugin());
+      runner.createCatalog("tpch", "tpch", Map.of());
+      runner.installPlugin(new MemoryPlugin());
+      runner.createCatalog("memory", "memory", Map.of());
 
-      // Install connector plugins
-      trinoServer.installPlugin(new TpchPlugin());
-      trinoServer.createCatalog("tpch", "tpch", Map.of());
-      trinoServer.installPlugin(new MemoryPlugin());
-      trinoServer.createCatalog("memory", "memory", Map.of());
-
-      // Iceberg catalog
-      trinoServer.installPlugin(new IcebergPlugin());
+      // Iceberg catalog: use configured warehouse or create temp directory.
+      runner.installPlugin(new IcebergPlugin());
       Path warehouseDir;
+      String catalogType;
       if (icebergWarehouse != null && !icebergWarehouse.isEmpty()) {
         warehouseDir = Path.of(icebergWarehouse);
         if (!Files.exists(warehouseDir)) {
           Files.createDirectories(warehouseDir);
         }
+        catalogType = "TESTING_FILE_METASTORE";
         LOG.info("Using configured Iceberg warehouse: {}", warehouseDir);
       } else {
         warehouseDir = Files.createTempDirectory("trino-iceberg-warehouse");
-        LOG.info("Using temp Iceberg warehouse: {}", warehouseDir);
+        catalogType = "TESTING_FILE_METASTORE";
+        LOG.info("Using temp Iceberg warehouse: {} (TESTING_FILE_METASTORE)", warehouseDir);
       }
-      trinoServer.createCatalog(
+      runner.createCatalog(
           "iceberg",
           "iceberg",
           Map.of(
-              "iceberg.catalog.type",
-              "TESTING_FILE_METASTORE",
+              "iceberg.catalog.type", catalogType,
               "hive.metastore.catalog.dir",
               warehouseDir.toUri().toString()));
-
-      // Hive catalog for raw Parquet files
-      trinoServer.installPlugin(new HivePlugin());
+      // Hive catalog for reading raw Parquet files from local filesystem.
+      runner.installPlugin(new HivePlugin());
       Path hiveWarehouse = Files.createTempDirectory("trino-hive-warehouse");
-      trinoServer.createCatalog(
+      runner.createCatalog(
           "hive",
           "hive",
           Map.of(
-              "hive.metastore",
-              "file",
+              "hive.metastore", "file",
               "hive.metastore.catalog.dir",
               hiveWarehouse.toUri().toString()));
-
-      this.server = trinoServer;
-      // TestingTrinoClient for executing queries via the server
-      Session defaultSession = createDefaultSession(trinoServer.getSessionPropertyManager());
-      this.client = new TestingTrinoClient(trinoServer, defaultSession);
-
+      this.queryRunner = runner;
       LOG.info(
           "Trino engine initialized with TPCH, Memory, Iceberg, and Hive catalogs"
               + " (iceberg warehouse: {}, hive warehouse: {})",
-          warehouseDir,
-          hiveWarehouse);
+          warehouseDir, hiveWarehouse);
     } catch (Exception e) {
       LOG.error("Failed to initialize Trino engine", e);
       throw new RuntimeException("Failed to initialize Trino engine", e);
@@ -177,7 +176,9 @@ public class TrinoEngine implements Closeable {
     }
   }
 
-  private static Session createDefaultSession(SessionPropertyManager spm) {
+  private static Session createDefaultSession() {
+    SessionPropertyManager spm =
+        new SessionPropertyManager(Collections.emptySet(), CatalogServiceProvider.fail());
     Identity identity = Identity.ofUser("opensearch");
     return Session.builder(spm)
         .setIdentity(identity)
@@ -189,27 +190,17 @@ public class TrinoEngine implements Closeable {
         .build();
   }
 
-  /**
-   * Execute a SQL query and return the result in Trino client protocol JSON format.
-   *
-   * @param sql the SQL query to execute
-   * @return JSON string in Trino v1/statement response format
-   */
   public String executeAndSerializeJson(String sql) {
     return executeAndSerializeJson(sql, null, null);
   }
 
-  /**
-   * Execute a SQL query with optional catalog/schema and return the result in Trino client protocol
-   * JSON format.
-   */
   public String executeAndSerializeJson(String sql, String catalog, String schema) {
     String queryId = UUID.randomUUID().toString().replace("-", "");
     LOG.debug("TrinoEngine executing query [{}] with id [{}]", sql, queryId);
 
     try {
       Session session = createSessionWithCatalogSchema(catalog, schema);
-      MaterializedResult result = client.execute(session, sql).getResult();
+      MaterializedResult result = queryRunner.execute(session, sql);
       return serializeToTrinoJson(queryId, result);
     } catch (Exception e) {
       LOG.error("Query execution failed: {}", e.getMessage(), e);
@@ -218,7 +209,7 @@ public class TrinoEngine implements Closeable {
   }
 
   private Session createSessionWithCatalogSchema(String catalog, String schema) {
-    SessionPropertyManager spm = server.getSessionPropertyManager();
+    SessionPropertyManager spm = queryRunner.getSessionPropertyManager();
     Identity identity = Identity.ofUser("opensearch");
     int taskConcurrency = Runtime.getRuntime().availableProcessors();
     Session.SessionBuilder builder =
@@ -238,17 +229,11 @@ public class TrinoEngine implements Closeable {
     return builder.build();
   }
 
-  /** Get the underlying TestingTrinoServer for accessing internal components. */
-  public TestingTrinoServer getServer() {
-    return server;
+  /** Get the underlying query runner for access to internal components. */
+  public DistributedQueryRunner getQueryRunner() {
+    return queryRunner;
   }
 
-  /** Get the SessionPropertyManager. */
-  public SessionPropertyManager getSessionPropertyManager() {
-    return server.getSessionPropertyManager();
-  }
-
-  /** Serialize a MaterializedResult to Trino client protocol JSON. */
   private String serializeToTrinoJson(String queryId, MaterializedResult result) {
     StringBuilder sb = new StringBuilder();
     sb.append("{");
@@ -429,14 +414,9 @@ public class TrinoEngine implements Closeable {
   public void close() {
     LOG.info("Closing Trino engine");
     try {
-      client.close();
+      queryRunner.close();
     } catch (Exception e) {
-      LOG.warn("Error closing Trino client", e);
-    }
-    try {
-      server.close();
-    } catch (Exception e) {
-      LOG.warn("Error closing Trino server", e);
+      LOG.warn("Error closing Trino engine", e);
     }
   }
 }

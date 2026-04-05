@@ -14,8 +14,10 @@ import io.trino.spi.connector.CatalogHandle;
 import java.net.URI;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import org.opensearch.cluster.ClusterChangedEvent;
@@ -34,6 +36,9 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
 
   private final CopyOnWriteArrayList<Consumer<AllNodes>> listeners = new CopyOnWriteArrayList<>();
 
+  // Reverse mapping: Trino node ID → OpenSearch DiscoveryNode
+  private final Map<String, DiscoveryNode> nodeIdToDiscoveryNode = new ConcurrentHashMap<>();
+
   private volatile InternalNode currentNode;
   private volatile Set<InternalNode> activeNodes;
   private volatile AllNodes allNodes;
@@ -47,6 +52,7 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
     this.currentNode = toInternalNode(localNode);
     this.activeNodes = Set.of(currentNode);
     this.allNodes = buildAllNodes(activeNodes);
+    nodeIdToDiscoveryNode.put(localNode.getId(), localNode);
   }
 
   @Override
@@ -56,8 +62,10 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
     }
     DiscoveryNodes discoveryNodes = event.state().nodes();
     Set<InternalNode> newActiveNodes = new HashSet<>();
+    nodeIdToDiscoveryNode.clear();
     for (DiscoveryNode dn : discoveryNodes) {
       newActiveNodes.add(toInternalNode(dn));
+      nodeIdToDiscoveryNode.put(dn.getId(), dn);
     }
     newActiveNodes = Collections.unmodifiableSet(newActiveNodes);
 
@@ -125,6 +133,24 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
   @Override
   public void removeNodeChangeListener(Consumer<AllNodes> listener) {
     listeners.remove(listener);
+  }
+
+  /**
+   * Map a Trino {@link InternalNode} back to its OpenSearch {@link DiscoveryNode}. Used by {@code
+   * TransportRemoteTaskFactory} to send transport actions to the correct node.
+   *
+   * @param internalNode the Trino node
+   * @return the corresponding OpenSearch discovery node
+   * @throws IllegalArgumentException if the node is not known
+   */
+  public DiscoveryNode toDiscoveryNode(InternalNode internalNode) {
+    DiscoveryNode dn = nodeIdToDiscoveryNode.get(internalNode.getNodeIdentifier());
+    if (dn == null) {
+      throw new IllegalArgumentException(
+          "Unknown Trino node: " + internalNode.getNodeIdentifier()
+              + ". Known nodes: " + nodeIdToDiscoveryNode.keySet());
+    }
+    return dn;
   }
 
   /**

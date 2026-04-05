@@ -95,9 +95,11 @@ public class TrinoEngine implements Closeable {
       LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
           processors, taskConcurrency);
 
+      // Use 2 nodes for distributed execution: doubles parallelism for
+      // partitioned exchanges (GROUP BY, JOIN) on a multi-core machine.
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session)
-              .setNodeCount(1)
+              .setNodeCount(2)
               .addExtraProperty("query.max-memory-per-node", queryMemStr)
               .addExtraProperty("query.max-memory", queryMemStr)
               .addExtraProperty("memory.heap-headroom-per-node", headroomStr)
@@ -252,7 +254,10 @@ public class TrinoEngine implements Closeable {
             .setSystemProperty("dictionary_aggregation", "true")
             // Optimize hash partitioning for single-node execution
             .setSystemProperty("max_hash_partition_count", String.valueOf(taskConcurrency))
-            .setSystemProperty("min_hash_partition_count", String.valueOf(taskConcurrency));
+            .setSystemProperty("min_hash_partition_count", String.valueOf(taskConcurrency))
+            // Increase Parquet read block size for better vectorization
+            .setCatalogSessionProperty("iceberg", "parquet_max_read_block_row_count", "65536")
+            .setCatalogSessionProperty("iceberg", "parquet_max_read_block_size", "64MB");
     builder.setCatalog(catalog != null ? catalog : "tpch");
     builder.setSchema(schema != null ? schema : "tiny");
     return builder.build();

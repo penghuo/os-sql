@@ -89,6 +89,12 @@ public class TrinoEngine implements Closeable {
       LOG.info("Trino memory config: heap={}MB, queryMem={}, headroom={}",
           maxHeap / (1024 * 1024), queryMemStr, headroomStr);
 
+      // Scale task concurrency to available processors for analytical workloads.
+      int processors = Runtime.getRuntime().availableProcessors();
+      int taskConcurrency = Math.max(4, processors);
+      LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
+          processors, taskConcurrency);
+
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session)
               .setNodeCount(1)
@@ -234,12 +240,19 @@ public class TrinoEngine implements Closeable {
     // Use the queryRunner's SessionPropertyManager so that catalog-level properties are resolved
     SessionPropertyManager spm = queryRunner.getSessionPropertyManager();
     Identity identity = Identity.ofUser("opensearch");
+    int taskConcurrency = Runtime.getRuntime().availableProcessors();
     Session.SessionBuilder builder =
         Session.builder(spm)
             .setIdentity(identity)
             .setOriginalIdentity(identity)
             .setSource("opensearch-sql-plugin")
-            .setQueryId(QueryId.valueOf(UUID.randomUUID().toString().replace("-", "")));
+            .setQueryId(QueryId.valueOf(UUID.randomUUID().toString().replace("-", "")))
+            // Performance: scale parallelism to available CPUs
+            .setSystemProperty("task_concurrency", String.valueOf(taskConcurrency))
+            .setSystemProperty("dictionary_aggregation", "true")
+            // Optimize hash partitioning for single-node execution
+            .setSystemProperty("max_hash_partition_count", String.valueOf(taskConcurrency))
+            .setSystemProperty("min_hash_partition_count", String.valueOf(taskConcurrency));
     builder.setCatalog(catalog != null ? catalog : "tpch");
     builder.setSchema(schema != null ? schema : "tiny");
     return builder.build();

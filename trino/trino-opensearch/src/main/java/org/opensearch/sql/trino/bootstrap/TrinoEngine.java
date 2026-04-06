@@ -112,12 +112,14 @@ public class TrinoEngine implements Closeable {
               .addExtraProperty("query.max-memory-per-node", perNodeMemStr)
               .addExtraProperty("query.max-memory", clusterMemStr)
               .addExtraProperty("memory.heap-headroom-per-node", headroomStr)
-              .addExtraProperty("spill-enabled", "true")
-              .addExtraProperty("spiller-spill-path", "/tmp/trino-spill")
-              .addExtraProperty("spiller-max-used-space-threshold", "0.8")
-              .addExtraProperty("spiller-threads", "4")
-              .addExtraProperty("max-spill-per-node", "50GB")
-              .addExtraProperty("query-max-spill-per-node", "10GB")
+              // Spill disabled: FileSingleStreamSpillerFactory constructor unconditionally
+              // invokes StackCallerProtectionDomainChainExtractor which walks the call stack
+              // calling CodeSource.getLocation().getProtocol(). In OpenSearch's plugin
+              // classloader, classes loaded from JARs-inside-ZIP have null CodeSource location,
+              // causing NPE. This only manifests when running as an installed plugin (not via
+              // Gradle test runner which provides valid CodeSource). With 16g+/node and 60%
+              // for queries, ClickBench fits in memory without spill.
+              .addExtraProperty("spill-enabled", "false")
               .addExtraProperty("exchange.compression-codec", "LZ4")
               .addExtraProperty("query.max-execution-time", "10m")
               .build();
@@ -292,8 +294,17 @@ public class TrinoEngine implements Closeable {
       org.opensearch.cluster.node.DiscoveryNode localNode = clusterService.localNode();
       java.net.URI trinoHttpUrl = queryRunner.getCoordinator().getBaseUrl();
 
+      // Get the coordinator's original Trino node ID — DistributedQueryRunner assigns a UUID
+      // that differs from the OpenSearch DiscoveryNode ID. The NodeManager must know this ID
+      // so TransportRemoteTaskFactory can map it back when Trino's scheduler assigns splits.
+      String coordinatorTrinoNodeId = queryRunner.getCoordinator()
+          .getInstance(com.google.inject.Key.get(io.trino.metadata.InternalNodeManager.class))
+          .getCurrentNode().getNodeIdentifier();
+
       org.opensearch.sql.trino.node.OpenSearchNodeManager nodeManager =
           new org.opensearch.sql.trino.node.OpenSearchNodeManager(localNode);
+      // Register coordinator's Trino node ID as alias for the local OpenSearch node
+      nodeManager.registerCoordinatorTrinoNodeId(coordinatorTrinoNodeId, localNode);
       // Register the Trino HTTP URL BEFORE rebuilding nodes
       nodeManager.registerTrinoHttpUrl(localNode.getId(), trinoHttpUrl);
       // Rebuild active nodes from current cluster state (now with correct HTTP URLs)

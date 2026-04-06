@@ -43,6 +43,11 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
   // Reverse mapping: Trino node ID → OpenSearch DiscoveryNode
   private final Map<String, DiscoveryNode> nodeIdToDiscoveryNode = new ConcurrentHashMap<>();
 
+  // Coordinator's Trino-internal node ID alias (from DistributedQueryRunner).
+  // Must be preserved across clusterChanged() rebuilds since it doesn't come from ClusterState.
+  private volatile String coordinatorTrinoNodeId;
+  private volatile DiscoveryNode coordinatorLocalNode;
+
   // Trino HTTP URL mapping: OpenSearch node ID → Trino HTTP server URI
   // Used to construct InternalNode with correct HTTP URIs for exchange
   private final Map<String, URI> trinoHttpUrls = new ConcurrentHashMap<>();
@@ -73,6 +78,10 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
     for (DiscoveryNode dn : discoveryNodes) {
       newActiveNodes.add(toInternalNode(dn, trinoHttpUrls.get(dn.getId())));
       nodeIdToDiscoveryNode.put(dn.getId(), dn);
+    }
+    // Re-register coordinator's Trino node ID alias (not in ClusterState)
+    if (coordinatorTrinoNodeId != null && coordinatorLocalNode != null) {
+      nodeIdToDiscoveryNode.put(coordinatorTrinoNodeId, coordinatorLocalNode);
     }
     newActiveNodes = Collections.unmodifiableSet(newActiveNodes);
 
@@ -159,6 +168,23 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
               + ". Known nodes: " + nodeIdToDiscoveryNode.keySet());
     }
     return dn;
+  }
+
+  /**
+   * Register the coordinator's Trino-internal node ID as an alias for the local OpenSearch node.
+   * DistributedQueryRunner assigns a UUID to the coordinator that differs from the OpenSearch
+   * DiscoveryNode ID. When Trino's NodeScheduler assigns splits to this node, it uses the Trino ID.
+   * TransportRemoteTaskFactory.toDiscoveryNode() needs this mapping to resolve the node.
+   *
+   * @param trinoNodeId the coordinator's Trino-internal node ID (UUID from DistributedQueryRunner)
+   * @param localNode the local OpenSearch DiscoveryNode
+   */
+  public void registerCoordinatorTrinoNodeId(String trinoNodeId, DiscoveryNode localNode) {
+    this.coordinatorTrinoNodeId = trinoNodeId;
+    this.coordinatorLocalNode = localNode;
+    nodeIdToDiscoveryNode.put(trinoNodeId, localNode);
+    LOG.info("Registered coordinator Trino node ID {} → OpenSearch node {}",
+        trinoNodeId, localNode.getId());
   }
 
   /**

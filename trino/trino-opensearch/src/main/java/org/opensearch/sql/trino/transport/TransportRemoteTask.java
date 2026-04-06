@@ -13,23 +13,34 @@ import com.google.common.util.concurrent.SettableFuture;
 import io.trino.Session;
 import io.trino.execution.PartitionedSplitsInfo;
 import io.trino.execution.RemoteTask;
+import io.trino.execution.ScheduledSplit;
+import io.trino.execution.SplitAssignment;
 import io.trino.execution.StateMachine.StateChangeListener;
 import io.trino.execution.TaskId;
 import io.trino.execution.TaskInfo;
 import io.trino.execution.TaskStatus;
 import io.trino.execution.buffer.OutputBuffers;
 import io.trino.execution.buffer.SpoolingOutputStats;
+import io.trino.operator.TaskStats;
 import io.trino.metadata.InternalNode;
 import io.trino.metadata.Split;
 import io.trino.sql.planner.PlanFragment;
 import io.trino.sql.planner.plan.PlanNodeId;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -71,11 +82,17 @@ public class TransportRemoteTask implements RemoteTask {
   private final Multimap<PlanNodeId, Split> pendingSplits =
       HashMultimap.create();
   private final Set<PlanNodeId> noMoreSplitsSources = new HashSet<>();
+  private final AtomicLong splitSequenceId = new AtomicLong(0);
 
   private final CopyOnWriteArrayList<StateChangeListener<TaskStatus>> statusListeners =
       new CopyOnWriteArrayList<>();
   private final CopyOnWriteArrayList<StateChangeListener<TaskInfo>> infoListeners =
       new CopyOnWriteArrayList<>();
+
+  private static final ScheduledExecutorService STATUS_POLLER =
+      Executors.newScheduledThreadPool(2,
+          r -> { Thread t = new Thread(r, "transport-task-status-poller"); t.setDaemon(true); return t; });
+  private volatile ScheduledFuture<?> statusPollFuture;
 
   public TransportRemoteTask(
       TransportService transportService,
@@ -97,6 +114,22 @@ public class TransportRemoteTask implements RemoteTask {
     this.outputBuffers.set(initialOutputBuffers);
     this.pendingSplits.putAll(initialSplits);
     this.pendingSplitCount.set(initialSplits.size());
+
+    // Initialize with a placeholder TaskInfo (same pattern as HttpRemoteTask).
+    // The self URI must include the task path for the exchange client to construct
+    // correct results URLs: {self}/results/{bufferId}/{token}
+    java.net.URI selfUri = java.net.URI.create(
+        trinoNode.getInternalUri() + "/v1/task/" + taskId);
+    TaskStatus initialStatus =
+        TaskStatus.initialTaskStatus(taskId, selfUri,
+            trinoNode.getNodeIdentifier(), false);
+    TaskStats initialStats = new TaskStats(
+        org.joda.time.DateTime.now(), org.joda.time.DateTime.now());
+    TaskInfo initialInfo =
+        TaskInfo.createInitialTask(taskId, selfUri,
+            trinoNode.getNodeIdentifier(), false, Optional.empty(), initialStats);
+    this.lastTaskInfo.set(initialInfo);
+    this.lastTaskStatus.set(initialStatus);
   }
 
   @Override
@@ -124,7 +157,12 @@ public class TransportRemoteTask implements RemoteTask {
     if (!started.compareAndSet(false, true)) {
       return;
     }
+    LOG.info("Starting TransportRemoteTask {} on node {} (URI: {})",
+        taskId, targetNode.getName(), trinoNode.getInternalUri());
     sendUpdate(Optional.of(planFragment));
+    // Start polling task status — required for the coordinator to know when tasks finish
+    statusPollFuture = STATUS_POLLER.scheduleWithFixedDelay(
+        this::pollStatus, 200, 200, TimeUnit.MILLISECONDS);
   }
 
   @Override
@@ -133,7 +171,9 @@ public class TransportRemoteTask implements RemoteTask {
       pendingSplits.putAll(splits);
       pendingSplitCount.addAndGet(splits.size());
     }
-    sendUpdate(Optional.empty());
+    if (started.get()) {
+      sendUpdate(Optional.empty());
+    }
   }
 
   @Override
@@ -141,7 +181,9 @@ public class TransportRemoteTask implements RemoteTask {
     synchronized (pendingSplits) {
       noMoreSplitsSources.add(sourceId);
     }
-    sendUpdate(Optional.empty());
+    if (started.get()) {
+      sendUpdate(Optional.empty());
+    }
   }
 
   @Override
@@ -159,11 +201,17 @@ public class TransportRemoteTask implements RemoteTask {
 
   @Override
   public void cancel() {
+    if (statusPollFuture != null) {
+      statusPollFuture.cancel(false);
+    }
     sendCancel();
   }
 
   @Override
   public void abort() {
+    if (statusPollFuture != null) {
+      statusPollFuture.cancel(false);
+    }
     sendCancel();
   }
 
@@ -217,10 +265,20 @@ public class TransportRemoteTask implements RemoteTask {
   private void sendUpdate(Optional<PlanFragment> fragment) {
     try {
       byte[] fragmentJson = fragment.map(codec::serializePlanFragment).orElse(new byte[0]);
-      // TODO: serialize actual pending splits and session in Task 17
-      byte[] splitsJson = codec.serializeSplitAssignments(List.of());
+      if (fragment.isPresent()) {
+        LOG.info("sendUpdate for {}: fragment size={} bytes",
+            taskId, fragmentJson.length);
+      }
+
+      // Convert pending splits to SplitAssignment list
+      List<SplitAssignment> splitAssignments;
+      synchronized (pendingSplits) {
+        splitAssignments = buildSplitAssignments();
+        pendingSplits.clear();
+      }
+      byte[] splitsJson = codec.serializeSplitAssignments(splitAssignments);
       byte[] buffersJson = codec.serializeOutputBuffers(outputBuffers.get());
-      byte[] sessionJson = new byte[0]; // Wired in Task 17
+      byte[] sessionJson = new byte[0];
 
       TrinoTaskUpdateRequest request =
           new TrinoTaskUpdateRequest(
@@ -244,6 +302,8 @@ public class TransportRemoteTask implements RemoteTask {
                 TaskInfo info = codec.deserializeTaskInfo(response.getTaskInfoJson());
                 lastTaskInfo.set(info);
                 lastTaskStatus.set(info.getTaskStatus());
+                LOG.info("Task update response for {}: state={}, self={}",
+                    taskId, info.getTaskStatus().getState(), info.getTaskStatus().getSelf());
               } catch (Exception e) {
                 LOG.warn("Failed to deserialize task update response for {}", taskId, e);
               }
@@ -262,6 +322,87 @@ public class TransportRemoteTask implements RemoteTask {
     } catch (Exception e) {
       LOG.error("Failed to send task update for {}", taskId, e);
     }
+  }
+
+  private void pollStatus() {
+    try {
+      TrinoTaskStatusRequest request = new TrinoTaskStatusRequest(taskId.toString());
+      transportService.sendRequest(
+          targetNode,
+          TrinoTaskStatusAction.NAME,
+          request,
+          new org.opensearch.transport.TransportResponseHandler<TrinoTaskStatusResponse>() {
+            @Override
+            public TrinoTaskStatusResponse read(
+                org.opensearch.core.common.io.stream.StreamInput in)
+                throws java.io.IOException {
+              return new TrinoTaskStatusResponse(in);
+            }
+
+            @Override
+            public void handleResponse(TrinoTaskStatusResponse response) {
+              try {
+                TaskInfo info = codec.deserializeTaskInfo(response.getTaskInfoJson());
+                TaskInfo prev = lastTaskInfo.getAndSet(info);
+                TaskStatus status = info.getTaskStatus();
+                TaskStatus prevStatus = lastTaskStatus.getAndSet(status);
+                LOG.info("Status poll for {}: state={}, self={}",
+                    taskId, status.getState(), status.getSelf());
+                // Notify listeners on status change
+                if (prevStatus == null || !prevStatus.getState().equals(status.getState())) {
+                  for (StateChangeListener<TaskStatus> listener : statusListeners) {
+                    listener.stateChanged(status);
+                  }
+                }
+                // If task is done, notify final info listeners and stop polling
+                if (status.getState().isDone()) {
+                  for (StateChangeListener<TaskInfo> listener : infoListeners) {
+                    listener.stateChanged(info);
+                  }
+                  if (statusPollFuture != null) {
+                    statusPollFuture.cancel(false);
+                  }
+                }
+              } catch (Exception e) {
+                LOG.debug("Failed to process status poll response for {}", taskId, e);
+              }
+            }
+
+            @Override
+            public void handleException(org.opensearch.transport.TransportException exp) {
+              LOG.debug("Status poll failed for {}: {}", taskId, exp.getMessage());
+            }
+
+            @Override
+            public String executor() {
+              return org.opensearch.threadpool.ThreadPool.Names.SAME;
+            }
+          });
+    } catch (Exception e) {
+      LOG.debug("Failed to poll status for {}", taskId, e);
+    }
+  }
+
+  /** Convert pending splits multimap to a list of SplitAssignment for serialization. */
+  private List<SplitAssignment> buildSplitAssignments() {
+    List<SplitAssignment> assignments = new ArrayList<>();
+    // Group splits by PlanNodeId
+    for (PlanNodeId planNodeId : new HashSet<>(pendingSplits.keySet())) {
+      Set<ScheduledSplit> scheduledSplits = new LinkedHashSet<>();
+      for (Split split : pendingSplits.get(planNodeId)) {
+        scheduledSplits.add(
+            new ScheduledSplit(splitSequenceId.getAndIncrement(), planNodeId, split));
+      }
+      boolean noMore = noMoreSplitsSources.contains(planNodeId);
+      assignments.add(new SplitAssignment(planNodeId, scheduledSplits, noMore));
+    }
+    // Also add no-more-splits signals for sources that have no pending splits
+    for (PlanNodeId planNodeId : noMoreSplitsSources) {
+      if (!pendingSplits.containsKey(planNodeId)) {
+        assignments.add(new SplitAssignment(planNodeId, Set.of(), true));
+      }
+    }
+    return assignments;
   }
 
   private void sendCancel() {

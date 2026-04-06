@@ -20,6 +20,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -34,10 +36,16 @@ import org.opensearch.cluster.node.DiscoveryNodes;
  */
 public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateListener {
 
+  private static final Logger LOG = LogManager.getLogger(OpenSearchNodeManager.class);
+
   private final CopyOnWriteArrayList<Consumer<AllNodes>> listeners = new CopyOnWriteArrayList<>();
 
   // Reverse mapping: Trino node ID → OpenSearch DiscoveryNode
   private final Map<String, DiscoveryNode> nodeIdToDiscoveryNode = new ConcurrentHashMap<>();
+
+  // Trino HTTP URL mapping: OpenSearch node ID → Trino HTTP server URI
+  // Used to construct InternalNode with correct HTTP URIs for exchange
+  private final Map<String, URI> trinoHttpUrls = new ConcurrentHashMap<>();
 
   private volatile InternalNode currentNode;
   private volatile Set<InternalNode> activeNodes;
@@ -49,7 +57,7 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
    * @param localNode the local OpenSearch discovery node
    */
   public OpenSearchNodeManager(DiscoveryNode localNode) {
-    this.currentNode = toInternalNode(localNode);
+    this.currentNode = toInternalNode(localNode, null);
     this.activeNodes = Set.of(currentNode);
     this.allNodes = buildAllNodes(activeNodes);
     nodeIdToDiscoveryNode.put(localNode.getId(), localNode);
@@ -57,14 +65,13 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
 
   @Override
   public void clusterChanged(ClusterChangedEvent event) {
-    if (!event.nodesChanged()) {
-      return;
-    }
+    // Always rebuild on explicit calls (e.g., trino-init) even if nodes didn't change,
+    // to pick up registered Trino HTTP URLs.
     DiscoveryNodes discoveryNodes = event.state().nodes();
     Set<InternalNode> newActiveNodes = new HashSet<>();
     nodeIdToDiscoveryNode.clear();
     for (DiscoveryNode dn : discoveryNodes) {
-      newActiveNodes.add(toInternalNode(dn));
+      newActiveNodes.add(toInternalNode(dn, trinoHttpUrls.get(dn.getId())));
       nodeIdToDiscoveryNode.put(dn.getId(), dn);
     }
     newActiveNodes = Collections.unmodifiableSet(newActiveNodes);
@@ -72,7 +79,8 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
     // Update local node reference from cluster state
     DiscoveryNode localDiscoveryNode = discoveryNodes.getLocalNode();
     if (localDiscoveryNode != null) {
-      this.currentNode = toInternalNode(localDiscoveryNode);
+      this.currentNode = toInternalNode(
+          localDiscoveryNode, trinoHttpUrls.get(localDiscoveryNode.getId()));
     }
 
     this.activeNodes = newActiveNodes;
@@ -154,15 +162,39 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
   }
 
   /**
+   * Register the Trino HTTP server URL for an OpenSearch node. This URL is used to construct
+   * InternalNodes with correct HTTP URIs for Trino's exchange mechanism.
+   *
+   * @param nodeId OpenSearch node ID
+   * @param httpUrl Trino HTTP server URI (e.g., http://host:port)
+   */
+  public void registerTrinoHttpUrl(String nodeId, URI httpUrl) {
+    trinoHttpUrls.put(nodeId, httpUrl);
+    LOG.info("Registered Trino HTTP URL for node {}: {}", nodeId, httpUrl);
+  }
+
+  /**
+   * Get the registered Trino HTTP URL for a node. Returns null if not registered.
+   */
+  public URI getTrinoHttpUrl(String nodeId) {
+    return trinoHttpUrls.get(nodeId);
+  }
+
+  /**
    * Convert an OpenSearch {@link DiscoveryNode} to a Trino {@link InternalNode}.
    *
-   * <p>Uses the node's transport address to construct a URI and maps the OpenSearch version string
-   * to a Trino {@link NodeVersion}. All nodes are marked as coordinators (symmetric design).
+   * <p>If a Trino HTTP URL is registered for this node, uses that URL. Otherwise falls back to
+   * constructing a URI from the transport address.
    */
-  static InternalNode toInternalNode(DiscoveryNode discoveryNode) {
-    String host = discoveryNode.getHostAddress();
-    int port = discoveryNode.getAddress().address().getPort();
-    URI uri = URI.create("http://" + host + ":" + port);
+  static InternalNode toInternalNode(DiscoveryNode discoveryNode, URI trinoHttpUrl) {
+    URI uri;
+    if (trinoHttpUrl != null) {
+      uri = trinoHttpUrl;
+    } else {
+      String host = discoveryNode.getHostAddress();
+      int port = discoveryNode.getAddress().address().getPort();
+      uri = URI.create("http://" + host + ":" + port);
+    }
     NodeVersion version = new NodeVersion(discoveryNode.getVersion().toString());
     return new InternalNode(discoveryNode.getId(), uri, version, /* isCoordinator= */ true);
   }

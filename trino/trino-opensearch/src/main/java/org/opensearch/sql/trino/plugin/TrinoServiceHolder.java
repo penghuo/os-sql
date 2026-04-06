@@ -6,8 +6,10 @@
 package org.opensearch.sql.trino.plugin;
 
 import io.trino.execution.SqlTaskManager;
+import java.net.URI;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
 import org.opensearch.sql.trino.execution.OpenSearchSqlTaskManager;
+import org.opensearch.sql.trino.node.OpenSearchNodeManager;
 import org.opensearch.sql.trino.transport.TrinoJsonCodec;
 import org.opensearch.transport.TransportService;
 
@@ -27,6 +29,8 @@ public final class TrinoServiceHolder {
   private final TrinoJsonCodec codec;
   private final TrinoEngine engine;
   private volatile TransportService transportService;
+  private volatile OpenSearchNodeManager nodeManager;
+  private volatile URI trinoHttpUrl;
 
   private TrinoServiceHolder(
       OpenSearchSqlTaskManager taskManager, TrinoJsonCodec codec, TrinoEngine engine) {
@@ -48,7 +52,17 @@ public final class TrinoServiceHolder {
   public static void initializeWithEngine(TrinoEngine trinoEngine) {
     SqlTaskManager sqlTaskManager = trinoEngine.getCoordinatorTaskManager();
     OpenSearchSqlTaskManager taskManager = new OpenSearchSqlTaskManager(sqlTaskManager);
-    TrinoJsonCodec codec = new TrinoJsonCodec();
+    // Get Trino's ObjectMapper from the coordinator's Guice injector — it has all
+    // the custom serializers for PlanFragment, SplitAssignment, OutputBuffers, etc.
+    com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+    try {
+      objectMapper = trinoEngine.getQueryRunner().getCoordinator().getInstance(
+          com.google.inject.Key.get(com.fasterxml.jackson.databind.ObjectMapper.class));
+    } catch (Exception e) {
+      // Fallback to default ObjectMapper if Guice injection fails
+      objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    }
+    TrinoJsonCodec codec = new TrinoJsonCodec(objectMapper);
     instance = new TrinoServiceHolder(taskManager, codec, trinoEngine);
   }
 
@@ -85,5 +99,36 @@ public final class TrinoServiceHolder {
     if (instance != null) {
       instance.transportService = ts;
     }
+  }
+
+  public OpenSearchNodeManager getNodeManager() {
+    return nodeManager;
+  }
+
+  public void setNodeManager(OpenSearchNodeManager nodeManager) {
+    this.nodeManager = nodeManager;
+  }
+
+  public URI getTrinoHttpUrl() {
+    return trinoHttpUrl;
+  }
+
+  public void setTrinoHttpUrl(URI trinoHttpUrl) {
+    this.trinoHttpUrl = trinoHttpUrl;
+  }
+
+  /**
+   * Enable split-level distribution on the coordinator. Must be called after both the engine
+   * and TransportService are available. Delegates to TrinoEngine.enableSplitLevelDistribution()
+   * which sets up the NodeManager and patches the coordinator via reflection.
+   *
+   * @param clusterService OpenSearch cluster service for node discovery
+   */
+  public void enableSplitLevelDistribution(
+      org.opensearch.cluster.service.ClusterService clusterService) {
+    if (engine == null || transportService == null) {
+      return;
+    }
+    engine.enableSplitLevelDistribution(clusterService, transportService);
   }
 }

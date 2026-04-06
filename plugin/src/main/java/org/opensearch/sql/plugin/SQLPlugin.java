@@ -379,10 +379,9 @@ public class SQLPlugin extends Plugin
           TrinoSettings.TRINO_CATALOG_WAREHOUSE.get(environment.settings());
       this.trinoEngine = new TrinoEngine(icebergWarehouse);
 
-      // Initialize transport actions backed by the real SqlTaskManager.
-      // This enables cross-node task dispatch: when a remote coordinator sends a
-      // trino:task/update, our local SqlTaskManager creates Trino drivers and executes splits.
-      // Called on the engine to stay within the shadow jar classloader.
+      // Phase 1: Initialize transport actions backed by the real SqlTaskManager.
+      // Phase 2 (split-level distribution patching) is deferred until TransportService is
+      // available, triggered by transport action @Inject in TransportTrinoQueryForwardAction.
       this.trinoEngine.initializeTransportServices();
     } else {
       LOGGER.info("Trino engine is disabled (plugins.trino.enabled=false)");

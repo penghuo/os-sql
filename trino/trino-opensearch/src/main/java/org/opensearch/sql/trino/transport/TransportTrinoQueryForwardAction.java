@@ -9,6 +9,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.trino.bootstrap.TrinoEngine;
@@ -28,7 +29,9 @@ public class TransportTrinoQueryForwardAction
 
   @Inject
   public TransportTrinoQueryForwardAction(
-      TransportService transportService, ActionFilters actionFilters) {
+      TransportService transportService,
+      ActionFilters actionFilters,
+      ClusterService clusterService) {
     super(
         TrinoQueryForwardAction.NAME,
         transportService,
@@ -36,6 +39,22 @@ public class TransportTrinoQueryForwardAction
         TrinoQueryForwardRequest::new);
     // Make TransportService available to the REST handler for direct node targeting
     org.opensearch.sql.trino.plugin.TrinoServiceHolder.setTransportService(transportService);
+
+    // Enable split-level distribution after cluster state is available.
+    // ClusterState is null during @Inject, so we defer via a cluster state listener.
+    if (org.opensearch.sql.trino.plugin.TrinoServiceHolder.isInitialized()) {
+      clusterService.addListener(event -> {
+        if (org.opensearch.sql.trino.plugin.TrinoServiceHolder.getInstance()
+            .getNodeManager() == null) {
+          try {
+            org.opensearch.sql.trino.plugin.TrinoServiceHolder.getInstance()
+                .enableSplitLevelDistribution(clusterService);
+          } catch (Exception e) {
+            LOG.warn("Split-level distribution not enabled: {}", e.getMessage());
+          }
+        }
+      });
+    }
   }
 
   @Override

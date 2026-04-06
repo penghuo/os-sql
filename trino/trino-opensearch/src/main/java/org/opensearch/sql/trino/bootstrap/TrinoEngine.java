@@ -93,10 +93,12 @@ public class TrinoEngine implements Closeable {
       LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
           processors, taskConcurrency);
 
-      // Scale node count for distributed execution parallelism.
-      // 4 nodes on a 32-CPU machine gives good parallelism for GROUP BY/JOIN.
-      int nodeCount = Math.max(2, Math.min(4, processors / 8));
-      LOG.info("Trino node count: {} (processors={})", nodeCount, processors);
+      // Use single coordinator node. Split-level distribution across OpenSearch cluster
+      // nodes is handled by TransportRemoteTaskFactory + OpenSearchNodeManager, which are
+      // patched into the coordinator via TransportDistributionPatcher after build.
+      // Hash partitioning within the single node still provides parallelism via task_concurrency.
+      int nodeCount = 1;
+      LOG.info("Trino node count: {} (single coordinator, transport distribution)", nodeCount);
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session)
               .setNodeCount(nodeCount)
@@ -244,14 +246,59 @@ public class TrinoEngine implements Closeable {
   }
 
   /**
-   * Initialize the TrinoServiceHolder with this engine and its SqlTaskManager. Must be called from
-   * within the shadow jar classloader to avoid class conflicts. After this call, transport actions
-   * can dispatch queries to this node's local Trino engine.
+   * Phase 1: Initialize the TrinoServiceHolder with this engine and SqlTaskManager. The
+   * OpenSearchNodeManager and split-level distribution patching are deferred to Phase 2
+   * ({@link #enableSplitLevelDistribution}) because the ClusterState and TransportService are not
+   * yet available during createComponents().
    */
   public void initializeTransportServices() {
     org.opensearch.sql.trino.plugin.TrinoServiceHolder.initializeWithEngine(this);
-    LOG.info("Trino transport services initialized — engine and SqlTaskManager available for "
-        + "cross-node dispatch");
+
+    // Store the Trino HTTP URL for exchange — remote nodes need this to fetch pages
+    java.net.URI trinoHttpUrl = queryRunner.getCoordinator().getBaseUrl();
+    org.opensearch.sql.trino.plugin.TrinoServiceHolder.getInstance()
+        .setTrinoHttpUrl(trinoHttpUrl);
+    LOG.info("Trino transport services initialized (phase 1) — HTTP URL: {}", trinoHttpUrl);
+  }
+
+  /**
+   * Phase 2: Set up OpenSearchNodeManager and enable split-level distribution. Called after the
+   * cluster is fully started and TransportService is available (triggered by transport action
+   * @Inject).
+   *
+   * @param clusterService OpenSearch cluster service
+   * @param transportService OpenSearch transport service
+   */
+  public void enableSplitLevelDistribution(
+      org.opensearch.cluster.service.ClusterService clusterService,
+      org.opensearch.transport.TransportService transportService) {
+    try {
+      org.opensearch.cluster.node.DiscoveryNode localNode = clusterService.localNode();
+      java.net.URI trinoHttpUrl = queryRunner.getCoordinator().getBaseUrl();
+
+      org.opensearch.sql.trino.node.OpenSearchNodeManager nodeManager =
+          new org.opensearch.sql.trino.node.OpenSearchNodeManager(localNode);
+      // Register the Trino HTTP URL BEFORE rebuilding nodes
+      nodeManager.registerTrinoHttpUrl(localNode.getId(), trinoHttpUrl);
+      // Rebuild active nodes from current cluster state (now with correct HTTP URLs)
+      org.opensearch.cluster.ClusterState state = clusterService.state();
+      nodeManager.clusterChanged(
+          new org.opensearch.cluster.ClusterChangedEvent("trino-init", state, state));
+      clusterService.addListener(nodeManager);
+
+      org.opensearch.sql.trino.plugin.TrinoServiceHolder holder =
+          org.opensearch.sql.trino.plugin.TrinoServiceHolder.getInstance();
+      holder.setNodeManager(nodeManager);
+
+      // Patch the coordinator's Guice-injected components for transport-based distribution
+      org.opensearch.sql.trino.transport.TransportDistributionPatcher.patch(
+          queryRunner, transportService, nodeManager, holder.getCodec());
+
+      LOG.info("Split-level distribution enabled — NodeManager and RemoteTaskFactory patched. "
+          + "Local node: {}, HTTP URL: {}", localNode.getName(), trinoHttpUrl);
+    } catch (Exception e) {
+      LOG.warn("Split-level distribution not enabled: {}", e.getMessage(), e);
+    }
   }
 
   private String serializeToTrinoJson(String queryId, MaterializedResult result) {

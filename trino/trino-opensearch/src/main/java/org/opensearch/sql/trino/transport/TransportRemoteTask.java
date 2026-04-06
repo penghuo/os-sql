@@ -77,7 +77,8 @@ public class TransportRemoteTask implements RemoteTask {
   private final AtomicReference<TaskStatus> lastTaskStatus = new AtomicReference<>();
   private final AtomicReference<OutputBuffers> outputBuffers = new AtomicReference<>();
   private final AtomicBoolean started = new AtomicBoolean(false);
-  private final AtomicBoolean firstUpdateSent = new AtomicBoolean(false);
+  private final AtomicBoolean taskCreated = new AtomicBoolean(false);
+  private final Object sendLock = new Object();
   private final AtomicInteger pendingSplitCount = new AtomicInteger(0);
   private final AtomicInteger queuedSplitCount = new AtomicInteger(0);
 
@@ -162,19 +163,7 @@ public class TransportRemoteTask implements RemoteTask {
     }
     LOG.info("Starting TransportRemoteTask {} on node {} (URI: {})",
         taskId, targetNode.getName(), trinoNode.getInternalUri());
-
-    // Send the initial update with the fragment SYNCHRONOUSLY.
-    // This ensures the task is created on the worker before any subsequent
-    // addSplits/setOutputBuffers calls send fragment-less updates.
-    CountDownLatch latch = new CountDownLatch(1);
-    sendUpdateWithLatch(Optional.of(planFragment), latch);
-    try {
-      latch.await(10, TimeUnit.SECONDS);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      LOG.warn("Interrupted waiting for initial task creation for {}", taskId);
-    }
-    firstUpdateSent.set(true);
+    scheduleSend();
     // Start polling task status — required for the coordinator to know when tasks finish
     statusPollFuture = STATUS_POLLER.scheduleWithFixedDelay(
         this::pollStatus, 200, 200, TimeUnit.MILLISECONDS);
@@ -186,9 +175,8 @@ public class TransportRemoteTask implements RemoteTask {
       pendingSplits.putAll(splits);
       pendingSplitCount.addAndGet(splits.size());
     }
-    // Only send updates after the first update (with fragment) has been sent
-    if (firstUpdateSent.get()) {
-      sendUpdate(Optional.empty());
+    if (started.get()) {
+      scheduleSend();
     }
   }
 
@@ -197,17 +185,34 @@ public class TransportRemoteTask implements RemoteTask {
     synchronized (pendingSplits) {
       noMoreSplitsSources.add(sourceId);
     }
-    if (firstUpdateSent.get()) {
-      sendUpdate(Optional.empty());
+    if (started.get()) {
+      scheduleSend();
     }
   }
 
   @Override
   public void setOutputBuffers(OutputBuffers newOutputBuffers) {
     outputBuffers.set(newOutputBuffers);
-    if (firstUpdateSent.get()) {
-      sendUpdate(Optional.empty());
+    if (started.get()) {
+      scheduleSend();
     }
+  }
+
+  /** Schedule a send on the status poller thread to serialize all updates. */
+  private void scheduleSend() {
+    STATUS_POLLER.execute(() -> {
+      synchronized (sendLock) {
+        doSendUpdate();
+      }
+    });
+  }
+
+  /**
+   * Send a task update. Always includes the fragment until the task is confirmed created.
+   * Must be called under sendLock to prevent concurrent sends.
+   */
+  private void doSendUpdate() {
+    sendUpdate();
   }
 
   @Override
@@ -278,16 +283,12 @@ public class TransportRemoteTask implements RemoteTask {
     return null;
   }
 
-  private void sendUpdateWithLatch(Optional<PlanFragment> fragment, CountDownLatch latch) {
-    sendUpdateInternal(fragment, latch);
-  }
-
-  private void sendUpdate(Optional<PlanFragment> fragment) {
-    sendUpdateInternal(fragment, null);
-  }
-
-  private void sendUpdateInternal(Optional<PlanFragment> fragment, CountDownLatch latch) {
+  /** Internal send — called from doSendUpdate under sendLock. */
+  private void sendUpdate() {
     try {
+      // Include fragment until task is confirmed created (RUNNING/FINISHED response received)
+      Optional<PlanFragment> fragment = taskCreated.get()
+          ? Optional.empty() : Optional.of(planFragment);
       byte[] fragmentJson = fragment.map(codec::serializePlanFragment).orElse(new byte[0]);
 
       // Convert pending splits to SplitAssignment list
@@ -322,23 +323,18 @@ public class TransportRemoteTask implements RemoteTask {
                 TaskInfo info = codec.deserializeTaskInfo(response.getTaskInfoJson());
                 lastTaskInfo.set(info);
                 lastTaskStatus.set(info.getTaskStatus());
-                LOG.debug("Task update response for {}: state={}, self={}",
-                    taskId, info.getTaskStatus().getState(), info.getTaskStatus().getSelf());
+                // Mark task as created once we get a non-PLANNED response
+                if (info.getTaskStatus().getState() != io.trino.execution.TaskState.PLANNED) {
+                  taskCreated.set(true);
+                }
               } catch (Exception e) {
                 LOG.warn("Failed to deserialize task update response for {}", taskId, e);
-              } finally {
-                if (latch != null) {
-                  latch.countDown();
-                }
               }
             }
 
             @Override
             public void handleException(org.opensearch.transport.TransportException exp) {
               LOG.error("Transport error sending task update for {}: {}", taskId, exp.getMessage());
-              if (latch != null) {
-                latch.countDown();
-              }
             }
 
             @Override

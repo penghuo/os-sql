@@ -109,8 +109,12 @@ public class RestTrinoQueryAction extends BaseRestHandler {
       String catalog = request.header("X-Trino-Catalog");
       String schema = request.header("X-Trino-Schema");
 
-      // Try to forward to a remote node for cross-node distribution
-      DiscoveryNode targetNode = pickRemoteNode();
+      // When split-level distribution is active, execute locally — the coordinator
+      // distributes individual stages/splits to remote nodes via TransportRemoteTask.
+      // Query-level forwarding is only used when split-level distribution is NOT available.
+      boolean splitLevelActive = TrinoServiceHolder.isInitialized()
+          && TrinoServiceHolder.getInstance().getNodeManager() != null;
+      DiscoveryNode targetNode = splitLevelActive ? null : pickRemoteNode();
       if (targetNode != null && TrinoServiceHolder.isInitialized()
           && TrinoServiceHolder.getInstance().getTransportService() != null) {
         LOG.debug("Forwarding query to remote node [{}]", targetNode.getName());

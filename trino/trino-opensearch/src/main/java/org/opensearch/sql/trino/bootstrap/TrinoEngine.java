@@ -103,7 +103,7 @@ public class TrinoEngine implements Closeable {
                       "memory.heap-headroom-per-node", headroomStr,
                       "spill-enabled", "false",
                       "exchange.compression-codec", "LZ4",
-                      "query.max-execution-time", "10m"))
+                      "query.max-execution-time", "60m"))
               .build();
 
       // Install connector plugins

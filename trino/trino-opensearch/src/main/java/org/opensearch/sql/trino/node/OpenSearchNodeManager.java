@@ -171,6 +171,31 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
   public void registerTrinoHttpUrl(String nodeId, URI httpUrl) {
     trinoHttpUrls.put(nodeId, httpUrl);
     LOG.info("Registered Trino HTTP URL for node {}: {}", nodeId, httpUrl);
+
+    // Rebuild activeNodes with the new URL so the coordinator sees updated URIs
+    rebuildActiveNodes();
+  }
+
+  /** Rebuild activeNodes from the current nodeIdToDiscoveryNode map with registered HTTP URLs. */
+  private void rebuildActiveNodes() {
+    if (nodeIdToDiscoveryNode.isEmpty()) {
+      return;
+    }
+    Set<InternalNode> newActiveNodes = new HashSet<>();
+    for (Map.Entry<String, DiscoveryNode> entry : nodeIdToDiscoveryNode.entrySet()) {
+      newActiveNodes.add(toInternalNode(entry.getValue(), trinoHttpUrls.get(entry.getKey())));
+    }
+    newActiveNodes = Collections.unmodifiableSet(newActiveNodes);
+    this.activeNodes = newActiveNodes;
+    this.allNodes = buildAllNodes(newActiveNodes);
+    // Update currentNode if its URL changed
+    for (InternalNode node : newActiveNodes) {
+      if (currentNode != null && node.getNodeIdentifier().equals(
+          currentNode.getNodeIdentifier())) {
+        this.currentNode = node;
+        break;
+      }
+    }
   }
 
   /**

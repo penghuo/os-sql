@@ -294,10 +294,75 @@ public class TrinoEngine implements Closeable {
       org.opensearch.sql.trino.transport.TransportDistributionPatcher.patch(
           queryRunner, transportService, nodeManager, holder.getCodec());
 
+      // Broadcast this node's Trino HTTP URL to all other cluster nodes so they can
+      // construct correct InternalNode URIs for the exchange mechanism.
+      // Also query remote nodes for their HTTP URLs (they may have started before us).
+      broadcastTrinoHttpUrl(clusterService, transportService, localNode, trinoHttpUrl);
+
       LOG.info("Split-level distribution enabled — NodeManager and RemoteTaskFactory patched. "
           + "Local node: {}, HTTP URL: {}", localNode.getName(), trinoHttpUrl);
     } catch (Exception e) {
       LOG.warn("Split-level distribution not enabled: {}", e.getMessage(), e);
+    }
+  }
+
+  private void broadcastTrinoHttpUrl(
+      org.opensearch.cluster.service.ClusterService clusterService,
+      org.opensearch.transport.TransportService transportService,
+      org.opensearch.cluster.node.DiscoveryNode localNode,
+      java.net.URI trinoHttpUrl) {
+    org.opensearch.cluster.node.DiscoveryNodes nodes = clusterService.state().nodes();
+    for (org.opensearch.cluster.node.DiscoveryNode node : nodes) {
+      if (node.getId().equals(localNode.getId())) {
+        continue; // Skip self — already registered locally
+      }
+      org.opensearch.sql.trino.transport.TrinoNodeRegisterRequest request =
+          new org.opensearch.sql.trino.transport.TrinoNodeRegisterRequest(
+              localNode.getId(), trinoHttpUrl.toString());
+      transportService.sendRequest(
+          node,
+          org.opensearch.sql.trino.transport.TrinoNodeRegisterAction.NAME,
+          request,
+          new org.opensearch.transport.TransportResponseHandler<
+              org.opensearch.sql.trino.transport.TrinoNodeRegisterResponse>() {
+            @Override
+            public org.opensearch.sql.trino.transport.TrinoNodeRegisterResponse read(
+                org.opensearch.core.common.io.stream.StreamInput in)
+                throws java.io.IOException {
+              return new org.opensearch.sql.trino.transport.TrinoNodeRegisterResponse(in);
+            }
+
+            @Override
+            public void handleResponse(
+                org.opensearch.sql.trino.transport.TrinoNodeRegisterResponse response) {
+              LOG.info("Registered Trino HTTP URL with node {}: success={}",
+                  node.getName(), response.isSuccess());
+              // Bidirectional: register the remote node's URL in our NodeManager
+              if (response.isSuccess()
+                  && !response.getReceiverTrinoHttpUrl().isEmpty()) {
+                org.opensearch.sql.trino.plugin.TrinoServiceHolder holder =
+                    org.opensearch.sql.trino.plugin.TrinoServiceHolder.getInstance();
+                if (holder.getNodeManager() != null) {
+                  holder.getNodeManager().registerTrinoHttpUrl(
+                      response.getReceiverNodeId(),
+                      java.net.URI.create(response.getReceiverTrinoHttpUrl()));
+                  LOG.info("Received remote Trino HTTP URL: node={}, url={}",
+                      response.getReceiverNodeId(), response.getReceiverTrinoHttpUrl());
+                }
+              }
+            }
+
+            @Override
+            public void handleException(org.opensearch.transport.TransportException exp) {
+              LOG.warn("Failed to register Trino HTTP URL with node {}: {}",
+                  node.getName(), exp.getMessage());
+            }
+
+            @Override
+            public String executor() {
+              return org.opensearch.threadpool.ThreadPool.Names.SAME;
+            }
+          });
     }
   }
 

@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -76,12 +77,14 @@ public class TransportRemoteTask implements RemoteTask {
   private final AtomicReference<TaskStatus> lastTaskStatus = new AtomicReference<>();
   private final AtomicReference<OutputBuffers> outputBuffers = new AtomicReference<>();
   private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean firstUpdateSent = new AtomicBoolean(false);
   private final AtomicInteger pendingSplitCount = new AtomicInteger(0);
   private final AtomicInteger queuedSplitCount = new AtomicInteger(0);
 
   private final Multimap<PlanNodeId, Split> pendingSplits =
       HashMultimap.create();
   private final Set<PlanNodeId> noMoreSplitsSources = new HashSet<>();
+  private final Set<PlanNodeId> sentNoMoreSplits = new HashSet<>();
   private final AtomicLong splitSequenceId = new AtomicLong(0);
 
   private final CopyOnWriteArrayList<StateChangeListener<TaskStatus>> statusListeners =
@@ -159,7 +162,19 @@ public class TransportRemoteTask implements RemoteTask {
     }
     LOG.info("Starting TransportRemoteTask {} on node {} (URI: {})",
         taskId, targetNode.getName(), trinoNode.getInternalUri());
-    sendUpdate(Optional.of(planFragment));
+
+    // Send the initial update with the fragment SYNCHRONOUSLY.
+    // This ensures the task is created on the worker before any subsequent
+    // addSplits/setOutputBuffers calls send fragment-less updates.
+    CountDownLatch latch = new CountDownLatch(1);
+    sendUpdateWithLatch(Optional.of(planFragment), latch);
+    try {
+      latch.await(10, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn("Interrupted waiting for initial task creation for {}", taskId);
+    }
+    firstUpdateSent.set(true);
     // Start polling task status — required for the coordinator to know when tasks finish
     statusPollFuture = STATUS_POLLER.scheduleWithFixedDelay(
         this::pollStatus, 200, 200, TimeUnit.MILLISECONDS);
@@ -171,7 +186,8 @@ public class TransportRemoteTask implements RemoteTask {
       pendingSplits.putAll(splits);
       pendingSplitCount.addAndGet(splits.size());
     }
-    if (started.get()) {
+    // Only send updates after the first update (with fragment) has been sent
+    if (firstUpdateSent.get()) {
       sendUpdate(Optional.empty());
     }
   }
@@ -181,7 +197,7 @@ public class TransportRemoteTask implements RemoteTask {
     synchronized (pendingSplits) {
       noMoreSplitsSources.add(sourceId);
     }
-    if (started.get()) {
+    if (firstUpdateSent.get()) {
       sendUpdate(Optional.empty());
     }
   }
@@ -189,7 +205,7 @@ public class TransportRemoteTask implements RemoteTask {
   @Override
   public void setOutputBuffers(OutputBuffers newOutputBuffers) {
     outputBuffers.set(newOutputBuffers);
-    if (started.get()) {
+    if (firstUpdateSent.get()) {
       sendUpdate(Optional.empty());
     }
   }
@@ -262,13 +278,17 @@ public class TransportRemoteTask implements RemoteTask {
     return null;
   }
 
+  private void sendUpdateWithLatch(Optional<PlanFragment> fragment, CountDownLatch latch) {
+    sendUpdateInternal(fragment, latch);
+  }
+
   private void sendUpdate(Optional<PlanFragment> fragment) {
+    sendUpdateInternal(fragment, null);
+  }
+
+  private void sendUpdateInternal(Optional<PlanFragment> fragment, CountDownLatch latch) {
     try {
       byte[] fragmentJson = fragment.map(codec::serializePlanFragment).orElse(new byte[0]);
-      if (fragment.isPresent()) {
-        LOG.info("sendUpdate for {}: fragment size={} bytes",
-            taskId, fragmentJson.length);
-      }
 
       // Convert pending splits to SplitAssignment list
       List<SplitAssignment> splitAssignments;
@@ -302,16 +322,23 @@ public class TransportRemoteTask implements RemoteTask {
                 TaskInfo info = codec.deserializeTaskInfo(response.getTaskInfoJson());
                 lastTaskInfo.set(info);
                 lastTaskStatus.set(info.getTaskStatus());
-                LOG.info("Task update response for {}: state={}, self={}",
+                LOG.debug("Task update response for {}: state={}, self={}",
                     taskId, info.getTaskStatus().getState(), info.getTaskStatus().getSelf());
               } catch (Exception e) {
                 LOG.warn("Failed to deserialize task update response for {}", taskId, e);
+              } finally {
+                if (latch != null) {
+                  latch.countDown();
+                }
               }
             }
 
             @Override
             public void handleException(org.opensearch.transport.TransportException exp) {
               LOG.error("Transport error sending task update for {}: {}", taskId, exp.getMessage());
+              if (latch != null) {
+                latch.countDown();
+              }
             }
 
             @Override
@@ -393,12 +420,17 @@ public class TransportRemoteTask implements RemoteTask {
         scheduledSplits.add(
             new ScheduledSplit(splitSequenceId.getAndIncrement(), planNodeId, split));
       }
-      boolean noMore = noMoreSplitsSources.contains(planNodeId);
+      boolean noMore = noMoreSplitsSources.contains(planNodeId)
+          && !sentNoMoreSplits.contains(planNodeId);
+      if (noMore) {
+        sentNoMoreSplits.add(planNodeId);
+      }
       assignments.add(new SplitAssignment(planNodeId, scheduledSplits, noMore));
     }
     // Also add no-more-splits signals for sources that have no pending splits
     for (PlanNodeId planNodeId : noMoreSplitsSources) {
-      if (!pendingSplits.containsKey(planNodeId)) {
+      if (!pendingSplits.containsKey(planNodeId) && !sentNoMoreSplits.contains(planNodeId)) {
+        sentNoMoreSplits.add(planNodeId);
         assignments.add(new SplitAssignment(planNodeId, Set.of(), true));
       }
     }

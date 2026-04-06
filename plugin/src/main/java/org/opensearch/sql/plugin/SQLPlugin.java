@@ -137,6 +137,9 @@ import org.opensearch.sql.trino.transport.TrinoTaskResultsAction;
 import org.opensearch.sql.trino.transport.TrinoTaskResultsResponse;
 import org.opensearch.sql.trino.transport.TrinoTaskStatusAction;
 import org.opensearch.sql.trino.transport.TrinoTaskStatusResponse;
+import org.opensearch.sql.trino.transport.TrinoNodeRegisterAction;
+import org.opensearch.sql.trino.transport.TrinoNodeRegisterResponse;
+import org.opensearch.sql.trino.transport.TransportTrinoNodeRegisterAction;
 import org.opensearch.sql.trino.transport.TrinoQueryForwardAction;
 import org.opensearch.sql.trino.transport.TrinoQueryForwardResponse;
 import org.opensearch.sql.trino.transport.TransportTrinoQueryForwardAction;
@@ -309,7 +312,10 @@ public class SQLPlugin extends Plugin
             TransportTrinoTaskResultsAckAction.class),
         new ActionHandler<>(
             new ActionType<>(TrinoQueryForwardAction.NAME, TrinoQueryForwardResponse::new),
-            TransportTrinoQueryForwardAction.class));
+            TransportTrinoQueryForwardAction.class),
+        new ActionHandler<>(
+            new ActionType<>(TrinoNodeRegisterAction.NAME, TrinoNodeRegisterResponse::new),
+            TransportTrinoNodeRegisterAction.class));
   }
 
   @Override

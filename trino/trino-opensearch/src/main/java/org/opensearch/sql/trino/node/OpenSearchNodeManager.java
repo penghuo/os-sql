@@ -43,7 +43,7 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
   // Reverse mapping: Trino node ID → OpenSearch DiscoveryNode
   private final Map<String, DiscoveryNode> nodeIdToDiscoveryNode = new ConcurrentHashMap<>();
 
-  // Coordinator's Trino-internal node ID alias (from DistributedQueryRunner).
+  // Coordinator's Trino-internal node ID alias (from TestingTrinoServer).
   // Must be preserved across clusterChanged() rebuilds since it doesn't come from ClusterState.
   private volatile String coordinatorTrinoNodeId;
   private volatile DiscoveryNode coordinatorLocalNode;
@@ -172,11 +172,11 @@ public class OpenSearchNodeManager implements InternalNodeManager, ClusterStateL
 
   /**
    * Register the coordinator's Trino-internal node ID as an alias for the local OpenSearch node.
-   * DistributedQueryRunner assigns a UUID to the coordinator that differs from the OpenSearch
+   * TestingTrinoServer assigns a UUID to the server that differs from the OpenSearch
    * DiscoveryNode ID. When Trino's NodeScheduler assigns splits to this node, it uses the Trino ID.
    * TransportRemoteTaskFactory.toDiscoveryNode() needs this mapping to resolve the node.
    *
-   * @param trinoNodeId the coordinator's Trino-internal node ID (UUID from DistributedQueryRunner)
+   * @param trinoNodeId the server's Trino-internal node ID (UUID from TestingTrinoServer)
    * @param localNode the local OpenSearch DiscoveryNode
    */
   public void registerCoordinatorTrinoNodeId(String trinoNodeId, DiscoveryNode localNode) {

@@ -10,9 +10,7 @@ import io.trino.execution.RemoteTaskFactory;
 import io.trino.execution.SqlQueryExecution;
 import io.trino.execution.scheduler.NodeScheduler;
 import io.trino.execution.scheduler.NodeSelectorFactory;
-import io.trino.metadata.InternalNodeManager;
 import io.trino.server.testing.TestingTrinoServer;
-import io.trino.testing.DistributedQueryRunner;
 import java.lang.reflect.Field;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -20,10 +18,10 @@ import org.opensearch.sql.trino.node.OpenSearchNodeManager;
 import org.opensearch.transport.TransportService;
 
 /**
- * Patches the Trino coordinator's Guice-injected components via reflection to use transport-based
+ * Patches the Trino server's Guice-injected components via reflection to use transport-based
  * split-level distribution instead of HTTP.
  *
- * <p>After {@link DistributedQueryRunner} is built (nodeCount=1), this patcher replaces:
+ * <p>After {@link TestingTrinoServer} is built, this patcher replaces:
  *
  * <ul>
  *   <li>{@code RemoteTaskFactory} → {@link TransportRemoteTaskFactory} (task dispatch via
@@ -42,20 +40,20 @@ public final class TransportDistributionPatcher {
   private TransportDistributionPatcher() {}
 
   /**
-   * Patch the coordinator for transport-based split-level distribution.
+   * Patch the server for transport-based split-level distribution.
    *
-   * @param runner the DistributedQueryRunner (nodeCount=1)
+   * @param server the TestingTrinoServer instance
    * @param transportService OpenSearch transport service for cross-node communication
    * @param nodeManager OpenSearch cluster topology manager
    * @param codec JSON codec for Trino type serialization
    */
   public static void patch(
-      DistributedQueryRunner runner,
+      TestingTrinoServer server,
       TransportService transportService,
       OpenSearchNodeManager nodeManager,
       TrinoJsonCodec codec) {
 
-    TestingTrinoServer coordinator = runner.getCoordinator();
+    TestingTrinoServer coordinator = server;
 
     // 1. Get the original HTTP-based RemoteTaskFactory for local delegation
     RemoteTaskFactory originalFactory;

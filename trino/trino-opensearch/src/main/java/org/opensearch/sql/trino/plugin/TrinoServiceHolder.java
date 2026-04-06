@@ -50,16 +50,15 @@ public final class TrinoServiceHolder {
    * @param trinoEngine the local TrinoEngine
    */
   public static void initializeWithEngine(TrinoEngine trinoEngine) {
-    SqlTaskManager sqlTaskManager = trinoEngine.getCoordinatorTaskManager();
+    SqlTaskManager sqlTaskManager = trinoEngine.getTaskManager();
     OpenSearchSqlTaskManager taskManager = new OpenSearchSqlTaskManager(sqlTaskManager);
-    // Get Trino's ObjectMapper from the coordinator's Guice injector — it has all
+    // Get Trino's ObjectMapper from the server's Guice injector — it has all
     // the custom serializers for PlanFragment, SplitAssignment, OutputBuffers, etc.
     com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     try {
-      objectMapper = trinoEngine.getQueryRunner().getCoordinator().getInstance(
+      objectMapper = trinoEngine.getServer().getInstance(
           com.google.inject.Key.get(com.fasterxml.jackson.databind.ObjectMapper.class));
     } catch (Exception e) {
-      // Fallback to default ObjectMapper if Guice injection fails
       objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
     }
     TrinoJsonCodec codec = new TrinoJsonCodec(objectMapper);

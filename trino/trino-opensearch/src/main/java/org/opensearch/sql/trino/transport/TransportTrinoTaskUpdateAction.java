@@ -103,10 +103,10 @@ public class TransportTrinoTaskUpdateAction
   }
 
   private static Session createSession(QueryId queryId) {
-    // Use the real SessionPropertyManager from the coordinator — it knows about
+    // Use the real SessionPropertyManager from the server — it knows about
     // all system properties (retry_policy, task_concurrency, etc.)
     SessionPropertyManager spm = TrinoServiceHolder.getInstance().getEngine()
-        .getQueryRunner().getSessionPropertyManager();
+        .getSessionPropertyManager();
     Identity identity = Identity.ofUser("opensearch");
     return Session.builder(spm)
         .setIdentity(identity)

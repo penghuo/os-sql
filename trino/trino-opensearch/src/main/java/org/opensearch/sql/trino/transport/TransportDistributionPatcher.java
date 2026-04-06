@@ -57,12 +57,23 @@ public final class TransportDistributionPatcher {
 
     TestingTrinoServer coordinator = runner.getCoordinator();
 
-    // 1. Replace RemoteTaskFactory in SqlQueryExecutionFactory
+    // 1. Get the original HTTP-based RemoteTaskFactory for local delegation
+    RemoteTaskFactory originalFactory;
+    try {
+      SqlQueryExecution.SqlQueryExecutionFactory executionFactory =
+          coordinator.getInstance(Key.get(SqlQueryExecution.SqlQueryExecutionFactory.class));
+      originalFactory = (RemoteTaskFactory) getField(executionFactory, "remoteTaskFactory");
+    } catch (Exception e) {
+      LOG.warn("Could not get original RemoteTaskFactory, using null delegate", e);
+      originalFactory = null;
+    }
+
+    // 2. Replace RemoteTaskFactory with hybrid factory (HTTP for local, transport for remote)
     TransportRemoteTaskFactory transportFactory =
-        new TransportRemoteTaskFactory(transportService, nodeManager, codec);
+        new TransportRemoteTaskFactory(transportService, nodeManager, codec, originalFactory);
     patchRemoteTaskFactory(coordinator, transportFactory);
 
-    // 2. Replace InternalNodeManager in NodeSelectorFactory (inside NodeScheduler)
+    // 3. Replace InternalNodeManager in NodeSelectorFactory (inside NodeScheduler)
     patchNodeManager(coordinator, nodeManager);
 
     LOG.info(
@@ -79,7 +90,7 @@ public final class TransportDistributionPatcher {
           coordinator.getInstance(
               Key.get(SqlQueryExecution.SqlQueryExecutionFactory.class));
 
-      // Replace remoteTaskFactory field
+      // Replace remoteTaskFactory field, saving the original for local delegation
       setField(executionFactory, "remoteTaskFactory", factory);
       LOG.info("Patched RemoteTaskFactory → TransportRemoteTaskFactory");
     } catch (Exception e) {

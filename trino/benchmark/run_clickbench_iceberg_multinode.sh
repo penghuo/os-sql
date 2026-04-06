@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 QUERIES_FILE="${REPO_DIR}/trino/trino-integ-test/src/test/resources/clickbench/queries.sql"
 NODES="${NODES:-3}"
-HEAP="${HEAP_PER_NODE:-10g}"
+HEAP="${HEAP_PER_NODE:-24g}"
 TRIES="${TRIES:-1}"
 WAREHOUSE="${ICEBERG_WAREHOUSE:-/tmp/iceberg-clickbench-warehouse}"
 
@@ -65,6 +65,9 @@ for i in $(seq 0 $((NODES-1))); do
     NODE_NAMES="${NODE_NAMES}node-${i}"
 done
 
+# Create spill directory for Trino's spill-to-disk feature
+mkdir -p /tmp/trino-spill
+
 for i in $(seq 0 $((NODES-1))); do
     HP=$((BASE_HTTP + i))
     TP=$((BASE_TRANSPORT + i))
@@ -96,7 +99,7 @@ indices.breaker.total.use_real_memory: false
 NODECONF
 
     export OPENSEARCH_PATH_CONF="${NODE_DIR}/config"
-    export OPENSEARCH_JAVA_OPTS="-Xms${HEAP} -Xmx${HEAP} -Dtrino.iceberg.warehouse=${WAREHOUSE}"
+    export OPENSEARCH_JAVA_OPTS="-Xms${HEAP} -Xmx${HEAP} -Dtrino.iceberg.warehouse=${WAREHOUSE} -XX:+UseG1GC -XX:G1HeapRegionSize=32m -XX:+ExitOnOutOfMemoryError"
 
     "${DISTRO_DIR}/bin/opensearch" -d -p "${NODE_DIR}/pid" &
     PIDS+=("$!")

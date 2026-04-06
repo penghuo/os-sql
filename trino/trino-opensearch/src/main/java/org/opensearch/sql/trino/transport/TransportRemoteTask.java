@@ -94,7 +94,7 @@ public class TransportRemoteTask implements RemoteTask {
       new CopyOnWriteArrayList<>();
 
   private static final ScheduledExecutorService STATUS_POLLER =
-      Executors.newScheduledThreadPool(2,
+      Executors.newScheduledThreadPool(8,
           r -> { Thread t = new Thread(r, "transport-task-status-poller"); t.setDaemon(true); return t; });
   private volatile ScheduledFuture<?> statusPollFuture;
 

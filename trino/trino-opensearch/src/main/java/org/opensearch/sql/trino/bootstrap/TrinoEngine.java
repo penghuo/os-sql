@@ -78,18 +78,25 @@ public class TrinoEngine implements Closeable {
 
       Session session = createDefaultSession();
       // Configure Trino memory adaptively based on available heap.
-      // Use 70% of heap for queries, 15% for headroom, rest for OS overhead.
+      // Use 60% of heap for queries (reduced from 70% to leave room for exchange
+      // buffers and Parquet readers in distributed mode), 15% for headroom.
       long maxHeap = Runtime.getRuntime().maxMemory();
-      long queryMem = (long) (maxHeap * 0.70);
+      long queryMemPerNode = (long) (maxHeap * 0.60);
       long headroom = (long) (maxHeap * 0.15);
-      String queryMemStr = (queryMem / (1024 * 1024)) + "MB";
+      // Cluster-wide limit: 10x per-node to avoid starving remote nodes.
+      // The per-node limit is the real constraint; this just prevents the global
+      // cap from blocking allocation when multiple nodes contribute to one query.
+      long queryMemCluster = queryMemPerNode * 10;
+      String perNodeMemStr = (queryMemPerNode / (1024 * 1024)) + "MB";
+      String clusterMemStr = (queryMemCluster / (1024 * 1024)) + "MB";
       String headroomStr = (headroom / (1024 * 1024)) + "MB";
-      LOG.info("Trino memory config: heap={}MB, queryMem={}, headroom={}",
-          maxHeap / (1024 * 1024), queryMemStr, headroomStr);
+      LOG.info("Trino memory config: heap={}MB, perNodeQueryMem={}, clusterQueryMem={}, headroom={}",
+          maxHeap / (1024 * 1024), perNodeMemStr, clusterMemStr, headroomStr);
 
-      // Scale task concurrency to available processors for analytical workloads.
+      // Scale task concurrency: use half of available processors (max 16) to reduce
+      // peak memory from concurrent hash partitions in distributed mode.
       int processors = Runtime.getRuntime().availableProcessors();
-      int taskConcurrency = Math.max(4, processors);
+      int taskConcurrency = Math.min(16, Math.max(4, processors / 2));
       LOG.info("Trino parallelism config: processors={}, taskConcurrency={}",
           processors, taskConcurrency);
 
@@ -102,9 +109,17 @@ public class TrinoEngine implements Closeable {
       DistributedQueryRunner runner =
           DistributedQueryRunner.builder(session)
               .setNodeCount(nodeCount)
-              .addExtraProperty("query.max-memory-per-node", queryMemStr)
-              .addExtraProperty("query.max-memory", queryMemStr)
+              .addExtraProperty("query.max-memory-per-node", perNodeMemStr)
+              .addExtraProperty("query.max-memory", clusterMemStr)
               .addExtraProperty("memory.heap-headroom-per-node", headroomStr)
+              .addExtraProperty("spill-enabled", "true")
+              .addExtraProperty("spiller-spill-path", "/tmp/trino-spill")
+              .addExtraProperty("spiller-max-used-space-threshold", "0.8")
+              .addExtraProperty("spiller-threads", "4")
+              .addExtraProperty("max-spill-per-node", "50GB")
+              .addExtraProperty("query-max-spill-per-node", "10GB")
+              .addExtraProperty("exchange.compression-codec", "LZ4")
+              .addExtraProperty("query.max-execution-time", "10m")
               .build();
       runner.installPlugin(new TpchPlugin());
       runner.createCatalog("tpch", "tpch", Map.of());
@@ -214,7 +229,8 @@ public class TrinoEngine implements Closeable {
   private Session createSessionWithCatalogSchema(String catalog, String schema) {
     SessionPropertyManager spm = queryRunner.getSessionPropertyManager();
     Identity identity = Identity.ofUser("opensearch");
-    int taskConcurrency = Runtime.getRuntime().availableProcessors();
+    int processors = Runtime.getRuntime().availableProcessors();
+    int taskConcurrency = Math.min(16, Math.max(4, processors / 2));
     Session.SessionBuilder builder =
         Session.builder(spm)
             .setIdentity(identity)
@@ -224,7 +240,7 @@ public class TrinoEngine implements Closeable {
             .setSystemProperty("task_concurrency", String.valueOf(taskConcurrency))
             .setSystemProperty("dictionary_aggregation", "true")
             .setSystemProperty("max_hash_partition_count", String.valueOf(taskConcurrency))
-            .setSystemProperty("min_hash_partition_count", String.valueOf(taskConcurrency))
+            .setSystemProperty("min_hash_partition_count", String.valueOf(Math.min(4, taskConcurrency)))
             .setCatalogSessionProperty("iceberg", "parquet_max_read_block_row_count", "65536")
             .setCatalogSessionProperty("iceberg", "parquet_max_read_block_size", "64MB");
     builder.setCatalog(catalog != null ? catalog : "tpch");

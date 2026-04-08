@@ -107,19 +107,120 @@ pkill -f "run_opensearch.sh"; pkill -f "run_all.sh"
 
 **Mnemonic**: scripts and SQL are 1-based, JSON is 0-based.
 
+## DQE Iceberg Benchmark
+
+### Architecture (Iceberg Path)
+
+```
+SQL query → TransportTrinoSqlAction (coordinator)
+          → IcebergFragmenter (splits into per-file plans)
+          → TransportIcebergSplitExecuteAction (per-Parquet-file)
+              └── LocalExecutionPlanner → ParquetPageSource
+          → Coordinator merges split results → returns to client
+```
+
+Key difference from OpenSearch path: no DSL filters, no DocValues — reads Parquet directly via `ParquetPageSource`. Predicate pushdown is NOT applied (Iceberg uses `optimizeForIceberg()` which skips DSL conversion). AVG is decomposed into SUM+COUNT via `decomposeAvgInPlanTree()`.
+
+### Benchmark Suite
+
+Location: `benchmarks/clickbench/benchmark_dqe_iceberg/`
+
+```
+benchmark_dqe_iceberg/
+├── golden/                        # 43 expected results (100M dataset, TSV)
+│   ├── q01.expected ... q43.expected
+├── baseline/
+│   └── trino_r5.4xlarge.json      # Trino 442 Hive Parquet (43/43, 363.2s)
+├── results/                       # Output dir (gitignored)
+│   ├── correctness_report.txt
+│   ├── <instance>.json
+│   └── comparison.txt
+└── omni_harness.sh                # Main harness script
+```
+
+### Harness Usage
+
+```bash
+cd benchmarks/clickbench
+
+# Full run: correctness → perf (3 runs) → Trino comparison
+bash benchmark_dqe_iceberg/omni_harness.sh
+
+# Correctness only
+bash benchmark_dqe_iceberg/omni_harness.sh --correctness-only
+
+# Single query
+bash benchmark_dqe_iceberg/omni_harness.sh --query 3
+
+# Perf only, 5 runs, 180s timeout
+bash benchmark_dqe_iceberg/omni_harness.sh --skip-correctness --tries 5 --timeout 180
+```
+
+### Harness Long-Running Commands
+
+| Command | Est. Time | Output File | Completion Marker |
+|---------|-----------|-------------|-------------------|
+| `omni_harness.sh --correctness-only` | 5-15 min | stdout | `Correctness:` |
+| `omni_harness.sh --skip-correctness` | 15-30 min | stdout | `Results written` |
+| `omni_harness.sh` (full) | 20-45 min | stdout | `Done.` |
+
+All harness runs MUST follow the async execution pattern:
+```bash
+nohup bash -c 'cd /local/home/penghuo/oss/os-sql/benchmarks/clickbench && bash benchmark_dqe_iceberg/omni_harness.sh > /tmp/harness.log 2>&1' &>/dev/null &
+echo "launched"
+# Poll:
+tail -5 /tmp/harness.log
+```
+
+### Iceberg Table Setup
+
+```bash
+# Create optimized Iceberg table (sorted by CounterID, EventDate, IsRefresh)
+python3 benchmarks/clickbench/data/create_iceberg_table_optimized.py \
+  --data-dir benchmarks/clickbench/data/parquet \
+  --warehouse /tmp/iceberg-warehouse
+```
+
+Table properties: 128MB target file size, 32MB row groups, 64KB pages, ZSTD, 4MB dict.
+
+### Trino Baseline (Docker)
+
+```bash
+# Start Trino 442 with Hive Parquet connector
+docker run -d --name trino --network host \
+  -v /tmp/trino-docker/etc:/etc/trino \
+  -v /local/home/penghuo/oss/os-sql/benchmarks/clickbench/data/parquet:/data/parquet \
+  trinodb/trino:442
+
+# Run baseline benchmark
+bash benchmarks/clickbench/run/run_trino_baseline.sh 3
+```
+
+### Queries
+
+- Iceberg queries: `benchmarks/clickbench/queries/queries_iceberg.sql` (43 queries)
+- Uses `iceberg.default.hits` catalog, DATE/TIMESTAMP types (not raw int)
+- EventDate is DATE type, EventTime is TIMESTAMP — converted during Iceberg table creation
+
 ## Pitfalls
 
 - **NEVER** run `reload-plugin` while a benchmark is running
-- Benchmark on 100M (`hits`), correctness on 1M (`hits_1m`)
-- Use ClickHouse-Parquet baseline, NOT native MergeTree
-- Baseline file: `benchmarks/clickbench/results/performance/clickhouse_parquet_official/c6a.4xlarge.json`
+- OpenSearch benchmark: 100M (`hits`), correctness on 1M (`hits_1m`)
+- Iceberg benchmark: always 100M (`iceberg.default.hits`)
+- OpenSearch baseline: `results/performance/clickhouse_parquet_official/c6a.4xlarge.json`
+- Iceberg baseline: `benchmark_dqe_iceberg/baseline/trino_r5.4xlarge.json`
 - OpenSearch endpoint: `http://localhost:9200`, DQE: `POST /_plugins/_trino_sql`
 
-## Current State (2026-03-26)
+## Current State (2026-04-08)
 
+### OpenSearch DQE
 - Correctness: 29/43 on 1M
-- Within 2x of CH-Parquet: 19/43 on r5.4xlarge (was 16/43 on m5.8xlarge before optimization)
-- Hybrid bitset/collector optimization deployed (selective filters use bitset, broad use Collector)
-- Bitset path: `Weight.count()` estimates selectivity; <50% of docs → bitset, else → Collector
-- Big wins: Q18(0.01x), Q39(1.1x), Q41(0.28x), Q42(1.02x), Q43(0.70x)
-- Target: >= 32/43 within 2x
+- Within 2x of CH-Parquet: 19/43 on r5.4xlarge
+- Hybrid bitset/collector optimization deployed
+
+### DQE Iceberg
+- Correctness: 20/43 on 100M (Q1-Q18, Q20 pass; Q19 type error; Q21+ OOM on high-cardinality GROUP BY)
+- Baseline: Trino 442 on Hive Parquet — 43/43, 363.2s total on r5.4xlarge
+- Key fixes applied: `optimizeForIceberg()` (skip predicate pushdown), AVG decomposition
+- Known issues: OOM on high-cardinality GROUP BY (Q19 extract(minute) type, Q21+ coordinator merge)
+- Data: sorted by (CounterID, EventDate, IsRefresh), 125 files, 10.1GB, 32MB row groups

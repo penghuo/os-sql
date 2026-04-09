@@ -88,6 +88,8 @@ run_correctness() {
             continue
         fi
 
+        # No non-deterministic queries — all have tiebreakers now
+
         query=$(echo "$query" | sed 's/;[[:space:]]*$//')
         local golden="$GOLDEN_DIR/q$(printf '%02d' "$qnum").expected"
         if [ ! -f "$golden" ]; then

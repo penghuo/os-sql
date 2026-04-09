@@ -12,6 +12,7 @@ import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 
@@ -57,6 +58,43 @@ public class CastBlockExpression implements BlockExpression {
       castToVarchar(input, pos, sourceType, builder);
     } else if (targetType instanceof BooleanType) {
       castToBoolean(input, pos, sourceType, builder);
+    } else if (targetType instanceof io.trino.spi.type.IntegerType
+        || targetType instanceof io.trino.spi.type.SmallintType
+        || targetType instanceof io.trino.spi.type.TinyintType) {
+      // Narrowing integer cast: truncate to target width
+      long value = sourceType.getLong(input, pos);
+      if (targetType instanceof io.trino.spi.type.IntegerType) {
+        value = (int) value;
+      } else if (targetType instanceof io.trino.spi.type.SmallintType) {
+        value = (short) value;
+      } else {
+        value = (byte) value;
+      }
+      targetType.writeLong(builder, value);
+    } else if (targetType instanceof TimestampType targetTs && sourceType instanceof TimestampType) {
+      // Timestamp precision downcast: divide micros by scale factor
+      long value = sourceType.getLong(input, pos);
+      int sourcePrec = ((TimestampType) sourceType).getPrecision();
+      int targetPrec = targetTs.getPrecision();
+      if (sourcePrec > targetPrec) {
+        long divisor = (long) Math.pow(10, sourcePrec - targetPrec);
+        value = value / divisor;
+      }
+      targetTs.writeLong(builder, value);
+    } else if (targetType instanceof TimestampType targetTs
+        && sourceType instanceof io.trino.spi.type.TimestampWithTimeZoneType) {
+      // TimestampWithTimeZone → Timestamp: extract millis, convert to micros
+      io.trino.spi.type.LongTimestampWithTimeZone ltz =
+          (io.trino.spi.type.LongTimestampWithTimeZone) sourceType.getObject(input, pos);
+      long millis = ltz.getEpochMillis();
+      int targetPrec = targetTs.getPrecision();
+      long value;
+      if (targetPrec <= 3) {
+        value = millis;
+      } else {
+        value = millis * (long) Math.pow(10, targetPrec - 3);
+      }
+      targetTs.writeLong(builder, value);
     } else {
       throw new UnsupportedOperationException(
           "Unsupported CAST from " + sourceType + " to " + targetType);

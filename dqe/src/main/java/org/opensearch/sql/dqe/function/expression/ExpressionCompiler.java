@@ -169,10 +169,10 @@ public class ExpressionCompiler {
     switch (typeName) {
       case "DATE":
         {
-          // Parse date string and convert to Trino timestamp micros
+          // Parse date string and convert to epoch days for DateType
           java.time.LocalDate date = java.time.LocalDate.parse(value);
-          long epochMicros = date.toEpochDay() * 86_400_000_000L;
-          return new ConstantExpression(epochMicros, TimestampType.TIMESTAMP_MILLIS);
+          long epochDays = date.toEpochDay();
+          return new ConstantExpression(epochDays, io.trino.spi.type.DateType.DATE);
         }
       case "TIMESTAMP":
         {
@@ -347,8 +347,12 @@ public class ExpressionCompiler {
     if (!(in.getValueList() instanceof InListExpression inList)) {
       throw new UnsupportedOperationException("Only IN list expressions are supported");
     }
+    Type targetType = value.getType();
     List<BlockExpression> list =
-        inList.getValues().stream().map(this::compile).collect(Collectors.toList());
+        inList.getValues().stream()
+            .map(this::compile)
+            .map(e -> e.getType().equals(targetType) ? e : new CastBlockExpression(e, targetType))
+            .collect(Collectors.toList());
     return new InBlockExpression(value, list);
   }
 

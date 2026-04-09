@@ -84,8 +84,12 @@ public class InBlockExpression implements BlockExpression {
   }
 
   private boolean valuesEqual(Block a, Block b, int pos, Type type) {
-    if (type instanceof BigintType) {
-      return BigintType.BIGINT.getLong(a, pos) == BigintType.BIGINT.getLong(b, pos);
+    if (type instanceof BigintType
+        || type instanceof io.trino.spi.type.IntegerType
+        || type instanceof io.trino.spi.type.SmallintType
+        || type instanceof io.trino.spi.type.TinyintType
+        || type instanceof io.trino.spi.type.DateType) {
+      return type.getLong(a, pos) == type.getLong(b, pos);
     } else if (type instanceof DoubleType) {
       return DoubleType.DOUBLE.getDouble(a, pos) == DoubleType.DOUBLE.getDouble(b, pos);
     } else if (type instanceof VarcharType) {

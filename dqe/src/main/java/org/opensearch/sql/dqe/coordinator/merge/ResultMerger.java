@@ -11,6 +11,8 @@ import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
+import io.trino.spi.type.LongTimestampWithTimeZone;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.ArrayList;
@@ -2761,6 +2763,10 @@ public class ResultMerger {
               boolean b1 = BooleanType.BOOLEAN.getBoolean(blk, pos1);
               boolean b2 = BooleanType.BOOLEAN.getBoolean(blk, pos2);
               cmp = Boolean.compare(b1, b2);
+            } else if (t instanceof TimestampWithTimeZoneType) {
+              LongTimestampWithTimeZone tz1 = (LongTimestampWithTimeZone) t.getObject(blk, pos1);
+              LongTimestampWithTimeZone tz2 = (LongTimestampWithTimeZone) t.getObject(blk, pos2);
+              cmp = tz1.compareTo(tz2);
             } else {
               // Fallback: compare as longs
               long v1 = t.getLong(blk, pos1);
@@ -2829,6 +2835,8 @@ public class ResultMerger {
           } else if (t instanceof BooleanType) {
             BooleanType.BOOLEAN.writeBoolean(
                 builders[col], BooleanType.BOOLEAN.getBoolean(srcBlock, pos));
+          } else if (t instanceof TimestampWithTimeZoneType) {
+            t.writeObject(builders[col], t.getObject(srcBlock, pos));
           } else {
             // Fallback for other types (integer, smallint, tinyint, timestamp)
             t.writeLong(builders[col], t.getLong(srcBlock, pos));
@@ -2858,6 +2866,8 @@ public class ResultMerger {
       return BooleanType.BOOLEAN.getBoolean(block, position);
     } else if (type instanceof VarcharType) {
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      return type.getObject(block, position);
     } else {
       // Default: try getLong for integer-like types
       return type.getLong(block, position);
@@ -3104,6 +3114,8 @@ public class ResultMerger {
       BooleanType.BOOLEAN.writeBoolean(builder, (Boolean) value);
     } else if (type instanceof VarcharType) {
       VarcharType.VARCHAR.writeSlice(builder, io.airlift.slice.Slices.utf8Slice(value.toString()));
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      type.writeObject(builder, value);
     } else {
       // Default: try writeLong for integer-like types
       type.writeLong(builder, ((Number) value).longValue());

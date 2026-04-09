@@ -13,8 +13,10 @@ import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
+import io.trino.spi.type.LongTimestampWithTimeZone;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -239,6 +241,10 @@ public class SortOperator implements Operator {
     } else if (type instanceof TimestampType) {
       // TimestampType stores values as long (microseconds since epoch)
       return Long.compare(type.getLong(block, posA), type.getLong(block, posB));
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      LongTimestampWithTimeZone a = (LongTimestampWithTimeZone) type.getObject(block, posA);
+      LongTimestampWithTimeZone b = (LongTimestampWithTimeZone) type.getObject(block, posB);
+      return a.compareTo(b);
     } else if (type instanceof BooleanType) {
       return Boolean.compare(
           BooleanType.BOOLEAN.getBoolean(block, posA), BooleanType.BOOLEAN.getBoolean(block, posB));

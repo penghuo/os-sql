@@ -10,6 +10,8 @@ import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.RealType;
 import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import java.util.ArrayList;
@@ -135,6 +137,13 @@ public class FunctionRegistry {
     }
     // REAL -> DOUBLE
     if (target instanceof DoubleType && source instanceof RealType) {
+      return true;
+    }
+    // TIMESTAMP(higher precision) -> TIMESTAMP(lower precision), e.g. TIMESTAMP(6) -> TIMESTAMP(3)
+    if (source instanceof TimestampType && target instanceof TimestampType) {
+      return ((TimestampType) source).getPrecision() > ((TimestampType) target).getPrecision();
+    }
+    if (source instanceof TimestampWithTimeZoneType && target instanceof TimestampType) {
       return true;
     }
     return false;

@@ -9,6 +9,7 @@ import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import java.util.List;
@@ -265,6 +266,31 @@ public final class BuiltinFunctions {
         List.of(TimestampType.TIMESTAMP_MILLIS),
         DoubleType.DOUBLE,
         DateTimeFunctions.toUnixtime());
+    // Timestamp with time zone overloads
+    reg(r, "year", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.yearTz());
+    reg(r, "month", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.monthTz());
+    reg(r, "day", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.dayTz());
+    reg(r, "hour", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.hourTz());
+    reg(r, "minute", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.minuteTz());
+    reg(r, "second", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.secondTz());
+    reg(r, "day_of_week", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.dayOfWeekTz());
+    reg(r, "dow", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.dayOfWeekTz());
+    reg(r, "day_of_year", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.dayOfYearTz());
+    reg(r, "doy", List.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS), BigintType.BIGINT,
+        DateTimeFunctions.dayOfYearTz());
+    reg(r, "date_trunc",
+        List.of(VarcharType.VARCHAR, TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS),
+        TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS,
+        DateTimeFunctions.dateTruncTz());
   }
 
   private static void registerTrigFunctions(FunctionRegistry r) {

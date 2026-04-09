@@ -1413,29 +1413,64 @@ public class TransportTrinoSqlAction
       LOG.info("PERF: mergeIcebergResults mergePassthrough {}ms, {} pages, {} rows",
           (System.nanoTime() - t0) / 1_000_000, rawPages.size(), totalRows);
       t0 = System.nanoTime();
-      // Parallelize: partition raw pages into N chunks, aggregate each in parallel, then merge.
-      int parallelism = Math.min(rawPages.size(), Runtime.getRuntime().availableProcessors());
-      List<Page> mergedPages;
-      if (parallelism <= 1) {
-        mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
-      } else {
-        int chunkSize = (rawPages.size() + parallelism - 1) / parallelism;
-        java.util.concurrent.ExecutorService pool =
-            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
-        try {
-          List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
-          for (int i = 0; i < rawPages.size(); i += chunkSize) {
-            List<Page> chunk = rawPages.subList(i, Math.min(i + chunkSize, rawPages.size()));
-            futures.add(java.util.concurrent.CompletableFuture.supplyAsync(
-                () -> runCoordinatorAggregation(singleAgg, chunk, rawColumnNames, columnTypeMap), pool));
+      int numPartitions = Runtime.getRuntime().availableProcessors();
+      int numGroupByCols = singleAgg.getGroupByKeys().size();
+
+      // Resolve group-by column indices in raw scan output
+      List<Integer> gbIndices = new ArrayList<>();
+      for (String key : singleAgg.getGroupByKeys()) {
+        gbIndices.add(rawColumnNames.indexOf(key));
+      }
+
+      // Hash-partition raw rows by group keys into N partitions (disjoint keys per partition)
+      @SuppressWarnings("unchecked")
+      List<Page>[] partitionPages = new List[numPartitions];
+      for (int p = 0; p < numPartitions; p++) partitionPages[p] = new ArrayList<>();
+
+      long perfRouteStart = System.nanoTime();
+      for (Page page : rawPages) {
+        int positionCount = page.getPositionCount();
+        int[][] selected = new int[numPartitions][positionCount];
+        int[] selectedCount = new int[numPartitions];
+        for (int pos = 0; pos < positionCount; pos++) {
+          int h = 1;
+          for (int gi : gbIndices) {
+            Block block = page.getBlock(gi);
+            if (block.isNull(pos)) { h = 31 * h; }
+            else {
+              Type type = columnTypeMap.getOrDefault(rawColumnNames.get(gi), io.trino.spi.type.BigintType.BIGINT);
+              h = 31 * h + Long.hashCode(type.getLong(block, pos));
+            }
           }
-          // Merge partial results — convert to splitPages format for mergeAggregation
-          List<List<Page>> partialResults = new ArrayList<>();
-          for (var f : futures) partialResults.add(f.join());
-          mergedPages = merger.mergeAggregation(partialResults, singleAgg, columnTypes);
-        } finally {
-          pool.shutdown();
+          int partition = Math.floorMod(h, numPartitions);
+          selected[partition][selectedCount[partition]++] = pos;
         }
+        for (int p = 0; p < numPartitions; p++) {
+          if (selectedCount[p] > 0) {
+            partitionPages[p].add(selectedCount[p] == positionCount
+                ? page : page.copyPositions(selected[p], 0, selectedCount[p]));
+          }
+        }
+      }
+      LOG.info("PERF: hash exchange routing {}ms, {} partitions",
+          (System.nanoTime() - perfRouteStart) / 1_000_000, numPartitions);
+
+      // Parallel aggregation per partition — each has disjoint group keys
+      long perfAggStart = System.nanoTime();
+      java.util.concurrent.ExecutorService pool =
+          java.util.concurrent.Executors.newFixedThreadPool(numPartitions);
+      List<Page> mergedPages;
+      try {
+        List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
+        for (int p = 0; p < numPartitions; p++) {
+          List<Page> pPages = partitionPages[p];
+          futures.add(java.util.concurrent.CompletableFuture.supplyAsync(
+              () -> runCoordinatorAggregation(singleAgg, pPages, rawColumnNames, columnTypeMap), pool));
+        }
+        mergedPages = new ArrayList<>();
+        for (var f : futures) mergedPages.addAll(f.join());
+      } finally {
+        pool.shutdown();
       }
       long aggGroups = mergedPages.stream().mapToLong(Page::getPositionCount).sum();
       LOG.info("PERF: mergeIcebergResults runCoordinatorAggregation {}ms, {} output groups",

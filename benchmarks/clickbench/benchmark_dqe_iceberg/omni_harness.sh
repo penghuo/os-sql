@@ -232,6 +232,124 @@ print(f'Faster than Trino: {wins} | Slower: {losses}')
 " | tee "$RESULT_DIR/comparison.txt"
 }
 
+# ── Combined (correctness on run 1 + timing on all runs) ─────────────────────
+run_combined() {
+    log "=== Combined Correctness + Performance ($TRIES runs per query) ==="
+    local results="[]"
+    local pass=0 fail=0 error=0 skip=0
+    local report="$RESULT_DIR/correctness_report.txt"
+    : > "$report"
+    local qnum=0
+
+    while IFS= read -r query; do
+        qnum=$((qnum + 1))
+        [ -z "$query" ] && continue
+        if [ -n "$ONLY_QUERY" ] && [ "$qnum" -ne "$ONLY_QUERY" ]; then
+            results=$(echo "$results" | jq ". + [[null]]")
+            skip=$((skip + 1))
+            continue
+        fi
+
+        query=$(echo "$query" | sed 's/;[[:space:]]*$//')
+        local golden="$GOLDEN_DIR/q$(printf '%02d' "$qnum").expected"
+        local escaped
+        escaped=$(printf '%s' "$query" | jq -Rs '.')
+        local times="[]"
+        local correctness_done=false
+
+        for i in $(seq 1 "$TRIES"); do
+            local start_ns end_ns
+            start_ns=$(date +%s%N)
+
+            if [ "$i" -eq 1 ]; then
+                # Run 1: capture full response for correctness check + timing
+                local response
+                response=$(curl -sf -XPOST "${OS_URL}/_plugins/_trino_sql" \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"query\": $escaped}" \
+                    --max-time "$TIMEOUT" 2>/dev/null) || response=""
+                end_ns=$(date +%s%N)
+
+                if [ -z "$response" ]; then
+                    times=$(echo "$times" | jq ". + [null]")
+                    echo "Q${qnum}: ERROR timeout_or_connection" >> "$report"
+                    error=$((error + 1))
+                    log "  Q${qnum} run 1: ERROR"
+                    correctness_done=true
+                else
+                    local ms=$(( (end_ns - start_ns) / 1000000 ))
+                    local t
+                    t=$(awk "BEGIN {printf \"%.3f\", $ms / 1000}")
+                    times=$(echo "$times" | jq ". + [$t]")
+                    log "  Q${qnum} run 1: ${t}s"
+
+                    # Correctness check
+                    if [ -f "$golden" ]; then
+                        local actual
+                        actual=$(echo "$response" | json_to_tsv 2>/tmp/harness_q${qnum}_err.txt) || actual=""
+                        if [ -z "$actual" ]; then
+                            local err
+                            err=$(cat /tmp/harness_q${qnum}_err.txt 2>/dev/null | head -1)
+                            echo "Q${qnum}: ERROR ${err}" >> "$report"
+                            error=$((error + 1))
+                            log "  Q${qnum}: ERROR ${err}"
+                        elif [ "$actual" = "$(cat "$golden")" ]; then
+                            echo "Q${qnum}: PASS" >> "$report"
+                            pass=$((pass + 1))
+                            log "  Q${qnum}: PASS"
+                        else
+                            echo "Q${qnum}: FAIL" >> "$report"
+                            diff <(cat "$golden") <(echo "$actual") > "$RESULT_DIR/diff_q${qnum}.txt" 2>/dev/null || true
+                            fail=$((fail + 1))
+                            log "  Q${qnum}: FAIL (diff saved)"
+                        fi
+                    else
+                        echo "Q${qnum}: SKIP (no golden)" >> "$report"
+                        skip=$((skip + 1))
+                    fi
+                    correctness_done=true
+                fi
+            else
+                # Runs 2+: timing only (discard response body)
+                local exit_code http_code
+                exit_code=0
+                http_code=$(curl -sf -o /dev/null -w '%{http_code}' \
+                    -XPOST "${OS_URL}/_plugins/_trino_sql" \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"query\": $escaped}" \
+                    --max-time "$TIMEOUT" 2>/dev/null) || exit_code=$?
+                end_ns=$(date +%s%N)
+
+                if [ "$exit_code" -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+                    local ms=$(( (end_ns - start_ns) / 1000000 ))
+                    local t
+                    t=$(awk "BEGIN {printf \"%.3f\", $ms / 1000}")
+                    times=$(echo "$times" | jq ". + [$t]")
+                    log "  Q${qnum} run $i: ${t}s"
+                else
+                    times=$(echo "$times" | jq ". + [null]")
+                    log "  Q${qnum} run $i: FAILED (exit=$exit_code http=$http_code)"
+                fi
+            fi
+        done
+        results=$(echo "$results" | jq ". + [$times]")
+    done < "$QUERY_FILE"
+
+    log "Correctness: ${pass} pass, ${fail} fail, ${error} error, ${skip} skip (out of 43)"
+    echo "---" >> "$report"
+    echo "PASS=${pass} FAIL=${fail} ERROR=${error} SKIP=${skip}" >> "$report"
+
+    local result_file="$RESULT_DIR/${INSTANCE}.json"
+    jq -n \
+        --arg system "DQE Iceberg (trino_sql)" \
+        --arg date "$(date +%Y-%m-%d)" \
+        --arg machine "$INSTANCE" \
+        --argjson result "$results" \
+        '{system:$system, date:$date, machine:$machine, tags:["Java","OpenSearch","Iceberg"], result:$result}' \
+        > "$result_file"
+    log "Results written to $result_file"
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 log "DQE Iceberg ClickBench Harness"
 log "Instance: $INSTANCE | Endpoint: $OS_URL"
@@ -242,8 +360,7 @@ elif [ "$SKIP_CORRECTNESS" = true ]; then
     run_performance
     run_comparison
 else
-    run_correctness
-    run_performance
+    run_combined
     run_comparison
 fi
 

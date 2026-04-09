@@ -53,6 +53,7 @@ import org.opensearch.sql.dqe.function.BuiltinFunctions;
 import org.opensearch.sql.dqe.function.FunctionRegistry;
 import org.opensearch.sql.dqe.function.expression.BlockExpression;
 import org.opensearch.sql.dqe.function.expression.ExpressionCompiler;
+import org.opensearch.sql.dqe.operator.HashAggregationOperator;
 import org.opensearch.sql.dqe.operator.Operator;
 import org.opensearch.sql.dqe.planner.LogicalPlanner;
 import org.opensearch.sql.dqe.planner.optimizer.PlanOptimizer;
@@ -955,7 +956,8 @@ public class TransportTrinoSqlAction
       boolean isExplain,
       ActionListener<TrinoSqlResponse> listener) {
     try {
-      String warehousePath = "/tmp/iceberg-warehouse";
+      String warehousePath = DqeSettings.ICEBERG_WAREHOUSE_PATH.get(
+          clusterService.getSettings());
       IcebergTableResolver icebergResolver = new IcebergTableResolver(warehousePath);
       TableInfo tableInfo = icebergResolver.resolve(indexName);
 
@@ -1057,86 +1059,100 @@ public class TransportTrinoSqlAction
         splitPlan = stripSortAndLimit(splitPlan);
       }
 
-      // Execute splits — parallel when multiple files, sequential for single
-      List<List<Page>> splitPages;
-      int parallelism = Math.min(splits.size(), Runtime.getRuntime().availableProcessors());
-      if (parallelism <= 1) {
-        splitPages = new ArrayList<>(splits.size());
-        for (IcebergSplitInfo split : splits) {
-          IcebergSplitExecuteResponse resp =
-              icebergSplitAction.executeLocal(splitPlan, split);
-          splitPages.add(resp.getPages());
-        }
-      } else {
-        java.util.concurrent.ExecutorService splitPool =
-            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
-        try {
-          DqePlanNode finalSplitPlan = splitPlan;
-          List<java.util.concurrent.CompletableFuture<List<Page>>> futures =
-              new ArrayList<>(splits.size());
-          for (IcebergSplitInfo split : splits) {
-            futures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-              try {
-                return icebergSplitAction.executeLocal(finalSplitPlan, split).getPages();
-              } catch (Exception e) {
-                throw new RuntimeException("Split failed: " + split.filePath(), e);
-              }
-            }, splitPool));
-          }
-          splitPages = new ArrayList<>(splits.size());
-          for (java.util.concurrent.CompletableFuture<List<Page>> future : futures) {
-            splitPages.add(future.join());
-          }
-        } finally {
-          splitPool.shutdown();
+      // Assign splits to nodes and dispatch
+      List<PlanFragment> splitFragments = fragmenter.assignSplitsToNodes(
+          splitPlan, splits, clusterService.state().nodes());
+
+      List<Page> mergedPages;
+      boolean needsMultiPass = false;
+      int estimatedGroups = 0;
+      try {
+        List<List<Page>> splitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
+        mergedPages = mergeIcebergResults(
+            splitPages, splitPlan, coordinatorPlan, optimizedPlan,
+            columnTypes, columnTypeMap, isSingleStepAgg, isScalarSingleStepAgg,
+            internalColumnNames);
+      } catch (HashAggregationOperator.GroupLimitExceededException e) {
+        needsMultiPass = true;
+        estimatedGroups = e.getGroupCount() * 2;
+        mergedPages = null;
+      } catch (Exception e) {
+        // Block builder overflow or OOM on high-cardinality GROUP BY merge
+        Throwable cause = e;
+        while (cause.getCause() != null) cause = cause.getCause();
+        if ((cause instanceof IndexOutOfBoundsException || cause instanceof OutOfMemoryError)
+            && coordinatorPlan instanceof AggregationNode) {
+          needsMultiPass = true;
+          estimatedGroups = 40_000_000; // block builder overflow — high cardinality
+          mergedPages = null;
+        } else {
+          throw e;
         }
       }
 
-      // Merge results using coordinator-plan-aware dispatch
-      ResultMerger merger = new ResultMerger();
-      List<Page> mergedPages;
+      if (needsMultiPass && coordinatorPlan instanceof AggregationNode aggNode) {
+        int numBuckets = Math.max(4, (int) Math.ceil((double) estimatedGroups / 6_000_000));
+        LOG.info("GROUP BY overflow, retrying with {} buckets", numBuckets);
 
-      if (isSingleStepAgg || isScalarSingleStepAgg) {
-        // SINGLE step: coordinator runs full aggregation over concatenated raw data
-        AggregationNode singleAgg = (AggregationNode) coordinatorPlan;
+        // Collect raw pages from all splits (no aggregation)
+        List<List<Page>> rawSplitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
+        List<Page> allRawPages = new ResultMerger().mergePassthrough(rawSplitPages);
+
+        // Determine GROUP BY column indices in the raw scan output
         List<String> rawColumnNames = resolveColumnNames(splitPlan);
-        List<Page> rawPages = merger.mergePassthrough(splitPages);
-        mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
-        // Apply ORDER BY + LIMIT after aggregation (matches shard path behavior)
-        mergedPages =
-            applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
-      } else if (coordinatorPlan instanceof AggregationNode aggNode
-          && isScalarPartialMerge(aggNode)) {
-        // Scalar aggregation (no GROUP BY): fast merge path
-        mergedPages = mergeScalarAggregation(splitPages, aggNode, columnTypes);
-      } else if (coordinatorPlan instanceof AggregationNode aggNode) {
-        // GROUP BY merge: use separate merge + HAVING + sort (not fused path).
-        // The fused mergeAggregationAndSort has a bug where LIMIT affects GROUP BY counts.
-        // Note: high-cardinality GROUP BY (e.g. WatchID) may OOM here — needs spill-to-disk
-        // or streaming merge in the future.
-        mergedPages = merger.mergeAggregation(splitPages, aggNode, columnTypes);
-        mergedPages =
-            applyCoordinatorHaving(mergedPages, optimizedPlan, aggNode, columnTypeMap);
-        mergedPages =
-            applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, merger);
-      } else {
-        // Non-aggregation path
-        SortNode sortNode = findSortNode(optimizedPlan);
-        if (sortNode != null) {
-          List<Integer> sortIndices =
-              sortNode.getSortKeys().stream()
-                  .map(internalColumnNames::indexOf)
-                  .collect(Collectors.toList());
-          long rawLimit = findGlobalLimit(optimizedPlan);
-          long sortLimit =
-              rawLimit >= 0 ? rawLimit + findGlobalOffset(optimizedPlan) : Long.MAX_VALUE;
-          mergedPages =
-              merger.mergeSorted(
-                  splitPages, sortIndices, sortNode.getAscending(),
-                  sortNode.getNullsFirst(), columnTypes, sortLimit);
-        } else {
-          mergedPages = merger.mergePassthrough(splitPages);
+        List<Integer> groupByIndices = new ArrayList<>();
+        for (String key : aggNode.getGroupByKeys()) {
+          int idx = rawColumnNames.indexOf(key);
+          if (idx >= 0) groupByIndices.add(idx);
         }
+        LOG.info("Multi-pass: rawColumns={}, groupByKeys={}, groupByIndices={}, rawPages={}",
+            rawColumnNames, aggNode.getGroupByKeys(), groupByIndices, allRawPages.size());
+        List<Type> rawColumnTypes = new ArrayList<>();
+        for (String col : rawColumnNames) {
+          rawColumnTypes.add(columnTypeMap.getOrDefault(col, io.trino.spi.type.BigintType.BIGINT));
+        }
+
+        // Run aggregation per bucket
+        List<Page> allBucketPages = new ArrayList<>();
+        for (int bucketId = 0; bucketId < numBuckets; bucketId++) {
+          // Filter raw pages for this bucket
+          List<Page> bucketPages = new ArrayList<>();
+          for (Page rawPage : allRawPages) {
+            int positionCount = rawPage.getPositionCount();
+            int[] selected = new int[positionCount];
+            int selectedCount = 0;
+            for (int pos = 0; pos < positionCount; pos++) {
+              int h = 1;
+              for (int gi : groupByIndices) {
+                Block block = rawPage.getBlock(gi);
+                Type type = rawColumnTypes.get(gi);
+                if (block.isNull(pos)) { h = 31 * h; }
+                else {
+                  Object val = HashAggregationOperator.readValue(block, pos, type);
+                  h = 31 * h + (val == null ? 0 : val.hashCode());
+                }
+              }
+              if (Math.floorMod(h, numBuckets) == bucketId) {
+                selected[selectedCount++] = pos;
+              }
+            }
+            if (selectedCount > 0) {
+              bucketPages.add(selectedCount == positionCount
+                  ? rawPage : rawPage.copyPositions(selected, 0, selectedCount));
+            }
+          }
+          // Merge this bucket's partial results
+          if (isSingleStepAgg || isScalarSingleStepAgg) {
+            allBucketPages.addAll(
+                runCoordinatorAggregation(aggNode, bucketPages, rawColumnNames, columnTypeMap));
+          } else {
+            List<List<Page>> bucketSplitPages = List.of(bucketPages);
+            allBucketPages.addAll(
+                new ResultMerger().mergeAggregation(bucketSplitPages, aggNode, columnTypes));
+          }
+        }
+        mergedPages = applyCoordinatorHaving(allBucketPages, optimizedPlan, aggNode, columnTypeMap);
+        mergedPages = applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, new ResultMerger());
       }
 
       // Apply coordinator-level OFFSET + LIMIT
@@ -1157,6 +1173,211 @@ public class TransportTrinoSqlAction
     } catch (Exception e) {
       LOG.error("Error executing Iceberg query: {}", queryStr, e);
       listener.onFailure(e);
+    }
+  }
+
+  /**
+   * Dispatch Iceberg splits to cluster nodes. On single-node, all splits execute
+   * locally without transport serialization. On multi-node, splits are dispatched
+   * via transport to their assigned nodes.
+   */
+  private List<List<Page>> dispatchIcebergSplits(
+      List<PlanFragment> splitFragments,
+      List<IcebergSplitInfo> splits,
+      DqePlanNode splitPlan) throws Exception {
+
+    String localNodeId = clusterService.localNode() != null
+        ? clusterService.localNode().getId() : null;
+    boolean allLocal = true;
+    for (PlanFragment frag : splitFragments) {
+      if (!frag.nodeId().equals(localNodeId)) {
+        allLocal = false;
+        break;
+      }
+    }
+
+    if (allLocal) {
+      // Local fast path — no transport serialization
+      int parallelism = Math.min(splits.size(), Runtime.getRuntime().availableProcessors());
+      if (parallelism <= 1) {
+        List<List<Page>> splitPages = new ArrayList<>(splits.size());
+        for (IcebergSplitInfo split : splits) {
+          splitPages.add(icebergSplitAction.executeLocal(splitPlan, split).getPages());
+        }
+        return splitPages;
+      }
+      java.util.concurrent.ExecutorService pool =
+          java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+      try {
+        DqePlanNode fp = splitPlan;
+        List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
+        for (IcebergSplitInfo split : splits) {
+          futures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try { return icebergSplitAction.executeLocal(fp, split).getPages(); }
+            catch (Exception e) { throw new RuntimeException("Split failed: " + split.filePath(), e); }
+          }, pool));
+        }
+        List<List<Page>> splitPages = new ArrayList<>();
+        for (var f : futures) splitPages.add(f.join());
+        return splitPages;
+      } finally { pool.shutdown(); }
+    }
+
+    // Transport path — serialize plan once, dispatch to assigned nodes
+    LOG.info("Iceberg dispatch: {} splits across {} nodes (allLocal=false)",
+        splits.size(),
+        splitFragments.stream().map(PlanFragment::nodeId).distinct().count());
+
+    org.opensearch.common.io.stream.BytesStreamOutput planOut =
+        new org.opensearch.common.io.stream.BytesStreamOutput();
+    DqePlanNode.writePlanNode(planOut, splitPlan);
+    byte[] serializedPlan = org.opensearch.core.common.bytes.BytesReference
+        .toBytes(planOut.bytes());
+
+    int numSplits = splits.size();
+    @SuppressWarnings("unchecked")
+    List<Page>[] results = new List[numSplits];
+    java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(numSplits);
+    Exception[] errors = new Exception[numSplits];
+
+    for (int i = 0; i < numSplits; i++) {
+      PlanFragment frag = splitFragments.get(i);
+      IcebergSplitInfo split = splits.get(i);
+      final int idx = i;
+
+      if (localNodeId != null && localNodeId.equals(frag.nodeId())) {
+        // Local split
+        transportService.getThreadPool()
+            .executor(org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction
+                .DQE_THREAD_POOL_NAME)
+            .execute(() -> {
+              try {
+                results[idx] = icebergSplitAction.executeLocal(splitPlan, split).getPages();
+              } catch (Exception e) { errors[idx] = e; }
+              latch.countDown();
+            });
+      } else {
+        // Remote split
+        org.opensearch.cluster.node.DiscoveryNode targetNode =
+            clusterService.state().nodes().get(frag.nodeId());
+        org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteRequest req =
+            new org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteRequest(
+                serializedPlan, split, 300_000L);
+        transportService.sendRequest(
+            targetNode,
+            org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteAction.NAME,
+            req,
+            new org.opensearch.transport.TransportResponseHandler<
+                org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteResponse>() {
+              @Override
+              public org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteResponse read(
+                  org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
+                return new org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteResponse(in);
+              }
+              @Override
+              public void handleResponse(
+                  org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteResponse response) {
+                results[idx] = response.getPages();
+                latch.countDown();
+              }
+              @Override
+              public void handleException(org.opensearch.transport.TransportException exp) {
+                errors[idx] = exp;
+                latch.countDown();
+              }
+              @Override
+              public String executor() { return org.opensearch.threadpool.ThreadPool.Names.SAME; }
+            });
+      }
+    }
+
+    latch.await();
+    for (int i = 0; i < numSplits; i++) {
+      if (errors[i] != null) {
+        throw new RuntimeException(
+            "Split " + i + " failed on node " + splitFragments.get(i).nodeId(), errors[i]);
+      }
+    }
+    List<List<Page>> splitPages = new ArrayList<>(numSplits);
+    for (int i = 0; i < numSplits; i++) splitPages.add(results[i]);
+    return splitPages;
+  }
+
+  /**
+   * Merge split results using coordinator-plan-aware dispatch.
+   */
+  private List<Page> mergeIcebergResults(
+      List<List<Page>> splitPages,
+      DqePlanNode splitPlan,
+      DqePlanNode coordinatorPlan, DqePlanNode optimizedPlan,
+      List<Type> columnTypes, Map<String, Type> columnTypeMap,
+      boolean isSingleStepAgg, boolean isScalarSingleStepAgg,
+      List<String> internalColumnNames) throws Exception {
+
+    ResultMerger merger = new ResultMerger();
+    if (isSingleStepAgg || isScalarSingleStepAgg) {
+      AggregationNode singleAgg = (AggregationNode) coordinatorPlan;
+      List<String> rawColumnNames = resolveColumnNames(splitPlan);
+      List<Page> rawPages = merger.mergePassthrough(splitPages);
+      List<Page> mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
+      return applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+    } else if (coordinatorPlan instanceof AggregationNode aggNode && isScalarPartialMerge(aggNode)) {
+      return mergeScalarAggregation(splitPages, aggNode, columnTypes);
+    } else if (coordinatorPlan instanceof AggregationNode aggNode) {
+      List<Page> mergedPages = merger.mergeAggregation(splitPages, aggNode, columnTypes);
+      mergedPages = applyCoordinatorHaving(mergedPages, optimizedPlan, aggNode, columnTypeMap);
+      return applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+    } else {
+      SortNode sortNode = findSortNode(optimizedPlan);
+      if (sortNode != null) {
+        List<Integer> sortIndices = sortNode.getSortKeys().stream()
+            .map(internalColumnNames::indexOf).collect(Collectors.toList());
+        long rawLimit = findGlobalLimit(optimizedPlan);
+        long sortLimit = rawLimit >= 0 ? rawLimit + findGlobalOffset(optimizedPlan) : Long.MAX_VALUE;
+        return merger.mergeSorted(splitPages, sortIndices, sortNode.getAscending(),
+            sortNode.getNullsFirst(), columnTypes, sortLimit);
+      } else {
+        return merger.mergePassthrough(splitPages);
+      }
+    }
+  }
+
+  /**
+   * Execute splits with bucket filtering for multi-pass aggregation.
+   */
+  private List<List<Page>> executeSplitsWithBucket(
+      List<IcebergSplitInfo> splits, DqePlanNode splitPlan,
+      List<Integer> groupByIndices, List<Type> splitColumnTypes,
+      int bucket, int numBuckets) throws Exception {
+    int parallelism = Math.min(splits.size(), Runtime.getRuntime().availableProcessors());
+    if (parallelism <= 1) {
+      List<List<Page>> result = new ArrayList<>(splits.size());
+      for (IcebergSplitInfo split : splits) {
+        result.add(icebergSplitAction.executeLocalWithBucketFilter(
+            splitPlan, split, groupByIndices, splitColumnTypes, bucket, numBuckets).getPages());
+      }
+      return result;
+    }
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+    try {
+      DqePlanNode fp = splitPlan;
+      List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
+      for (IcebergSplitInfo split : splits) {
+        futures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+          try {
+            return icebergSplitAction.executeLocalWithBucketFilter(
+                fp, split, groupByIndices, splitColumnTypes, bucket, numBuckets).getPages();
+          } catch (Exception ex) {
+            throw new RuntimeException("Bucket split failed", ex);
+          }
+        }, pool));
+      }
+      List<List<Page>> result = new ArrayList<>();
+      for (var f : futures) result.add(f.join());
+      return result;
+    } finally {
+      pool.shutdown();
     }
   }
 

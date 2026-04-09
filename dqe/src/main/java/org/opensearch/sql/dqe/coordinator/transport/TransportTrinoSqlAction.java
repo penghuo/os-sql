@@ -1044,6 +1044,26 @@ public class TransportTrinoSqlAction
       if (isSingleStepAgg || isScalarSingleStepAgg || isAggQuery) {
         // Aggregation queries: strip sort+limit, coordinator handles merge+sort+limit
         splitPlan = stripSortAndLimit(splitPlan);
+        // Push inflated Sort+Limit to each split for partial agg with ORDER BY agg_col LIMIT N.
+        // Each split produces top-K groups locally, reducing coordinator merge volume.
+        // Use large inflated limit (100K min) to preserve correctness for high-cardinality GROUP BY.
+        if (!isSingleStepAgg && !isScalarSingleStepAgg
+            && originalSort != null && originalLimit >= 0
+            && coordinatorPlan instanceof AggregationNode aggNode
+            && aggNode.getStep() != AggregationNode.Step.SINGLE) {
+          List<String> aggOutput = new ArrayList<>(aggNode.getGroupByKeys());
+          aggOutput.addAll(aggNode.getAggregateFunctions());
+          String primarySortKey = originalSort.getSortKeys().get(0);
+          int primaryIdx = aggOutput.indexOf(primarySortKey);
+          if (primaryIdx >= aggNode.getGroupByKeys().size()) {
+            long totalLimit = originalLimit + findGlobalOffset(optimizedPlan);
+            long inflatedLimit = Math.max(500_000, totalLimit * splits.size() * 10);
+            splitPlan = new SortNode(splitPlan,
+                originalSort.getSortKeys(), originalSort.getAscending(),
+                originalSort.getNullsFirst());
+            splitPlan = new LimitNode(splitPlan, inflatedLimit);
+          }
+        }
       } else if (originalLimit >= 0 && originalSort != null) {
         // Non-agg with ORDER BY + LIMIT — push to splits for top-N per split
         splitPlan = stripSortAndLimit(splitPlan);
@@ -1112,44 +1132,63 @@ public class TransportTrinoSqlAction
           rawColumnTypes.add(columnTypeMap.getOrDefault(col, io.trino.spi.type.BigintType.BIGINT));
         }
 
-        // Run aggregation per bucket
-        List<Page> allBucketPages = new ArrayList<>();
-        for (int bucketId = 0; bucketId < numBuckets; bucketId++) {
-          // Filter raw pages for this bucket
-          List<Page> bucketPages = new ArrayList<>();
-          for (Page rawPage : allRawPages) {
-            int positionCount = rawPage.getPositionCount();
-            int[] selected = new int[positionCount];
-            int selectedCount = 0;
-            for (int pos = 0; pos < positionCount; pos++) {
-              int h = 1;
-              for (int gi : groupByIndices) {
-                Block block = rawPage.getBlock(gi);
-                Type type = rawColumnTypes.get(gi);
-                if (block.isNull(pos)) { h = 31 * h; }
-                else {
-                  Object val = HashAggregationOperator.readValue(block, pos, type);
-                  h = 31 * h + (val == null ? 0 : val.hashCode());
+        // Run aggregation per bucket — PARALLEL across all cores.
+        // Each bucket filters by hash(groupKey) % numBuckets == bucketId.
+        // Buckets are independent (disjoint group sets), zero shared state.
+        int bucketParallelism = Math.min(numBuckets, Runtime.getRuntime().availableProcessors());
+        java.util.concurrent.ExecutorService bucketPool =
+            java.util.concurrent.Executors.newFixedThreadPool(bucketParallelism);
+        List<Page> allBucketPages;
+        try {
+          final List<Page> rawPages = allRawPages;
+          final List<Integer> gbIndices = groupByIndices;
+          final List<Type> rawColTypes = rawColumnTypes;
+          final List<String> rawColNames = rawColumnNames;
+          final boolean singleStep = isSingleStepAgg || isScalarSingleStepAgg;
+
+          List<java.util.concurrent.CompletableFuture<List<Page>>> bucketFutures = new ArrayList<>();
+          for (int b = 0; b < numBuckets; b++) {
+            final int bid = b;
+            bucketFutures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              List<Page> bucketPages = new ArrayList<>();
+              for (Page rawPage : rawPages) {
+                int positionCount = rawPage.getPositionCount();
+                int[] selected = new int[positionCount];
+                int selectedCount = 0;
+                for (int pos = 0; pos < positionCount; pos++) {
+                  int h = 1;
+                  for (int gi : gbIndices) {
+                    Block block = rawPage.getBlock(gi);
+                    Type type = rawColTypes.get(gi);
+                    if (block.isNull(pos)) { h = 31 * h; }
+                    else {
+                      Object val = HashAggregationOperator.readValue(block, pos, type);
+                      h = 31 * h + (val == null ? 0 : val.hashCode());
+                    }
+                  }
+                  if (Math.floorMod(h, numBuckets) == bid) {
+                    selected[selectedCount++] = pos;
+                  }
+                }
+                if (selectedCount > 0) {
+                  bucketPages.add(selectedCount == positionCount
+                      ? rawPage : rawPage.copyPositions(selected, 0, selectedCount));
                 }
               }
-              if (Math.floorMod(h, numBuckets) == bucketId) {
-                selected[selectedCount++] = pos;
+              if (singleStep) {
+                return runCoordinatorAggregation(aggNode, bucketPages, rawColNames, columnTypeMap);
+              } else {
+                return new ResultMerger().mergeAggregation(List.of(bucketPages), aggNode, columnTypes);
               }
-            }
-            if (selectedCount > 0) {
-              bucketPages.add(selectedCount == positionCount
-                  ? rawPage : rawPage.copyPositions(selected, 0, selectedCount));
-            }
+            }, bucketPool));
           }
-          // Merge this bucket's partial results
-          if (isSingleStepAgg || isScalarSingleStepAgg) {
-            allBucketPages.addAll(
-                runCoordinatorAggregation(aggNode, bucketPages, rawColumnNames, columnTypeMap));
-          } else {
-            List<List<Page>> bucketSplitPages = List.of(bucketPages);
-            allBucketPages.addAll(
-                new ResultMerger().mergeAggregation(bucketSplitPages, aggNode, columnTypes));
+
+          allBucketPages = new ArrayList<>();
+          for (var future : bucketFutures) {
+            allBucketPages.addAll(future.join());
           }
+        } finally {
+          bucketPool.shutdown();
         }
         mergedPages = applyCoordinatorHaving(allBucketPages, optimizedPlan, aggNode, columnTypeMap);
         mergedPages = applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, new ResultMerger());

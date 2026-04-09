@@ -1087,13 +1087,21 @@ public class TransportTrinoSqlAction
       boolean needsMultiPass = false;
       int estimatedGroups = 0;
       // Dispatch splits ONCE — reuse results in both fast path and multi-pass fallback.
+      long perfTotal = System.nanoTime();
+      long perfT0 = System.nanoTime();
       List<List<Page>> splitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
+      int totalPages = splitPages.stream().mapToInt(List::size).sum();
+      LOG.info("PERF: split dispatch {}ms, {} splits, {} total pages",
+          (System.nanoTime() - perfT0) / 1_000_000, splits.size(), totalPages);
       try {
+        perfT0 = System.nanoTime();
         mergedPages = mergeIcebergResults(
             splitPages, splitPlan, coordinatorPlan, optimizedPlan,
             columnTypes, columnTypeMap, isSingleStepAgg, isScalarSingleStepAgg,
             internalColumnNames);
       } catch (HashAggregationOperator.GroupLimitExceededException e) {
+        LOG.info("PERF: first agg attempt failed at {}ms, {} groups",
+            (System.nanoTime() - perfT0) / 1_000_000, e.getGroupCount());
         needsMultiPass = true;
         estimatedGroups = e.getGroupCount() * 2;
         mergedPages = null;
@@ -1116,7 +1124,11 @@ public class TransportTrinoSqlAction
         LOG.info("GROUP BY overflow, retrying with {} buckets", numBuckets);
 
         // Reuse raw pages from the first dispatch (no re-read)
+        perfT0 = System.nanoTime();
         List<Page> allRawPages = new ResultMerger().mergePassthrough(splitPages);
+        long totalRows = allRawPages.stream().mapToLong(Page::getPositionCount).sum();
+        LOG.info("PERF: mergePassthrough {}ms, {} pages, {} total rows",
+            (System.nanoTime() - perfT0) / 1_000_000, allRawPages.size(), totalRows);
 
         // Determine GROUP BY column indices in the raw scan output
         List<String> rawColumnNames = resolveColumnNames(splitPlan);
@@ -1147,10 +1159,13 @@ public class TransportTrinoSqlAction
           final boolean singleStep = isSingleStepAgg || isScalarSingleStepAgg;
 
           List<java.util.concurrent.CompletableFuture<List<Page>>> bucketFutures = new ArrayList<>();
+          long perfBucketsStart = System.nanoTime();
           for (int b = 0; b < numBuckets; b++) {
             final int bid = b;
             bucketFutures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              long filterStart = System.nanoTime();
               List<Page> bucketPages = new ArrayList<>();
+              long inputRows = 0;
               for (Page rawPage : rawPages) {
                 int positionCount = rawPage.getPositionCount();
                 int[] selected = new int[positionCount];
@@ -1173,13 +1188,22 @@ public class TransportTrinoSqlAction
                 if (selectedCount > 0) {
                   bucketPages.add(selectedCount == positionCount
                       ? rawPage : rawPage.copyPositions(selected, 0, selectedCount));
+                  inputRows += selectedCount;
                 }
               }
+              long filterMs = (System.nanoTime() - filterStart) / 1_000_000;
+              long aggStart = System.nanoTime();
+              List<Page> result;
               if (singleStep) {
-                return runCoordinatorAggregation(aggNode, bucketPages, rawColNames, columnTypeMap);
+                result = runCoordinatorAggregation(aggNode, bucketPages, rawColNames, columnTypeMap);
               } else {
-                return new ResultMerger().mergeAggregation(List.of(bucketPages), aggNode, columnTypes);
+                result = new ResultMerger().mergeAggregation(List.of(bucketPages), aggNode, columnTypes);
               }
+              long aggMs = (System.nanoTime() - aggStart) / 1_000_000;
+              long outputGroups = result.stream().mapToLong(Page::getPositionCount).sum();
+              LOG.info("PERF: bucket {} filter {}ms, agg {}ms, {} input rows, {} output groups",
+                  bid, filterMs, aggMs, inputRows, outputGroups);
+              return result;
             }, bucketPool));
           }
 
@@ -1187,11 +1211,15 @@ public class TransportTrinoSqlAction
           for (var future : bucketFutures) {
             allBucketPages.addAll(future.join());
           }
+          LOG.info("PERF: all buckets {}ms, {} total output pages",
+              (System.nanoTime() - perfBucketsStart) / 1_000_000, allBucketPages.size());
         } finally {
           bucketPool.shutdown();
         }
         mergedPages = applyCoordinatorHaving(allBucketPages, optimizedPlan, aggNode, columnTypeMap);
+        perfT0 = System.nanoTime();
         mergedPages = applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, new ResultMerger());
+        LOG.info("PERF: coordinator sort {}ms", (System.nanoTime() - perfT0) / 1_000_000);
       }
 
       // Apply coordinator-level OFFSET + LIMIT
@@ -1206,6 +1234,7 @@ public class TransportTrinoSqlAction
 
       String schemaPrefix = buildSchemaJsonPrefix(columnNames, columnTypes);
       Type[] typeArray = columnTypes.toArray(new Type[0]);
+      LOG.info("PERF: Q total {}ms", (System.nanoTime() - perfTotal) / 1_000_000);
       String responseJson =
           formatResponse(mergedPages, columnNames, columnTypes, schemaPrefix, typeArray);
       listener.onResponse(new TrinoSqlResponse(responseJson));
@@ -1357,13 +1386,105 @@ public class TransportTrinoSqlAction
     if (isSingleStepAgg || isScalarSingleStepAgg) {
       AggregationNode singleAgg = (AggregationNode) coordinatorPlan;
       List<String> rawColumnNames = resolveColumnNames(splitPlan);
+      long t0 = System.nanoTime();
       List<Page> rawPages = merger.mergePassthrough(splitPages);
-      List<Page> mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
-      return applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+      long totalRows = rawPages.stream().mapToLong(Page::getPositionCount).sum();
+      LOG.info("PERF: mergeIcebergResults mergePassthrough {}ms, {} pages, {} rows",
+          (System.nanoTime() - t0) / 1_000_000, rawPages.size(), totalRows);
+      t0 = System.nanoTime();
+      // Parallelize: partition raw pages into N chunks, aggregate each in parallel, then merge.
+      int parallelism = Math.min(rawPages.size(), Runtime.getRuntime().availableProcessors());
+      List<Page> mergedPages;
+      if (parallelism <= 1) {
+        mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
+      } else {
+        int chunkSize = (rawPages.size() + parallelism - 1) / parallelism;
+        java.util.concurrent.ExecutorService pool =
+            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+        try {
+          List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
+          for (int i = 0; i < rawPages.size(); i += chunkSize) {
+            List<Page> chunk = rawPages.subList(i, Math.min(i + chunkSize, rawPages.size()));
+            futures.add(java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> runCoordinatorAggregation(singleAgg, chunk, rawColumnNames, columnTypeMap), pool));
+          }
+          // Merge partial results — convert to splitPages format for mergeAggregation
+          List<List<Page>> partialResults = new ArrayList<>();
+          for (var f : futures) partialResults.add(f.join());
+          mergedPages = merger.mergeAggregation(partialResults, singleAgg, columnTypes);
+        } finally {
+          pool.shutdown();
+        }
+      }
+      long aggGroups = mergedPages.stream().mapToLong(Page::getPositionCount).sum();
+      LOG.info("PERF: mergeIcebergResults runCoordinatorAggregation {}ms, {} output groups",
+          (System.nanoTime() - t0) / 1_000_000, aggGroups);
+      t0 = System.nanoTime();
+      List<Page> sorted = applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+      LOG.info("PERF: mergeIcebergResults coordinatorSort {}ms", (System.nanoTime() - t0) / 1_000_000);
+      return sorted;
     } else if (coordinatorPlan instanceof AggregationNode aggNode && isScalarPartialMerge(aggNode)) {
       return mergeScalarAggregation(splitPages, aggNode, columnTypes);
     } else if (coordinatorPlan instanceof AggregationNode aggNode) {
-      List<Page> mergedPages = merger.mergeAggregation(splitPages, aggNode, columnTypes);
+      long t0 = System.nanoTime();
+      int numPartitions = Runtime.getRuntime().availableProcessors();
+      int numGroupByCols = aggNode.getGroupByKeys().size();
+
+      // Collect all partial pages from all splits into flat list
+      List<Page> allPartialPages = merger.mergePassthrough(splitPages);
+
+      // Hash-partitioned exchange: route each row to partition = hash(groupKeys) % N
+      @SuppressWarnings("unchecked")
+      List<Page>[] partitionPages = new List[numPartitions];
+      for (int p = 0; p < numPartitions; p++) partitionPages[p] = new ArrayList<>();
+
+      long perfRouteStart = System.nanoTime();
+      for (Page page : allPartialPages) {
+        int positionCount = page.getPositionCount();
+        int[][] selected = new int[numPartitions][positionCount];
+        int[] selectedCount = new int[numPartitions];
+        for (int pos = 0; pos < positionCount; pos++) {
+          int h = 1;
+          for (int k = 0; k < numGroupByCols; k++) {
+            Block block = page.getBlock(k);
+            if (block.isNull(pos)) { h = 31 * h; }
+            else { h = 31 * h + Long.hashCode(columnTypes.get(k).getLong(block, pos)); }
+          }
+          int partition = Math.floorMod(h, numPartitions);
+          selected[partition][selectedCount[partition]++] = pos;
+        }
+        for (int p = 0; p < numPartitions; p++) {
+          if (selectedCount[p] > 0) {
+            partitionPages[p].add(selectedCount[p] == positionCount
+                ? page : page.copyPositions(selected[p], 0, selectedCount[p]));
+          }
+        }
+      }
+      LOG.info("PERF: hash exchange routing {}ms, {} partitions",
+          (System.nanoTime() - perfRouteStart) / 1_000_000, numPartitions);
+
+      // Parallel FINAL aggregation per partition (disjoint group keys)
+      long perfAggStart = System.nanoTime();
+      java.util.concurrent.ExecutorService pool =
+          java.util.concurrent.Executors.newFixedThreadPool(numPartitions);
+      List<Page> mergedPages;
+      try {
+        List<java.util.concurrent.CompletableFuture<List<Page>>> futures = new ArrayList<>();
+        for (int p = 0; p < numPartitions; p++) {
+          List<Page> pPages = partitionPages[p];
+          futures.add(java.util.concurrent.CompletableFuture.supplyAsync(
+              () -> new ResultMerger().mergeAggregation(List.of(pPages), aggNode, columnTypes), pool));
+        }
+        mergedPages = new ArrayList<>();
+        for (var f : futures) mergedPages.addAll(f.join());
+      } finally {
+        pool.shutdown();
+      }
+      long aggGroups = mergedPages.stream().mapToLong(Page::getPositionCount).sum();
+      LOG.info("PERF: parallel FINAL agg {}ms, {} output groups",
+          (System.nanoTime() - perfAggStart) / 1_000_000, aggGroups);
+      LOG.info("PERF: mergeIcebergResults hash-exchange total {}ms",
+          (System.nanoTime() - t0) / 1_000_000);
       mergedPages = applyCoordinatorHaving(mergedPages, optimizedPlan, aggNode, columnTypeMap);
       return applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, merger);
     } else {

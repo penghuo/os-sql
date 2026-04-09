@@ -34,7 +34,7 @@ import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
 public class HashAggregationOperator implements Operator {
 
   /** Maximum groups before discarding new keys (approximate Top-K). */
-  private static final int MAX_GROUPS = 4_000_000;
+  private static final int MAX_GROUPS = 8_000_000;
 
   private final Operator source;
   private final List<Integer> groupByColumnIndices;
@@ -176,7 +176,20 @@ public class HashAggregationOperator implements Operator {
       }
     }
 
+    if (canUseMultiLongKeyPath()) {
+      return processMultiLongKeyAggregation();
+    }
+
     return processGenericGroupedAggregation();
+  }
+
+  /** Fast path: multi-key GROUP BY where ALL keys are numeric (long-representable). */
+  private boolean canUseMultiLongKeyPath() {
+    if (groupByColumnIndices.size() <= 1) return false;
+    for (int idx : groupByColumnIndices) {
+      if (!isLongKeyType(columnTypes.get(idx))) return false;
+    }
+    return true;
   }
 
   /** Check if a type can be represented as a long key for the specialized aggregation path. */
@@ -221,10 +234,8 @@ public class HashAggregationOperator implements Operator {
             key = keyType.getLong(keyBlock, pos);
           }
           List<Accumulator> accumulators = longMap.getOrCreate(key, aggregateFunctions);
-          if (accumulators != null) {
-            for (int i = 0; i < accumulators.size(); i++) {
-              accumulators.get(i).add(page, pos);
-            }
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
           }
         }
       }
@@ -306,17 +317,18 @@ public class HashAggregationOperator implements Operator {
         } else {
           String key = VarcharType.VARCHAR.getSlice(keyBlock, pos).toStringUtf8();
           List<Accumulator> accumulators = groups.get(key);
-          if (accumulators == null && groups.size() < MAX_GROUPS) {
+          if (accumulators == null) {
+            if (groups.size() >= MAX_GROUPS) {
+              throw new GroupLimitExceededException(groups.size());
+            }
             accumulators = new ArrayList<>(aggregateFunctions.size());
             for (AggregateFunction func : aggregateFunctions) {
               accumulators.add(func.createAccumulator());
             }
             groups.put(key, accumulators);
           }
-          if (accumulators != null) {
-            for (int i = 0; i < accumulators.size(); i++) {
-              accumulators.get(i).add(page, pos);
-            }
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
           }
         }
       }
@@ -394,16 +406,13 @@ public class HashAggregationOperator implements Operator {
       this.threshold = (int) (capacity * LOAD_FACTOR);
     }
 
-    /** Maximum groups before discarding new keys (approximate Top-K). */
-    private static final int MAX_GROUPS = 4_000_000;
-
     List<Accumulator> getOrCreate(long key, List<AggregateFunction> aggregateFunctions) {
       int slot = findSlot(key);
       if (occupied[slot] && keys[slot] == key) {
         return values[slot];
       }
       if (size >= MAX_GROUPS) {
-        return null; // Over limit — discard new group
+        throw new GroupLimitExceededException(size);
       }
       // New entry
       List<Accumulator> accs = createAccumulators(aggregateFunctions);
@@ -471,6 +480,229 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
+  /**
+   * Fast path for multi-key GROUP BY where all keys are numeric (long-representable).
+   * Uses open-addressing hash map with flat long[]/double[] aggregate arrays — zero per-row
+   * object allocation. Matches ResultMerger.mergeAggregationFastNumeric pattern.
+   */
+  private Page processMultiLongKeyAggregation() {
+    int numKeys = groupByColumnIndices.size();
+    int numAggs = aggregateFunctions.size();
+    int[] keyColIndices = new int[numKeys];
+    Type[] keyTypes = new Type[numKeys];
+    for (int i = 0; i < numKeys; i++) {
+      keyColIndices[i] = groupByColumnIndices.get(i);
+      keyTypes[i] = columnTypes.get(keyColIndices[i]);
+    }
+
+    // Classify aggregates by probing a trial accumulator
+    int[] aggColIndex = new int[numAggs];     // source column index (-1 for COUNT(*))
+    boolean[] isCount = new boolean[numAggs];  // COUNT(*) — just increment
+    boolean[] isAvg = new boolean[numAggs];    // AVG — track sum in double[], count in long[]
+    boolean[] isDouble = new boolean[numAggs]; // SUM on double column
+    Type[] aggInputType = new Type[numAggs];
+    boolean canUseFlatArrays = true;
+
+    for (int a = 0; a < numAggs; a++) {
+      Accumulator trial = aggregateFunctions.get(a).createAccumulator();
+      if (trial instanceof CountAccumulator) {
+        isCount[a] = true;
+        aggColIndex[a] = -1;
+      } else if (trial instanceof SumAccumulator sum) {
+        aggColIndex[a] = sum.columnIndex;
+        aggInputType[a] = sum.inputType;
+        isDouble[a] = sum.inputType instanceof DoubleType;
+      } else if (trial instanceof AvgAccumulator avg) {
+        isAvg[a] = true;
+        aggColIndex[a] = avg.columnIndex;
+        aggInputType[a] = avg.inputType;
+        isDouble[a] = true; // AVG always outputs double
+      } else {
+        // MIN/MAX/COUNT_DISTINCT/AVG — fall back to generic path
+        canUseFlatArrays = false;
+        break;
+      }
+    }
+
+    if (!canUseFlatArrays) {
+      return processGenericGroupedAggregation();
+    }
+
+    // Open-addressing hash map with flat primitive arrays
+    int capacity = 1024;
+    float loadFactor = 0.7f;
+    int threshold = (int) (capacity * loadFactor);
+    int size = 0;
+    long[][] mapKeys = new long[capacity][];
+    long[][] mapLongAggs = new long[capacity][];
+    double[][] mapDoubleAggs = new double[capacity][];
+    boolean[] mapOccupied = new boolean[capacity];
+    long[] tmpKey = new long[numKeys];
+
+    // Null-key group
+    long[] nullLongAggs = null;
+    double[] nullDoubleAggs = null;
+    boolean hasNullGroup = false;
+
+    Page page;
+    while ((page = source.processNextBatch()) != null) {
+      int positionCount = page.getPositionCount();
+
+      // Pre-fetch all blocks once per page
+      Block[] keyBlocks = new Block[numKeys];
+      for (int k = 0; k < numKeys; k++) keyBlocks[k] = page.getBlock(keyColIndices[k]);
+      Block[] aggBlocks = new Block[numAggs];
+      for (int a = 0; a < numAggs; a++) {
+        if (!isCount[a]) aggBlocks[a] = page.getBlock(aggColIndex[a]);
+      }
+
+      for (int pos = 0; pos < positionCount; pos++) {
+        // Check for nulls
+        boolean hasNull = false;
+        for (int k = 0; k < numKeys; k++) {
+          if (keyBlocks[k].isNull(pos)) { hasNull = true; break; }
+        }
+        if (hasNull) {
+          if (!hasNullGroup) {
+            nullLongAggs = new long[numAggs];
+            nullDoubleAggs = new double[numAggs];
+            hasNullGroup = true;
+          }
+          for (int a = 0; a < numAggs; a++) {
+            if (isCount[a]) { nullLongAggs[a]++; }
+            else if (isAvg[a] && !aggBlocks[a].isNull(pos)) {
+              nullLongAggs[a]++; // count
+              if (aggInputType[a] instanceof DoubleType) nullDoubleAggs[a] += DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+              else nullDoubleAggs[a] += aggInputType[a].getLong(aggBlocks[a], pos);
+            }
+            else if (!isAvg[a] && !aggBlocks[a].isNull(pos)) {
+              if (isDouble[a]) nullDoubleAggs[a] += DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+              else nullLongAggs[a] += aggInputType[a].getLong(aggBlocks[a], pos);
+            }
+          }
+          continue;
+        }
+
+        // Extract keys
+        for (int k = 0; k < numKeys; k++) {
+          if (keyTypes[k] instanceof TimestampWithTimeZoneType) {
+            tmpKey[k] = ((LongTimestampWithTimeZone) keyTypes[k].getObject(keyBlocks[k], pos)).getEpochMillis();
+          } else {
+            tmpKey[k] = keyTypes[k].getLong(keyBlocks[k], pos);
+          }
+        }
+
+        int hash = 1;
+        for (int k = 0; k < numKeys; k++) hash = hash * 31 + Long.hashCode(tmpKey[k]);
+
+        int mask = capacity - 1;
+        int slot = hash & mask;
+        while (true) {
+          if (!mapOccupied[slot]) {
+            if (size >= MAX_GROUPS) throw new GroupLimitExceededException(size);
+            mapKeys[slot] = tmpKey.clone();
+            mapLongAggs[slot] = new long[numAggs];
+            mapDoubleAggs[slot] = new double[numAggs];
+            mapOccupied[slot] = true;
+            size++;
+            // Accumulate for new group
+            for (int a = 0; a < numAggs; a++) {
+              if (isCount[a]) { mapLongAggs[slot][a] = 1; }
+              else if (isAvg[a] && !aggBlocks[a].isNull(pos)) {
+                mapLongAggs[slot][a] = 1; // count
+                if (aggInputType[a] instanceof DoubleType) mapDoubleAggs[slot][a] = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                else mapDoubleAggs[slot][a] = aggInputType[a].getLong(aggBlocks[a], pos);
+              }
+              else if (!isAvg[a] && !aggBlocks[a].isNull(pos)) {
+                if (isDouble[a]) mapDoubleAggs[slot][a] = DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                else mapLongAggs[slot][a] = aggInputType[a].getLong(aggBlocks[a], pos);
+              }
+            }
+            if (size > threshold) {
+              int newCap = capacity * 2;
+              long[][] nk = new long[newCap][];
+              long[][] nla = new long[newCap][];
+              double[][] nda = new double[newCap][];
+              boolean[] no = new boolean[newCap];
+              int nm = newCap - 1;
+              for (int s = 0; s < capacity; s++) {
+                if (mapOccupied[s]) {
+                  int rh = 1;
+                  for (int k = 0; k < numKeys; k++) rh = rh * 31 + Long.hashCode(mapKeys[s][k]);
+                  int ns = rh & nm;
+                  while (no[ns]) ns = (ns + 1) & nm;
+                  nk[ns] = mapKeys[s]; nla[ns] = mapLongAggs[s]; nda[ns] = mapDoubleAggs[s]; no[ns] = true;
+                }
+              }
+              capacity = newCap; mask = nm; threshold = (int) (newCap * loadFactor);
+              mapKeys = nk; mapLongAggs = nla; mapDoubleAggs = nda; mapOccupied = no;
+            }
+            break;
+          }
+          // Check key match
+          long[] existing = mapKeys[slot];
+          boolean match = true;
+          for (int k = 0; k < numKeys; k++) { if (existing[k] != tmpKey[k]) { match = false; break; } }
+          if (match) {
+            // Accumulate for existing group
+            for (int a = 0; a < numAggs; a++) {
+              if (isCount[a]) { mapLongAggs[slot][a]++; }
+              else if (isAvg[a] && !aggBlocks[a].isNull(pos)) {
+                mapLongAggs[slot][a]++; // count
+                if (aggInputType[a] instanceof DoubleType) mapDoubleAggs[slot][a] += DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                else mapDoubleAggs[slot][a] += aggInputType[a].getLong(aggBlocks[a], pos);
+              }
+              else if (!isAvg[a] && !aggBlocks[a].isNull(pos)) {
+                if (isDouble[a]) mapDoubleAggs[slot][a] += DoubleType.DOUBLE.getDouble(aggBlocks[a], pos);
+                else mapLongAggs[slot][a] += aggInputType[a].getLong(aggBlocks[a], pos);
+              }
+            }
+            break;
+          }
+          slot = (slot + 1) & mask;
+        }
+      }
+    }
+
+    int groupCount = size + (hasNullGroup ? 1 : 0);
+    if (groupCount == 0) return null;
+
+    // Build result page
+    int totalCols = numKeys + numAggs;
+    BlockBuilder[] builders = new BlockBuilder[totalCols];
+    for (int k = 0; k < numKeys; k++) builders[k] = keyTypes[k].createBlockBuilder(null, groupCount);
+    for (int a = 0; a < numAggs; a++) {
+      builders[numKeys + a] = aggregateFunctions.get(a).getOutputType().createBlockBuilder(null, groupCount);
+    }
+
+    for (int s = 0; s < capacity; s++) {
+      if (mapOccupied[s]) {
+        for (int k = 0; k < numKeys; k++) writeValue(builders[k], keyTypes[k], mapKeys[s][k]);
+        for (int a = 0; a < numAggs; a++) {
+          if (isAvg[a]) {
+            long cnt = mapLongAggs[s][a];
+            DoubleType.DOUBLE.writeDouble(builders[numKeys + a], cnt > 0 ? mapDoubleAggs[s][a] / cnt : 0.0);
+          } else if (isDouble[a]) DoubleType.DOUBLE.writeDouble(builders[numKeys + a], mapDoubleAggs[s][a]);
+          else BigintType.BIGINT.writeLong(builders[numKeys + a], mapLongAggs[s][a]);
+        }
+      }
+    }
+    if (hasNullGroup) {
+      for (int k = 0; k < numKeys; k++) builders[k].appendNull();
+      for (int a = 0; a < numAggs; a++) {
+        if (isAvg[a]) {
+          long cnt = nullLongAggs[a];
+          DoubleType.DOUBLE.writeDouble(builders[numKeys + a], cnt > 0 ? nullDoubleAggs[a] / cnt : 0.0);
+        } else if (isDouble[a]) DoubleType.DOUBLE.writeDouble(builders[numKeys + a], nullDoubleAggs[a]);
+        else BigintType.BIGINT.writeLong(builders[numKeys + a], nullLongAggs[a]);
+      }
+    }
+
+    Block[] blocks = new Block[totalCols];
+    for (int i = 0; i < totalCols; i++) blocks[i] = builders[i].build();
+    return new Page(blocks);
+  }
+
   /** Generic grouped aggregation for multi-key or non-long-key GROUP BY. */
   private Page processGenericGroupedAggregation() {
     // Drain all pages from source and group rows
@@ -493,17 +725,18 @@ public class HashAggregationOperator implements Operator {
         GroupKey groupKey = extractGroupKeyFast(groupBlocks, groupTypes, pos);
 
         List<Accumulator> accumulators = groups.get(groupKey);
-        if (accumulators == null && groups.size() < MAX_GROUPS) {
+        if (accumulators == null) {
+          if (groups.size() >= MAX_GROUPS) {
+            throw new GroupLimitExceededException(groups.size());
+          }
           accumulators = new ArrayList<>(aggregateFunctions.size());
           for (AggregateFunction func : aggregateFunctions) {
             accumulators.add(func.createAccumulator());
           }
           groups.put(groupKey, accumulators);
         }
-        if (accumulators != null) {
-          for (int i = 0; i < accumulators.size(); i++) {
-            accumulators.get(i).add(page, pos);
-          }
+        for (int i = 0; i < accumulators.size(); i++) {
+          accumulators.get(i).add(page, pos);
         }
       }
     }
@@ -619,7 +852,7 @@ public class HashAggregationOperator implements Operator {
     }
   }
 
-  static Object readValue(Block block, int position, Type type) {
+  public static Object readValue(Block block, int position, Type type) {
     if (block.isNull(position)) {
       return null;
     }
@@ -802,8 +1035,8 @@ public class HashAggregationOperator implements Operator {
 
   /** SUM accumulator for numeric columns. Uses long for integer types to avoid precision loss. */
   public static class SumAccumulator implements Accumulator {
-    private final int columnIndex;
-    private final Type inputType;
+    final int columnIndex;
+    final Type inputType;
     private final boolean isIntegerType;
     private long longSum = 0;
     private double doubleSum = 0;
@@ -1055,9 +1288,9 @@ public class HashAggregationOperator implements Operator {
    * ClickHouse/Trino overflow semantics (Int64 wrapping), then divides by count as double.
    */
   public static class AvgAccumulator implements Accumulator {
-    private final int columnIndex;
-    private final Type inputType;
-    private final boolean isIntegerType;
+    final int columnIndex;
+    final Type inputType;
+    final boolean isIntegerType;
     private long longSum = 0;
     private double doubleSum = 0;
     private long count = 0;
@@ -1245,6 +1478,79 @@ public class HashAggregationOperator implements Operator {
     @Override
     public void writeTo(BlockBuilder builder) {
       delegate.writeFinalTo(builder);
+    }
+  }
+
+  /** Thrown when group count exceeds MAX_GROUPS, signaling coordinator to use multi-pass. */
+  public static class GroupLimitExceededException extends RuntimeException {
+    private final int groupCount;
+    public GroupLimitExceededException(int groupCount) {
+      super("GROUP BY exceeded " + groupCount + " groups (max " + MAX_GROUPS + ")");
+      this.groupCount = groupCount;
+    }
+    public int getGroupCount() { return groupCount; }
+  }
+
+  /**
+   * Filters rows by bucket hash of group-by key columns. Used for multi-pass
+   * bucketed aggregation to bound memory usage.
+   */
+  public static class BucketFilterOperator implements Operator {
+    private final Operator source;
+    private final List<Integer> groupByColumnIndices;
+    private final List<Type> columnTypes;
+    private final int bucket;
+    private final int numBuckets;
+
+    public BucketFilterOperator(
+        Operator source, List<Integer> groupByColumnIndices,
+        List<Type> columnTypes, int bucket, int numBuckets) {
+      this.source = source;
+      this.groupByColumnIndices = groupByColumnIndices;
+      this.columnTypes = columnTypes;
+      this.bucket = bucket;
+      this.numBuckets = numBuckets;
+    }
+
+    @Override
+    public Page processNextBatch() {
+      while (true) {
+        Page page = source.processNextBatch();
+        if (page == null) return null;
+        int positionCount = page.getPositionCount();
+        int[] selected = new int[positionCount];
+        int selectedCount = 0;
+        for (int pos = 0; pos < positionCount; pos++) {
+          int h = computeGroupHash(page, pos);
+          if (Math.floorMod(h, numBuckets) == bucket) {
+            selected[selectedCount++] = pos;
+          }
+        }
+        if (selectedCount == 0) continue;
+        if (selectedCount == positionCount) return page;
+        return page.copyPositions(selected, 0, selectedCount);
+      }
+    }
+
+    private int computeGroupHash(Page page, int pos) {
+      int h = 1;
+      for (int i = 0; i < groupByColumnIndices.size(); i++) {
+        int colIdx = groupByColumnIndices.get(i);
+        Block block = page.getBlock(colIdx);
+        Type type = columnTypes.get(colIdx);
+        if (block.isNull(pos)) {
+          h = 31 * h;
+        } else {
+          Object val = readValue(block, pos, type);
+          h = 31 * h + (val == null ? 0 : val.hashCode());
+        }
+      }
+      return h;
+    }
+
+    @Override
+    public void close() {
+      source.close();
     }
   }
 }

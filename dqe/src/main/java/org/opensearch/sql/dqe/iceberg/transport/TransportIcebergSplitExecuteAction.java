@@ -49,6 +49,21 @@ public class TransportIcebergSplitExecuteAction
 
   private final org.opensearch.cluster.service.ClusterService clusterService;
 
+  // Cache table metadata across splits — same table is loaded 125+ times per query
+  private record CachedTableMeta(TableInfo tableInfo, Table icebergTable, Schema schema, Map<String, Type> columnTypeMap) {}
+  private final java.util.concurrent.ConcurrentHashMap<String, CachedTableMeta> tableCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+  private CachedTableMeta getTableMeta(String tableName) {
+    return tableCache.computeIfAbsent(tableName, name -> {
+      IcebergTableResolver resolver = new IcebergTableResolver(getWarehousePath());
+      TableInfo info = resolver.resolve(name);
+      Table table = resolver.loadTable(name);
+      Map<String, Type> typeMap = new HashMap<>();
+      for (TableInfo.ColumnInfo col : info.columns()) typeMap.put(col.name(), col.trinoType());
+      return new CachedTableMeta(info, table, table.schema(), typeMap);
+    });
+  }
+
   @Inject
   public TransportIcebergSplitExecuteAction(
       TransportService transportService, ActionFilters actionFilters,
@@ -80,15 +95,9 @@ public class TransportIcebergSplitExecuteAction
                   new ByteArrayInputStream(req.getSerializedPlan())));
 
       IcebergSplitInfo splitInfo = req.getSplitInfo();
-      IcebergTableResolver resolver = new IcebergTableResolver(getWarehousePath());
-      TableInfo tableInfo = resolver.resolve(splitInfo.tableName());
-      Table icebergTable = resolver.loadTable(splitInfo.tableName());
-      Schema icebergSchema = icebergTable.schema();
-
-      Map<String, Type> columnTypeMap = new HashMap<>();
-      for (TableInfo.ColumnInfo col : tableInfo.columns()) {
-        columnTypeMap.put(col.name(), col.trinoType());
-      }
+      CachedTableMeta meta = getTableMeta(splitInfo.tableName());
+      Schema icebergSchema = meta.schema();
+      Map<String, Type> columnTypeMap = meta.columnTypeMap();
 
       // Build scan factory that creates ParquetPageSource for the split
       ParquetReaderOptions options = new ParquetReaderOptions();
@@ -148,22 +157,21 @@ public class TransportIcebergSplitExecuteAction
    */
   public IcebergSplitExecuteResponse executeLocal(
       DqePlanNode plan, IcebergSplitInfo splitInfo) throws Exception {
-    IcebergTableResolver resolver = new IcebergTableResolver(getWarehousePath());
-    TableInfo tableInfo = resolver.resolve(splitInfo.tableName());
-    Table icebergTable = resolver.loadTable(splitInfo.tableName());
-    Schema icebergSchema = icebergTable.schema();
-
-    Map<String, Type> columnTypeMap = new HashMap<>();
-    for (TableInfo.ColumnInfo col : tableInfo.columns()) {
-      columnTypeMap.put(col.name(), col.trinoType());
-    }
+    long perfSplitStart = System.nanoTime();
+    long perfMetaStart = System.nanoTime();
+    CachedTableMeta meta = getTableMeta(splitInfo.tableName());
+    Schema icebergSchema = meta.schema();
+    Map<String, Type> columnTypeMap = meta.columnTypeMap();
+    long perfMetaMs = (System.nanoTime() - perfMetaStart) / 1_000_000;
 
     ParquetReaderOptions options = new ParquetReaderOptions();
     ParquetPredicateConverter predicateConverter = new ParquetPredicateConverter(columnTypeMap);
+    long[] perfParquetOpenMs = {0};
     LocalExecutionPlanner planner =
         new LocalExecutionPlanner(
             scanNode -> {
               try {
+                long openStart = System.nanoTime();
                 // Read file schema for predicate mapping
                 java.io.File file = new java.io.File(splitInfo.filePath());
                 io.trino.filesystem.local.LocalInputFile inputFile =
@@ -181,26 +189,44 @@ public class TransportIcebergSplitExecuteAction
                 TupleDomain<ColumnDescriptor> predicate =
                     predicateConverter.extractPredicates(plan, fileSchema);
 
-                return new ParquetPageSource(
+                ParquetPageSource source = new ParquetPageSource(
                     splitInfo.filePath(),
                     icebergSchema,
                     scanNode.getColumns(),
                     columnTypeMap,
                     options,
                     predicate);
+                perfParquetOpenMs[0] = (System.nanoTime() - openStart) / 1_000_000;
+                return source;
               } catch (Exception e) {
                 throw new RuntimeException("Failed to create ParquetPageSource", e);
               }
             },
             columnTypeMap);
 
+    long perfPlanStart = System.nanoTime();
     Operator pipeline = plan.accept(planner, null);
+    long perfPlanMs = (System.nanoTime() - perfPlanStart) / 1_000_000;
+
+    long perfExecStart = System.nanoTime();
     List<Page> pages = new ArrayList<>();
     Page page;
+    long totalRows = 0;
     while ((page = pipeline.processNextBatch()) != null) {
       pages.add(page);
+      totalRows += page.getPositionCount();
     }
     pipeline.close();
+    long perfExecMs = (System.nanoTime() - perfExecStart) / 1_000_000;
+    long perfTotalMs = (System.nanoTime() - perfSplitStart) / 1_000_000;
+
+    // Log per-split profiling (sampled: first, last, and every 25th split)
+    String fileName = splitInfo.filePath();
+    int lastSlash = fileName.lastIndexOf('/');
+    String shortName = lastSlash >= 0 ? fileName.substring(lastSlash + 1) : fileName;
+    LOG.info("PERF-SPLIT: {} total={}ms meta={}ms parquetOpen={}ms plan={}ms exec={}ms pages={} rows={}",
+        shortName, perfTotalMs, perfMetaMs, perfParquetOpenMs[0], perfPlanMs, perfExecMs,
+        pages.size(), totalRows);
 
     List<Type> columnTypes = resolveColumnTypes(plan, columnTypeMap);
     return new IcebergSplitExecuteResponse(pages, columnTypes);
@@ -214,15 +240,9 @@ public class TransportIcebergSplitExecuteAction
       DqePlanNode plan, IcebergSplitInfo splitInfo,
       List<Integer> groupByIndices, List<Type> allColumnTypes,
       int bucket, int numBuckets) throws Exception {
-    IcebergTableResolver resolver = new IcebergTableResolver(getWarehousePath());
-    TableInfo tableInfo = resolver.resolve(splitInfo.tableName());
-    Table icebergTable = resolver.loadTable(splitInfo.tableName());
-    Schema icebergSchema = icebergTable.schema();
-
-    Map<String, Type> columnTypeMap = new HashMap<>();
-    for (TableInfo.ColumnInfo col : tableInfo.columns()) {
-      columnTypeMap.put(col.name(), col.trinoType());
-    }
+    CachedTableMeta meta = getTableMeta(splitInfo.tableName());
+    Schema icebergSchema = meta.schema();
+    Map<String, Type> columnTypeMap = meta.columnTypeMap();
 
     ParquetReaderOptions options = new ParquetReaderOptions();
     ParquetPredicateConverter predicateConverter = new ParquetPredicateConverter(columnTypeMap);

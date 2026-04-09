@@ -11,11 +11,14 @@ import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.DateType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
+import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.RealType;
 import io.trino.spi.type.SmallintType;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarbinaryType;
@@ -47,7 +50,12 @@ public final class PageSerializer {
           Map.entry("tinyint", TinyintType.TINYINT),
           Map.entry("real", RealType.REAL),
           Map.entry("varbinary", VarbinaryType.VARBINARY),
-          Map.entry("timestamp(3)", TimestampType.TIMESTAMP_MILLIS));
+          Map.entry("timestamp(3)", TimestampType.TIMESTAMP_MILLIS),
+          Map.entry("timestamp(6) with time zone",
+              TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS),
+          Map.entry("timestamp(3) with time zone",
+              TimestampWithTimeZoneType.TIMESTAMP_TZ_MILLIS),
+          Map.entry("date", DateType.DATE));
 
   private PageSerializer() {}
 
@@ -223,6 +231,11 @@ public final class PageSerializer {
       for (int pos = 0; pos < positionCount; pos++) {
         out.writeInt((int) RealType.REAL.getLong(block, pos));
       }
+    } else if (type instanceof DateType) {
+      io.trino.spi.block.IntArrayBlock intBlock = (io.trino.spi.block.IntArrayBlock) block;
+      for (int pos = 0; pos < positionCount; pos++) {
+        out.writeInt(intBlock.getInt(pos));
+      }
     }
   }
 
@@ -235,7 +248,8 @@ public final class PageSerializer {
         || type instanceof SmallintType
         || type instanceof TinyintType
         || type instanceof BooleanType
-        || type instanceof RealType;
+        || type instanceof RealType
+        || type instanceof DateType;
   }
 
   /**
@@ -360,6 +374,10 @@ public final class PageSerializer {
       for (int pos = 0; pos < positionCount; pos++) {
         RealType.REAL.writeLong(builder, in.readInt());
       }
+    } else if (type instanceof DateType) {
+      for (int pos = 0; pos < positionCount; pos++) {
+        ((io.trino.spi.block.IntArrayBlockBuilder) builder).writeInt(in.readInt());
+      }
     }
   }
 
@@ -424,6 +442,14 @@ public final class PageSerializer {
       out.writeByteArray(bytes);
     } else if (type instanceof TimestampType) {
       out.writeLong(type.getLong(block, position));
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      LongTimestampWithTimeZone tz =
+          (LongTimestampWithTimeZone) type.getObject(block, position);
+      out.writeLong(tz.getEpochMillis());
+      out.writeInt(tz.getPicosOfMilli());
+      out.writeShort(tz.getTimeZoneKey());
+    } else if (type instanceof DateType) {
+      out.writeInt(((io.trino.spi.block.IntArrayBlock) block).getInt(position));
     } else {
       throw new IOException("Unsupported type for serialization: " + type);
     }
@@ -459,6 +485,14 @@ public final class PageSerializer {
       VarbinaryType.VARBINARY.writeSlice(builder, Slices.wrappedBuffer(bytes));
     } else if (type instanceof TimestampType) {
       type.writeLong(builder, in.readLong());
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      long epochMillis = in.readLong();
+      int picosOfMilli = in.readInt();
+      short tzKey = in.readShort();
+      type.writeObject(builder,
+          LongTimestampWithTimeZone.fromEpochMillisAndFraction(epochMillis, picosOfMilli, tzKey));
+    } else if (type instanceof DateType) {
+      ((io.trino.spi.block.IntArrayBlockBuilder) builder).writeInt(in.readInt());
     } else {
       throw new IOException("Unsupported type for deserialization: " + type);
     }

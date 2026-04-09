@@ -9,15 +9,18 @@ import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.DateType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.RealType;
 import io.trino.spi.type.SmallintType;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.tree.Query;
+import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.sql.tree.QuerySpecification;
 import io.trino.sql.tree.Statement;
 import java.io.IOException;
@@ -65,6 +68,11 @@ import org.opensearch.sql.dqe.planner.plan.TableScanNode;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteAction;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteRequest;
 import org.opensearch.sql.dqe.shard.transport.ShardExecuteResponse;
+import org.opensearch.sql.dqe.iceberg.IcebergFragmenter;
+import org.opensearch.sql.dqe.iceberg.IcebergSplitInfo;
+import org.opensearch.sql.dqe.iceberg.IcebergTableResolver;
+import org.opensearch.sql.dqe.iceberg.transport.IcebergSplitExecuteResponse;
+import org.opensearch.sql.dqe.iceberg.transport.TransportIcebergSplitExecuteAction;
 import org.opensearch.sql.dqe.trino.parser.DqeSqlParser;
 import org.opensearch.sql.dqe.operator.LongOpenHashSet;
 import org.opensearch.tasks.Task;
@@ -123,6 +131,7 @@ public class TransportTrinoSqlAction
   private final ClusterService clusterService;
   private final TransportService transportService;
   private final org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction;
+  private final TransportIcebergSplitExecuteAction icebergSplitAction;
 
   /**
    * Constructor for plugin wiring with dependency injection.
@@ -137,11 +146,13 @@ public class TransportTrinoSqlAction
       TransportService transportService,
       ActionFilters actionFilters,
       ClusterService clusterService,
-      org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction) {
+      org.opensearch.sql.dqe.shard.transport.TransportShardExecuteAction shardAction,
+      TransportIcebergSplitExecuteAction icebergSplitAction) {
     super(TrinoSqlAction.NAME, transportService, actionFilters, TrinoSqlRequest::new);
     this.clusterService = clusterService;
     this.transportService = transportService;
     this.shardAction = shardAction;
+    this.icebergSplitAction = icebergSplitAction;
     INSTANCE = this;
   }
 
@@ -223,13 +234,22 @@ public class TransportTrinoSqlAction
         OpenSearchMetadata metadata = new OpenSearchMetadata(clusterService);
         Map<String, TableInfo> tableInfoCache = new HashMap<>();
         java.util.function.Function<String, TableInfo> cachingResolver =
-            name -> tableInfoCache.computeIfAbsent(name, metadata::getTableInfo);
+            name -> tableInfoCache.computeIfAbsent(name, n -> {
+              if (IcebergTableResolver.isIcebergTable(n)) {
+                return new TableInfo(n, java.util.List.of());
+              }
+              return metadata.getTableInfo(n);
+            });
 
         // 3. Plan
         DqePlanNode plan = LogicalPlanner.plan(stmt, cachingResolver);
 
         // 4. Optimize (resolve field types for predicate pushdown)
         String indexName = findIndexName(plan);
+        if (IcebergTableResolver.isIcebergTable(indexName)) {
+          executeIcebergQuery(queryStr, stmt, plan, indexName, isExplain, listener);
+          return;
+        }
         TableInfo tableInfo = cachingResolver.apply(indexName);
         List<TableInfo.ColumnInfo> columnInfoList = tableInfo.columns();
         Map<String, String> fieldTypeMap = new HashMap<>(columnInfoList.size());
@@ -924,6 +944,223 @@ public class TransportTrinoSqlAction
   }
 
   /**
+   * Execute an Iceberg query: resolve table, plan, fragment into splits, dispatch to local
+   * Iceberg split executor, merge results, and format response.
+   */
+  private void executeIcebergQuery(
+      String queryStr,
+      Statement stmt,
+      DqePlanNode initialPlan,
+      String indexName,
+      boolean isExplain,
+      ActionListener<TrinoSqlResponse> listener) {
+    try {
+      String warehousePath = "/tmp/iceberg-warehouse";
+      IcebergTableResolver icebergResolver = new IcebergTableResolver(warehousePath);
+      TableInfo tableInfo = icebergResolver.resolve(indexName);
+
+      // Re-plan with Iceberg table info
+      DqePlanNode plan =
+          LogicalPlanner.plan(stmt, name -> icebergResolver.resolve(name));
+
+      // Build column type map
+      Map<String, Type> columnTypeMap = new HashMap<>();
+      for (TableInfo.ColumnInfo col : tableInfo.columns()) {
+        columnTypeMap.put(col.name(), col.trinoType());
+      }
+
+      // Optimize
+      Map<String, String> fieldTypeMap = new HashMap<>();
+      for (TableInfo.ColumnInfo col : tableInfo.columns()) {
+        fieldTypeMap.put(col.name(), col.openSearchType());
+      }
+      PlanOptimizer optimizer = new PlanOptimizer(fieldTypeMap);
+      DqePlanNode optimizedPlan = optimizer.optimizeForIceberg(plan);
+
+      // Resolve column names and types
+      List<String> internalColumnNames = resolveColumnNames(optimizedPlan);
+      List<String> columnNames;
+      if (stmt instanceof Query query2
+          && query2.getQueryBody() instanceof QuerySpecification querySpec2) {
+        List<String> allColumnNames =
+            tableInfo.columns().stream().map(TableInfo.ColumnInfo::name).toList();
+        columnNames = LogicalPlanner.extractDisplayColumnNames(querySpec2, allColumnNames);
+      } else {
+        columnNames = internalColumnNames;
+      }
+      List<Type> columnTypes = resolveColumnTypes(internalColumnNames, columnTypeMap, optimizedPlan);
+
+      if (isExplain) {
+        IcebergFragmenter fragmenter = new IcebergFragmenter();
+        String localNodeId =
+            clusterService.localNode() != null ? clusterService.localNode().getId() : "local";
+        PlanFragmenter.FragmentResult fragments =
+            fragmenter.fragment(optimizedPlan, warehousePath, columnTypeMap, localNodeId);
+        listener.onResponse(
+            new TrinoSqlResponse(formatExplain(plan, optimizedPlan, fragments)));
+        return;
+      }
+
+      // Plan splits
+      IcebergFragmenter fragmenter = new IcebergFragmenter();
+      List<IcebergSplitInfo> splits = fragmenter.planSplits(indexName, warehousePath);
+
+      if (splits.isEmpty()) {
+        String schemaPrefix = buildSchemaJsonPrefix(columnNames, columnTypes);
+        Type[] typeArray = columnTypes.toArray(new Type[0]);
+        String responseJson =
+            formatResponse(List.of(), columnNames, columnTypes, schemaPrefix, typeArray);
+        listener.onResponse(new TrinoSqlResponse(responseJson));
+        return;
+      }
+
+      // Decompose AVG into SUM+COUNT for PARTIAL aggregation merge
+      DqePlanNode splitPlan = decomposeAvgInPlanTree(optimizedPlan);
+
+      // For SINGLE-step aggregation (COUNT(DISTINCT), AVG without COUNT in GROUP BY),
+      // strip the AggregationNode from the split plan so splits return raw data.
+      // The coordinator will run the full aggregation over concatenated raw data.
+      DqePlanNode coordinatorPlan = IcebergFragmenter.buildCoordinatorPlan(optimizedPlan);
+      boolean isSingleStepAgg = coordinatorPlan instanceof AggregationNode singleCheck
+          && singleCheck.getStep() == AggregationNode.Step.SINGLE
+          && !singleCheck.getGroupByKeys().isEmpty();
+      boolean isScalarSingleStepAgg = coordinatorPlan instanceof AggregationNode scalarCheck
+          && scalarCheck.getStep() == AggregationNode.Step.SINGLE
+          && scalarCheck.getGroupByKeys().isEmpty();
+      if (isSingleStepAgg || isScalarSingleStepAgg) {
+        // Strip everything above and including AggregationNode — splits return raw rows
+        splitPlan = findAggregationChild(splitPlan);
+      }
+
+      // Push down Sort+Limit to splits when safe, to avoid OOM on high-cardinality results.
+      // For non-agg queries with ORDER BY + LIMIT, keep Sort+Limit on the split plan
+      // so each split does top-N locally. For aggregation queries, always strip —
+      // partial aggregation results must be fully merged before limiting.
+      long originalLimit = findGlobalLimit(optimizedPlan);
+      SortNode originalSort = findSortNode(optimizedPlan);
+      boolean isAggQuery = coordinatorPlan instanceof AggregationNode;
+      if (isSingleStepAgg || isScalarSingleStepAgg || isAggQuery) {
+        // Aggregation queries: strip sort+limit, coordinator handles merge+sort+limit
+        splitPlan = stripSortAndLimit(splitPlan);
+      } else if (originalLimit >= 0 && originalSort != null) {
+        // Non-agg with ORDER BY + LIMIT — push to splits for top-N per split
+        splitPlan = stripSortAndLimit(splitPlan);
+        splitPlan = new SortNode(splitPlan, originalSort.getSortKeys(),
+            originalSort.getAscending(), originalSort.getNullsFirst());
+        splitPlan = new LimitNode(splitPlan, originalLimit);
+      } else if (originalLimit >= 0) {
+        // Non-agg with LIMIT only — push limit to splits
+        splitPlan = stripSortAndLimit(splitPlan);
+        splitPlan = new LimitNode(splitPlan, originalLimit);
+      } else {
+        // No LIMIT — strip sort+limit as before
+        splitPlan = stripSortAndLimit(splitPlan);
+      }
+
+      // Execute splits — parallel when multiple files, sequential for single
+      List<List<Page>> splitPages;
+      int parallelism = Math.min(splits.size(), Runtime.getRuntime().availableProcessors());
+      if (parallelism <= 1) {
+        splitPages = new ArrayList<>(splits.size());
+        for (IcebergSplitInfo split : splits) {
+          IcebergSplitExecuteResponse resp =
+              icebergSplitAction.executeLocal(splitPlan, split);
+          splitPages.add(resp.getPages());
+        }
+      } else {
+        java.util.concurrent.ExecutorService splitPool =
+            java.util.concurrent.Executors.newFixedThreadPool(parallelism);
+        try {
+          DqePlanNode finalSplitPlan = splitPlan;
+          List<java.util.concurrent.CompletableFuture<List<Page>>> futures =
+              new ArrayList<>(splits.size());
+          for (IcebergSplitInfo split : splits) {
+            futures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+              try {
+                return icebergSplitAction.executeLocal(finalSplitPlan, split).getPages();
+              } catch (Exception e) {
+                throw new RuntimeException("Split failed: " + split.filePath(), e);
+              }
+            }, splitPool));
+          }
+          splitPages = new ArrayList<>(splits.size());
+          for (java.util.concurrent.CompletableFuture<List<Page>> future : futures) {
+            splitPages.add(future.join());
+          }
+        } finally {
+          splitPool.shutdown();
+        }
+      }
+
+      // Merge results using coordinator-plan-aware dispatch
+      ResultMerger merger = new ResultMerger();
+      List<Page> mergedPages;
+
+      if (isSingleStepAgg || isScalarSingleStepAgg) {
+        // SINGLE step: coordinator runs full aggregation over concatenated raw data
+        AggregationNode singleAgg = (AggregationNode) coordinatorPlan;
+        List<String> rawColumnNames = resolveColumnNames(splitPlan);
+        List<Page> rawPages = merger.mergePassthrough(splitPages);
+        mergedPages = runCoordinatorAggregation(singleAgg, rawPages, rawColumnNames, columnTypeMap);
+        // Apply ORDER BY + LIMIT after aggregation (matches shard path behavior)
+        mergedPages =
+            applyCoordinatorSort(mergedPages, singleAgg, optimizedPlan, columnTypes, merger);
+      } else if (coordinatorPlan instanceof AggregationNode aggNode
+          && isScalarPartialMerge(aggNode)) {
+        // Scalar aggregation (no GROUP BY): fast merge path
+        mergedPages = mergeScalarAggregation(splitPages, aggNode, columnTypes);
+      } else if (coordinatorPlan instanceof AggregationNode aggNode) {
+        // GROUP BY merge: use separate merge + HAVING + sort (not fused path).
+        // The fused mergeAggregationAndSort has a bug where LIMIT affects GROUP BY counts.
+        // Note: high-cardinality GROUP BY (e.g. WatchID) may OOM here — needs spill-to-disk
+        // or streaming merge in the future.
+        mergedPages = merger.mergeAggregation(splitPages, aggNode, columnTypes);
+        mergedPages =
+            applyCoordinatorHaving(mergedPages, optimizedPlan, aggNode, columnTypeMap);
+        mergedPages =
+            applyCoordinatorSort(mergedPages, aggNode, optimizedPlan, columnTypes, merger);
+      } else {
+        // Non-aggregation path
+        SortNode sortNode = findSortNode(optimizedPlan);
+        if (sortNode != null) {
+          List<Integer> sortIndices =
+              sortNode.getSortKeys().stream()
+                  .map(internalColumnNames::indexOf)
+                  .collect(Collectors.toList());
+          long rawLimit = findGlobalLimit(optimizedPlan);
+          long sortLimit =
+              rawLimit >= 0 ? rawLimit + findGlobalOffset(optimizedPlan) : Long.MAX_VALUE;
+          mergedPages =
+              merger.mergeSorted(
+                  splitPages, sortIndices, sortNode.getAscending(),
+                  sortNode.getNullsFirst(), columnTypes, sortLimit);
+        } else {
+          mergedPages = merger.mergePassthrough(splitPages);
+        }
+      }
+
+      // Apply coordinator-level OFFSET + LIMIT
+      long globalOffset = findGlobalOffset(optimizedPlan);
+      if (globalOffset > 0) {
+        mergedPages = applyGlobalOffset(mergedPages, globalOffset);
+      }
+      long globalLimit = findGlobalLimit(optimizedPlan);
+      if (globalLimit >= 0) {
+        mergedPages = applyGlobalLimit(mergedPages, globalLimit);
+      }
+
+      String schemaPrefix = buildSchemaJsonPrefix(columnNames, columnTypes);
+      Type[] typeArray = columnTypes.toArray(new Type[0]);
+      String responseJson =
+          formatResponse(mergedPages, columnNames, columnTypes, schemaPrefix, typeArray);
+      listener.onResponse(new TrinoSqlResponse(responseJson));
+    } catch (Exception e) {
+      LOG.error("Error executing Iceberg query: {}", queryStr, e);
+      listener.onFailure(e);
+    }
+  }
+
+  /**
    * Resolve column names from the root plan node by walking the tree to find effective output
    * columns.
    */
@@ -1415,6 +1652,9 @@ public class TransportTrinoSqlAction
           .append("\"");
     } else if (type instanceof BooleanType) {
       sb.append(BooleanType.BOOLEAN.getBoolean(block, position));
+    } else if (type instanceof DateType) {
+      int daysSinceEpoch = (int) DateType.DATE.getLong(block, position);
+      sb.append("\"").append(java.time.LocalDate.ofEpochDay(daysSinceEpoch)).append("\"");
     } else if (type instanceof TimestampType) {
       long microsSinceEpoch = type.getLong(block, position);
       long millisSinceEpoch = microsSinceEpoch / 1000;
@@ -1469,6 +1709,9 @@ public class TransportTrinoSqlAction
       return BooleanType.BOOLEAN.getBoolean(block, position);
     } else if (type instanceof VarcharType) {
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
+    } else if (type instanceof DateType) {
+      int daysSinceEpoch = (int) DateType.DATE.getLong(block, position);
+      return java.time.LocalDate.ofEpochDay(daysSinceEpoch).toString();
     } else if (type instanceof TimestampType) {
       // Trino stores timestamps as microseconds since epoch.
       // Format as date or datetime string depending on time components.
@@ -1478,6 +1721,15 @@ public class TransportTrinoSqlAction
           Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDateTime();
       if (ldt.getHour() == 0 && ldt.getMinute() == 0 && ldt.getSecond() == 0) {
         return ldt.toLocalDate().toString(); // YYYY-MM-DD
+      }
+      return ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      LongTimestampWithTimeZone ltz = (LongTimestampWithTimeZone) type.getObject(block, position);
+      long millisSinceEpoch = ltz.getEpochMillis();
+      java.time.LocalDateTime ldt =
+          Instant.ofEpochMilli(millisSinceEpoch).atZone(ZoneOffset.UTC).toLocalDateTime();
+      if (ldt.getHour() == 0 && ldt.getMinute() == 0 && ldt.getSecond() == 0) {
+        return ldt.toLocalDate().toString();
       }
       return ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
     } else {
@@ -1608,6 +1860,50 @@ public class TransportTrinoSqlAction
               }
             }
             return -1L;
+          }
+        },
+        null);
+  }
+
+  /**
+   * Walk the plan tree and decompose AVG aggregates into SUM+COUNT for PARTIAL execution.
+   * Delegates to PlanFragmenter.decomposeAvgInShardPlan for the AggregationNode.
+   */
+  private static DqePlanNode decomposeAvgInPlanTree(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<DqePlanNode, Void>() {
+          @Override
+          public DqePlanNode visitAggregation(AggregationNode node, Void context) {
+            DqePlanNode optimizedChild = node.getChild().accept(this, context);
+            AggregationNode rebuilt =
+                new AggregationNode(
+                    optimizedChild,
+                    node.getGroupByKeys(),
+                    node.getAggregateFunctions(),
+                    node.getStep());
+            return PlanFragmenter.decomposeAvgInShardPlan(rebuilt);
+          }
+
+          @Override
+          public DqePlanNode visitPlan(DqePlanNode node, Void context) {
+            List<DqePlanNode> children = node.getChildren();
+            if (children.isEmpty()) return node;
+            DqePlanNode visitedChild = children.get(0).accept(this, context);
+            if (node instanceof SortNode s) {
+              return new SortNode(visitedChild, s.getSortKeys(), s.getAscending(), s.getNullsFirst());
+            } else if (node instanceof LimitNode l) {
+              return new LimitNode(visitedChild, l.getCount(), l.getOffset());
+            } else if (node instanceof FilterNode f) {
+              return new FilterNode(visitedChild, f.getPredicateString());
+            } else if (node instanceof ProjectNode p) {
+              // Strip ProjectNode if child AggregationNode was decomposed (AVG→SUM+COUNT)
+              // because the ProjectNode's column references are now stale
+              if (visitedChild instanceof AggregationNode) {
+                return visitedChild;
+              }
+              return new ProjectNode(visitedChild, p.getOutputColumns());
+            }
+            return node;
           }
         },
         null);
@@ -1864,6 +2160,126 @@ public class TransportTrinoSqlAction
    */
   private static boolean isScalarPartialMerge(AggregationNode aggNode) {
     return aggNode.getStep() == AggregationNode.Step.FINAL && aggNode.getGroupByKeys().isEmpty();
+  }
+
+  /**
+   * Find the AggregationNode in the plan tree and return its child.
+   * Strips everything above and including the AggregationNode (ProjectNode, SortNode, LimitNode).
+   * Used for SINGLE-step aggregation in Iceberg queries where splits should return raw data.
+   */
+  private static DqePlanNode findAggregationChild(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<DqePlanNode, Void>() {
+          @Override
+          public DqePlanNode visitAggregation(AggregationNode node, Void context) {
+            return node.getChild();
+          }
+
+          @Override
+          public DqePlanNode visitPlan(DqePlanNode node, Void context) {
+            for (DqePlanNode child : node.getChildren()) {
+              DqePlanNode result = child.accept(this, context);
+              if (result != null) return result;
+            }
+            return plan; // no AggregationNode found, return original
+          }
+        },
+        null);
+  }
+
+  /**
+   * Strip the top-level AggregationNode from a plan tree, returning its child.
+   * Used for SINGLE-step aggregation in Iceberg queries where splits should return raw data
+   * and the coordinator runs the full aggregation.
+   */
+  private static DqePlanNode stripAggregationNode(DqePlanNode plan) {
+    if (plan instanceof AggregationNode aggNode) {
+      return aggNode.getChild();
+    }
+    // If the AggregationNode is not at the top, walk the tree
+    return plan.accept(
+        new DqePlanVisitor<DqePlanNode, Void>() {
+          @Override
+          public DqePlanNode visitAggregation(AggregationNode node, Void context) {
+            return node.getChild();
+          }
+
+          @Override
+          public DqePlanNode visitPlan(DqePlanNode node, Void context) {
+            // Rebuild the node with transformed children
+            List<DqePlanNode> children = node.getChildren();
+            if (children.isEmpty()) return node;
+            DqePlanNode newChild = children.get(0).accept(this, context);
+            if (newChild == children.get(0)) return node;
+            // Reconstruct the node with the new child
+            if (node instanceof SortNode sortNode) {
+              return new SortNode(newChild, sortNode.getSortKeys(),
+                  sortNode.getAscending(), sortNode.getNullsFirst());
+            }
+            if (node instanceof LimitNode limitNode) {
+              return new LimitNode(newChild, limitNode.getCount(), limitNode.getOffset());
+            }
+            if (node instanceof FilterNode filterNode) {
+              return new FilterNode(newChild, filterNode.getPredicateString());
+            }
+            if (node instanceof ProjectNode projectNode) {
+              return new ProjectNode(newChild, projectNode.getOutputColumns());
+            }
+            return node;
+          }
+        },
+        null);
+  }
+
+  /**
+   * Strip SortNode, LimitNode, and HAVING FilterNode from a plan tree. Used for Iceberg split
+   * plans where the coordinator handles sorting, limiting, and HAVING after merging partial
+   * aggregation results.
+   */
+  private static DqePlanNode stripSortAndLimit(DqePlanNode plan) {
+    return plan.accept(
+        new DqePlanVisitor<DqePlanNode, Void>() {
+          @Override
+          public DqePlanNode visitSort(SortNode node, Void context) {
+            return node.getChild().accept(this, context);
+          }
+
+          @Override
+          public DqePlanNode visitLimit(LimitNode node, Void context) {
+            return node.getChild().accept(this, context);
+          }
+
+          @Override
+          public DqePlanNode visitFilter(FilterNode node, Void context) {
+            DqePlanNode child = node.getChild().accept(this, context);
+            // Strip HAVING: FilterNode whose child is AggregationNode
+            if (child instanceof AggregationNode) {
+              return child;
+            }
+            if (child == node.getChild()) return node;
+            return new FilterNode(child, node.getPredicateString());
+          }
+
+          @Override
+          public DqePlanNode visitPlan(DqePlanNode node, Void context) {
+            List<DqePlanNode> children = node.getChildren();
+            if (children.isEmpty()) return node;
+            DqePlanNode newChild = children.get(0).accept(this, context);
+            if (newChild == children.get(0)) return node;
+            if (node instanceof AggregationNode aggNode) {
+              return new AggregationNode(newChild, aggNode.getGroupByKeys(),
+                  aggNode.getAggregateFunctions(), aggNode.getStep());
+            }
+            if (node instanceof FilterNode filterNode) {
+              return new FilterNode(newChild, filterNode.getPredicateString());
+            }
+            if (node instanceof ProjectNode projectNode) {
+              return new ProjectNode(newChild, projectNode.getOutputColumns());
+            }
+            return node;
+          }
+        },
+        null);
   }
 
   /**

@@ -13,7 +13,9 @@ import io.trino.spi.type.BooleanType;
 import io.trino.spi.type.DoubleType;
 import io.trino.spi.type.IntegerType;
 import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
@@ -30,6 +32,9 @@ import org.opensearch.sql.dqe.function.aggregate.AggregateAccumulatorFactory;
  * <p>Supported aggregate functions: COUNT, SUM, MIN, MAX, AVG.
  */
 public class HashAggregationOperator implements Operator {
+
+  /** Maximum groups before discarding new keys (approximate Top-K). */
+  private static final int MAX_GROUPS = 4_000_000;
 
   private final Operator source;
   private final List<Integer> groupByColumnIndices;
@@ -180,7 +185,8 @@ public class HashAggregationOperator implements Operator {
         || type instanceof IntegerType
         || type instanceof SmallintType
         || type instanceof TinyintType
-        || type instanceof TimestampType;
+        || type instanceof TimestampType
+        || type instanceof TimestampWithTimeZoneType;
   }
 
   /**
@@ -206,10 +212,19 @@ public class HashAggregationOperator implements Operator {
             accumulators.get(i).add(page, pos);
           }
         } else {
-          long key = keyType.getLong(keyBlock, pos);
+          long key;
+          if (keyType instanceof TimestampWithTimeZoneType) {
+            LongTimestampWithTimeZone tz =
+                (LongTimestampWithTimeZone) keyType.getObject(keyBlock, pos);
+            key = tz.getEpochMillis();
+          } else {
+            key = keyType.getLong(keyBlock, pos);
+          }
           List<Accumulator> accumulators = longMap.getOrCreate(key, aggregateFunctions);
-          for (int i = 0; i < accumulators.size(); i++) {
-            accumulators.get(i).add(page, pos);
+          if (accumulators != null) {
+            for (int i = 0; i < accumulators.size(); i++) {
+              accumulators.get(i).add(page, pos);
+            }
           }
         }
       }
@@ -290,18 +305,18 @@ public class HashAggregationOperator implements Operator {
           }
         } else {
           String key = VarcharType.VARCHAR.getSlice(keyBlock, pos).toStringUtf8();
-          List<Accumulator> accumulators =
-              groups.computeIfAbsent(
-                  key,
-                  k -> {
-                    List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
-                    for (AggregateFunction func : aggregateFunctions) {
-                      accs.add(func.createAccumulator());
-                    }
-                    return accs;
-                  });
-          for (int i = 0; i < accumulators.size(); i++) {
-            accumulators.get(i).add(page, pos);
+          List<Accumulator> accumulators = groups.get(key);
+          if (accumulators == null && groups.size() < MAX_GROUPS) {
+            accumulators = new ArrayList<>(aggregateFunctions.size());
+            for (AggregateFunction func : aggregateFunctions) {
+              accumulators.add(func.createAccumulator());
+            }
+            groups.put(key, accumulators);
+          }
+          if (accumulators != null) {
+            for (int i = 0; i < accumulators.size(); i++) {
+              accumulators.get(i).add(page, pos);
+            }
           }
         }
       }
@@ -379,10 +394,16 @@ public class HashAggregationOperator implements Operator {
       this.threshold = (int) (capacity * LOAD_FACTOR);
     }
 
+    /** Maximum groups before discarding new keys (approximate Top-K). */
+    private static final int MAX_GROUPS = 4_000_000;
+
     List<Accumulator> getOrCreate(long key, List<AggregateFunction> aggregateFunctions) {
       int slot = findSlot(key);
       if (occupied[slot] && keys[slot] == key) {
         return values[slot];
+      }
+      if (size >= MAX_GROUPS) {
+        return null; // Over limit — discard new group
       }
       // New entry
       List<Accumulator> accs = createAccumulators(aggregateFunctions);
@@ -392,7 +413,6 @@ public class HashAggregationOperator implements Operator {
       size++;
       if (size > threshold) {
         resize();
-        // After resize, return from the new slot location
         return values[findSlot(key)];
       }
       return accs;
@@ -472,19 +492,18 @@ public class HashAggregationOperator implements Operator {
       for (int pos = 0; pos < positionCount; pos++) {
         GroupKey groupKey = extractGroupKeyFast(groupBlocks, groupTypes, pos);
 
-        List<Accumulator> accumulators =
-            groups.computeIfAbsent(
-                groupKey,
-                k -> {
-                  List<Accumulator> accs = new ArrayList<>(aggregateFunctions.size());
-                  for (AggregateFunction func : aggregateFunctions) {
-                    accs.add(func.createAccumulator());
-                  }
-                  return accs;
-                });
-
-        for (int i = 0; i < accumulators.size(); i++) {
-          accumulators.get(i).add(page, pos);
+        List<Accumulator> accumulators = groups.get(groupKey);
+        if (accumulators == null && groups.size() < MAX_GROUPS) {
+          accumulators = new ArrayList<>(aggregateFunctions.size());
+          for (AggregateFunction func : aggregateFunctions) {
+            accumulators.add(func.createAccumulator());
+          }
+          groups.put(groupKey, accumulators);
+        }
+        if (accumulators != null) {
+          for (int i = 0; i < accumulators.size(); i++) {
+            accumulators.get(i).add(page, pos);
+          }
         }
       }
     }
@@ -618,6 +637,10 @@ public class HashAggregationOperator implements Operator {
       return VarcharType.VARCHAR.getSlice(block, position).toStringUtf8();
     } else if (type instanceof TimestampType) {
       return type.getLong(block, position);
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      LongTimestampWithTimeZone tz =
+          (LongTimestampWithTimeZone) type.getObject(block, position);
+      return tz.getEpochMillis();
     } else if (type instanceof BooleanType) {
       return BooleanType.BOOLEAN.getBoolean(block, position) ? 1L : 0L;
     }
@@ -651,6 +674,11 @@ public class HashAggregationOperator implements Operator {
       }
     } else if (type instanceof TimestampType) {
       type.writeLong(builder, ((Number) value).longValue());
+    } else if (type instanceof TimestampWithTimeZoneType) {
+      long millis = ((Number) value).longValue();
+      LongTimestampWithTimeZone tz = LongTimestampWithTimeZone.fromEpochMillisAndFraction(
+          millis, 0, io.trino.spi.type.TimeZoneKey.UTC_KEY);
+      type.writeObject(builder, tz);
     } else {
       // Fallback: try writeLong for other numeric types
       try {

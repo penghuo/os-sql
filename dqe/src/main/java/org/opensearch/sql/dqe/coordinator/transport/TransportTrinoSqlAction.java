@@ -1086,8 +1086,9 @@ public class TransportTrinoSqlAction
       List<Page> mergedPages;
       boolean needsMultiPass = false;
       int estimatedGroups = 0;
+      // Dispatch splits ONCE — reuse results in both fast path and multi-pass fallback.
+      List<List<Page>> splitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
       try {
-        List<List<Page>> splitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
         mergedPages = mergeIcebergResults(
             splitPages, splitPlan, coordinatorPlan, optimizedPlan,
             columnTypes, columnTypeMap, isSingleStepAgg, isScalarSingleStepAgg,
@@ -1114,9 +1115,8 @@ public class TransportTrinoSqlAction
         int numBuckets = Math.max(4, (int) Math.ceil((double) estimatedGroups / 6_000_000));
         LOG.info("GROUP BY overflow, retrying with {} buckets", numBuckets);
 
-        // Collect raw pages from all splits (no aggregation)
-        List<List<Page>> rawSplitPages = dispatchIcebergSplits(splitFragments, splits, splitPlan);
-        List<Page> allRawPages = new ResultMerger().mergePassthrough(rawSplitPages);
+        // Reuse raw pages from the first dispatch (no re-read)
+        List<Page> allRawPages = new ResultMerger().mergePassthrough(splitPages);
 
         // Determine GROUP BY column indices in the raw scan output
         List<String> rawColumnNames = resolveColumnNames(splitPlan);

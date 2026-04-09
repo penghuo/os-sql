@@ -525,8 +525,11 @@ public class HashAggregationOperator implements Operator {
     }
 
     if (!canUseFlatArrays) {
+      System.err.println("PERF-DEBUG: multi-key flat arrays DISABLED, falling back to generic");
       return processGenericGroupedAggregation();
     }
+
+    System.err.println("PERF-DEBUG: multi-key flat arrays ACTIVE, numKeys=" + numKeys + " numAggs=" + numAggs);
 
     // Open-addressing hash map with flat primitive arrays
     int capacity = 1024;

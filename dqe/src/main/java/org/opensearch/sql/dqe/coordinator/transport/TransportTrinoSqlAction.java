@@ -1034,6 +1034,27 @@ public class TransportTrinoSqlAction
         splitPlan = findAggregationChild(splitPlan);
       }
 
+      // For PARTIAL aggregation with many splits, skip per-split aggregation entirely.
+      // Profiling shows PARTIAL agg is 98% of split time (6700ms agg vs 80ms scan) but
+      // achieves <7% row reduction for high-cardinality GROUP BY (Q33: 500K→467K).
+      // Trino's PARTIAL also achieves 0% reduction for Q33 (100M in → 100M out).
+      // By returning raw rows, split dispatch drops from ~60s to ~2s.
+      boolean skippedPartialAgg = false;
+      if (!isSingleStepAgg && !isScalarSingleStepAgg
+          && coordinatorPlan instanceof AggregationNode partialCheck
+          && !partialCheck.getGroupByKeys().isEmpty()
+          && splits.size() > 50) {
+        splitPlan = findAggregationChild(splitPlan);
+        skippedPartialAgg = true;
+        // Override: treat as SINGLE step so coordinator does full aggregation on raw rows
+        isSingleStepAgg = true;
+        AggregationNode partialNode = (AggregationNode) coordinatorPlan;
+        coordinatorPlan = new AggregationNode(
+            null, partialNode.getGroupByKeys(), partialNode.getAggregateFunctions(),
+            AggregationNode.Step.SINGLE);
+        LOG.info("PERF: skipping PARTIAL agg for {} splits, treating as raw scan", splits.size());
+      }
+
       // Push down Sort+Limit to splits when safe, to avoid OOM on high-cardinality results.
       // For non-agg queries with ORDER BY + LIMIT, keep Sort+Limit on the split plan
       // so each split does top-N locally. For aggregation queries, always strip —

@@ -51,6 +51,48 @@ repositories {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fix Parquet jar hell: multiple parquet jars contain overlapping classes.
+// Merge ALL parquet jars into a single fat jar to eliminate duplicates.
+// ---------------------------------------------------------------------------
+configurations {
+    parquetMerge
+    coralFilter
+}
+
+dependencies {
+    parquetMerge 'org.apache.parquet:parquet-column:1.13.1'
+    parquetMerge 'org.apache.parquet:parquet-common:1.13.1'
+    parquetMerge 'org.apache.parquet:parquet-encoding:1.13.1'
+    parquetMerge 'org.apache.parquet:parquet-format-structures:1.13.1'
+    parquetMerge('org.apache.parquet:parquet-hadoop:1.13.1') { transitive = false }
+    parquetMerge('org.apache.parquet:parquet-avro:1.13.1') { transitive = false }
+    parquetMerge 'org.apache.parquet:parquet-jackson:1.13.1'
+
+    coralFilter 'io.trino.coral:coral:2.2.14-1'
+}
+
+tasks.register('mergeParquetJars', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
+    archiveBaseName = 'parquet-merged'
+    archiveVersion = '1.13.1'
+    archiveClassifier = ''
+    configurations = [project.configurations.parquetMerge]
+    mergeServiceFiles()
+}
+
+// Filter Coral fat JAR to remove bundled Calcite/Avatica classes (:api provides calcite-core 1.41.0)
+tasks.register('filterCoralJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
+    archiveBaseName = 'coral-filtered'
+    archiveVersion = '2.2.14-1'
+    archiveClassifier = ''
+    configurations = [project.configurations.coralFilter]
+    exclude 'org/apache/calcite/**'
+    exclude 'org/apache/calcite/avatica/**'
+    exclude 'org/slf4j/**'
+    exclude 'com/google/gson/**'
+    mergeServiceFiles()
+}
+
 opensearchplugin {
     name 'opensearch-sql'
     description 'OpenSearch SQL'
@@ -98,28 +140,59 @@ publishing {
 javadoc.enabled = false
 loggerUsageCheck.enabled = false
 dependencyLicenses.enabled = false
+// Disable third-party audit — the vendored Trino + Netty + parquet stack has many classes
+// audited negatively; we accept that cost for the embedded engine.
 thirdPartyAudit.enabled = false
 
+// Bundle merged and filtered jars; exclude the originals
+tasks.named('bundlePlugin') {
+    dependsOn mergeParquetJars
+    dependsOn filterCoralJar
+    from(mergeParquetJars.archiveFile)
+    from(filterCoralJar.archiveFile)
+    from(configurations.runtimeClasspath.filter { it.name.startsWith('jakarta.annotation-api') })
+    exclude 'parquet-column-*.jar'
+    exclude 'parquet-common-*.jar'
+    exclude 'parquet-encoding-*.jar'
+    exclude 'parquet-format-structures-*.jar'
+    exclude 'parquet-hadoop-*.jar'
+    exclude 'parquet-avro-*.jar'
+    exclude 'parquet-jackson-*.jar'
+    exclude 'annotations-2.25*.jar'
+    exclude 'slf4j-api-*.jar'
+    exclude 'coral-2.*.jar'
+}
+
 configurations.all {
-    // conflict with spring-jcl
-    resolutionStrategy.force "commons-logging:commons-logging:${commons_logging_version}"
-    // enforce 2.12.6, https://github.com/opensearch-project/sql/issues/424
-    resolutionStrategy.force "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
-    resolutionStrategy.force "commons-codec:commons-codec:${commons_codec_version}"
-    resolutionStrategy.force "com.google.guava:guava:${guava_version}"
-    resolutionStrategy.force 'com.google.guava:failureaccess:1.0.2'
-    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:${versions.jackson}"
-    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-smile:${versions.jackson}"
-    resolutionStrategy.force "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${versions.jackson}"
-    resolutionStrategy.force "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
-    resolutionStrategy.force "com.squareup.okhttp3:okhttp:4.12.0"
-    resolutionStrategy.force "joda-time:joda-time:2.10.12"
-    resolutionStrategy.force "org.slf4j:slf4j-api:1.7.36"
-    resolutionStrategy.force "org.apache.httpcomponents:httpcore:4.4.15"
-    resolutionStrategy.force "org.apache.httpcomponents:httpclient:4.5.13"
-    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
-    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
-    resolutionStrategy.force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+    resolutionStrategy {
+        // Omni brings many dependency version conflicts - use latest version to resolve
+        preferProjectModules()
+
+        // conflict with spring-jcl
+        force "commons-logging:commons-logging:${commons_logging_version}"
+        // enforce 2.12.6, https://github.com/opensearch-project/sql/issues/424
+        force "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+        force "commons-codec:commons-codec:${commons_codec_version}"
+        force "com.google.guava:guava:${guava_version}"
+        force 'com.google.guava:failureaccess:1.0.2'
+        force "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:${versions.jackson}"
+        force "com.fasterxml.jackson.dataformat:jackson-dataformat-smile:${versions.jackson}"
+        force "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${versions.jackson}"
+        force "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+        force "com.squareup.okhttp3:okhttp:4.12.0"
+        force "joda-time:joda-time:2.10.12"
+        force "org.slf4j:slf4j-api:1.7.36"
+        force "org.apache.httpcomponents:httpcore:4.4.15"
+        force "org.apache.httpcomponents:httpclient:4.5.13"
+        force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.10"
+        force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.10"
+        force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+        // Omni dependencies - force higher versions to resolve conflicts
+        force 'com.google.code.gson:gson:2.10.1'
+        force 'io.airlift:slice:2.2'
+        force 'org.openjdk.jol:jol-core:0.17'
+        force 'io.opentelemetry:opentelemetry-api:1.35.0'
+    }
 }
 
 configurations {

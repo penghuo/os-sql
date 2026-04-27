@@ -72,6 +72,7 @@ buildscript {
 
     dependencies {
         classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+        classpath 'com.gradleup.shadow:shadow-gradle-plugin:9.3.1'
     }
 }
 

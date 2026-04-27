@@ -17,8 +17,272 @@ tasks.withType(JavaCompile).configureEach {
     options.compilerArgs += ['-Xmaxerrs', '2000', '-parameters']
 }
 
-// loggerUsageCheck and thirdPartyAudit tasks come from the opensearch plugin, not needed for java-library
+// Fallback definition if root buildscript ext is not accessible
+def opensearch_version = System.getProperty("opensearch.version", "3.7.0-SNAPSHOT")
 
-dependencies {
-    // Filled in later tasks
+repositories {
+    mavenLocal()
+    maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+    mavenCentral()
+    maven { url "https://plugins.gradle.org/m2/" }
 }
+
+configurations {
+    all {
+        resolutionStrategy {
+            force 'com.google.errorprone:error_prone_annotations:2.25.0'
+            force 'jakarta.annotation:jakarta.annotation-api:2.1.1'
+            force 'com.fasterxml.jackson.core:jackson-core:2.16.1'
+            force 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
+            force 'com.fasterxml.jackson.core:jackson-annotations:2.16.1'
+            force 'com.fasterxml.jackson.dataformat:jackson-dataformat-smile:2.16.1'
+            force 'com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.16.1'
+            force 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.16.1'
+            force 'com.fasterxml.jackson.datatype:jackson-datatype-guava:2.16.1'
+            force 'com.fasterxml.jackson.datatype:jackson-datatype-joda:2.16.1'
+            force 'com.fasterxml.jackson.module:jackson-module-parameter-names:2.16.1'
+            force 'org.locationtech.jts:jts-core:1.19.0'
+            force 'com.google.guava:guava:33.0.0-jre'
+            force 'org.roaringbitmap:RoaringBitmap:1.0.1'
+            force 'com.google.protobuf:protobuf-java:3.25.3'
+            force 'org.apache.httpcomponents.client5:httpclient5:5.2.3'
+            force 'org.apache.httpcomponents.core5:httpcore5:5.2.4'
+            force 'org.apache.httpcomponents.core5:httpcore5-h2:5.2.4'
+            force 'commons-codec:commons-codec:1.16.1'
+
+            // os-sql transitive dependency conflict resolution
+            force 'net.minidev:json-smart:2.5.2'
+            force 'com.squareup.okio:okio-jvm:3.8.0'
+            force 'org.jetbrains.kotlin:kotlin-stdlib:1.9.23'
+            force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.21'
+            force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.21'
+            force 'org.antlr:antlr4-runtime:4.13.2'
+            force 'joda-time:joda-time:2.12.7'
+            force 'org.ow2.asm:asm:9.7.1'
+            force 'org.jetbrains:annotations:24.1.0'
+            force 'com.amazonaws:aws-java-sdk-core:1.12.674'
+            force 'com.amazonaws:aws-java-sdk-sts:1.12.674'
+            force 'com.fasterxml.jackson:jackson-bom:2.16.1'
+            force 'com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:2.16.1'
+            force 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.16.1'
+            force 'org.checkerframework:checker-qual:3.41.0'
+            force 'commons-logging:commons-logging:1.2'
+            force 'org.yaml:snakeyaml:2.5'
+            force 'org.apache.commons:commons-lang3:3.18.0'
+            force 'org.slf4j:slf4j-api:2.0.17'
+            force 'org.apache.commons:commons-text:1.11.0'
+
+            // os-sql targets OpenSearch 3.6.0-SNAPSHOT; Omni targets 3.5.0-SNAPSHOT
+            force "org.opensearch:opensearch:${opensearch_version}"
+            force "org.opensearch:opensearch-cli:${opensearch_version}"
+            force "org.opensearch:opensearch-common:${opensearch_version}"
+            force "org.opensearch:opensearch-core:${opensearch_version}"
+            force "org.opensearch:opensearch-telemetry:${opensearch_version}"
+            force 'org.apache.lucene:lucene-core:10.3.2'
+            force 'io.projectreactor:reactor-core:3.8.4'
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trino SPI dependencies (pinned to Trino 442 versions)
+// ---------------------------------------------------------------------------
+dependencies {
+    // os-sql PPL-to-Trino translation API
+    api project(':api')
+
+    // trino-spi
+    implementation 'io.airlift:slice:2.2'
+    implementation 'org.openjdk.jol:jol-core:0.17'
+    implementation 'io.airlift:units:1.10'
+    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.16.1'
+    implementation 'io.opentelemetry:opentelemetry-api:1.35.0'
+    implementation 'io.opentelemetry:opentelemetry-context:1.35.0'
+    implementation 'jakarta.annotation:jakarta.annotation-api:2.1.1'
+    implementation 'com.google.errorprone:error_prone_annotations:2.25.0'
+    // trino-parser
+    implementation 'org.antlr:antlr4-runtime:4.13.1'
+    implementation 'com.google.guava:guava:33.0.0-jre'
+    // trino-main
+    implementation 'io.airlift:bytecode:1.5'
+    implementation 'io.airlift:concurrent:242'
+    implementation 'io.airlift:configuration:242'
+    implementation 'io.airlift:json:242'
+    implementation 'io.airlift:log:242'
+    implementation 'io.airlift:node:242'
+    implementation 'io.airlift:stats:242'
+    implementation 'io.airlift:tracing:242'
+    implementation 'io.airlift:http-client:242'
+    implementation 'io.airlift:discovery:242'
+    implementation 'io.airlift:aircompressor:0.26'
+    implementation 'com.fasterxml.jackson.core:jackson-core:2.16.1'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
+    implementation 'it.unimi.dsi:fastutil:8.5.13'
+    implementation 'joda-time:joda-time:2.12.7'
+    implementation 'org.ow2.asm:asm:9.6'
+    implementation 'org.ow2.asm:asm-analysis:9.6'
+    implementation 'org.ow2.asm:asm-tree:9.6'
+    implementation 'org.ow2.asm:asm-util:9.6'
+    implementation 'org.pcollections:pcollections:4.0.1'
+    implementation 'jakarta.validation:jakarta.validation-api:3.0.2'
+    implementation 'commons-codec:commons-codec:1.16.1'
+    implementation 'org.apache.commons:commons-math3:3.6.1'
+    implementation 'com.esri.geometry:esri-geometry-api:2.2.4'
+    implementation 'org.locationtech.jts:jts-core:1.19.0'
+    compileOnly 'com.github.oshi:oshi-core:6.4.13'
+    compileOnly 'net.java.dev.jna:jna-platform:5.14.0'
+
+    // Netty HTTP codec — needed for AuxTransport exchange server
+    implementation 'io.netty:netty-codec-http:4.2.9.Final'
+    implementation 'io.netty:netty-handler:4.2.9.Final'
+    implementation 'io.netty:netty-transport:4.2.9.Final'
+    implementation 'io.netty:netty-buffer:4.2.9.Final'
+    implementation 'io.netty:netty-common:4.2.9.Final'
+    implementation 'io.netty:netty-codec:4.2.9.Final'
+    implementation 'io.netty:netty-codec-base:4.2.9.Final'
+    implementation 'io.netty:netty-resolver:4.2.9.Final'
+    implementation 'com.clearspring.analytics:stream:2.9.8'
+    // -----------------------------------------------------------------------
+    // compileOnly: Server infrastructure deps needed to compile Trino source
+    // but NOT shipped in the plugin ZIP. At runtime, the OpenSearch
+    // integration layer (Phase 2) replaces these code paths.
+    // -----------------------------------------------------------------------
+    implementation 'jakarta.ws.rs:jakarta.ws.rs-api:3.1.0'
+    implementation 'io.airlift:joni:2.1.5.3'
+    implementation 'io.airlift:jmx:242'
+    compileOnly 'io.airlift:jmx-http:242'
+    compileOnly 'io.airlift:log-manager:242'
+    implementation 'io.airlift:bootstrap:242'
+    implementation 'org.hibernate.validator:hibernate-validator:8.0.1.Final'
+    implementation 'org.glassfish.expressly:expressly:5.0.0'
+    implementation 'org.jboss.logging:jboss-logging:3.5.3.Final'
+    implementation 'com.fasterxml:classmate:1.7.0'
+    implementation 'aopalliance:aopalliance:1.0'
+    implementation 'io.airlift:event:242'
+    compileOnly 'io.airlift:jaxrs:242'
+    compileOnly 'io.airlift:openmetrics:242'
+    implementation 'io.airlift:security:242'
+    implementation 'io.airlift:trace-token:242'
+    compileOnly 'jakarta.servlet:jakarta.servlet-api:6.0.0'
+    implementation 'com.google.inject:guice:7.0.0'
+    implementation 'org.weakref:jmxutils:1.26'
+    implementation 'dev.failsafe:failsafe:3.3.2'
+    implementation 'org.roaringbitmap:RoaringBitmap:1.0.1'
+    compileOnly 'com.nimbusds:nimbus-jose-jwt:9.37.3'
+    compileOnly 'com.nimbusds:oauth2-oidc-sdk:11.10.1'
+    compileOnly 'io.jsonwebtoken:jjwt-api:0.12.5'
+    compileOnly 'io.jsonwebtoken:jjwt-impl:0.12.5'
+    compileOnly 'io.jsonwebtoken:jjwt-jackson:0.12.5'
+    compileOnly 'io.airlift:http-server:242'
+    compileOnly 'io.airlift.discovery:discovery-server:1.36'
+    implementation 'org.jetbrains:annotations:24.1.0'
+    compileOnly 'org.assertj:assertj-core:3.25.3'
+    implementation 'io.opentelemetry:opentelemetry-sdk-trace:1.35.0'
+    implementation 'io.opentelemetry:opentelemetry-sdk-testing:1.35.0'
+    compileOnly 'com.squareup.okhttp3:okhttp:4.12.0'
+    compileOnly 'com.googlecode.json-simple:json-simple:1.1.1'
+    implementation 'org.locationtech.jts.io:jts-io-common:1.19.0'
+    compileOnly 'com.squareup.okhttp3:okhttp-urlconnection:4.12.0'
+    // Transitive deps needed on compile classpath
+    implementation 'com.google.guava:failureaccess:1.0.2'
+    compileOnly 'net.minidev:json-smart:2.5.0'
+    compileOnly 'com.squareup.okio:okio-jvm:3.8.0'
+    compileOnly 'org.jetbrains.kotlin:kotlin-stdlib:1.9.23'
+    // trino-parquet
+    implementation 'org.apache.parquet:parquet-column:1.13.1'
+    implementation 'org.apache.parquet:parquet-common:1.13.1'
+    implementation 'org.apache.parquet:parquet-encoding:1.13.1'
+    implementation 'org.apache.parquet:parquet-format-structures:1.13.1'
+    implementation 'org.apache.parquet:parquet-hadoop:1.13.1'
+    // trino-iceberg + trino-hive
+    implementation 'org.apache.iceberg:iceberg-core:1.4.3'
+    implementation 'org.apache.iceberg:iceberg-parquet:1.4.3'
+    implementation 'org.apache.iceberg:iceberg-api:1.4.3'
+    implementation 'org.apache.iceberg:iceberg-nessie:1.4.3'
+    implementation 'org.apache.avro:avro:1.11.3'
+    implementation 'org.apache.thrift:libthrift:0.19.0'
+    implementation 'com.amazonaws:aws-java-sdk-core:1.12.674'
+    implementation 'com.amazonaws:aws-java-sdk-glue:1.12.674'
+    implementation 'com.amazonaws:aws-java-sdk-sts:1.12.674'
+    implementation 'com.amazonaws:aws-java-sdk-s3:1.12.674'
+    implementation 'org.apache.datasketches:datasketches-java:5.0.1'
+    implementation 'org.apache.datasketches:datasketches-memory:2.2.0'
+    implementation 'org.jdbi:jdbi3-core:3.45.0'
+    implementation 'org.projectnessie.nessie:nessie-client:0.71.1'
+    implementation 'org.projectnessie.nessie:nessie-model:0.71.1'
+    implementation 'org.apache.httpcomponents.client5:httpclient5:5.2.3'
+    implementation 'org.apache.httpcomponents.core5:httpcore5:5.2.4'
+    implementation 'org.apache.httpcomponents.core5:httpcore5-h2:5.2.4'
+    implementation 'org.apache.parquet:parquet-avro:1.13.1'
+    implementation 'io.trino.hive:hive-thrift:2'
+    // ORC
+    implementation('org.apache.orc:orc-format:1.0.0') { artifact { classifier = 'shaded-protobuf' } }
+    implementation 'com.google.protobuf:protobuf-java:3.25.3'
+    // AWS SDK v2 (for filesystem-s3)
+    implementation 'software.amazon.awssdk:s3:2.25.4'
+    implementation 'software.amazon.awssdk:sts:2.25.4'
+    implementation 'software.amazon.awssdk:sdk-core:2.25.4'
+    implementation 'software.amazon.awssdk:auth:2.25.4'
+    implementation 'software.amazon.awssdk:regions:2.25.4'
+    implementation 'software.amazon.awssdk:aws-core:2.25.4'
+    implementation 'software.amazon.awssdk:http-client-spi:2.25.4'
+    implementation 'software.amazon.awssdk:http-auth:2.25.4'
+    implementation 'software.amazon.awssdk:http-auth-aws:2.25.4'
+    implementation 'software.amazon.awssdk:http-auth-spi:2.25.4'
+    implementation 'software.amazon.awssdk:identity-spi:2.25.4'
+    implementation 'software.amazon.awssdk:endpoints-spi:2.25.4'
+    implementation 'software.amazon.awssdk:protocol-core:2.25.4'
+    implementation 'software.amazon.awssdk:json-utils:2.25.4'
+    implementation 'software.amazon.awssdk:metrics-spi:2.25.4'
+    implementation 'software.amazon.awssdk:profiles:2.25.4'
+    implementation 'software.amazon.awssdk:utils:2.25.4'
+    implementation 'software.amazon.awssdk:annotations:2.25.4'
+    implementation 'software.amazon.awssdk:apache-client:2.25.4'
+    implementation 'software.amazon.awssdk:netty-nio-client:2.25.4'
+    // GCS
+    implementation 'com.google.cloud:google-cloud-storage:2.35.0'
+    // Alluxio
+    implementation 'org.alluxio:alluxio-core-client-fs:311'
+    implementation 'org.alluxio:alluxio-core-common:311'
+    // Coral (LinkedIn)
+    implementation 'io.trino.coral:coral:2.2.14-1'
+    // GCS auth + API
+    implementation 'com.google.auth:google-auth-library-credentials:1.23.0'
+    implementation 'com.google.auth:google-auth-library-oauth2-http:1.23.0'
+    implementation 'com.google.api:gax:2.45.0'
+    implementation 'com.google.api-client:google-api-client:2.4.0'
+    // Azure
+    implementation 'com.azure:azure-storage-blob:12.25.2'
+    implementation 'com.azure:azure-storage-file-datalake:12.18.2'
+    implementation 'com.azure:azure-identity:1.11.2'
+    implementation 'com.azure:azure-core:1.46.0'
+    implementation 'com.azure:azure-core-http-okhttp:1.11.18'
+    implementation 'com.azure:azure-core-tracing-opentelemetry:1.0.0-beta.42'
+    implementation 'com.azure:azure-storage-common:12.24.2'
+    // Google API client
+    implementation 'com.google.api-client:google-api-client:2.4.0'
+    implementation 'com.google.cloud:google-cloud-core:2.35.0'
+    implementation 'com.google.cloud:google-cloud-core-http:2.35.0'
+    implementation 'com.google.http-client:google-http-client:1.44.1'
+    // Consistent hash
+    implementation 'com.github.ishugaliy:allgood-consistent-hash:1.0.0'
+    // OpenTelemetry instrumentation
+    implementation 'io.opentelemetry.semconv:opentelemetry-semconv:1.23.1-alpha'
+    implementation 'io.opentelemetry.instrumentation:opentelemetry-instrumentation-api:2.1.0'
+    implementation 'io.opentelemetry.instrumentation:opentelemetry-aws-sdk-1.11:2.1.0-alpha'
+    implementation 'io.opentelemetry.instrumentation:opentelemetry-aws-sdk-2.2:2.1.0-alpha'
+    implementation 'io.opentelemetry.instrumentation:opentelemetry-apache-httpclient-5.2:2.1.0-alpha'
+    // ThreeTen
+    implementation 'org.threeten:threetenbp:1.6.8'
+    implementation 'org.weakref:jmxutils:1.26'
+    implementation 'io.trino:trino-re2j:1.7'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.16.1'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.16.1'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-guava:2.16.1'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-joda:2.16.1'
+    implementation 'com.fasterxml.jackson.module:jackson-module-parameter-names:2.16.1'
+    implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-smile:2.16.1'
+    implementation 'jakarta.inject:jakarta.inject-api:2.0.1'
+}
+
+// loggerUsageCheck and thirdPartyAudit tasks come from the opensearch plugin, not needed for java-library

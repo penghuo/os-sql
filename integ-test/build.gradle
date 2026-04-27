@@ -542,11 +542,29 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     filter {
         includeTestsMatching 'org.opensearch.sql.security.*'
     }
+
+    // Filter test classpath to remove raw Coral/Parquet jars that cause jar hell.
+    // The plugin ZIP already contains filtered/merged versions of these jars.
+    classpath = sourceSets.test.runtimeClasspath.filter { file ->
+        !file.name.startsWith('parquet-hadoop-') &&
+        !file.name.startsWith('parquet-avro-') &&
+        !(file.name.startsWith('annotations-') && file.name.contains('2.25')) &&
+        !file.name.startsWith('coral-')
+    }
 }
 
 yamlRestTest {
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'opensearch.jar.hell.skip', 'true'
+
+    // Filter test classpath to remove raw Coral/Parquet jars that cause jar hell.
+    // The plugin ZIP already contains filtered/merged versions of these jars.
+    classpath = sourceSets.test.runtimeClasspath.filter { file ->
+        !file.name.startsWith('parquet-hadoop-') &&
+        !file.name.startsWith('parquet-avro-') &&
+        !(file.name.startsWith('annotations-') && file.name.contains('2.25')) &&
+        !file.name.startsWith('coral-')
+    }
 }
 
 // Run PPL ITs and new, legacy and comparison SQL ITs with new SQL engine enabled
@@ -571,7 +589,7 @@ integTest {
     testLogging {
         events "failed"
     }
-    
+
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
     if(!ignorePrometheus && getOSFamilyType() != "windows") {
         dependsOn startPrometheus
@@ -642,6 +660,15 @@ integTest {
     exclude 'org/opensearch/sql/security/**'
 
     finalizedBy 'printIntegTestPaths'
+
+    // Filter test classpath to remove raw Coral/Parquet jars that cause jar hell.
+    // The plugin ZIP already contains filtered/merged versions of these jars.
+    classpath = sourceSets.test.runtimeClasspath.filter { file ->
+        !file.name.startsWith('parquet-hadoop-') &&
+        !file.name.startsWith('parquet-avro-') &&
+        !(file.name.startsWith('annotations-') && file.name.contains('2.25')) &&
+        !file.name.startsWith('coral-')
+    }
 }
 
 task printIntegTestPaths {

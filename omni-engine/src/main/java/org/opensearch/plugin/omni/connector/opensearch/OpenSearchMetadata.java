@@ -77,12 +77,16 @@ public class OpenSearchMetadata
                         new org.opensearch.common.util.concurrent.ThreadContext(
                                 org.opensearch.common.settings.Settings.EMPTY));
 
+        String[] patterns = pattern.split(",");
+        for (int i = 0; i < patterns.length; i++) {
+            patterns[i] = patterns[i].trim();
+        }
         String[] concreteIndices;
         try {
             concreteIndices = resolver.concreteIndexNames(
                     state,
                     org.opensearch.action.support.IndicesOptions.lenientExpandOpen(),
-                    pattern);
+                    patterns);
         } catch (Exception e) {
             return null; // Pattern didn't resolve
         }

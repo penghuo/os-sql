@@ -91,6 +91,14 @@ dependencies {
     // os-sql PPL-to-Trino translation API
     api project(':api')
 
+    // OpenSearch platform + sibling module deps
+    api project(':opensearch')
+    implementation "org.opensearch:opensearch:${opensearch_version}"
+    implementation "org.opensearch:opensearch-core:${opensearch_version}"
+    implementation "org.opensearch:opensearch-common:${opensearch_version}"
+    implementation "org.opensearch:opensearch-x-content:${opensearch_version}"
+    implementation "org.opensearch.plugin:transport-netty4-client:${opensearch_version}"
+
     // trino-spi
     implementation 'io.airlift:slice:2.2'
     implementation 'org.openjdk.jol:jol-core:0.17'

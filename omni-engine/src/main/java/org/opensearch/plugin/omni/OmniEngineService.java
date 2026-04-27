@@ -244,7 +244,7 @@ public class OmniEngineService {
     }
     if (cause instanceof Exception e) {
       return new QueryEngineException(
-          e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+          e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(), e);
     }
     return new QueryEngineException(String.valueOf(cause));
   }

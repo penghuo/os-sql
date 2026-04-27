@@ -16,8 +16,11 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
@@ -28,8 +31,12 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Guice;
+import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.ModulesBuilder;
+import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
+import org.opensearch.common.lifecycle.LifecycleComponent;
+import org.opensearch.common.network.NetworkService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
@@ -38,15 +45,24 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.jobscheduler.spi.JobSchedulerExtension;
 import org.opensearch.jobscheduler.spi.ScheduledJobParser;
 import org.opensearch.jobscheduler.spi.ScheduledJobRunner;
+import org.opensearch.plugin.omni.OmniEngineService;
+import org.opensearch.plugin.omni.OmniSettings;
+import org.opensearch.plugin.omni.ServiceWiring;
+import org.opensearch.plugin.omni.cluster.ClusterStateNodeManager;
+import org.opensearch.plugin.omni.exchange.ExchangeHttpHandler;
+import org.opensearch.plugin.omni.exchange.Netty4ExchangeTransport;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
+import org.opensearch.plugins.NetworkPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
@@ -121,9 +137,11 @@ import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.CreateAsyncQueryActionResponse;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionResponse;
 import org.opensearch.sql.storage.DataSourceFactory;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.AuxTransport;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.watcher.ResourceWatcherService;
@@ -133,7 +151,8 @@ public class SQLPlugin extends Plugin
         ScriptPlugin,
         SystemIndexPlugin,
         JobSchedulerExtension,
-        ExtensiblePlugin {
+        ExtensiblePlugin,
+        NetworkPlugin {
 
   private static final Logger LOGGER = LogManager.getLogger(SQLPlugin.class);
 
@@ -147,6 +166,10 @@ public class SQLPlugin extends Plugin
   private DataSourceServiceImpl dataSourceService;
   private OpenSearchAsyncQueryScheduler asyncQueryScheduler;
   private Injector injector;
+  private final AtomicReference<IndicesService> indicesServiceRef = new AtomicReference<>();
+  private volatile ServiceWiring omniWiring;
+  private volatile ClusterStateNodeManager omniNodeManager;
+  private volatile OmniEngineService omniEngineService;
 
   public String name() {
     return "sql";
@@ -309,13 +332,29 @@ public class SQLPlugin extends Plugin
 
     EngineExtensionsHolder extensionsHolder = new EngineExtensionsHolder(executionEngineExtensions);
 
+    // ── Omni engine wiring ──
+    this.omniNodeManager = new ClusterStateNodeManager(nodeEnvironment.nodeId());
+    clusterService.addListener(omniNodeManager);
+    this.omniWiring =
+        new ServiceWiring(
+            environment.settings(),
+            omniNodeManager,
+            (NodeClient) client,
+            clusterService,
+            indicesServiceRef::get);
+    this.omniEngineService = new OmniEngineService(omniWiring);
+    LOGGER.info("Omni engine initialized — Trino service graph constructed");
+
     return ImmutableList.of(
         dataSourceService,
         asyncQueryExecutorService,
         clusterManagerEventListener,
         pluginSettings,
         directQueryExecutorService,
-        extensionsHolder);
+        extensionsHolder,
+        omniWiring,
+        omniNodeManager,
+        omniEngineService);
   }
 
   @Override
@@ -336,6 +375,14 @@ public class SQLPlugin extends Plugin
   @Override
   public ScheduledJobParser getJobParser() {
     return OpenSearchScheduleQueryJobRequestParser.getJobParser();
+  }
+
+  @Override
+  public Settings additionalSettings() {
+    int exchangePort = OmniSettings.EXCHANGE_PORT.get(Settings.EMPTY);
+    return Settings.builder()
+        .put("node.attr.omni_exchange_port", String.valueOf(exchangePort))
+        .build();
   }
 
   @Override
@@ -365,7 +412,34 @@ public class SQLPlugin extends Plugin
     return new ImmutableList.Builder<Setting<?>>()
         .addAll(OpenSearchSettings.pluginSettings())
         .addAll(OpenSearchSettings.pluginNonDynamicSettings())
+        .addAll(OmniSettings.getSettings())
         .build();
+  }
+
+  @Override
+  public Map<String, Supplier<AuxTransport>> getAuxTransports(
+      Settings settings,
+      ThreadPool threadPool,
+      CircuitBreakerService circuitBreakerService,
+      NetworkService networkService,
+      ClusterSettings clusterSettings,
+      Tracer tracer) {
+    return Map.of(
+        Netty4ExchangeTransport.SETTING_KEY,
+        () -> {
+          ServiceWiring wiring = this.omniWiring;
+          ExchangeHttpHandler handler =
+              new ExchangeHttpHandler(
+                  () -> wiring.getSqlTaskManager(),
+                  false,
+                  wiring.getSessionPropertyManager(),
+                  wiring.getTaskUpdateRequestCodec(),
+                  wiring.getTaskInfoCodec(),
+                  wiring.getTaskStatusCodec(),
+                  wiring.getFailTaskRequestCodec(),
+                  wiring.getDynamicFilterDomainsCodec());
+          return new Netty4ExchangeTransport(settings, networkService, handler);
+        });
   }
 
   @Override
@@ -404,6 +478,59 @@ public class SQLPlugin extends Plugin
             .build(),
         dataSourceMetadataStorage,
         dataSourceUserAuthorizationHelper);
+  }
+
+  @Override
+  public Collection<org.opensearch.common.inject.Module> createGuiceModules() {
+    return Collections.singletonList(binder -> binder.bind(SQLPlugin.class).toInstance(this));
+  }
+
+  @Override
+  public Collection<Class<? extends LifecycleComponent>> getGuiceServiceClasses() {
+    return Collections.singletonList(IndicesServiceBinder.class);
+  }
+
+  public void setIndicesService(IndicesService indicesService) {
+    indicesServiceRef.set(indicesService);
+    LOGGER.info("IndicesService bound to Omni engine");
+  }
+
+  public OmniEngineService getOmniEngineService() {
+    return omniEngineService;
+  }
+
+  /** Runs after Guice injection — feeds IndicesService into our AtomicReference. */
+  public static class IndicesServiceBinder extends AbstractLifecycleComponent {
+    private final IndicesService indicesService;
+    private final SQLPlugin plugin;
+
+    @Inject
+    public IndicesServiceBinder(IndicesService indicesService, SQLPlugin plugin) {
+      this.indicesService = indicesService;
+      this.plugin = plugin;
+    }
+
+    @Override
+    protected void doStart() {
+      plugin.setIndicesService(indicesService);
+    }
+
+    @Override
+    protected void doStop() {}
+
+    @Override
+    protected void doClose() {}
+  }
+
+  @Override
+  public void close() {
+    if (omniWiring != null) {
+      try {
+        omniWiring.close();
+      } catch (Exception e) {
+        LOGGER.warn("Failed to close Omni wiring", e);
+      }
+    }
   }
 
   @Override

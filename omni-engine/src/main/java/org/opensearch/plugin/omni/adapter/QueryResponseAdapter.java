@@ -6,6 +6,8 @@
 package org.opensearch.plugin.omni.adapter;
 
 import io.trino.client.Column;
+import io.trino.spi.type.SqlDecimal;
+import io.trino.spi.type.SqlTimestamp;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -54,6 +56,24 @@ public final class QueryResponseAdapter {
     if (raw == null) {
       return ExprValueUtils.nullValue();
     }
-    return ExprValueUtils.fromObjectValue(raw, type);
+    // Unwrap Trino SPI types to Java primitives/strings that ExprValueUtils expects
+    Object normalized = normalize(raw);
+    return ExprValueUtils.fromObjectValue(normalized, type);
+  }
+
+  /**
+   * Converts Trino SPI types (SqlDecimal, SqlTimestamp, etc.) to plain Java types that
+   * ExprValueUtils.fromObjectValue() expects.
+   */
+  private static Object normalize(Object raw) {
+    if (raw instanceof SqlDecimal decimal) {
+      // TrinoTypeMapper maps DECIMAL→DOUBLE, so convert to double
+      return decimal.toBigDecimal().doubleValue();
+    }
+    if (raw instanceof SqlTimestamp timestamp) {
+      // Return ISO-8601 string format expected by ExprValueUtils for TIMESTAMP
+      return timestamp.toString();
+    }
+    return raw;
   }
 }

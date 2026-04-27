@@ -277,6 +277,9 @@ testClusters {
         plugin(getGeoSpatialPlugin())
         plugin ":opensearch-sql-plugin"
         setting "plugins.query.datasources.encryption.masterkey", "1234567812345678"
+        setting 'aux.transport.types', '["omni-exchange"]'
+        systemProperty 'opensearch.jar.hell.skip', 'true'
+        setting 'plugins.omni.catalog.type', 'rest'
     }
     yamlRestTest {
         testDistribution = 'archive'
@@ -284,6 +287,9 @@ testClusters {
         plugin(getGeoSpatialPlugin())
         plugin ":opensearch-sql-plugin"
         setting "plugins.query.datasources.encryption.masterkey", "1234567812345678"
+        setting 'aux.transport.types', '["omni-exchange"]'
+        systemProperty 'opensearch.jar.hell.skip', 'true'
+        setting 'plugins.omni.catalog.type', 'rest'
     }
     remoteCluster {
         testDistribution = 'archive'
@@ -295,6 +301,9 @@ testClusters {
         testDistribution = 'archive'
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
+        setting 'aux.transport.types', '["omni-exchange"]'
+        systemProperty 'opensearch.jar.hell.skip', 'true'
+        setting 'plugins.omni.catalog.type', 'rest'
     }
     remoteIntegTestWithSecurity {
         testDistribution = 'archive'
@@ -416,6 +425,7 @@ task integTestWithSecurity(type: RestIntegTestTask) {
 
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'project.root', project.projectDir.absolutePath
+    systemProperty 'opensearch.jar.hell.skip', 'true'
 
     // Set default query size limit
     systemProperty 'defaultQuerySizeLimit', '10000'
@@ -453,6 +463,7 @@ task integTestWithSecurity(type: RestIntegTestTask) {
 
 yamlRestTest {
     systemProperty 'tests.security.manager', 'false'
+    systemProperty 'opensearch.jar.hell.skip', 'true'
 }
 
 // Run PPL ITs and new, legacy and comparison SQL ITs with new SQL engine enabled
@@ -491,6 +502,7 @@ integTest {
 
     systemProperty 'tests.security.manager', 'false'
     systemProperty('project.root', project.projectDir.absolutePath)
+    systemProperty 'opensearch.jar.hell.skip', 'true'
 
     systemProperty "https", System.getProperty("https")
     systemProperty "user", System.getProperty("user")

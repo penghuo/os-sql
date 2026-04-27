@@ -52,64 +52,66 @@ public class OpenSearchSplitManager
             Constraint constraint)
     {
         OpenSearchTableHandle osTable = (OpenSearchTableHandle) table;
-        String indexName = osTable.getIndex();
         ClusterState state = clusterService.state();
-
-        // 1. Get shard routing
-        IndexRoutingTable routingTable = state.routingTable().index(indexName);
-        if (routingTable == null) {
-            return new FixedSplitSource(List.of());
-        }
-
-        // 2. Get segment metadata and build segment-level splits
-        Map<Integer, List<Segment>> shardSegmentsMap = new HashMap<>();
-        try {
-            IndicesService indicesService = indicesServiceSupplier.get();
-            if (indicesService != null) {
-                IndexService indexService = indicesService.indexService(routingTable.getIndex());
-                if (indexService != null) {
-                    shardSegmentsMap = buildShardSegmentsMap(indexService);
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to get segment metadata for index [{}], falling back to shard-level splits", indexName, e);
-        }
-
-        // 3. Build splits — segment-level when metadata available, shard-level otherwise
         List<ConnectorSplit> splits = new ArrayList<>();
 
-        for (IndexShardRoutingTable shardRoutingTable : routingTable) {
-            int shardId = shardRoutingTable.shardId().id();
-            List<HostAddress> addresses = getShardAddresses(shardRoutingTable, state);
-            if (addresses.isEmpty()) {
+        // Loop over all resolved indices
+        for (String indexName : osTable.getResolvedIndices()) {
+            // 1. Get shard routing
+            IndexRoutingTable routingTable = state.routingTable().index(indexName);
+            if (routingTable == null) {
+                logger.warn("Index [{}] not found in routing table, skipping", indexName);
                 continue;
             }
 
-            List<Segment> segments = shardSegmentsMap.getOrDefault(shardId, List.of());
-            if (segments.isEmpty()) {
-                splits.add(OpenSearchSplit.shardSplit(indexName, shardId, TARGET_DOCS_PER_SPLIT, addresses));
-                continue;
+            // 2. Get segment metadata and build segment-level splits
+            Map<Integer, List<Segment>> shardSegmentsMap = new HashMap<>();
+            try {
+                IndicesService indicesService = indicesServiceSupplier.get();
+                if (indicesService != null) {
+                    IndexService indexService = indicesService.indexService(routingTable.getIndex());
+                    if (indexService != null) {
+                        shardSegmentsMap = buildShardSegmentsMap(indexService);
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to get segment metadata for index [{}], falling back to shard-level splits", indexName, e);
             }
 
-            logger.debug("Shard {} has {} segments", shardId, segments.size());
+            // 3. Build splits — segment-level when metadata available, shard-level otherwise
+            for (IndexShardRoutingTable shardRoutingTable : routingTable) {
+                int shardId = shardRoutingTable.shardId().id();
+                List<HostAddress> addresses = getShardAddresses(shardRoutingTable, state);
+                if (addresses.isEmpty()) {
+                    continue;
+                }
 
-            for (Segment segment : segments) {
-                String segName = segment.getName();
-                int docCount = segment.getNumDocs();
+                List<Segment> segments = shardSegmentsMap.getOrDefault(shardId, List.of());
+                if (segments.isEmpty()) {
+                    splits.add(OpenSearchSplit.shardSplit(indexName, shardId, TARGET_DOCS_PER_SPLIT, addresses));
+                    continue;
+                }
 
-                // One split per segment (no doc-range sub-splitting for now).
-                // Doc-range splits cause ClosedChannelException because multiple splits
-                // sharing the same segment close each other's file handles via ref-counting.
-                splits.add(new OpenSearchSplit(indexName, shardId, segName,
-                        -1, -1, docCount, addresses));
+                logger.debug("Shard {} has {} segments", shardId, segments.size());
+
+                for (Segment segment : segments) {
+                    String segName = segment.getName();
+                    int docCount = segment.getNumDocs();
+
+                    // One split per segment (no doc-range sub-splitting for now).
+                    // Doc-range splits cause ClosedChannelException because multiple splits
+                    // sharing the same segment close each other's file handles via ref-counting.
+                    splits.add(new OpenSearchSplit(indexName, shardId, segName,
+                            -1, -1, docCount, addresses));
+                }
+            }
+
+            if (splits.isEmpty()) {
+                splits.addAll(createShardLevelSplits(routingTable, state));
             }
         }
 
-        if (splits.isEmpty()) {
-            splits.addAll(createShardLevelSplits(routingTable, state));
-        }
-
-        logger.debug("Total splits created: {} for index [{}]", splits.size(), indexName);
+        logger.debug("Total splits created: {} for pattern [{}]", splits.size(), osTable.getPattern());
         return new FixedSplitSource(splits);
     }
 

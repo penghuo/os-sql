@@ -62,29 +62,59 @@ public class OpenSearchMetadata
         if (!DEFAULT_SCHEMA.equals(tableName.getSchemaName())) {
             return null;
         }
-        String indexName = tableName.getTableName();
+        String pattern = tableName.getTableName();
 
-        // Filter system indices
-        if (indexName.startsWith(".")) {
+        // Filter system indices (literal names starting with "." that aren't patterns)
+        if (pattern.startsWith(".") && !pattern.contains("*") && !pattern.contains(",")) {
             return null;
         }
 
         ClusterState state = clusterService.state();
-        IndexMetadata indexMeta = state.metadata().index(indexName);
-        if (indexMeta == null) {
-            return null; // Index does not exist
+
+        // Resolve the pattern to concrete indices
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver resolver =
+                new org.opensearch.cluster.metadata.IndexNameExpressionResolver(
+                        new org.opensearch.common.util.concurrent.ThreadContext(
+                                org.opensearch.common.settings.Settings.EMPTY));
+
+        String[] concreteIndices;
+        try {
+            concreteIndices = resolver.concreteIndexNames(
+                    state,
+                    org.opensearch.action.support.IndicesOptions.lenientExpandOpen(),
+                    pattern);
+        } catch (Exception e) {
+            return null; // Pattern didn't resolve
         }
-        if (indexMeta.getState() == IndexMetadata.State.CLOSE) {
-            return null; // Index is closed
+
+        if (concreteIndices.length == 0) {
+            return null;
         }
-        return new OpenSearchTableHandle(indexName);
+
+        // Filter out system indices and closed indices
+        List<String> resolved = new ArrayList<>();
+        for (String idx : concreteIndices) {
+            if (idx.startsWith(".")) {
+                continue; // Skip system index
+            }
+            IndexMetadata md = state.metadata().index(idx);
+            if (md != null && md.getState() != IndexMetadata.State.CLOSE) {
+                resolved.add(idx);
+            }
+        }
+
+        if (resolved.isEmpty()) {
+            return null;
+        }
+
+        return new OpenSearchTableHandle(pattern, resolved);
     }
 
     @Override
     public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table)
     {
         OpenSearchTableHandle osTable = (OpenSearchTableHandle) table;
-        List<OpenSearchColumnHandle> columns = getColumnsForIndex(osTable.getIndex());
+        List<OpenSearchColumnHandle> columns = getColumnsForIndices(osTable.getResolvedIndices());
         List<ColumnMetadata> columnMetadatas = new ArrayList<>();
         for (OpenSearchColumnHandle col : columns) {
             columnMetadatas.add(new ColumnMetadata(col.getName(), col.getType()));
@@ -94,7 +124,7 @@ public class OpenSearchMetadata
         columnMetadatas.add(ColumnMetadata.builder().setName("_source").setType(VarcharType.VARCHAR).setHidden(true).build());
         columnMetadatas.add(ColumnMetadata.builder().setName("_score").setType(RealType.REAL).setHidden(true).build());
         return new ConnectorTableMetadata(
-                new SchemaTableName(DEFAULT_SCHEMA, osTable.getIndex()),
+                new SchemaTableName(DEFAULT_SCHEMA, osTable.getPattern()),
                 columnMetadatas);
     }
 
@@ -102,7 +132,7 @@ public class OpenSearchMetadata
     public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle table)
     {
         OpenSearchTableHandle osTable = (OpenSearchTableHandle) table;
-        List<OpenSearchColumnHandle> columns = getColumnsForIndex(osTable.getIndex());
+        List<OpenSearchColumnHandle> columns = getColumnsForIndices(osTable.getResolvedIndices());
         ImmutableMap.Builder<String, ColumnHandle> builder = ImmutableMap.builder();
         for (OpenSearchColumnHandle col : columns) {
             builder.put(col.getName(), col);
@@ -193,7 +223,7 @@ public class OpenSearchMetadata
         }
 
         OpenSearchTableHandle newTable = new OpenSearchTableHandle(
-                table.getIndex(), newPushed, table.getLimit(), newLikePatterns, newQueryString);
+                table.getPattern(), table.getResolvedIndices(), newPushed, table.getLimit(), newLikePatterns, newQueryString);
 
         return Optional.of(new ConstraintApplicationResult<>(
                 newTable,
@@ -324,12 +354,27 @@ public class OpenSearchMetadata
             return Optional.empty();
         }
         OpenSearchTableHandle newTable = new OpenSearchTableHandle(
-                table.getIndex(), table.getConstraint(), OptionalLong.of(limit));
+                table.getPattern(), table.getResolvedIndices(), table.getConstraint(), OptionalLong.of(limit));
         return Optional.of(new LimitApplicationResult<>(newTable, false, false));
     }
 
+    /**
+     * Get columns for multiple indices, merging their schemas.
+     * Same column name → keep type from first index.
+     */
+    private List<OpenSearchColumnHandle> getColumnsForIndices(List<String> indices)
+    {
+        LinkedHashMap<String, OpenSearchColumnHandle> merged = new LinkedHashMap<>();
+        for (String idx : indices) {
+            for (OpenSearchColumnHandle col : getColumnsForSingleIndex(idx)) {
+                merged.putIfAbsent(col.getName(), col);
+            }
+        }
+        return ImmutableList.copyOf(merged.values());
+    }
+
     @SuppressWarnings("unchecked")
-    private List<OpenSearchColumnHandle> getColumnsForIndex(String indexName)
+    private List<OpenSearchColumnHandle> getColumnsForSingleIndex(String indexName)
     {
         ClusterState state = clusterService.state();
         IndexMetadata indexMeta = state.metadata().index(indexName);

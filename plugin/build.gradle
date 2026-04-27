@@ -77,6 +77,8 @@ tasks.register('mergeParquetJars', com.github.jengelman.gradle.plugins.shadow.ta
     archiveVersion = '1.13.1'
     archiveClassifier = ''
     configurations = [project.configurations.parquetMerge]
+    // Exclude audience-annotations — it's separately bundled and causes jar hell
+    exclude 'org/apache/yetus/**'
     mergeServiceFiles()
 }
 
@@ -159,8 +161,11 @@ tasks.named('bundlePlugin') {
     exclude 'parquet-avro-*.jar'
     exclude 'parquet-jackson-*.jar'
     exclude 'annotations-2.25*.jar'
+    exclude 'annotations-4.*.jar'  // Keep only annotations-24.1.0.jar (org.jetbrains:annotations)
     exclude 'slf4j-api-*.jar'
     exclude 'coral-2.*.jar'
+    exclude 'javax.annotation-api-*.jar'  // OpenSearch provides jakarta.annotation-api
+    exclude 'failsafe-2.*.jar'  // Keep only failsafe-3.3.2.jar (dev.failsafe:failsafe)
 }
 
 configurations.all {

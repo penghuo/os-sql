@@ -294,6 +294,20 @@ public class SQLPlugin extends Plugin
     LocalClusterState.state().setClusterService(clusterService);
     LocalClusterState.state().setPluginSettings((OpenSearchSettings) pluginSettings);
     LocalClusterState.state().setClient(client);
+
+    // ── Omni engine wiring ──
+    this.omniNodeManager = new ClusterStateNodeManager(nodeEnvironment.nodeId());
+    clusterService.addListener(omniNodeManager);
+    this.omniWiring =
+        new ServiceWiring(
+            environment.settings(),
+            omniNodeManager,
+            (NodeClient) client,
+            clusterService,
+            indicesServiceRef::get);
+    this.omniEngineService = new OmniEngineService(omniWiring);
+    LOGGER.info("Omni engine initialized — Trino service graph constructed");
+
     ModulesBuilder modules = new ModulesBuilder();
     modules.add(new OpenSearchPluginModule(executionEngineExtensions));
     modules.add(
@@ -302,6 +316,7 @@ public class SQLPlugin extends Plugin
           b.bind(org.opensearch.sql.common.setting.Settings.class).toInstance(pluginSettings);
           b.bind(DataSourceService.class).toInstance(dataSourceService);
           b.bind(ClusterService.class).toInstance(clusterService);
+          b.bind(OmniEngineService.class).toInstance(omniEngineService);
         });
     modules.add(new AsyncExecutorServiceModule());
     modules.add(new DirectQueryModule());
@@ -331,19 +346,6 @@ public class SQLPlugin extends Plugin
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);
 
     EngineExtensionsHolder extensionsHolder = new EngineExtensionsHolder(executionEngineExtensions);
-
-    // ── Omni engine wiring ──
-    this.omniNodeManager = new ClusterStateNodeManager(nodeEnvironment.nodeId());
-    clusterService.addListener(omniNodeManager);
-    this.omniWiring =
-        new ServiceWiring(
-            environment.settings(),
-            omniNodeManager,
-            (NodeClient) client,
-            clusterService,
-            indicesServiceRef::get);
-    this.omniEngineService = new OmniEngineService(omniWiring);
-    LOGGER.info("Omni engine initialized — Trino service graph constructed");
 
     return ImmutableList.of(
         dataSourceService,

@@ -172,6 +172,9 @@ loggerUsageCheck.enabled = false
 
 
 configurations.all {
+    exclude group: 'org.apache.logging.log4j', module: 'log4j-to-slf4j'
+    exclude group: 'org.slf4j', module: 'slf4j-simple'
+
     resolutionStrategy.force 'junit:junit:4.13.2'
     resolutionStrategy.force "commons-logging:commons-logging:${commons_logging_version}"
     // enforce 1.1.3, https://www.whitesourcesoftware.com/vulnerability-database/WS-2019-0379

@@ -29,6 +29,9 @@ repositories {
 
 configurations {
     all {
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-to-slf4j'
+        exclude group: 'org.slf4j', module: 'slf4j-simple'
+
         resolutionStrategy {
             force 'com.google.errorprone:error_prone_annotations:2.25.0'
             force 'jakarta.annotation:jakarta.annotation-api:2.1.1'

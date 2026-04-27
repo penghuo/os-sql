@@ -93,6 +93,9 @@ dependencies {
 
     // OpenSearch platform + sibling module deps
     api project(':opensearch')
+    api project(':ppl')
+    api project(':core')
+    api project(':common')
     implementation "org.opensearch:opensearch:${opensearch_version}"
     implementation "org.opensearch:opensearch-core:${opensearch_version}"
     implementation "org.opensearch:opensearch-common:${opensearch_version}"

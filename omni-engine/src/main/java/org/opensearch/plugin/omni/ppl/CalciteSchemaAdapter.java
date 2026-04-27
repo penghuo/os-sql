@@ -62,21 +62,49 @@ public class CalciteSchemaAdapter extends AbstractSchema {
 
     private class TrinoSchemaAdapter extends AbstractSchema {
         private final String schemaName;
+        private final Map<String, Table> tableMap = new LinkedHashMap<String, Table>() {
+            @Override
+            public Table get(Object key) {
+                String name = (String) key;
+                // First: try the static cache
+                if (super.containsKey(name)) {
+                    return super.get(name);
+                }
+                // Fallback: try resolving dynamically via metadata.getTableHandle.
+                // This lets wildcard patterns ("logs-*") work. Comma-separated patterns ("a,b")
+                // require additional connector support that may be added in future phases.
+                try {
+                    Optional<TableHandle> handle = metadata.getTableHandle(
+                            session,
+                            new QualifiedObjectName(catalogName, schemaName, name));
+                    if (handle.isPresent()) {
+                        log.debug("Resolved table pattern {} dynamically", name);
+                        Table table = new TrinoTableAdapter(schemaName, name);
+                        super.put(name, table);
+                        return table;
+                    }
+                } catch (Exception e) {
+                    log.debug("Dynamic table resolution failed for {}.{}.{}: {}",
+                            catalogName, schemaName, name, e.getMessage());
+                }
+                return null;
+            }
+        };
 
         TrinoSchemaAdapter(String schemaName) {
             this.schemaName = schemaName;
+            // Pre-populate the table map with statically-listed tables
+            List<QualifiedObjectName> tables = metadata.listTables(
+                    session, new QualifiedTablePrefix(catalogName, schemaName));
+            log.info("TrinoSchemaAdapter() catalog={} schema={} tables={}", catalogName, schemaName, tables);
+            for (QualifiedObjectName table : tables) {
+                tableMap.put(table.getObjectName(), new TrinoTableAdapter(schemaName, table.getObjectName()));
+            }
         }
 
         @Override
         protected Map<String, Table> getTableMap() {
-            List<QualifiedObjectName> tables = metadata.listTables(
-                    session, new QualifiedTablePrefix(catalogName, schemaName));
-            log.info("TrinoSchemaAdapter.getTableMap() catalog={} schema={} tables={}", catalogName, schemaName, tables);
-            Map<String, Table> result = new LinkedHashMap<>();
-            for (QualifiedObjectName table : tables) {
-                result.put(table.getObjectName(), new TrinoTableAdapter(schemaName, table.getObjectName()));
-            }
-            return result;
+            return tableMap;
         }
     }
 

@@ -90,10 +90,6 @@ public class PplTranslator {
                 sql = rewriteCoalesce(sql);
                 // REGEXP(col, pattern) → regexp_like(col, pattern) — os-sql REGEXP operator → Trino function
                 sql = rewriteRegexp(sql);
-                // Time/datetime function rewrites for Trino compatibility
-                sql = rewriteTimeFunction(sql);
-                sql = rewriteTimestampCast(sql);
-                sql = rewriteDayofFunctions(sql);
                 return sql;
             }
         } catch (Exception e) {
@@ -201,41 +197,6 @@ public class PplTranslator {
      */
     static String rewriteRegexp(String sql) {
         return sql.replaceAll("\\bREGEXP\\s*\\(", "regexp_like(");
-    }
-
-    /**
-     * Rewrites time('literal') → CAST('literal' AS TIME).
-     * time() is a MySQL function not present in Trino.
-     * Only matches single-argument calls with string literals to avoid breaking complex expressions.
-     */
-    static String rewriteTimeFunction(String sql) {
-        // Match time('literal') - single quoted string argument only
-        return java.util.regex.Pattern.compile("(?<!AS )\\btime\\s*\\(\\s*'([^']*)'\\s*\\)", java.util.regex.Pattern.CASE_INSENSITIVE)
-                .matcher(sql)
-                .replaceAll(m -> "CAST('" + java.util.regex.Matcher.quoteReplacement(m.group(1)) + "' AS TIME)");
-    }
-
-    /**
-     * Rewrites timestamp(x) → CAST(x AS TIMESTAMP).
-     * Uses negative lookbehind to avoid matching Trino's TIMESTAMP(p) type syntax (e.g., "AS TIMESTAMP(6)").
-     * Only matches single-argument calls with string literals to avoid breaking complex expressions.
-     */
-    static String rewriteTimestampCast(String sql) {
-        // Match timestamp('literal') - single quoted string argument only, to avoid breaking multi-arg forms
-        return java.util.regex.Pattern.compile("(?<!AS )\\btimestamp\\s*\\(\\s*'([^']*)'\\s*\\)", java.util.regex.Pattern.CASE_INSENSITIVE)
-                .matcher(sql)
-                .replaceAll(m -> "CAST('" + java.util.regex.Matcher.quoteReplacement(m.group(1)) + "' AS TIMESTAMP)");
-    }
-
-    /**
-     * Rewrites dayofweek/dayofyear/dayofmonth to day_of_week/day_of_year/day_of_month.
-     * MySQL uses dayofX(), Trino uses day_of_X().
-     */
-    static String rewriteDayofFunctions(String sql) {
-        sql = sql.replaceAll("\\bdayofweek\\s*\\(", "day_of_week(");
-        sql = sql.replaceAll("\\bdayofyear\\s*\\(", "day_of_year(");
-        sql = sql.replaceAll("\\bdayofmonth\\s*\\(", "day_of_month(");
-        return sql;
     }
 
 }

@@ -138,6 +138,127 @@ public final class MySqlCompatFunctions
         }
     }
 
+    // ========== weekday: MySQL Monday=0..Sunday=6 ==========
+
+    @Description("MySQL weekday (Monday=0..Sunday=6)")
+    @ScalarFunction("weekday")
+    public static final class Weekday
+    {
+        private Weekday() {}
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long weekdayFromDate(@SqlType(StandardTypes.DATE) long date)
+        {
+            // ISO: Monday=1..Sunday=7. Convert to MySQL weekday: Monday=0..Sunday=6.
+            long iso = UTC_CHRONOLOGY.dayOfWeek().get(DAYS.toMillis(date));
+            return iso - 1;
+        }
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long weekdayFromTimestamp(@SqlType("timestamp(p)") long timestamp)
+        {
+            long iso = UTC_CHRONOLOGY.dayOfWeek().get(scaleEpochMicrosToMillis(timestamp));
+            return iso - 1;
+        }
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long weekdayFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
+        {
+            return weekdayFromTimestamp(timestamp.getEpochMicros());
+        }
+    }
+
+    // ========== minute_of_day: minute within the day (0..1439) ==========
+
+    @Description("MySQL minute of day (0..1439)")
+    @ScalarFunction("minute_of_day")
+    public static final class MinuteOfDay
+    {
+        private MinuteOfDay() {}
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long minuteOfDayFromTimestamp(@SqlType("timestamp(p)") long timestamp)
+        {
+            long millis = scaleEpochMicrosToMillis(timestamp);
+            long hour = UTC_CHRONOLOGY.hourOfDay().get(millis);
+            long minute = UTC_CHRONOLOGY.minuteOfHour().get(millis);
+            return hour * 60 + minute;
+        }
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long minuteOfDayFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
+        {
+            return minuteOfDayFromTimestamp(timestamp.getEpochMicros());
+        }
+    }
+
+    // ========== microsecond: microsecond part (0..999999) ==========
+
+    @Description("MySQL microsecond (0..999999)")
+    @ScalarFunction("microsecond")
+    public static final class Microsecond
+    {
+        private Microsecond() {}
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long microsecondFromTimestamp(@SqlType("timestamp(p)") long timestamp)
+        {
+            // timestamp is in microseconds, extract the fractional part
+            return timestamp % 1_000_000;
+        }
+
+        @LiteralParameters("p")
+        @SqlType(StandardTypes.INTEGER)
+        public static long microsecondFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
+        {
+            long micros = timestamp.getEpochMicros();
+            int picosOfMicro = timestamp.getPicosOfMicro();
+            // Convert picos to additional micros (though typically this is sub-microsecond)
+            return (micros % 1_000_000 + picosOfMicro / 1_000_000) % 1_000_000;
+        }
+    }
+
+    // ========== period_diff: difference between two periods (YYYYMM format) ==========
+
+    @Description("MySQL period_diff: difference in months between two periods")
+    @ScalarFunction("period_diff")
+    @SqlType(StandardTypes.INTEGER)
+    public static long periodDiff(@SqlType(StandardTypes.BIGINT) long period1, @SqlType(StandardTypes.BIGINT) long period2)
+    {
+        // Convert YYYYMM or YYMM to total months
+        long months1 = periodToMonths(period1);
+        long months2 = periodToMonths(period2);
+        return months1 - months2;
+    }
+
+    private static long periodToMonths(long period)
+    {
+        if (period >= 100_0000) {
+            // Format: YYYYMM (e.g., 202301)
+            long year = period / 100;
+            long month = period % 100;
+            return year * 12 + month;
+        }
+        else {
+            // Format: YYMM (e.g., 2301)
+            long year = period / 100;
+            long month = period % 100;
+            // Assume 70-99 are 1970-1999, 00-69 are 2000-2069
+            if (year >= 70) {
+                year += 1900;
+            }
+            else {
+                year += 2000;
+            }
+            return year * 12 + month;
+        }
+    }
+
     // ========== strftime: format unix timestamp ==========
 
     @Description("Format unix timestamp using strftime format string")

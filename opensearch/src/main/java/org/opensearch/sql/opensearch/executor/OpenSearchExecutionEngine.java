@@ -25,7 +25,6 @@ import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
-import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
@@ -120,7 +119,6 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
           }
         });
   }
-
 
   /** Registers opensearch-dependent functions */
   private void registerOpenSearchFunctions() {

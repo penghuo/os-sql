@@ -24,20 +24,20 @@ import org.joda.time.chrono.ISOChronology;
 import static io.trino.type.DateTimes.scaleEpochMicrosToMillis;
 
 @Description("Day of the year of the given timestamp")
-@ScalarFunction(value = "day_of_year", alias = {"doy", "dayofyear"})
+@ScalarFunction(value = "day_of_year", alias = "doy")
 public class ExtractDayOfYear
 {
     private ExtractDayOfYear() {}
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.INTEGER)
+    @SqlType(StandardTypes.BIGINT)
     public static long extract(@SqlType("timestamp(p)") long timestamp)
     {
         return ISOChronology.getInstanceUTC().dayOfYear().get(scaleEpochMicrosToMillis(timestamp));
     }
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.INTEGER)
+    @SqlType(StandardTypes.BIGINT)
     public static long extract(@SqlType("timestamp(p)") LongTimestamp timestamp)
     {
         return extract(timestamp.getEpochMicros());

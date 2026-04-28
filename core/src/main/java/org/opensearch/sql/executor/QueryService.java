@@ -35,7 +35,6 @@ public class QueryService {
   private DataSourceService dataSourceService;
   private Settings settings;
 
-
   /** Execute the {@link UnresolvedPlan}, using {@link ResponseListener} to get response.<br> */
   public void execute(
       UnresolvedPlan plan,

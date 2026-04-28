@@ -450,16 +450,16 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the week of the given date")
-    @ScalarFunction(value = "day_of_week", alias = {"dow", "dayofweek"})
-    @SqlType(StandardTypes.INTEGER)
+    @ScalarFunction(value = "day_of_week", alias = "dow")
+    @SqlType(StandardTypes.BIGINT)
     public static long dayOfWeekFromDate(@SqlType(StandardTypes.DATE) long date)
     {
         return DAY_OF_WEEK.get(DAYS.toMillis(date));
     }
 
     @Description("Day of the month of the given date")
-    @ScalarFunction(value = "day", alias = {"day_of_month", "dayofmonth"})
-    @SqlType(StandardTypes.INTEGER)
+    @ScalarFunction(value = "day", alias = "day_of_month")
+    @SqlType(StandardTypes.BIGINT)
     public static long dayFromDate(@SqlType(StandardTypes.DATE) long date)
     {
         return DAY_OF_MONTH.get(DAYS.toMillis(date));
@@ -483,8 +483,8 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the year of the given date")
-    @ScalarFunction(value = "day_of_year", alias = {"doy", "dayofyear"})
-    @SqlType(StandardTypes.INTEGER)
+    @ScalarFunction(value = "day_of_year", alias = "doy")
+    @SqlType(StandardTypes.BIGINT)
     public static long dayOfYearFromDate(@SqlType(StandardTypes.DATE) long date)
     {
         return DAY_OF_YEAR.get(DAYS.toMillis(date));

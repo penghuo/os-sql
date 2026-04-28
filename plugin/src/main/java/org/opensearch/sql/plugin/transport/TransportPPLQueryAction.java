@@ -71,7 +71,8 @@ public class TransportPPLQueryAction
     if (!pplEnabled.get()) {
       listener.onFailure(
           new IllegalAccessException(
-              "Either plugins.ppl.enabled or rest.action.multi.allow_explicit_index setting is false"));
+              "Either plugins.ppl.enabled or rest.action.multi.allow_explicit_index setting is"
+                  + " false"));
       return;
     }
 

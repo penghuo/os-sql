@@ -124,6 +124,7 @@ import io.trino.operator.scalar.CombineHashFunction;
 import io.trino.operator.scalar.ConcatWsFunction;
 import io.trino.operator.scalar.DataSizeFunctions;
 import io.trino.operator.scalar.DateTimeFunctions;
+import io.trino.operator.scalar.MySqlCompatFunctions;
 import io.trino.operator.scalar.EmptyMapConstructor;
 import io.trino.operator.scalar.FailureFunction;
 import io.trino.operator.scalar.FormatNumberFunction;
@@ -438,6 +439,9 @@ public final class SystemFunctionBundle
                 .scalars(BitwiseFunctions.class)
                 .scalars(DateTimeFunctions.class)
                 .scalar(DateTimeFunctions.FromUnixtimeNanosDecimal.class)
+                .scalar(MySqlCompatFunctions.DayOfWeek.class)
+                .scalar(MySqlCompatFunctions.DayOfMonth.class)
+                .scalar(MySqlCompatFunctions.DayOfYear.class)
                 .scalars(JsonFunctions.class)
                 .scalars(JsonInputFunctions.class)
                 .scalars(JsonOutputFunctions.class)

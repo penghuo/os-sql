@@ -88,6 +88,8 @@ public class PplTranslator {
                 // COALESCE mixed types: cast all args to VARCHAR when mixing types
                 // (dialect doesn't have type info at unparse time)
                 sql = rewriteCoalesce(sql);
+                // REGEXP(col, pattern) → regexp_like(col, pattern) — os-sql REGEXP operator → Trino function
+                sql = rewriteRegexp(sql);
                 return sql;
             }
         } catch (Exception e) {
@@ -184,5 +186,12 @@ public class PplTranslator {
                 });
     }
 
+    /**
+     * Rewrites REGEXP to regexp_like since Trino doesn't have a REGEXP function.
+     * os-sql emits REGEXP(col, pattern) but Trino uses regexp_like(col, pattern).
+     */
+    static String rewriteRegexp(String sql) {
+        return sql.replaceAll("\\bREGEXP\\s*\\(", "regexp_like(");
+    }
 
 }

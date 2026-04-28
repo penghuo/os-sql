@@ -33,16 +33,9 @@ public final class QueryResponseAdapter {
     List<ExprType> types = new ArrayList<>(n);
     for (Column c : columns) {
       ExprType t = TrinoTypeMapper.toExprType(c.getType());
-      String colName = c.getName();
-      // Rewrite Trino's arbitrary() aggregate back to PPL's first() for schema compatibility
-      // Note: This loses the distinction between first() and last() since both map to arbitrary()
-      // in Trino, but it's the best we can do without more complex context tracking.
-      if (colName.startsWith("arbitrary(")) {
-        colName = colName.replace("arbitrary(", "first(");
-      }
-      names.add(colName);
+      names.add(c.getName());
       types.add(t);
-      schemaCols.add(new Schema.Column(colName, null, t));
+      schemaCols.add(new Schema.Column(c.getName(), null, t));
     }
 
     List<ExprValue> results = new ArrayList<>(rows.size());

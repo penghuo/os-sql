@@ -13,6 +13,8 @@
  */
 package io.trino.operator.scalar;
 
+import io.airlift.slice.Slice;
+import io.airlift.slice.Slices;
 import io.trino.spi.function.Description;
 import io.trino.spi.function.LiteralParameters;
 import io.trino.spi.function.ScalarFunction;
@@ -20,6 +22,15 @@ import io.trino.spi.function.SqlType;
 import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.StandardTypes;
 import org.joda.time.chrono.ISOChronology;
+
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static io.trino.type.DateTimes.scaleEpochMicrosToMillis;
 import static java.util.concurrent.TimeUnit.DAYS;
@@ -125,5 +136,75 @@ public final class MySqlCompatFunctions
         {
             return dayOfYearFromTimestamp(timestamp.getEpochMicros());
         }
+    }
+
+    // ========== strftime: format unix timestamp ==========
+
+    @Description("Format unix timestamp using strftime format string")
+    @ScalarFunction("strftime")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice strftime(@SqlType(StandardTypes.BIGINT) long unixTimestamp, @SqlType(StandardTypes.VARCHAR) Slice formatSlice)
+    {
+        return formatTimestamp(unixTimestamp, 0, formatSlice);
+    }
+
+    @Description("Format unix timestamp (double) using strftime format string")
+    @ScalarFunction("strftime")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice strftimeDouble(@SqlType(StandardTypes.DOUBLE) double unixTimestamp, @SqlType(StandardTypes.VARCHAR) Slice formatSlice)
+    {
+        long seconds = (long) unixTimestamp;
+        int nanos = (int) ((unixTimestamp - seconds) * 1_000_000_000);
+        return formatTimestamp(seconds, nanos, formatSlice);
+    }
+
+    private static Slice formatTimestamp(long seconds, int nanos, Slice formatSlice)
+    {
+        String format = formatSlice.toStringUtf8();
+        Instant instant = Instant.ofEpochSecond(seconds, nanos);
+        ZonedDateTime zdt = ZonedDateTime.ofInstant(instant, ZoneId.of("UTC"));
+
+        // Convert strftime format specifiers to Java DateTimeFormatter patterns
+        String javaPattern = convertStrftimeToJavaPattern(format);
+
+        try {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern(javaPattern);
+            String result = zdt.format(formatter);
+            return Slices.utf8Slice(result);
+        }
+        catch (Exception e) {
+            // Fallback to simple format
+            return Slices.utf8Slice(zdt.toString());
+        }
+    }
+
+    private static String convertStrftimeToJavaPattern(String strftimeFormat)
+    {
+        // Map common strftime format specifiers to Java DateTimeFormatter patterns
+        // Process longer patterns first to avoid partial matches
+        String result = strftimeFormat;
+
+        // Handle multi-character patterns first
+        result = result.replace("%3Q", "SSS");        // Milliseconds (3 digits)
+        result = result.replace("%F", "yyyy-MM-dd");  // Date (YYYY-MM-DD)
+        result = result.replace("%T", "HH:mm:ss");    // Time (HH:MM:SS)
+
+        // Then single-character patterns
+        result = result.replace("%Y", "yyyy");   // 4-digit year
+        result = result.replace("%y", "yy");     // 2-digit year
+        result = result.replace("%m", "MM");     // Month (01..12)
+        result = result.replace("%d", "dd");     // Day of month (01..31)
+        result = result.replace("%H", "HH");     // Hour (00..23)
+        result = result.replace("%I", "hh");     // Hour (01..12)
+        result = result.replace("%M", "mm");     // Minute (00..59)
+        result = result.replace("%S", "ss");     // Second (00..59) - lowercase!
+        result = result.replace("%p", "a");      // AM/PM
+        result = result.replace("%a", "EEE");    // Abbreviated weekday name
+        result = result.replace("%A", "EEEE");   // Full weekday name
+        result = result.replace("%b", "MMM");    // Abbreviated month name
+        result = result.replace("%B", "MMMM");   // Full month name
+        result = result.replace("%Z", "z");      // Time zone
+
+        return result;
     }
 }

@@ -195,7 +195,6 @@ import io.trino.operator.scalar.timestamp.ExtractHour;
 import io.trino.operator.scalar.timestamp.ExtractMillisecond;
 import io.trino.operator.scalar.timestamp.ExtractMinute;
 import io.trino.operator.scalar.timestamp.ExtractMonth;
-import io.trino.operator.scalar.timestamp.ExtractMonthName;
 import io.trino.operator.scalar.timestamp.ExtractQuarter;
 import io.trino.operator.scalar.timestamp.ExtractSecond;
 import io.trino.operator.scalar.timestamp.ExtractWeekOfYear;
@@ -442,6 +441,7 @@ public final class SystemFunctionBundle
                 .scalar(MySqlCompatFunctions.DayOfWeek.class)
                 .scalar(MySqlCompatFunctions.DayOfMonth.class)
                 .scalar(MySqlCompatFunctions.DayOfYear.class)
+                .scalars(MySqlCompatFunctions.class)
                 .scalars(JsonFunctions.class)
                 .scalars(JsonInputFunctions.class)
                 .scalars(JsonOutputFunctions.class)
@@ -636,7 +636,6 @@ public final class SystemFunctionBundle
                 .scalar(ExtractDayOfYear.class)
                 .scalar(ExtractDayOfWeek.class)
                 .scalar(ExtractDayName.class)
-                .scalar(ExtractMonthName.class)
                 .scalar(ExtractWeekOfYear.class)
                 .scalar(ExtractYearOfWeek.class)
                 .scalar(LastDayOfMonth.class);

@@ -125,6 +125,7 @@ import io.trino.operator.scalar.ConcatWsFunction;
 import io.trino.operator.scalar.DataSizeFunctions;
 import io.trino.operator.scalar.DateTimeFunctions;
 import io.trino.operator.scalar.MySqlCompatFunctions;
+import io.trino.operator.scalar.MySqlTimeFunctions;
 import io.trino.operator.scalar.EmptyMapConstructor;
 import io.trino.operator.scalar.FailureFunction;
 import io.trino.operator.scalar.FormatNumberFunction;
@@ -445,6 +446,7 @@ public final class SystemFunctionBundle
                 .scalar(MySqlCompatFunctions.MinuteOfDay.class)
                 .scalar(MySqlCompatFunctions.Microsecond.class)
                 .scalars(MySqlCompatFunctions.class)
+                .scalars(MySqlTimeFunctions.class)
                 .scalars(JsonFunctions.class)
                 .scalars(JsonInputFunctions.class)
                 .scalars(JsonOutputFunctions.class)

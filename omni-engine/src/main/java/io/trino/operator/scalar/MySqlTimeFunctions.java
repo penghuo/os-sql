@@ -20,7 +20,6 @@ import io.trino.spi.function.Description;
 import io.trino.spi.function.LiteralParameters;
 import io.trino.spi.function.ScalarFunction;
 import io.trino.spi.function.SqlType;
-import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.StandardTypes;
 
 import java.time.Instant;
@@ -32,8 +31,6 @@ import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 
 import static io.trino.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
-import static io.trino.type.DateTimes.scaleEpochMicrosToMillis;
-import static java.util.concurrent.TimeUnit.DAYS;
 
 /**
  * MySQL-compatible time manipulation functions.
@@ -55,17 +52,6 @@ public final class MySqlTimeFunctions
         return timestamp + microsToAdd;
     }
 
-    @Description("Add time to timestamp (LongTimestamp)")
-    @ScalarFunction("addtime")
-    @LiteralParameters("p")
-    @SqlType("timestamp(p)")
-    public static LongTimestamp addtimeLong(@SqlType("timestamp(p)") LongTimestamp timestamp, @SqlType(StandardTypes.VARCHAR) Slice timeStr)
-    {
-        long microsToAdd = parseTimeDuration(timeStr);
-        long newMicros = timestamp.getEpochMicros() + microsToAdd;
-        return new LongTimestamp(newMicros, timestamp.getPicosOfMicro());
-    }
-
     // ========== subtime: subtract time duration from a timestamp ==========
 
     @Description("Subtract time from timestamp")
@@ -76,17 +62,6 @@ public final class MySqlTimeFunctions
     {
         long microsToSubtract = parseTimeDuration(timeStr);
         return timestamp - microsToSubtract;
-    }
-
-    @Description("Subtract time from timestamp (LongTimestamp)")
-    @ScalarFunction("subtime")
-    @LiteralParameters("p")
-    @SqlType("timestamp(p)")
-    public static LongTimestamp subtimeLong(@SqlType("timestamp(p)") LongTimestamp timestamp, @SqlType(StandardTypes.VARCHAR) Slice timeStr)
-    {
-        long microsToSubtract = parseTimeDuration(timeStr);
-        long newMicros = timestamp.getEpochMicros() - microsToSubtract;
-        return new LongTimestamp(newMicros, timestamp.getPicosOfMicro());
     }
 
     private static long parseTimeDuration(Slice timeStr)
@@ -232,15 +207,6 @@ public final class MySqlTimeFunctions
         String timeStr = String.format("%02d:%02d:%02d",
                 dt.getHour(), dt.getMinute(), dt.getSecond());
         return Slices.utf8Slice(timeStr);
-    }
-
-    @Description("Extract time part from timestamp (LongTimestamp)")
-    @ScalarFunction("time")
-    @LiteralParameters("p")
-    @SqlType(StandardTypes.VARCHAR)
-    public static Slice timeLong(@SqlType("timestamp(p)") LongTimestamp timestamp)
-    {
-        return time(timestamp.getEpochMicros());
     }
 
     @Description("Parse time from string")

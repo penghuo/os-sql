@@ -279,6 +279,32 @@ public final class MySqlCompatFunctions
         return formatTimestamp(seconds, nanos, formatSlice);
     }
 
+    @Description("Format timestamp using strftime format string")
+    @ScalarFunction("strftime")
+    @LiteralParameters("p")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice strftimeTimestamp(@SqlType("timestamp(p)") long timestamp, @SqlType(StandardTypes.VARCHAR) Slice formatSlice)
+    {
+        // timestamp is in microseconds since epoch, use proper scaling
+        long millis = scaleEpochMicrosToMillis(timestamp);
+        long seconds = millis / 1000;
+        int nanos = (int) ((millis % 1000) * 1_000_000);
+        return formatTimestamp(seconds, nanos, formatSlice);
+    }
+
+    @Description("Format timestamp with time zone using strftime format string")
+    @ScalarFunction("strftime")
+    @LiteralParameters("p")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice strftimeTimestampWithTz(@SqlType("timestamp(p) with time zone") long timestampWithTz, @SqlType(StandardTypes.VARCHAR) Slice formatSlice)
+    {
+        // timestamp with time zone is also in microseconds since epoch
+        long millis = scaleEpochMicrosToMillis(timestampWithTz);
+        long seconds = millis / 1000;
+        int nanos = (int) ((millis % 1000) * 1_000_000);
+        return formatTimestamp(seconds, nanos, formatSlice);
+    }
+
     private static Slice formatTimestamp(long seconds, int nanos, Slice formatSlice)
     {
         String format = formatSlice.toStringUtf8();

@@ -808,4 +808,15 @@ public final class DateTimeFunctions
         long totalSeconds = hour * 3600 + minute * 60 + second;
         return totalSeconds * picosPerSecond;
     }
+
+    @Description("Construct time from hours, minutes, seconds with fractional seconds")
+    @ScalarFunction("maketime")
+    @SqlType(StandardTypes.TIME)
+    public static long makeTimeDouble(@SqlType(StandardTypes.DOUBLE) double hour, @SqlType(StandardTypes.DOUBLE) double minute, @SqlType(StandardTypes.DOUBLE) double second)
+    {
+        long picosPerSecond = 1_000_000_000_000L;
+        long totalSeconds = (long) (hour * 3600 + minute * 60 + second);
+        long fractionalPicos = (long) ((second - (long) second) * picosPerSecond);
+        return totalSeconds * picosPerSecond + fractionalPicos;
+    }
 }

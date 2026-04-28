@@ -233,6 +233,8 @@ public class OmniEngineService {
     if (cause instanceof QueryError err) {
       String name = err.getErrorName() == null ? "" : err.getErrorName();
       String msg = err.getMessage() == null ? name : err.getMessage();
+      // Translate Trino error messages to OpenSearch conventions
+      msg = translateErrorMessage(msg);
       if ("SYNTAX_ERROR".equals(name)) return new SyntaxCheckException(msg);
       if (name.startsWith("MISSING_")) return new SemanticCheckException(msg);
       return new QueryEngineException(msg);
@@ -243,10 +245,23 @@ public class OmniEngineService {
       return (Exception) cause;
     }
     if (cause instanceof Exception e) {
-      return new QueryEngineException(
-          e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(), e);
+      String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+      msg = translateErrorMessage(msg);
+      return new QueryEngineException(msg, e);
     }
     return new QueryEngineException(String.valueOf(cause));
+  }
+
+  /**
+   * Translates Trino/Calcite error messages to match OpenSearch SQL error conventions.
+   */
+  private static String translateErrorMessage(String msg) {
+    // "Table 'foo' not found" → "no such index [foo]"
+    msg = java.util.regex.Pattern.compile("Table '([^']+)' not found")
+            .matcher(msg)
+            .replaceAll("no such index [$1]");
+    // "Field [foo] not found" → keep as-is (OpenSearch convention)
+    return msg;
   }
 
   private record DispatchResult(QueryId queryId, Slug slug, Query query, Throwable earlyFailure) {}

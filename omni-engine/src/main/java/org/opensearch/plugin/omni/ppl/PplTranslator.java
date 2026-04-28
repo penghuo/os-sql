@@ -94,7 +94,12 @@ public class PplTranslator {
             }
         } catch (Exception e) {
             transactionManager.asyncAbort(transactionId);
-            throw new RuntimeException("Failed to translate PPL to SQL: " + e.getMessage(), e);
+            String msg = e.getMessage();
+            // Translate Calcite error messages to OpenSearch conventions
+            if (msg != null) {
+                msg = msg.replaceAll("Table '([^']+)' not found", "no such index [$1]");
+            }
+            throw new RuntimeException("Failed to translate PPL to SQL: " + msg, e);
         }
     }
 

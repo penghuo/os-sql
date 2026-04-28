@@ -187,12 +187,14 @@ import io.trino.operator.scalar.timestamp.DateFormat;
 import io.trino.operator.scalar.timestamp.DateToTimestampCast;
 import io.trino.operator.scalar.timestamp.DateTrunc;
 import io.trino.operator.scalar.timestamp.ExtractDay;
+import io.trino.operator.scalar.timestamp.ExtractDayName;
 import io.trino.operator.scalar.timestamp.ExtractDayOfWeek;
 import io.trino.operator.scalar.timestamp.ExtractDayOfYear;
 import io.trino.operator.scalar.timestamp.ExtractHour;
 import io.trino.operator.scalar.timestamp.ExtractMillisecond;
 import io.trino.operator.scalar.timestamp.ExtractMinute;
 import io.trino.operator.scalar.timestamp.ExtractMonth;
+import io.trino.operator.scalar.timestamp.ExtractMonthName;
 import io.trino.operator.scalar.timestamp.ExtractQuarter;
 import io.trino.operator.scalar.timestamp.ExtractSecond;
 import io.trino.operator.scalar.timestamp.ExtractWeekOfYear;
@@ -629,6 +631,8 @@ public final class SystemFunctionBundle
                 .scalar(ExtractMillisecond.class)
                 .scalar(ExtractDayOfYear.class)
                 .scalar(ExtractDayOfWeek.class)
+                .scalar(ExtractDayName.class)
+                .scalar(ExtractMonthName.class)
                 .scalar(ExtractWeekOfYear.class)
                 .scalar(ExtractYearOfWeek.class)
                 .scalar(LastDayOfMonth.class);

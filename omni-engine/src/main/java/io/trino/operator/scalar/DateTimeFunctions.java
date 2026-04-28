@@ -450,7 +450,7 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the week of the given date")
-    @ScalarFunction(value = "day_of_week", alias = "dow")
+    @ScalarFunction(value = "day_of_week", alias = {"dow", "dayofweek"})
     @SqlType(StandardTypes.BIGINT)
     public static long dayOfWeekFromDate(@SqlType(StandardTypes.DATE) long date)
     {
@@ -458,7 +458,7 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the month of the given date")
-    @ScalarFunction(value = "day", alias = "day_of_month")
+    @ScalarFunction(value = "day", alias = {"day_of_month", "dayofmonth"})
     @SqlType(StandardTypes.BIGINT)
     public static long dayFromDate(@SqlType(StandardTypes.DATE) long date)
     {
@@ -466,7 +466,7 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the month of the given interval")
-    @ScalarFunction(value = "day", alias = "day_of_month")
+    @ScalarFunction(value = "day", alias = {"day_of_month", "dayofmonth"})
     @SqlType(StandardTypes.BIGINT)
     public static long dayFromInterval(@SqlType(StandardTypes.INTERVAL_DAY_TO_SECOND) long milliseconds)
     {
@@ -474,7 +474,7 @@ public final class DateTimeFunctions
     }
 
     @Description("Last day of the month of the given date")
-    @ScalarFunction("last_day_of_month")
+    @ScalarFunction(value = "last_day_of_month", alias = "last_day")
     @SqlType(StandardTypes.DATE)
     public static long lastDayOfMonthFromDate(@SqlType(StandardTypes.DATE) long date)
     {
@@ -483,7 +483,7 @@ public final class DateTimeFunctions
     }
 
     @Description("Day of the year of the given date")
-    @ScalarFunction(value = "day_of_year", alias = "doy")
+    @ScalarFunction(value = "day_of_year", alias = {"doy", "dayofyear"})
     @SqlType(StandardTypes.BIGINT)
     public static long dayOfYearFromDate(@SqlType(StandardTypes.DATE) long date)
     {
@@ -689,5 +689,123 @@ public final class DateTimeFunctions
     public static long toMilliseconds(@SqlType(StandardTypes.INTERVAL_DAY_TO_SECOND) long value)
     {
         return value;
+    }
+
+    // MySQL-compatible datetime functions
+
+    @Description("Add N days to a date (MySQL-compatible)")
+    @ScalarFunction("adddate")
+    @SqlType(StandardTypes.DATE)
+    public static long addDate(@SqlType(StandardTypes.DATE) long date, @SqlType(StandardTypes.BIGINT) long days)
+    {
+        return date + days;  // date is stored as epoch days in Trino
+    }
+
+    @Description("Subtract N days from a date (MySQL-compatible)")
+    @ScalarFunction("subdate")
+    @SqlType(StandardTypes.DATE)
+    public static long subDate(@SqlType(StandardTypes.DATE) long date, @SqlType(StandardTypes.BIGINT) long days)
+    {
+        return date - days;
+    }
+
+    @Description("Day difference in days (MySQL-compatible: datediff(d1, d2) = d1 - d2)")
+    @ScalarFunction("datediff")
+    @SqlType(StandardTypes.BIGINT)
+    public static long dateDiff(@SqlType(StandardTypes.DATE) long d1, @SqlType(StandardTypes.DATE) long d2)
+    {
+        return d1 - d2;
+    }
+
+    @Description("Day name of the week (MySQL-compatible)")
+    @ScalarFunction("dayname")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice dayName(@SqlType(StandardTypes.DATE) long date)
+    {
+        // Get day of week as text (Sunday, Monday, etc.)
+        long millis = DAYS.toMillis(date);
+        DateTimeFormatter formatter = DateTimeFormat.forPattern("EEEE")
+                .withChronology(UTC_CHRONOLOGY)
+                .withLocale(ENGLISH);
+        return utf8Slice(formatter.print(millis));
+    }
+
+    @Description("Month name (MySQL-compatible)")
+    @ScalarFunction("monthname")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice monthName(@SqlType(StandardTypes.DATE) long date)
+    {
+        // Get month name (January, February, etc.)
+        long millis = DAYS.toMillis(date);
+        DateTimeFormatter formatter = DateTimeFormat.forPattern("MMMM")
+                .withChronology(UTC_CHRONOLOGY)
+                .withLocale(ENGLISH);
+        return utf8Slice(formatter.print(millis));
+    }
+
+    @Description("Convert seconds to time (MySQL-compatible)")
+    @ScalarFunction("sec_to_time")
+    @SqlType(StandardTypes.TIME)
+    public static long secToTime(@SqlType(StandardTypes.BIGINT) long seconds)
+    {
+        // Time in Trino is stored as picoseconds since midnight
+        // We need to convert seconds to picoseconds
+        long picosPerSecond = 1_000_000_000_000L;
+        return (seconds % MILLISECONDS_IN_DAY) * picosPerSecond;
+    }
+
+    @Description("Convert time to seconds (MySQL-compatible)")
+    @ScalarFunction("time_to_sec")
+    @SqlType(StandardTypes.BIGINT)
+    public static long timeToSec(@SqlType(StandardTypes.TIME) long time)
+    {
+        // Time in Trino is stored as picoseconds since midnight
+        long picosPerSecond = 1_000_000_000_000L;
+        return time / picosPerSecond;
+    }
+
+    @Description("Days since year 0 (MySQL-compatible)")
+    @ScalarFunction("to_days")
+    @SqlType(StandardTypes.BIGINT)
+    public static long toDays(@SqlType(StandardTypes.DATE) long date)
+    {
+        // MySQL's TO_DAYS counts from year 0, but Trino's date is days since 1970-01-01
+        // Days from 0000-01-01 to 1970-01-01 is 719528
+        return date + 719528;
+    }
+
+    @Description("Date from days since year 0 (MySQL-compatible)")
+    @ScalarFunction("from_days")
+    @SqlType(StandardTypes.DATE)
+    public static long fromDays(@SqlType(StandardTypes.BIGINT) long days)
+    {
+        // Convert from MySQL's day count (since year 0) to Trino's date (days since 1970-01-01)
+        return days - 719528;
+    }
+
+    @Description("Construct date from year and day of year (MySQL-compatible)")
+    @ScalarFunction("makedate")
+    @SqlType(StandardTypes.DATE)
+    public static long makeDate(@SqlType(StandardTypes.BIGINT) long year, @SqlType(StandardTypes.BIGINT) long dayOfYear)
+    {
+        try {
+            LocalDate janFirst = new LocalDate(toIntExact(year), 1, 1, UTC_CHRONOLOGY);
+            LocalDate result = janFirst.plusDays(toIntExact(dayOfYear - 1));
+            return Days.daysBetween(new LocalDate(1970, 1, 1), result).getDays();
+        }
+        catch (IllegalArgumentException | ArithmeticException e) {
+            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, e);
+        }
+    }
+
+    @Description("Construct time from hours, minutes, seconds (MySQL-compatible)")
+    @ScalarFunction("maketime")
+    @SqlType(StandardTypes.TIME)
+    public static long makeTime(@SqlType(StandardTypes.BIGINT) long hour, @SqlType(StandardTypes.BIGINT) long minute, @SqlType(StandardTypes.BIGINT) long second)
+    {
+        // Time in Trino is stored as picoseconds since midnight
+        long picosPerSecond = 1_000_000_000_000L;
+        long totalSeconds = hour * 3600 + minute * 60 + second;
+        return totalSeconds * picosPerSecond;
     }
 }

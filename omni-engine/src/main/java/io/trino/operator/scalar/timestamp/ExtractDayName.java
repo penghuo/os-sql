@@ -13,6 +13,7 @@
  */
 package io.trino.operator.scalar.timestamp;
 
+import io.airlift.slice.Slice;
 import io.trino.spi.function.Description;
 import io.trino.spi.function.LiteralParameters;
 import io.trino.spi.function.ScalarFunction;
@@ -20,25 +21,33 @@ import io.trino.spi.function.SqlType;
 import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.StandardTypes;
 import org.joda.time.chrono.ISOChronology;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
 
+import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.type.DateTimes.scaleEpochMicrosToMillis;
+import static java.util.Locale.ENGLISH;
 
-@Description("Day of the week of the given timestamp")
-@ScalarFunction(value = "day_of_week", alias = {"dow", "dayofweek"})
-public class ExtractDayOfWeek
+@Description("Day name of the week of the given timestamp (MySQL-compatible)")
+@ScalarFunction("dayname")
+public class ExtractDayName
 {
-    private ExtractDayOfWeek() {}
+    private static final DateTimeFormatter DAY_NAME_FORMATTER = DateTimeFormat.forPattern("EEEE")
+            .withChronology(ISOChronology.getInstanceUTC())
+            .withLocale(ENGLISH);
+
+    private ExtractDayName() {}
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.BIGINT)
-    public static long extract(@SqlType("timestamp(p)") long timestamp)
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice extract(@SqlType("timestamp(p)") long timestamp)
     {
-        return ISOChronology.getInstanceUTC().dayOfWeek().get(scaleEpochMicrosToMillis(timestamp));
+        return utf8Slice(DAY_NAME_FORMATTER.print(scaleEpochMicrosToMillis(timestamp)));
     }
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.BIGINT)
-    public static long extract(@SqlType("timestamp(p)") LongTimestamp timestamp)
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice extract(@SqlType("timestamp(p)") LongTimestamp timestamp)
     {
         return extract(timestamp.getEpochMicros());
     }

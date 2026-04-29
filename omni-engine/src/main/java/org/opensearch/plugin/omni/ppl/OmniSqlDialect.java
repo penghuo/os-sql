@@ -36,6 +36,63 @@ public class OmniSqlDialect extends TrinoSqlDialect
     {
         String opName = call.getOperator().getName();
 
+        // JSON_OBJECT('k1', v1, 'k2', v2, ...) - Calcite emits "JSON_OBJECT(KEY 'k' VALUE v NULL ON NULL)"
+        // Rewrite to Trino's  map_to_json(MAP(ARRAY[...], ARRAY[...]))
+        if (opName.equalsIgnoreCase("JSON_OBJECT") || opName.equalsIgnoreCase("JSONOBJECT")) {
+            // Calcite's JSON_OBJECT operator has operands: nullBehavior, key1, value1, key2, value2, ...
+            // See SqlJsonObjectFunction in Calcite. Skip operand(0) (null behavior flag).
+            int start = 1;
+            int pairCount = (call.operandCount() - 1) / 2;
+            if (pairCount < 1) { // fallback — just empty map
+                writer.literal("map_to_json(MAP())");
+                return;
+            }
+            writer.keyword("map_to_json");
+            SqlWriter.Frame outer = writer.startList("(", ")");
+            writer.keyword("MAP");
+            SqlWriter.Frame args = writer.startList("(", ")");
+            writer.keyword("ARRAY");
+            SqlWriter.Frame keys = writer.startList("[", "]");
+            for (int i = 0; i < pairCount; i++) {
+                if (i > 0) writer.sep(",");
+                call.operand(start + i * 2).unparse(writer, 0, 0);
+            }
+            writer.endList(keys);
+            writer.sep(",");
+            writer.keyword("ARRAY");
+            SqlWriter.Frame vals = writer.startList("[", "]");
+            for (int i = 0; i < pairCount; i++) {
+                if (i > 0) writer.sep(",");
+                call.operand(start + i * 2 + 1).unparse(writer, 0, 0);
+            }
+            writer.endList(vals);
+            writer.endList(args);
+            writer.endList(outer);
+            return;
+        }
+
+        // JSON_ARRAY(v1, v2, ...) — Calcite standard → Trino json_format(CAST(ARRAY[...] AS JSON))
+        if (opName.equalsIgnoreCase("JSON_ARRAY") || opName.equalsIgnoreCase("JSONARRAY")) {
+            // Calcite operand(0) is null behavior flag
+            int start = 1;
+            writer.keyword("json_format");
+            SqlWriter.Frame outer = writer.startList("(", ")");
+            writer.keyword("CAST");
+            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.keyword("ARRAY");
+            SqlWriter.Frame arr = writer.startList("[", "]");
+            for (int i = start; i < call.operandCount(); i++) {
+                if (i > start) writer.sep(",");
+                call.operand(i).unparse(writer, 0, 0);
+            }
+            writer.endList(arr);
+            writer.keyword("AS");
+            writer.keyword("JSON");
+            writer.endList(castFrame);
+            writer.endList(outer);
+            return;
+        }
+
         // SPAN(value, interval, unit?)  — PPL time/numeric bucketing
         //   SPAN(ts, N, 'w'|'d'|'h'|'m'|'s'|'mo'|'y')  → date_trunc(unit, ts)  (we ignore N for single-unit buckets)
         //   SPAN(num, N)                                → floor(num / N) * N

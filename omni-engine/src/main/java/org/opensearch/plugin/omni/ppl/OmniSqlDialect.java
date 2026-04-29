@@ -40,56 +40,35 @@ public class OmniSqlDialect extends TrinoSqlDialect
         // Rewrite to Trino's  map_to_json(MAP(ARRAY[...], ARRAY[...]))
         if (opName.equalsIgnoreCase("JSON_OBJECT") || opName.equalsIgnoreCase("JSONOBJECT")) {
             // Calcite's JSON_OBJECT operator has operands: nullBehavior, key1, value1, key2, value2, ...
-            // See SqlJsonObjectFunction in Calcite. Skip operand(0) (null behavior flag).
             int start = 1;
             int pairCount = (call.operandCount() - 1) / 2;
-            if (pairCount < 1) { // fallback — just empty map
-                writer.literal("map_to_json(MAP())");
+            if (pairCount < 1) {
+                writer.print("map_to_json(MAP())");
                 return;
             }
-            writer.keyword("map_to_json");
-            SqlWriter.Frame outer = writer.startList("(", ")");
-            writer.keyword("MAP");
-            SqlWriter.Frame args = writer.startList("(", ")");
-            writer.keyword("ARRAY");
-            SqlWriter.Frame keys = writer.startList("[", "]");
+            writer.print("map_to_json(MAP(ARRAY[");
             for (int i = 0; i < pairCount; i++) {
-                if (i > 0) writer.sep(",");
+                if (i > 0) writer.print(", ");
                 call.operand(start + i * 2).unparse(writer, 0, 0);
             }
-            writer.endList(keys);
-            writer.sep(",");
-            writer.keyword("ARRAY");
-            SqlWriter.Frame vals = writer.startList("[", "]");
+            writer.print("], ARRAY[");
             for (int i = 0; i < pairCount; i++) {
-                if (i > 0) writer.sep(",");
+                if (i > 0) writer.print(", ");
                 call.operand(start + i * 2 + 1).unparse(writer, 0, 0);
             }
-            writer.endList(vals);
-            writer.endList(args);
-            writer.endList(outer);
+            writer.print("]))");
             return;
         }
 
         // JSON_ARRAY(v1, v2, ...) — Calcite standard → Trino json_format(CAST(ARRAY[...] AS JSON))
         if (opName.equalsIgnoreCase("JSON_ARRAY") || opName.equalsIgnoreCase("JSONARRAY")) {
-            // Calcite operand(0) is null behavior flag
             int start = 1;
-            writer.keyword("json_format");
-            SqlWriter.Frame outer = writer.startList("(", ")");
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
-            writer.keyword("ARRAY");
-            SqlWriter.Frame arr = writer.startList("[", "]");
+            writer.print("json_format(CAST(ARRAY[");
             for (int i = start; i < call.operandCount(); i++) {
-                if (i > start) writer.sep(",");
+                if (i > start) writer.print(", ");
                 call.operand(i).unparse(writer, 0, 0);
             }
-            writer.endList(arr);
-            writer.keyword("AS");
-            writer.keyword("JSON");
-            writer.endList(castFrame);
-            writer.endList(outer);
+            writer.print("] AS JSON))");
             return;
         }
 
@@ -248,26 +227,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
         }
 
         // ARRAY(a, b, c) → ARRAY[a, b, c] — Trino uses bracket literal, not function
-        if (opName.equalsIgnoreCase("ARRAY")) {
-            writer.keyword("ARRAY");
-            SqlWriter.Frame frame = writer.startList("[", "]");
+        if (opName.equalsIgnoreCase("ARRAY") || opName.equalsIgnoreCase("LIST")) {
+            writer.print("ARRAY[");
             for (int i = 0; i < call.operandCount(); i++) {
-                if (i > 0) writer.sep(",");
+                if (i > 0) writer.print(", ");
                 call.operand(i).unparse(writer, 0, 0);
             }
-            writer.endList(frame);
-            return;
-        }
-
-        // LIST(a, b, c) → ARRAY[a, b, c] — PPL alias for array
-        if (opName.equalsIgnoreCase("LIST")) {
-            writer.keyword("ARRAY");
-            SqlWriter.Frame frame = writer.startList("[", "]");
-            for (int i = 0; i < call.operandCount(); i++) {
-                if (i > 0) writer.sep(",");
-                call.operand(i).unparse(writer, 0, 0);
-            }
-            writer.endList(frame);
+            writer.print("]");
             return;
         }
 

@@ -100,38 +100,40 @@ public class OmniSqlDialect extends TrinoSqlDialect
         // MySQL-style function name → Trino canonical name mappings
         // These handle PPL function names that don't match Trino's conventions
 
-        // DAYOFWEEK(x) → day_of_week(x)
-        if (opName.equalsIgnoreCase("DAYOFWEEK") && call.operandCount() == 1) {
-            writer.keyword("day_of_week");
+        // PPL temporal extraction functions accept varchar/date/timestamp; Trino's don't accept varchar.
+        // Wrap arg in CAST(... AS TIMESTAMP) when we emit.
+        if (call.operandCount() == 1 && (
+                opName.equalsIgnoreCase("DAYOFWEEK") || opName.equalsIgnoreCase("DAY_OF_WEEK")
+             || opName.equalsIgnoreCase("DAYOFMONTH") || opName.equalsIgnoreCase("DAY_OF_MONTH")
+             || opName.equalsIgnoreCase("DAYOFYEAR") || opName.equalsIgnoreCase("DAY_OF_YEAR")
+             || opName.equalsIgnoreCase("DAY")
+             || opName.equalsIgnoreCase("MONTH")
+             || opName.equalsIgnoreCase("YEAR")
+             || opName.equalsIgnoreCase("HOUR")
+             || opName.equalsIgnoreCase("MINUTE")
+             || opName.equalsIgnoreCase("SECOND")
+             || opName.equalsIgnoreCase("QUARTER")
+             || opName.equalsIgnoreCase("WEEK")
+             || opName.equalsIgnoreCase("WEEK_OF_YEAR")
+             || opName.equalsIgnoreCase("LAST_DAY"))) {
+            String trinoName = switch (opName.toUpperCase()) {
+                case "DAYOFWEEK" -> "day_of_week";
+                case "DAYOFMONTH" -> "day";
+                case "DAYOFYEAR" -> "day_of_year";
+                case "LAST_DAY" -> "last_day_of_month";
+                case "WEEK" -> "week_of_year";
+                default -> opName.toLowerCase();
+            };
+            writer.keyword(trinoName);
             SqlWriter.Frame frame = writer.startList("(", ")");
+            // Cast to TIMESTAMP so varchar inputs are accepted. TIMESTAMP(date) and
+            // TIMESTAMP(timestamp) are both valid in Trino (identity cast).
+            writer.keyword("CAST");
+            SqlWriter.Frame castFrame = writer.startList("(", ")");
             call.operand(0).unparse(writer, 0, 0);
-            writer.endList(frame);
-            return;
-        }
-
-        // DAYOFMONTH(x) → day(x) [Trino's alias for day_of_month]
-        if (opName.equalsIgnoreCase("DAYOFMONTH") && call.operandCount() == 1) {
-            writer.keyword("day");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.endList(frame);
-            return;
-        }
-
-        // DAYOFYEAR(x) → day_of_year(x)
-        if (opName.equalsIgnoreCase("DAYOFYEAR") && call.operandCount() == 1) {
-            writer.keyword("day_of_year");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.endList(frame);
-            return;
-        }
-
-        // LAST_DAY(x) → last_day_of_month(x)
-        if (opName.equalsIgnoreCase("LAST_DAY") && call.operandCount() == 1) {
-            writer.keyword("last_day_of_month");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            call.operand(0).unparse(writer, 0, 0);
+            writer.keyword("AS");
+            writer.keyword("TIMESTAMP");
+            writer.endList(castFrame);
             writer.endList(frame);
             return;
         }

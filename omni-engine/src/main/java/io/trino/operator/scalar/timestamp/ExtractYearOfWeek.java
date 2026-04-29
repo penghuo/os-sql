@@ -30,14 +30,14 @@ public class ExtractYearOfWeek
     private ExtractYearOfWeek() {}
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.INTEGER)
+    @SqlType(StandardTypes.BIGINT)
     public static long extract(@SqlType("timestamp(p)") long timestamp)
     {
         return ISOChronology.getInstanceUTC().weekyear().get(scaleEpochMicrosToMillis(timestamp));
     }
 
     @LiteralParameters("p")
-    @SqlType(StandardTypes.INTEGER)
+    @SqlType(StandardTypes.BIGINT)
     public static long extract(@SqlType("timestamp(p)") LongTimestamp timestamp)
     {
         return extract(timestamp.getEpochMicros());

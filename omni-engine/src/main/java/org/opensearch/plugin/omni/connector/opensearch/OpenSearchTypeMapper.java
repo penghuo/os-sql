@@ -120,13 +120,20 @@ public final class OpenSearchTypeMapper
             case "float" -> new TypeAndPredicate(RealType.REAL, true);
             case "double" -> new TypeAndPredicate(DoubleType.DOUBLE, true);
             case "scaled_float" -> new TypeAndPredicate(DoubleType.DOUBLE, true);
-            case "date" -> {
+            case "date", "date_nanos" -> {
                 // OpenSearch stores all date fields as epoch_millis in doc_values,
-                // regardless of the display format. Accept all date formats.
+                // regardless of the display format. Accept all date formats (including date_nanos).
                 yield new TypeAndPredicate(TimestampType.TIMESTAMP_MILLIS, true);
             }
+            case "half_float" -> new TypeAndPredicate(RealType.REAL, true);
+            case "unsigned_long" -> new TypeAndPredicate(BigintType.BIGINT, true);
             case "ip" -> new TypeAndPredicate(VarcharType.VARCHAR, false);
             case "binary" -> new TypeAndPredicate(VarbinaryType.VARBINARY, false);
+            case "geo_point", "geo_shape" -> new TypeAndPredicate(VarcharType.VARCHAR, false);
+            case "alias" -> new TypeAndPredicate(VarcharType.VARCHAR, false);
+            case "match_only_text" -> new TypeAndPredicate(VarcharType.VARCHAR, false);
+            case "wildcard" -> new TypeAndPredicate(VarcharType.VARCHAR, true);
+            case "constant_keyword" -> new TypeAndPredicate(VarcharType.VARCHAR, true);
             default -> null; // Unknown types are skipped
         };
     }

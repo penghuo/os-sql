@@ -36,24 +36,51 @@ public class OmniSqlDialect extends TrinoSqlDialect
     {
         String opName = call.getOperator().getName();
 
-        // TIMESTAMP('2023-01-01 00:00:00') → TIMESTAMP '2023-01-01 00:00:00'
-        if (opName.equals("TIMESTAMP") && call.operandCount() == 1
-                && call.operand(0) instanceof SqlCharStringLiteral literal) {
-            writer.literal("TIMESTAMP '" + literal.getNlsString().getValue() + "'");
+        // TIMESTAMP(literal string) → TIMESTAMP 'literal' (literal prefix)
+        // TIMESTAMP(expr)          → CAST(expr AS TIMESTAMP)
+        if (opName.equals("TIMESTAMP") && call.operandCount() == 1) {
+            if (call.operand(0) instanceof SqlCharStringLiteral literal) {
+                writer.literal("TIMESTAMP '" + literal.getNlsString().getValue() + "'");
+            } else {
+                writer.keyword("CAST");
+                SqlWriter.Frame frame = writer.startList("(", ")");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.keyword("AS");
+                writer.keyword("TIMESTAMP");
+                writer.endList(frame);
+            }
             return;
         }
 
-        // TIME('09:16:37') → TIME '09:16:37'
-        if (opName.equals("TIME") && call.operandCount() == 1
-                && call.operand(0) instanceof SqlCharStringLiteral timeLit) {
-            writer.literal("TIME '" + timeLit.getNlsString().getValue() + "'");
+        // TIME(literal)  → TIME 'literal'
+        // TIME(expr)     → CAST(expr AS TIME)
+        if (opName.equals("TIME") && call.operandCount() == 1) {
+            if (call.operand(0) instanceof SqlCharStringLiteral timeLit) {
+                writer.literal("TIME '" + timeLit.getNlsString().getValue() + "'");
+            } else {
+                writer.keyword("CAST");
+                SqlWriter.Frame frame = writer.startList("(", ")");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.keyword("AS");
+                writer.keyword("TIME");
+                writer.endList(frame);
+            }
             return;
         }
 
-        // DATE('2023-01-01') → DATE '2023-01-01'
-        if (opName.equals("DATE") && call.operandCount() == 1
-                && call.operand(0) instanceof SqlCharStringLiteral dateLit) {
-            writer.literal("DATE '" + dateLit.getNlsString().getValue() + "'");
+        // DATE(literal)  → DATE 'literal'
+        // DATE(expr)     → CAST(expr AS DATE)
+        if (opName.equals("DATE") && call.operandCount() == 1) {
+            if (call.operand(0) instanceof SqlCharStringLiteral dateLit) {
+                writer.literal("DATE '" + dateLit.getNlsString().getValue() + "'");
+            } else {
+                writer.keyword("CAST");
+                SqlWriter.Frame frame = writer.startList("(", ")");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.keyword("AS");
+                writer.keyword("DATE");
+                writer.endList(frame);
+            }
             return;
         }
 
@@ -195,9 +222,20 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "regexp_like", call);
             return;
         }
-        // JSON_EXTRACT_ALL(json, path) → json_extract(json, path)
-        if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL")) {
-            unparseFunctionLike(writer, "json_extract", call);
+        // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)
+        // Trino's json_extract requires JSON type for the first arg; OpenSearch text fields are VARCHAR.
+        if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 2) {
+            writer.keyword("json_extract");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            writer.keyword("CAST");
+            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.keyword("AS");
+            writer.keyword("JSON");
+            writer.endList(castFrame);
+            writer.sep(",");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.endList(frame);
             return;
         }
         // VALUES(x) → array_agg(x) — PPL collects distinct values as an array

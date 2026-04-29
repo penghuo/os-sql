@@ -38,9 +38,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.plugin.omni.adapter.QueryResponseAdapter;
+import org.opensearch.plugin.omni.ppl.PplTranslator;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.antlr.SyntaxCheckException;
@@ -85,7 +87,7 @@ public class OmniEngineService {
         listener.onFailure(classify(collected.error()));
         return;
       }
-      listener.onResponse(QueryResponseAdapter.adapt(collected.columns(), collected.rows()));
+      listener.onResponse(QueryResponseAdapter.adapt(collected.columns(), collected.rows(), dispatch.rowType()));
     } catch (Exception e) {
       listener.onFailure(classify(e));
     }
@@ -164,7 +166,9 @@ public class OmniEngineService {
         wiring
             .getSessionSupplier()
             .createSession(translationId, Span.getInvalid(), sessionContext);
-    String sql = wiring.getPplTranslator().translate(request.getRequest(), pplSession);
+    PplTranslator.TranslatedQuery translated = wiring.getPplTranslator().translate(request.getRequest(), pplSession);
+    String sql = translated.sql();
+    RelDataType rowType = translated.rowType();
     log.debug("PPL translated to SQL: {}", sql);
 
     QueryId queryId = dispatchManager.createQueryId();
@@ -186,7 +190,7 @@ public class OmniEngineService {
           info.flatMap(i -> Optional.ofNullable(i.getErrorCode()))
               .map(c -> c.getName())
               .orElse("");
-      return new DispatchResult(queryId, slug, null, new RuntimeException(name + ":" + msg));
+      return new DispatchResult(queryId, slug, null, null, new RuntimeException(name + ":" + msg));
     }
 
     Session session = wiring.getSqlQueryManager().getQuerySession(queryId);
@@ -201,7 +205,7 @@ public class OmniEngineService {
             wiring.getQueryResultsExecutor(),
             wiring.getQueryResultsTimeoutExecutor(),
             wiring.getBlockEncodingSerde());
-    return new DispatchResult(queryId, slug, query, null);
+    return new DispatchResult(queryId, slug, query, rowType, null);
   }
 
   private CollectedResults collectResults(DispatchResult dispatch) throws Exception {
@@ -264,7 +268,7 @@ public class OmniEngineService {
     return msg;
   }
 
-  private record DispatchResult(QueryId queryId, Slug slug, Query query, Throwable earlyFailure) {}
+  private record DispatchResult(QueryId queryId, Slug slug, Query query, RelDataType rowType, Throwable earlyFailure) {}
 
   private record CollectedResults(
       List<Column> columns, List<List<Object>> rows, QueryError error) {}

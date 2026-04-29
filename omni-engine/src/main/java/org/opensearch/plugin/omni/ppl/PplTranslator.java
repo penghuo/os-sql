@@ -18,6 +18,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import io.trino.transaction.TransactionManager;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.schema.Schema;
 import org.opensearch.plugin.omni.ppl.OmniSqlDialect;
 import org.opensearch.sql.api.UnifiedQueryContext;
@@ -32,6 +33,14 @@ import static io.airlift.concurrent.MoreFutures.getFutureValue;
  */
 public class PplTranslator {
     private static final Logger log = LogManager.getLogger(PplTranslator.class);
+
+    /**
+     * Result of PPL-to-SQL translation, carrying both the SQL and the Calcite row type.
+     *
+     * @param sql the transpiled SQL query
+     * @param rowType the Calcite RelDataType from the planned RelNode (encodes PPL's type inference)
+     */
+    public record TranslatedQuery(String sql, RelDataType rowType) {}
 
     private final Metadata metadata;
     private final TransactionManager transactionManager;
@@ -48,9 +57,9 @@ public class PplTranslator {
      *
      * @param ppl the PPL query (e.g., "source=hits | stats count()")
      * @param session the Trino session (provides catalog/schema context)
-     * @return the equivalent Trino SQL string
+     * @return TranslatedQuery containing the SQL and Calcite row type
      */
-    public String translate(String ppl, Session session) {
+    public TranslatedQuery translate(String ppl, Session session) {
         String catalogName = session.getCatalog()
                 .orElseThrow(() -> new IllegalStateException("No catalog set in session"));
         String schemaName = session.getSchema().orElse("default");
@@ -72,6 +81,7 @@ public class PplTranslator {
                     .setting("plugins.ppl.rex.max_match.limit", 10)
                     .build()) {
                 RelNode plan = new UnifiedQueryPlanner(ctx).plan(ppl);
+                RelDataType rowType = plan.getRowType();
                 String sql = UnifiedQueryTranspiler.builder()
                         .dialect(OmniSqlDialect.DEFAULT)
                         .build()
@@ -90,7 +100,7 @@ public class PplTranslator {
                 sql = rewriteCoalesce(sql);
                 // REGEXP(col, pattern) → regexp_like(col, pattern) — os-sql REGEXP operator → Trino function
                 sql = rewriteRegexp(sql);
-                return sql;
+                return new TranslatedQuery(sql, rowType);
             }
         } catch (Exception e) {
             transactionManager.asyncAbort(transactionId);

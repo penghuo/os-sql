@@ -430,71 +430,6 @@ public final class MySqlCompatFunctions
         return result;
     }
 
-    // ========== curdate, curtime, current_time: MySQL current-time functions ==========
-
-    @Description("MySQL curdate() — current date in session timezone")
-    @ScalarFunction("curdate")
-    @SqlType(StandardTypes.DATE)
-    public static long curdate(ConnectorSession session)
-    {
-        // Return current date in session timezone as days since epoch
-        return LocalDate.ofInstant(
-                Instant.ofEpochMilli(session.getStart().toEpochMilli()),
-                session.getTimeZoneKey().getZoneId()
-        ).toEpochDay();
-    }
-
-    @Description("MySQL curtime() — current time in session timezone")
-    @ScalarFunction("curtime")
-    @SqlType(StandardTypes.VARCHAR)
-    public static Slice curtime(ConnectorSession session)
-    {
-        // Return current time as HH:MM:SS string
-        LocalTime time = LocalTime.ofInstant(
-                Instant.ofEpochMilli(session.getStart().toEpochMilli()),
-                session.getTimeZoneKey().getZoneId()
-        );
-        return Slices.utf8Slice(String.format("%02d:%02d:%02d",
-                time.getHour(), time.getMinute(), time.getSecond()));
-    }
-
-    @Description("MySQL current_time() — alias for curtime()")
-    @ScalarFunction("current_time")
-    @SqlType(StandardTypes.VARCHAR)
-    public static Slice currentTime(ConnectorSession session)
-    {
-        return curtime(session);
-    }
-
-    // ========== utc_date, utc_time, utc_timestamp: MySQL UTC functions ==========
-
-    @Description("MySQL utc_date() — current date in UTC")
-    @ScalarFunction("utc_date")
-    @SqlType(StandardTypes.DATE)
-    public static long utcDate()
-    {
-        return LocalDate.now(ZoneOffset.UTC).toEpochDay();
-    }
-
-    @Description("MySQL utc_time() — current time in UTC")
-    @ScalarFunction("utc_time")
-    @SqlType(StandardTypes.VARCHAR)
-    public static Slice utcTime()
-    {
-        LocalTime time = LocalTime.now(ZoneOffset.UTC);
-        return Slices.utf8Slice(String.format("%02d:%02d:%02d",
-                time.getHour(), time.getMinute(), time.getSecond()));
-    }
-
-    @Description("MySQL utc_timestamp() — current timestamp in UTC")
-    @ScalarFunction("utc_timestamp")
-    @SqlType("timestamp(6)")
-    public static long utcTimestamp()
-    {
-        // Return microseconds since epoch
-        return Instant.now().toEpochMilli() * 1000L;
-    }
-
     // ========== date_sub: subtract days from date ==========
 
     @Description("MySQL date_sub(date, N) — subtract N days")
@@ -521,40 +456,6 @@ public final class MySqlCompatFunctions
         }
     }
 
-    // ========== yearweek: return YYYYww format ==========
-
-    @Description("MySQL yearweek(date) — return year and week as YYYYww")
-    @ScalarFunction("yearweek")
-    @SqlType(StandardTypes.INTEGER)
-    public static long yearweek(@SqlType(StandardTypes.DATE) long date)
-    {
-        long millis = DAYS.toMillis(date);
-        long year = UTC_CHRONOLOGY.year().get(millis);
-        long week = UTC_CHRONOLOGY.weekOfWeekyear().get(millis);
-        return year * 100 + week;
-    }
-
-    @Description("MySQL yearweek(timestamp) — return year and week as YYYYww")
-    @ScalarFunction("yearweek")
-    @LiteralParameters("p")
-    @SqlType(StandardTypes.INTEGER)
-    public static long yearweekFromTimestamp(@SqlType("timestamp(p)") long timestamp)
-    {
-        long millis = scaleEpochMicrosToMillis(timestamp);
-        long year = UTC_CHRONOLOGY.year().get(millis);
-        long week = UTC_CHRONOLOGY.weekOfWeekyear().get(millis);
-        return year * 100 + week;
-    }
-
-    @Description("MySQL yearweek(date_str) — return year and week as YYYYww from string")
-    @ScalarFunction("yearweek")
-    @SqlType(StandardTypes.INTEGER)
-    public static long yearweekFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
-    {
-        long timestamp = parseTimestampMicros(dateStr);
-        return yearweekFromTimestamp(timestamp);
-    }
-
     // ========== to_seconds: seconds since year 0 ==========
 
     @Description("MySQL to_seconds(date) — seconds since year 0")
@@ -575,9 +476,11 @@ public final class MySqlCompatFunctions
     @SqlType(StandardTypes.BIGINT)
     public static long toSecondsFromTimestamp(@SqlType("timestamp(p)") long timestamp)
     {
-        // Timestamp is in microseconds; convert to date first
-        long days = timestamp / (1_000_000L * 86400L);
-        return toSeconds(days);
+        // Timestamp is in microseconds; convert to epoch seconds, then add offset to year 0
+        // MySQL to_seconds counts from year 0 (proleptic Gregorian).
+        // Unix epoch (1970-01-01 00:00:00) = 62167219200 seconds since year 0.
+        long epochSec = timestamp / 1_000_000L;
+        return epochSec + 62167219200L;
     }
 
     @Description("MySQL to_seconds(date_str) — seconds since year 0 from string")
@@ -585,23 +488,8 @@ public final class MySqlCompatFunctions
     @SqlType(StandardTypes.BIGINT)
     public static long toSecondsFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
     {
-        String str = dateStr.toStringUtf8().trim();
-        try {
-            LocalDate ld = LocalDate.parse(str.substring(0, Math.min(10, str.length())));
-            return toSeconds(ld.toEpochDay());
-        }
-        catch (Exception e) {
-            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse date: " + str);
-        }
-    }
-
-    // ========== datetime: parse string to timestamp ==========
-
-    @Description("MySQL datetime(str) — parse datetime string")
-    @ScalarFunction("datetime")
-    @SqlType("timestamp(6)")
-    public static long datetime(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
-    {
-        return parseTimestampMicros(dateStr);
+        // Parse full timestamp (date + time) when available, fallback to date-only
+        long timestamp = parseTimestampMicros(dateStr);
+        return toSecondsFromTimestamp(timestamp);
     }
 }

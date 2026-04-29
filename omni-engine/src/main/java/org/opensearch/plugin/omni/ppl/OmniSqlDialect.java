@@ -336,6 +336,82 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         // MKTIME(y, m, d, h, mi, s) → date literal → Trino has no single function, omit
+        // ARRAY_COMPACT(arr) → filter(arr, x -> x IS NOT NULL)  (Trino has no built-in array_compact)
+        if (opName.equalsIgnoreCase("ARRAY_COMPACT") && call.operandCount() == 1) {
+            writer.print("filter(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", x -> x IS NOT NULL)");
+            return;
+        }
+        // ARRAY_LENGTH(arr) → cardinality(arr)
+        if (opName.equalsIgnoreCase("ARRAY_LENGTH") && call.operandCount() == 1) {
+            unparseFunctionLike(writer, "cardinality", call);
+            return;
+        }
+        // MVAPPEND(a, b, ...)  → concat(a, b, ...) on arrays (Trino's concat handles arrays)
+        if (opName.equalsIgnoreCase("MVAPPEND")) {
+            unparseFunctionLike(writer, "concat", call);
+            return;
+        }
+        // MVFIND(arr, pattern) → Trino: element_at(filter(arr, x -> regexp_like(x, pattern)), 1)
+        //   returns first matching element (or null)
+        if (opName.equalsIgnoreCase("MVFIND") && call.operandCount() == 2) {
+            writer.print("element_at(filter(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", x -> regexp_like(x, ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")), 1)");
+            return;
+        }
+        // MVZIP(arr1, arr2) → zip(arr1, arr2) — Trino has zip() builtin
+        if (opName.equalsIgnoreCase("MVZIP")) {
+            unparseFunctionLike(writer, "zip", call);
+            return;
+        }
+        // NUMBER_TO_STRING(x) → CAST(x AS VARCHAR)
+        if (opName.equalsIgnoreCase("NUMBER_TO_STRING") && call.operandCount() == 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR)");
+            return;
+        }
+        // STRFTIME(ts_or_epoch, fmt) → Trino: format_datetime(CAST(ts_or_epoch AS TIMESTAMP), fmt)
+        if (opName.equalsIgnoreCase("STRFTIME") && call.operandCount() == 2) {
+            writer.print("format_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP), ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+        // DATETIME(x) / DATETIME(x, zone)  — treat as CAST(x AS TIMESTAMP)
+        if (opName.equalsIgnoreCase("DATETIME") && call.operandCount() >= 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP)");
+            return;
+        }
+        // CONVERT_TZ(ts, from, to) → at_timezone(from_tz(CAST(ts AS TIMESTAMP), from_zone), to_zone)
+        // simplest robust form: AT TIME ZONE syntax
+        if (opName.equalsIgnoreCase("CONVERT_TZ") && call.operandCount() == 3) {
+            writer.print("(");
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP) AT TIME ZONE ");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+        // ADDDATE(date, days) → date_add('day', days, CAST(date AS TIMESTAMP))
+        if (opName.equalsIgnoreCase("ADDDATE") && call.operandCount() == 2) {
+            writer.print("date_add('day', ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(", CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP))");
+            return;
+        }
+
         // TO_DAYS(date) → day of rata die; Trino: date_diff('day', DATE '0000-01-01', date)
         if (opName.equalsIgnoreCase("TO_DAYS") && call.operandCount() == 1) {
             writer.keyword("date_diff");

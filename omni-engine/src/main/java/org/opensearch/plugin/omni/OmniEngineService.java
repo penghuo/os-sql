@@ -171,7 +171,7 @@ public class OmniEngineService {
     PplTranslator.TranslatedQuery translated = wiring.getPplTranslator().translate(request.getRequest(), pplSession);
     String sql = translated.sql();
     RelDataType rowType = translated.rowType();
-    log.debug("PPL translated to SQL: {}", sql);
+    log.info("PPL translated to SQL: {}", sql);
 
     QueryId queryId = dispatchManager.createQueryId();
     Slug slug = Slug.createNew();

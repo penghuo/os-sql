@@ -15,6 +15,7 @@ package io.trino.operator.scalar;
 
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import io.trino.spi.TrinoException;
 import io.trino.spi.function.Description;
 import io.trino.spi.function.LiteralParameters;
 import io.trino.spi.function.ScalarFunction;
@@ -32,8 +33,12 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static io.trino.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
 import static io.trino.type.DateTimes.scaleEpochMicrosToMillis;
 import static java.util.concurrent.TimeUnit.DAYS;
+
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 
 /**
  * MySQL-compatible wrappers over existing Trino datetime extraction functions.
@@ -47,6 +52,30 @@ public final class MySqlCompatFunctions
     private static final ISOChronology UTC_CHRONOLOGY = ISOChronology.getInstanceUTC();
 
     private MySqlCompatFunctions() {}
+
+    // ========== Helper methods for parsing VARCHAR to TIMESTAMP/DATE/TIME ==========
+
+    /**
+     * Parse a timestamp string in MySQL-compatible format.
+     * Returns epoch microseconds.
+     */
+    private static long parseTimestampMicros(Slice s)
+    {
+        String str = s.toStringUtf8().trim();
+        // Try "YYYY-MM-DD HH:MM:SS(.fff)" / "YYYY-MM-DDTHH:MM:SS"
+        String normalized = str.length() > 10 && str.charAt(10) == 'T'
+                ? str : str.replace(' ', 'T');
+        if (normalized.length() == 10) {
+            normalized = normalized + "T00:00:00";
+        }
+        try {
+            LocalDateTime ldt = LocalDateTime.parse(normalized);
+            return ldt.toEpochSecond(ZoneOffset.UTC) * 1_000_000L + ldt.getNano() / 1000;
+        }
+        catch (Exception e) {
+            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse timestamp: " + str);
+        }
+    }
 
     // ========== dayofweek: MySQL Sunday=1..Saturday=7 ==========
 
@@ -78,6 +107,13 @@ public final class MySqlCompatFunctions
         {
             return dayOfWeekFromTimestamp(timestamp.getEpochMicros());
         }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long dayOfWeekFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+        {
+            long timestamp = parseTimestampMicros(dateStr);
+            return dayOfWeekFromTimestamp(timestamp);
+        }
     }
 
     // ========== dayofmonth: just cast to INTEGER ==========
@@ -107,6 +143,13 @@ public final class MySqlCompatFunctions
         {
             return dayOfMonthFromTimestamp(timestamp.getEpochMicros());
         }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long dayOfMonthFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+        {
+            long timestamp = parseTimestampMicros(dateStr);
+            return dayOfMonthFromTimestamp(timestamp);
+        }
     }
 
     // ========== dayofyear: just cast to INTEGER ==========
@@ -135,6 +178,13 @@ public final class MySqlCompatFunctions
         public static long dayOfYearFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
         {
             return dayOfYearFromTimestamp(timestamp.getEpochMicros());
+        }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long dayOfYearFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+        {
+            long timestamp = parseTimestampMicros(dateStr);
+            return dayOfYearFromTimestamp(timestamp);
         }
     }
 
@@ -168,6 +218,13 @@ public final class MySqlCompatFunctions
         {
             return weekdayFromTimestamp(timestamp.getEpochMicros());
         }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long weekdayFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+        {
+            long timestamp = parseTimestampMicros(dateStr);
+            return weekdayFromTimestamp(timestamp);
+        }
     }
 
     // ========== minute_of_day: minute within the day (0..1439) ==========
@@ -193,6 +250,13 @@ public final class MySqlCompatFunctions
         public static long minuteOfDayFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
         {
             return minuteOfDayFromTimestamp(timestamp.getEpochMicros());
+        }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long minuteOfDayFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice timestampStr)
+        {
+            long timestamp = parseTimestampMicros(timestampStr);
+            return minuteOfDayFromTimestamp(timestamp);
         }
     }
 
@@ -220,6 +284,13 @@ public final class MySqlCompatFunctions
             int picosOfMicro = timestamp.getPicosOfMicro();
             // Convert picos to additional micros (though typically this is sub-microsecond)
             return (micros % 1_000_000 + picosOfMicro / 1_000_000) % 1_000_000;
+        }
+
+        @SqlType(StandardTypes.INTEGER)
+        public static long microsecondFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice timestampStr)
+        {
+            long timestamp = parseTimestampMicros(timestampStr);
+            return microsecondFromTimestamp(timestamp);
         }
     }
 

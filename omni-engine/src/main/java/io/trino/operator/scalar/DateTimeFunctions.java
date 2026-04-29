@@ -819,4 +819,106 @@ public final class DateTimeFunctions
         long fractionalPicos = (long) ((second - (long) second) * picosPerSecond);
         return totalSeconds * picosPerSecond + fractionalPicos;
     }
+
+    // ========== VARCHAR overloads for MySQL compatibility ==========
+
+    /**
+     * Parse a date string in MySQL-compatible format (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS).
+     * Returns epoch days.
+     */
+    private static long parseDateFromVarchar(Slice dateStr)
+    {
+        String s = dateStr.toStringUtf8().trim();
+        // MySQL accepts "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS"
+        if (s.length() >= 10 && s.charAt(4) == '-' && s.charAt(7) == '-') {
+            try {
+                java.time.LocalDate date = java.time.LocalDate.parse(s.substring(0, 10));
+                return date.toEpochDay();
+            }
+            catch (Exception e) {
+                // Fall through
+            }
+        }
+        throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse date: " + s);
+    }
+
+    /**
+     * Parse a time string in MySQL-compatible format (HH:MM:SS or HH:MM:SS.ffffff).
+     * Returns picoseconds since midnight.
+     */
+    private static long parseTimeFromVarchar(Slice timeStr)
+    {
+        String s = timeStr.toStringUtf8().trim();
+        try {
+            java.time.LocalTime time = java.time.LocalTime.parse(s);
+            long picosPerSecond = 1_000_000_000_000L;
+            return time.toSecondOfDay() * picosPerSecond + time.getNano() * 1000L;
+        }
+        catch (Exception e) {
+            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse time: " + s);
+        }
+    }
+
+    @Description("Day name of the week from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("dayname")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice dayNameFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return dayName(date);
+    }
+
+    @Description("Month name from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("monthname")
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice monthNameFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return monthName(date);
+    }
+
+    @Description("Last day of the month from VARCHAR (MySQL-compatible)")
+    @ScalarFunction(value = "last_day_of_month", alias = "last_day")
+    @SqlType(StandardTypes.DATE)
+    public static long lastDayOfMonthFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return lastDayOfMonthFromDate(date);
+    }
+
+    @Description("Convert time to seconds from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("time_to_sec")
+    @SqlType(StandardTypes.BIGINT)
+    public static long timeToSecFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice timeStr)
+    {
+        long time = parseTimeFromVarchar(timeStr);
+        return timeToSec(time);
+    }
+
+    @Description("Days since year 0 from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("to_days")
+    @SqlType(StandardTypes.BIGINT)
+    public static long toDaysFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return toDays(date);
+    }
+
+    @Description("Add N days to a date from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("adddate")
+    @SqlType(StandardTypes.DATE)
+    public static long addDateFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr, @SqlType(StandardTypes.BIGINT) long days)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return addDate(date, days);
+    }
+
+    @Description("Subtract N days from a date from VARCHAR (MySQL-compatible)")
+    @ScalarFunction("subdate")
+    @SqlType(StandardTypes.DATE)
+    public static long subDateFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr, @SqlType(StandardTypes.BIGINT) long days)
+    {
+        long date = parseDateFromVarchar(dateStr);
+        return subDate(date, days);
+    }
 }

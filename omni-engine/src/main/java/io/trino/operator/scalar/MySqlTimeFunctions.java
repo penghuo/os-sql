@@ -25,6 +25,7 @@ import io.trino.spi.type.StandardTypes;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
@@ -38,6 +39,30 @@ import static io.trino.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
 public final class MySqlTimeFunctions
 {
     private MySqlTimeFunctions() {}
+
+    // ========== Helper methods for parsing VARCHAR to TIMESTAMP ==========
+
+    /**
+     * Parse a timestamp string in MySQL-compatible format.
+     * Returns epoch microseconds.
+     */
+    private static long parseTimestampMicros(Slice s)
+    {
+        String str = s.toStringUtf8().trim();
+        // Try "YYYY-MM-DD HH:MM:SS(.fff)" / "YYYY-MM-DDTHH:MM:SS"
+        String normalized = str.length() > 10 && str.charAt(10) == 'T'
+                ? str : str.replace(' ', 'T');
+        if (normalized.length() == 10) {
+            normalized = normalized + "T00:00:00";
+        }
+        try {
+            LocalDateTime ldt = LocalDateTime.parse(normalized);
+            return ldt.toEpochSecond(ZoneOffset.UTC) * 1_000_000L + ldt.getNano() / 1000;
+        }
+        catch (Exception e) {
+            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse timestamp: " + str);
+        }
+    }
 
     // ========== addtime: add time duration to a timestamp ==========
 
@@ -109,6 +134,19 @@ public final class MySqlTimeFunctions
         };
     }
 
+    @Description("Difference between two timestamps from VARCHAR")
+    @ScalarFunction("timestampdiff")
+    @SqlType(StandardTypes.BIGINT)
+    public static long timestampdiffFromVarchar(
+            @SqlType(StandardTypes.VARCHAR) Slice unit,
+            @SqlType(StandardTypes.VARCHAR) Slice timestamp1Str,
+            @SqlType(StandardTypes.VARCHAR) Slice timestamp2Str)
+    {
+        long timestamp1 = parseTimestampMicros(timestamp1Str);
+        long timestamp2 = parseTimestampMicros(timestamp2Str);
+        return timestampdiff(unit, timestamp1, timestamp2);
+    }
+
     private static long calculateMonthDiff(long micros1, long micros2)
     {
         LocalDateTime dt1 = LocalDateTime.ofInstant(Instant.ofEpochMilli(micros1 / 1000), ZoneId.of("UTC"));
@@ -146,6 +184,18 @@ public final class MySqlTimeFunctions
         catch (Exception e) {
             throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Invalid timezone conversion: " + e.getMessage());
         }
+    }
+
+    @Description("Convert timestamp from VARCHAR from one timezone to another")
+    @ScalarFunction("convert_tz")
+    @SqlType(StandardTypes.TIMESTAMP)
+    public static long convertTzFromVarchar(
+            @SqlType(StandardTypes.VARCHAR) Slice timestampStr,
+            @SqlType(StandardTypes.VARCHAR) Slice fromTz,
+            @SqlType(StandardTypes.VARCHAR) Slice toTz)
+    {
+        long timestamp = parseTimestampMicros(timestampStr);
+        return convertTz(timestamp, fromTz, toTz);
     }
 
     // ========== str_to_date: parse string to date/timestamp ==========

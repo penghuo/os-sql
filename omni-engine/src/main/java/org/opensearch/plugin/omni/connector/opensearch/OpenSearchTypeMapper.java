@@ -65,10 +65,7 @@ public final class OpenSearchTypeMapper
     @SuppressWarnings("unchecked")
     private static OpenSearchColumnHandle mapField(String name, Map<String, Object> mapping, Map<String, Object> trinoMeta)
     {
-        // Preserve original case so PPL field references like `Id`, `severityText`, `@timestamp`
-        // survive round-tripping through Calcite's schema. Trino treats quoted identifiers as
-        // case-sensitive, so as long as RelToSql quotes column references we're fine.
-        String trinoName = name;
+        String trinoName = name.toLowerCase(java.util.Locale.ROOT);
 
         // Check asRawJson flag
         if (isRawJson(name, trinoMeta)) {

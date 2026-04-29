@@ -34,6 +34,21 @@ public final class RowFieldDecoder implements FieldDecoder
             output.appendNull();
             return;
         }
+        // OpenSearch `object` fields can contain either a single object or an
+        // array of objects (both share the same mapping). When _source returns a
+        // list, collapse it to the first element — matches v2 engine behavior
+        // for object fields that happen to hold arrays at index time.
+        if (value instanceof List<?> list) {
+            if (list.isEmpty()) {
+                output.appendNull();
+                return;
+            }
+            value = list.get(0);
+            if (value == null) {
+                output.appendNull();
+                return;
+            }
+        }
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) value;
         ((RowBlockBuilder) output).buildEntry(fieldBuilders -> {

@@ -88,8 +88,10 @@ public class OmniEngineService {
         return;
       }
       listener.onResponse(QueryResponseAdapter.adapt(collected.columns(), collected.rows(), dispatch.rowType()));
-    } catch (Exception e) {
-      listener.onFailure(classify(e));
+    } catch (Throwable t) {
+      // Catch Error (AssertionError from Calcite RelToSql etc.) so the OpenSearch node
+      // doesn't exit on uncaught Error. Everything surfaces as a normal query failure.
+      listener.onFailure(classifyThrowable(t));
     }
   }
 
@@ -125,8 +127,8 @@ public class OmniEngineService {
       listener.onResponse(
           new ExecutionEngine.ExplainResponse(
               new ExecutionEngine.ExplainResponseNode(plan.toString())));
-    } catch (Exception e) {
-      listener.onFailure(classify(e));
+    } catch (Throwable t) {
+      listener.onFailure(classifyThrowable(t));
     }
   }
 
@@ -231,6 +233,23 @@ public class OmniEngineService {
     }
     query.markResultsConsumedIfReady();
     return new CollectedResults(columns == null ? List.of() : columns, rows, error);
+  }
+
+  /**
+   * Classify any Throwable (including Error/AssertionError that escapes Calcite/Trino internals)
+   * into a normal query exception so the OpenSearch node never exits on an uncaught Error.
+   */
+  private Exception classifyThrowable(Throwable cause) {
+    if (cause instanceof Error error) {
+      String name = error.getClass().getSimpleName();
+      String msg = error.getMessage() == null ? name : error.getMessage();
+      msg = translateErrorMessage(msg);
+      QueryEngineException wrapped = new QueryEngineException(
+              "Query failed (" + name + "): " + msg, error);
+      log.error("Uncaught Error during PPL execution: {}", msg, error);
+      return wrapped;
+    }
+    return classify(cause);
   }
 
   private Exception classify(Object cause) {

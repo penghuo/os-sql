@@ -38,42 +38,59 @@ public final class QueryResponseAdapter {
    */
   public static ExecutionEngine.QueryResponse adapt(
       List<Column> columns, List<List<Object>> rows, RelDataType pplRowType) {
+    // Trino returns columns in its own order (often alphabetical for SELECT *). PPL expects
+    // columns in the order declared by the planned RelNode (pplRowType). When pplRowType is
+    // available we build the schema in PPL order and reorder each row's values to match.
     int n = columns.size();
-    List<Schema.Column> schemaCols = new ArrayList<>(n);
-    List<String> names = new ArrayList<>(n);
-    List<ExprType> types = new ArrayList<>(n);
 
-    // Build a map from column name → RelDataTypeField for fast lookup
-    Map<String, RelDataTypeField> pplFields = new LinkedHashMap<>();
+    // Index Trino columns by name for reorder lookup.
+    Map<String, Integer> trinoIndexByName = new LinkedHashMap<>();
+    for (int i = 0; i < n; i++) {
+      trinoIndexByName.put(columns.get(i).getName(), i);
+    }
+
+    // Determine the authoritative column order + types.
+    List<String> pplNames;
+    List<ExprType> pplTypes;
+    List<Schema.Column> schemaCols = new ArrayList<>(n);
+
     if (pplRowType != null) {
-      for (RelDataTypeField field : pplRowType.getFieldList()) {
-        pplFields.put(field.getName(), field);
+      List<RelDataTypeField> fields = pplRowType.getFieldList();
+      pplNames = new ArrayList<>(fields.size());
+      pplTypes = new ArrayList<>(fields.size());
+      for (RelDataTypeField field : fields) {
+        String name = field.getName();
+        ExprType t = CalciteToExprTypeMapper.toExprType(field.getType());
+        pplNames.add(name);
+        pplTypes.add(t);
+        schemaCols.add(new Schema.Column(name, null, t));
+      }
+    } else {
+      pplNames = new ArrayList<>(n);
+      pplTypes = new ArrayList<>(n);
+      for (Column c : columns) {
+        String name = c.getName();
+        ExprType t = TrinoTypeMapper.toExprType(c.getType());
+        pplNames.add(name);
+        pplTypes.add(t);
+        schemaCols.add(new Schema.Column(name, null, t));
       }
     }
 
-    for (Column c : columns) {
-      String name = c.getName();
-      ExprType t;
-      // Prefer Calcite's type if available (it has PPL's type inference baked in)
-      RelDataTypeField pplField = pplFields.get(name);
-      if (pplField != null) {
-        t = CalciteToExprTypeMapper.toExprType(pplField.getType());
-      } else {
-        // Fallback to Trino type mapping
-        t = TrinoTypeMapper.toExprType(c.getType());
-      }
-      names.add(name);
-      types.add(t);
-      schemaCols.add(new Schema.Column(name, null, t));
+    // Precompute Trino column index for each PPL column (by name match).
+    int[] trinoIdx = new int[pplNames.size()];
+    for (int i = 0; i < pplNames.size(); i++) {
+      Integer idx = trinoIndexByName.get(pplNames.get(i));
+      trinoIdx[i] = idx == null ? i : idx;
     }
 
     List<ExprValue> results = new ArrayList<>(rows.size());
     for (List<Object> row : rows) {
       Map<String, ExprValue> tuple = new LinkedHashMap<>();
-      int cells = Math.min(row.size(), n);
-      for (int i = 0; i < cells; i++) {
-        Object raw = row.get(i);
-        tuple.put(names.get(i), toExprValue(raw, types.get(i)));
+      for (int i = 0; i < pplNames.size(); i++) {
+        int src = trinoIdx[i];
+        Object raw = src < row.size() ? row.get(src) : null;
+        tuple.put(pplNames.get(i), toExprValue(raw, pplTypes.get(i)));
       }
       results.add(ExprTupleValue.fromExprValueMap(tuple));
     }

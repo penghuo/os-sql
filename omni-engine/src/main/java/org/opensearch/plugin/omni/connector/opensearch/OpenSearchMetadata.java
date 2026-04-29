@@ -392,6 +392,14 @@ public class OpenSearchMetadata
         Map<String, Object> source = mapping.sourceAsMap();
         Map<String, Object> properties = (Map<String, Object>) source.get("properties");
         Map<String, Object> meta = (Map<String, Object>) source.get("_meta");
-        return OpenSearchTypeMapper.mapColumns(properties, meta);
+        // OpenSearch stores dynamic mappings in alphabetical order via sourceAsMap().
+        // The legacy Calcite code path iterated fields through a HashMap in
+        // OpenSearchDescribeIndexRequest.getFieldTypes(), producing a deterministic but
+        // hash-based column order. Existing integration tests (CalcitePPLBasicIT,
+        // PPLBankIT, etc.) rely on that ordering — their data-row matchers are
+        // positional within each row. Re-wrapping properties in a HashMap here reproduces
+        // that iteration order so we match the same behavior.
+        Map<String, Object> hashOrdered = properties == null ? null : new HashMap<>(properties);
+        return OpenSearchTypeMapper.mapColumns(hashOrdered, meta);
     }
 }

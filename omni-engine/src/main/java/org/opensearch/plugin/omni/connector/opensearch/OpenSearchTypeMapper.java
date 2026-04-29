@@ -76,7 +76,10 @@ public final class OpenSearchTypeMapper
 
         // Nested object
         if (mapping.containsKey("properties")) {
-            Map<String, Object> subProperties = (Map<String, Object>) mapping.get("properties");
+            // Re-wrap in HashMap to match legacy OpenSearchDescribeIndexRequest.getFieldTypes()
+            // iteration order. See OpenSearchMetadata.getColumnsForSingleIndex for rationale.
+            Map<String, Object> subProperties = new HashMap<>(
+                    (Map<String, Object>) mapping.get("properties"));
             List<RowType.Field> rowFields = new ArrayList<>();
             for (Map.Entry<String, Object> entry : subProperties.entrySet()) {
                 Map<String, Object> subMapping = (Map<String, Object>) entry.getValue();

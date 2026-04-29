@@ -36,6 +36,58 @@ public class OmniSqlDialect extends TrinoSqlDialect
     {
         String opName = call.getOperator().getName();
 
+        // SPAN(value, interval, unit?)  — PPL time/numeric bucketing
+        //   SPAN(ts, N, 'w'|'d'|'h'|'m'|'s'|'mo'|'y')  → date_trunc(unit, ts)  (we ignore N for single-unit buckets)
+        //   SPAN(num, N)                                → floor(num / N) * N
+        // Best-effort — N is dropped for time ranges.
+        if (opName.equalsIgnoreCase("SPAN")) {
+            if (call.operandCount() == 3 && call.operand(2) instanceof SqlCharStringLiteral unitLit) {
+                String unit = unitLit.getNlsString().getValue().toLowerCase();
+                String trinoUnit = switch (unit) {
+                    case "y", "year", "years" -> "year";
+                    case "mo", "month", "months" -> "month";
+                    case "w", "week", "weeks" -> "week";
+                    case "d", "day", "days" -> "day";
+                    case "h", "hour", "hours" -> "hour";
+                    case "m", "minute", "minutes" -> "minute";
+                    case "s", "second", "seconds" -> "second";
+                    default -> unit;
+                };
+                writer.keyword("date_trunc");
+                SqlWriter.Frame frame = writer.startList("(", ")");
+                writer.literal("'" + trinoUnit + "'");
+                writer.sep(",");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.endList(frame);
+                return;
+            }
+            if (call.operandCount() == 2) {
+                // SPAN(num, N) → floor(num / N) * N
+                SqlWriter.Frame frame = writer.startList("(", ")");
+                writer.keyword("FLOOR");
+                SqlWriter.Frame floorFrame = writer.startList("(", ")");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" / ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.endList(floorFrame);
+                writer.print(" * ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.endList(frame);
+                return;
+            }
+        }
+
+        // SAFE_CAST(expr AS type) → TRY_CAST(expr AS type)  (Calcite BigQuery name → Trino)
+        if (opName.equalsIgnoreCase("SAFE_CAST") && call.operandCount() == 2) {
+            writer.keyword("TRY_CAST");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.keyword("AS");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
         // TIMESTAMP(literal string) → TIMESTAMP 'literal' (literal prefix)
         // TIMESTAMP(expr)          → CAST(expr AS TIMESTAMP)
         if (opName.equals("TIMESTAMP") && call.operandCount() == 1) {

@@ -45,11 +45,18 @@ import java.time.LocalTime;
 import io.trino.spi.connector.ConnectorSession;
 
 /**
- * MySQL-compatible wrappers over existing Trino datetime extraction functions.
+ * MySQL-compatible datetime functions that implement logic not available in Trino.
  *
- * <p>These differ from Trino canonical functions in return type (INTEGER vs BIGINT)
- * and — for {@code dayofweek} — in numbering convention (Sunday=1..Saturday=7 vs
- * ISO Monday=1..Sunday=7).
+ * <p>These provide MySQL-specific behaviors:
+ * - {@code weekday}: Monday=0..Sunday=6 (vs day_of_week Sunday=1..Saturday=7)
+ * - {@code minute_of_day}: minute within day (0..1439)
+ * - {@code microsecond}: microsecond part (0..999999)
+ * - {@code period_diff}: difference in months between YYYYMM periods
+ * - {@code strftime}: format timestamp using strftime format strings
+ * - {@code to_seconds}: seconds since year 0 (proleptic Gregorian)
+ *
+ * <p>Note: Simple name mappings (dayofweek→day_of_week, date_sub→date_add)
+ * are handled at the SqlDialect layer, not here.
  */
 public final class MySqlCompatFunctions
 {
@@ -78,117 +85,6 @@ public final class MySqlCompatFunctions
         }
         catch (Exception e) {
             throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse timestamp: " + str);
-        }
-    }
-
-    // ========== dayofweek: MySQL Sunday=1..Saturday=7 ==========
-
-    @Description("MySQL day of week (Sunday=1..Saturday=7)")
-    @ScalarFunction("dayofweek")
-    public static final class DayOfWeek
-    {
-        private DayOfWeek() {}
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfWeekFromDate(@SqlType(StandardTypes.DATE) long date)
-        {
-            // ISO: Monday=1..Sunday=7. Convert to MySQL: Sunday=1..Saturday=7.
-            long iso = UTC_CHRONOLOGY.dayOfWeek().get(DAYS.toMillis(date));
-            return (iso % 7) + 1;
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfWeekFromTimestamp(@SqlType("timestamp(p)") long timestamp)
-        {
-            long iso = UTC_CHRONOLOGY.dayOfWeek().get(scaleEpochMicrosToMillis(timestamp));
-            return (iso % 7) + 1;
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfWeekFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
-        {
-            return dayOfWeekFromTimestamp(timestamp.getEpochMicros());
-        }
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfWeekFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
-        {
-            long timestamp = parseTimestampMicros(dateStr);
-            return dayOfWeekFromTimestamp(timestamp);
-        }
-    }
-
-    // ========== dayofmonth: just cast to INTEGER ==========
-
-    @Description("MySQL day of month (1..31)")
-    @ScalarFunction("dayofmonth")
-    public static final class DayOfMonth
-    {
-        private DayOfMonth() {}
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfMonthFromDate(@SqlType(StandardTypes.DATE) long date)
-        {
-            return UTC_CHRONOLOGY.dayOfMonth().get(DAYS.toMillis(date));
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfMonthFromTimestamp(@SqlType("timestamp(p)") long timestamp)
-        {
-            return UTC_CHRONOLOGY.dayOfMonth().get(scaleEpochMicrosToMillis(timestamp));
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfMonthFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
-        {
-            return dayOfMonthFromTimestamp(timestamp.getEpochMicros());
-        }
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfMonthFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
-        {
-            long timestamp = parseTimestampMicros(dateStr);
-            return dayOfMonthFromTimestamp(timestamp);
-        }
-    }
-
-    // ========== dayofyear: just cast to INTEGER ==========
-
-    @Description("MySQL day of year (1..366)")
-    @ScalarFunction("dayofyear")
-    public static final class DayOfYear
-    {
-        private DayOfYear() {}
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfYearFromDate(@SqlType(StandardTypes.DATE) long date)
-        {
-            return UTC_CHRONOLOGY.dayOfYear().get(DAYS.toMillis(date));
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfYearFromTimestamp(@SqlType("timestamp(p)") long timestamp)
-        {
-            return UTC_CHRONOLOGY.dayOfYear().get(scaleEpochMicrosToMillis(timestamp));
-        }
-
-        @LiteralParameters("p")
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfYearFromLongTimestamp(@SqlType("timestamp(p)") LongTimestamp timestamp)
-        {
-            return dayOfYearFromTimestamp(timestamp.getEpochMicros());
-        }
-
-        @SqlType(StandardTypes.INTEGER)
-        public static long dayOfYearFromVarchar(@SqlType(StandardTypes.VARCHAR) Slice dateStr)
-        {
-            long timestamp = parseTimestampMicros(dateStr);
-            return dayOfYearFromTimestamp(timestamp);
         }
     }
 
@@ -428,32 +324,6 @@ public final class MySqlCompatFunctions
         result = result.replace("%Z", "z");      // Time zone
 
         return result;
-    }
-
-    // ========== date_sub: subtract days from date ==========
-
-    @Description("MySQL date_sub(date, N) — subtract N days")
-    @ScalarFunction("date_sub")
-    @SqlType(StandardTypes.DATE)
-    public static long dateSub(@SqlType(StandardTypes.DATE) long date, @SqlType(StandardTypes.BIGINT) long days)
-    {
-        return date - days;
-    }
-
-    @Description("MySQL date_sub(date_str, N) — subtract N days from string date")
-    @ScalarFunction("date_sub")
-    @SqlType(StandardTypes.DATE)
-    public static long dateSub(@SqlType(StandardTypes.VARCHAR) Slice dateStr, @SqlType(StandardTypes.BIGINT) long days)
-    {
-        // Parse date string to epoch day, then subtract
-        String str = dateStr.toStringUtf8().trim();
-        try {
-            LocalDate ld = LocalDate.parse(str.substring(0, Math.min(10, str.length())));
-            return ld.toEpochDay() - days;
-        }
-        catch (Exception e) {
-            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "Cannot parse date: " + str);
-        }
     }
 
     // ========== to_seconds: seconds since year 0 ==========

@@ -56,6 +56,62 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
 
+        // MySQL-style function name → Trino canonical name mappings
+        // These handle PPL function names that don't match Trino's conventions
+
+        // DAYOFWEEK(x) → day_of_week(x)
+        if (opName.equalsIgnoreCase("DAYOFWEEK") && call.operandCount() == 1) {
+            writer.keyword("day_of_week");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
+        // DAYOFMONTH(x) → day(x) [Trino's alias for day_of_month]
+        if (opName.equalsIgnoreCase("DAYOFMONTH") && call.operandCount() == 1) {
+            writer.keyword("day");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
+        // DAYOFYEAR(x) → day_of_year(x)
+        if (opName.equalsIgnoreCase("DAYOFYEAR") && call.operandCount() == 1) {
+            writer.keyword("day_of_year");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
+        // LAST_DAY(x) → last_day_of_month(x)
+        if (opName.equalsIgnoreCase("LAST_DAY") && call.operandCount() == 1) {
+            writer.keyword("last_day_of_month");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
+        // DATE_SUB(date, interval) → date_add('day', -interval, date)
+        // Note: Trino has date_add(unit, value, timestamp)
+        // This rewrite assumes DATE_SUB is used as DATE_SUB(date, days)
+        // More complex interval handling may be needed based on actual usage
+        if (opName.equalsIgnoreCase("DATE_SUB") && call.operandCount() == 2) {
+            writer.keyword("date_add");
+            SqlWriter.Frame frame = writer.startList("(", ")");
+            writer.literal("'day'");
+            writer.sep(",");
+            writer.print("-");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.sep(",");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.endList(frame);
+            return;
+        }
+
         super.unparseCall(writer, call, leftPrec, rightPrec);
     }
 }

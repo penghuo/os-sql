@@ -124,8 +124,6 @@ import io.trino.operator.scalar.CombineHashFunction;
 import io.trino.operator.scalar.ConcatWsFunction;
 import io.trino.operator.scalar.DataSizeFunctions;
 import io.trino.operator.scalar.DateTimeFunctions;
-import io.trino.operator.scalar.MySqlCompatFunctions;
-import io.trino.operator.scalar.MySqlTimeFunctions;
 import io.trino.operator.scalar.EmptyMapConstructor;
 import io.trino.operator.scalar.FailureFunction;
 import io.trino.operator.scalar.FormatNumberFunction;
@@ -189,7 +187,6 @@ import io.trino.operator.scalar.timestamp.DateFormat;
 import io.trino.operator.scalar.timestamp.DateToTimestampCast;
 import io.trino.operator.scalar.timestamp.DateTrunc;
 import io.trino.operator.scalar.timestamp.ExtractDay;
-import io.trino.operator.scalar.timestamp.ExtractDayName;
 import io.trino.operator.scalar.timestamp.ExtractDayOfWeek;
 import io.trino.operator.scalar.timestamp.ExtractDayOfYear;
 import io.trino.operator.scalar.timestamp.ExtractHour;
@@ -439,11 +436,6 @@ public final class SystemFunctionBundle
                 .scalars(BitwiseFunctions.class)
                 .scalars(DateTimeFunctions.class)
                 .scalar(DateTimeFunctions.FromUnixtimeNanosDecimal.class)
-                .scalar(MySqlCompatFunctions.Weekday.class)
-                .scalar(MySqlCompatFunctions.MinuteOfDay.class)
-                .scalar(MySqlCompatFunctions.Microsecond.class)
-                .scalars(MySqlCompatFunctions.class)
-                .scalars(MySqlTimeFunctions.class)
                 .scalars(JsonFunctions.class)
                 .scalars(JsonInputFunctions.class)
                 .scalars(JsonOutputFunctions.class)
@@ -637,7 +629,6 @@ public final class SystemFunctionBundle
                 .scalar(ExtractMillisecond.class)
                 .scalar(ExtractDayOfYear.class)
                 .scalar(ExtractDayOfWeek.class)
-                .scalar(ExtractDayName.class)
                 .scalar(ExtractWeekOfYear.class)
                 .scalar(ExtractYearOfWeek.class)
                 .scalar(LastDayOfMonth.class);

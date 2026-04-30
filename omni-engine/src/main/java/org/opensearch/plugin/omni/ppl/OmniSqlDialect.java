@@ -1035,6 +1035,29 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP)))");
             return;
         }
+        // WIDTH_BUCKET(operand, bucketCount, range, maxVal) — PPL's bin emits this shape,
+        // which does not match Trino's width_bucket(operand, bound1, bound2, count).
+        // Translate:
+        //   bound1 = maxVal - range (min)
+        //   bound2 = maxVal         (exclusive upper)
+        //   count  = bucketCount
+        // Use TRY_CAST(... AS DOUBLE) so numerics pass through cleanly; timestamp operands
+        // receive NULL from TRY_CAST (the bin output will be NULL for those rows rather than
+        // erroring).
+        if (opName.equalsIgnoreCase("WIDTH_BUCKET") && call.operandCount() == 4) {
+            writer.print("width_bucket(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE), TRY_CAST((");
+            call.operand(3).unparse(writer, 0, 0);
+            writer.print(") - (");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(") AS DOUBLE), TRY_CAST(");
+            call.operand(3).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE), CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT))");
+            return;
+        }
         // ADDDATE(date, days_or_interval) → date + interval. PPL passes either a BIGINT days
         // or an INTERVAL. Trino supports `ts + interval` natively; for a BIGINT we convert to
         // days-interval via multiplication. Detect interval vs numeric by checking if operand

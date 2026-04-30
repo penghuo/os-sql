@@ -89,38 +89,31 @@ public class OmniSqlDialect extends TrinoSqlDialect
                     case "s", "second", "seconds" -> "second";
                     default -> unit;
                 };
-                writer.keyword("date_trunc");
-                SqlWriter.Frame frame = writer.startList("(", ")");
-                writer.literal("'" + trinoUnit + "'");
-                writer.sep(",");
+                writer.print("date_trunc('" + trinoUnit + "', ");
                 call.operand(0).unparse(writer, 0, 0);
-                writer.endList(frame);
+                writer.print(")");
                 return;
             }
             if (call.operandCount() == 2) {
                 // SPAN(num, N) → floor(num / N) * N
-                SqlWriter.Frame frame = writer.startList("(", ")");
-                writer.keyword("FLOOR");
-                SqlWriter.Frame floorFrame = writer.startList("(", ")");
+                writer.print("(FLOOR(");
                 call.operand(0).unparse(writer, 0, 0);
                 writer.print(" / ");
                 call.operand(1).unparse(writer, 0, 0);
-                writer.endList(floorFrame);
-                writer.print(" * ");
+                writer.print(") * ");
                 call.operand(1).unparse(writer, 0, 0);
-                writer.endList(frame);
+                writer.print(")");
                 return;
             }
         }
 
         // SAFE_CAST(expr AS type) → TRY_CAST(expr AS type)  (Calcite BigQuery name → Trino)
         if (opName.equalsIgnoreCase("SAFE_CAST") && call.operandCount() == 2) {
-            writer.keyword("TRY_CAST");
-            SqlWriter.Frame frame = writer.startList("(", ")");
+            writer.print("TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
+            writer.print(" AS ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
 
@@ -130,12 +123,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
             if (call.operand(0) instanceof SqlCharStringLiteral literal) {
                 writer.literal("TIMESTAMP '" + literal.getNlsString().getValue() + "'");
             } else {
-                writer.keyword("CAST");
-                SqlWriter.Frame frame = writer.startList("(", ")");
+                writer.print("CAST(");
                 call.operand(0).unparse(writer, 0, 0);
-                writer.keyword("AS");
-                writer.keyword("TIMESTAMP");
-                writer.endList(frame);
+                writer.print(" AS TIMESTAMP)");
             }
             return;
         }
@@ -146,12 +136,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
             if (call.operand(0) instanceof SqlCharStringLiteral timeLit) {
                 writer.literal("TIME '" + timeLit.getNlsString().getValue() + "'");
             } else {
-                writer.keyword("CAST");
-                SqlWriter.Frame frame = writer.startList("(", ")");
+                writer.print("CAST(");
                 call.operand(0).unparse(writer, 0, 0);
-                writer.keyword("AS");
-                writer.keyword("TIME");
-                writer.endList(frame);
+                writer.print(" AS TIME)");
             }
             return;
         }
@@ -162,12 +149,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
             if (call.operand(0) instanceof SqlCharStringLiteral dateLit) {
                 writer.literal("DATE '" + dateLit.getNlsString().getValue() + "'");
             } else {
-                writer.keyword("CAST");
-                SqlWriter.Frame frame = writer.startList("(", ")");
+                writer.print("CAST(");
                 call.operand(0).unparse(writer, 0, 0);
-                writer.keyword("AS");
-                writer.keyword("DATE");
-                writer.endList(frame);
+                writer.print(" AS DATE)");
             }
             return;
         }
@@ -176,12 +160,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
         if (opName.equals("EXTRACT") && call.operandCount() == 2
                 && call.operand(0) instanceof SqlCharStringLiteral unitLiteral) {
             String unit = unitLiteral.getNlsString().getValue().toUpperCase();
-            writer.keyword("EXTRACT");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.keyword(unit);
-            writer.keyword("FROM");
+            writer.print("EXTRACT(" + unit + " FROM ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
 
@@ -212,17 +193,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 case "WEEK" -> "week_of_year";
                 default -> opName.toLowerCase();
             };
-            writer.keyword(trinoName);
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            // Cast to TIMESTAMP so varchar inputs are accepted. TIMESTAMP(date) and
-            // TIMESTAMP(timestamp) are both valid in Trino (identity cast).
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.print(trinoName + "(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
-            writer.keyword("TIMESTAMP");
-            writer.endList(castFrame);
-            writer.endList(frame);
+            writer.print(" AS TIMESTAMP))");
             return;
         }
 
@@ -269,29 +242,21 @@ public class OmniSqlDialect extends TrinoSqlDialect
         }
         // DATEDIFF(a, b) → date_diff('day', b, a) — PPL semantics: a − b in days
         if (opName.equalsIgnoreCase("DATEDIFF") && call.operandCount() == 2) {
-            writer.keyword("date_diff");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.literal("'day'");
-            writer.sep(",");
+            writer.print("date_diff('day', ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.sep(",");
+            writer.print(", ");
             call.operand(0).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
         // TIMESTAMPADD(unit, interval, ts) → date_add(lowercase_unit_literal, interval, ts)
         if (opName.equalsIgnoreCase("TIMESTAMPADD") && call.operandCount() == 3) {
-            writer.keyword("date_add");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            // Calcite emits the unit as a special SqlIntervalQualifier keyword in operand(0);
-            // fall back to printing its toString, lowercased and quoted.
             String unit = call.operand(0).toString().toLowerCase();
-            writer.literal("'" + unit + "'");
-            writer.sep(",");
+            writer.print("date_add('" + unit + "', ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.sep(",");
+            writer.print(", ");
             call.operand(2).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
         // REGEXP_CONTAINS(str, pattern) → regexp_like(str, pattern)
@@ -300,19 +265,12 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)
-        // Trino's json_extract requires JSON type for the first arg; OpenSearch text fields are VARCHAR.
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 2) {
-            writer.keyword("json_extract");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.print("json_extract(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
-            writer.keyword("JSON");
-            writer.endList(castFrame);
-            writer.sep(",");
+            writer.print(" AS JSON), ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
         // VALUES(x) → array_agg(x) — PPL collects distinct values as an array
@@ -320,19 +278,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "array_agg", call);
             return;
         }
-        // TAKE(x, n) → first n values — use array_agg then slice; collapse to array_agg
+        // TAKE(x, n) → slice(array_agg(x), 1, n)
         if (opName.equalsIgnoreCase("TAKE") && call.operandCount() == 2) {
-            writer.keyword("slice");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.keyword("array_agg");
-            SqlWriter.Frame aggFrame = writer.startList("(", ")");
+            writer.print("slice(array_agg(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.endList(aggFrame);
-            writer.sep(",");
-            writer.literal("1");
-            writer.sep(",");
+            writer.print("), 1, ");
             call.operand(1).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
         // MKTIME(y, m, d, h, mi, s) → date literal → Trino has no single function, omit
@@ -460,83 +412,48 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
 
-        // TO_DAYS(date) → day of rata die; Trino: date_diff('day', DATE '0000-01-01', date)
+        // TO_DAYS(date) → date_diff('day', DATE '0000-01-01', CAST(date AS DATE))
         if (opName.equalsIgnoreCase("TO_DAYS") && call.operandCount() == 1) {
-            writer.keyword("date_diff");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.literal("'day'");
-            writer.sep(",");
-            writer.literal("DATE '0000-01-01'");
-            writer.sep(",");
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.print("date_diff('day', DATE '0000-01-01', CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
-            writer.keyword("DATE");
-            writer.endList(castFrame);
-            writer.endList(frame);
+            writer.print(" AS DATE))");
             return;
         }
-        // CIDRMATCH(ip, cidr) → contains(..., cast(ip as ipaddress))
-        // simplest: regex check — but Trino has contains for IPADDRESS type only.
-        // Defer: fall through (still generates function-not-found) — unknown enough to need proper UDF.
-        // ASCII(x) → codepoint(cast(x as varchar(1))) — but simpler: Trino has no ASCII, use codepoint
+        // ASCII(x) → codepoint(CAST(x AS VARCHAR(1)))
         if (opName.equalsIgnoreCase("ASCII") && call.operandCount() == 1) {
-            writer.keyword("codepoint");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.print("codepoint(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
-            writer.keyword("VARCHAR(1)");
-            writer.endList(castFrame);
-            writer.endList(frame);
+            writer.print(" AS VARCHAR(1)))");
             return;
         }
-        // MONTHNAME(x) → format_datetime(cast(x as timestamp), 'MMMM')
+        // MONTHNAME(x) → format_datetime(CAST(x AS TIMESTAMP), 'MMMM')
         if (opName.equalsIgnoreCase("MONTHNAME") && call.operandCount() == 1) {
-            writer.keyword("format_datetime");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.keyword("CAST");
-            SqlWriter.Frame castFrame = writer.startList("(", ")");
+            writer.print("format_datetime(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.keyword("AS");
-            writer.keyword("TIMESTAMP");
-            writer.endList(castFrame);
-            writer.sep(",");
-            writer.literal("'MMMM'");
-            writer.endList(frame);
+            writer.print(" AS TIMESTAMP), 'MMMM')");
             return;
         }
 
-        // DATE_SUB(date, interval) → date_add('day', -interval, date)
-        // Note: Trino has date_add(unit, value, timestamp)
-        // This rewrite assumes DATE_SUB is used as DATE_SUB(date, days)
-        // More complex interval handling may be needed based on actual usage
+        // DATE_SUB(date, N)  → date_add('day', -N, date)
         if (opName.equalsIgnoreCase("DATE_SUB") && call.operandCount() == 2) {
-            writer.keyword("date_add");
-            SqlWriter.Frame frame = writer.startList("(", ")");
-            writer.literal("'day'");
-            writer.sep(",");
-            writer.print("-");
+            writer.print("date_add('day', -(");
             call.operand(1).unparse(writer, 0, 0);
-            writer.sep(",");
+            writer.print("), ");
             call.operand(0).unparse(writer, 0, 0);
-            writer.endList(frame);
+            writer.print(")");
             return;
         }
-
         super.unparseCall(writer, call, leftPrec, rightPrec);
     }
 
     /** Helper: write "funcName(arg0, arg1, ...)" using call's existing operands. */
     private static void unparseFunctionLike(SqlWriter writer, String funcName, SqlCall call) {
-        writer.keyword(funcName);
-        SqlWriter.Frame frame = writer.startList("(", ")");
+        writer.print(funcName);
+        writer.print("(");
         for (int i = 0; i < call.operandCount(); i++) {
-            if (i > 0) writer.sep(",");
+            if (i > 0) writer.print(", ");
             call.operand(i).unparse(writer, 0, 0);
         }
-        writer.endList(frame);
+        writer.print(")");
     }
 }

@@ -143,15 +143,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
 
-        // DATE_ADD('unit', interval-or-bigint, ts) — PPL emits INTERVAL for the increment, which
-        // Trino's date_add does not accept. Rewrite as "ts + interval" (Trino supports this
-        // natively and it preserves timestamp precision).
+        // DATE_ADD('unit', delta, ts) — Trino's date_add takes BIGINT delta; when PPL passes
+        // an INTERVAL we need `ts + interval` instead.
         if (opName.equalsIgnoreCase("DATE_ADD") && call.operandCount() == 3) {
-            writer.print("(CAST(");
-            call.operand(2).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP(3)) + ");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(")");
+            if (isIntervalOperand(call.operand(1))) {
+                writer.print("(CAST(");
+                call.operand(2).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP(3)) + ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+            } else {
+                writer.print("date_add(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(", CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT), CAST(");
+                call.operand(2).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP(3)))");
+            }
             return;
         }
 
@@ -321,15 +330,23 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS DATE))");
             return;
         }
-        // TIMESTAMPADD(unit, interval, ts) — Trino's date_add needs BIGINT, not INTERVAL.
-        // Use native "ts + interval" and coerce the timestamp to TIMESTAMP(3) so precision
-        // doesn't collide with literal timestamp(0) sources.
+        // TIMESTAMPADD(unit, delta, ts) — same ambiguity as DATE_ADD. If delta is an interval,
+        // use ts + interval; otherwise pass delta as BIGINT to date_add.
         if (opName.equalsIgnoreCase("TIMESTAMPADD") && call.operandCount() == 3) {
-            writer.print("(CAST(");
-            call.operand(2).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP(3)) + ");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(")");
+            if (isIntervalOperand(call.operand(1))) {
+                writer.print("(CAST(");
+                call.operand(2).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP(3)) + ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+            } else {
+                String unit = call.operand(0).toString().toLowerCase();
+                writer.print("date_add('" + unit + "', CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT), CAST(");
+                call.operand(2).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP(3)))");
+            }
             return;
         }
         // REGEXP_CONTAINS(str, pattern) → regexp_like(str, pattern)

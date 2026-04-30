@@ -357,16 +357,22 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS VARCHAR)");
             return;
         }
-        // STRFTIME(ts_or_epoch, fmt) → format_datetime(TRY_CAST(x AS TIMESTAMP) or from_unixtime, fmt)
-        // Try TRY_CAST first (handles varchar and timestamp), fall back to from_unixtime for numerics.
+        // STRFTIME(ts_or_epoch, fmt) → format_datetime(...)
+        // If arg is numeric literal, use from_unixtime directly. Otherwise COALESCE try_cast paths.
         if (opName.equalsIgnoreCase("STRFTIME") && call.operandCount() == 2) {
-            writer.print("format_datetime(COALESCE(TRY_CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP), from_unixtime(TRY_CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS DOUBLE))), ");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(")");
+            if (call.operand(0).toString().matches("^\\s*-?[0-9.E]+\\s*$")) {
+                writer.print("format_datetime(from_unixtime(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print("), ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+            } else {
+                writer.print("format_datetime(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP), ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+            }
             return;
         }
         // DATETIME(x) / DATETIME(x, zone)  — treat as CAST(x AS TIMESTAMP)
@@ -420,13 +426,17 @@ public class OmniSqlDialect extends TrinoSqlDialect
         }
         // MKTIME(hours) → time literal; Trino has no mktime — defer (fall through, fail gracefully)
 
-        // CTIME(epoch) → format_datetime with from_unixtime fallback
+        // CTIME(epoch) → format_datetime(from_unixtime(epoch))
         if (opName.equalsIgnoreCase("CTIME") && call.operandCount() == 1) {
-            writer.print("format_datetime(COALESCE(TRY_CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP), from_unixtime(TRY_CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS DOUBLE))), 'EEE MMM dd HH:mm:ss yyyy')");
+            if (call.operand(0).toString().matches("^\\s*-?[0-9.E]+\\s*$")) {
+                writer.print("format_datetime(from_unixtime(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print("), 'EEE MMM dd HH:mm:ss yyyy')");
+            } else {
+                writer.print("format_datetime(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP), 'EEE MMM dd HH:mm:ss yyyy')");
+            }
             return;
         }
         // CONVERT(x, type) → CAST(x AS type) — PPL compatibility

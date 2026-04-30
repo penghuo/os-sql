@@ -194,6 +194,12 @@ public class OpenSearchPageSource
 
         // Create doc_values readers for this leaf
         LeafReader leafReader = leaf.reader();
+        // _primary_term doc_values exist only on root docs, never on nested child docs.
+        // We use this to skip nested children when scanning Lucene directly, so that a doc
+        // with N nested entries still yields one row per root doc (matching OpenSearch's
+        // usual search behavior).
+        final org.apache.lucene.index.NumericDocValues primaryTermDV =
+                leafReader.getNumericDocValues("_primary_term");
         DocValuesReader[] leafDvReaders = new DocValuesReader[columns.size()];
         boolean leafNeedsSource = false;
         for (int i = 0; i < columns.size(); i++) {
@@ -263,6 +269,14 @@ public class OpenSearchPageSource
                 if (targetMinDoc >= 0 && doc < targetMinDoc) return;
                 if (targetMaxDoc >= 0 && doc >= targetMaxDoc) {
                     throw new CollectionTerminatedException();
+                }
+
+                // Skip nested child docs: only root docs have _primary_term doc_values.
+                // This matches OpenSearch search semantics (one hit per root doc, not per
+                // nested inner entry). If primaryTermDV is null the index has no
+                // _primary_term field; leave every doc as-is (older index format).
+                if (primaryTermDV != null && !primaryTermDV.advanceExact(doc)) {
+                    return;
                 }
 
                 // Save doc ID for batch columns

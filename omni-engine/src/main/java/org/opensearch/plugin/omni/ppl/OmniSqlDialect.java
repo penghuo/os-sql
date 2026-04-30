@@ -264,11 +264,12 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "regexp_like", call);
             return;
         }
-        // JSON_EXTRACT_ALL(jsonStr)       → CAST(jsonStr AS JSON)   (PPL spath opens full doc)
+        // JSON_EXTRACT_ALL(jsonStr) → CAST(jsonStr AS MAP(VARCHAR, JSON))
+        // PPL's spath materializes the doc as a map so subsequent ['user.name'] subscripts work.
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 1) {
             writer.print("CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS JSON)");
+            writer.print(" AS MAP(VARCHAR, JSON))");
             return;
         }
         // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)
@@ -334,11 +335,14 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS VARCHAR)");
             return;
         }
-        // STRFTIME(ts_or_epoch, fmt) → Trino: format_datetime(CAST(ts_or_epoch AS TIMESTAMP), fmt)
+        // STRFTIME(ts_or_epoch, fmt) → format_datetime(TRY_CAST(x AS TIMESTAMP) or from_unixtime, fmt)
+        // Try TRY_CAST first (handles varchar and timestamp), fall back to from_unixtime for numerics.
         if (opName.equalsIgnoreCase("STRFTIME") && call.operandCount() == 2) {
-            writer.print("format_datetime(CAST(");
+            writer.print("format_datetime(COALESCE(TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP), ");
+            writer.print(" AS TIMESTAMP), from_unixtime(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE))), ");
             call.operand(1).unparse(writer, 0, 0);
             writer.print(")");
             return;
@@ -394,11 +398,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
         }
         // MKTIME(hours) → time literal; Trino has no mktime — defer (fall through, fail gracefully)
 
-        // CTIME(x) → CAST(x AS VARCHAR) of a timestamp — simplest: format_datetime(CAST x as TIMESTAMP, ...)
+        // CTIME(epoch) → format_datetime with from_unixtime fallback
         if (opName.equalsIgnoreCase("CTIME") && call.operandCount() == 1) {
-            writer.print("format_datetime(CAST(");
+            writer.print("format_datetime(COALESCE(TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP), 'EEE MMM dd HH:mm:ss yyyy')");
+            writer.print(" AS TIMESTAMP), from_unixtime(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE))), 'EEE MMM dd HH:mm:ss yyyy')");
             return;
         }
         // CONVERT(x, type) → CAST(x AS type) — PPL compatibility

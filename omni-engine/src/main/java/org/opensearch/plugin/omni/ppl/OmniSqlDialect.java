@@ -626,6 +626,26 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" THEN 1 ELSE 0 END)");
             return;
         }
+        // MD5/SHA1/CRC32 on varchar — Trino expects varbinary, wrap through to_utf8.
+        // Hex output matches MySQL / PPL conventions.
+        if (opName.equalsIgnoreCase("MD5") && call.operandCount() == 1) {
+            writer.print("lower(to_hex(md5(to_utf8(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print("))))");
+            return;
+        }
+        if (opName.equalsIgnoreCase("SHA1") && call.operandCount() == 1) {
+            writer.print("lower(to_hex(sha1(to_utf8(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print("))))");
+            return;
+        }
+        if (opName.equalsIgnoreCase("CRC32") && call.operandCount() == 1) {
+            writer.print("crc32(to_utf8(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print("))");
+            return;
+        }
         // SHA2(str, bits) — Trino has sha256/sha512; pick based on bits
         if (opName.equalsIgnoreCase("SHA2") && call.operandCount() == 2) {
             String bits = call.operand(1).toString().trim();

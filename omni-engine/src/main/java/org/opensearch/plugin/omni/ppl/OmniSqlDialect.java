@@ -264,6 +264,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "regexp_like", call);
             return;
         }
+        // JSON_EXTRACT_ALL(jsonStr)       → CAST(jsonStr AS JSON)   (PPL spath opens full doc)
+        if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS JSON)");
+            return;
+        }
         // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 2) {
             writer.print("json_extract(CAST(");
@@ -375,13 +382,14 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print("]");
             return;
         }
-        // MAKEDATE(year, dayOfYear) → date_add('day', dayOfYear - 1, DATE year||'-01-01')
+        // MAKEDATE(year, dayOfYear) → date_add('day', CAST(dayOfYear AS BIGINT) - 1,
+        //                                        DATE from_iso8601_date(lpad(CAST(CAST(year AS BIGINT) AS VARCHAR),4,'0')||'-01-01'))
         if (opName.equalsIgnoreCase("MAKEDATE") && call.operandCount() == 2) {
-            writer.print("date_add('day', ");
+            writer.print("date_add('day', CAST(");
             call.operand(1).unparse(writer, 0, 0);
-            writer.print(" - 1, CAST(CONCAT(CAST(");
+            writer.print(" AS BIGINT) - 1, CAST(CONCAT(CAST(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS VARCHAR), '-01-01') AS DATE))");
+            writer.print(" AS BIGINT) AS VARCHAR), '-01-01') AS DATE))");
             return;
         }
         // MKTIME(hours) → time literal; Trino has no mktime — defer (fall through, fail gracefully)

@@ -6,8 +6,13 @@
 package org.opensearch.plugin.omni.adapter;
 
 import io.trino.client.Column;
+import io.trino.spi.type.SqlDate;
 import io.trino.spi.type.SqlDecimal;
+import io.trino.spi.type.SqlTime;
+import io.trino.spi.type.SqlTimeWithTimeZone;
 import io.trino.spi.type.SqlTimestamp;
+import io.trino.spi.type.SqlTimestampWithTimeZone;
+import io.trino.spi.type.SqlVarbinary;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -121,12 +126,25 @@ public final class QueryResponseAdapter {
    */
   private static Object normalize(Object raw) {
     if (raw instanceof SqlDecimal decimal) {
-      // TrinoTypeMapper maps DECIMAL→DOUBLE, so convert to double
       return decimal.toBigDecimal().doubleValue();
     }
     if (raw instanceof SqlTimestamp timestamp) {
-      // Return ISO-8601 string format expected by ExprValueUtils for TIMESTAMP
       return timestamp.toString();
+    }
+    if (raw instanceof SqlTimestampWithTimeZone ts) {
+      return ts.toString();
+    }
+    if (raw instanceof SqlDate date) {
+      return date.toString();
+    }
+    if (raw instanceof SqlTime time) {
+      return time.toString();
+    }
+    if (raw instanceof SqlTimeWithTimeZone time) {
+      return time.toString();
+    }
+    if (raw instanceof SqlVarbinary bin) {
+      return bin.getBytes();
     }
     return raw;
   }

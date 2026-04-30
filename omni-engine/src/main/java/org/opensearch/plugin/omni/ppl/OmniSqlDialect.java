@@ -1041,19 +1041,22 @@ public class OmniSqlDialect extends TrinoSqlDialect
         //   bound1 = maxVal - range (min)
         //   bound2 = maxVal         (exclusive upper)
         //   count  = bucketCount
-        // Use TRY_CAST(... AS DOUBLE) so numerics pass through cleanly; timestamp operands
-        // receive NULL from TRY_CAST (the bin output will be NULL for those rows rather than
-        // erroring).
+        // Coerce each non-count arg to DOUBLE via a helper: numeric → cast, timestamp →
+        // to_unixtime(timestamp with time zone) (seconds since epoch).
         if (opName.equalsIgnoreCase("WIDTH_BUCKET") && call.operandCount() == 4) {
-            writer.print("width_bucket(TRY_CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS DOUBLE), TRY_CAST((");
-            call.operand(3).unparse(writer, 0, 0);
+            writer.print("width_bucket(");
+            emitToDouble(writer, call.operand(0));
+            writer.print(", ");
+            // bound1 = maxVal - range:  need either numeric subtraction or
+            // timestamp-minus-interval → to_unixtime
+            writer.print("((");
+            emitToDouble(writer, call.operand(3));
             writer.print(") - (");
-            call.operand(2).unparse(writer, 0, 0);
-            writer.print(") AS DOUBLE), TRY_CAST(");
-            call.operand(3).unparse(writer, 0, 0);
-            writer.print(" AS DOUBLE), CAST(");
+            emitToDouble(writer, call.operand(2));
+            writer.print("))");
+            writer.print(", ");
+            emitToDouble(writer, call.operand(3));
+            writer.print(", CAST(");
             call.operand(1).unparse(writer, 0, 0);
             writer.print(" AS BIGINT))");
             return;
@@ -1110,6 +1113,20 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         super.unparseCall(writer, call, leftPrec, rightPrec);
+    }
+
+    /**
+     * Emit a Trino expression that coerces an arbitrary operand to DOUBLE. For numerics,
+     * TRY_CAST works. For INTERVAL day-to-second, extract seconds via to_milliseconds/1000.
+     * For timestamps, use to_unixtime(timestamp with time zone). TRY_CAST handles the
+     * numeric path; if that returns NULL, fall through to to_unixtime.
+     */
+    private static void emitToDouble(SqlWriter writer, org.apache.calcite.sql.SqlNode node) {
+        writer.print("COALESCE(TRY_CAST(");
+        node.unparse(writer, 0, 0);
+        writer.print(" AS DOUBLE), to_unixtime(TRY_CAST(");
+        node.unparse(writer, 0, 0);
+        writer.print(" AS TIMESTAMP(3) WITH TIME ZONE)))");
     }
 
     /**

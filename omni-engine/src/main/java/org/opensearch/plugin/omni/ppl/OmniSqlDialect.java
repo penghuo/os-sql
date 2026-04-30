@@ -402,6 +402,54 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // ARRAY_SLICE(arr, start, length?) → slice(arr, start, length)
+        if (opName.equalsIgnoreCase("ARRAY_SLICE")) {
+            unparseFunctionLike(writer, "slice", call);
+            return;
+        }
+        // JSON_EXTRACT_ALL(json, path1, path2, ...) with >2 operands:
+        //   Trino json_extract accepts only one path; for multi-path, chain ARRAY of single extracts.
+        // Single-path (2 operands) already handled above.
+        if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() > 2) {
+            writer.print("ARRAY[");
+            for (int i = 1; i < call.operandCount(); i++) {
+                if (i > 1) writer.print(", ");
+                writer.print("json_extract(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS JSON), ");
+                call.operand(i).unparse(writer, 0, 0);
+                writer.print(")");
+            }
+            writer.print("]");
+            return;
+        }
+        // MAKEDATE(year, dayOfYear) → date_add('day', dayOfYear - 1, DATE year||'-01-01')
+        if (opName.equalsIgnoreCase("MAKEDATE") && call.operandCount() == 2) {
+            writer.print("date_add('day', ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" - 1, CAST(CONCAT(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), '-01-01') AS DATE))");
+            return;
+        }
+        // MKTIME(hours) → time literal; Trino has no mktime — defer (fall through, fail gracefully)
+
+        // CTIME(x) → CAST(x AS VARCHAR) of a timestamp — simplest: format_datetime(CAST x as TIMESTAMP, ...)
+        if (opName.equalsIgnoreCase("CTIME") && call.operandCount() == 1) {
+            writer.print("format_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP), 'EEE MMM dd HH:mm:ss yyyy')");
+            return;
+        }
+        // CONVERT(x, type) → CAST(x AS type) — PPL compatibility
+        if (opName.equalsIgnoreCase("CONVERT") && call.operandCount() == 2) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
         // ADDDATE(date, days) → date_add('day', days, CAST(date AS TIMESTAMP))
         if (opName.equalsIgnoreCase("ADDDATE") && call.operandCount() == 2) {
             writer.print("date_add('day', ");

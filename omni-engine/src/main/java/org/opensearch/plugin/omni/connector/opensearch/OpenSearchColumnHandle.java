@@ -26,24 +26,36 @@ public final class OpenSearchColumnHandle
     private final String opensearchName;
     private final Type type;
     private final boolean supportsPredicates;
+    // opensearchType: original OpenSearch field type (e.g. "date", "date_nanos", "keyword").
+    // Needed to distinguish date vs date_nanos since both map to Trino TIMESTAMP(3) but have
+    // different doc_values encodings (millis vs nanos).
+    private final String opensearchType;
 
     @JsonCreator
     public OpenSearchColumnHandle(
             @JsonProperty("name") String name,
             @JsonProperty("opensearchName") String opensearchName,
             @JsonProperty("type") Type type,
-            @JsonProperty("supportsPredicates") boolean supportsPredicates)
+            @JsonProperty("supportsPredicates") boolean supportsPredicates,
+            @JsonProperty("opensearchType") String opensearchType)
     {
         this.name = requireNonNull(name, "name is null");
         this.opensearchName = requireNonNull(opensearchName, "opensearchName is null");
         this.type = requireNonNull(type, "type is null");
         this.supportsPredicates = supportsPredicates;
+        this.opensearchType = opensearchType;
+    }
+
+    /** Legacy 4-arg ctor — opensearchType unknown. */
+    public OpenSearchColumnHandle(String name, String opensearchName, Type type, boolean supportsPredicates)
+    {
+        this(name, opensearchName, type, supportsPredicates, null);
     }
 
     /** Convenience: when name == opensearchName (already lowercase or built-in) */
     public OpenSearchColumnHandle(String name, Type type, boolean supportsPredicates)
     {
-        this(name, name, type, supportsPredicates);
+        this(name, name, type, supportsPredicates, null);
     }
 
     @JsonProperty
@@ -69,6 +81,12 @@ public final class OpenSearchColumnHandle
     public boolean isSupportsPredicates()
     {
         return supportsPredicates;
+    }
+
+    @JsonProperty
+    public String getOpensearchType()
+    {
+        return opensearchType;
     }
 
     @Override

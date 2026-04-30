@@ -104,7 +104,7 @@ public final class OpenSearchTypeMapper
         boolean isArray = isArray(name, trinoMeta);
         Type type = isArray ? new ArrayType(tap.type) : tap.type;
         boolean supportsPredicate = isArray ? false : tap.supportsPredicate;
-        return new OpenSearchColumnHandle(trinoName, name, type, supportsPredicate);
+        return new OpenSearchColumnHandle(trinoName, name, type, supportsPredicate, fieldType);
     }
 
     private static TypeAndPredicate mapPrimitiveType(String fieldType, Map<String, Object> mapping)
@@ -121,8 +121,10 @@ public final class OpenSearchTypeMapper
             case "double" -> new TypeAndPredicate(DoubleType.DOUBLE, true);
             case "scaled_float" -> new TypeAndPredicate(DoubleType.DOUBLE, true);
             case "date", "date_nanos" -> {
-                // OpenSearch stores all date fields as epoch_millis in doc_values,
-                // regardless of the display format. Accept all date formats (including date_nanos).
+                // Map both to TIMESTAMP(3). For `date_nanos`, doc_values contain nanoseconds;
+                // the DocValuesReader detects this from the OS mapping and divides by 1e6 before
+                // writing to the TIMESTAMP_MILLIS block. Keeping a single Trino type keeps type
+                // coercion simple for downstream expressions.
                 yield new TypeAndPredicate(TimestampType.TIMESTAMP_MILLIS, true);
             }
             case "half_float" -> new TypeAndPredicate(RealType.REAL, true);

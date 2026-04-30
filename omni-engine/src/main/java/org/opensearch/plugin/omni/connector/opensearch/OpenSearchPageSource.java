@@ -205,8 +205,15 @@ public class OpenSearchPageSource
                 continue;
             }
             if (DocValuesReader.isSupported(type)) {
-                // Use original OpenSearch field name for doc_values lookup
-                leafDvReaders[i] = DocValuesReader.create(type, leafReader, osName);
+                // Use original OpenSearch field name for doc_values lookup.
+                // For date_nanos, route through forTimestampNanos to divide the nanosecond
+                // doc_values down to millisecond precision before writing to the MILLIS block.
+                String osType = columns.get(i).getOpensearchType();
+                if ("date_nanos".equals(osType)) {
+                    leafDvReaders[i] = DocValuesReader.forTimestampNanos(leafReader, osName);
+                } else {
+                    leafDvReaders[i] = DocValuesReader.create(type, leafReader, osName);
+                }
                 if (leafDvReaders[i] == null) {
                     leafNeedsSource = true;
                 }

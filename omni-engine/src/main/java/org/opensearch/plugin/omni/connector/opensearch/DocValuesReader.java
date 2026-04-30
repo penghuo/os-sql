@@ -288,6 +288,31 @@ public abstract class DocValuesReader
         return forLongBlock(reader, field, TimestampType.TIMESTAMP_MILLIS, true);
     }
 
+    /** date_nanos: doc_values store epoch_nanos already; no scaling needed for TIMESTAMP(9).
+     *  But Trino's TIMESTAMP(9) uses a LongTimestamp block. We downcast to TIMESTAMP(3) here
+     *  (dividing nanos → micros → round to millis) to keep round-trip simple with the rest of
+     *  the pipeline, which already treats all dates as TIMESTAMP_MILLIS. */
+    public static DocValuesReader forTimestampNanos(LeafReader reader, String field) throws IOException
+    {
+        SortedNumericDocValues dv = getNumericDV(reader, field);
+        if (dv == null) return null;
+        return new DocValuesReader() {
+            @Override
+            public void read(int docId, BlockBuilder output) throws IOException
+            {
+                if (dv.advanceExact(docId) && dv.docValueCount() > 0) {
+                    long nanos = dv.nextValue();
+                    // nanos → micros (divide by 1000) — TIMESTAMP_MILLIS expects epoch_micros
+                    // rounded to millisecond precision. Round nanos to millis then to micros.
+                    long millis = nanos / 1_000_000L;
+                    TimestampType.TIMESTAMP_MILLIS.writeLong(output, millis * 1000L);
+                } else {
+                    output.appendNull();
+                }
+            }
+        };
+    }
+
     public static DocValuesReader forKeyword(LeafReader reader, String field) throws IOException
     {
         // OpenSearch stores keywords as SortedSetDocValues (multi-valued)

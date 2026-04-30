@@ -122,7 +122,8 @@ public final class QueryResponseAdapter {
 
   /**
    * Converts Trino SPI types (SqlDecimal, SqlTimestamp, etc.) to plain Java types that
-   * ExprValueUtils.fromObjectValue() expects.
+   * ExprValueUtils.fromObjectValue() expects. Recurses into Lists and Maps so nested
+   * timestamps/decimals inside array/multi-value columns get unwrapped too.
    */
   private static Object normalize(Object raw) {
     if (raw instanceof SqlDecimal decimal) {
@@ -145,6 +146,18 @@ public final class QueryResponseAdapter {
     }
     if (raw instanceof SqlVarbinary bin) {
       return bin.getBytes();
+    }
+    if (raw instanceof java.util.List<?> list) {
+      java.util.List<Object> out = new java.util.ArrayList<>(list.size());
+      for (Object item : list) out.add(normalize(item));
+      return out;
+    }
+    if (raw instanceof java.util.Map<?, ?> map) {
+      java.util.LinkedHashMap<Object, Object> out = new java.util.LinkedHashMap<>(map.size());
+      for (java.util.Map.Entry<?, ?> e : map.entrySet()) {
+        out.put(normalize(e.getKey()), normalize(e.getValue()));
+      }
+      return out;
     }
     return raw;
   }

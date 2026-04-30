@@ -962,13 +962,20 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP), 'EEEE')");
             return;
         }
-        // SUBDATE(date, days) → date_add('day', -days, CAST(date AS TIMESTAMP))
+        // SUBDATE(date, days_or_interval) → date − interval. Mirror of ADDDATE.
         if (opName.equalsIgnoreCase("SUBDATE") && call.operandCount() == 2) {
-            writer.print("date_add('day', -(");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print("), CAST(");
+            boolean isInterval = isIntervalOperand(call.operand(1));
+            writer.print("(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP))");
+            writer.print(" AS TIMESTAMP(3)) - ");
+            if (isInterval) {
+                call.operand(1).unparse(writer, 0, 0);
+            } else {
+                writer.print("(CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT) * INTERVAL '1' DAY)");
+            }
+            writer.print(")");
             return;
         }
         // ADDTIME(t1, t2) → Trino t1 + t2 (intervals)
@@ -1028,13 +1035,23 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP)))");
             return;
         }
-        // ADDDATE(date, days) → date_add('day', days, CAST(date AS TIMESTAMP))
+        // ADDDATE(date, days_or_interval) → date + interval. PPL passes either a BIGINT days
+        // or an INTERVAL. Trino supports `ts + interval` natively; for a BIGINT we convert to
+        // days-interval via multiplication. Detect interval vs numeric by checking if operand
+        // is an interval literal.
         if (opName.equalsIgnoreCase("ADDDATE") && call.operandCount() == 2) {
-            writer.print("date_add('day', ");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(", CAST(");
+            boolean isInterval = isIntervalOperand(call.operand(1));
+            writer.print("(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP))");
+            writer.print(" AS TIMESTAMP(3)) + ");
+            if (isInterval) {
+                call.operand(1).unparse(writer, 0, 0);
+            } else {
+                writer.print("(CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT) * INTERVAL '1' DAY)");
+            }
+            writer.print(")");
             return;
         }
 
@@ -1070,6 +1087,22 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         super.unparseCall(writer, call, leftPrec, rightPrec);
+    }
+
+    /**
+     * True if the node is an SQL interval literal (INTERVAL '1' DAY, etc.).
+     * Used to disambiguate numeric-days vs interval in ADDDATE/SUBDATE rewrites.
+     */
+    private static boolean isIntervalOperand(org.apache.calcite.sql.SqlNode node) {
+        if (node instanceof org.apache.calcite.sql.SqlIntervalLiteral) return true;
+        // Unary minus(INTERVAL '0' DAY) — keeps interval semantics.
+        if (node instanceof org.apache.calcite.sql.SqlCall call) {
+            String name = call.getOperator().getName();
+            if (("-".equals(name) || "MINUS_PREFIX".equals(name)) && call.operandCount() == 1) {
+                return isIntervalOperand(call.operand(0));
+            }
+        }
+        return false;
     }
 
     /**

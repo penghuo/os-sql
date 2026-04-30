@@ -396,9 +396,22 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")), 1)");
             return;
         }
-        // MVZIP(arr1, arr2) → zip(arr1, arr2) — Trino has zip() builtin
-        if (opName.equalsIgnoreCase("MVZIP")) {
-            unparseFunctionLike(writer, "zip", call);
+        // MVZIP(arr1, arr2, sep?) → array of joined strings.
+        // Trino's zip() returns array(row(T1, T2)); we then transform to a single varchar per
+        // position with the separator. 2-arg form uses ',' by default (matches Splunk's mvzip).
+        if (opName.equalsIgnoreCase("MVZIP")
+                && (call.operandCount() == 2 || call.operandCount() == 3)) {
+            writer.print("transform(zip(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print("), x -> concat(CAST(x[1] AS VARCHAR), ");
+            if (call.operandCount() == 3) {
+                call.operand(2).unparse(writer, 0, 0);
+            } else {
+                writer.print("','");
+            }
+            writer.print(", CAST(x[2] AS VARCHAR)))");
             return;
         }
         // NUMBER_TO_STRING(x) → CAST(x AS VARCHAR)
@@ -463,6 +476,27 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 writer.print(")");
             }
             writer.print("]");
+            return;
+        }
+        // JSON_EXTRACT(json, path) or JSON_EXTRACT(json, path, defaultValue)
+        // Trino requires a JSON-typed first arg. PPL passes varchar. Cast the first arg.
+        // If 3 operands, use coalesce(json_extract(...), default).
+        if (opName.equalsIgnoreCase("JSON_EXTRACT") && call.operandCount() >= 2) {
+            if (call.operandCount() == 2) {
+                writer.print("json_extract(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS JSON), ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+            } else {
+                writer.print("coalesce(json_extract(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS JSON), ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print("), ");
+                call.operand(2).unparse(writer, 0, 0);
+                writer.print(")");
+            }
             return;
         }
         // MAKEDATE(year, dayOfYear) → date_add('day', CAST(dayOfYear AS BIGINT) - 1,
@@ -624,6 +658,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" > ");
             call.operand(1).unparse(writer, 0, 0);
             writer.print(" THEN 1 ELSE 0 END)");
+            return;
+        }
+        // DATE_FORMAT(varchar, fmt) — Trino's date_format needs TIMESTAMP; PPL passes varchar.
+        if (opName.equalsIgnoreCase("DATE_FORMAT") && call.operandCount() == 2) {
+            writer.print("date_format(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)), ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+        // REGEXP_LIKE(x, pattern) — coerce x to varchar so integer inputs work.
+        if (opName.equalsIgnoreCase("REGEXP_LIKE") && call.operandCount() == 2) {
+            writer.print("regexp_like(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
             return;
         }
         // MD5/SHA1/CRC32 on varchar — Trino expects varbinary, wrap through to_utf8.

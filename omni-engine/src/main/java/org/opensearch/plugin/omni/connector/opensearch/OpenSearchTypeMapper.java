@@ -65,7 +65,10 @@ public final class OpenSearchTypeMapper
     @SuppressWarnings("unchecked")
     private static OpenSearchColumnHandle mapField(String name, Map<String, Object> mapping, Map<String, Object> trinoMeta)
     {
-        String trinoName = name.toLowerCase(java.util.Locale.ROOT);
+        // Preserve original case for column name — PPL's QualifiedNameResolver does case-
+        // sensitive lookup against Calcite's row type, and mappings like OTEL logs use
+        // camelCase (severityText, traceId, etc). Lowercasing here would break resolution.
+        String trinoName = name;
 
         // Check asRawJson flag
         if (isRawJson(name, trinoMeta)) {

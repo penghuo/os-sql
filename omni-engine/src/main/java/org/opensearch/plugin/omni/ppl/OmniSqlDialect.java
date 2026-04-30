@@ -448,6 +448,18 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // PERCENTILE_APPROX(col, p, accuracy_type) → approx_percentile(col, p)
+        // Calcite emits a 3rd operand of type name (BIGINT/DOUBLE) that Trino tries to resolve as
+        // a column. Drop it and also rename percentile_approx to approx_percentile (Trino's name).
+        if (opName.equalsIgnoreCase("PERCENTILE_APPROX") && call.operandCount() >= 2) {
+            writer.print("approx_percentile(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+
         // NUM(x) → CAST(x AS DOUBLE)
         if (opName.equalsIgnoreCase("NUM") && call.operandCount() == 1) {
             writer.print("CAST(");

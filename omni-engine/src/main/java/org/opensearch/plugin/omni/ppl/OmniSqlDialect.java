@@ -286,10 +286,10 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "regexp_like", call);
             return;
         }
-        // JSON_EXTRACT_ALL(jsonStr) → CAST(CAST(jsonStr AS JSON) AS MAP(VARCHAR, JSON))
-        // Trino needs two-step cast: varchar → json → map. One-step varchar→map is unsupported.
+        // JSON_EXTRACT_ALL(jsonStr) → TRY_CAST(CAST(jsonStr AS JSON) AS MAP(VARCHAR, JSON))
+        // TRY_CAST returns NULL for non-object JSON (arrays etc.); subscripts then just return NULL.
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 1) {
-            writer.print("CAST(CAST(");
+            writer.print("TRY_CAST(CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS JSON) AS MAP(VARCHAR, JSON))");
             return;

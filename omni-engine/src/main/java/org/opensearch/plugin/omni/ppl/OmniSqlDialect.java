@@ -36,27 +36,26 @@ public class OmniSqlDialect extends TrinoSqlDialect
     {
         String opName = call.getOperator().getName();
 
-        // JSON_OBJECT('k1', v1, 'k2', v2, ...) - Calcite emits "JSON_OBJECT(KEY 'k' VALUE v NULL ON NULL)"
-        // Rewrite to Trino's  map_to_json(MAP(ARRAY[...], ARRAY[...]))
+        // JSON_OBJECT('k1', v1, 'k2', v2, ...) → CAST(MAP(ARRAY[keys], ARRAY[values]) AS JSON)
+        // Then json_format(...) to get a VARCHAR. Use json_format(CAST(MAP(..) AS JSON)).
         if (opName.equalsIgnoreCase("JSON_OBJECT") || opName.equalsIgnoreCase("JSONOBJECT")) {
-            // Calcite's JSON_OBJECT operator has operands: nullBehavior, key1, value1, key2, value2, ...
             int start = 1;
             int pairCount = (call.operandCount() - 1) / 2;
             if (pairCount < 1) {
-                writer.print("map_to_json(MAP())");
+                writer.print("json_format(CAST(MAP() AS JSON))");
                 return;
             }
-            writer.print("map_to_json(MAP(ARRAY[");
+            writer.print("json_format(CAST(MAP(ARRAY[");
             for (int i = 0; i < pairCount; i++) {
                 if (i > 0) writer.print(", ");
                 call.operand(start + i * 2).unparse(writer, 0, 0);
             }
-            writer.print("], ARRAY[");
+            writer.print("], ARRAY[CAST(");
             for (int i = 0; i < pairCount; i++) {
-                if (i > 0) writer.print(", ");
+                if (i > 0) { writer.print(" AS JSON), CAST("); }
                 call.operand(start + i * 2 + 1).unparse(writer, 0, 0);
             }
-            writer.print("]))");
+            writer.print(" AS JSON)]) AS JSON))");
             return;
         }
 
@@ -488,6 +487,20 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS VARCHAR), CONCAT('^', regexp_replace(");
             call.operand(1).unparse(writer, 0, 0);
             writer.print(", '/.+', ''), '($|\\.)'))");
+            return;
+        }
+        // JSON(x) → CAST(x AS JSON)
+        if (opName.equalsIgnoreCase("JSON") && call.operandCount() == 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS JSON)");
+            return;
+        }
+        // JSON_KEYS(jsonStr) → map_keys(CAST CAST jsonStr AS JSON AS MAP(VARCHAR, JSON))
+        if (opName.equalsIgnoreCase("JSON_KEYS") && call.operandCount() == 1) {
+            writer.print("map_keys(TRY_CAST(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS JSON) AS MAP(VARCHAR, JSON)))");
             return;
         }
         // JSON_DELETE(json, path) — Trino has no built-in; emit a NULL-returning cast

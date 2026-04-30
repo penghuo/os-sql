@@ -193,9 +193,31 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 case "WEEK" -> "week_of_year";
                 default -> opName.toLowerCase();
             };
-            writer.print(trinoName + "(CAST(");
+            // Time-only extractions (hour/minute/second) accept TIME directly in Trino;
+            // others need TIMESTAMP/DATE. Use CASE to pick a viable cast, since COALESCE
+            // would require all branches to have the same type.
+            boolean isTimeExtract = opName.equalsIgnoreCase("HOUR")
+                    || opName.equalsIgnoreCase("MINUTE")
+                    || opName.equalsIgnoreCase("SECOND");
+            writer.print("(CASE WHEN TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP) IS NOT NULL THEN " + trinoName + "(TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS TIMESTAMP))");
+            if (isTimeExtract) {
+                writer.print(" WHEN TRY_CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIME) IS NOT NULL THEN " + trinoName + "(TRY_CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIME))");
+            } else {
+                writer.print(" WHEN TRY_CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS DATE) IS NOT NULL THEN " + trinoName + "(TRY_CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS DATE))");
+            }
+            writer.print(" ELSE NULL END)");
             return;
         }
 
@@ -264,12 +286,12 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "regexp_like", call);
             return;
         }
-        // JSON_EXTRACT_ALL(jsonStr) → CAST(jsonStr AS MAP(VARCHAR, JSON))
-        // PPL's spath materializes the doc as a map so subsequent ['user.name'] subscripts work.
+        // JSON_EXTRACT_ALL(jsonStr) → CAST(CAST(jsonStr AS JSON) AS MAP(VARCHAR, JSON))
+        // Trino needs two-step cast: varchar → json → map. One-step varchar→map is unsupported.
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 1) {
-            writer.print("CAST(");
+            writer.print("CAST(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS MAP(VARCHAR, JSON))");
+            writer.print(" AS JSON) AS MAP(VARCHAR, JSON))");
             return;
         }
         // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)

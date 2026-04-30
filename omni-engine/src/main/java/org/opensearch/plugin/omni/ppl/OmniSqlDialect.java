@@ -93,17 +93,66 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 writer.print(")");
                 return;
             }
-            if (call.operandCount() == 2) {
-                // SPAN(num, N) → floor(num / N) * N
-                writer.print("(FLOOR(");
+            // 3-arg form with a non-literal (usually NULL) unit — PPL emits SPAN(col, N, NULL)
+            // for numeric bucketing too. Fall through to the numeric FLOOR form.
+            if (call.operandCount() == 3) {
+                writer.print("(FLOOR(CAST(");
                 call.operand(0).unparse(writer, 0, 0);
-                writer.print(" / ");
+                writer.print(" AS DOUBLE) / CAST(");
                 call.operand(1).unparse(writer, 0, 0);
-                writer.print(") * ");
+                writer.print(" AS DOUBLE)) * CAST(");
                 call.operand(1).unparse(writer, 0, 0);
-                writer.print(")");
+                writer.print(" AS DOUBLE))");
                 return;
             }
+            if (call.operandCount() == 2) {
+                // SPAN(num, N) → floor(num / N) * N
+                writer.print("(FLOOR(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS DOUBLE) / CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS DOUBLE)) * CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS DOUBLE))");
+                return;
+            }
+        }
+
+        // UNIX_TIMESTAMP(t with tz) — Omni's unix_timestamp UDF is registered for bigint/double/
+        // timestamp(3)/varchar but not for timestamp-with-time-zone. PPL's CURRENT_TIMESTAMP
+        // returns timestamp(3) with time zone, so coerce via cast.
+        if (opName.equalsIgnoreCase("UNIX_TIMESTAMP") && call.operandCount() == 1) {
+            writer.print("unix_timestamp(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)))");
+            return;
+        }
+
+        // DATE_DIFF('unit', a, b) — Trino requires both a and b to be temporal (DATE/TIMESTAMP/TIME)
+        // of the same kind. PPL sometimes passes varchars. Cast both sides to TIMESTAMP(3) so the
+        // call resolves against `date_diff(varchar(x), timestamp(p), timestamp(p))`.
+        if (opName.equalsIgnoreCase("DATE_DIFF") && call.operandCount() == 3
+                && call.operand(0) instanceof SqlCharStringLiteral) {
+            writer.print("date_diff(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)), CAST(");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)))");
+            return;
+        }
+
+        // DATE_ADD('unit', interval-or-bigint, ts) — PPL emits INTERVAL for the increment, which
+        // Trino's date_add does not accept. Rewrite as "ts + interval" (Trino supports this
+        // natively and it preserves timestamp precision).
+        if (opName.equalsIgnoreCase("DATE_ADD") && call.operandCount() == 3) {
+            writer.print("(CAST(");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)) + ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
         }
 
         // SAFE_CAST(expr AS type) → TRY_CAST(expr AS type)  (Calcite BigQuery name → Trino)
@@ -270,13 +319,14 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
-        // TIMESTAMPADD(unit, interval, ts) → date_add(lowercase_unit_literal, interval, ts)
+        // TIMESTAMPADD(unit, interval, ts) — Trino's date_add needs BIGINT, not INTERVAL.
+        // Use native "ts + interval" and coerce the timestamp to TIMESTAMP(3) so precision
+        // doesn't collide with literal timestamp(0) sources.
         if (opName.equalsIgnoreCase("TIMESTAMPADD") && call.operandCount() == 3) {
-            String unit = call.operand(0).toString().toLowerCase();
-            writer.print("date_add('" + unit + "', ");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(", ");
+            writer.print("(CAST(");
             call.operand(2).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)) + ");
+            call.operand(1).unparse(writer, 0, 0);
             writer.print(")");
             return;
         }

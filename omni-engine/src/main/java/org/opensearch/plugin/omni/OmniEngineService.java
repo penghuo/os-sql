@@ -154,7 +154,10 @@ public class OmniEngineService {
             Optional.empty(),
             Optional.empty(),
             ImmutableSet.of(),
-            ImmutableSet.of(),
+            // clientCapabilities — announce PARAMETRIC_DATETIME so Trino's server protocol
+            // serializes timestamps without trying to round to precision 3 (which breaks on
+            // non-millisecond precision timestamps and causes SERIALIZATION_ERROR).
+            ImmutableSet.of(io.trino.client.ClientCapabilities.PARAMETRIC_DATETIME.toString()),
             new ResourceEstimates(Optional.empty(), Optional.empty(), Optional.empty()),
             ImmutableMap.of(),
             ImmutableMap.of(),

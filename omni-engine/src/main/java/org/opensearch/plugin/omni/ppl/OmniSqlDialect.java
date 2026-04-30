@@ -340,8 +340,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 call.operand(1).unparse(writer, 0, 0);
                 writer.print(")");
             } else {
-                String unit = call.operand(0).toString().toLowerCase();
-                writer.print("date_add('" + unit + "', CAST(");
+                writer.print("date_add(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(", CAST(");
                 call.operand(1).unparse(writer, 0, 0);
                 writer.print(" AS BIGINT), CAST(");
                 call.operand(2).unparse(writer, 0, 0);

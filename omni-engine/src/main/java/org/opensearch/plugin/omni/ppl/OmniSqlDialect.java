@@ -1035,28 +1035,20 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP)))");
             return;
         }
-        // WIDTH_BUCKET(operand, bucketCount, range, maxVal) — PPL's bin emits this shape,
-        // which does not match Trino's width_bucket(operand, bound1, bound2, count).
-        // Translate:
-        //   bound1 = maxVal - range (min)
-        //   bound2 = maxVal         (exclusive upper)
-        //   count  = bucketCount
-        // Coerce each non-count arg to DOUBLE via a helper: numeric → cast, timestamp →
-        // to_unixtime(timestamp with time zone) (seconds since epoch).
+        // WIDTH_BUCKET(operand, bucketCount, range, maxVal) — PPL's bin emits this shape
+        // which mismatches Trino's width_bucket(operand, bound1, bound2, count). Reorder
+        // and compute bound1 = maxVal - range. This handles numeric operands; timestamp
+        // bin still needs a dedicated UDF (out of scope here).
         if (opName.equalsIgnoreCase("WIDTH_BUCKET") && call.operandCount() == 4) {
-            writer.print("width_bucket(");
-            emitToDouble(writer, call.operand(0));
-            writer.print(", ");
-            // bound1 = maxVal - range:  need either numeric subtraction or
-            // timestamp-minus-interval → to_unixtime
-            writer.print("((");
-            emitToDouble(writer, call.operand(3));
+            writer.print("width_bucket(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE), CAST((");
+            call.operand(3).unparse(writer, 0, 0);
             writer.print(") - (");
-            emitToDouble(writer, call.operand(2));
-            writer.print("))");
-            writer.print(", ");
-            emitToDouble(writer, call.operand(3));
-            writer.print(", CAST(");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(") AS DOUBLE), CAST(");
+            call.operand(3).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE), CAST(");
             call.operand(1).unparse(writer, 0, 0);
             writer.print(" AS BIGINT))");
             return;

@@ -506,13 +506,15 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 call.operand(1).unparse(writer, 0, 0);
                 writer.print(")");
             } else {
-                writer.print("coalesce(json_extract(CAST(");
+                // Both branches of COALESCE must be the same type. Use varchar for both
+                // (json_format → varchar) so the default value merges cleanly.
+                writer.print("coalesce(json_format(json_extract(CAST(");
                 call.operand(0).unparse(writer, 0, 0);
                 writer.print(" AS JSON), ");
                 call.operand(1).unparse(writer, 0, 0);
-                writer.print("), ");
+                writer.print(")), CAST(");
                 call.operand(2).unparse(writer, 0, 0);
-                writer.print(")");
+                writer.print(" AS VARCHAR))");
             }
             return;
         }

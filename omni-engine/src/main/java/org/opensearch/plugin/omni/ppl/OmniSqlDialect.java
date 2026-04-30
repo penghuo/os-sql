@@ -459,6 +459,38 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
 
+        // PARSE(col, pattern, 'regex')  → MAP<VARCHAR, VARCHAR> of named groups.
+        // PPL's parse extracts named regex groups. Build a MAP(ARRAY[keys], ARRAY[values]) at
+        // unparse time by extracting group names from the literal pattern.
+        if (opName.equalsIgnoreCase("PARSE") && call.operandCount() >= 2
+                && call.operand(1) instanceof SqlCharStringLiteral patternLit) {
+            String pattern = patternLit.getNlsString().getValue();
+            // Find all (?<name>...) named groups
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\\(\\?<([A-Za-z][A-Za-z0-9_]*)>")
+                    .matcher(pattern);
+            java.util.List<String> groups = new java.util.ArrayList<>();
+            while (m.find()) groups.add(m.group(1));
+            if (groups.isEmpty()) {
+                // No named groups — emit empty map
+                writer.print("MAP(ARRAY[], ARRAY[])");
+                return;
+            }
+            writer.print("MAP(ARRAY[");
+            for (int i = 0; i < groups.size(); i++) {
+                if (i > 0) writer.print(", ");
+                writer.print("'" + groups.get(i).replace("'", "''") + "'");
+            }
+            writer.print("], ARRAY[");
+            for (int i = 0; i < groups.size(); i++) {
+                if (i > 0) writer.print(", ");
+                writer.print("regexp_extract(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS VARCHAR), '" + pattern.replace("'", "''") + "', " + (i + 1) + ")");
+            }
+            writer.print("])");
+            return;
+        }
         // STRCMP(a, b) → sign(compare(a, b))  — Trino has no strcmp; emulate with CASE
         if (opName.equalsIgnoreCase("STRCMP") && call.operandCount() == 2) {
             writer.print("(CASE WHEN ");

@@ -310,13 +310,15 @@ public class OmniSqlDialect extends TrinoSqlDialect
             unparseFunctionLike(writer, "greatest", call);
             return;
         }
-        // DATEDIFF(a, b) → date_diff('day', b, a) — PPL semantics: a − b in days
+        // DATEDIFF(a, b) → date_diff('day', b, a) — PPL semantics: a − b in days.
+        // Both operands may be varchar (PPL planner passes '1970-01-01' literally), so
+        // coerce each to DATE so the call resolves against date_diff(varchar, date, date).
         if (opName.equalsIgnoreCase("DATEDIFF") && call.operandCount() == 2) {
-            writer.print("date_diff('day', ");
+            writer.print("date_diff('day', CAST(");
             call.operand(1).unparse(writer, 0, 0);
-            writer.print(", ");
+            writer.print(" AS DATE), CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(")");
+            writer.print(" AS DATE))");
             return;
         }
         // TIMESTAMPADD(unit, interval, ts) — Trino's date_add needs BIGINT, not INTERVAL.

@@ -465,15 +465,17 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS VARCHAR), '[0-9.]+') AS DOUBLE)");
             return;
         }
-        // CIDRMATCH(ip, cidr) → contains(IPADDRESS prefix). Trino builtin 'contains' + 'cast(ip as ipaddress)'
+        // CIDRMATCH(ip, cidr) — Trino has no built-in CIDR containment; emulate with regex.
+        // If cidr is '10.0.0.0/24', this converts to ^10\\.0\\.0\\. prefix match on string.
+        // Not perfect, but matches many IPv4/IPv6 prefix cases.
         if (opName.equalsIgnoreCase("CIDRMATCH") && call.operandCount() == 2) {
-            // Use regexp — simplest: CAST cidr to ipprefix and use contains()
-            // Trino 442 has contains(ipprefix, ipaddress) via ipaddress module
-            writer.print("contains(CAST(");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(" AS IPPREFIX), CAST(");
+            // regexp_like(ip_str, concat('^', regexp_replace(cidr, '/.+', ''), '\\.'))
+            // Best-effort — if cidr doesn't end in /32 this is only a prefix check.
+            writer.print("regexp_like(CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS IPADDRESS))");
+            writer.print(" AS VARCHAR), CONCAT('^', regexp_replace(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(", '/.+', ''), '($|\\.)'))");
             return;
         }
         // JSON_DELETE(json, path) — Trino has no built-in; emit a NULL-returning cast

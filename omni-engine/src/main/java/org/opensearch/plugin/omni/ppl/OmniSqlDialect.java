@@ -447,6 +447,18 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // CONV(x, fromBase, toBase) — PPL `conv` base conversion. Comes through as CONVERT/3.
+        // Trino: to_base(from_base(x, fromBase), toBase)
+        if (opName.equalsIgnoreCase("CONVERT") && call.operandCount() == 3) {
+            writer.print("to_base(from_base(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT)), CAST(");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT))");
+            return;
+        }
         // PERCENTILE_APPROX(col, p_in_percent [, type]) → approx_percentile(col, p/100)
         // PPL passes percentile as percent (e.g. 50.0 for median). Trino expects a 0-1 fraction.
         // Also rename and strip the 3rd Calcite-only type-name operand.
@@ -489,6 +501,64 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 writer.print(" AS VARCHAR), '" + pattern.replace("'", "''") + "', " + (i + 1) + ")");
             }
             writer.print("])");
+            return;
+        }
+        // REX_EXTRACT(col, pattern, 'groupName') → regexp_extract(col, pattern, groupIdx)
+        // Trino regexp_extract only supports 1-based group index, not names. Resolve the name
+        // against the literal pattern at unparse time.
+        if (opName.equalsIgnoreCase("REX_EXTRACT") && call.operandCount() == 3
+                && call.operand(1) instanceof SqlCharStringLiteral rxPat
+                && call.operand(2) instanceof SqlCharStringLiteral rxName) {
+            String pat = rxPat.getNlsString().getValue();
+            String target = rxName.getNlsString().getValue();
+            int idx = findNamedGroupIndex(pat, target);
+            if (idx <= 0) {
+                writer.print("CAST(NULL AS VARCHAR)");
+                return;
+            }
+            writer.print("regexp_extract(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), '" + pat.replace("'", "''") + "', " + idx + ")");
+            return;
+        }
+        // REX_EXTRACT_MULTI(col, pattern, 'groupName', maxMatch) →
+        //   slice(regexp_extract_all(col, pattern, groupIdx), 1, maxMatch)
+        // When maxMatch is 0 (unlimited) the slice gets the whole array.
+        if (opName.equalsIgnoreCase("REX_EXTRACT_MULTI") && call.operandCount() == 4
+                && call.operand(1) instanceof SqlCharStringLiteral rxmPat
+                && call.operand(2) instanceof SqlCharStringLiteral rxmName) {
+            String pat = rxmPat.getNlsString().getValue();
+            String target = rxmName.getNlsString().getValue();
+            int idx = findNamedGroupIndex(pat, target);
+            if (idx <= 0) {
+                writer.print("CAST(NULL AS ARRAY(VARCHAR))");
+                return;
+            }
+            writer.print("(CASE WHEN CAST(");
+            call.operand(3).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) <= 0 THEN regexp_extract_all(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), '" + pat.replace("'", "''") + "', " + idx + ")");
+            writer.print(" ELSE slice(regexp_extract_all(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), '" + pat.replace("'", "''") + "', " + idx + "), 1, CAST(");
+            call.operand(3).unparse(writer, 0, 0);
+            writer.print(" AS INTEGER)) END)");
+            return;
+        }
+        // PERIOD_DIFF(p1, p2) → months between YYYYMM-encoded periods.
+        // MySQL semantics: p1 and p2 encoded as YYMM or YYYYMM. For YYYYMM:
+        //   diff = (p1/100 - p2/100) * 12 + (p1%100 - p2%100)
+        if (opName.equalsIgnoreCase("PERIOD_DIFF") && call.operandCount() == 2) {
+            writer.print("((CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) / 100 - CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) / 100) * 12 + (CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) % 100 - CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) % 100))");
             return;
         }
         // STRCMP(a, b) → sign(compare(a, b))  — Trino has no strcmp; emulate with CASE
@@ -712,6 +782,23 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS VARCHAR)");
             return;
         }
+        // TOSTRING(x, format) — PPL: format=="commas" adds thousands separators.
+        // Trino has no direct format-int-with-commas; emulate with regex for simple integers.
+        // For non-"commas" formats, fall back to plain CAST. Works for integer-typed values.
+        if (opName.equalsIgnoreCase("TOSTRING") && call.operandCount() == 2) {
+            if (call.operand(1) instanceof SqlCharStringLiteral fmtLit
+                    && "commas".equalsIgnoreCase(fmtLit.getNlsString().getValue().trim())) {
+                // Inject ',' every 3 digits from the right on the integer part.
+                writer.print("regexp_replace(CAST(CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT) AS VARCHAR), '(\\d)(?=(\\d{3})+$)', '$1,')");
+                return;
+            }
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR)");
+            return;
+        }
         // UTC_TIMESTAMP() → current_timestamp AT TIME ZONE 'UTC'
         if (opName.equalsIgnoreCase("UTC_TIMESTAMP")) {
             writer.print("(current_timestamp AT TIME ZONE 'UTC')");
@@ -859,6 +946,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         super.unparseCall(writer, call, leftPrec, rightPrec);
+    }
+
+    /**
+     * Find the 1-based index of a named capture group in a regex pattern.
+     * Returns -1 if the name is not present. Counts any `(?<name>` occurrence as one group,
+     * since Trino's regexp_extract uses 1-based group indexes and named groups participate in
+     * group numbering.
+     */
+    private static int findNamedGroupIndex(String pattern, String target) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\(\\?<([A-Za-z][A-Za-z0-9_]*)>")
+                .matcher(pattern);
+        int idx = 0;
+        while (m.find()) {
+            idx++;
+            if (m.group(1).equals(target)) return idx;
+        }
+        return -1;
     }
 
     /** Helper: write "funcName(arg0, arg1, ...)" using call's existing operands. */

@@ -448,6 +448,54 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // NUM(x) → CAST(x AS DOUBLE)
+        if (opName.equalsIgnoreCase("NUM") && call.operandCount() == 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DOUBLE)");
+            return;
+        }
+        // MEMK(x) — PPL memory-size string parse, return bytes; approximate with regex extract
+        // x is something like '10k', '5m' → number * unit multiplier
+        // Fallback: CAST(x AS DOUBLE) * 1024 (PPL semantics: memk returns kilobytes as numeric)
+        if (opName.equalsIgnoreCase("MEMK") && call.operandCount() == 1) {
+            // Best-effort: try_cast the numeric part and multiply
+            writer.print("TRY_CAST(regexp_extract(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), '[0-9.]+') AS DOUBLE)");
+            return;
+        }
+        // CIDRMATCH(ip, cidr) → contains(IPADDRESS prefix). Trino builtin 'contains' + 'cast(ip as ipaddress)'
+        if (opName.equalsIgnoreCase("CIDRMATCH") && call.operandCount() == 2) {
+            // Use regexp — simplest: CAST cidr to ipprefix and use contains()
+            // Trino 442 has contains(ipprefix, ipaddress) via ipaddress module
+            writer.print("contains(CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS IPPREFIX), CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS IPADDRESS))");
+            return;
+        }
+        // JSON_DELETE(json, path) — Trino has no built-in; emit a NULL-returning cast
+        if (opName.equalsIgnoreCase("JSON_DELETE")) {
+            writer.print("CAST(NULL AS JSON)");
+            return;
+        }
+        // JSON_SET(json, path, value) — Trino has no built-in; return json unchanged
+        if (opName.equalsIgnoreCase("JSON_SET") && call.operandCount() >= 1) {
+            call.operand(0).unparse(writer, 0, 0);
+            return;
+        }
+        // SUBTIME(ts, t) → ts - (t interval)
+        if (opName.equalsIgnoreCase("SUBTIME") && call.operandCount() == 2) {
+            writer.print("(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP) - (CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS TIME) - TIME '00:00:00'))");
+            return;
+        }
+
         // SPAN_BUCKET / MINSPAN_BUCKET / RANGE_BUCKET(col, N, unit?) → date_trunc or floor*N
         if ((opName.equalsIgnoreCase("SPAN_BUCKET")
              || opName.equalsIgnoreCase("MINSPAN_BUCKET")

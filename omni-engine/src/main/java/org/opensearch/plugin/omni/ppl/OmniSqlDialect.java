@@ -547,19 +547,74 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS BIGINT) AS VARCHAR), '-01-01') AS DATE))");
             return;
         }
-        // MKTIME(hours) → time literal; Trino has no mktime — defer (fall through, fail gracefully)
-
-        // CTIME(epoch) → format_datetime(from_unixtime(epoch))
-        if (opName.equalsIgnoreCase("CTIME") && call.operandCount() == 1) {
-            if (call.operand(0).toString().matches("^\\s*-?[0-9.E]+\\s*$")) {
-                writer.print("format_datetime(from_unixtime(");
-                call.operand(0).unparse(writer, 0, 0);
-                writer.print("), 'EEE MMM dd HH:mm:ss yyyy')");
+        // MKTIME(dateStr [, fmt]) — PPL: parse date-string to unix epoch (double seconds).
+        // Default format is 'MM/dd/yyyy HH:mm:ss'.
+        if (opName.equalsIgnoreCase("MKTIME") && (call.operandCount() == 1 || call.operandCount() == 2)) {
+            writer.print("to_unixtime(parse_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ");
+            if (call.operandCount() == 2) {
+                call.operand(1).unparse(writer, 0, 0);
             } else {
-                writer.print("format_datetime(CAST(");
-                call.operand(0).unparse(writer, 0, 0);
-                writer.print(" AS TIMESTAMP), 'EEE MMM dd HH:mm:ss yyyy')");
+                writer.print("'MM/dd/yyyy HH:mm:ss'");
             }
+            writer.print("))");
+            return;
+        }
+        // MSTIME(timeStr) — PPL convert: parse 'HH:MM:SS' or 'MM:SS' and return total seconds.
+        // Example: '03:45' → 225 (3*60 + 45). '01:23:45' → 5025.
+        // Split by ':' and sum weighted. Use regexp_extract_all + transform.
+        if (opName.equalsIgnoreCase("MSTIME") && call.operandCount() == 1) {
+            // Parts = split(timeStr, ':'). 2 parts = M:S, 3 parts = H:M:S.
+            // Result = parts[0]*60^(len-1) + parts[1]*60^(len-2) + ... + parts[len-1]
+            // Express as: reduce over parts
+            writer.print("(CASE ");
+            writer.print("WHEN cardinality(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':')) = 3 THEN ");
+            writer.print("CAST(element_at(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':'), 1) AS DOUBLE) * 3600 + ");
+            writer.print("CAST(element_at(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':'), 2) AS DOUBLE) * 60 + ");
+            writer.print("CAST(element_at(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':'), 3) AS DOUBLE) ");
+            writer.print("WHEN cardinality(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':')) = 2 THEN ");
+            writer.print("CAST(element_at(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':'), 1) AS DOUBLE) * 60 + ");
+            writer.print("CAST(element_at(split(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR), ':'), 2) AS DOUBLE) ");
+            writer.print("ELSE NULL END)");
+            return;
+        }
+
+        // CTIME(epoch [, fmt]) — PPL default format is M/d/Y H:m:s (MM/dd/yyyy HH:mm:ss).
+        // Trino: format_datetime uses Joda patterns; default is 'MM/dd/yyyy HH:mm:ss'.
+        if (opName.equalsIgnoreCase("CTIME") && (call.operandCount() == 1 || call.operandCount() == 2)) {
+            boolean numericArg = call.operand(0).toString().matches("^\\s*-?[0-9.E]+\\s*$");
+            writer.print("format_datetime(");
+            if (numericArg) {
+                writer.print("from_unixtime(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(")");
+            } else {
+                writer.print("CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP)");
+            }
+            writer.print(", ");
+            if (call.operandCount() == 2) {
+                call.operand(1).unparse(writer, 0, 0);
+            } else {
+                writer.print("'MM/dd/yyyy HH:mm:ss'");
+            }
+            writer.print(")");
             return;
         }
         // CONVERT(x, type) → CAST(x AS type) — PPL compatibility

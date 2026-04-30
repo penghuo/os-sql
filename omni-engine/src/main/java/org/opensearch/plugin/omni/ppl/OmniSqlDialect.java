@@ -448,6 +448,86 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // WEEKDAY(x) → day_of_week(x) - 1  (PPL: monday=0, Trino: monday=1)
+        if (opName.equalsIgnoreCase("WEEKDAY") && call.operandCount() == 1) {
+            writer.print("(day_of_week(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS DATE)) - 1)");
+            return;
+        }
+        // DAYNAME(x) → format_datetime(CAST x AS TIMESTAMP, 'EEEE')
+        if (opName.equalsIgnoreCase("DAYNAME") && call.operandCount() == 1) {
+            writer.print("format_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP), 'EEEE')");
+            return;
+        }
+        // SUBDATE(date, days) → date_add('day', -days, CAST(date AS TIMESTAMP))
+        if (opName.equalsIgnoreCase("SUBDATE") && call.operandCount() == 2) {
+            writer.print("date_add('day', -(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print("), CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP))");
+            return;
+        }
+        // ADDTIME(t1, t2) → Trino t1 + t2 (intervals)
+        if (opName.equalsIgnoreCase("ADDTIME") && call.operandCount() == 2) {
+            writer.print("(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP) + (CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS TIME) - TIME '00:00:00'))");
+            return;
+        }
+        // TIME_TO_SEC(t) → hour(t)*3600 + minute(t)*60 + second(t)
+        if (opName.equalsIgnoreCase("TIME_TO_SEC") && call.operandCount() == 1) {
+            writer.print("(hour(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME)) * 3600 + minute(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME)) * 60 + second(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME)))");
+            return;
+        }
+        // TIMESTAMPDIFF(unit, start, end) → date_diff(unit, start, end)
+        if (opName.equalsIgnoreCase("TIMESTAMPDIFF") && call.operandCount() == 3) {
+            String unit = call.operand(0).toString().toLowerCase().replaceAll("[^a-z]", "");
+            writer.print("date_diff('" + unit + "', CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP), CAST(");
+            call.operand(2).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP))");
+            return;
+        }
+        // STR_TO_DATE(str, fmt) → date_parse(str, fmt)
+        if (opName.equalsIgnoreCase("STR_TO_DATE") && call.operandCount() == 2) {
+            writer.print("date_parse(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(", ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+        // YEARWEEK(x) → year*100 + week_of_year
+        if (opName.equalsIgnoreCase("YEARWEEK")) {
+            writer.print("(year(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP)) * 100 + week_of_year(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP)))");
+            return;
+        }
+        // MINUTE_OF_DAY(x) → hour(x)*60 + minute(x)
+        if (opName.equalsIgnoreCase("MINUTE_OF_DAY") && call.operandCount() == 1) {
+            writer.print("(hour(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP)) * 60 + minute(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP)))");
+            return;
+        }
         // ADDDATE(date, days) → date_add('day', days, CAST(date AS TIMESTAMP))
         if (opName.equalsIgnoreCase("ADDDATE") && call.operandCount() == 2) {
             writer.print("date_add('day', ");

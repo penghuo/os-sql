@@ -143,6 +143,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
 
+        // DATE_ADD(ts, interval) — PPL's 2-arg form. Use ts + interval natively.
+        if ((opName.equalsIgnoreCase("DATE_ADD") || opName.equalsIgnoreCase("DATE_SUB"))
+                && call.operandCount() == 2) {
+            boolean isSub = opName.equalsIgnoreCase("DATE_SUB");
+            writer.print("(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(3)) ");
+            writer.print(isSub ? "- " : "+ ");
+            if (isIntervalOperand(call.operand(1))) {
+                call.operand(1).unparse(writer, 0, 0);
+            } else {
+                writer.print("(CAST(");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(" AS BIGINT) * INTERVAL '1' DAY)");
+            }
+            writer.print(")");
+            return;
+        }
         // DATE_ADD('unit', delta, ts) — Trino's date_add takes BIGINT delta; when PPL passes
         // an INTERVAL we need `ts + interval` instead.
         if (opName.equalsIgnoreCase("DATE_ADD") && call.operandCount() == 3) {

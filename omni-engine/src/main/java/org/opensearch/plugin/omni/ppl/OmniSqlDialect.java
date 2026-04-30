@@ -448,6 +448,75 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // SPAN_BUCKET / MINSPAN_BUCKET / RANGE_BUCKET(col, N, unit?) → date_trunc or floor*N
+        if ((opName.equalsIgnoreCase("SPAN_BUCKET")
+             || opName.equalsIgnoreCase("MINSPAN_BUCKET")
+             || opName.equalsIgnoreCase("RANGE_BUCKET"))) {
+            if (call.operandCount() == 3 && call.operand(2) instanceof SqlCharStringLiteral unitLit) {
+                String unit = unitLit.getNlsString().getValue().toLowerCase();
+                String trinoUnit = switch (unit) {
+                    case "y", "year", "years" -> "year";
+                    case "mo", "month", "months" -> "month";
+                    case "w", "week", "weeks" -> "week";
+                    case "d", "day", "days" -> "day";
+                    case "h", "hour", "hours" -> "hour";
+                    case "m", "minute", "minutes" -> "minute";
+                    case "s", "second", "seconds" -> "second";
+                    default -> unit;
+                };
+                writer.print("date_trunc('" + trinoUnit + "', CAST(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP))");
+                return;
+            }
+            if (call.operandCount() >= 2) {
+                writer.print("(FLOOR(");
+                call.operand(0).unparse(writer, 0, 0);
+                writer.print(" / ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(") * ");
+                call.operand(1).unparse(writer, 0, 0);
+                writer.print(")");
+                return;
+            }
+        }
+        // AUTO(x) → x  (PPL auto-cast, Trino will coerce as needed)
+        if (opName.equalsIgnoreCase("AUTO") && call.operandCount() == 1) {
+            call.operand(0).unparse(writer, 0, 0);
+            return;
+        }
+        // TOSTRING(x) → CAST(x AS VARCHAR)
+        if (opName.equalsIgnoreCase("TOSTRING") && call.operandCount() == 1) {
+            writer.print("CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS VARCHAR)");
+            return;
+        }
+        // UTC_TIMESTAMP() → current_timestamp AT TIME ZONE 'UTC'
+        if (opName.equalsIgnoreCase("UTC_TIMESTAMP")) {
+            writer.print("(current_timestamp AT TIME ZONE 'UTC')");
+            return;
+        }
+        // TO_SECONDS(x) → date_diff('second', TIMESTAMP '0001-01-01 00:00:00', CAST x AS TIMESTAMP)
+        if (opName.equalsIgnoreCase("TO_SECONDS") && call.operandCount() == 1) {
+            writer.print("date_diff('second', TIMESTAMP '0001-01-01 00:00:00', CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP))");
+            return;
+        }
+        // TIME_FORMAT(t, fmt) → format_datetime(CAST t AS TIMESTAMP, fmt)
+        if (opName.equalsIgnoreCase("TIME_FORMAT") && call.operandCount() == 2) {
+            writer.print("format_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP), ");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(")");
+            return;
+        }
+        // MATCH_BOOL_PREFIX(field, query) and SIMPLE_QUERY_STRING — these are OpenSearch relevance
+        // functions without Trino equivalents. Fall through so the test cleanly fails.
+        // JSON_SET / JSON_DELETE — Trino has json_merge but no json_set/delete. Defer.
+        // PATTERN / GROK / PARSE / REX_EXTRACT_MULTI — PPL-specific, no Trino equivalents. Defer.
         // WEEKDAY(x) → day_of_week(x) - 1  (PPL: monday=0, Trino: monday=1)
         if (opName.equalsIgnoreCase("WEEKDAY") && call.operandCount() == 1) {
             writer.print("(day_of_week(CAST(");

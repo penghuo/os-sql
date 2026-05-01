@@ -119,12 +119,29 @@ public class QualifiedNameResolver {
         inputCount);
 
     List<String> currentFields = context.relBuilder.peek().getRowType().getFieldNames();
-    if (currentFields.contains(nameNode.toString())) {
+    // Case-insensitive match: OpenSearch mappings preserve original case (e.g. camelCase
+    // "severityText"), but downstream layers may normalize to lowercase. PPL's user-facing
+    // name resolution should not depend on the exact case of the stored field.
+    Optional<String> matched = findFieldCaseInsensitive(currentFields, nameNode.toString());
+    if (matched.isPresent()) {
       try {
-        return Optional.of(context.relBuilder.field(nameNode.toString()));
+        return Optional.of(context.relBuilder.field(matched.get()));
       } catch (IllegalArgumentException e) {
         log.debug("resolveFieldDirectly() failed: {}", e.getMessage());
       }
+    }
+    return Optional.empty();
+  }
+
+  /**
+   * Find a field name case-insensitively. Returns the original-case name if present.
+   * Prefers an exact match; falls back to a case-insensitive match when no exact hit exists.
+   */
+  private static Optional<String> findFieldCaseInsensitive(
+      java.util.Collection<String> pool, String target) {
+    if (pool.contains(target)) return Optional.of(target);
+    for (String name : pool) {
+      if (name.equalsIgnoreCase(target)) return Optional.of(name);
     }
     return Optional.empty();
   }
@@ -169,6 +186,22 @@ public class QualifiedNameResolver {
     } catch (IllegalArgumentException e) {
       log.debug("tryToResolveField() failed: {}", e.getMessage());
     }
+    // Fallback: case-insensitive scan of all inputs' row types.
+    for (int i = 0; i < inputCount; i++) {
+      int inputOrdinal = inputCount - i - 1;
+      Set<String> names =
+          context.relBuilder.peek(inputOrdinal).getRowType().getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toSet());
+      Optional<String> matched = findFieldCaseInsensitive(names, fieldName);
+      if (matched.isPresent()) {
+        try {
+          return Optional.of(context.relBuilder.field(inputCount, alias, matched.get()));
+        } catch (IllegalArgumentException ignore) {
+          // continue searching other inputs
+        }
+      }
+    }
     return Optional.empty();
   }
 
@@ -184,29 +217,37 @@ public class QualifiedNameResolver {
       String fieldName = joinParts(parts, 0, length);
       log.debug("resolveFieldWithoutAlias() trying fieldName={} with length={}", fieldName, length);
 
-      int foundInput = findInputContainingFieldName(inputCount, inputFieldNames, fieldName);
-      log.debug("resolveFieldWithoutAlias() foundInput={}", foundInput);
-      if (foundInput != -1) {
-        RexNode fieldNode = context.relBuilder.field(inputCount, foundInput, fieldName);
+      InputMatch match = findInputContainingFieldName(inputCount, inputFieldNames, fieldName);
+      log.debug(
+          "resolveFieldWithoutAlias() matchedInput={} resolvedName={}",
+          match.inputIndex,
+          match.resolvedName);
+      if (match.inputIndex != -1) {
+        RexNode fieldNode = context.relBuilder.field(inputCount, match.inputIndex, match.resolvedName);
         return Optional.of(resolveFieldAccess(context, parts, 0, length, fieldNode));
       }
     }
     return Optional.empty();
   }
 
-  private static int findInputContainingFieldName(
+  /** Outcome of a case-insensitive input search: which input index and which actual field name matched. */
+  private record InputMatch(int inputIndex, String resolvedName) {}
+
+  private static InputMatch findInputContainingFieldName(
       int inputCount, List<Set<String>> inputFieldNames, String fieldName) {
     int foundInput = -1;
+    String foundName = null;
     for (int i = 0; i < inputCount; i++) {
-      if (inputFieldNames.get(i).contains(fieldName)) {
+      Optional<String> match = findFieldCaseInsensitive(inputFieldNames.get(i), fieldName);
+      if (match.isPresent()) {
         if (foundInput != -1) {
           throw new IllegalArgumentException("Ambiguous field: " + fieldName);
-        } else {
-          foundInput = i;
         }
+        foundInput = i;
+        foundName = match.get();
       }
     }
-    return foundInput;
+    return new InputMatch(foundInput, foundName);
   }
 
   private static List<Set<String>> collectInputFieldNames(
@@ -275,8 +316,9 @@ public class QualifiedNameResolver {
                 for (int length = parts.size() - start; 1 <= length; length--) {
                   String fieldName = joinParts(parts, start, length);
                   log.debug("resolveCorrelationField() trying fieldName={}", fieldName);
-                  if (fieldNameList.contains(fieldName)) {
-                    RexNode field = context.relBuilder.field(correlation, fieldName);
+                  Optional<String> matched = findFieldCaseInsensitive(fieldNameList, fieldName);
+                  if (matched.isPresent()) {
+                    RexNode field = context.relBuilder.field(correlation, matched.get());
                     return resolveFieldAccess(context, parts, start, length, field);
                   }
                 }

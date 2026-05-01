@@ -164,8 +164,12 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
     RexNode value = analyze(node.getValue(), context);
     SqlIntervalQualifier intervalQualifier =
         context.rexBuilder.createIntervalUntil(PlanUtils.intervalUnitToSpanUnit(node.getUnit()));
-    return context.rexBuilder.makeIntervalLiteral(
-        new BigDecimal(value.toString()), intervalQualifier);
+    // Calcite's makeIntervalLiteral(BigDecimal, qualifier) expects the value expressed in
+    // the qualifier's *base unit* (milliseconds for day-to-second, months for year-to-month).
+    // Callers pass the qualifier's nominal unit count (e.g. 1 DAY), so scale here.
+    BigDecimal scaled = new BigDecimal(value.toString())
+        .multiply(intervalQualifier.getUnit().multiplier);
+    return context.rexBuilder.makeIntervalLiteral(scaled, intervalQualifier);
   }
 
   @Override

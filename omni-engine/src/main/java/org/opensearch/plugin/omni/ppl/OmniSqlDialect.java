@@ -261,19 +261,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
              || opName.equalsIgnoreCase("WEEK_OF_YEAR")
              || opName.equalsIgnoreCase("LAST_DAY"))) {
             String trinoName = switch (opName.toUpperCase()) {
-                case "DAYOFWEEK" -> "day_of_week";
+                case "DAYOFWEEK", "DAY_OF_WEEK" -> "day_of_week";
                 case "DAYOFMONTH" -> "day";
                 case "DAYOFYEAR" -> "day_of_year";
                 case "LAST_DAY" -> "last_day_of_month";
                 case "WEEK" -> "week_of_year";
                 default -> opName.toLowerCase();
             };
+            // day_of_week: PPL/MySQL uses Sunday=1..Saturday=7, Trino is Monday=1..Sunday=7.
+            // Rewrite: ((trinoDow % 7) + 1) shifts the cycle to match.
+            boolean isDayOfWeek = opName.equalsIgnoreCase("DAYOFWEEK")
+                    || opName.equalsIgnoreCase("DAY_OF_WEEK");
             // Time-only extractions (hour/minute/second) accept TIME directly in Trino;
             // others need TIMESTAMP/DATE. Use CASE to pick a viable cast, since COALESCE
             // would require all branches to have the same type.
             boolean isTimeExtract = opName.equalsIgnoreCase("HOUR")
                     || opName.equalsIgnoreCase("MINUTE")
                     || opName.equalsIgnoreCase("SECOND");
+            if (isDayOfWeek) writer.print("((");
             writer.print("(CASE WHEN TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS TIMESTAMP) IS NOT NULL THEN " + trinoName + "(TRY_CAST(");
@@ -293,6 +298,7 @@ public class OmniSqlDialect extends TrinoSqlDialect
                 writer.print(" AS DATE))");
             }
             writer.print(" ELSE NULL END)");
+            if (isDayOfWeek) writer.print(" % 7) + 1)");
             return;
         }
 

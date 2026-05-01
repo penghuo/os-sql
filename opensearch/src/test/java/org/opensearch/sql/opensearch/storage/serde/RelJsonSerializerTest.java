@@ -11,7 +11,11 @@ import static org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.TYPE_FACTOR
 
 import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectOutputStream;
 import java.math.BigDecimal;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.calcite.plan.RelOptCluster;
@@ -347,5 +351,25 @@ public class RelJsonSerializerTest {
     assertEquals(expectedNode, rexNode);
     assertEquals(List.of(2, 0, 0, 2), helper.sources);
     assertEquals(List.of(20, "Number", "Number", 10), helper.digests);
+  }
+
+  /**
+   * Regression: the deserializer must not fall back to Java native deserialization for legacy
+   * payloads. We construct a Base64 string that happens to be a valid {@link ObjectInputStream}
+   * stream (a serialized {@link HashMap}) and confirm {@code deserialize()} refuses it via the
+   * Jackson parse path rather than silently calling {@code readObject()}.
+   */
+  @Test
+  void testDeserializeRejectsJavaSerializedPayload() throws Exception {
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+      // HashMap is a classic gadget-chain starter; safe to embed here because
+      // the deserializer must never hand these bytes to ObjectInputStream.
+      oos.writeObject(new HashMap<String, String>());
+    }
+    String javaSerializedB64 = Base64.getEncoder().encodeToString(baos.toByteArray());
+
+    // Must throw, NOT return a RexNode and NOT instantiate the HashMap.
+    assertThrows(IllegalStateException.class, () -> serializer.deserialize(javaSerializedB64));
   }
 }

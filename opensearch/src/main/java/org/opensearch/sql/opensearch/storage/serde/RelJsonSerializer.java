@@ -8,11 +8,7 @@ package org.opensearch.sql.opensearch.storage.serde;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -35,8 +31,12 @@ import org.opensearch.sql.opensearch.executor.OpenSearchExecutionEngine.Operator
  *
  * <p>This serializer:
  * <li>Uses Calcite's RelJson class to convert RexNode and RelDataType to/from JSON string
- * <li>Manages required OpenSearch field mapping information Note: OpenSearch ExprType subclasses
- *     implement {@link Serializable} and are handled through standard Java serialization.
+ * <li>Manages required OpenSearch field mapping information
+ *
+ *     <p>Wire format: {@code Base64(UTF-8(<calcite-rel-json-string>))}. The payload is a JSON
+ *     string produced by Calcite's {@link RelJson}; it is transported as UTF-8 bytes rather than
+ *     wrapped in a Java {@link java.io.ObjectOutputStream} frame to keep the envelope in line with
+ *     the JSON-native payload.
  */
 @Getter
 public class RelJsonSerializer {
@@ -97,12 +97,13 @@ public class RelJsonSerializer {
       String rexNodeJson = jsonBuilder.toJsonString(relJson.toJson(standardizedRexExpr));
 
       if (CalcitePlanContext.skipEncoding.get()) return rexNodeJson;
-      // Write bytes of all serializable contents
-      ByteArrayOutputStream output = new ByteArrayOutputStream();
-      ObjectOutputStream objectOutput = new ObjectOutputStream(output);
-      objectOutput.writeObject(rexNodeJson);
-      objectOutput.flush();
-      return Base64.getEncoder().encodeToString(output.toByteArray());
+      // Encode the Calcite JSON string as UTF-8 bytes + Base64.
+      //
+      // The payload is already a String produced by Calcite's RelJson; wrapping
+      // it in ObjectOutputStream writes a Java serialization frame header and
+      // extra length metadata that adds no value over raw UTF-8 bytes.
+      return Base64.getEncoder()
+          .encodeToString(rexNodeJson.getBytes(StandardCharsets.UTF_8));
     } catch (Exception e) {
       throw new IllegalStateException("Failed to serialize RexNode: " + standardizedRexExpr, e);
     }
@@ -118,9 +119,10 @@ public class RelJsonSerializer {
   public RexNode deserialize(String struct) {
     String exprStr = null;
     try {
-      ByteArrayInputStream input = new ByteArrayInputStream(Base64.getDecoder().decode(struct));
-      ObjectInputStream objectInput = new ObjectInputStream(input);
-      exprStr = (String) objectInput.readObject();
+      // Decode the Calcite JSON string from UTF-8 bytes. Pairs with the
+      // serialize() envelope: Base64(UTF-8(<calcite-rel-json-string>)).
+      byte[] decoded = Base64.getDecoder().decode(struct);
+      exprStr = new String(decoded, StandardCharsets.UTF_8);
 
       // Deserialize RelDataType and RexNode by JSON
       RelJson relJson = ExtendedRelJson.create((JsonBuilder) null);

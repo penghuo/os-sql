@@ -118,10 +118,26 @@ public class OmniSqlDialect extends TrinoSqlDialect
             }
         }
 
-        // UNIX_TIMESTAMP(t with tz) — Omni's unix_timestamp UDF is registered for bigint/double/
-        // timestamp(3)/varchar but not for timestamp-with-time-zone. PPL's CURRENT_TIMESTAMP
-        // returns timestamp(3) with time zone, so coerce via cast.
+        // UNIX_TIMESTAMP(x) — Omni's unix_timestamp UDF is registered for bigint/double/
+        // timestamp(3)/varchar. Pass through for BIGINT/VARCHAR, and cast timestamp-with-
+        // time-zone down to timestamp(3) so the signature resolves.
         if (opName.equalsIgnoreCase("UNIX_TIMESTAMP") && call.operandCount() == 1) {
+            org.apache.calcite.sql.SqlNode arg = call.operand(0);
+            if (arg instanceof org.apache.calcite.sql.SqlLiteral lit) {
+                org.apache.calcite.sql.type.SqlTypeName tn = lit.getTypeName();
+                if (tn == org.apache.calcite.sql.type.SqlTypeName.DECIMAL
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.BIGINT
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.INTEGER
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.DOUBLE
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.FLOAT
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.CHAR
+                        || tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR) {
+                    writer.print("unix_timestamp(");
+                    arg.unparse(writer, 0, 0);
+                    writer.print(")");
+                    return;
+                }
+            }
             writer.print("unix_timestamp(CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS TIMESTAMP(3)))");

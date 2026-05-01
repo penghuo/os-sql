@@ -124,12 +124,25 @@ public class CalciteSchemaAdapter extends AbstractSchema {
             if (handle.isEmpty()) {
                 return typeFactory.builder().build();
             }
-            TableMetadata tableMeta = metadata.getTableMetadata(session, handle.get());
+            // Pull column handles via the metadata service — OpenSearchMetadata preserves
+            // the original OpenSearch field case on OpenSearchColumnHandle.name, whereas
+            // Trino's ColumnMetadata lowercases it. PPL needs the original case so users can
+            // reference "severityText" rather than "severitytext" and verifySchema matches.
+            java.util.Map<String, io.trino.spi.connector.ColumnHandle> columnHandles =
+                    metadata.getColumnHandles(session, handle.get());
             RelDataTypeFactory.Builder builder = typeFactory.builder();
-            for (ColumnMetadata col : tableMeta.getColumns()) {
-                if (col.isHidden()) continue;
-                // Flatten RowType (nested objects) into dotted field names to match PPL convention
-                flattenColumn(col.getName(), col.getType(), typeFactory, builder);
+            for (var entry : columnHandles.entrySet()) {
+                io.trino.spi.connector.ColumnHandle ch = entry.getValue();
+                if (ch instanceof org.opensearch.plugin.omni.connector.opensearch.OpenSearchColumnHandle osch) {
+                    if (osch.getName().startsWith("_")) continue; // hidden built-ins
+                    flattenColumn(osch.getName(), osch.getType(), typeFactory, builder);
+                } else {
+                    // Non-OpenSearch handle: fall back to Trino's ColumnMetadata (lowercased).
+                    io.trino.spi.connector.ColumnMetadata cm =
+                            metadata.getColumnMetadata(session, handle.get(), ch);
+                    if (cm.isHidden()) continue;
+                    flattenColumn(cm.getName(), cm.getType(), typeFactory, builder);
+                }
             }
             return builder.build();
         }

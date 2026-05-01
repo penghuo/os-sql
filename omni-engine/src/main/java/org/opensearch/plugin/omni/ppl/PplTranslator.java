@@ -116,10 +116,14 @@ public class PplTranslator {
     /**
      * Rewrites ILIKE to LOWER(x) LIKE LOWER(pattern) since Trino doesn't support ILIKE.
      * os-sql emits ILIKE as a custom operator not routed through dialect.unparseCall().
+     * Matches either a quoted string literal (may contain spaces) or a non-whitespace token
+     * on each side so patterns like 'Hello world' survive intact.
      */
     static String rewriteIlike(String sql) {
+        // operand = either a single-quoted string (allowing '' escapes) or a bare token.
+        String operand = "('[^']*(?:''[^']*)*'|\\S+)";
         return sql.replaceAll(
-                "(\\S+)\\s+ILIKE\\s+(\\S+)",
+                operand + "\\s+ILIKE\\s+" + operand,
                 "LOWER($1) LIKE LOWER($2)");
     }
 

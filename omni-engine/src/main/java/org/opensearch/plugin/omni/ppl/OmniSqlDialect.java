@@ -870,8 +870,16 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS BIGINT) AS VARCHAR), 2, '0')) AS TIME)");
             return;
         }
-        // MICROSECOND(ts) → fractional microseconds. Trino: millisecond(ts)*1000 (approximate)
+        // MICROSECOND(ts) → fractional-second part in microseconds (0–999999).
+        // Trino has no native microsecond extractor, so format the timestamp with .SSSSSS
+        // and parse the fractional component. Cast to TIMESTAMP(6) to preserve precision.
         if (opName.equalsIgnoreCase("MICROSECOND") && call.operandCount() == 1) {
+            writer.print("CAST(substr(format_datetime(CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP(6)), 'SSSSSS'), 1, 6) AS BIGINT)");
+            return;
+        }
+        if (false && opName.equalsIgnoreCase("MICROSECOND") && call.operandCount() == 1) {
             writer.print("(millisecond(CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS TIMESTAMP)) * 1000)");
@@ -886,13 +894,25 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS BIGINT) - 719528, DATE '1970-01-01')");
             return;
         }
-        // PERIOD_ADD(period, months) → period after adding months. Ignore encoding for now.
+        // PERIOD_ADD(P, N) — MySQL: P is YYYYMM (or YYMM). Convert to total months, add N,
+        // then re-encode. Handles month-rollover correctly (200712 + 1 → 200801).
+        // totalMonths = (P/100)*12 + (P%100 - 1) + N
+        // newPeriod = (totalMonths/12) * 100 + (totalMonths%12 + 1)
         if (opName.equalsIgnoreCase("PERIOD_ADD") && call.operandCount() == 2) {
-            writer.print("(CAST(");
+            writer.print("((CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS BIGINT) + CAST(");
+            writer.print(" AS BIGINT) / 100 * 12 + CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) % 100 - 1 + CAST(");
             call.operand(1).unparse(writer, 0, 0);
-            writer.print(" AS BIGINT))");
+            writer.print(" AS BIGINT)) / 12 * 100 + ");
+            writer.print("((CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) / 100 * 12 + CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT) % 100 - 1 + CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS BIGINT)) % 12 + 1))");
             return;
         }
         // MSTIME() → current_timestamp as unix millis
@@ -1071,11 +1091,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print("(current_timestamp AT TIME ZONE 'UTC')");
             return;
         }
-        // TO_SECONDS(x) → date_diff('second', TIMESTAMP '0001-01-01 00:00:00', CAST x AS TIMESTAMP)
+        // TO_SECONDS(x) — MySQL returns seconds since 0000-00-00 (which in proleptic Gregorian
+        // is effectively 0000-01-01 minus 1 day; MySQL extrapolates a year-0 leap year). Trino
+        // DATE starts at 0001-01-01, so offset by 366 days × 86400 s = 31622400.
         if (opName.equalsIgnoreCase("TO_SECONDS") && call.operandCount() == 1) {
-            writer.print("date_diff('second', TIMESTAMP '0001-01-01 00:00:00', CAST(");
+            writer.print("(date_diff('second', TIMESTAMP '0001-01-01 00:00:00', CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP))");
+            writer.print(" AS TIMESTAMP)) + 31622400)");
             return;
         }
         // TIME_FORMAT(t, fmt) → format_datetime(CAST t AS TIMESTAMP, fmt)
@@ -1165,13 +1187,24 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP)))");
             return;
         }
-        // MINUTE_OF_DAY(x) → hour(x)*60 + minute(x)
+        // MINUTE_OF_DAY(x) → hour(x)*60 + minute(x). Handle both TIMESTAMP and TIME inputs
+        // via TRY_CAST so pure time-only values like '17:30:00' resolve cleanly.
         if (opName.equalsIgnoreCase("MINUTE_OF_DAY") && call.operandCount() == 1) {
-            writer.print("(hour(CAST(");
+            writer.print("(CASE WHEN TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP)) * 60 + minute(CAST(");
+            writer.print(" AS TIMESTAMP) IS NOT NULL THEN hour(TRY_CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP)))");
+            writer.print(" AS TIMESTAMP)) * 60 + minute(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP))");
+            writer.print(" WHEN TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME) IS NOT NULL THEN hour(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME)) * 60 + minute(TRY_CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME))");
+            writer.print(" ELSE NULL END)");
             return;
         }
         // WIDTH_BUCKET(operand, bucketCount, range, maxVal) — PPL's bin emits this shape

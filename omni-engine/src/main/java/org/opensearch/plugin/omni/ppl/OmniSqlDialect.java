@@ -771,6 +771,50 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
+        // TIME_DIFF(t1, t2) → TIME '00:00:00' + (t1 - t2).
+        // PPL returns a TIME value; Trino has no time_diff, so express via
+        // date_add('second', diff, TIME '00:00:00').
+        if (opName.equalsIgnoreCase("TIME_DIFF") && call.operandCount() == 2) {
+            writer.print("date_add('millisecond', ");
+            writer.print("date_diff('millisecond', CAST(");
+            call.operand(1).unparse(writer, 0, 0);
+            writer.print(" AS TIME(3)), CAST(");
+            call.operand(0).unparse(writer, 0, 0);
+            writer.print(" AS TIME(3))), TIME '00:00:00')");
+            return;
+        }
+        // GET_FORMAT(type, region) → MySQL-style format string. Enumerate the combinations
+        // PPL supports ('DATE','USA'), ('DATE','JIS'), etc.
+        if (opName.equalsIgnoreCase("GET_FORMAT") && call.operandCount() == 2
+                && call.operand(0) instanceof SqlCharStringLiteral typeLit
+                && call.operand(1) instanceof SqlCharStringLiteral regionLit) {
+            String t = typeLit.getNlsString().getValue().toUpperCase();
+            String r = regionLit.getNlsString().getValue().toUpperCase();
+            String fmt;
+            switch (t + ":" + r) {
+                case "DATE:USA": fmt = "%m.%d.%Y"; break;
+                case "DATE:JIS":
+                case "DATE:ISO": fmt = "%Y-%m-%d"; break;
+                case "DATE:EUR": fmt = "%d.%m.%Y"; break;
+                case "DATE:INTERNAL": fmt = "%Y%m%d"; break;
+                case "TIME:USA": fmt = "%h:%i:%s %p"; break;
+                case "TIME:JIS":
+                case "TIME:ISO": fmt = "%H:%i:%s"; break;
+                case "TIME:EUR": fmt = "%H.%i.%s"; break;
+                case "TIME:INTERNAL": fmt = "%H%i%s"; break;
+                case "DATETIME:USA":
+                case "DATETIME:JIS":
+                case "DATETIME:ISO": fmt = "%Y-%m-%d %H:%i:%s"; break;
+                case "DATETIME:EUR": fmt = "%Y-%m-%d %H.%i.%s"; break;
+                case "DATETIME:INTERNAL": fmt = "%Y%m%d%H%i%s"; break;
+                default: fmt = null;
+            }
+            if (fmt != null) {
+                writer.print("'" + fmt + "'");
+                return;
+            }
+        }
+
         // MD5/SHA1/CRC32 on varchar — Trino expects varbinary, wrap through to_utf8.
         // Hex output matches MySQL / PPL conventions.
         if (opName.equalsIgnoreCase("MD5") && call.operandCount() == 1) {

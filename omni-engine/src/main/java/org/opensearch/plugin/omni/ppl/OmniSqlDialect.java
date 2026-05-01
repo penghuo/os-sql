@@ -381,12 +381,14 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS JSON) AS MAP(VARCHAR, JSON))");
             return;
         }
-        // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), path)
+        // JSON_EXTRACT_ALL(jsonStr, path) → json_extract(CAST(jsonStr AS JSON), normalized_path)
+        // PPL accepts paths like 'name' or '{2}.Bridges{0}' while Trino requires a JSONPath
+        // starting with '$' (e.g. '$.name' or '$[2].Bridges[0]'). Normalize the literal path.
         if (opName.equalsIgnoreCase("JSON_EXTRACT_ALL") && call.operandCount() == 2) {
             writer.print("json_extract(CAST(");
             call.operand(0).unparse(writer, 0, 0);
             writer.print(" AS JSON), ");
-            call.operand(1).unparse(writer, 0, 0);
+            emitJsonPath(writer, call.operand(1));
             writer.print(")");
             return;
         }
@@ -1242,6 +1244,33 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         super.unparseCall(writer, call, leftPrec, rightPrec);
+    }
+
+    /**
+     * Normalize a PPL JSON path literal to a Trino JSONPath literal. PPL accepts
+     *   name / a.b.c / {2}.foo / {2}.Bridges{0}
+     * Trino requires
+     *   $.name / $.a.b.c / $[2].foo / $[2].Bridges[0]
+     * If the operand isn't a string literal, pass through unchanged.
+     */
+    private static void emitJsonPath(SqlWriter writer, org.apache.calcite.sql.SqlNode node) {
+        if (!(node instanceof SqlCharStringLiteral lit)) {
+            node.unparse(writer, 0, 0);
+            return;
+        }
+        String raw = lit.getNlsString().getValue();
+        String normalized = normalizeJsonPath(raw);
+        writer.print("'" + normalized.replace("'", "''") + "'");
+    }
+
+    /** {N} → [N]; leading '$' added if absent. Preserves the rest. */
+    static String normalizeJsonPath(String path) {
+        String p = path;
+        // Replace {N} with [N]
+        p = p.replaceAll("\\{(\\d+)\\}", "[$1]");
+        if (p.startsWith("$")) return p;
+        if (p.startsWith("[")) return "$" + p;
+        return "$." + p;
     }
 
     /**

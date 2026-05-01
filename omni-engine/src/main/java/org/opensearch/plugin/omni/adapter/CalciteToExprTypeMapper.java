@@ -30,6 +30,13 @@ public final class CalciteToExprTypeMapper {
      * @return the corresponding ExprType, or UNDEFINED if unmapped
      */
     public static ExprType toExprType(RelDataType type) {
+        // PPL's Calcite plan uses UDT wrappers (ExprDateType, ExprTimeType, ExprTimeStampType,
+        // ExprIPType) whose getSqlTypeName() returns VARCHAR/BIGINT, not the real semantic type.
+        // Detect them via instanceof so the response schema preserves date/time/timestamp/ip.
+        if (type instanceof org.opensearch.sql.calcite.type.ExprDateType) return ExprCoreType.DATE;
+        if (type instanceof org.opensearch.sql.calcite.type.ExprTimeType) return ExprCoreType.TIME;
+        if (type instanceof org.opensearch.sql.calcite.type.ExprTimeStampType) return ExprCoreType.TIMESTAMP;
+        if (type instanceof org.opensearch.sql.calcite.type.ExprIPType) return ExprCoreType.IP;
         SqlTypeName sqlType = type.getSqlTypeName();
         return switch (sqlType) {
             case BOOLEAN -> ExprCoreType.BOOLEAN;

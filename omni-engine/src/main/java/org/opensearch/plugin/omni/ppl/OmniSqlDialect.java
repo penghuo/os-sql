@@ -338,14 +338,14 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         // DATEDIFF(a, b) → date_diff('day', b, a) — PPL semantics: a − b in days.
-        // Both operands may be varchar (PPL planner passes '1970-01-01' literally), so
-        // coerce each to DATE so the call resolves against date_diff(varchar, date, date).
+        // Operands can be DATE, TIMESTAMP, TIME or varchar. Coerce through a helper that
+        // lifts TIME to today's date (matches PPL), otherwise casts to DATE.
         if (opName.equalsIgnoreCase("DATEDIFF") && call.operandCount() == 2) {
-            writer.print("date_diff('day', CAST(");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(" AS DATE), CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS DATE))");
+            writer.print("date_diff('day', ");
+            emitAsDate(writer, call.operand(1));
+            writer.print(", ");
+            emitAsDate(writer, call.operand(0));
+            writer.print(")");
             return;
         }
         // TIMESTAMPADD(unit, delta, ts) — same ambiguity as DATE_ADD. If delta is an interval,
@@ -871,11 +871,13 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(" AS TIMESTAMP)) * 1000)");
             return;
         }
-        // FROM_DAYS(n) → epoch days offset from rata die to DATE
+        // FROM_DAYS(n) — MySQL semantics: days since 0000-00-00. Trino's DATE is limited
+        // to >= 0001-01-01, so rebase through Unix epoch: days_after_1970 = n - 719528
+        // (DAYS_0000_TO_1970 from PPL's own implementation).
         if (opName.equalsIgnoreCase("FROM_DAYS") && call.operandCount() == 1) {
             writer.print("date_add('day', CAST(");
             call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS BIGINT), DATE '0000-01-01')");
+            writer.print(" AS BIGINT) - 719528, DATE '1970-01-01')");
             return;
         }
         // PERIOD_ADD(period, months) → period after adding months. Ignore encoding for now.
@@ -991,13 +993,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
             call.operand(0).unparse(writer, 0, 0);
             return;
         }
-        // SUBTIME(ts, t) → ts - (t interval)
+        // SUBTIME(a, b) → a − (time-of-day of b). When b is DATE, subtract 0.
         if (opName.equalsIgnoreCase("SUBTIME") && call.operandCount() == 2) {
-            writer.print("(CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP) - (CAST(");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(" AS TIME) - TIME '00:00:00'))");
+            emitTimeArith(writer, call.operand(0), call.operand(1), /*add=*/false);
             return;
         }
 
@@ -1117,13 +1115,9 @@ public class OmniSqlDialect extends TrinoSqlDialect
             writer.print(")");
             return;
         }
-        // ADDTIME(t1, t2) → Trino t1 + t2 (intervals)
+        // ADDTIME(a, b) → a + (time-of-day of b). When b is DATE, add 0.
         if (opName.equalsIgnoreCase("ADDTIME") && call.operandCount() == 2) {
-            writer.print("(CAST(");
-            call.operand(0).unparse(writer, 0, 0);
-            writer.print(" AS TIMESTAMP) + (CAST(");
-            call.operand(1).unparse(writer, 0, 0);
-            writer.print(" AS TIME) - TIME '00:00:00'))");
+            emitTimeArith(writer, call.operand(0), call.operand(1), /*add=*/true);
             return;
         }
         // TIME_TO_SEC(t) → hour(t)*3600 + minute(t)*60 + second(t)
@@ -1244,6 +1238,103 @@ public class OmniSqlDialect extends TrinoSqlDialect
             return;
         }
         super.unparseCall(writer, call, leftPrec, rightPrec);
+    }
+
+    /**
+     * Emit an expression that evaluates to a DATE regardless of the operand's static type.
+     * For TIME operands, Trino's CAST(time AS DATE) is illegal; we combine today's date
+     * with the time and extract the date part (which is simply today). For DATE/TIMESTAMP/
+     * varchar, TRY_CAST handles it directly.
+     */
+    private static void emitAsDate(SqlWriter writer, org.apache.calcite.sql.SqlNode node) {
+        // If the node is a TIME literal (or CAST(x AS TIME)), today's date is the right answer.
+        if (isTimeOperand(node)) {
+            writer.print("current_date");
+            return;
+        }
+        writer.print("CAST(");
+        node.unparse(writer, 0, 0);
+        writer.print(" AS DATE)");
+    }
+
+    /**
+     * Emit ADDTIME / SUBTIME semantics: result = a ± (time-of-day of b).
+     * If b is a DATE (no time part), the interval contribution is zero, so emit plain a.
+     * If a is a TIME, keep the result as TIME; otherwise return TIMESTAMP.
+     */
+    private static void emitTimeArith(SqlWriter writer,
+            org.apache.calcite.sql.SqlNode a,
+            org.apache.calcite.sql.SqlNode b,
+            boolean add) {
+        if (isDateOperand(b)) {
+            // Delta is zero. Result mirrors a's kind. For DATE a, PPL returns TIMESTAMP at midnight.
+            if (isTimeOperand(a)) {
+                writer.print("CAST(");
+                a.unparse(writer, 0, 0);
+                writer.print(" AS TIME)");
+            } else {
+                writer.print("CAST(");
+                a.unparse(writer, 0, 0);
+                writer.print(" AS TIMESTAMP)");
+            }
+            return;
+        }
+        // Non-zero delta — compute as an interval-day-to-second from b's time part.
+        // TIMESTAMP a or DATE a → result TIMESTAMP; TIME a → result TIME.
+        if (isTimeOperand(a)) {
+            writer.print("(CAST(");
+            a.unparse(writer, 0, 0);
+            writer.print(" AS TIME) ");
+            writer.print(add ? "+" : "-");
+            writer.print(" (CAST(");
+            b.unparse(writer, 0, 0);
+            writer.print(" AS TIME) - TIME '00:00:00'))");
+        } else {
+            writer.print("(CAST(");
+            a.unparse(writer, 0, 0);
+            writer.print(" AS TIMESTAMP) ");
+            writer.print(add ? "+" : "-");
+            writer.print(" (CAST(");
+            b.unparse(writer, 0, 0);
+            writer.print(" AS TIME) - TIME '00:00:00'))");
+        }
+    }
+
+    /** True if the node is statically a DATE value (DATE literal or CAST AS DATE). */
+    private static boolean isDateOperand(org.apache.calcite.sql.SqlNode node) {
+        if (node instanceof org.apache.calcite.sql.SqlLiteral lit) {
+            return lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.DATE;
+        }
+        if (node instanceof org.apache.calcite.sql.SqlCall c) {
+            String n = c.getOperator().getName();
+            if ("DATE".equalsIgnoreCase(n) && c.operandCount() == 1) return true;
+            if ("CAST".equalsIgnoreCase(n) && c.operandCount() == 2) {
+                org.apache.calcite.sql.SqlNode typeNode = c.operand(1);
+                if (typeNode instanceof org.apache.calcite.sql.SqlDataTypeSpec spec) {
+                    return "DATE".equalsIgnoreCase(spec.getTypeName().getSimple());
+                }
+            }
+        }
+        return false;
+    }
+
+    /** True if the node is statically a TIME value (TIME literal or CAST AS TIME). */
+    private static boolean isTimeOperand(org.apache.calcite.sql.SqlNode node) {
+        if (node instanceof org.apache.calcite.sql.SqlLiteral lit) {
+            return lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.TIME;
+        }
+        if (node instanceof org.apache.calcite.sql.SqlCall c) {
+            String n = c.getOperator().getName();
+            if ("TIME".equalsIgnoreCase(n) && c.operandCount() == 1) return true;
+            if ("CAST".equalsIgnoreCase(n) && c.operandCount() == 2) {
+                org.apache.calcite.sql.SqlNode typeNode = c.operand(1);
+                if (typeNode instanceof org.apache.calcite.sql.SqlDataTypeSpec spec) {
+                    String typeName = spec.getTypeName().getSimple();
+                    return "TIME".equalsIgnoreCase(typeName);
+                }
+            }
+        }
+        return false;
     }
 
     /**

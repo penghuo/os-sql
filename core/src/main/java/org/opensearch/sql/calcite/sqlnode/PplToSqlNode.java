@@ -19,6 +19,8 @@ import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.opensearch.sql.ast.AbstractNodeVisitor;
+import org.opensearch.sql.ast.expression.AggregateFunction;
+import org.opensearch.sql.ast.expression.Alias;
 import org.opensearch.sql.ast.expression.AllFields;
 import org.opensearch.sql.ast.expression.And;
 import org.opensearch.sql.ast.expression.Argument;
@@ -34,6 +36,7 @@ import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
@@ -160,6 +163,47 @@ public class PplToSqlNode {
     }
 
     @Override
+    public Void visitAggregation(Aggregation node, Void ignored) {
+      walkChild(node);
+      // Aggregation always changes the row set; wrap any pending pipe state into a subquery so
+      // GROUP BY operates on the input rows, not the post-aggregation rows.
+      if (state.where != null
+          || state.evalExtended
+          || state.projectionReplaced
+          || state.orderBy != null
+          || state.fetch != null) {
+        state.wrap();
+      }
+      List<SqlNode> selects = new ArrayList<>();
+      List<SqlNode> groupKeys = new ArrayList<>();
+      if (node.getGroupExprList() != null) {
+        for (UnresolvedExpression g : node.getGroupExprList()) {
+          SqlNode key;
+          String alias = null;
+          if (g instanceof Alias a) {
+            key = expr(a.getDelegated());
+            alias = a.getName();
+          } else {
+            key = expr(g);
+          }
+          groupKeys.add(key);
+          // Group keys are part of the select list so downstream pipes can reference them.
+          selects.add(alias != null ? asAlias(key, alias) : key);
+        }
+      }
+      for (UnresolvedExpression a : node.getAggExprList()) {
+        if (a instanceof Alias al) {
+          selects.add(asAlias(aggCall(al.getDelegated()), al.getName()));
+        } else {
+          selects.add(aggCall(a));
+        }
+      }
+      state.setProjection(selects);
+      state.setGroupBy(groupKeys);
+      return null;
+    }
+
+    @Override
     public Void visitSort(Sort node, Void ignored) {
       walkChild(node);
       if (state.fetch != null) {
@@ -215,6 +259,7 @@ public class PplToSqlNode {
     /** {@code null} means "SELECT *" (un-modified projection). */
     List<SqlNode> projection;
 
+    List<SqlNode> groupBy;
     List<SqlNode> orderBy;
     SqlNode fetch;
 
@@ -249,6 +294,10 @@ public class PplToSqlNode {
       projectionReplaced = true;
     }
 
+    void setGroupBy(List<SqlNode> keys) {
+      groupBy = keys;
+    }
+
     void setOrderBy(List<SqlNode> keys) {
       orderBy = keys;
     }
@@ -262,6 +311,7 @@ public class PplToSqlNode {
       from = toSqlNode();
       where = null;
       projection = null;
+      groupBy = null;
       orderBy = null;
       fetch = null;
       evalExtended = false;
@@ -272,6 +322,7 @@ public class PplToSqlNode {
       // Nothing populated besides a bare table reference — return identifier directly.
       if (where == null
           && projection == null
+          && groupBy == null
           && orderBy == null
           && fetch == null
           && from instanceof SqlIdentifier) {
@@ -285,24 +336,31 @@ public class PplToSqlNode {
           selectList.add(n);
         }
       }
-      // Build a plain SELECT ... FROM ... [WHERE ...]; ORDER BY / FETCH go into a wrapping
-      // SqlOrderBy. Putting them on the SqlSelect directly trips Calcite's precedence-driven
-      // subquery-wrap path during unparse and during validation, dropping the order on the
-      // outermost select.
+      SqlNodeList groupList = null;
+      if (groupBy != null && !groupBy.isEmpty()) {
+        groupList = new SqlNodeList(POS);
+        for (SqlNode n : groupBy) {
+          groupList.add(n);
+        }
+      }
+      // Build a plain SELECT ... FROM ... [WHERE ...] [GROUP BY ...]; ORDER BY / FETCH go into a
+      // wrapping SqlOrderBy. Putting them on the SqlSelect directly trips Calcite's
+      // precedence-driven subquery-wrap path during unparse and during validation, dropping the
+      // order on the outermost select.
       SqlSelect select =
           new SqlSelect(
-              POS, /* keywordList */
-              null,
+              POS,
+              /* keywordList */ null,
               selectList,
               from,
               where,
-              /* group */ null, /* having */
-              null, /* windowList */
-              null,
-              /* qualify */ null, /* orderBy */
-              null, /* offset */
-              null, /* fetch */
-              null,
+              groupList,
+              /* having */ null,
+              /* windowList */ null,
+              /* qualify */ null,
+              /* orderBy */ null,
+              /* offset */ null,
+              /* fetch */ null,
               /* hints */ null);
       if (orderBy != null || fetch != null) {
         SqlNodeList ord = new SqlNodeList(POS);
@@ -382,6 +440,36 @@ public class PplToSqlNode {
                   "Compare operator not supported: " + c.getOperator());
         };
     return new SqlBasicCall(op, List.of(expr(c.getLeft()), expr(c.getRight())), POS);
+  }
+
+  private SqlNode aggCall(UnresolvedExpression e) {
+    if (!(e instanceof AggregateFunction af)) {
+      throw new UnsupportedOperationException(
+          "stats aggregator must be an AggregateFunction, got: " + e.getClass().getSimpleName());
+    }
+    SqlOperator op =
+        switch (af.getFuncName().toLowerCase()) {
+          case "count" -> SqlStdOperatorTable.COUNT;
+          case "sum" -> SqlStdOperatorTable.SUM;
+          case "avg" -> SqlStdOperatorTable.AVG;
+          case "min" -> SqlStdOperatorTable.MIN;
+          case "max" -> SqlStdOperatorTable.MAX;
+          default ->
+              throw new UnsupportedOperationException(
+                  "Aggregate not yet wired in SqlNode POC: " + af.getFuncName());
+        };
+    // PPL `count()` parses as count(AllFields). Map to SQL `COUNT(*)`.
+    SqlNode arg;
+    if (af.getField() == null || af.getField() instanceof AllFields) {
+      arg = SqlIdentifier.star(POS);
+    } else {
+      arg = expr(af.getField());
+    }
+    SqlLiteral quantifier =
+        af.getDistinct()
+            ? SqlLiteral.createSymbol(org.apache.calcite.sql.SqlSelectKeyword.DISTINCT, POS)
+            : null;
+    return new SqlBasicCall(op, List.of(arg), POS, quantifier);
   }
 
   private SqlNode inExpr(In in) {

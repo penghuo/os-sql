@@ -133,6 +133,27 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void stats_count_no_groupby() {
+    RelNode root = runViaSqlNode("source=EMP | stats count()");
+    String expected =
+        "LogicalAggregate(group=[{}], count()=[COUNT()])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
+  public void stats_avg_by_dept() {
+    RelNode root = runViaSqlNode("source=EMP | stats avg(SAL) by DEPTNO");
+    // Standard SQL aggregate produces a clean Aggregate(group=[{0}]) over the trim-projected
+    // input; no post-project needed since we're at the top of the tree.
+    String expected =
+        "LogicalAggregate(group=[{0}], avg(SAL)=[AVG($1)])\n"
+            + "  LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+            + "    LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
   public void case_when_with_else() {
     // PPL `case(cond, val, ..., else val)` translates to Calcite's SqlCase. The validator inserts
     // CAST($7):INTEGER for DEPTNO (TINYINT in SCOTT) when comparing to integer literals — the same

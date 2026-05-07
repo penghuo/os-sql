@@ -5,21 +5,14 @@
 
 package org.opensearch.sql.calcite.sqlnode;
 
-import java.util.Properties;
 import org.apache.calcite.adapter.java.JavaTypeFactory;
-import org.apache.calcite.config.CalciteConnectionConfigImpl;
-import org.apache.calcite.config.CalciteConnectionProperty;
-import org.apache.calcite.jdbc.CalciteSchema;
-import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.ViewExpanders;
-import org.apache.calcite.prepare.CalciteCatalogReader;
+import org.apache.calcite.prepare.Prepare;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
-import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rex.RexBuilder;
-import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -29,7 +22,9 @@ import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
 import org.apache.calcite.sql2rel.StandardConvertletTable;
 import org.apache.calcite.tools.FrameworkConfig;
-import org.apache.calcite.tools.Frameworks;
+import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 
 /**
  * POC: drives a programmatically built PPL {@link SqlNode} through Calcite's standard pipeline:
@@ -39,93 +34,97 @@ import org.apache.calcite.tools.Frameworks;
  *   <li>{@link SqlToRelConverter#convertQuery(SqlNode, boolean, boolean)} — emit a {@link RelNode}.
  * </ol>
  *
- * <p>This intentionally mirrors what {@code OpenSearchPrepareImpl} does for raw SQL today; we just
- * skip the parser since PPL produces SqlNode directly.
+ * <p>Uses {@link CalciteToolsHelper#withOpenSearchPrepare} so the validator/converter see the
+ * OpenSearch index catalog (lazy table registration via {@code OpenSearchSchema} only works when
+ * driven through {@code OpenSearchPrepareImpl}).
  */
 public final class SqlNodePlanner {
 
   private final FrameworkConfig config;
+  private final CalcitePlanContext context;
 
+  /** Constructor used by tests that don't have a CalcitePlanContext available. */
   public SqlNodePlanner(FrameworkConfig config) {
+    this(config, null);
+  }
+
+  /** Constructor used by QueryService — passes the plan context's connection through. */
+  public SqlNodePlanner(FrameworkConfig config, CalcitePlanContext context) {
     this.config = config;
+    this.context = context;
   }
 
   /** Validate then convert {@code sqlNode} into a {@link RelNode}. */
   public RelNode plan(SqlNode sqlNode) {
-    return Frameworks.withPrepare(
-        config,
-        (cluster, relOptSchema, rootSchema, statement) -> convert(cluster, rootSchema, sqlNode));
+    return runWithPrepare((cluster, catalogReader) -> convert(cluster, catalogReader, sqlNode));
   }
 
   /**
    * Build a row-type oracle suitable for {@link PplToSqlNode}'s schema-introspection-backed
-   * commands. Validates a probe SqlNode in the same FrameworkConfig and returns its row type.
+   * commands. Validates a probe SqlNode in the same prepare context and returns its row type.
    */
   public java.util.function.Function<SqlNode, org.apache.calcite.rel.type.RelDataType>
       rowTypeOracle() {
     return probe ->
-        Frameworks.withPrepare(
-            config,
-            (cluster, relOptSchema, rootSchema, statement) -> {
-              JavaTypeFactory typeFactory = new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
-              Properties props = new Properties();
-              props.setProperty(CalciteConnectionProperty.CASE_SENSITIVE.camelName(), "false");
-              CalciteConnectionConfigImpl ccc = new CalciteConnectionConfigImpl(props);
-              SchemaPlus defaultSchema =
-                  config.getDefaultSchema() != null ? config.getDefaultSchema() : rootSchema;
-              CalciteSchema schema = CalciteSchema.from(defaultSchema);
-              CalciteCatalogReader catalogReader =
-                  new CalciteCatalogReader(schema.root(), schema.path(null), typeFactory, ccc);
-              SqlOperatorTable operatorTable =
-                  config.getOperatorTable() != null
-                      ? new ChainedSqlOperatorTable(
-                          java.util.Arrays.asList(
-                              config.getOperatorTable(), SqlStdOperatorTable.instance()))
-                      : SqlStdOperatorTable.instance();
+        runWithPrepare(
+            (cluster, catalogReader) -> {
               SqlValidator probeValidator =
                   SqlValidatorUtil.newValidator(
-                      operatorTable,
+                      buildOperatorTable(),
                       catalogReader,
-                      typeFactory,
+                      cluster.getTypeFactory(),
                       SqlValidator.Config.DEFAULT.withTypeCoercionEnabled(true));
               SqlNode validatedProbe = probeValidator.validate(probe);
               return probeValidator.getValidatedNodeType(validatedProbe);
             });
   }
 
-  private RelNode convert(RelOptCluster cluster, SchemaPlus rootSchema, SqlNode sqlNode) {
-    JavaTypeFactory typeFactory = new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
-
-    Properties props = new Properties();
-    props.setProperty(CalciteConnectionProperty.CASE_SENSITIVE.camelName(), "false");
-    CalciteConnectionConfigImpl ccc = new CalciteConnectionConfigImpl(props);
-
-    SchemaPlus defaultSchema =
-        config.getDefaultSchema() != null ? config.getDefaultSchema() : rootSchema;
-    CalciteSchema schema = CalciteSchema.from(defaultSchema);
-    CalciteCatalogReader catalogReader =
-        new CalciteCatalogReader(schema.root(), schema.path(null), typeFactory, ccc);
-
-    // Chain: caller-supplied operators (if any) + PPL built-in operators + standard SQL.
+  private SqlOperatorTable buildOperatorTable() {
     java.util.List<SqlOperatorTable> tables = new java.util.ArrayList<>();
     if (config.getOperatorTable() != null) {
       tables.add(config.getOperatorTable());
     }
     tables.add(org.opensearch.sql.expression.function.PPLBuiltinOperators.instance());
     tables.add(SqlStdOperatorTable.instance());
-    SqlOperatorTable operatorTable =
-        tables.size() == 1 ? tables.get(0) : new ChainedSqlOperatorTable(tables);
+    return tables.size() == 1 ? tables.get(0) : new ChainedSqlOperatorTable(tables);
+  }
 
+  /**
+   * Run an action through the OpenSearch-aware prepare pipeline so {@code OpenSearchSchema}'s lazy
+   * table registration is exercised. Falls back to a fresh JDBC connection when no
+   * CalcitePlanContext was supplied (test-only path).
+   */
+  private <R> R runWithPrepare(
+      java.util.function.BiFunction<RelOptCluster, Prepare.CatalogReader, R> action) {
+    JavaTypeFactory typeFactory = OpenSearchTypeFactory.TYPE_FACTORY;
+    java.sql.Connection conn =
+        context != null ? context.connection : CalciteToolsHelper.connect(config, typeFactory);
+    return CalciteToolsHelper.withOpenSearchPrepare(
+        config,
+        typeFactory,
+        conn,
+        (cluster, relOptSchema, rootSchema, statement) -> {
+          if (!(relOptSchema instanceof Prepare.CatalogReader catalogReader)) {
+            throw new IllegalStateException(
+                "OpenSearch prepare expected a Prepare.CatalogReader, got: "
+                    + relOptSchema.getClass().getName());
+          }
+          return action.apply(cluster, catalogReader);
+        });
+  }
+
+  private RelNode convert(
+      RelOptCluster cluster, Prepare.CatalogReader catalogReader, SqlNode sqlNode) {
     SqlValidator validator =
         SqlValidatorUtil.newValidator(
-            operatorTable,
+            buildOperatorTable(),
             catalogReader,
-            typeFactory,
+            cluster.getTypeFactory(),
             SqlValidator.Config.DEFAULT.withTypeCoercionEnabled(true));
 
     SqlNode validated = validator.validate(sqlNode);
 
-    RexBuilder rexBuilder = new RexBuilder(typeFactory);
+    RexBuilder rexBuilder = new RexBuilder(cluster.getTypeFactory());
     RelOptCluster relCluster = RelOptCluster.create(cluster.getPlanner(), rexBuilder);
     SqlToRelConverter converter =
         new SqlToRelConverter(

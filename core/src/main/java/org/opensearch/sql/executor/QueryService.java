@@ -303,19 +303,16 @@ public class QueryService {
     if (isSqlNodePathEnabled()) {
       try {
         org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
-            new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config);
+            new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
         org.apache.calcite.sql.SqlNode sqlNode =
             new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(planner.rowTypeOracle())
                 .visit(plan);
         return planner.plan(sqlNode);
-      } catch (RuntimeException e) {
-        // SqlNode path didn't make it through translation/validation. Fall back to the legacy
-        // RelBuilder visitor — this is the documented graceful degradation strategy while the
-        // SqlNode path matures. The new path is opt-in (default off) so this only affects users
-        // who explicitly enabled it.
+      } catch (UnsupportedOperationException e) {
+        // PPL pipe not yet covered by the SqlNode path — fall back. Other RuntimeExceptions
+        // (validator errors, converter errors) propagate so they're visible during shakeout.
         log.warn(
-            "Falling back to CalciteRelNodeVisitor path; SqlNode path failed with: {}: {}",
-            e.getClass().getSimpleName(),
+            "Falling back to CalciteRelNodeVisitor for unsupported SqlNode case: {}",
             e.getMessage());
       }
     }

@@ -153,6 +153,20 @@ public class CalciteToolsHelper {
   }
 
   /**
+   * Public variant of {@link #withPrepare(FrameworkConfig, JavaTypeFactory, Connection,
+   * Frameworks.BasePrepareAction)} so callers (notably SqlNodePlanner) can run actions through the
+   * OpenSearch-customized prepare machinery — needed for OpenSearch index resolution to work in the
+   * validator/converter.
+   */
+  public static <R> R withOpenSearchPrepare(
+      FrameworkConfig config,
+      JavaTypeFactory typeFactory,
+      Connection connection,
+      Frameworks.BasePrepareAction<R> action) {
+    return withPrepare(config, typeFactory, connection, action);
+  }
+
+  /**
    * This method copied from {@link Frameworks#withPrepare(FrameworkConfig,
    * Frameworks.BasePrepareAction)}. The purpose is the method {@link
    * CalciteFactory#newConnection(UnregisteredDriver, AvaticaFactory, String, Properties)} create

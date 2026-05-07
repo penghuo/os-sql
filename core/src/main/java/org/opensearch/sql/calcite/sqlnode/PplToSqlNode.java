@@ -843,7 +843,36 @@ public class PplToSqlNode {
      * SORT/HEAD/LIMIT pipes that need to survive subsequent pipes.
      */
     SqlNode toFinalSqlNode() {
-      SqlNode body = toSqlNode();
+      // The validator needs a query expression (SELECT ...) at the top level, never a bare
+      // table identifier. Force SELECT * FROM <table> when nothing else is set so a bare
+      // `source=test` query reaches validation as a complete SELECT.
+      SqlNode body;
+      if (where == null
+          && projection == null
+          && groupBy == null
+          && orderBy == null
+          && fetch == null
+          && from instanceof SqlIdentifier) {
+        SqlNodeList selectList = new SqlNodeList(POS);
+        selectList.add(SqlIdentifier.star(POS));
+        body =
+            new SqlSelect(
+                POS, /* keywordList */
+                null,
+                selectList,
+                from, /* where */
+                null,
+                /* group */ null, /* having */
+                null, /* windowList */
+                null,
+                /* qualify */ null, /* orderBy */
+                null, /* offset */
+                null, /* fetch */
+                null,
+                /* hints */ null);
+      } else {
+        body = toSqlNode();
+      }
       if (outerOrderBy != null || outerFetch != null) {
         SqlNodeList ord = new SqlNodeList(POS);
         if (outerOrderBy != null) {

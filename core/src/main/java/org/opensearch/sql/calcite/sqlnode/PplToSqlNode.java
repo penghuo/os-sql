@@ -41,9 +41,11 @@ import org.opensearch.sql.ast.expression.subquery.InSubquery;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
+import org.opensearch.sql.ast.tree.Expand;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.Lookup;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
@@ -195,6 +197,125 @@ public class PplToSqlNode {
     private boolean isSelectStar(Project node) {
       List<UnresolvedExpression> list = node.getProjectList();
       return list.size() == 1 && list.get(0) instanceof AllFields;
+    }
+
+    @Override
+    public Void visitLookup(Lookup node, Void ignored) {
+      walkChild(node);
+      state.wrap();
+      // Lookup-side: SELECT <output cols>, <key cols> FROM <lookup table>
+      // Build by recursively visiting the lookup relation, then projecting just the keys + outputs.
+      SqlNode lookupSide = new PplToSqlNode().visit(node.getLookupRelation());
+      java.util.Map<String, String> mapping = node.getMappingAliasMap();
+      java.util.Map<String, String> output = node.getOutputAliasMap();
+      // Project the lookup-side columns we need: outputs first, then mapping keys.
+      SqlNodeList lookupSelectList = new SqlNodeList(POS);
+      for (java.util.Map.Entry<String, String> e : output.entrySet()) {
+        lookupSelectList.add(new SqlIdentifier(e.getKey(), POS));
+      }
+      for (String key : mapping.keySet()) {
+        lookupSelectList.add(new SqlIdentifier(key, POS));
+      }
+      SqlSelect lookupProject =
+          new SqlSelect(
+              POS, /* keywordList */
+              null,
+              lookupSelectList,
+              lookupSide, /* where */
+              null,
+              /* group */ null, /* having */
+              null, /* windowList */
+              null,
+              /* qualify */ null, /* orderBy */
+              null, /* offset */
+              null, /* fetch */
+              null,
+              /* hints */ null);
+      String inputAlias = "lookup_input";
+      String lookupAlias = "lookup_t";
+      SqlNode aliasedLookup =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS,
+              List.of(lookupProject, new SqlIdentifier(lookupAlias, POS)),
+              POS);
+      SqlNode aliasedInput =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS, List.of(state.from, new SqlIdentifier(inputAlias, POS)), POS);
+      // Build join condition: input.<key> = lookupAlias.<key> for each mapping entry.
+      SqlNode condition = null;
+      for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
+        SqlNode left = new SqlIdentifier(java.util.Arrays.asList(inputAlias, e.getKey()), POS);
+        SqlNode right = new SqlIdentifier(java.util.Arrays.asList(lookupAlias, e.getValue()), POS);
+        SqlNode eq = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(left, right), POS);
+        condition =
+            condition == null
+                ? eq
+                : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(condition, eq), POS);
+      }
+      org.apache.calcite.sql.SqlJoin join =
+          new org.apache.calcite.sql.SqlJoin(
+              POS,
+              aliasedInput,
+              SqlLiteral.createBoolean(false, POS),
+              org.apache.calcite.sql.JoinType.LEFT.symbol(POS),
+              aliasedLookup,
+              org.apache.calcite.sql.JoinConditionType.ON.symbol(POS),
+              condition);
+      state.from = join;
+      // For OUTPUT (APPEND) strategy, leave projection as-is (SELECT *) — user already sees all
+      // input cols + the joined lookup cols. For REPLACE strategy we'd need to drop overwritten
+      // input cols and add the lookup cols under their new names; that requires schema info to
+      // enumerate input columns, which isn't available without validation. Throw for REPLACE
+      // and let QueryService fall back.
+      if (node.getOutputStrategy() == Lookup.OutputStrategy.REPLACE) {
+        throw new UnsupportedOperationException(
+            "lookup REPLACE strategy needs input-schema enumeration not yet wired in SqlNode POC");
+      }
+      return null;
+    }
+
+    @Override
+    public Void visitExpand(Expand node, Void ignored) {
+      walkChild(node);
+      // Always wrap; expand changes the row set (each input row becomes N rows).
+      state.wrap();
+      String fieldName;
+      UnresolvedExpression fieldExpr = node.getField().getField();
+      if (fieldExpr instanceof QualifiedName qn) {
+        fieldName = qn.toString();
+      } else {
+        throw new UnsupportedOperationException(
+            "expand requires a simple column reference, got: " + fieldExpr.getClass());
+      }
+      String alias = node.getAlias() != null ? node.getAlias() : fieldName;
+      // Build SQL: SELECT <input>.*, t.<alias> FROM (<input>) AS s, UNNEST(s.<field>) AS t(<alias>)
+      // We achieve the implicit-LATERAL CROSS JOIN by setting state.from to a SqlJoin with COMMA.
+      String inputAlias = "expand_input";
+      SqlNode aliasedInput =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS, List.of(state.from, new SqlIdentifier(inputAlias, POS)), POS);
+      SqlNode unnestArg = new SqlIdentifier(java.util.Arrays.asList(inputAlias, fieldName), POS);
+      SqlNode unnest = new SqlBasicCall(SqlStdOperatorTable.UNNEST, List.of(unnestArg), POS);
+      SqlNode aliasedUnnest =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS,
+              List.of(unnest, new SqlIdentifier("expand_t", POS), new SqlIdentifier(alias, POS)),
+              POS);
+      org.apache.calcite.sql.SqlJoin join =
+          new org.apache.calcite.sql.SqlJoin(
+              POS,
+              aliasedInput,
+              SqlLiteral.createBoolean(false, POS),
+              org.apache.calcite.sql.JoinType.COMMA.symbol(POS),
+              aliasedUnnest,
+              org.apache.calcite.sql.JoinConditionType.NONE.symbol(POS),
+              null);
+      state.from = join;
+      // Reset projection to allow downstream pipes to see all columns including the unnested one.
+      state.projection = null;
+      state.projectionReplaced = false;
+      state.evalExtended = false;
+      return null;
     }
 
     @Override

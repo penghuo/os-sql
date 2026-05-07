@@ -178,6 +178,23 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void lookup_append_left_joins_lookup_table() {
+    // PPL's `append` strategy keeps all input columns and appends the lookup-side outputs.
+    // (`output` in PPL semantics maps to OutputStrategy.REPLACE, which needs schema enumeration
+    // and is currently unsupported in the SqlNode POC — the visitor throws and QueryService
+    // falls back to the legacy path.)
+    RelNode root = runViaSqlNode("source=EMP | lookup DEPT DEPTNO append LOC");
+    String tree = root.explain();
+    // Expected shape: LogicalJoin(condition=[=($7, $9)], joinType=[left]) over EMP and a
+    // projected DEPT side (LOC, DEPTNO).
+    assertThat("plan contains LogicalJoin", tree.contains("LogicalJoin"), is(true));
+    assertThat("plan contains joinType=[left]", tree.contains("joinType=[left]"), is(true));
+    assertThat("plan reads scott.EMP", tree.contains("[scott, EMP]"), is(true));
+    assertThat("plan reads scott.DEPT", tree.contains("[scott, DEPT]"), is(true));
+    assertThat("LOC is selected from lookup side", tree.contains("LOC=["), is(true));
+  }
+
+  @Test
   public void parse_regex_named_groups() {
     // Mirrors CalcitePPLParseTest.testParse — extract a named group via PARSE+ITEM.
     RelNode root =

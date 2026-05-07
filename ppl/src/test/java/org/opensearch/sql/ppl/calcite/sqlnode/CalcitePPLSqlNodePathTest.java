@@ -86,16 +86,15 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
-  public void multi_source_unions_tables() {
-    // Use EMP twice (same row type) so SQL UNION ALL row-type unification trivially succeeds.
-    // PPL's existing path widens schemas across tables — that broader unification is an open
-    // gap for the SqlNode path.
-    RelNode root = runViaSqlNode("source=EMP, EMP | fields ENAME");
-    String tree = root.explain();
-    assertThat(
-        "plan contains LogicalUnion(all=[true])",
-        tree.contains("LogicalUnion(all=[true])"),
-        is(true));
+  public void multi_source_passes_joined_name_through() {
+    // PPL `source=A, B` mirrors CalciteRelNodeVisitor: the comma-joined name flows through as a
+    // single scan; the storage engine resolves multi-index/wildcard semantics. The SCOTT schema
+    // doesn't carry that resolution, so we just sanity-check the joined identifier is what the
+    // validator looks up.
+    UnresolvedPlan plan = parse("source=EMP, EMP | fields ENAME");
+    SqlNode sqlNode = new PplToSqlNode().visit(plan);
+    String unparsed = sqlNode.toString().toUpperCase().replace("\"", "");
+    assertThat("joined name appears", unparsed.contains("EMP,EMP"), is(true));
   }
 
   @Test

@@ -153,36 +153,12 @@ public class PplToSqlNode {
 
     @Override
     public Void visitRelation(Relation node, Void ignored) {
-      // PPL `source=a, b` → SQL UNION ALL of two SELECT * statements, identical to how the
-      // existing CalciteRelNodeVisitor materializes multiple tables.
-      List<UnresolvedExpression> tables = node.getTableNames();
-      if (tables.size() == 1) {
-        state.setFrom(qualifiedNameToIdentifier((QualifiedName) tables.get(0)));
-      } else {
-        SqlNode union = null;
-        for (UnresolvedExpression t : tables) {
-          SqlNode select =
-              new SqlSelect(
-                  POS,
-                  /* keywordList */ null,
-                  starList(),
-                  qualifiedNameToIdentifier((QualifiedName) t),
-                  /* where */ null,
-                  /* group */ null,
-                  /* having */ null,
-                  /* windowList */ null,
-                  /* qualify */ null,
-                  /* orderBy */ null,
-                  /* offset */ null,
-                  /* fetch */ null,
-                  /* hints */ null);
-          union =
-              union == null
-                  ? select
-                  : new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, select), POS);
-        }
-        state.setFrom(union);
-      }
+      // PPL `source=a, b` matches the existing CalciteRelNodeVisitor: pass the comma-joined name
+      // through as a single scan. OpenSearch's storage engine resolves comma-separated indices
+      // (and wildcard patterns) natively and dedups identical indices in the result. This mirrors
+      // `relBuilder.scan(getTableQualifiedName().getParts())` in the v2 visitor.
+      QualifiedName joinedName = node.getTableQualifiedName();
+      state.setFrom(qualifiedNameToIdentifier(joinedName));
       return null;
     }
 
@@ -196,6 +172,17 @@ public class PplToSqlNode {
       }
       state.addWhere(expr(node.getCondition()));
       return null;
+    }
+
+    @Override
+    public Void visitSearch(org.opensearch.sql.ast.tree.Search node, Void ignored) {
+      // PPL Search → query_string filter requires the relevance-query UDF, whose operand type
+      // checker rejects validator-shaped MAP operands. The RexNode path bypasses validation and
+      // builds the call directly. Rather than reimplementing that bypass for SqlNode, fall back
+      // to CalciteRelNodeVisitor for any pipeline that contains Search. Throwing here triggers
+      // the QueryService fallback path (UnsupportedOperationException → v2 visitor).
+      throw new UnsupportedOperationException(
+          "Search (query_string filter) is not yet supported via the SqlNode path");
     }
 
     @Override

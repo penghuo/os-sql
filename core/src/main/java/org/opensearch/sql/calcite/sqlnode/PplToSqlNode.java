@@ -218,10 +218,40 @@ public class PplToSqlNode {
         throw new UnsupportedOperationException("fields - is not supported in SqlNode POC yet");
       }
       // PPL wraps every parsed query in a synthesized top-level "project AllFields" — i.e. the
-      // bare PPL "source=T" implicitly ends with "| fields *". We must not let that no-op
-      // wrap a downstream pipe (especially Sort) since wrapping pushes ORDER BY into a
-      // subquery where SQL semantics treat it as informational.
+      // bare PPL "source=T" implicitly ends with "| fields *". On OpenSearch indices this
+      // expansion picks up metadata fields (_id, _index, _score, ...) which PPL hides; if any
+      // are present we must enumerate the non-meta columns. Otherwise leave it as a no-op so
+      // downstream pipes (especially Sort) aren't wrapped into informational subqueries.
       if (isSelectStar(node)) {
+        // Only enumerate-and-filter metadata when the projection is still the default SELECT *
+        // (no upstream pipe customised it). If a Stats / Eval / Project / Window already set
+        // a projection, they own the row shape — don't overwrite.
+        if (rowTypeOracle != null
+            && state.from != null
+            && state.projection == null
+            && !state.evalExtended) {
+          List<String> cols = deriveColumnNames(state.from);
+          boolean hasMeta =
+              cols.stream()
+                  .anyMatch(
+                      org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                          ::containsKey);
+          if (hasMeta) {
+            if (state.orderBy != null || state.fetch != null) {
+              state.wrap();
+            }
+            List<SqlNode> projection = new ArrayList<>();
+            for (String c : cols) {
+              if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                  .containsKey(c)) {
+                continue;
+              }
+              projection.add(new SqlIdentifier(c, POS));
+            }
+            state.setProjection(projection);
+            return null;
+          }
+        }
         return null;
       }
       // SQL aliases in the SELECT list aren't visible inside the same SELECT list, so a project

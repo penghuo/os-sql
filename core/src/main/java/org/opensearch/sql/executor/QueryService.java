@@ -308,15 +308,39 @@ public class QueryService {
             new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(planner.rowTypeOracle())
                 .visit(plan);
         return planner.plan(sqlNode);
-      } catch (UnsupportedOperationException e) {
-        // PPL pipe not yet covered by the SqlNode path — fall back. Other RuntimeExceptions
-        // (validator errors, converter errors) propagate so they're visible during shakeout.
-        log.warn(
-            "Falling back to CalciteRelNodeVisitor for unsupported SqlNode case: {}",
-            e.getMessage());
+      } catch (Throwable t) {
+        if (shouldFallbackFromSqlNode(t)) {
+          log.warn(
+              "Falling back to CalciteRelNodeVisitor after SqlNode path failure: {}",
+              t.getMessage());
+        } else {
+          throw t;
+        }
       }
     }
     return getRelNodeVisitor().analyze(plan, context);
+  }
+
+  /**
+   * The SqlNode path doesn't cover every PPL feature yet (Search/query_string filtering, alias-type
+   * fields, etc.); when validation fails for a feature gap, fall back to the v2 visitor. Currently
+   * we treat any UnsupportedOperationException or "Field [X] not found." / "Column 'X' not found"
+   * as a recoverable shape.
+   */
+  private static boolean shouldFallbackFromSqlNode(Throwable t) {
+    Throwable cur = t;
+    while (cur != null) {
+      if (cur instanceof UnsupportedOperationException) {
+        return true;
+      }
+      if (cur instanceof IllegalArgumentException
+          && cur.getMessage() != null
+          && cur.getMessage().startsWith("Field [")) {
+        return true;
+      }
+      cur = cur.getCause();
+    }
+    return false;
   }
 
   private boolean isSqlNodePathEnabled() {

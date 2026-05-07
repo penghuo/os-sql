@@ -192,6 +192,30 @@ public class PplToSqlNode {
       if (state.orderBy != null || state.fetch != null) {
         state.wrap();
       }
+      // If we have an oracle and the projection is still SELECT *, seed it with the non-metadata
+      // columns enumerated from the FROM. This stops the eval-extended SELECT list from inheriting
+      // OpenSearch's hidden metadata fields (_id, _index, _score, ...) via SELECT *.
+      if (state.projection == null
+          && rowTypeOracle != null
+          && state.from != null
+          && !node.getExpressionList().isEmpty()) {
+        List<String> cols = deriveColumnNames(state.from);
+        boolean hasMeta =
+            cols.stream()
+                .anyMatch(
+                    org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                        ::containsKey);
+        if (hasMeta) {
+          List<SqlNode> seeded = new ArrayList<>();
+          for (String c : cols) {
+            if (!org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                .containsKey(c)) {
+              seeded.add(new SqlIdentifier(c, POS));
+            }
+          }
+          state.projection = seeded;
+        }
+      }
       for (Let let : node.getExpressionList()) {
         state.addEvalAlias(expr(let.getExpression()), letName(let));
       }
@@ -1002,7 +1026,12 @@ public class PplToSqlNode {
     return switch (t) {
       case BOOLEAN -> SqlLiteral.createBoolean((Boolean) v, POS);
       case INTEGER, LONG, SHORT -> SqlLiteral.createExactNumeric(v.toString(), POS);
-      case FLOAT, DOUBLE, DECIMAL -> {
+      // PPL FLOAT/DOUBLE literals are approximate. createApproxNumeric requires scientific
+      // notation, so add "E0" if it's missing. CAST the FLOAT result down to FLOAT (REAL) so it
+      // doesn't widen to DOUBLE during validator type promotion.
+      case FLOAT -> castTo(approxNumeric(v), org.apache.calcite.sql.type.SqlTypeName.FLOAT);
+      case DOUBLE -> approxNumeric(v);
+      case DECIMAL -> {
         BigDecimal bd = (v instanceof BigDecimal b) ? b : new BigDecimal(v.toString());
         yield SqlLiteral.createExactNumeric(bd.toPlainString(), POS);
       }
@@ -1113,12 +1142,17 @@ public class PplToSqlNode {
     if (op != null) {
       return new SqlBasicCall(op, args, POS);
     }
+    // Some PPL function names don't match the SQL operator name. The full mapping lives in
+    // PPLFuncImpTable, but the SqlNode path goes through the validator's name lookup which
+    // doesn't consult that table. Translate the well-known mismatches here so the validator
+    // can find the operator under its standard name.
+    String resolvedName = resolveFunctionName(f.getFuncName());
     // Defer function resolution to the validator: build an unresolved function call that
     // SqlValidator will resolve against PPLBuiltinOperators + SqlStdOperatorTable, performing
     // overload selection and type coercion as standard SQL would.
     return new SqlBasicCall(
         new org.apache.calcite.sql.SqlUnresolvedFunction(
-            new SqlIdentifier(f.getFuncName(), POS),
+            new SqlIdentifier(resolvedName, POS),
             /* returnTypeInference */ null,
             /* operandTypeInference */ null,
             /* operandTypeChecker */ null,
@@ -1126,6 +1160,18 @@ public class PplToSqlNode {
             org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
         args,
         POS);
+  }
+
+  /**
+   * PPL function names that bind to a different Calcite operator name in PPLFuncImpTable. Keep this
+   * in sync with {@code PPLFuncImpTable.registerOperator(POW, SqlStdOperatorTable.POWER)} style
+   * mappings — anywhere a PPL builtin doesn't share the SqlStdOperatorTable name.
+   */
+  private static String resolveFunctionName(String pplName) {
+    return switch (pplName.toLowerCase()) {
+      case "pow" -> "POWER";
+      default -> pplName;
+    };
   }
 
   /**
@@ -1137,7 +1183,9 @@ public class PplToSqlNode {
       case "+" -> SqlStdOperatorTable.PLUS;
       case "-" -> SqlStdOperatorTable.MINUS;
       case "*" -> SqlStdOperatorTable.MULTIPLY;
-      case "/" -> SqlStdOperatorTable.DIVIDE;
+      // PPL semantics: x/0 returns NULL, not an exception. Mirrors PPLFuncImpTable's
+      // registerDivideFunction (DIVIDE → SAFE_DIVIDE). MOD doesn't have an equivalent here yet.
+      case "/" -> org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_DIVIDE;
       case "%" -> SqlStdOperatorTable.MOD;
       default -> null;
     };
@@ -1147,6 +1195,22 @@ public class PplToSqlNode {
 
   private static SqlNode intLiteral(int v) {
     return SqlLiteral.createExactNumeric(Integer.toString(v), POS);
+  }
+
+  private static SqlNode approxNumeric(Object v) {
+    BigDecimal bd = (v instanceof BigDecimal b) ? b : new BigDecimal(v.toString());
+    String approx = bd.toString();
+    if (!approx.contains("E") && !approx.contains("e")) {
+      approx = bd.toPlainString() + "E0";
+    }
+    return SqlLiteral.createApproxNumeric(approx, POS);
+  }
+
+  private static SqlNode castTo(SqlNode value, org.apache.calcite.sql.type.SqlTypeName tn) {
+    org.apache.calcite.sql.SqlDataTypeSpec spec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(tn, POS), POS);
+    return new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(value, spec), POS);
   }
 
   private static SqlNodeList starList() {

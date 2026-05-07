@@ -86,6 +86,12 @@ public final class SqlNodePlanner {
     }
     tables.add(org.opensearch.sql.expression.function.PPLBuiltinOperators.instance());
     tables.add(SqlStdOperatorTable.instance());
+    // SqlLibraryOperators contains operators like SAFE_DIVIDE that PPLFuncImpTable uses for
+    // PPL-specific arithmetic semantics (e.g. division by zero returns NULL).
+    tables.add(
+        org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(
+            org.apache.calcite.sql.fun.SqlLibrary.STANDARD,
+            org.apache.calcite.sql.fun.SqlLibrary.BIG_QUERY));
     return tables.size() == 1 ? tables.get(0) : new ChainedSqlOperatorTable(tables);
   }
 
@@ -122,7 +128,12 @@ public final class SqlNodePlanner {
             cluster.getTypeFactory(),
             SqlValidator.Config.DEFAULT.withTypeCoercionEnabled(true));
 
-    SqlNode validated = validator.validate(sqlNode);
+    SqlNode validated;
+    try {
+      validated = validator.validate(sqlNode);
+    } catch (RuntimeException e) {
+      throw translateValidationError(e);
+    }
 
     RexBuilder rexBuilder = new RexBuilder(cluster.getTypeFactory());
     RelOptCluster relCluster = RelOptCluster.create(cluster.getPlanner(), rexBuilder);
@@ -135,7 +146,12 @@ public final class SqlNodePlanner {
             StandardConvertletTable.INSTANCE,
             SqlToRelConverter.config().withTrimUnusedFields(false).withExpand(false));
 
-    RelRoot root = converter.convertQuery(validated, /* needsValidation */ false, /* top */ true);
+    RelRoot root;
+    try {
+      root = converter.convertQuery(validated, /* needsValidation */ false, /* top */ true);
+    } catch (RuntimeException e) {
+      throw translateValidationError(e);
+    }
     RelNode rel = root.rel;
     // The converter strips a top-level ORDER BY into RelRoot.collation; PPL preserves sort
     // through the pipe chain, so re-attach an explicit LogicalSort if needed.
@@ -144,5 +160,24 @@ public final class SqlNodePlanner {
       rel = org.apache.calcite.rel.logical.LogicalSort.create(rel, root.collation, null, null);
     }
     return RelOptUtil.propagateRelHints(rel, false);
+  }
+
+  /**
+   * Map Calcite validator exceptions to PPL's existing IllegalArgumentException("Field [X] not
+   * found.") shape so callers (and tests) that pattern-match on the v2 message keep working. Only
+   * rewrites the column-not-found case; everything else is rethrown unchanged.
+   */
+  private static RuntimeException translateValidationError(RuntimeException original) {
+    String msg = original.getMessage();
+    if (msg == null) {
+      return original;
+    }
+    java.util.regex.Matcher m =
+        java.util.regex.Pattern.compile("Column '([^']+)' not found").matcher(msg);
+    if (m.find()) {
+      String col = m.group(1);
+      return new IllegalArgumentException("Field [" + col + "] not found.", original);
+    }
+    return original;
   }
 }

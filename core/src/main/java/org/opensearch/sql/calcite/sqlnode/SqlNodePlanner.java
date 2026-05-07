@@ -70,11 +70,15 @@ public final class SqlNodePlanner {
     CalciteCatalogReader catalogReader =
         new CalciteCatalogReader(schema.root(), schema.path(null), typeFactory, ccc);
 
+    // Chain: caller-supplied operators (if any) + PPL built-in operators + standard SQL.
+    java.util.List<SqlOperatorTable> tables = new java.util.ArrayList<>();
+    if (config.getOperatorTable() != null) {
+      tables.add(config.getOperatorTable());
+    }
+    tables.add(org.opensearch.sql.expression.function.PPLBuiltinOperators.instance());
+    tables.add(SqlStdOperatorTable.instance());
     SqlOperatorTable operatorTable =
-        config.getOperatorTable() != null
-            ? new ChainedSqlOperatorTable(
-                java.util.Arrays.asList(config.getOperatorTable(), SqlStdOperatorTable.instance()))
-            : SqlStdOperatorTable.instance();
+        tables.size() == 1 ? tables.get(0) : new ChainedSqlOperatorTable(tables);
 
     SqlValidator validator =
         SqlValidatorUtil.newValidator(

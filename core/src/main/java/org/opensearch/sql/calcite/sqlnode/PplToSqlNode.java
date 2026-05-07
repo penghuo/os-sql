@@ -541,26 +541,41 @@ public class PplToSqlNode {
   }
 
   private SqlNode func(Function f) {
-    SqlOperator op = lookupOperator(f.getFuncName());
     List<SqlNode> args = new ArrayList<>(f.getFuncArgs().size());
     for (UnresolvedExpression a : f.getFuncArgs()) {
       args.add(expr(a));
     }
-    return new SqlBasicCall(op, args, POS);
+    SqlOperator op = arithmeticOperator(f.getFuncName());
+    if (op != null) {
+      return new SqlBasicCall(op, args, POS);
+    }
+    // Defer function resolution to the validator: build an unresolved function call that
+    // SqlValidator will resolve against PPLBuiltinOperators + SqlStdOperatorTable, performing
+    // overload selection and type coercion as standard SQL would.
+    return new SqlBasicCall(
+        new org.apache.calcite.sql.SqlUnresolvedFunction(
+            new SqlIdentifier(f.getFuncName(), POS),
+            /* returnTypeInference */ null,
+            /* operandTypeInference */ null,
+            /* operandTypeChecker */ null,
+            /* paramTypes */ null,
+            org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+        args,
+        POS);
   }
 
-  /** Tiny first-cut name→operator map. Will eventually be replaced by validator overload lookup. */
-  private SqlOperator lookupOperator(String name) {
-    return switch (name.toLowerCase()) {
+  /**
+   * PPL parses arithmetic operators as Function nodes with names like "+"/"-"/etc. Map those to
+   * Calcite operators directly; everything else goes through the validator's name lookup.
+   */
+  private SqlOperator arithmeticOperator(String name) {
+    return switch (name) {
       case "+" -> SqlStdOperatorTable.PLUS;
       case "-" -> SqlStdOperatorTable.MINUS;
       case "*" -> SqlStdOperatorTable.MULTIPLY;
       case "/" -> SqlStdOperatorTable.DIVIDE;
-      case "abs" -> SqlStdOperatorTable.ABS;
-      case "upper" -> SqlStdOperatorTable.UPPER;
-      case "lower" -> SqlStdOperatorTable.LOWER;
-      default ->
-          throw new UnsupportedOperationException("Function not yet wired in SqlNode POC: " + name);
+      case "%" -> SqlStdOperatorTable.MOD;
+      default -> null;
     };
   }
 

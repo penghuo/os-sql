@@ -155,6 +155,16 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void function_resolved_by_validator() {
+    // `upper` is not in our hand-rolled operator table — it must be resolved by the validator
+    // via the chained SqlOperatorTable (PPLBuiltinOperators + SqlStdOperatorTable).
+    RelNode root = runViaSqlNode("source=EMP | eval n = upper(ENAME) | fields n");
+    String expected =
+        "LogicalProject(n=[UPPER($1)])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
   public void where_in_subquery() {
     // PPL `where x in [source=T | ...]` mirrors SQL `WHERE x IN (SELECT ...)`.
     RelNode root =

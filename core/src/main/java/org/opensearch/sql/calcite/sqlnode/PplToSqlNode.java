@@ -36,6 +36,7 @@ import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.expression.WindowFunction;
 import org.opensearch.sql.ast.expression.subquery.InSubquery;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Eval;
@@ -46,6 +47,7 @@ import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
+import org.opensearch.sql.ast.tree.Window;
 
 /**
  * POC: translate a PPL {@link UnresolvedPlan} pipeline into a Calcite {@link SqlNode} tree.
@@ -190,6 +192,47 @@ public class PplToSqlNode {
     private boolean isSelectStar(Project node) {
       List<UnresolvedExpression> list = node.getProjectList();
       return list.size() == 1 && list.get(0) instanceof AllFields;
+    }
+
+    @Override
+    public Void visitWindow(Window node, Void ignored) {
+      walkChild(node);
+      // eventstats appends agg-OVER columns to the row. Wrap if there's pending state that would
+      // make alias visibility ambiguous in the new projection.
+      if (state.evalExtended || state.projectionReplaced) {
+        state.wrap();
+      }
+      // Projection is "*, <each window func> AS <alias>".
+      List<SqlNode> selects = new ArrayList<>();
+      selects.add(SqlIdentifier.star(POS));
+      SqlNodeList partitionBy = new SqlNodeList(POS);
+      for (UnresolvedExpression p : node.getGroupList()) {
+        UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+        partitionBy.add(expr(core));
+      }
+      for (UnresolvedExpression item : node.getWindowFunctionList()) {
+        Alias al = (Alias) item;
+        WindowFunction wf = (WindowFunction) al.getDelegated();
+        SqlNode aggNode = aggCall(wf.getFunction());
+        SqlNode window =
+            org.apache.calcite.sql.SqlWindow.create(
+                /* declName */ null,
+                /* refName */ null,
+                partitionBy,
+                /* orderList */ new SqlNodeList(POS),
+                /* isRows */ SqlLiteral.createBoolean(false, POS),
+                /* lowerBound */ null,
+                /* upperBound */ null,
+                /* allowPartial */ null,
+                POS);
+        SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+        selects.add(asAlias(over, al.getName()));
+      }
+      state.setProjection(selects);
+      // Mark projection as replaced so subsequent pipes wrap, but we must NOT mark evalExtended
+      // (that would force the next where to wrap unnecessarily; aliases here are visible to
+      // downstream pipes via the wrap).
+      return null;
     }
 
     @Override
@@ -503,9 +546,19 @@ public class PplToSqlNode {
   }
 
   private SqlNode aggCall(UnresolvedExpression e) {
-    if (!(e instanceof AggregateFunction af)) {
+    // PPL eventstats wraps aggregates as WindowFunction(Function("count", [])); stats wraps them
+    // as AggregateFunction. Normalize to a (name, arg-or-null) shape so the same operator-name
+    // dispatch handles both.
+    AggregateFunction af;
+    if (e instanceof AggregateFunction a) {
+      af = a;
+    } else if (e instanceof Function f) {
+      UnresolvedExpression arg = f.getFuncArgs().isEmpty() ? null : f.getFuncArgs().get(0);
+      af = new AggregateFunction(f.getFuncName(), arg);
+    } else {
       throw new UnsupportedOperationException(
-          "stats aggregator must be an AggregateFunction, got: " + e.getClass().getSimpleName());
+          "stats aggregator must be a Function or AggregateFunction, got: "
+              + e.getClass().getSimpleName());
     }
     SqlOperator op =
         switch (af.getFuncName().toLowerCase()) {

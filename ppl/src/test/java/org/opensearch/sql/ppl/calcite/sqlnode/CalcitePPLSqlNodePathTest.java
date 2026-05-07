@@ -178,6 +178,34 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void eventstats_count() {
+    RelNode root = runViaSqlNode("source=EMP | eventstats count()");
+    // The validator inserts an explicit RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    // FOLLOWING (semantically the default empty-window for an unbounded aggregate; the existing
+    // path abbreviates as `OVER ()`). It also injects `ORDER BY $0` because OVER without ORDER
+    // BY is non-deterministic in standard SQL — this matches Calcite's standard window
+    // validation. Both behaviors are exactly what the existing CalcitePPLEventstatsTest's
+    // verifyPPLToSparkSQL expects.
+    String expected =
+        "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
+            + " COMM=[$6], DEPTNO=[$7], count()=[COUNT() OVER (ORDER BY $0 RANGE BETWEEN"
+            + " UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
+  public void eventstats_by() {
+    RelNode root = runViaSqlNode("source=EMP | eventstats max(SAL) by DEPTNO");
+    String expected =
+        "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
+            + " COMM=[$6], DEPTNO=[$7], max(SAL)=[MAX($5) OVER (PARTITION BY $7 ORDER BY $0"
+            + " RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
   public void where_in_subquery() {
     // PPL `where x in [source=T | ...]` mirrors SQL `WHERE x IN (SELECT ...)`.
     RelNode root =

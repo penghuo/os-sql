@@ -7,6 +7,7 @@ package org.opensearch.sql.ppl.calcite.sqlnode;
 
 import static org.apache.calcite.test.Matchers.hasTree;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 
 import java.util.List;
 import org.apache.calcite.plan.RelTraitDef;
@@ -105,30 +106,30 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   /**
-   * Documents a known POC limitation: PPL `sort | fields` carries the order through to the final
-   * result, but SQL semantics treat ORDER BY in a subquery as informational (the validator drops
-   * it). A real cutover will need to either lift ORDER BY to the outermost level or post-attach
-   * collation from RelRoot. Tracked for the design phase.
+   * PPL `sort | fields` keeps the sort through downstream pipes. We achieve this by storing
+   * SORT/HEAD/LIMIT effects at the pipeline level (not the inner select) and applying them as the
+   * outermost SqlOrderBy. The validator no longer treats them as informational subquery sorts.
    */
   @Test
-  public void sort_then_fields_loses_sort_in_pure_sql_translation() {
+  public void sort_then_fields_preserves_sort() {
     RelNode root = runViaSqlNode("source=EMP | sort SAL | fields ENAME, SAL");
-    String expectedNoSort =
-        "LogicalProject(ENAME=[$1], SAL=[$5])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
-    assertThat(root, hasTree(expectedNoSort));
+    String expected =
+        "LogicalSort(sort0=[$1], dir0=[ASC-nulls-first])\n"
+            + "  LogicalProject(ENAME=[$1], SAL=[$5])\n"
+            + "    LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
   }
 
   @Test
   public void head_n_caps_rows() {
     RelNode root = runViaSqlNode("source=EMP | head 5 | fields ENAME");
-    // The inner SELECT * yields a redundant LogicalProject(*) — harmless; FieldTrimmer or
-    // RelOptUtil collapse passes drop it during optimization. The Sort(fetch=5) is preserved.
+    // FETCH is lifted to the outermost SqlOrderBy so it sits above the projection in the
+    // resulting RelNode — semantically correct and produces a tight tree with no redundant
+    // intermediate Project(*).
     String expected =
-        "LogicalProject(ENAME=[$1])\n"
-            + "  LogicalSort(fetch=[5])\n"
-            + "    LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
-            + " SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
-            + "      LogicalTableScan(table=[[scott, EMP]])\n";
+        "LogicalSort(fetch=[5])\n"
+            + "  LogicalProject(ENAME=[$1])\n"
+            + "    LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
   }
 
@@ -151,6 +152,24 @@ public class CalcitePPLSqlNodePathTest {
             + "  LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
             + "    LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
+  }
+
+  @Test
+  public void where_in_subquery() {
+    // PPL `where x in [source=T | ...]` mirrors SQL `WHERE x IN (SELECT ...)`.
+    RelNode root =
+        runViaSqlNode(
+            "source=EMP | where DEPTNO in [source=EMP | eval new_deptno = case(DEPTNO in (20,"
+                + " 21), 20, DEPTNO in (30, 31), 30 else 100) | fields new_deptno] | fields"
+                + " DEPTNO");
+    // The inner subquery becomes a LogicalProject(case(...)) over the EMP scan; the outer
+    // becomes a LogicalFilter(IN(DEPTNO, subquery)) over EMP.
+    String prefix = "LogicalProject(DEPTNO=[$7])\n";
+    String tree = root.explain();
+    assertThat(tree.startsWith(prefix), is(true));
+    assertThat(tree.contains("LogicalFilter"), is(true));
+    assertThat(tree.contains("IN"), is(true));
+    assertThat(tree.contains("CASE"), is(true));
   }
 
   @Test

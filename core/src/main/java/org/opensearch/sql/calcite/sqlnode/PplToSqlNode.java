@@ -36,6 +36,7 @@ import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.expression.subquery.InSubquery;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
@@ -73,7 +74,7 @@ public class PplToSqlNode {
   public SqlNode visit(UnresolvedPlan plan) {
     Pipeline state = new Pipeline();
     new Builder(state).walk(plan);
-    return state.toSqlNode();
+    return state.toFinalSqlNode();
   }
 
   /** Walks a PPL pipeline (linked through {@code child}) bottom-up. */
@@ -206,9 +207,6 @@ public class PplToSqlNode {
     @Override
     public Void visitSort(Sort node, Void ignored) {
       walkChild(node);
-      if (state.fetch != null) {
-        state.wrap();
-      }
       List<SqlNode> keys = new ArrayList<>(node.getSortList().size());
       for (Field f : node.getSortList()) {
         SqlNode key = expr(f.getField());
@@ -223,9 +221,9 @@ public class PplToSqlNode {
         key = new SqlBasicCall(nullsOp, List.of(key), POS);
         keys.add(key);
       }
-      state.setOrderBy(keys);
+      state.setOuterOrderBy(keys);
       if (node.getCount() != null && node.getCount() != 0) {
-        state.setFetch(intLiteral(node.getCount()));
+        state.setOuterFetch(intLiteral(node.getCount()));
       }
       return null;
     }
@@ -233,20 +231,14 @@ public class PplToSqlNode {
     @Override
     public Void visitHead(Head node, Void ignored) {
       walkChild(node);
-      if (state.fetch != null) {
-        state.wrap();
-      }
-      state.setFetch(intLiteral(node.getSize()));
+      state.setOuterFetch(intLiteral(node.getSize()));
       return null;
     }
 
     @Override
     public Void visitLimit(Limit node, Void ignored) {
       walkChild(node);
-      if (state.fetch != null) {
-        state.wrap();
-      }
-      state.setFetch(intLiteral(node.getLimit()));
+      state.setOuterFetch(intLiteral(node.getLimit()));
       return null;
     }
   }
@@ -262,6 +254,15 @@ public class PplToSqlNode {
     List<SqlNode> groupBy;
     List<SqlNode> orderBy;
     SqlNode fetch;
+
+    /**
+     * PPL preserves SORT/HEAD effects through downstream pipes. SQL ORDER BY in a subquery is
+     * informational only — so we accumulate them at the pipeline level and apply as the outermost
+     * {@link SqlOrderBy} once the entire pipeline has been walked.
+     */
+    List<SqlNode> outerOrderBy;
+
+    SqlNode outerFetch;
 
     /** True when an Eval pipe added alias columns to the projection. */
     boolean evalExtended;
@@ -306,6 +307,14 @@ public class PplToSqlNode {
       fetch = f;
     }
 
+    void setOuterOrderBy(List<SqlNode> keys) {
+      outerOrderBy = keys;
+    }
+
+    void setOuterFetch(SqlNode f) {
+      outerFetch = f;
+    }
+
     /** Close the current SqlSelect and start a new one whose FROM is the just-closed select. */
     void wrap() {
       from = toSqlNode();
@@ -316,6 +325,27 @@ public class PplToSqlNode {
       fetch = null;
       evalExtended = false;
       projectionReplaced = false;
+      // outerOrderBy/outerFetch are deliberately preserved across wraps — they apply at the
+      // outermost level of the final SqlNode tree, regardless of pipe nesting.
+    }
+
+    /**
+     * Build the final SqlNode tree for the whole pipeline: take the in-flight select and wrap it in
+     * a top-level {@link SqlOrderBy} carrying any pending outer sort/fetch from upstream
+     * SORT/HEAD/LIMIT pipes that need to survive subsequent pipes.
+     */
+    SqlNode toFinalSqlNode() {
+      SqlNode body = toSqlNode();
+      if (outerOrderBy != null || outerFetch != null) {
+        SqlNodeList ord = new SqlNodeList(POS);
+        if (outerOrderBy != null) {
+          for (SqlNode n : outerOrderBy) {
+            ord.add(n);
+          }
+        }
+        return new SqlOrderBy(POS, body, ord, /* offset */ null, outerFetch);
+      }
+      return body;
     }
 
     SqlNode toSqlNode() {
@@ -404,6 +434,7 @@ public class PplToSqlNode {
     if (e instanceof Not n)
       return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
     if (e instanceof In in) return inExpr(in);
+    if (e instanceof InSubquery is) return inSubqueryExpr(is);
     throw new UnsupportedOperationException(
         "Expression not yet supported in SqlNode POC: " + e.getClass().getSimpleName());
   }
@@ -470,6 +501,23 @@ public class PplToSqlNode {
             ? SqlLiteral.createSymbol(org.apache.calcite.sql.SqlSelectKeyword.DISTINCT, POS)
             : null;
     return new SqlBasicCall(op, List.of(arg), POS, quantifier);
+  }
+
+  private SqlNode inSubqueryExpr(InSubquery is) {
+    // Compile the subquery plan with a fresh visitor — it produces its own SqlSelect tree.
+    SqlNode subQuery = new PplToSqlNode().visit(is.getQuery());
+    SqlNode left;
+    if (is.getValue().size() == 1) {
+      left = expr(is.getValue().get(0));
+    } else {
+      // Multi-column IN — wrap as a row.
+      List<SqlNode> rowOperands = new ArrayList<>(is.getValue().size());
+      for (UnresolvedExpression v : is.getValue()) {
+        rowOperands.add(expr(v));
+      }
+      left = new SqlBasicCall(SqlStdOperatorTable.ROW, rowOperands, POS);
+    }
+    return new SqlBasicCall(SqlStdOperatorTable.IN, List.of(left, subQuery), POS);
   }
 
   private SqlNode inExpr(In in) {

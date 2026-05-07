@@ -194,21 +194,13 @@ public class CalcitePPLSqlNodeParityTest {
   }
 
   /**
-   * Demonstrates the documented divergence: when sort comes mid-pipeline, the SqlNode path drops
-   * the sort under SQL semantics, so the emitted SQL differs from the existing path. This is the
-   * tracked design issue, captured here as an explicit non-parity test so a future fix flips it to
-   * a parity assertion.
+   * Sort-mid-pipeline used to drop ORDER BY under SQL semantics. Now fixed by lifting PPL's
+   * SORT/HEAD/LIMIT effects to the outermost SqlOrderBy in the SqlNode tree, so they survive any
+   * subsequent pipe wrapping.
    */
   @Test
-  public void sort_then_fields_known_divergence() {
-    String ppl = "source=EMP | sort SAL | fields ENAME, SAL";
-    String oldSql = toSparkSql(runViaOldPath(ppl));
-    String newSql = toSparkSql(runViaNewPath(ppl));
-    assertThat("old path keeps the ORDER BY", oldSql.toUpperCase().contains("ORDER BY"), is(true));
-    assertThat(
-        "new path drops the ORDER BY (known limitation)",
-        newSql.toUpperCase().contains("ORDER BY"),
-        is(false));
+  public void sort_then_fields_now_parity() {
+    assertSparkSqlMatches("source=EMP | sort SAL | fields ENAME, SAL");
   }
 
   /**

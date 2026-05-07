@@ -178,6 +178,31 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void streamstats_no_partition_excluding_current() {
+    // Mirrors CalcitePPLStreamstatsTest.testStreamstatsCurrent — running max excluding current row.
+    RelNode root = runViaSqlNode("source=EMP | streamstats current = false max(SAL)");
+    String tree = root.explain();
+    assertThat(
+        "MAX over an unbounded-preceding-to-1-preceding ROWS frame is present",
+        tree.contains("MAX($5) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"),
+        is(true));
+  }
+
+  @Test
+  public void dedup_one_field() {
+    RelNode root = runViaSqlNode("source=EMP | dedup 1 DEPTNO");
+    String tree = root.explain();
+    // Expect ROW_NUMBER OVER (PARTITION BY DEPTNO), an IS NOT NULL filter, and a <= 1 cap.
+    assertThat(
+        "ROW_NUMBER over partition is present",
+        tree.contains("ROW_NUMBER() OVER (PARTITION BY"),
+        is(true));
+    assertThat("IS NOT NULL filter for non-keepempty", tree.contains("IS NOT NULL"), is(true));
+    assertThat(
+        "row-cap filter present", tree.contains("LogicalFilter") && tree.contains("<=("), is(true));
+  }
+
+  @Test
   public void eventstats_count() {
     RelNode root = runViaSqlNode("source=EMP | eventstats count()");
     // The validator inserts an explicit RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED

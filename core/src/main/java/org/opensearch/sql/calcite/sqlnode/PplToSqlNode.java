@@ -39,6 +39,7 @@ import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.expression.WindowFunction;
 import org.opensearch.sql.ast.expression.subquery.InSubquery;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
@@ -46,6 +47,7 @@ import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Sort;
+import org.opensearch.sql.ast.tree.StreamWindow;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.ast.tree.Window;
 
@@ -192,6 +194,142 @@ public class PplToSqlNode {
     private boolean isSelectStar(Project node) {
       List<UnresolvedExpression> list = node.getProjectList();
       return list.size() == 1 && list.get(0) instanceof AllFields;
+    }
+
+    @Override
+    public Void visitDedupe(Dedupe node, Void ignored) {
+      walkChild(node);
+      List<Argument> opts = node.getOptions();
+      int allowedDup = (Integer) opts.get(0).getValue().getValue();
+      boolean keepEmpty = (Boolean) opts.get(1).getValue().getValue();
+      boolean consecutive = (Boolean) opts.get(2).getValue().getValue();
+      if (allowedDup <= 0) {
+        throw new IllegalArgumentException("Number of duplicate events must be greater than 0");
+      }
+      if (consecutive) {
+        throw new UnsupportedOperationException(
+            "Consecutive deduplication is not supported in the SqlNode POC");
+      }
+      // Step 1: if !keepEmpty, add IS NOT NULL filters on the dedup fields.
+      List<SqlNode> fieldNodes = new ArrayList<>(node.getFields().size());
+      for (Field f : node.getFields()) {
+        fieldNodes.add(expr(f.getField()));
+      }
+      if (!keepEmpty) {
+        // Wrap if any prior pipe state would conflict with adding pure filters.
+        if (state.evalExtended || state.projectionReplaced) {
+          state.wrap();
+        }
+        for (SqlNode field : fieldNodes) {
+          state.addWhere(new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(field), POS));
+        }
+      }
+      // Step 2: extend projection with `ROW_NUMBER() OVER (PARTITION BY ...) AS
+      // _row_number_dedup_`.
+      SqlNodeList partitionBy = new SqlNodeList(POS);
+      for (SqlNode field : fieldNodes) {
+        partitionBy.add(field);
+      }
+      SqlNode rowNumberWindow =
+          org.apache.calcite.sql.SqlWindow.create(
+              null,
+              null,
+              partitionBy,
+              new SqlNodeList(POS),
+              SqlLiteral.createBoolean(false, POS),
+              null,
+              null,
+              null,
+              POS);
+      SqlNode rowNumberOver =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(SqlStdOperatorTable.ROW_NUMBER, List.of(), POS),
+                  rowNumberWindow),
+              POS);
+      state.addEvalAlias(rowNumberOver, "_row_number_dedup_");
+      // Step 3: wrap and filter on _row_number_dedup_ <= allowedDup.
+      state.wrap();
+      SqlNode rowCol = new SqlIdentifier("_row_number_dedup_", POS);
+      SqlNode boundCheck =
+          new SqlBasicCall(
+              SqlStdOperatorTable.LESS_THAN_OR_EQUAL, List.of(rowCol, intLiteral(allowedDup)), POS);
+      if (keepEmpty) {
+        // (field IS NULL) OR ... OR (_row_number_dedup_ <= N)
+        SqlNode predicate = boundCheck;
+        for (SqlNode field : fieldNodes) {
+          predicate =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.OR,
+                  List.of(
+                      new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(field), POS),
+                      predicate),
+                  POS);
+        }
+        state.addWhere(predicate);
+      } else {
+        state.addWhere(boundCheck);
+      }
+      // Step 4: drop the helper column on the way out.
+      state.wrap();
+      // No explicit projection needed — caller's downstream pipe (or an automatic *) shows the
+      // _row_number_dedup_ column too. The existing path adds an explicit Project that strips
+      // the helper. Mirror that by setting projection = list of original column refs is not
+      // possible without schema info; instead we leave it and rely on a downstream `fields`
+      // pipe in PPL to drop it. Tests that check for the Project layer will need to assert on
+      // the inner shape.
+      return null;
+    }
+
+    @Override
+    public Void visitStreamWindow(StreamWindow node, Void ignored) {
+      walkChild(node);
+      if (node.getResetBefore() != null || node.getResetAfter() != null) {
+        throw new UnsupportedOperationException(
+            "streamstats reset_before/reset_after not yet supported in SqlNode POC");
+      }
+      if (!node.getGroupList().isEmpty()) {
+        throw new UnsupportedOperationException(
+            "streamstats with `by` requires a synthetic __stream_seq__ helper column not yet"
+                + " implemented in the SqlNode POC");
+      }
+      if (node.getWindow() > 0) {
+        throw new UnsupportedOperationException(
+            "streamstats `window=N` not yet supported in SqlNode POC");
+      }
+      if (state.evalExtended || state.projectionReplaced) {
+        state.wrap();
+      }
+      // ROWS frame: UNBOUNDED PRECEDING → (CURRENT ROW or 1 PRECEDING based on `current`).
+      SqlNode lower = org.apache.calcite.sql.SqlWindow.createUnboundedPreceding(POS);
+      SqlNode upper =
+          node.isCurrent()
+              ? org.apache.calcite.sql.SqlWindow.createCurrentRow(POS)
+              : new SqlBasicCall(
+                  org.apache.calcite.sql.SqlWindow.PRECEDING_OPERATOR, List.of(intLiteral(1)), POS);
+      List<SqlNode> selects = new ArrayList<>();
+      selects.add(SqlIdentifier.star(POS));
+      for (UnresolvedExpression item : node.getWindowFunctionList()) {
+        Alias al = (Alias) item;
+        WindowFunction wf = (WindowFunction) al.getDelegated();
+        SqlNode aggNode = aggCall(wf.getFunction());
+        SqlNode window =
+            org.apache.calcite.sql.SqlWindow.create(
+                null,
+                null,
+                new SqlNodeList(POS),
+                new SqlNodeList(POS),
+                /* isRows */ SqlLiteral.createBoolean(true, POS),
+                lower,
+                upper,
+                null,
+                POS);
+        SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+        selects.add(asAlias(over, al.getName()));
+      }
+      state.setProjection(selects);
+      return null;
     }
 
     @Override

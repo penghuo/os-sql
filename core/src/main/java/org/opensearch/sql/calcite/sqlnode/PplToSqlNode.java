@@ -987,7 +987,7 @@ public class PplToSqlNode {
 
   private SqlNode expr(UnresolvedExpression e) {
     if (e instanceof Literal lit) return literal(lit);
-    if (e instanceof QualifiedName qn) return qualifiedNameToIdentifier(qn);
+    if (e instanceof QualifiedName qn) return qualifiedNameToFieldIdentifier(qn);
     if (e instanceof Field f) return expr(f.getField());
     if (e instanceof Compare c) return cmp(c);
     if (e instanceof And a)
@@ -1173,8 +1173,22 @@ public class PplToSqlNode {
         SqlStdOperatorTable.AS, List.of(expr, new SqlIdentifier(alias, POS)), POS);
   }
 
+  /**
+   * Build a multi-part identifier suitable for a table reference (FROM clause). For a name like
+   * `schema.table`, the validator interprets each part as a catalog level.
+   */
   private static SqlIdentifier qualifiedNameToIdentifier(QualifiedName qn) {
     return new SqlIdentifier(qn.getParts(), POS);
+  }
+
+  /**
+   * Build a single-part identifier suitable for a column reference. PPL parses `obj.sub` as a
+   * QualifiedName with two parts, but on OpenSearch indices the column name is the literal dotted
+   * string ("obj.sub"), not a navigation into a struct. Joining the parts back into one identifier
+   * component matches that storage shape.
+   */
+  private static SqlIdentifier qualifiedNameToFieldIdentifier(QualifiedName qn) {
+    return new SqlIdentifier(qn.toString(), POS);
   }
 
   private static String letName(Let let) {

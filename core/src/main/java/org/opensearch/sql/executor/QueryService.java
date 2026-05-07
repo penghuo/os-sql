@@ -302,9 +302,12 @@ public class QueryService {
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
     if (isSqlNodePathEnabled()) {
       try {
+        org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
+            new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config);
         org.apache.calcite.sql.SqlNode sqlNode =
-            new org.opensearch.sql.calcite.sqlnode.PplToSqlNode().visit(plan);
-        return new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config).plan(sqlNode);
+            new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(planner.rowTypeOracle())
+                .visit(plan);
+        return planner.plan(sqlNode);
       } catch (UnsupportedOperationException e) {
         // PPL command/expression not yet covered by the SqlNode path — fall back to the legacy
         // RelBuilder visitor. This is the documented graceful degradation strategy while the

@@ -57,6 +57,42 @@ public final class SqlNodePlanner {
         (cluster, relOptSchema, rootSchema, statement) -> convert(cluster, rootSchema, sqlNode));
   }
 
+  /**
+   * Build a row-type oracle suitable for {@link PplToSqlNode}'s schema-introspection-backed
+   * commands. Validates a probe SqlNode in the same FrameworkConfig and returns its row type.
+   */
+  public java.util.function.Function<SqlNode, org.apache.calcite.rel.type.RelDataType>
+      rowTypeOracle() {
+    return probe ->
+        Frameworks.withPrepare(
+            config,
+            (cluster, relOptSchema, rootSchema, statement) -> {
+              JavaTypeFactory typeFactory = new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
+              Properties props = new Properties();
+              props.setProperty(CalciteConnectionProperty.CASE_SENSITIVE.camelName(), "false");
+              CalciteConnectionConfigImpl ccc = new CalciteConnectionConfigImpl(props);
+              SchemaPlus defaultSchema =
+                  config.getDefaultSchema() != null ? config.getDefaultSchema() : rootSchema;
+              CalciteSchema schema = CalciteSchema.from(defaultSchema);
+              CalciteCatalogReader catalogReader =
+                  new CalciteCatalogReader(schema.root(), schema.path(null), typeFactory, ccc);
+              SqlOperatorTable operatorTable =
+                  config.getOperatorTable() != null
+                      ? new ChainedSqlOperatorTable(
+                          java.util.Arrays.asList(
+                              config.getOperatorTable(), SqlStdOperatorTable.instance()))
+                      : SqlStdOperatorTable.instance();
+              SqlValidator probeValidator =
+                  SqlValidatorUtil.newValidator(
+                      operatorTable,
+                      catalogReader,
+                      typeFactory,
+                      SqlValidator.Config.DEFAULT.withTypeCoercionEnabled(true));
+              SqlNode validatedProbe = probeValidator.validate(probe);
+              return probeValidator.getValidatedNodeType(validatedProbe);
+            });
+  }
+
   private RelNode convert(RelOptCluster cluster, SchemaPlus rootSchema, SqlNode sqlNode) {
     JavaTypeFactory typeFactory = new JavaTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
 

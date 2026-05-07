@@ -43,12 +43,14 @@ import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Expand;
 import org.opensearch.sql.ast.tree.Filter;
+import org.opensearch.sql.ast.tree.Flatten;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Lookup;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
+import org.opensearch.sql.ast.tree.Rename;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.StreamWindow;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -76,6 +78,53 @@ import org.opensearch.sql.ast.tree.Window;
 public class PplToSqlNode {
 
   private static final SqlParserPos POS = SqlParserPos.ZERO;
+
+  /**
+   * Optional row-type oracle. Some PPL commands (flatten, lookup REPLACE, rename) need to know the
+   * columns of the input row type at translation time to emit the right projection. The caller
+   * (typically {@link SqlNodePlanner}) supplies a function that runs the partially-built {@link
+   * SqlNode} through Calcite's validator and returns its row type. Without an oracle, those
+   * commands raise {@link UnsupportedOperationException}.
+   */
+  private final java.util.function.Function<SqlNode, org.apache.calcite.rel.type.RelDataType>
+      rowTypeOracle;
+
+  public PplToSqlNode() {
+    this(null);
+  }
+
+  public PplToSqlNode(
+      java.util.function.Function<SqlNode, org.apache.calcite.rel.type.RelDataType> rowTypeOracle) {
+    this.rowTypeOracle = rowTypeOracle;
+  }
+
+  private List<String> deriveColumnNames(SqlNode partialFrom) {
+    if (rowTypeOracle == null) {
+      throw new UnsupportedOperationException(
+          "This PPL pipe needs schema introspection (flatten / rename / lookup REPLACE / etc.);"
+              + " supply a row-type oracle to PplToSqlNode to enable it.");
+    }
+    // Wrap the partial FROM in a SELECT * to make it a queryable expression.
+    SqlSelect probe =
+        new SqlSelect(
+            POS, /* keywordList */
+            null,
+            starList(),
+            partialFrom, /* where */
+            null,
+            /* group */ null, /* having */
+            null, /* windowList */
+            null,
+            /* qualify */ null, /* orderBy */
+            null, /* offset */
+            null, /* fetch */
+            null,
+            /* hints */ null);
+    org.apache.calcite.rel.type.RelDataType rt = rowTypeOracle.apply(probe);
+    return rt.getFieldList().stream()
+        .map(org.apache.calcite.rel.type.RelDataTypeField::getName)
+        .toList();
+  }
 
   /** Public entry point. */
   public SqlNode visit(UnresolvedPlan plan) {
@@ -176,8 +225,12 @@ public class PplToSqlNode {
         return null;
       }
       // SQL aliases in the SELECT list aren't visible inside the same SELECT list, so a project
-      // after an eval must wrap. Likewise wrap if a row-cap was already applied.
-      if (state.evalExtended || state.orderBy != null || state.fetch != null) {
+      // after an eval/rename/etc. that introduced new names must wrap. Likewise wrap if a
+      // row-cap was already applied.
+      if (state.evalExtended
+          || state.projectionReplaced
+          || state.orderBy != null
+          || state.fetch != null) {
         state.wrap();
       }
       List<SqlNode> selects = new ArrayList<>(node.getProjectList().size());
@@ -197,6 +250,69 @@ public class PplToSqlNode {
     private boolean isSelectStar(Project node) {
       List<UnresolvedExpression> list = node.getProjectList();
       return list.size() == 1 && list.get(0) instanceof AllFields;
+    }
+
+    @Override
+    public Void visitRename(Rename node, Void ignored) {
+      walkChild(node);
+      if (state.evalExtended || state.projectionReplaced) {
+        state.wrap();
+      }
+      // Build origin -> target name map (PPL Rename uses Map nodes with origin=Field,
+      // target=Field).
+      java.util.Map<String, String> renames = new java.util.HashMap<>();
+      for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+        String origin = ((Field) m.getOrigin()).getField().toString();
+        String target = ((Field) m.getTarget()).getField().toString();
+        renames.put(origin, target);
+      }
+      List<String> cols = deriveColumnNames(state.from);
+      List<SqlNode> selects = new ArrayList<>();
+      for (String c : cols) {
+        if (renames.containsKey(c)) {
+          selects.add(asAlias(new SqlIdentifier(c, POS), renames.get(c)));
+        } else {
+          selects.add(new SqlIdentifier(c, POS));
+        }
+      }
+      state.setProjection(selects);
+      return null;
+    }
+
+    @Override
+    public Void visitFlatten(Flatten node, Void ignored) {
+      walkChild(node);
+      // Need schema to enumerate the struct's sub-fields (named "<flatField>.<sub>" in the
+      // existing TableWithStruct convention). Materialize the in-flight FROM and probe its row
+      // type via the validator-backed oracle.
+      if (state.evalExtended || state.projectionReplaced) {
+        state.wrap();
+      }
+      String fieldName = node.getField().getField().toString();
+      List<String> allCols = deriveColumnNames(state.from);
+      List<String> subCols = allCols.stream().filter(c -> c.startsWith(fieldName + ".")).toList();
+      List<String> aliases =
+          node.getAliases() != null
+              ? node.getAliases()
+              : subCols.stream().map(c -> c.substring(fieldName.length() + 1)).toList();
+      if (node.getAliases() != null && node.getAliases().size() != subCols.size()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "alias count (%d) doesn't match flattened field count (%d)",
+                node.getAliases().size(), subCols.size()));
+      }
+      // Project all input columns + aliased sub-fields. Building the SELECT list requires us
+      // to enumerate inputs (we can't use SELECT * + extras because the sub-field aliases would
+      // collide with the existing dotted-name columns).
+      List<SqlNode> selects = new ArrayList<>();
+      for (String c : allCols) {
+        selects.add(new SqlIdentifier(c, POS));
+      }
+      for (int i = 0; i < subCols.size(); i++) {
+        selects.add(asAlias(new SqlIdentifier(subCols.get(i), POS), aliases.get(i)));
+      }
+      state.setProjection(selects);
+      return null;
     }
 
     @Override
@@ -262,14 +378,29 @@ public class PplToSqlNode {
               org.apache.calcite.sql.JoinConditionType.ON.symbol(POS),
               condition);
       state.from = join;
-      // For OUTPUT (APPEND) strategy, leave projection as-is (SELECT *) — user already sees all
-      // input cols + the joined lookup cols. For REPLACE strategy we'd need to drop overwritten
-      // input cols and add the lookup cols under their new names; that requires schema info to
-      // enumerate input columns, which isn't available without validation. Throw for REPLACE
-      // and let QueryService fall back.
       if (node.getOutputStrategy() == Lookup.OutputStrategy.REPLACE) {
-        throw new UnsupportedOperationException(
-            "lookup REPLACE strategy needs input-schema enumeration not yet wired in SqlNode POC");
+        // REPLACE: drop input columns that collide with the renamed lookup outputs, then append
+        // the lookup outputs under their target names. Requires schema enumeration of the input.
+        java.util.Set<String> overwritten = new java.util.HashSet<>(output.values());
+        List<String> inputCols = deriveColumnNames(aliasedInput);
+        // The aliased input's schema is the input's row type; the join just appends lookup cols.
+        List<SqlNode> selects = new ArrayList<>();
+        for (String c : inputCols) {
+          if (overwritten.contains(c)) {
+            continue;
+          }
+          selects.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
+        }
+        for (java.util.Map.Entry<String, String> e : output.entrySet()) {
+          SqlNode lookupCol =
+              new SqlIdentifier(java.util.Arrays.asList(lookupAlias, e.getKey()), POS);
+          if (e.getKey().equals(e.getValue())) {
+            selects.add(lookupCol);
+          } else {
+            selects.add(asAlias(lookupCol, e.getValue()));
+          }
+        }
+        state.setProjection(selects);
       }
       return null;
     }

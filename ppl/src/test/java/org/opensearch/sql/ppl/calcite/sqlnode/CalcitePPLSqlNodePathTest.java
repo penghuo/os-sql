@@ -74,6 +74,18 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void rename_aliases_columns_via_schema_introspection() {
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan =
+        parse("source=EMP | rename ENAME as employee_name | fields employee_name");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String expected =
+        "LogicalProject(employee_name=[$1])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
   public void multi_source_unions_tables() {
     // Use EMP twice (same row type) so SQL UNION ALL row-type unification trivially succeeds.
     // PPL's existing path widens schemas across tables — that broader unification is an open
@@ -175,6 +187,20 @@ public class CalcitePPLSqlNodePathTest {
     String expected =
         "LogicalProject(n=[UPPER($1)])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
+  }
+
+  @Test
+  public void lookup_replace_drops_collided_inputs() {
+    // PPL `lookup ... replace LOC` — REPLACE strategy: drop input.LOC if present, append
+    // lookup.LOC. EMP doesn't have LOC, so the result is the same as APPEND (input + LOC).
+    // This exercises the schema-introspection path.
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | lookup DEPT DEPTNO replace LOC");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    assertThat("plan contains LogicalJoin", tree.contains("LogicalJoin"), is(true));
+    assertThat("LOC column appears", tree.contains("LOC=["), is(true));
   }
 
   @Test

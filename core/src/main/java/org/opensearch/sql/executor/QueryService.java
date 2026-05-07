@@ -308,12 +308,14 @@ public class QueryService {
             new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(planner.rowTypeOracle())
                 .visit(plan);
         return planner.plan(sqlNode);
-      } catch (UnsupportedOperationException e) {
-        // PPL command/expression not yet covered by the SqlNode path — fall back to the legacy
-        // RelBuilder visitor. This is the documented graceful degradation strategy while the
-        // SqlNode path matures.
+      } catch (RuntimeException e) {
+        // SqlNode path didn't make it through translation/validation. Fall back to the legacy
+        // RelBuilder visitor — this is the documented graceful degradation strategy while the
+        // SqlNode path matures. The new path is opt-in (default off) so this only affects users
+        // who explicitly enabled it.
         log.warn(
-            "Falling back to CalciteRelNodeVisitor path for unsupported SqlNode case: {}",
+            "Falling back to CalciteRelNodeVisitor path; SqlNode path failed with: {}: {}",
+            e.getClass().getSimpleName(),
             e.getMessage());
       }
     }

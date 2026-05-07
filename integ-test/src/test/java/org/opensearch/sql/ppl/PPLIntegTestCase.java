@@ -231,6 +231,19 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
             "persistent", Settings.Key.CALCITE_ENGINE_ENABLED.getKeyValue(), "false"));
   }
 
+  /** Toggle the experimental PPL→SqlNode→SqlValidator path. Default is off. */
+  public static void enableSqlNodePath() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.CALCITE_SQLNODE_ENABLED.getKeyValue(), "true"));
+  }
+
+  public static void disableSqlNodePath() throws IOException {
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", Settings.Key.CALCITE_SQLNODE_ENABLED.getKeyValue(), "false"));
+  }
+
   public static void withCalciteEnabled(Runnable f) throws IOException {
     boolean isCalciteEnabled = isCalciteEnabled();
     if (isCalciteEnabled) f.run();

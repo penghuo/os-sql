@@ -44,6 +44,7 @@ import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Sort;
@@ -194,6 +195,51 @@ public class PplToSqlNode {
     private boolean isSelectStar(Project node) {
       List<UnresolvedExpression> list = node.getProjectList();
       return list.size() == 1 && list.get(0) instanceof AllFields;
+    }
+
+    @Override
+    public Void visitParse(Parse node, Void ignored) {
+      walkChild(node);
+      org.opensearch.sql.ast.expression.ParseMethod parseMethod = node.getParseMethod();
+      if (parseMethod == org.opensearch.sql.ast.expression.ParseMethod.PATTERNS) {
+        throw new UnsupportedOperationException(
+            "patterns method via Parse not supported in SqlNode POC yet");
+      }
+      String patternValue = (String) node.getPattern().getValue();
+      List<String> groupCandidates =
+          org.opensearch.sql.utils.ParseUtils.getNamedGroupCandidates(
+              parseMethod, patternValue, node.getArguments());
+      if (groupCandidates.isEmpty()) {
+        return null;
+      }
+      if (state.orderBy != null || state.fetch != null) {
+        state.wrap();
+      }
+      SqlNode source = expr(node.getSourceField());
+      SqlNode patternLit = SqlLiteral.createCharString(patternValue, POS);
+      // Mirror the existing path: PARSE(field, pattern, 'regex'|'grok') for REGEX/GROK; the
+      // resulting MAP-typed value is then indexed by the named group via ITEM (i.e. arr[name]).
+      SqlNode methodLit = SqlLiteral.createCharString(parseMethod.getName(), POS);
+      for (String group : groupCandidates) {
+        SqlNode inner =
+            new SqlBasicCall(
+                new org.apache.calcite.sql.SqlUnresolvedFunction(
+                    new SqlIdentifier("PARSE", POS),
+                    null,
+                    null,
+                    null,
+                    null,
+                    org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                List.of(source, patternLit, methodLit),
+                POS);
+        SqlNode itemCall =
+            new SqlBasicCall(
+                SqlStdOperatorTable.ITEM,
+                List.of(inner, SqlLiteral.createCharString(group, POS)),
+                POS);
+        state.addEvalAlias(itemCall, group);
+      }
+      return null;
     }
 
     @Override

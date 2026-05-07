@@ -178,6 +178,23 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void parse_regex_named_groups() {
+    // Mirrors CalcitePPLParseTest.testParse — extract a named group via PARSE+ITEM.
+    RelNode root =
+        runViaSqlNode(
+            "source=EMP | parse DATE_FORMAT(HIREDATE, '%Y-%m-%d')"
+                + " '(?<year>\\d{4})-\\d{2}-\\d{2}' | fields JOB, year");
+    // Existing path emits explicit `:VARCHAR` type suffixes on string literals (via makeLiteral
+    // with the type set). The SqlNode path lets the validator infer the literal type, producing
+    // bare 'foo' (without the suffix) — semantically identical.
+    String expected =
+        "LogicalProject(JOB=[$2], year=[ITEM(PARSE(DATE_FORMAT($4, '%Y-%m-%d'),"
+            + " '(?<year>\\d{4})-\\d{2}-\\d{2}', 'regex'), 'year')])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(root, hasTree(expected));
+  }
+
+  @Test
   public void streamstats_no_partition_excluding_current() {
     // Mirrors CalcitePPLStreamstatsTest.testStreamstatsCurrent — running max excluding current row.
     RelNode root = runViaSqlNode("source=EMP | streamstats current = false max(SAL)");

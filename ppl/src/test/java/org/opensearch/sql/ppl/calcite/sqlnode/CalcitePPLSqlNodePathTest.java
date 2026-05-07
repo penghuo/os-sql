@@ -74,6 +74,19 @@ public class CalcitePPLSqlNodePathTest {
   }
 
   @Test
+  public void multi_source_unions_tables() {
+    // Use EMP twice (same row type) so SQL UNION ALL row-type unification trivially succeeds.
+    // PPL's existing path widens schemas across tables — that broader unification is an open
+    // gap for the SqlNode path.
+    RelNode root = runViaSqlNode("source=EMP, EMP | fields ENAME");
+    String tree = root.explain();
+    assertThat(
+        "plan contains LogicalUnion(all=[true])",
+        tree.contains("LogicalUnion(all=[true])"),
+        is(true));
+  }
+
+  @Test
   public void source_only() {
     RelNode root = runViaSqlNode("source=EMP | fields ENAME, DEPTNO");
     String expected =

@@ -300,7 +300,29 @@ public class QueryService {
   }
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
+    if (isSqlNodePathEnabled()) {
+      try {
+        org.apache.calcite.sql.SqlNode sqlNode =
+            new org.opensearch.sql.calcite.sqlnode.PplToSqlNode().visit(plan);
+        return new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config).plan(sqlNode);
+      } catch (UnsupportedOperationException e) {
+        // PPL command/expression not yet covered by the SqlNode path — fall back to the legacy
+        // RelBuilder visitor. This is the documented graceful degradation strategy while the
+        // SqlNode path matures.
+        log.warn(
+            "Falling back to CalciteRelNodeVisitor path for unsupported SqlNode case: {}",
+            e.getMessage());
+      }
+    }
     return getRelNodeVisitor().analyze(plan, context);
+  }
+
+  private boolean isSqlNodePathEnabled() {
+    if (settings == null) {
+      return false;
+    }
+    Boolean enabled = settings.getSettingValue(Settings.Key.CALCITE_SQLNODE_ENABLED);
+    return Boolean.TRUE.equals(enabled);
   }
 
   /** Analyze {@link UnresolvedPlan}. */

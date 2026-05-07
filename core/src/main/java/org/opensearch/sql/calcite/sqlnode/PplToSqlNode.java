@@ -97,7 +97,36 @@ public class PplToSqlNode {
 
     @Override
     public Void visitRelation(Relation node, Void ignored) {
-      state.setFrom(qualifiedNameToIdentifier(node.getTableQualifiedName()));
+      // PPL `source=a, b` → SQL UNION ALL of two SELECT * statements, identical to how the
+      // existing CalciteRelNodeVisitor materializes multiple tables.
+      List<UnresolvedExpression> tables = node.getTableNames();
+      if (tables.size() == 1) {
+        state.setFrom(qualifiedNameToIdentifier((QualifiedName) tables.get(0)));
+      } else {
+        SqlNode union = null;
+        for (UnresolvedExpression t : tables) {
+          SqlNode select =
+              new SqlSelect(
+                  POS,
+                  /* keywordList */ null,
+                  starList(),
+                  qualifiedNameToIdentifier((QualifiedName) t),
+                  /* where */ null,
+                  /* group */ null,
+                  /* having */ null,
+                  /* windowList */ null,
+                  /* qualify */ null,
+                  /* orderBy */ null,
+                  /* offset */ null,
+                  /* fetch */ null,
+                  /* hints */ null);
+          union =
+              union == null
+                  ? select
+                  : new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, select), POS);
+        }
+        state.setFrom(union);
+      }
       return null;
     }
 
@@ -583,6 +612,12 @@ public class PplToSqlNode {
 
   private static SqlNode intLiteral(int v) {
     return SqlLiteral.createExactNumeric(Integer.toString(v), POS);
+  }
+
+  private static SqlNodeList starList() {
+    SqlNodeList l = new SqlNodeList(POS);
+    l.add(SqlIdentifier.star(POS));
+    return l;
   }
 
   private static SqlNode asAlias(SqlNode expr, String alias) {

@@ -549,6 +549,27 @@ public class PplToSqlNode {
         throw new UnsupportedOperationException(
             "Consecutive deduplication is not supported in the SqlNode POC");
       }
+      // Snapshot input columns NOW (before we add the helper) so we can project them at the end
+      // and drop the helper. Without an oracle, downstream sees the helper column.
+      List<String> inputCols = null;
+      if (rowTypeOracle != null && state.from != null) {
+        // Materialize the in-flight pipeline state via wrap() so the probe doesn't include the
+        // helper. Wrapping is safe here because we'll add filters and a window after this point.
+        if (state.where != null
+            || state.evalExtended
+            || state.projectionReplaced
+            || state.orderBy != null
+            || state.fetch != null) {
+          state.wrap();
+        }
+        inputCols =
+            deriveColumnNames(state.from).stream()
+                .filter(
+                    c ->
+                        !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                            .containsKey(c))
+                .toList();
+      }
       // Step 1: if !keepEmpty, add IS NOT NULL filters on the dedup fields.
       List<SqlNode> fieldNodes = new ArrayList<>(node.getFields().size());
       for (Field f : node.getFields()) {
@@ -610,14 +631,16 @@ public class PplToSqlNode {
       } else {
         state.addWhere(boundCheck);
       }
-      // Step 4: drop the helper column on the way out.
+      // Step 4: drop the helper column on the way out using the pre-captured input column list.
+      // Without an oracle (test-only path), downstream sees the helper column.
       state.wrap();
-      // No explicit projection needed — caller's downstream pipe (or an automatic *) shows the
-      // _row_number_dedup_ column too. The existing path adds an explicit Project that strips
-      // the helper. Mirror that by setting projection = list of original column refs is not
-      // possible without schema info; instead we leave it and rely on a downstream `fields`
-      // pipe in PPL to drop it. Tests that check for the Project layer will need to assert on
-      // the inner shape.
+      if (inputCols != null) {
+        List<SqlNode> proj = new ArrayList<>();
+        for (String c : inputCols) {
+          proj.add(new SqlIdentifier(c, POS));
+        }
+        state.setProjection(proj);
+      }
       return null;
     }
 

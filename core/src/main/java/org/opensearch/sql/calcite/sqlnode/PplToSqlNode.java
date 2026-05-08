@@ -724,12 +724,25 @@ public class PplToSqlNode {
           || state.fetch != null) {
         state.wrap();
       }
-      // PPL stats output ordering: aggregations first, then group-by columns. v2's
-      // visitAggregation explicitly reorders the row layout to (metrics, group-by) — match that
-      // here so downstream pipes (and tests) see the same column order.
+      // PPL stats output ordering: aggregations first, then group-by columns (span before
+      // explicit by-fields). v2's visitAggregation explicitly reorders the row layout to
+      // (metrics, group-by) and prepends span to the group expressions — match that here.
       List<SqlNode> aggSelects = new ArrayList<>();
       List<SqlNode> groupSelects = new ArrayList<>();
       List<SqlNode> groupKeys = new ArrayList<>();
+      // Span goes first in the group list when present.
+      if (node.getSpan() != null) {
+        UnresolvedExpression spanExpr = node.getSpan();
+        String spanAlias = null;
+        UnresolvedExpression spanCore = spanExpr;
+        if (spanExpr instanceof Alias al) {
+          spanAlias = al.getName();
+          spanCore = al.getDelegated();
+        }
+        SqlNode key = expr(spanCore);
+        groupKeys.add(key);
+        groupSelects.add(spanAlias != null ? asAlias(key, spanAlias) : key);
+      }
       if (node.getGroupExprList() != null) {
         for (UnresolvedExpression g : node.getGroupExprList()) {
           SqlNode key;
@@ -1019,8 +1032,29 @@ public class PplToSqlNode {
       return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
     if (e instanceof In in) return inExpr(in);
     if (e instanceof InSubquery is) return inSubqueryExpr(is);
+    if (e instanceof org.opensearch.sql.ast.expression.Span sp) return spanExpr(sp);
     throw new UnsupportedOperationException(
         "Expression not yet supported in SqlNode POC: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate a PPL Span expression into a call to {@link
+   * org.opensearch.sql.expression.function.PPLBuiltinOperators#SPAN}. Mirrors
+   * CalciteRexNodeVisitor.visitSpan: SPAN(field, value, unitName-or-null).
+   */
+  private SqlNode spanExpr(org.opensearch.sql.ast.expression.Span sp) {
+    SqlNode field = expr(sp.getField());
+    SqlNode value = expr(sp.getValue());
+    org.opensearch.sql.ast.expression.SpanUnit unit = sp.getUnit();
+    SqlNode unitNode =
+        (unit == org.opensearch.sql.ast.expression.SpanUnit.NONE
+                || unit == org.opensearch.sql.ast.expression.SpanUnit.UNKNOWN)
+            ? SqlLiteral.createNull(POS)
+            : SqlLiteral.createCharString(unit.getName(), POS);
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
+        List.of(field, value, unitNode),
+        POS);
   }
 
   private SqlNode literal(Literal lit) {
@@ -1176,6 +1210,13 @@ public class PplToSqlNode {
   private static String resolveFunctionName(String pplName) {
     return switch (pplName.toLowerCase()) {
       case "pow" -> "POWER";
+      case "length" -> "CHAR_LENGTH";
+      case "ifnull" -> "COALESCE";
+      case "locate" -> "POSITION";
+      case "signum" -> "SIGN";
+      case "addfunction" -> "PLUS";
+      case "multiplyfunction" -> "MULTIPLY";
+      case "json_valid" -> "IS_JSON_VALUE";
       default -> pplName;
     };
   }

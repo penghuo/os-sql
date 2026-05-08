@@ -307,7 +307,14 @@ public class PplToSqlNode {
         String target = ((Field) m.getTarget()).getField().toString();
         renames.put(origin, target);
       }
-      List<String> cols = deriveColumnNames(state.from);
+      // Filter metadata fields so the rename projection doesn't expose them.
+      List<String> cols =
+          deriveColumnNames(state.from).stream()
+              .filter(
+                  c ->
+                      !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                          .containsKey(c))
+              .toList();
       List<SqlNode> selects = new ArrayList<>();
       for (String c : cols) {
         if (renames.containsKey(c)) {
@@ -330,7 +337,15 @@ public class PplToSqlNode {
         state.wrap();
       }
       String fieldName = node.getField().getField().toString();
-      List<String> allCols = deriveColumnNames(state.from);
+      // Filter out metadata fields when enumerating the input columns; we don't want to expose
+      // _id/_index/_score in the post-flatten projection.
+      List<String> allCols =
+          deriveColumnNames(state.from).stream()
+              .filter(
+                  c ->
+                      !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                          .containsKey(c))
+              .toList();
       List<String> subCols = allCols.stream().filter(c -> c.startsWith(fieldName + ".")).toList();
       List<String> aliases =
           node.getAliases() != null
@@ -423,7 +438,13 @@ public class PplToSqlNode {
         // REPLACE: drop input columns that collide with the renamed lookup outputs, then append
         // the lookup outputs under their target names. Requires schema enumeration of the input.
         java.util.Set<String> overwritten = new java.util.HashSet<>(output.values());
-        List<String> inputCols = deriveColumnNames(aliasedInput);
+        List<String> inputCols =
+            deriveColumnNames(aliasedInput).stream()
+                .filter(
+                    c ->
+                        !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                            .containsKey(c))
+                .toList();
         // The aliased input's schema is the input's row type; the join just appends lookup cols.
         List<SqlNode> selects = new ArrayList<>();
         for (String c : inputCols) {

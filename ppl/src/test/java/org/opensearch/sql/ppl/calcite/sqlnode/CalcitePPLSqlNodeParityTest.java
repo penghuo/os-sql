@@ -164,28 +164,14 @@ public class CalcitePPLSqlNodeParityTest {
   }
 
   /**
-   * Divergence: column order in the projection. The existing path emits aggregate-then-key ({@code
-   * SELECT AVG(SAL), DEPTNO}); the new path emits key-then-aggregate ({@code SELECT DEPTNO,
-   * AVG(SAL)}). Both are semantically equivalent and both are valid SQL. A user-visible column
-   * order is the only difference.
+   * Both paths now emit aggregate-then-key column order to match PPL stats semantics. Verified via
+   * SQL parity rather than asserting a single literal — the new path's outer Project is
+   * structurally different (it lifts the metric to position 0 above the Aggregate) but the SQL
+   * column order is the same.
    */
   @Test
-  public void stats_avg_by_dept_column_order_differs() {
-    String ppl = "source=EMP | stats avg(SAL) by DEPTNO";
-    String oldSql = toSparkSql(runViaOldPath(ppl));
-    String newSql = toSparkSql(runViaNewPath(ppl));
-    assertThat(
-        oldSql,
-        is(
-            "SELECT AVG(`SAL`) `avg(SAL)`, `DEPTNO`\n"
-                + "FROM `scott`.`EMP`\n"
-                + "GROUP BY `DEPTNO`"));
-    assertThat(
-        newSql,
-        is(
-            "SELECT `DEPTNO`, AVG(`SAL`) `avg(SAL)`\n"
-                + "FROM `scott`.`EMP`\n"
-                + "GROUP BY `DEPTNO`"));
+  public void stats_avg_by_dept_column_order_parity() {
+    assertSparkSqlMatches("source=EMP | stats avg(SAL) by DEPTNO");
   }
 
   @Test

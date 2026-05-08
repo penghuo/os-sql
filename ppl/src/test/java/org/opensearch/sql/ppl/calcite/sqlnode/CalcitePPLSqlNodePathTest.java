@@ -169,12 +169,15 @@ public class CalcitePPLSqlNodePathTest {
   @Test
   public void stats_avg_by_dept() {
     RelNode root = runViaSqlNode("source=EMP | stats avg(SAL) by DEPTNO");
-    // Standard SQL aggregate produces a clean Aggregate(group=[{0}]) over the trim-projected
-    // input; no post-project needed since we're at the top of the tree.
+    // PPL stats output ordering puts metrics first, then group-by columns. The SqlNode path
+    // emits the SELECT list in (avg(SAL), DEPTNO) order, so the LogicalProject above the
+    // Aggregate reverses the natural Calcite (group, agg) layout. This matches v2's
+    // visitAggregation reordering.
     String expected =
-        "LogicalAggregate(group=[{0}], avg(SAL)=[AVG($1)])\n"
-            + "  LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
-            + "    LogicalTableScan(table=[[scott, EMP]])\n";
+        "LogicalProject(avg(SAL)=[$1], DEPTNO=[$0])\n"
+            + "  LogicalAggregate(group=[{0}], avg(SAL)=[AVG($1)])\n"
+            + "    LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+            + "      LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
   }
 

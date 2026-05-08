@@ -724,7 +724,11 @@ public class PplToSqlNode {
           || state.fetch != null) {
         state.wrap();
       }
-      List<SqlNode> selects = new ArrayList<>();
+      // PPL stats output ordering: aggregations first, then group-by columns. v2's
+      // visitAggregation explicitly reorders the row layout to (metrics, group-by) — match that
+      // here so downstream pipes (and tests) see the same column order.
+      List<SqlNode> aggSelects = new ArrayList<>();
+      List<SqlNode> groupSelects = new ArrayList<>();
       List<SqlNode> groupKeys = new ArrayList<>();
       if (node.getGroupExprList() != null) {
         for (UnresolvedExpression g : node.getGroupExprList()) {
@@ -737,17 +741,19 @@ public class PplToSqlNode {
             key = expr(g);
           }
           groupKeys.add(key);
-          // Group keys are part of the select list so downstream pipes can reference them.
-          selects.add(alias != null ? asAlias(key, alias) : key);
+          groupSelects.add(alias != null ? asAlias(key, alias) : key);
         }
       }
       for (UnresolvedExpression a : node.getAggExprList()) {
         if (a instanceof Alias al) {
-          selects.add(asAlias(aggCall(al.getDelegated()), al.getName()));
+          aggSelects.add(asAlias(aggCall(al.getDelegated()), al.getName()));
         } else {
-          selects.add(aggCall(a));
+          aggSelects.add(aggCall(a));
         }
       }
+      List<SqlNode> selects = new ArrayList<>(aggSelects.size() + groupSelects.size());
+      selects.addAll(aggSelects);
+      selects.addAll(groupSelects);
       state.setProjection(selects);
       state.setGroupBy(groupKeys);
       return null;

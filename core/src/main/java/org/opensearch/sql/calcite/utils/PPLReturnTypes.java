@@ -12,7 +12,7 @@ import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeTransforms;
 import org.apache.calcite.sql.type.SqlTypeUtil;
-import org.opensearch.sql.data.type.ExprCoreType;
+import org.opensearch.sql.calcite.type.ExprTimeType;
 
 /**
  * Return types used in PPL. This class complements the {@link
@@ -36,8 +36,7 @@ public final class PPLReturnTypes {
   public static SqlReturnTypeInference TIME_APPLY_RETURN_TYPE =
       opBinding -> {
         RelDataType temporalType = opBinding.getOperandType(0);
-        if (ExprCoreType.TIME.equals(
-            OpenSearchTypeFactory.convertRelDataTypeToExprType(temporalType))) {
+        if (temporalType instanceof ExprTimeType) {
           return UserDefinedFunctionUtils.NULLABLE_TIME_UDT;
         }
         return UserDefinedFunctionUtils.NULLABLE_TIMESTAMP_UDT;

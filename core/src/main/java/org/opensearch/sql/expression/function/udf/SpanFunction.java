@@ -24,8 +24,9 @@ import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.util.BuiltInMethod;
-import org.opensearch.sql.calcite.type.ExprSqlType;
-import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
+import org.opensearch.sql.calcite.type.ExprDateType;
+import org.opensearch.sql.calcite.type.ExprTimeStampType;
+import org.opensearch.sql.calcite.type.ExprTimeType;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -95,28 +96,31 @@ public class SpanFunction extends ImplementorUDF {
                   Expressions.call(BuiltInMethod.FLOOR.method, Expressions.divide(field, interval)),
                   interval);
         };
-      } else if (fieldType instanceof ExprSqlType exprSqlType) {
-        // TODO: pass in constant arguments when constructing
-        String methodName =
-            switch (exprSqlType.getUdt()) {
-              case EXPR_DATE -> "evalDate";
-              case EXPR_TIME -> "evalTime";
-              case EXPR_TIMESTAMP -> "evalTimestamp";
-              default ->
-                  throw new IllegalArgumentException(
-                      String.format("Unsupported expr type: %s", exprSqlType.getExprType()));
-            };
-        ScalarFunctionImpl function =
-            (ScalarFunctionImpl)
-                ScalarFunctionImpl.create(
-                    Types.lookupMethod(
-                        SpanFunction.class, methodName, String.class, int.class, String.class));
-        return function.getImplementor().implement(translator, call, RexImpTable.NullAs.NULL);
+      } else {
+        String methodName;
+        if (fieldType instanceof ExprDateType) {
+          methodName = "evalDate";
+        } else if (fieldType instanceof ExprTimeType) {
+          methodName = "evalTime";
+        } else if (fieldType instanceof ExprTimeStampType) {
+          methodName = "evalTimestamp";
+        } else {
+          methodName = null;
+        }
+        if (methodName != null) {
+          // TODO: pass in constant arguments when constructing
+          ScalarFunctionImpl function =
+              (ScalarFunctionImpl)
+                  ScalarFunctionImpl.create(
+                      Types.lookupMethod(
+                          SpanFunction.class, methodName, String.class, int.class, String.class));
+          return function.getImplementor().implement(translator, call, RexImpTable.NullAs.NULL);
+        }
       }
       throw new IllegalArgumentException(
           String.format(
               "Unsupported expr type: %s",
-              OpenSearchTypeFactory.convertRelDataTypeToExprType(fieldType)));
+              org.opensearch.sql.expression.function.PPLTypeChecker.renderTypeName(fieldType)));
     }
   }
 

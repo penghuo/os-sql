@@ -25,6 +25,7 @@ import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
+import org.opensearch.sql.calcite.type.ExprDateType;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
 import org.opensearch.sql.calcite.utils.datetime.DateTimeConversionUtils;
@@ -32,7 +33,6 @@ import org.opensearch.sql.data.model.ExprDateValue;
 import org.opensearch.sql.data.model.ExprTimestampValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.data.model.ExprValueUtils;
-import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.expression.function.FunctionProperties;
 import org.opensearch.sql.expression.function.ImplementorUDF;
 import org.opensearch.sql.expression.function.UDFOperandMetadata;
@@ -63,7 +63,7 @@ public class AddSubDateFunction extends ImplementorUDF {
     return opBinding -> {
       RelDataType temporalType = opBinding.getOperandType(0);
       RelDataType temporalDeltaType = opBinding.getOperandType(1);
-      if (OpenSearchTypeFactory.convertRelDataTypeToExprType(temporalType) == ExprCoreType.DATE
+      if (temporalType instanceof ExprDateType
           && SqlTypeFamily.NUMERIC.contains(temporalDeltaType)) {
         return NULLABLE_DATE_UDT;
       } else {
@@ -106,8 +106,7 @@ public class AddSubDateFunction extends ImplementorUDF {
 
       if (SqlTypeFamily.NUMERIC.contains(temporalDeltaType)) {
         String applyDaysFuncName;
-        if (ExprCoreType.DATE.equals(
-            OpenSearchTypeFactory.convertRelDataTypeToExprType(temporalType))) {
+        if (temporalType instanceof ExprDateType) {
           applyDaysFuncName = isAdd ? "dateAddDaysOnDate" : "dateSubDaysOnDate";
         } else {
           applyDaysFuncName = isAdd ? "dateAddDaysOnTimestamp" : "dateSubDaysOnTimestamp";

@@ -3503,11 +3503,55 @@ public class PplToSqlNode {
       state.projectionReplaced = !selects.isEmpty();
       state.evalExtended = false;
       state.evalAliasNames.clear();
-      // Limit caps the per-row expansion. SQL has no inline UNNEST-limit, so apply as outer fetch
-      // — only correct for single-row inputs, otherwise this would truncate the whole result set.
-      // The semantics divergence is documented; users hitting this case should use stats LIMIT.
+      // Limit caps the per-row array expansion. PPL semantics: each input doc emits at most N
+      // unnested rows. Implement via ROW_NUMBER() OVER (PARTITION BY <input cols>) <= N — the
+      // partition key needs to uniquely identify each input row, so include all non-dotted
+      // input cols (which together identify the doc — a single OpenSearch hit's projection).
       if (node.getLimit() != null && node.getLimit() > 0) {
-        state.setOuterFetch(intLiteral(node.getLimit()));
+        // Wrap so the projection becomes a real subquery row-set.
+        state.wrap();
+        // Add ROW_NUMBER OVER (PARTITION BY <all input cols except `fieldName`>) eval alias.
+        SqlNodeList partitionBy = new SqlNodeList(POS);
+        if (rowTypeOracle != null) {
+          try {
+            for (String c : deriveColumnNames(state.from)) {
+              if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                  .containsKey(c)) {
+                continue;
+              }
+              if (c.equals(fieldName)) {
+                continue;
+              }
+              partitionBy.add(new SqlIdentifier(c, POS));
+            }
+          } catch (RuntimeException ignored2) {
+            // probe failed; PARTITION BY remains empty (limit applies globally)
+          }
+        }
+        SqlNode rowNumWindow =
+            org.apache.calcite.sql.SqlWindow.create(
+                null,
+                null,
+                partitionBy,
+                new SqlNodeList(POS),
+                SqlLiteral.createBoolean(false, POS),
+                null,
+                null,
+                null,
+                POS);
+        SqlNode rowNumCall =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OVER,
+                List.of(
+                    new SqlBasicCall(SqlStdOperatorTable.ROW_NUMBER, List.of(), POS), rowNumWindow),
+                POS);
+        state.addEvalAlias(rowNumCall, "__mvexpand_rn__");
+        state.wrap();
+        state.addWhere(
+            new SqlBasicCall(
+                SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+                List.of(new SqlIdentifier("__mvexpand_rn__", POS), intLiteral(node.getLimit())),
+                POS));
       }
       return null;
     }

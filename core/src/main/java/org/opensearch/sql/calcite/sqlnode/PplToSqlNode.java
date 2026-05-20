@@ -4383,69 +4383,82 @@ public class PplToSqlNode {
       // Validate target fields exist in the input row type. Mirror v2's exact error format so
       // tests that pattern-match on the message keep working — input list includes metadata
       // fields ordered as [user-fields..., _id, _index, _score, _maxscore, _sort, _routing].
+      // For MAP/STRUCT-leaf paths (e.g. `doc.user.name` after spath), validate that the leaf is
+      // navigable through tryMapOrStructItemAccess instead of looking for a flat column.
       java.util.Set<String> colsSet = new java.util.HashSet<>(cols);
+      java.util.Map<String, SqlNode> mapLeafAccess = new java.util.HashMap<>();
       for (String t : targets) {
-        if (!colsSet.contains(t)) {
+        if (colsSet.contains(t)) continue;
+        SqlNode itemAccess =
+            tryMapOrStructItemAccess(QualifiedName.of(java.util.Arrays.asList(t.split("\\."))));
+        if (itemAccess == null) {
           throw new IllegalArgumentException(
               "field [" + t + "] not found; input fields are: " + allCols);
         }
+        mapLeafAccess.put(t, itemAccess);
       }
       List<SqlNode> selects = new ArrayList<>();
       for (String c : cols) {
         SqlNode fieldRef = new SqlIdentifier(c, POS);
         if (targets.contains(c)) {
-          SqlNode value = fieldRef;
-          for (org.opensearch.sql.ast.tree.ReplacePair pair : node.getReplacePairs()) {
-            String patternStr = pair.getPattern().getValue().toString();
-            String replacementStr = pair.getReplacement().getValue().toString();
-            if (patternStr.contains("*")) {
-              // Wildcard replace: convert to REGEXP_REPLACE.
-              org.opensearch.sql.calcite.utils.WildcardUtils.validateWildcardSymmetry(
-                  patternStr, replacementStr);
-              String regexPattern =
-                  org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardPatternToRegex(
-                      patternStr);
-              String regexReplacement =
-                  org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardReplacementToRegex(
-                      replacementStr);
-              value =
-                  new SqlBasicCall(
-                      org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
-                      List.of(
-                          value,
-                          castTo(
-                              SqlLiteral.createCharString(regexPattern, POS),
-                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR),
-                          castTo(
-                              SqlLiteral.createCharString(regexReplacement, POS),
-                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR)),
-                      POS);
-            } else {
-              // Cast string literals to VARCHAR explicitly. Without the cast, Calcite widens
-              // unequal-length CHAR literals (e.g. 'IL' and 'Illinois') to a common max-length
-              // CHAR(N) and right-pads shorter values with spaces — breaking exact-string match
-              // and mismatching v2's emission shape.
-              value =
-                  new SqlBasicCall(
-                      SqlStdOperatorTable.REPLACE,
-                      List.of(
-                          value,
-                          castTo(
-                              expr(pair.getPattern()),
-                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR),
-                          castTo(
-                              expr(pair.getReplacement()),
-                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR)),
-                      POS);
-            }
-          }
-          selects.add(asAlias(value, c));
+          selects.add(asAlias(buildReplaceChain(fieldRef, node), c));
         } else {
           selects.add(fieldRef);
         }
       }
+      // Emit MAP/STRUCT-leaf rewrites as additional aliased projections so downstream
+      // `fields doc.user.name` finds the column under its dotted name.
+      for (java.util.Map.Entry<String, SqlNode> e : mapLeafAccess.entrySet()) {
+        selects.add(asAlias(buildReplaceChain(e.getValue(), node), e.getKey()));
+      }
       state.setProjection(selects);
       return null;
+    }
+
+    private SqlNode buildReplaceChain(SqlNode value, org.opensearch.sql.ast.tree.Replace node) {
+      for (org.opensearch.sql.ast.tree.ReplacePair pair : node.getReplacePairs()) {
+        String patternStr = pair.getPattern().getValue().toString();
+        String replacementStr = pair.getReplacement().getValue().toString();
+        if (patternStr.contains("*")) {
+          org.opensearch.sql.calcite.utils.WildcardUtils.validateWildcardSymmetry(
+              patternStr, replacementStr);
+          String regexPattern =
+              org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardPatternToRegex(
+                  patternStr);
+          String regexReplacement =
+              org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardReplacementToRegex(
+                  replacementStr);
+          value =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
+                  List.of(
+                      value,
+                      castTo(
+                          SqlLiteral.createCharString(regexPattern, POS),
+                          org.apache.calcite.sql.type.SqlTypeName.VARCHAR),
+                      castTo(
+                          SqlLiteral.createCharString(regexReplacement, POS),
+                          org.apache.calcite.sql.type.SqlTypeName.VARCHAR)),
+                  POS);
+        } else {
+          // Cast string literals to VARCHAR explicitly. Without the cast, Calcite widens
+          // unequal-length CHAR literals (e.g. 'IL' and 'Illinois') to a common max-length
+          // CHAR(N) and right-pads shorter values with spaces — breaking exact-string match
+          // and mismatching v2's emission shape.
+          value =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.REPLACE,
+                  List.of(
+                      value,
+                      castTo(
+                          expr(pair.getPattern()), org.apache.calcite.sql.type.SqlTypeName.VARCHAR),
+                      castTo(
+                          expr(pair.getReplacement()),
+                          org.apache.calcite.sql.type.SqlTypeName.VARCHAR)),
+                  POS);
+        }
+      }
+      return value;
     }
 
     @Override

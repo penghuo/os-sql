@@ -2923,8 +2923,23 @@ public class PplToSqlNode {
             // pushdown rule fails to apply at the OpenSearch composite-source level and the
             // execution-time check raises "Cannot execute nested aggregation on ...". Surface
             // this earlier (before execution).
+            //
+            // Skip when the dotted path is a MAP/STRUCT-leaf access (e.g. spath-rewritten
+            // `doc.user.age` after `eval doc = json_extract_all(doc)`). Those navigate into a
+            // MAP-typed column via tryMapOrStructItemAccess and don't go through OpenSearch
+            // nested-aggregation pushdown — they're plain SQL ITEM access aggregations.
             int lastDot = argName.lastIndexOf('.');
-            if (lastDot >= 0 && hadPreAggComplexity && !groupKeyNames.isEmpty()) {
+            boolean isMapLeafAccess = false;
+            if (lastDot >= 0) {
+              SqlNode itemAccess =
+                  tryMapOrStructItemAccess(
+                      QualifiedName.of(java.util.Arrays.asList(argName.split("\\."))));
+              isMapLeafAccess = itemAccess != null;
+            }
+            if (lastDot >= 0
+                && hadPreAggComplexity
+                && !groupKeyNames.isEmpty()
+                && !isMapLeafAccess) {
               throw org.opensearch.sql.common.error.ErrorReport.wrap(
                       new IllegalArgumentException(
                           "Cannot execute nested aggregation on " + argName))
@@ -8445,6 +8460,26 @@ public class PplToSqlNode {
       arg = SqlIdentifier.star(POS);
     } else {
       arg = expr(af.getField());
+      // For numeric aggregations on a MAP-leaf access (ITEM(map, 'key')), the value type is
+      // VARCHAR (json_extract_all returns MAP<VARCHAR, VARCHAR> with stringified scalars).
+      // SUM/AVG/MIN/MAX over VARCHAR fails type validation; cast the ITEM result to DOUBLE
+      // so PPL's expected numeric coercion applies. Only fires for the numeric-aggregate names
+      // that actually need it.
+      if (arg instanceof SqlBasicCall sbcItem
+          && sbcItem.getOperator() == SqlStdOperatorTable.ITEM
+          && (name.equals("sum")
+              || name.equals("avg")
+              || name.equals("min")
+              || name.equals("max")
+              || name.equals("var_pop")
+              || name.equals("var_samp")
+              || name.equals("stddev_pop")
+              || name.equals("stddev_samp")
+              || name.equals("variance")
+              || name.equals("std")
+              || name.equals("stddev"))) {
+        arg = castTo(arg, org.apache.calcite.sql.type.SqlTypeName.DOUBLE);
+      }
     }
     SqlLiteral quantifier =
         isDistinct

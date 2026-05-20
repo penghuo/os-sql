@@ -685,9 +685,34 @@ public class PplToSqlNode {
                   .anyMatch(
                       org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           ::containsKey);
-          java.util.Set<String> ancestorStructs =
-              collectAncestorStructs(new java.util.HashSet<>(cols));
-          if (hasMeta || !ancestorStructs.isEmpty()) {
+          // Mirror visitProject's two pruning shapes. When the eval introduces a dotted-name
+          // alias (e.g. `eval resource.X = ...`), drop struct parents so the flat leaf wins;
+          // otherwise drop flat dotted leaves so the struct parents stay (matching v2's
+          // tryToRemoveNestedFields default behaviour).
+          boolean hasDottedAlias = false;
+          for (Let let : node.getExpressionList()) {
+            if (letName(let).contains(".")) {
+              hasDottedAlias = true;
+              break;
+            }
+          }
+          java.util.Set<String> colSet = new java.util.HashSet<>(cols);
+          java.util.Set<String> ancestorStructs;
+          java.util.Set<String> dottedLeafChildren;
+          if (hasDottedAlias) {
+            ancestorStructs = collectAncestorStructs(colSet);
+            dottedLeafChildren = java.util.Collections.emptySet();
+          } else {
+            ancestorStructs = java.util.Collections.emptySet();
+            dottedLeafChildren = new java.util.HashSet<>();
+            for (String c : cols) {
+              int lastDot = c.lastIndexOf('.');
+              if (lastDot != -1 && colSet.contains(c.substring(0, lastDot))) {
+                dottedLeafChildren.add(c);
+              }
+            }
+          }
+          if (hasMeta || !ancestorStructs.isEmpty() || !dottedLeafChildren.isEmpty()) {
             List<SqlNode> seeded = new ArrayList<>();
             for (String c : cols) {
               if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
@@ -695,6 +720,9 @@ public class PplToSqlNode {
                 continue;
               }
               if (ancestorStructs.contains(c)) {
+                continue;
+              }
+              if (dottedLeafChildren.contains(c)) {
                 continue;
               }
               seeded.add(new SqlIdentifier(c, POS));
@@ -983,10 +1011,43 @@ public class PplToSqlNode {
                   .anyMatch(
                       org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           ::containsKey);
-          java.util.Set<String> ancestorStructs = collectAncestorStructs(colSet);
           // In eval-extended mode, also drop columns whose name was overridden by an eval alias.
           java.util.Set<String> overriddenByEval = new java.util.HashSet<>(state.evalAliasNames);
-          if (hasMeta || !ancestorStructs.isEmpty() || !overriddenByEval.isEmpty()) {
+          // Two pruning shapes depending on whether downstream wants struct parents or flat leaves:
+          //   - Default (no dotted alias in projection/eval): keep struct parents, drop flat
+          //     dotted leaves whose parent is in scope. Mirrors v2's tryToRemoveNestedFields.
+          //   - Dotted alias present (e.g. `eval resource.X = ...`, `bin resource.X`): keep flat
+          //     leaves, drop struct parents (ancestors). The flat leaf is what the user named and
+          //     the parent struct would conflict with the eval/bin override.
+          boolean hasDottedAlias = state.evalAliasNames.stream().anyMatch(n -> n.contains("."));
+          if (!hasDottedAlias && state.projection != null) {
+            for (SqlNode p : state.projection) {
+              String nm = identifierName(p);
+              if (nm != null && nm.contains(".")) {
+                hasDottedAlias = true;
+                break;
+              }
+            }
+          }
+          java.util.Set<String> ancestorStructs;
+          java.util.Set<String> dottedLeafChildren;
+          if (hasDottedAlias) {
+            ancestorStructs = collectAncestorStructs(colSet);
+            dottedLeafChildren = java.util.Collections.emptySet();
+          } else {
+            ancestorStructs = java.util.Collections.emptySet();
+            dottedLeafChildren = new java.util.HashSet<>();
+            for (String c : cols) {
+              int lastDot = c.lastIndexOf('.');
+              if (lastDot != -1 && colSet.contains(c.substring(0, lastDot))) {
+                dottedLeafChildren.add(c);
+              }
+            }
+          }
+          if (hasMeta
+              || !ancestorStructs.isEmpty()
+              || !dottedLeafChildren.isEmpty()
+              || !overriddenByEval.isEmpty()) {
             if (state.orderBy != null || state.fetch != null) {
               state.wrap();
             }
@@ -998,15 +1059,6 @@ public class PplToSqlNode {
                 evalEntries.add(p);
               }
             }
-            System.err.println(
-                "[DBG OVERRIDE] cols="
-                    + cols
-                    + " ancestorStructs="
-                    + ancestorStructs
-                    + " overriddenByEval="
-                    + overriddenByEval
-                    + " evalEntries="
-                    + evalEntries);
             List<SqlNode> projection = new ArrayList<>();
             for (String c : cols) {
               if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
@@ -1014,6 +1066,9 @@ public class PplToSqlNode {
                 continue;
               }
               if (ancestorStructs.contains(c)) {
+                continue;
+              }
+              if (dottedLeafChildren.contains(c)) {
                 continue;
               }
               if (overriddenByEval.contains(c)) {

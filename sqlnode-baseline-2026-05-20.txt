@@ -1,0 +1,13 @@
+94 org.opensearch.sql.calcite.remote.CalciteExplainIT
+27 org.opensearch.sql.calcite.remote.CalcitePPLGraphLookupIT
+25 org.opensearch.sql.calcite.remote.CalcitePPLMapPathIT
+8 org.opensearch.sql.calcite.remote.CalciteMvExpandCommandIT
+6 org.opensearch.sql.calcite.remote.CalcitePPLSpathCommandIT
+6 org.opensearch.sql.calcite.remote.CalciteBinCommandIT
+5 org.opensearch.sql.calcite.remote.CalciteExpandCommandIT
+4 org.opensearch.sql.calcite.remote.CalcitePPLPatternsIT
+4 org.opensearch.sql.calcite.remote.CalciteNewAddedCommandsIT
+1 org.opensearch.sql.calcite.remote.CalcitePPLJoinIT
+1 org.opensearch.sql.calcite.remote.CalcitePPLExistsSubqueryIT
+1 org.opensearch.sql.calcite.remote.CalcitePPLCaseFunctionIT
+1 org.opensearch.sql.calcite.remote.CalciteEvalCommandIT

@@ -685,10 +685,11 @@ public class PplToSqlNode {
                   .anyMatch(
                       org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           ::containsKey);
-          // Mirror visitProject's two pruning shapes. When the eval introduces a dotted-name
-          // alias (e.g. `eval resource.X = ...`), drop struct parents so the flat leaf wins;
-          // otherwise drop flat dotted leaves so the struct parents stay (matching v2's
-          // tryToRemoveNestedFields default behaviour).
+          // Drop struct parents only when this eval introduces a DOTTED-name alias that would
+          // collide with a struct parent (e.g. `eval resource.X = ...`). Don't drop flat dotted
+          // leaves at the seed — downstream `eval` / `where` may reference them directly. The
+          // user-facing leaf-vs-parent pruning happens at the implicit-fields-* projection
+          // (visitProject's default branch).
           boolean hasDottedAlias = false;
           for (Let let : node.getExpressionList()) {
             if (letName(let).contains(".")) {
@@ -696,23 +697,11 @@ public class PplToSqlNode {
               break;
             }
           }
-          java.util.Set<String> colSet = new java.util.HashSet<>(cols);
-          java.util.Set<String> ancestorStructs;
-          java.util.Set<String> dottedLeafChildren;
-          if (hasDottedAlias) {
-            ancestorStructs = collectAncestorStructs(colSet);
-            dottedLeafChildren = java.util.Collections.emptySet();
-          } else {
-            ancestorStructs = java.util.Collections.emptySet();
-            dottedLeafChildren = new java.util.HashSet<>();
-            for (String c : cols) {
-              int lastDot = c.lastIndexOf('.');
-              if (lastDot != -1 && colSet.contains(c.substring(0, lastDot))) {
-                dottedLeafChildren.add(c);
-              }
-            }
-          }
-          if (hasMeta || !ancestorStructs.isEmpty() || !dottedLeafChildren.isEmpty()) {
+          java.util.Set<String> ancestorStructs =
+              hasDottedAlias
+                  ? collectAncestorStructs(new java.util.HashSet<>(cols))
+                  : java.util.Collections.emptySet();
+          if (hasMeta || !ancestorStructs.isEmpty()) {
             List<SqlNode> seeded = new ArrayList<>();
             for (String c : cols) {
               if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
@@ -720,9 +709,6 @@ public class PplToSqlNode {
                 continue;
               }
               if (ancestorStructs.contains(c)) {
-                continue;
-              }
-              if (dottedLeafChildren.contains(c)) {
                 continue;
               }
               seeded.add(new SqlIdentifier(c, POS));

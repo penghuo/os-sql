@@ -1645,7 +1645,13 @@ public class PplToSqlNode {
       // the input side and surfaces the unnested element as `alias`. Otherwise the join exposes
       // both `expand_input.<field>` (array) and `expand_t.<alias>`, and downstream column
       // references on `<field>`/`<alias>` are ambiguous.
+      //
+      // Also drop dotted DESCENDANTS of `fieldName` (OpenSearch flattens nested fields, exposing
+      // both `<field>` and `<field>.<leaf>` as scan columns; the leaves should be reached via
+      // expand_t struct navigation, not the source-side flat columns which the pushdown would
+      // collapse to single values).
       List<SqlNode> selects = new ArrayList<>();
+      String dottedPrefix = fieldName + ".";
       if (rowTypeOracle != null) {
         try {
           List<String> inputCols = deriveColumnNames(aliasedInput);
@@ -1654,8 +1660,12 @@ public class PplToSqlNode {
                 .containsKey(c)) {
               continue;
             }
-            // When the alias matches the source field, drop the source side; otherwise keep both.
-            if (alias.equals(fieldName) && c.equals(fieldName)) {
+            // Always drop the source-side `fieldName` — the unnested element replaces it (whether
+            // surfaced under the same name or the user-supplied alias).
+            if (c.equals(fieldName)) {
+              continue;
+            }
+            if (c.startsWith(dottedPrefix)) {
               continue;
             }
             selects.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
@@ -3457,7 +3467,16 @@ public class PplToSqlNode {
       // input side and surfaces the unnested element as `fieldName`. Otherwise the join produces
       // both `mvexpand_input.skills` (array) and `mvexpand_t.skills` (element) and downstream
       // references trip the validator's ambiguity check.
+      //
+      // Also drop dotted DESCENDANTS of `fieldName` (e.g. `skills.name`, `skills.level` for
+      // mvexpand on `skills`). OpenSearch's nested-field flattening exposes both the parent array
+      // (skills) AND its leaves (skills.X) as separate scan columns. If we project the leaves
+      // here, the OpenSearch pushdown returns flattened single values for them — bypassing the
+      // LATERAL UNNEST and producing one row per source doc instead of one row per array element.
+      // The leaves should be reached via mvexpand_t.skills.X (struct navigation on the unnested
+      // element), not via the source-side flat columns.
       List<SqlNode> selects = new ArrayList<>();
+      String dottedPrefix = fieldName + ".";
       if (rowTypeOracle != null) {
         try {
           List<String> inputCols = deriveColumnNames(aliasedInput);
@@ -3467,6 +3486,9 @@ public class PplToSqlNode {
               continue;
             }
             if (c.equals(fieldName)) {
+              continue;
+            }
+            if (c.startsWith(dottedPrefix)) {
               continue;
             }
             selects.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
@@ -9822,7 +9844,11 @@ public class PplToSqlNode {
     boolean isMap = tn == org.apache.calcite.sql.type.SqlTypeName.MAP;
     boolean isStructLike =
         tn == org.apache.calcite.sql.type.SqlTypeName.ROW || parent.getType().isStruct();
-    if (!isMap && !isStructLike) return null;
+    // ANY-typed parent: element of UNNEST(ARRAY<ANY>) (e.g. mvexpand on a Nested field) loses its
+    // structural type. Treat as struct-like and emit chained ITEM — the runtime ExprValue is a
+    // Map and ITEM dispatches dynamically.
+    boolean isAny = tn == org.apache.calcite.sql.type.SqlTypeName.ANY;
+    if (!isMap && !isStructLike && !isAny) return null;
     // Two emission shapes:
     //   - STRUCT/ROW (nested): chain ITEM calls — `ITEM(ITEM(doc, 'user'), 'name')`. Each ITEM
     //     navigates one level into the struct's value type.

@@ -4303,6 +4303,16 @@ public class PplToSqlNode {
       if (state.orderBy != null || state.fetch != null) {
         state.wrap();
       }
+      // If the source field is a dotted MAP/STRUCT-leaf whose top-level identifier has been
+      // overridden by an upstream eval (e.g. spath rewrites to `eval doc = json_extract_all(doc)`),
+      // SQL's SELECT-list alias visibility means a subsequent expression in the SAME select list
+      // sees the ORIGINAL `doc`, not the overridden one. Wrap first so the override becomes the
+      // FROM-side `doc` before we emit ITEM(doc, ...) as a new eval-alias.
+      if (node.getField() instanceof QualifiedName fieldQn
+          && fieldQn.getParts().size() >= 2
+          && state.evalAliasNames.contains(fieldQn.getParts().get(0))) {
+        state.wrap();
+      }
       SqlNode source = expr(node.getField());
       SqlNode patternLit = SqlLiteral.createCharString(patternStr, POS);
       // Reuse the PARSE-style invocation pattern; named-group extraction lives on the

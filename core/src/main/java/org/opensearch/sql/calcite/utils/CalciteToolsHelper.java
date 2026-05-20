@@ -188,6 +188,16 @@ public class CalciteToolsHelper {
           connection.createStatement().unwrap(CalciteServerStatement.class);
       return new OpenSearchPrepareImpl().perform(statement, config, typeFactory, action);
     } catch (Exception e) {
+      // Preserve ErrorReport so the response surfaces its code/stage. Wrapping in a generic
+      // RuntimeException strips both. Also walk the cause chain — Calcite's validator may have
+      // wrapped an ErrorReport (from OpenSearchNodeClient.getIndexMappings on missing index).
+      Throwable t = e;
+      while (t != null) {
+        if (t instanceof org.opensearch.sql.common.error.ErrorReport er) {
+          throw er;
+        }
+        t = t.getCause();
+      }
       throw new RuntimeException(e);
     }
   }

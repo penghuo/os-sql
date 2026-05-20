@@ -301,46 +301,89 @@ public class QueryService {
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
     if (isSqlNodePathEnabled()) {
-      try {
-        org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
-            new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
-        org.apache.calcite.sql.SqlNode sqlNode =
-            new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(planner.rowTypeOracle())
-                .visit(plan);
-        return planner.plan(sqlNode);
-      } catch (Throwable t) {
-        if (shouldFallbackFromSqlNode(t)) {
-          log.warn(
-              "Falling back to CalciteRelNodeVisitor after SqlNode path failure: {}",
-              t.getMessage());
-        } else {
-          throw t;
-        }
+      // No fallback: every PPL query goes through PPL→SqlNode→SqlValidator→SqlToRelConverter.
+      // Any error surfaces to the caller so we get visibility into real translation gaps.
+      org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
+          new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
+      int subsearchLimit = context.sysLimit != null ? context.sysLimit.subsearchLimit() : 0;
+      int joinSubsearchLimit = context.sysLimit != null ? context.sysLimit.joinSubsearchLimit() : 0;
+      org.apache.calcite.sql.SqlNode sqlNode =
+          new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(
+                  planner.rowTypeOracle(), subsearchLimit, joinSubsearchLimit)
+              .visit(plan);
+      RelNode rel = planner.plan(sqlNode);
+      // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
+      // from the request body's `highlight` parameter, parallel to the PPL pipe). Mirror v2's
+      // post-scan injection here: rewrite each LogicalTableScan to its pushDownHighlight form
+      // and add an outer Project that surfaces the `_highlight` column to the caller.
+      if (context.getHighlightConfig() != null) {
+        rel = injectHighlight(rel, context);
+        context.setHighlightConfig(null);
       }
+      return rel;
     }
     return getRelNodeVisitor().analyze(plan, context);
   }
 
-  /**
-   * The SqlNode path doesn't cover every PPL feature yet (Search/query_string filtering, alias-type
-   * fields, etc.); when validation fails for a feature gap, fall back to the v2 visitor. Currently
-   * we treat any UnsupportedOperationException or "Field [X] not found." / "Column 'X' not found"
-   * as a recoverable shape.
-   */
-  private static boolean shouldFallbackFromSqlNode(Throwable t) {
-    Throwable cur = t;
-    while (cur != null) {
-      if (cur instanceof UnsupportedOperationException) {
-        return true;
-      }
-      if (cur instanceof IllegalArgumentException
-          && cur.getMessage() != null
-          && cur.getMessage().startsWith("Field [")) {
-        return true;
-      }
-      cur = cur.getCause();
+  private static RelNode injectHighlight(
+      RelNode rel, org.opensearch.sql.calcite.CalcitePlanContext context) {
+    org.opensearch.sql.ast.tree.HighlightConfig hl = context.getHighlightConfig();
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(org.apache.calcite.rel.core.TableScan scan) {
+            if (scan instanceof org.opensearch.sql.calcite.plan.HighlightPushDown hp) {
+              return hp.pushDownHighlight(hl);
+            }
+            return super.visit(scan);
+          }
+        };
+    RelNode rewritten = rel.accept(shuttle);
+    // If the rewritten relation's row-type now includes _highlight, surface it through an
+    // outer Project. The SqlNode→RelNode pipeline produced an explicit projection from the
+    // pipe's terminal `fields` (or implicit `fields *`); the column count there is fixed and
+    // doesn't pick up the appended _highlight. Add it explicitly only when the RelNode's
+    // current row type doesn't already include it (which it won't, because the project list
+    // was frozen at SqlNode time).
+    if (!rewritten
+        .getRowType()
+        .getFieldNames()
+        .contains(org.opensearch.sql.expression.HighlightExpression.HIGHLIGHT_FIELD)) {
+      // Walk down to find a node whose input has _highlight and re-project.
+      rewritten = surfaceHighlight(rewritten);
     }
-    return false;
+    return rewritten;
+  }
+
+  /**
+   * Walk down to the deepest input that carries _highlight and re-build the project chain on top of
+   * it preserving the original column order, with _highlight appended.
+   */
+  private static RelNode surfaceHighlight(RelNode rel) {
+    String hlField = org.opensearch.sql.expression.HighlightExpression.HIGHLIGHT_FIELD;
+    if (rel.getInputs().isEmpty()) {
+      return rel;
+    }
+    java.util.List<RelNode> newInputs = new java.util.ArrayList<>();
+    for (RelNode input : rel.getInputs()) {
+      newInputs.add(surfaceHighlight(input));
+    }
+    RelNode replaced = rel.copy(rel.getTraitSet(), newInputs);
+    if (rel instanceof org.apache.calcite.rel.core.Project proj) {
+      RelNode input = newInputs.get(0);
+      int hlIdx = input.getRowType().getFieldNames().indexOf(hlField);
+      if (hlIdx >= 0 && !replaced.getRowType().getFieldNames().contains(hlField)) {
+        java.util.List<org.apache.calcite.rex.RexNode> projects =
+            new java.util.ArrayList<>(proj.getProjects());
+        java.util.List<String> names = new java.util.ArrayList<>(proj.getRowType().getFieldNames());
+        org.apache.calcite.rex.RexBuilder rb = proj.getCluster().getRexBuilder();
+        projects.add(rb.makeInputRef(input, hlIdx));
+        names.add(hlField);
+        return org.apache.calcite.rel.logical.LogicalProject.create(
+            input, java.util.Collections.emptyList(), projects, names, proj.getVariablesSet());
+      }
+    }
+    return replaced;
   }
 
   private boolean isSqlNodePathEnabled() {

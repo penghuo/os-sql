@@ -164,8 +164,30 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
     RexNode value = analyze(node.getValue(), context);
     SqlIntervalQualifier intervalQualifier =
         context.rexBuilder.createIntervalUntil(PlanUtils.intervalUnitToSpanUnit(node.getUnit()));
-    return context.rexBuilder.makeIntervalLiteral(
-        new BigDecimal(value.toString()), intervalQualifier);
+    // Calcite stores day-time intervals internally as milliseconds and year-month intervals as
+    // months. Multiply the user-supplied count by the unit's base value so the Rex literal value
+    // matches Calcite conventions (matters for PPL UDFs that read the long via
+    // RexLiteral.getValueAs(Long.class)).
+    java.math.BigDecimal raw = new BigDecimal(value.toString());
+    java.math.BigDecimal scaled = raw.multiply(unitMultiplier(node.getUnit()));
+    return context.rexBuilder.makeIntervalLiteral(scaled, intervalQualifier);
+  }
+
+  private static java.math.BigDecimal unitMultiplier(
+      org.opensearch.sql.ast.expression.IntervalUnit unit) {
+    return switch (unit) {
+      case YEAR -> java.math.BigDecimal.valueOf(12);
+      case QUARTER -> java.math.BigDecimal.valueOf(3);
+      case MONTH -> java.math.BigDecimal.ONE;
+      case WEEK -> java.math.BigDecimal.valueOf(7L * 86_400_000L);
+      case DAY -> java.math.BigDecimal.valueOf(86_400_000L);
+      case HOUR -> java.math.BigDecimal.valueOf(3_600_000L);
+      case MINUTE -> java.math.BigDecimal.valueOf(60_000L);
+      case SECOND -> java.math.BigDecimal.valueOf(1000L);
+      case MILLISECOND -> java.math.BigDecimal.ONE;
+      case MICROSECOND -> java.math.BigDecimal.ONE; // approximated as ms
+      default -> java.math.BigDecimal.ONE;
+    };
   }
 
   @Override

@@ -132,9 +132,22 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata NUMERIC_NUMERIC_OPTIONAL_NUMERIC =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              OperandTypes.NUMERIC_NUMERIC.or(
-                  OperandTypes.family(
-                      SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC)));
+              OperandTypes.NUMERIC_NUMERIC
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC))
+                  // Trailing ANY accommodates the SqlTypeName-flag arg the SqlNode path appends
+                  // for percentile_approx/median (used by the runtime to coerce the result back
+                  // to the field's input type).
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.ANY))
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.ANY)));
   public static final UDFOperandMetadata NUMERIC_NUMERIC_NUMERIC =
       UDFOperandMetadata.wrap(
           OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC));
@@ -224,7 +237,10 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata OPTIONAL_DATE_OR_TIMESTAMP_OR_NUMERIC =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              OperandTypes.DATETIME.or(OperandTypes.NUMERIC).or(OperandTypes.family()));
+              OperandTypes.DATETIME
+                  .or(OperandTypes.NUMERIC)
+                  .or(OperandTypes.CHARACTER)
+                  .or(OperandTypes.family()));
 
   public static final UDFOperandMetadata DATETIME_OR_STRING =
       UDFOperandMetadata.wrap(
@@ -244,8 +260,10 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata DATETIME_OPTIONAL_INTEGER =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              OperandTypes.DATETIME.or(
-                  OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER)));
+              OperandTypes.DATETIME
+                  .or(OperandTypes.CHARACTER)
+                  .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER))
+                  .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.INTEGER)));
   public static final UDFOperandMetadata ANY_DATETIME_OR_STRING =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -254,7 +272,12 @@ public class PPLOperandTypes {
                   .or(OperandTypes.family(SqlTypeFamily.ANY, SqlTypeFamily.STRING)));
 
   public static final UDFOperandMetadata DATETIME_DATETIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME));
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME)
+                  .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.CHARACTER))
+                  .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME))
+                  .or(OperandTypes.CHARACTER_CHARACTER));
   public static final UDFOperandMetadata DATETIME_OR_STRING_STRING =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -269,13 +292,26 @@ public class PPLOperandTypes {
                   .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME)));
   public static final UDFOperandMetadata STRING_TIMESTAMP =
       UDFOperandMetadata.wrap(
-          OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.TIMESTAMP));
+          (CompositeOperandTypeChecker)
+              OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.TIMESTAMP)
+                  .or(OperandTypes.CHARACTER_CHARACTER));
   public static final UDFOperandMetadata STRING_DATETIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME));
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME)
+                  .or(OperandTypes.CHARACTER_CHARACTER));
   public static final UDFOperandMetadata DATETIME_INTERVAL =
-      UDFOperandMetadata.wrap((FamilyOperandTypeChecker) OperandTypes.DATETIME_INTERVAL);
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.DATETIME_INTERVAL.or(
+                  OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME_INTERVAL)));
   public static final UDFOperandMetadata TIME_TIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.TIME, SqlTypeFamily.TIME));
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.family(SqlTypeFamily.TIME, SqlTypeFamily.TIME)
+                  .or(OperandTypes.family(SqlTypeFamily.TIME, SqlTypeFamily.CHARACTER))
+                  .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.TIME))
+                  .or(OperandTypes.CHARACTER_CHARACTER));
 
   public static final UDFOperandMetadata TIMESTAMP_OR_STRING_STRING_STRING =
       UDFOperandMetadata.wrap(
@@ -291,10 +327,10 @@ public class PPLOperandTypes {
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
               OperandTypes.family(
-                      SqlTypeFamily.CHARACTER, SqlTypeFamily.INTEGER, SqlTypeFamily.CHARACTER)
+                      SqlTypeFamily.CHARACTER, SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER)
                   .or(
                       OperandTypes.family(
-                          SqlTypeFamily.CHARACTER, SqlTypeFamily.INTEGER, SqlTypeFamily.DATETIME)));
+                          SqlTypeFamily.CHARACTER, SqlTypeFamily.NUMERIC, SqlTypeFamily.DATETIME)));
   public static final UDFOperandMetadata INTERVAL_DATETIME_DATETIME =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -325,4 +361,40 @@ public class PPLOperandTypes {
    */
   public static final UDFOperandMetadata ANY_SCALAR_OPTIONAL_INTEGER =
       UDFOperandMetadata.wrapUDT(createScalarWithOptionalInteger());
+
+  /**
+   * Signature for the {@code pattern} aggregate UDF (BRAIN log-pattern parser).
+   *
+   * <p>The first four operands are fixed: {@code field:STRING, max_sample_count:INTEGER,
+   * buffer_limit:INTEGER, show_numbered_token:BOOLEAN}. Optional named parameters (passed by {@code
+   * CalciteRelNodeVisitor#visitPatterns}) are appended in alphabetical order by name:
+   *
+   * <pre>
+   *   frequency_threshold_percentage:NUMERIC  (alphabetically first → position 4)
+   *   variable_count_threshold:INTEGER        (alphabetically second → position 5)
+   * </pre>
+   *
+   * That ordering is fixed by v2's {@code Comparator.comparing(Argument::getArgName)} sort, so we
+   * encode the same here. Required arity is 4; the trailing two parameters always appear together
+   * when present.
+   *
+   * <p>Without this metadata, {@code SqlOperator.getOperandCountRange} throws and the validator
+   * cannot route through this aggregate at all.
+   */
+  public static final UDFOperandMetadata PATTERN_AGG_SIGNATURE =
+      UDFOperandMetadata.wrap(
+          (CompositeOperandTypeChecker)
+              OperandTypes.family(
+                      SqlTypeFamily.CHARACTER,
+                      SqlTypeFamily.INTEGER,
+                      SqlTypeFamily.INTEGER,
+                      SqlTypeFamily.BOOLEAN)
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.CHARACTER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.BOOLEAN,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.INTEGER)));
 }

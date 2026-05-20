@@ -107,6 +107,7 @@ import org.opensearch.sql.expression.function.udf.datetime.YearweekFunction;
 import org.opensearch.sql.expression.function.udf.ip.CidrMatchFunction;
 import org.opensearch.sql.expression.function.udf.ip.CompareIpFunction;
 import org.opensearch.sql.expression.function.udf.ip.IPFunction;
+import org.opensearch.sql.expression.function.udf.ip.IpToStringFunction;
 import org.opensearch.sql.expression.function.udf.math.ConvFunction;
 import org.opensearch.sql.expression.function.udf.math.DivideFunction;
 import org.opensearch.sql.expression.function.udf.math.EulerFunction;
@@ -339,6 +340,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   // IP cast function
   public static final SqlOperator IP =
       new IPFunction().toUDF(UserDefinedFunctionUtils.IP_FUNCTION_NAME);
+  public static final SqlOperator IP_TO_STRING = new IpToStringFunction().toUDF("IP_TO_STRING");
   public static final SqlOperator TIME_TO_SEC =
       adaptExprMethodToUDF(
               DateTimeFunctions.class,
@@ -490,7 +492,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
           LogPatternAggFunction.class,
           "pattern",
           ReturnTypes.explicit(UserDefinedFunctionUtils.nullablePatternAggList),
-          null);
+          PPLOperandTypes.PATTERN_AGG_SIGNATURE);
   public static final SqlAggFunction LIST =
       createUserDefinedAggFunction(
           ListAggFunction.class, "LIST", PPLReturnTypes.STRING_ARRAY, PPLOperandTypes.ANY_SCALAR);

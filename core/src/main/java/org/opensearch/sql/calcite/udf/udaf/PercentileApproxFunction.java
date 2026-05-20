@@ -35,9 +35,24 @@ public class PercentileApproxFunction
       return acc;
     }
     percentile = ((Number) values[1]).intValue() / 100.0;
-    returnType = (SqlTypeName) values[values.length - 1];
-    if (values.length > 3) { // have compression
-      compression = ((Number) values[values.length - 2]).doubleValue();
+    // The optional trailing flag is the SqlTypeName of the field, used to coerce the result
+    // back to the field's declared type. The SqlNode emit always includes it; the older v2
+    // path also includes it. When absent (or wrongly typed), infer from the target value's
+    // runtime class so we don't blow up at the cast site.
+    Object lastArg = values[values.length - 1];
+    if (lastArg instanceof SqlTypeName s) {
+      returnType = s;
+    } else if (targetValue instanceof Long) {
+      returnType = SqlTypeName.BIGINT;
+    } else if (targetValue instanceof Integer) {
+      returnType = SqlTypeName.INTEGER;
+    } else if (targetValue instanceof Float) {
+      returnType = SqlTypeName.FLOAT;
+    } else {
+      returnType = SqlTypeName.DOUBLE;
+    }
+    if (values.length > 3 && values[values.length - 2] instanceof Number compNum) {
+      compression = compNum.doubleValue();
     }
 
     acc.evaluate(((Number) targetValue).doubleValue());

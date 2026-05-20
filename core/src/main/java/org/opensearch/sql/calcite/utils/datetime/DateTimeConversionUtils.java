@@ -118,15 +118,23 @@ public final class DateTimeConversionUtils {
    * @return A temporal amount value, can be either a Period or a Duration
    */
   public static TemporalAmount convertToTemporalAmount(long number, TimeUnit unit) {
+    // Calcite stores day-time INTERVAL values internally as milliseconds (e.g. INTERVAL 1 DAY
+    // = 86_400_000) and year-month intervals as months. The visitInterval emitter on the v2
+    // path multiplies the user-supplied count by the unit base before calling
+    // {@code makeIntervalLiteral}; the SqlNode path goes through Calcite's
+    // SqlNodeToRexConverterImpl which performs the same scaling via
+    // {@code SqlIntervalLiteral.getValueAs(BigDecimal.class)}. Either way, the {@code number}
+    // we receive here is in the unit's base, so divide back out before constructing the
+    // Period/Duration.
     return switch (unit) {
-      case YEAR -> Period.ofYears((int) number);
-      case QUARTER -> Period.ofMonths((int) number * 3);
+      case YEAR -> Period.ofYears((int) (number / 12)); // year-month: months
+      case QUARTER -> Period.ofMonths((int) number); // already in months (3 * quarter count)
       case MONTH -> Period.ofMonths((int) number);
-      case WEEK -> Period.ofWeeks((int) number);
-      case DAY -> Period.ofDays((int) number);
-      case HOUR -> Duration.ofHours(number);
-      case MINUTE -> Duration.ofMinutes(number);
-      case SECOND -> Duration.ofSeconds(number);
+      case WEEK -> Period.ofWeeks((int) (number / (7L * 86_400_000L)));
+      case DAY -> Period.ofDays((int) (number / 86_400_000L));
+      case HOUR -> Duration.ofMillis(number);
+      case MINUTE -> Duration.ofMillis(number);
+      case SECOND -> Duration.ofMillis(number);
       case MILLISECOND -> Duration.ofMillis(number);
       case MICROSECOND -> Duration.ofNanos(number * 1000);
       case NANOSECOND -> Duration.ofNanos(number);

@@ -357,4 +357,105 @@ public class CalcitePPLSqlNodePathTest {
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
   }
+
+  // -- Newly added commands -------------------------------------------------
+
+  @Test
+  public void fields_exclude_drops_listed_columns() {
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | fields - SAL, COMM");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    assertThat("EMPNO retained", tree.contains("EMPNO=["), is(true));
+    assertThat("SAL excluded", tree.contains("SAL=["), is(false));
+    assertThat("COMM excluded", tree.contains("COMM=["), is(false));
+  }
+
+  @Test
+  public void streamstats_partition_by_dept() {
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | streamstats max(SAL) by DEPTNO");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    assertThat(
+        "MAX(SAL) OVER PARTITION BY DEPTNO is present",
+        tree.contains("MAX($5) OVER (PARTITION BY $7"),
+        is(true));
+  }
+
+  @Test
+  public void streamstats_window_n_caps_lookback() {
+    // window=3 caps the lookback at 2 rows preceding current. Calcite collapses
+    // "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW" to the equivalent shorthand "ROWS 2 PRECEDING".
+    RelNode root = runViaSqlNode("source=EMP | streamstats window=3 sum(SAL)");
+    String tree = root.explain();
+    assertThat(
+        "ROWS 2 PRECEDING frame appears for window=3", tree.contains("ROWS 2 PRECEDING"), is(true));
+  }
+
+  @Test
+  public void union_two_sources() {
+    // Both sides must produce the same column set for SQL UNION ALL. PPL's v2 visitor uses
+    // SchemaUnifier to resolve mismatches; the SqlNode path defers schema unification to the
+    // validator (so identical-shape unions work; mismatched ones surface a validator error).
+    RelNode root =
+        runViaSqlNode(
+            "source=EMP | fields ENAME | union [source=EMP | fields ENAME] | fields ENAME");
+    String tree = root.explain();
+    assertThat("plan contains LogicalUnion", tree.contains("LogicalUnion"), is(true));
+  }
+
+  @Test
+  public void regex_filters_rows() {
+    RelNode root = runViaSqlNode("source=EMP | regex ENAME='^A.*'");
+    String tree = root.explain();
+    assertThat("REGEXP_CONTAINS filter is present", tree.contains("REGEXP_CONTAINS"), is(true));
+  }
+
+  @Test
+  public void regex_negated_filters_rows() {
+    RelNode root = runViaSqlNode("source=EMP | regex ENAME!='^A.*'");
+    String tree = root.explain();
+    assertThat("NOT(REGEXP_CONTAINS) filter is present", tree.contains("NOT"), is(true));
+    assertThat("contains REGEXP_CONTAINS", tree.contains("REGEXP_CONTAINS"), is(true));
+  }
+
+  @Test
+  public void fillnull_with_value_for_specific_field() {
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | fillnull with 0 in COMM");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    // SqlToRelConverter expands COALESCE into a CASE(IS NOT NULL(...), x, 0).
+    assertThat(
+        "COMM has IS NOT NULL guard from COALESCE expansion",
+        tree.contains("IS NOT NULL($6)") || tree.contains("COALESCE"),
+        is(true));
+  }
+
+  @Test
+  public void convert_num_replaces_field_in_place() {
+    // PPL `convert num(SAL)` replaces SAL in-place with NUM(SAL). The validator resolves NUM
+    // against PPLBuiltinOperators (registered by SqlNodePlanner.buildOperatorTable).
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | convert num(SAL)");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    assertThat("NUM replaces SAL in-place", tree.contains("SAL=[NUM($5)]"), is(true));
+  }
+
+  @Test
+  public void convert_with_alias_appends_column() {
+    SqlNodePlanner planner = new SqlNodePlanner(config);
+    UnresolvedPlan plan = parse("source=EMP | convert auto(SAL) AS salary_num");
+    SqlNode sqlNode = new PplToSqlNode(planner.rowTypeOracle()).visit(plan);
+    RelNode root = planner.plan(sqlNode);
+    String tree = root.explain();
+    assertThat("salary_num is appended", tree.contains("salary_num=[AUTO($5)]"), is(true));
+    assertThat("SAL is preserved", tree.contains("SAL=[$5]"), is(true));
+  }
 }

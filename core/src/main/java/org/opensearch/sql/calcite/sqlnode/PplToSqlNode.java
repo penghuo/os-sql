@@ -3455,6 +3455,24 @@ public class PplToSqlNode {
           selects.add(fieldRef);
         }
       }
+      // PPL also allows fillnull on MAP/STRUCT-leaf paths (e.g. `fillnull using
+      // doc.user.name='N/A'`
+      // after `spath input=doc`). Such pair-keys aren't flat columns; lower each unmatched per-pair
+      // through tryMapOrStructItemAccess and emit `COALESCE(ITEM(...), repl) AS "doc.user.name"`.
+      // The aliased column then surfaces as a flat name for downstream `fields doc.user.name`.
+      for (java.util.Map.Entry<String, UnresolvedExpression> e : perField.entrySet()) {
+        String fieldName = e.getKey();
+        if (cols.contains(fieldName)) continue; // already handled above
+        SqlNode itemAccess =
+            tryMapOrStructItemAccess(
+                QualifiedName.of(java.util.Arrays.asList(fieldName.split("\\."))));
+        if (itemAccess != null) {
+          SqlNode replExpr = expr(e.getValue());
+          SqlNode coalesce =
+              new SqlBasicCall(SqlStdOperatorTable.COALESCE, List.of(itemAccess, replExpr), POS);
+          selects.add(asAlias(coalesce, fieldName));
+        }
+      }
       state.setProjection(selects);
       return null;
     }

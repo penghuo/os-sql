@@ -685,13 +685,19 @@ public class PplToSqlNode {
                   .anyMatch(
                       org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           ::containsKey);
-          if (hasMeta) {
+          java.util.Set<String> ancestorStructs =
+              collectAncestorStructs(new java.util.HashSet<>(cols));
+          if (hasMeta || !ancestorStructs.isEmpty()) {
             List<SqlNode> seeded = new ArrayList<>();
             for (String c : cols) {
-              if (!org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+              if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                   .containsKey(c)) {
-                seeded.add(new SqlIdentifier(c, POS));
+                continue;
               }
+              if (ancestorStructs.contains(c)) {
+                continue;
+              }
+              seeded.add(new SqlIdentifier(c, POS));
             }
             state.projection = seeded;
           }
@@ -961,13 +967,15 @@ public class PplToSqlNode {
             state.setProjection(filteredProj);
           }
         }
-        // Only enumerate-and-filter metadata when the projection is still the default SELECT *
-        // (no upstream pipe customised it). If a Stats / Eval / Project / Window already set
-        // a projection, they own the row shape — don't overwrite.
-        if (rowTypeOracle != null
-            && state.from != null
-            && state.projection == null
-            && !state.evalExtended) {
+        // Enumerate-and-filter metadata + ancestor structs when the projection still contains a
+        // `*` star — either the default SELECT * (state.projection == null) or an eval-extended
+        // projection of shape `[*, expr AS alias, ...]`. Once we rebuild with explicit identifiers
+        // the `*` is gone and we leave it untouched on subsequent passes.
+        boolean projectionHasStar =
+            state.projection == null
+                || state.projection.stream()
+                    .anyMatch(p -> p instanceof SqlIdentifier id && id.isStar());
+        if (rowTypeOracle != null && state.from != null && projectionHasStar) {
           List<String> cols = deriveColumnNames(state.from);
           java.util.Set<String> colSet = new java.util.HashSet<>(cols);
           boolean hasMeta =
@@ -975,34 +983,45 @@ public class PplToSqlNode {
                   .anyMatch(
                       org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           ::containsKey);
-          // Detect dotted struct-leaf columns whose parent struct is also in the row type.
-          // v2's visitProject calls tryToRemoveNestedFields after the implicit `fields *`
-          // project to drop these duplicates. Only applies to the implicit AllFields project,
-          // which is what we're handling here (explicit `fields` lists go through the
-          // non-isSelectStar branch and own their row shape).
-          boolean hasDottedDup =
-              cols.stream()
-                  .anyMatch(
-                      c -> {
-                        int lastDot = c.lastIndexOf('.');
-                        return lastDot != -1 && colSet.contains(c.substring(0, lastDot));
-                      });
-          if (hasMeta || hasDottedDup) {
+          java.util.Set<String> ancestorStructs = collectAncestorStructs(colSet);
+          // In eval-extended mode, also drop columns whose name was overridden by an eval alias.
+          java.util.Set<String> overriddenByEval = new java.util.HashSet<>(state.evalAliasNames);
+          if (hasMeta || !ancestorStructs.isEmpty() || !overriddenByEval.isEmpty()) {
             if (state.orderBy != null || state.fetch != null) {
               state.wrap();
             }
+            // Preserve any non-`*` projection entries (eval aliases) so they survive the rebuild.
+            List<SqlNode> evalEntries = new ArrayList<>();
+            if (state.projection != null) {
+              for (SqlNode p : state.projection) {
+                if (p instanceof SqlIdentifier id && id.isStar()) continue;
+                evalEntries.add(p);
+              }
+            }
+            System.err.println(
+                "[DBG OVERRIDE] cols="
+                    + cols
+                    + " ancestorStructs="
+                    + ancestorStructs
+                    + " overriddenByEval="
+                    + overriddenByEval
+                    + " evalEntries="
+                    + evalEntries);
             List<SqlNode> projection = new ArrayList<>();
             for (String c : cols) {
               if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                   .containsKey(c)) {
                 continue;
               }
-              int lastDot = c.lastIndexOf('.');
-              if (lastDot != -1 && colSet.contains(c.substring(0, lastDot))) {
+              if (ancestorStructs.contains(c)) {
+                continue;
+              }
+              if (overriddenByEval.contains(c)) {
                 continue;
               }
               projection.add(new SqlIdentifier(c, POS));
             }
+            projection.addAll(evalEntries);
             state.setProjection(projection);
             return null;
           }
@@ -5656,33 +5675,54 @@ public class PplToSqlNode {
         throw new UnsupportedOperationException(
             "Unknown Bin subtype: " + node.getClass().getSimpleName());
       }
-      // Project: replace input field with bucket call (when alias == fieldName) or append.
+      // Project: emit non-bin columns in original order, then append the bin column at the end
+      // (v2's emission shape — visible in the testBinWithNestedFieldWithoutExplicitProjection
+      // result column order).
       if (rowTypeOracle != null && state.from != null) {
+        List<String> rawCols = deriveColumnNames(state.from);
+        java.util.Set<String> rawColSet = new java.util.HashSet<>(rawCols);
+        java.util.Set<String> ancestorStructs = collectAncestorStructs(rawColSet);
         List<String> cols =
-            deriveColumnNames(state.from).stream()
+            rawCols.stream()
                 .filter(
                     c ->
                         !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                             .containsKey(c))
+                .filter(c -> !ancestorStructs.contains(c))
                 .toList();
         List<SqlNode> selects = new ArrayList<>();
-        boolean replaced = false;
         for (String c : cols) {
-          if (c.equals(alias)) {
-            selects.add(asAlias(bucketCall, c));
-            replaced = true;
-          } else {
-            selects.add(new SqlIdentifier(c, POS));
-          }
+          if (c.equals(alias)) continue; // skip the source field; bin replaces it at the end
+          selects.add(new SqlIdentifier(c, POS));
         }
-        if (!replaced) {
-          selects.add(asAlias(bucketCall, alias));
-        }
+        selects.add(asAlias(bucketCall, alias));
         state.setProjection(selects);
       } else {
         state.addEvalAlias(bucketCall, alias);
       }
       return null;
+    }
+
+    /**
+     * Identify "ancestor struct" columns — those whose name is a strict dotted prefix of any other
+     * column. OpenSearch's mapping flattening emits both the parent struct (e.g. {@code resource})
+     * and its leaves ({@code resource.attributes...sdk.version}); user-facing output should surface
+     * only the leaves. Returns an empty set when no such ancestor exists, which keeps standalone
+     * MAP/struct columns (like the spath-rewritten {@code doc}) intact.
+     */
+    private java.util.Set<String> collectAncestorStructs(java.util.Set<String> colSet) {
+      java.util.Set<String> ancestors = new java.util.HashSet<>();
+      for (String c : colSet) {
+        int lastDot = c.lastIndexOf('.');
+        while (lastDot != -1) {
+          String prefix = c.substring(0, lastDot);
+          if (colSet.contains(prefix)) {
+            ancestors.add(prefix);
+          }
+          lastDot = c.lastIndexOf('.', lastDot - 1);
+        }
+      }
+      return ancestors;
     }
 
     /** MIN(field) OVER () — used as a default range bound for default-bin magnitude inference. */

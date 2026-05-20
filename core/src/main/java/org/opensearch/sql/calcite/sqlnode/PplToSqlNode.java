@@ -1295,6 +1295,23 @@ public class PplToSqlNode {
           selects.add(new SqlIdentifier(c, POS));
         }
       }
+      // PPL also allows renaming a MAP/STRUCT-leaf path (e.g. `rename doc.user.name as username`
+      // after `spath input=doc`). Such rename origins don't appear as flat columns in `cols`; lower
+      // each non-wildcard origin that wasn't matched above through tryMapOrStructItemAccess and
+      // emit `ITEM(...) AS target`. Skip wildcard renames — those only match flat names.
+      for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+        String origin = ((Field) m.getOrigin()).getField().toString();
+        String target = ((Field) m.getTarget()).getField().toString();
+        if (origin.contains("*") || target.contains("*")) continue;
+        if (origin.equals(target)) continue;
+        if (cols.contains(origin)) continue; // already handled by flat-column path above
+        SqlNode itemAccess =
+            tryMapOrStructItemAccess(
+                QualifiedName.of(java.util.Arrays.asList(origin.split("\\."))));
+        if (itemAccess != null) {
+          selects.add(asAlias(itemAccess, target));
+        }
+      }
       state.setProjection(selects);
       return null;
     }

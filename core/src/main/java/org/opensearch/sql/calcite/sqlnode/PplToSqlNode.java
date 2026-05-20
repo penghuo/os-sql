@@ -4039,6 +4039,27 @@ public class PplToSqlNode {
       // record the inner alias as a synonym so column refs like `tt.X` rewrite to `t2.X`.
       registerNestedAliasSynonyms(node.getRight(), node.getRightAlias().orElse(null));
       registerNestedAliasSynonyms(node.getChildren().get(0), node.getLeftAlias().orElse(null));
+      // PPL also allows referencing a bare-table side by its raw table name in the JOIN's ON
+      // clause: `source = X | JOIN ON X.col = Y.col Y`. The maybeAlias step below wraps such
+      // unaliased sides under `__l`/`__r` defaults, dropping the table name from scope. Register
+      // the table name(s) as synonyms for the assigned default alias so multi-part identifier
+      // navigation in expr() rewrites them.
+      //
+      // Only register when not already present — in a multi-join chain, the first JOIN already
+      // registered the table->__l synonym; the second JOIN's `joinAliasCounter` has bumped to
+      // produce `__l2`, but the prior table is still aliased as `__l` in the inherited SqlJoin.
+      String leftDefault = defaultLeftAlias();
+      String rightDefault = defaultRightAlias();
+      if (node.getLeftAlias().isEmpty()) {
+        for (String t : extractRelationTableNames(node.getChildren().get(0))) {
+          joinAliasSynonyms.putIfAbsent(t, leftDefault);
+        }
+      }
+      if (node.getRightAlias().isEmpty()) {
+        for (String t : extractRelationTableNames(node.getRight())) {
+          joinAliasSynonyms.putIfAbsent(t, rightDefault);
+        }
+      }
       SqlNode rightSide = new PplToSqlNode(rowTypeOracle).visit(node.getRight());
       // PPL `plugins.ppl.join.subsearch_maxout` cluster setting caps the right side to N rows
       // total (not per partition). v2 calls addSysLimitForJoinSubsearch which adds a top-level
@@ -9819,6 +9840,33 @@ public class PplToSqlNode {
    * #joinAliasSynonyms}. Only the SubqueryAlias names matching the same join side are registered so
    * column refs in projections / filters resolve to the SQL alias used in the emitted FROM clause.
    */
+  /**
+   * Walk down a join-side AST to find any bare-table {@link org.opensearch.sql.ast.tree.Relation}
+   * nodes and return their qualified table names. Used to register table-name synonyms for the
+   * default `__l`/`__r` aliases so user ON-clauses that reference the raw table name resolve
+   * through the wrap.
+   */
+  private java.util.List<String> extractRelationTableNames(
+      org.opensearch.sql.ast.tree.UnresolvedPlan plan) {
+    java.util.List<String> out = new java.util.ArrayList<>();
+    if (plan == null) return out;
+    org.opensearch.sql.ast.tree.UnresolvedPlan current = plan;
+    while (current != null) {
+      if (current instanceof org.opensearch.sql.ast.tree.Relation rel) {
+        for (QualifiedName qn : rel.getQualifiedNames()) {
+          out.add(qn.toString());
+        }
+        break;
+      }
+      java.util.List<? extends org.opensearch.sql.ast.Node> children = current.getChild();
+      if (children == null || children.isEmpty()) break;
+      org.opensearch.sql.ast.Node first = children.get(0);
+      if (!(first instanceof org.opensearch.sql.ast.tree.UnresolvedPlan p)) break;
+      current = p;
+    }
+    return out;
+  }
+
   private void registerNestedAliasSynonyms(
       org.opensearch.sql.ast.tree.UnresolvedPlan plan, String canonicalAlias) {
     if (canonicalAlias == null || plan == null) return;

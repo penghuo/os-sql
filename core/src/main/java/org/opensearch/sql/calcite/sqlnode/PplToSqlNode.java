@@ -1641,6 +1641,9 @@ public class PplToSqlNode {
       if (rowTypeOracle != null) {
         try {
           List<String> inputCols = deriveColumnNames(aliasedInput);
+          // Drop flat dotted leaves whose parent is also in scope — matches v2's
+          // tryToRemoveNestedFields default behaviour (parent struct wins, leaves drop).
+          java.util.Set<String> inputColSet = new java.util.HashSet<>(inputCols);
           for (String c : inputCols) {
             if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                 .containsKey(c)) {
@@ -1652,6 +1655,11 @@ public class PplToSqlNode {
               continue;
             }
             if (c.startsWith(dottedPrefix)) {
+              continue;
+            }
+            // Drop flat dotted leaves whose parent struct is in scope.
+            int lastDot = c.lastIndexOf('.');
+            if (lastDot != -1 && inputColSet.contains(c.substring(0, lastDot))) {
               continue;
             }
             selects.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
@@ -3466,6 +3474,7 @@ public class PplToSqlNode {
       if (rowTypeOracle != null) {
         try {
           List<String> inputCols = deriveColumnNames(aliasedInput);
+          java.util.Set<String> inputColSet = new java.util.HashSet<>(inputCols);
           for (String c : inputCols) {
             if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                 .containsKey(c)) {
@@ -3475,6 +3484,12 @@ public class PplToSqlNode {
               continue;
             }
             if (c.startsWith(dottedPrefix)) {
+              continue;
+            }
+            // Drop flat dotted leaves whose parent struct is in scope (v2's default
+            // tryToRemoveNestedFields behaviour).
+            int lastDot = c.lastIndexOf('.');
+            if (lastDot != -1 && inputColSet.contains(c.substring(0, lastDot))) {
               continue;
             }
             selects.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));

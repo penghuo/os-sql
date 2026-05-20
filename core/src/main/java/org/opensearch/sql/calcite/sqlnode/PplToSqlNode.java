@@ -9589,11 +9589,34 @@ public class PplToSqlNode {
     }
     if (parent == null) return null;
     org.apache.calcite.sql.type.SqlTypeName tn = parent.getType().getSqlTypeName();
-    boolean isNavigable =
-        tn == org.apache.calcite.sql.type.SqlTypeName.MAP
-            || tn == org.apache.calcite.sql.type.SqlTypeName.ROW
-            || parent.getType().isStruct();
-    if (!isNavigable) return null;
+    boolean isMap = tn == org.apache.calcite.sql.type.SqlTypeName.MAP;
+    boolean isStructLike =
+        tn == org.apache.calcite.sql.type.SqlTypeName.ROW || parent.getType().isStruct();
+    if (!isMap && !isStructLike) return null;
+    // Two emission shapes:
+    //   - STRUCT/ROW (nested): chain ITEM calls — `ITEM(ITEM(doc, 'user'), 'name')`. Each ITEM
+    //     navigates one level into the struct's value type.
+    //   - MAP with scalar value type (e.g. JSON_EXTRACT_ALL → MAP<VARCHAR, VARCHAR> keyed by
+    //     flattened dot-paths "user.name"): single-level ITEM with the joined trailing parts as
+    //     key — `ITEM(doc, 'user.name')`. Chaining would type-fail since ITEM(doc, 'user') is a
+    //     scalar and a second ITEM rejects `<VARCHAR>` operand.
+    if (isMap) {
+      org.apache.calcite.rel.type.RelDataType valueType = parent.getType().getValueType();
+      org.apache.calcite.sql.type.SqlTypeName vt =
+          valueType == null ? null : valueType.getSqlTypeName();
+      boolean valueIsNavigable =
+          vt == org.apache.calcite.sql.type.SqlTypeName.MAP
+              || vt == org.apache.calcite.sql.type.SqlTypeName.ROW
+              || (valueType != null && valueType.isStruct());
+      if (!valueIsNavigable) {
+        String joinedKey = String.join(".", parts.subList(1, parts.size()));
+        return new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(
+                new SqlIdentifier(parts.get(0), POS), SqlLiteral.createCharString(joinedKey, POS)),
+            POS);
+      }
+    }
     SqlNode acc = new SqlIdentifier(parts.get(0), POS);
     for (int i = 1; i < parts.size(); i++) {
       acc =

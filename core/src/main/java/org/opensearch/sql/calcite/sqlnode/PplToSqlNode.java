@@ -4692,19 +4692,46 @@ public class PplToSqlNode {
         state.wrap();
       }
       // Step 1: SELECT <groups>, <fields>, COUNT(*) AS countFieldName GROUP BY <groups, fields>.
+      // For dotted MAP/STRUCT leaves (e.g. `doc.user.name`), expr() returns an ITEM(...) call.
+      // Wrap each such projection with an explicit alias so the post-wrap row type carries the
+      // expected dotted name as a flat column — step 3 references it by name via SqlIdentifier.
       List<SqlNode> aggSelects = new ArrayList<>();
       List<SqlNode> groupKeys = new ArrayList<>();
       List<SqlNode> partitionKeys = new ArrayList<>();
+      List<String> groupExprNames = new ArrayList<>();
+      List<String> fieldNames = new ArrayList<>();
       for (UnresolvedExpression g : node.getGroupExprList()) {
         SqlNode k = expr(g);
         groupKeys.add(k);
-        partitionKeys.add(k);
-        aggSelects.add(k);
+        String alias = null;
+        if (g instanceof QualifiedName qn) alias = qn.toString();
+        else if (g instanceof Field f) alias = f.getField().toString();
+        if (alias != null
+            && alias.contains(".")
+            && k instanceof SqlBasicCall sbc
+            && sbc.getOperator() == SqlStdOperatorTable.ITEM) {
+          aggSelects.add(asAlias(k, alias));
+          // After the wrap below, the dotted name is a flat column; partitionKeys (used in the
+          // OVER clause) must reference that flat name, not re-emit the ITEM() against `doc`.
+          partitionKeys.add(new SqlIdentifier(alias, POS));
+        } else {
+          aggSelects.add(k);
+          partitionKeys.add(k);
+        }
+        groupExprNames.add(alias);
       }
       for (Field f : node.getFields()) {
         SqlNode k = expr(f.getField());
         groupKeys.add(k);
-        aggSelects.add(k);
+        String alias = f.getField().toString();
+        if (alias.contains(".")
+            && k instanceof SqlBasicCall sbc
+            && sbc.getOperator() == SqlStdOperatorTable.ITEM) {
+          aggSelects.add(asAlias(k, alias));
+        } else {
+          aggSelects.add(k);
+        }
+        fieldNames.add(alias);
       }
       SqlNode countCall =
           new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(SqlIdentifier.star(POS)), POS);
@@ -4756,12 +4783,27 @@ public class PplToSqlNode {
               POS));
       state.wrap();
       // Step 3: project away helper column (and count if !showCount).
+      // After the wraps, dotted MAP-leaves are now flat columns under their alias name. Reference
+      // them by SqlIdentifier rather than re-running expr() (which would re-emit ITEM(...) on a
+      // FROM scope that no longer has the parent MAP).
       List<SqlNode> finalSelects = new ArrayList<>();
+      int gi = 0;
       for (UnresolvedExpression g : node.getGroupExprList()) {
-        finalSelects.add(expr(g));
+        String alias = groupExprNames.get(gi++);
+        if (alias != null && alias.contains(".")) {
+          finalSelects.add(new SqlIdentifier(alias, POS));
+        } else {
+          finalSelects.add(expr(g));
+        }
       }
+      int fi = 0;
       for (Field f : node.getFields()) {
-        finalSelects.add(expr(f.getField()));
+        String alias = fieldNames.get(fi++);
+        if (alias.contains(".")) {
+          finalSelects.add(new SqlIdentifier(alias, POS));
+        } else {
+          finalSelects.add(expr(f.getField()));
+        }
       }
       if (Boolean.TRUE.equals(showCount)) {
         finalSelects.add(new SqlIdentifier(countFieldName, POS));

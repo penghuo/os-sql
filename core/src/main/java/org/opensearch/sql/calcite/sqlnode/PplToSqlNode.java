@@ -6177,6 +6177,16 @@ public class PplToSqlNode {
           state.addEvalAlias(tokensItem, "tokens");
         }
       } else if (method == org.opensearch.sql.ast.expression.PatternMethod.BRAIN) {
+        // BRAIN AGG mode is structurally different from LABEL: aggregate INTERNAL_PATTERN
+        // (returns ARRAY<MAP>), then UNNEST/Correlate to expand each cluster MAP into its own
+        // row, then SAFE_CAST(ITEM(map, 'pattern' / 'pattern_count' / 'tokens' / 'sample_logs'))
+        // for the four flattened columns. Mirrors v2's
+        // CalciteRelNodeVisitor.visitPatterns#1127-1153 path. Handle here and return early; the
+        // downstream `if (mode == AGGREGATION)` block is for SIMPLE_PATTERN/BRAIN-LABEL flows.
+        if (mode == org.opensearch.sql.ast.expression.PatternMode.AGGREGATION) {
+          emitBrainAggregationMode(node, aliasField);
+          return null;
+        }
         // BRAIN: SAFE_CAST(ITEM(PATTERN_PARSER(field, pattern(field, max_sample, buffer,
         //                                       show_numbered) OVER (PARTITION BY <by>),
         //                       show_numbered),
@@ -6219,18 +6229,41 @@ public class PplToSqlNode {
                 null,
                 null,
                 POS);
+        // Build INTERNAL_PATTERN args: 4 fixed + optional BRAIN tuning params (alphabetical). v2's
+        // visitPatterns sorts by Argument::getArgName: frequency_threshold_percentage first, then
+        // variable_count_threshold. Match that ordering.
+        List<SqlNode> patternArgs = new ArrayList<>();
+        patternArgs.add(source);
+        patternArgs.add(maxSampleCount);
+        patternArgs.add(bufferLimit);
+        patternArgs.add(showNumbered);
+        if (node.getArguments() != null) {
+          List<String> brainKeys =
+              node.getArguments().keySet().stream()
+                  .filter(
+                      org.opensearch.sql.common.patterns.PatternUtils.VALID_BRAIN_PARAMETERS
+                          ::contains)
+                  .sorted()
+                  .toList();
+          for (String k : brainKeys) {
+            patternArgs.add(
+                expr(
+                    new org.opensearch.sql.ast.expression.Literal(
+                        node.getArguments().get(k).getValue(),
+                        node.getArguments().get(k).getType())));
+          }
+        }
         SqlNode patternAgg =
             new SqlBasicCall(
                 org.opensearch.sql.expression.function.PPLBuiltinOperators.INTERNAL_PATTERN,
-                List.of(source, maxSampleCount, bufferLimit, showNumbered),
+                patternArgs,
                 POS);
         SqlNode patternOver =
             new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(patternAgg, patternWindow), POS);
-        // Stage 1: project the window aggregate as a helper column, then wrap.
-        state.addEvalAlias(patternOver, "_pattern_agg_");
-        state.wrap();
-        // Stage 2: reference `_pattern_agg_` in PATTERN_PARSER.
-        SqlNode helperRef = new SqlIdentifier("_pattern_agg_", POS);
+        // Inline OVER inside PATTERN_PARSER (mirroring v2's projectPlus emission). Producing a
+        // single Project with the OVER nested matches v2's RelNode shape and prevents Calcite
+        // from pushing a downstream Sort/Fetch below the window-bearing project (which would
+        // restrict the BRAIN aggregator to fewer input rows than the user expects).
         SqlNode source2 = expr(node.getSourceField());
         SqlNode parserCall =
             new SqlBasicCall(
@@ -6241,7 +6274,7 @@ public class PplToSqlNode {
                     null,
                     null,
                     org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-                List.of(source2, helperRef, showNumbered),
+                List.of(source2, patternOver, showNumbered),
                 POS);
         SqlNode itemCall =
             new SqlBasicCall(
@@ -6273,6 +6306,11 @@ public class PplToSqlNode {
                   POS);
           state.addEvalAlias(tokensItem, "tokens");
         }
+        // Wrap so the patterns_field projection (which contains a window function over the full
+        // input) lives inside its own SELECT. Without this wrap, a downstream `head N` lands in
+        // the same SELECT as the OVER and Calcite's SortProjectTranspose may push FETCH below
+        // the window — restricting BRAIN to N input rows instead of all rows.
+        state.wrap();
       } else {
         throw new IllegalArgumentException("Unknown patterns method: " + method);
       }
@@ -6315,9 +6353,10 @@ public class PplToSqlNode {
         // override patterns_field with the numbered version + add tokens column. Mirrors v2's
         // flattenParsedPattern call at CalciteRelNodeVisitor.java#1057-1077.
         boolean showNumberedAgg = false;
-        // Only SIMPLE_PATTERN benefits from re-running PATTERN_PARSER after aggregation: BRAIN's
-        // tokens are computed by the brain pattern() aggregator itself, not a separate parser
-        // call, and re-parsing post-grouping yields empty tokens for variable-bearing patterns.
+        // SIMPLE_PATTERN with show_numbered=true: re-run PATTERN_PARSER post-grouping. BRAIN's
+        // numbered tokens use a different format (`<token1>`) than the SIMPLE_PATTERN wildcard
+        // (`<*>`), so PATTERN_PARSER's evalSamples (WILDCARD_PATTERN-based) can't extract them.
+        // BRAIN AGG show_numbered=true is handled via a dedicated path below.
         if (method == org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN
             && node.getShowNumberedToken() instanceof org.opensearch.sql.ast.expression.Literal lit
             && Boolean.TRUE.equals(lit.getValue())) {
@@ -6384,6 +6423,195 @@ public class PplToSqlNode {
         }
       }
       return null;
+    }
+
+    /**
+     * Emit BRAIN AGG mode as: aggregate INTERNAL_PATTERN (returns ARRAY&lt;MAP&gt;) → CROSS JOIN
+     * LATERAL UNNEST → ITEM access for each MAP key. Mirrors v2's {@code
+     * aggregate(...).buildExpandRelNode(...).flattenParsedPattern(aggMode=true,...)}.
+     *
+     * <p>SQL shape (no group by):
+     *
+     * <pre>
+     *   SELECT SAFE_CAST(t.patterns_field['pattern'] AS VARCHAR) AS patterns_field,
+     *          SAFE_CAST(t.patterns_field['pattern_count'] AS BIGINT) AS pattern_count,
+     *          SAFE_CAST(t.patterns_field['tokens'] AS MAP&lt;VARCHAR, VARCHAR ARRAY&gt;) AS tokens, -- only when show_numbered=true
+     *          SAFE_CAST(t.patterns_field['sample_logs'] AS VARCHAR ARRAY) AS sample_logs
+     *   FROM (SELECT pattern(field, ...) AS patterns_field FROM &lt;input&gt;) AS s,
+     *        LATERAL UNNEST(s.patterns_field) AS t(patterns_field)
+     * </pre>
+     *
+     * <p>With partitionBy, the inner SELECT also groups by partitionBy and surfaces those keys.
+     */
+    private void emitBrainAggregationMode(
+        org.opensearch.sql.ast.tree.Patterns node, String aliasField) {
+      // Bake any pending eval/projection state into a subquery before reshaping FROM into the
+      // aggregate+UNNEST cross-join.
+      if (state.evalExtended || state.projectionReplaced) {
+        state.wrap();
+      }
+      SqlNode source = expr(node.getSourceField());
+      SqlNode maxSampleCount =
+          node.getPatternMaxSampleCount() != null
+              ? expr(node.getPatternMaxSampleCount())
+              : intLiteral(10);
+      SqlNode bufferLimit =
+          node.getPatternBufferLimit() != null
+              ? expr(node.getPatternBufferLimit())
+              : intLiteral(100000);
+      SqlNode showNumbered =
+          node.getShowNumberedToken() != null
+              ? expr(node.getShowNumberedToken())
+              : SqlLiteral.createBoolean(false, POS);
+      boolean showNumberedTrue =
+          showNumbered instanceof SqlLiteral lit && Boolean.TRUE.equals(lit.getValue());
+      // Build INTERNAL_PATTERN args: 4 fixed + optional BRAIN tuning params (alphabetical).
+      List<SqlNode> patternArgs = new ArrayList<>();
+      patternArgs.add(source);
+      patternArgs.add(maxSampleCount);
+      patternArgs.add(bufferLimit);
+      patternArgs.add(showNumbered);
+      if (node.getArguments() != null) {
+        List<String> brainKeys =
+            node.getArguments().keySet().stream()
+                .filter(
+                    org.opensearch.sql.common.patterns.PatternUtils.VALID_BRAIN_PARAMETERS
+                        ::contains)
+                .sorted()
+                .toList();
+        for (String k : brainKeys) {
+          patternArgs.add(
+              expr(
+                  new org.opensearch.sql.ast.expression.Literal(
+                      node.getArguments().get(k).getValue(),
+                      node.getArguments().get(k).getType())));
+        }
+      }
+      SqlNode patternAgg =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.INTERNAL_PATTERN,
+              patternArgs,
+              POS);
+      // Inner SELECT: pattern aggregate (+ partitionBy keys when present).
+      List<SqlNode> innerProjects = new ArrayList<>();
+      List<String> partitionNames = new ArrayList<>();
+      if (node.getPartitionByList() != null) {
+        for (UnresolvedExpression p : node.getPartitionByList()) {
+          UnresolvedExpression core = stripAlias(p);
+          String pname =
+              (p instanceof Alias al)
+                  ? al.getName()
+                  : (core instanceof QualifiedName qn ? qn.toString() : null);
+          partitionNames.add(pname);
+          innerProjects.add(expr(core));
+        }
+      }
+      innerProjects.add(asAlias(patternAgg, aliasField));
+      // Build inner SqlSelect: SELECT <partitionBy>..., pattern(...) AS patterns_field FROM <from>
+      // [GROUP BY <partitionBy>]
+      SqlNode innerFrom = state.from;
+      org.apache.calcite.sql.SqlSelect inner =
+          new org.apache.calcite.sql.SqlSelect(
+              POS,
+              null,
+              new SqlNodeList(innerProjects, POS),
+              innerFrom,
+              null,
+              partitionNames.isEmpty()
+                  ? null
+                  : new SqlNodeList(
+                      node.getPartitionByList().stream().map(p -> expr(stripAlias(p))).toList(),
+                      POS),
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null);
+      String innerAlias = "_brain_agg_";
+      SqlNode aliasedInner =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS, List.of(inner, new SqlIdentifier(innerAlias, POS)), POS);
+      // LATERAL UNNEST(<innerAlias>.patterns_field) AS t(patterns_field)
+      SqlNode unnestArg = new SqlIdentifier(java.util.Arrays.asList(innerAlias, aliasField), POS);
+      SqlNode unnest = new SqlBasicCall(SqlStdOperatorTable.UNNEST, List.of(unnestArg), POS);
+      String unnestAlias = "_brain_unnest_";
+      SqlNode aliasedUnnest =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS,
+              List.of(
+                  unnest, new SqlIdentifier(unnestAlias, POS), new SqlIdentifier(aliasField, POS)),
+              POS);
+      // CROSS JOIN (comma) implicit-LATERAL: SqlJoin with COMMA join type.
+      org.apache.calcite.sql.SqlJoin join =
+          new org.apache.calcite.sql.SqlJoin(
+              POS,
+              aliasedInner,
+              SqlLiteral.createBoolean(false, POS),
+              org.apache.calcite.sql.JoinType.COMMA.symbol(POS),
+              aliasedUnnest,
+              org.apache.calcite.sql.JoinConditionType.NONE.symbol(POS),
+              null);
+      // Outer projection: partitionBy keys + 4 ITEM-access columns.
+      List<SqlNode> outerProjects = new ArrayList<>();
+      for (String pname : partitionNames) {
+        outerProjects.add(new SqlIdentifier(java.util.Arrays.asList(innerAlias, pname), POS));
+      }
+      SqlNode unnestedRef =
+          new SqlIdentifier(java.util.Arrays.asList(unnestAlias, aliasField), POS);
+      outerProjects.add(asAlias(safeCastItem(unnestedRef, "pattern", "VARCHAR"), aliasField));
+      outerProjects.add(
+          asAlias(safeCastItem(unnestedRef, "pattern_count", "BIGINT"), "pattern_count"));
+      if (showNumberedTrue) {
+        outerProjects.add(asAlias(safeCastTokens(unnestedRef), "tokens"));
+      }
+      outerProjects.add(asAlias(safeCastSampleLogs(unnestedRef), "sample_logs"));
+      // Reset and install the new shape: from=join, projection=outerProjects.
+      state.reset();
+      state.setFrom(join);
+      state.setProjection(outerProjects);
+    }
+
+    private SqlNode safeCastItem(SqlNode mapRef, String key, String typeName) {
+      SqlNode item =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(mapRef, SqlLiteral.createCharString(key, POS)),
+              POS);
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+          List.of(
+              item,
+              new org.apache.calcite.sql.SqlDataTypeSpec(
+                  new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                      org.apache.calcite.sql.type.SqlTypeName.valueOf(typeName), POS),
+                  POS)),
+          POS);
+    }
+
+    /** SAFE_CAST(map['tokens'] AS MAP&lt;VARCHAR, VARCHAR ARRAY&gt;). */
+    private SqlNode safeCastTokens(SqlNode mapRef) {
+      SqlNode item =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(mapRef, SqlLiteral.createCharString("tokens", POS)),
+              POS);
+      // tokens is MAP<VARCHAR, ARRAY<VARCHAR>> — preserve via ITEM access; let the validator
+      // infer/coerce instead of forcing a SqlDataTypeSpec (Calcite's parser-side MAP/ARRAY
+      // type spec construction is complicated to build by hand).
+      return item;
+    }
+
+    /** SAFE_CAST(map['sample_logs'] AS VARCHAR ARRAY). */
+    private SqlNode safeCastSampleLogs(SqlNode mapRef) {
+      SqlNode item =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(mapRef, SqlLiteral.createCharString("sample_logs", POS)),
+              POS);
+      // ARRAY<VARCHAR> — let the validator infer.
+      return item;
     }
 
     @Override

@@ -699,6 +699,16 @@ public final class SqlNodePlanner {
     return true;
   }
 
+  /** True when any of the Project's expressions contains a RexOver (window function). */
+  private static boolean projectContainsWindow(org.apache.calcite.rel.logical.LogicalProject proj) {
+    for (org.apache.calcite.rex.RexNode e : proj.getProjects()) {
+      if (org.apache.calcite.rex.RexOver.containsOver(e)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * True when the Project has at least one passthrough RexInputRef AND at least one computed
    * expression — i.e., the Project augments the input row with new columns rather than purely
@@ -1040,6 +1050,13 @@ public final class SqlNodePlanner {
   private static boolean shouldSwapSort(
       org.apache.calcite.rel.logical.LogicalSort sort,
       org.apache.calcite.rel.logical.LogicalProject proj) {
+    // Never swap when Project contains an OVER (window function): the window must see all input
+    // rows (or whatever rows the Sort lets through). Pushing Sort below the Project would
+    // restrict the window's input to FETCH N rows — wrong for `patterns` and other window-bearing
+    // commands.
+    if (projectContainsWindow(proj)) {
+      return false;
+    }
     if (!sort.getCollation().getFieldCollations().isEmpty()) {
       return true;
     }

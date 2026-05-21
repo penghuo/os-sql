@@ -378,17 +378,16 @@ public class PPLOperandTypes {
    * Signature for the {@code pattern} aggregate UDF (BRAIN log-pattern parser).
    *
    * <p>The first four operands are fixed: {@code field:STRING, max_sample_count:INTEGER,
-   * buffer_limit:INTEGER, show_numbered_token:BOOLEAN}. Optional named parameters (passed by {@code
-   * CalciteRelNodeVisitor#visitPatterns}) are appended in alphabetical order by name:
+   * buffer_limit:INTEGER, show_numbered_token:BOOLEAN}. Optional named parameters are appended in
+   * alphabetical order by name:
    *
    * <pre>
    *   frequency_threshold_percentage:NUMERIC  (alphabetically first → position 4)
    *   variable_count_threshold:INTEGER        (alphabetically second → position 5)
    * </pre>
    *
-   * That ordering is fixed by v2's {@code Comparator.comparing(Argument::getArgName)} sort, so we
-   * encode the same here. Required arity is 4; the trailing two parameters always appear together
-   * when present.
+   * <p>PPL allows specifying either, both, or neither. When only one is given, arity is 5 (the
+   * single tail param is either NUMERIC or INTEGER); when both, arity is 6.
    *
    * <p>Without this metadata, {@code SqlOperator.getOperandCountRange} throws and the validator
    * cannot route through this aggregate at all.
@@ -401,6 +400,20 @@ public class PPLOperandTypes {
                       SqlTypeFamily.INTEGER,
                       SqlTypeFamily.INTEGER,
                       SqlTypeFamily.BOOLEAN)
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.CHARACTER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.BOOLEAN,
+                          SqlTypeFamily.NUMERIC))
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.CHARACTER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.BOOLEAN,
+                          SqlTypeFamily.INTEGER))
                   .or(
                       OperandTypes.family(
                           SqlTypeFamily.CHARACTER,

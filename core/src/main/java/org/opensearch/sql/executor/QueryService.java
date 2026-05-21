@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Optional;
 import javax.annotation.Nullable;
 import lombok.AllArgsConstructor;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.calcite.jdbc.CalciteSchema;
@@ -30,7 +29,6 @@ import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.ast.tree.HighlightConfig;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
-import org.opensearch.sql.calcite.CalciteRelNodeVisitor;
 import org.opensearch.sql.calcite.OpenSearchSchema;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -64,9 +62,6 @@ public class QueryService {
   private final Planner planner;
   private DataSourceService dataSourceService;
   private Settings settings;
-
-  @Getter(lazy = true)
-  private final CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor(dataSourceService);
 
   /** Helper: depending on the type of error, either re-raise or propagate to the listener. */
   private void propagateCalciteError(Throwable t, ResponseListener<?> listener)
@@ -300,29 +295,25 @@ public class QueryService {
   }
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
-    if (isSqlNodePathEnabled()) {
-      // No fallback: every PPL query goes through PPL→SqlNode→SqlValidator→SqlToRelConverter.
-      // Any error surfaces to the caller so we get visibility into real translation gaps.
-      org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
-          new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
-      int subsearchLimit = context.sysLimit != null ? context.sysLimit.subsearchLimit() : 0;
-      int joinSubsearchLimit = context.sysLimit != null ? context.sysLimit.joinSubsearchLimit() : 0;
-      org.apache.calcite.sql.SqlNode sqlNode =
-          new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(
-                  planner.rowTypeOracle(), subsearchLimit, joinSubsearchLimit)
-              .visit(plan);
-      RelNode rel = planner.plan(sqlNode);
-      // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
-      // from the request body's `highlight` parameter, parallel to the PPL pipe). Mirror v2's
-      // post-scan injection here: rewrite each LogicalTableScan to its pushDownHighlight form
-      // and add an outer Project that surfaces the `_highlight` column to the caller.
-      if (context.getHighlightConfig() != null) {
-        rel = injectHighlight(rel, context);
-        context.setHighlightConfig(null);
-      }
-      return rel;
+    // Every PPL query goes through PPL→SqlNode→SqlValidator→SqlToRelConverter.
+    org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
+        new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
+    int subsearchLimit = context.sysLimit != null ? context.sysLimit.subsearchLimit() : 0;
+    int joinSubsearchLimit = context.sysLimit != null ? context.sysLimit.joinSubsearchLimit() : 0;
+    org.apache.calcite.sql.SqlNode sqlNode =
+        new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(
+                planner.rowTypeOracle(), subsearchLimit, joinSubsearchLimit)
+            .visit(plan);
+    RelNode rel = planner.plan(sqlNode);
+    // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
+    // from the request body's `highlight` parameter, parallel to the PPL pipe). Rewrite each
+    // LogicalTableScan to its pushDownHighlight form and add an outer Project that surfaces
+    // the `_highlight` column to the caller.
+    if (context.getHighlightConfig() != null) {
+      rel = injectHighlight(rel, context);
+      context.setHighlightConfig(null);
     }
-    return getRelNodeVisitor().analyze(plan, context);
+    return rel;
   }
 
   private static RelNode injectHighlight(
@@ -384,14 +375,6 @@ public class QueryService {
       }
     }
     return replaced;
-  }
-
-  private boolean isSqlNodePathEnabled() {
-    if (settings == null) {
-      return false;
-    }
-    Boolean enabled = settings.getSettingValue(Settings.Key.CALCITE_SQLNODE_ENABLED);
-    return Boolean.TRUE.equals(enabled);
   }
 
   /** Analyze {@link UnresolvedPlan}. */

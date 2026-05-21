@@ -165,13 +165,6 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
-  public static final Setting<?> CALCITE_SQLNODE_ENABLED_SETTING =
-      Setting.boolSetting(
-          Key.CALCITE_SQLNODE_ENABLED.getKeyValue(),
-          true,
-          Setting.Property.NodeScope,
-          Setting.Property.Dynamic);
-
   public static final Setting<?> CALCITE_PUSHDOWN_ENABLED_SETTING =
       Setting.boolSetting(
           Key.CALCITE_PUSHDOWN_ENABLED.getKeyValue(),
@@ -459,12 +452,6 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
-        Key.CALCITE_SQLNODE_ENABLED,
-        CALCITE_SQLNODE_ENABLED_SETTING,
-        new Updater(Key.CALCITE_SQLNODE_ENABLED));
-    register(
-        settingBuilder,
-        clusterSettings,
         Key.CALCITE_PUSHDOWN_ENABLED,
         CALCITE_PUSHDOWN_ENABLED_SETTING,
         new Updater(Key.CALCITE_PUSHDOWN_ENABLED));
@@ -668,7 +655,6 @@ public class OpenSearchSettings extends Settings {
         .add(PPL_SYNTAX_LEGACY_PREFERRED_SETTING)
         .add(CALCITE_ENGINE_ENABLED_SETTING)
         .add(CALCITE_FALLBACK_ALLOWED_SETTING)
-        .add(CALCITE_SQLNODE_ENABLED_SETTING)
         .add(CALCITE_PUSHDOWN_ENABLED_SETTING)
         .add(CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR_SETTING)
         .add(CALCITE_SUPPORT_ALL_JOIN_TYPES_SETTING)

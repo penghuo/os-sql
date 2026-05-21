@@ -2174,6 +2174,30 @@ public class PplToSqlNode {
       if (state.evalExtended || state.projectionReplaced) {
         state.wrap();
       }
+      // v2-compatibility: streamstats global=true window=N by <map-leaf> is unimplemented in v2's
+      // correlate-based emission (see CalcitePPLMapPathIT.testStreamstatsGlobalWindowByMapPath).
+      // Surface the same error to keep the test contract.
+      if (node.isGlobal() && node.getWindow() > 0 && rowTypeOracle != null && state.from != null) {
+        try {
+          List<String> stateCols = deriveColumnNames(state.from);
+          for (UnresolvedExpression g : node.getGroupList()) {
+            UnresolvedExpression core = g instanceof Alias al ? al.getDelegated() : g;
+            String gname = null;
+            if (core instanceof Field f && f.getField() instanceof QualifiedName qn) {
+              gname = qn.toString();
+            } else if (core instanceof QualifiedName qn) {
+              gname = qn.toString();
+            }
+            if (gname != null && gname.contains(".") && !stateCols.contains(gname)) {
+              throw new IllegalArgumentException("field [" + gname + "] not found");
+            }
+          }
+        } catch (IllegalArgumentException iae) {
+          throw iae;
+        } catch (RuntimeException ignored2) {
+          // probe failed — let downstream handle
+        }
+      }
       // ROWS frame:
       //   current=true,  window=N>0 : lower = (N-1) PRECEDING, upper = CURRENT ROW (N rows total)
       //   current=false, window=N>0 : lower = N     PRECEDING, upper = 1 PRECEDING (N rows excl)

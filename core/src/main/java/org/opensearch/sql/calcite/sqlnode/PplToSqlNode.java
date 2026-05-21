@@ -167,6 +167,22 @@ public class PplToSqlNode {
   private boolean joinScope = false;
 
   /**
+   * Probe FROM for {@link #tryAliasMapItemAccess}. visitJoin's ON clause is processed BEFORE the
+   * SqlJoin is constructed, so the in-flight {@code state.from} only carries the left side at that
+   * moment. Set this to a synthetic {@code aliasedLeft, aliasedRight} pair so the alias-prefixed
+   * MAP-leaf probe can resolve {@code <alias>.<col>}.
+   */
+  private SqlNode joinProbeFrom;
+
+  /**
+   * Alias names of the join sides currently being processed. Used by isKnownJoinAlias during ON
+   * clause evaluation, before state.joinLeftAlias/state.joinRightAlias are assigned.
+   */
+  private String activeJoinLeftAlias;
+
+  private String activeJoinRightAlias;
+
+  /**
    * Alias synonym map: alternative name → canonical SQL alias name. PPL allows both an inner
    * SubqueryAlias (e.g. `[Y as tt]`) and an explicit JOIN-arg alias (e.g. `right=t2`) to coexist on
    * the same join side. SQL only supports one alias per side, so we keep the explicit one as the
@@ -1511,8 +1527,34 @@ public class PplToSqlNode {
       for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
         SqlNode lookupCol =
             new SqlIdentifier(java.util.Arrays.asList(lookupAlias, e.getKey()), POS);
-        SqlNode sourceCol =
-            new SqlIdentifier(java.util.Arrays.asList(inputAlias, e.getValue()), POS);
+        // PPL allows the source column to be a dotted MAP/STRUCT path (e.g.
+        // `LOOKUP X name AS doc.user.name` after spath). For 2+ part source paths, lower the
+        // navigation through ITEM so the validator doesn't interpret it as `inputAlias.col.col`.
+        String sourceName = e.getValue();
+        SqlNode sourceCol;
+        if (sourceName.contains(".")) {
+          // Try the alias-prefixed MAP-leaf helper. Set up a temporary join probe context against
+          // the just-built input alias.
+          SqlNode prevProbe = joinProbeFrom;
+          String prevActiveL = activeJoinLeftAlias;
+          joinProbeFrom = aliasedInput;
+          activeJoinLeftAlias = inputAlias;
+          boolean prevJoinScope = joinScope;
+          joinScope = true;
+          java.util.List<String> parts = new java.util.ArrayList<>();
+          parts.add(inputAlias);
+          for (String p : sourceName.split("\\.")) parts.add(p);
+          SqlNode itemAccess = tryAliasMapItemAccess(parts);
+          joinProbeFrom = prevProbe;
+          activeJoinLeftAlias = prevActiveL;
+          joinScope = prevJoinScope;
+          sourceCol =
+              itemAccess != null
+                  ? itemAccess
+                  : new SqlIdentifier(java.util.Arrays.asList(inputAlias, sourceName), POS);
+        } else {
+          sourceCol = new SqlIdentifier(java.util.Arrays.asList(inputAlias, sourceName), POS);
+        }
         SqlNode eq =
             new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(sourceCol, lookupCol), POS);
         condition =
@@ -4308,6 +4350,23 @@ public class PplToSqlNode {
       // Set joinScope BEFORE evaluating the join condition so `EMP.DEPTNO`-style references
       // resolve as multi-part SQL navigation rather than dotted single identifiers.
       joinScope = true;
+      // Set joinProbeFrom + activeJoinLeftAlias/RightAlias so tryAliasMapItemAccess can resolve
+      // `<alias>.<col>` against the synthetic JOIN we're about to build. state.from is still the
+      // left side and state.joinLeftAlias/RightAlias aren't set until after ON eval.
+      SqlNode prevJoinProbe = joinProbeFrom;
+      String prevActiveL = activeJoinLeftAlias;
+      String prevActiveR = activeJoinRightAlias;
+      activeJoinLeftAlias = node.getLeftAlias().orElse(null);
+      activeJoinRightAlias = node.getRightAlias().orElse(null);
+      joinProbeFrom =
+          new org.apache.calcite.sql.SqlJoin(
+              POS,
+              aliasedLeft,
+              SqlLiteral.createBoolean(false, POS),
+              org.apache.calcite.sql.JoinType.INNER.symbol(POS),
+              aliasedRight,
+              org.apache.calcite.sql.JoinConditionType.ON.symbol(POS),
+              SqlLiteral.createBoolean(true, POS));
       if (node.getJoinCondition().isPresent()) {
         condition = expr(node.getJoinCondition().get());
         condType = org.apache.calcite.sql.JoinConditionType.ON;
@@ -4386,6 +4445,10 @@ public class PplToSqlNode {
               condition);
       state.reset();
       state.setFrom(join);
+      // Restore previous join-eval context now that ON-clause evaluation is complete.
+      joinProbeFrom = prevJoinProbe;
+      activeJoinLeftAlias = prevActiveL;
+      activeJoinRightAlias = prevActiveR;
       // Track the side aliases so visitProject can disambiguate bare column refs after the join.
       // PPL semantics: `name` after `... | join left=a right=b ON ...` binds to LEFT side (`a`).
       state.joinLeftAlias = node.getLeftAlias().orElse(null);
@@ -9905,9 +9968,21 @@ public class PplToSqlNode {
     java.util.List<String> parts = qn.getParts();
     if (parts.size() < 2) return null;
     if (rowTypeOracle == null || currentState == null || currentState.from == null) return null;
-    // Don't intercept inside a join scope — qualified `<alias>.<col>` already resolves correctly
-    // via the multi-part SqlIdentifier path; intercepting would break aliased table references.
-    if (joinScope) return null;
+    // In a join scope, the standard 2-part path `<alias>.<col>` is correct. But for 3+ parts
+    // where `parts[1]` is a MAP/STRUCT column on the aliased side, the multi-part identifier
+    // would emit `<alias>.<col>.<deeper>` which the validator can't resolve. Probe the in-flight
+    // state for `<alias>.<parts[1]>` and, when it lands on a MAP/STRUCT column, lower the deeper
+    // navigation through ITEM. Falls through to standard multi-part navigation otherwise.
+    if (joinScope) {
+      if (parts.size() >= 3 && isKnownJoinAlias(parts.get(0))) {
+        SqlNode aliasItem = tryAliasMapItemAccess(parts);
+        if (aliasItem != null) return aliasItem;
+        // No alias-prefixed lowering — fall through to standard alias.col multi-part emission.
+        return null;
+      }
+      // parts[0] isn't a known alias — fall through to regular MAP-leaf navigation below
+      // (e.g. `doc.user.name` after JOIN where `doc` is a column, not an alias).
+    }
     // Skip if this is a known synonym (handled elsewhere).
     if (joinAliasSynonyms.containsKey(parts.get(0))) return null;
     org.apache.calcite.rel.type.RelDataType rowType;
@@ -9973,6 +10048,79 @@ public class PplToSqlNode {
               SqlStdOperatorTable.ITEM,
               List.of(acc, SqlLiteral.createCharString(parts.get(i), POS)),
               POS);
+    }
+    return acc;
+  }
+
+  /**
+   * True when {@code name} is a recognized join-side alias: a registered synonym, a default
+   * `__l`/`__r`/`__l2`/`__r2` from defaultLeftAlias/defaultRightAlias, or the user-supplied
+   * left/right alias set on the current Pipeline state.
+   */
+  private boolean isKnownJoinAlias(String name) {
+    if (joinAliasSynonyms.containsValue(name)) return true;
+    if (joinAliasSynonyms.containsKey(name)) return true;
+    if (name.equals(activeJoinLeftAlias) || name.equals(activeJoinRightAlias)) return true;
+    if (currentState != null) {
+      if (name.equals(currentState.joinLeftAlias)) return true;
+      if (name.equals(currentState.joinRightAlias)) return true;
+    }
+    if (name.startsWith("__l") || name.startsWith("__r")) return true;
+    return false;
+  }
+
+  /**
+   * In joinScope with parts of form `<alias>.<col>.<rest...>`, emit `ITEM(<alias>.<col>, '<rest>')`
+   * when `<col>` is a MAP/STRUCT column on the side aliased as `<alias>`. Returns null when: the
+   * alias isn't a join side, the `<col>` doesn't exist or is scalar, or the probe fails.
+   */
+  private SqlNode tryAliasMapItemAccess(java.util.List<String> parts) {
+    String alias = parts.get(0);
+    String col = parts.get(1);
+    java.util.List<String> deeper = parts.subList(2, parts.size());
+    SqlNode probeFrom = joinProbeFrom != null ? joinProbeFrom : currentState.from;
+    if (probeFrom == null) return null;
+    org.apache.calcite.rel.type.RelDataType rowType;
+    try {
+      SqlNodeList sel = new SqlNodeList(POS);
+      sel.add(new SqlIdentifier(java.util.Arrays.asList(alias, col), POS));
+      SqlSelect probe =
+          new SqlSelect(
+              POS, null, sel, probeFrom, null, null, null, null, null, null, null, null, null);
+      rowType = rowTypeOracle.apply(probe);
+    } catch (RuntimeException e) {
+      return null;
+    }
+    if (rowType.getFieldList().isEmpty()) return null;
+    org.apache.calcite.rel.type.RelDataType colType = rowType.getFieldList().get(0).getType();
+    org.apache.calcite.sql.type.SqlTypeName tn = colType.getSqlTypeName();
+    boolean isMap = tn == org.apache.calcite.sql.type.SqlTypeName.MAP;
+    boolean isStructLike = tn == org.apache.calcite.sql.type.SqlTypeName.ROW || colType.isStruct();
+    boolean isAny = tn == org.apache.calcite.sql.type.SqlTypeName.ANY;
+    if (!isMap && !isStructLike && !isAny) return null;
+    SqlNode parentRef = new SqlIdentifier(java.util.Arrays.asList(alias, col), POS);
+    if (isMap) {
+      // Check if the value type is navigable; if not, single-level ITEM with joined trailing key.
+      org.apache.calcite.rel.type.RelDataType valueType = colType.getValueType();
+      org.apache.calcite.sql.type.SqlTypeName vt =
+          valueType == null ? null : valueType.getSqlTypeName();
+      boolean valueIsNavigable =
+          vt == org.apache.calcite.sql.type.SqlTypeName.MAP
+              || vt == org.apache.calcite.sql.type.SqlTypeName.ROW
+              || (valueType != null && valueType.isStruct());
+      if (!valueIsNavigable) {
+        String joinedKey = String.join(".", deeper);
+        return new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parentRef, SqlLiteral.createCharString(joinedKey, POS)),
+            POS);
+      }
+    }
+    SqlNode acc = parentRef;
+    for (String d : deeper) {
+      acc =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM, List.of(acc, SqlLiteral.createCharString(d, POS)), POS);
     }
     return acc;
   }

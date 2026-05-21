@@ -162,12 +162,24 @@ public class PPLOperandTypes {
   public static final UDFOperandMetadata WIDTH_BUCKET_OPERAND =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              // 1. Numeric fields: bin age span=10
+              // 0. EXPR_TIMESTAMP UDT (SqlTypeName=VARCHAR) on CHARACTER-family operands.
+              //    Listed FIRST so the validator picks this signature for EXPR_TIMESTAMP fields
+              //    instead of coercing them to NUMERIC (DECIMAL via implicit CAST). Without
+              //    this, the AggregateIndexScanRule's containsWidthBucketFuncOnDate predicate
+              //    fails because the CAST result type isn't an EXPR_DATE/TIME/TIMESTAMP UDT,
+              //    breaking auto_date_histogram pushdown for `bin <ts> bins=N | stats ...`.
               OperandTypes.family(
-                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.CHARACTER,
                       SqlTypeFamily.INTEGER,
-                      SqlTypeFamily.NUMERIC,
-                      SqlTypeFamily.NUMERIC)
+                      SqlTypeFamily.CHARACTER,
+                      SqlTypeFamily.CHARACTER)
+                  // 1. Numeric fields: bin age span=10
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.INTEGER,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC))
                   // 2. Timestamp fields with OpenSearch type system
                   // Used in: Production + Integration tests (CalciteBinCommandIT)
                   .or(

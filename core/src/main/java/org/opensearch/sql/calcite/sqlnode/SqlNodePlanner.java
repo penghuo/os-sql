@@ -1316,17 +1316,18 @@ public final class SqlNodePlanner {
                 && isIdentityProject(proj)) {
               return proj.getInput();
             }
-            // Collapse adjacent passthrough Projects (Project-on-Project, both RexInputRefs only)
-            // by composing the outer's index mapping through the inner's. v2's RelBuilder doesn't
-            // emit two adjacent Projects for fields-narrowing-after-sort; we sometimes do because
-            // visitFields wraps eval-extended state into a subquery. Composing the projections
-            // produces a single Project that references the underlying input directly, matching
-            // v2's emission shape.
+            // Collapse adjacent passthrough Projects (Project-on-Project) by composing the
+            // outer's index mapping through the inner's. The outer must be passthrough/reorder
+            // (RexInputRefs only); the inner can carry arbitrary expressions (e.g.
+            // WIDTH_BUCKET emitted by visitBin). v2's RelBuilder doesn't emit two adjacent
+            // Projects for fields-narrowing-after-sort/bin; we sometimes do because visitBin and
+            // visitFields wrap eval-extended state into a subquery. Composing produces a single
+            // Project so the AggregateIndexScanRule's `Agg > Project > Scan` pattern can match
+            // (auto_date_histogram pushdown depends on this).
             if (visited instanceof org.apache.calcite.rel.logical.LogicalProject outerProj
                 && outerProj.getInput()
                     instanceof org.apache.calcite.rel.logical.LogicalProject innerProj
-                && allRexInputRefsAtTopLevel(outerProj.getProjects())
-                && allRexInputRefsAtTopLevel(innerProj.getProjects())) {
+                && allRexInputRefsAtTopLevel(outerProj.getProjects())) {
               java.util.List<org.apache.calcite.rex.RexNode> innerExprs = innerProj.getProjects();
               java.util.List<org.apache.calcite.rex.RexNode> composed = new java.util.ArrayList<>();
               for (org.apache.calcite.rex.RexNode outerExpr : outerProj.getProjects()) {

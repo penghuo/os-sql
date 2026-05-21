@@ -4894,6 +4894,46 @@ public class PplToSqlNode {
                       !org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
                           .containsKey(c))
               .toList();
+      // PPL allows mvcombine on a MAP/STRUCT-leaf path (e.g. `mvcombine doc.user.name` after
+      // spath). Without a flat column matching the dotted name, lower the leaf through
+      // tryMapOrStructItemAccess and emit ARRAY[ITEM(...)] AS "<dotted>" plus pass-through of
+      // existing cols. Per-row 1-element array matches the test expectation that mvcombine on a
+      // scalar leaf surfaces it as a single-element array column.
+      if (!cols.contains(fieldName) && fieldName.contains(".")) {
+        SqlNode itemAccess =
+            tryMapOrStructItemAccess(
+                QualifiedName.of(java.util.Arrays.asList(fieldName.split("\\."))));
+        if (itemAccess != null) {
+          List<SqlNode> selects = new ArrayList<>();
+          for (String c : cols) {
+            selects.add(new SqlIdentifier(c, POS));
+          }
+          // Per-row: NULL source → NULL array (matches v2's null-skipping mvcombine semantics);
+          // else ARRAY[ITEM(...)] (1-element array since the leaf is scalar). Use a CASE WHEN
+          // expression rather than COALESCE — ARRAY[null] is a 1-element array whose content is
+          // null, which IS NULL evaluates as false on. Need explicit null check.
+          SqlNode isNullCheck =
+              new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(itemAccess), POS);
+          SqlNode arrayCtor =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlStdOperatorTable.ARRAY_VALUE_CONSTRUCTOR,
+                  List.of(itemAccess),
+                  POS);
+          SqlNodeList whens = new SqlNodeList(POS);
+          whens.add(isNullCheck);
+          SqlNodeList thens = new SqlNodeList(POS);
+          thens.add(SqlLiteral.createNull(POS));
+          SqlNode arrayWrap =
+              new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, arrayCtor);
+          selects.add(asAlias(arrayWrap, fieldName));
+          state.setProjection(selects);
+          // Wrap so downstream `fields` sees the aliased array column as a real flat row-type
+          // entry instead of falling back to ITEM(doc, 'user.name') against the wrapped FROM
+          // (which produces a scalar, not the wrapped 1-element array).
+          state.wrap();
+          return null;
+        }
+      }
       // PPL surfaces a 4xx when the target field doesn't exist in the input row.
       if (!cols.contains(fieldName)) {
         throw new IllegalArgumentException("Field [" + fieldName + "] not found.");

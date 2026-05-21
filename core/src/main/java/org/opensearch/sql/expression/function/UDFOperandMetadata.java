@@ -133,7 +133,40 @@ public interface UDFOperandMetadata extends SqlOperandMetadata {
 
     @Override
     public SqlOperandCountRange getOperandCountRange() {
-      return null;
+      // Derive from the allowed signatures: min and max arity across all allowed parameter
+      // type lists. Returning null trips a NPE on the validator side
+      // (Cannot invoke SqlOperandCountRange.getMax() because range is null) when the
+      // SqlNode validator routes through this metadata. v2 path (RelBuilder) doesn't
+      // exercise getOperandCountRange because the operator is dispatched directly.
+      int min = Integer.MAX_VALUE;
+      int max = 0;
+      for (List<ExprType> sig : allowedParamTypes) {
+        int s = sig.size();
+        if (s < min) min = s;
+        if (s > max) max = s;
+      }
+      if (allowedParamTypes.isEmpty()) {
+        min = 0;
+        max = 0;
+      }
+      final int finalMin = min;
+      final int finalMax = max;
+      return new SqlOperandCountRange() {
+        @Override
+        public boolean isValidCount(int count) {
+          return count >= finalMin && count <= finalMax;
+        }
+
+        @Override
+        public int getMin() {
+          return finalMin;
+        }
+
+        @Override
+        public int getMax() {
+          return finalMax;
+        }
+      };
     }
 
     @Override

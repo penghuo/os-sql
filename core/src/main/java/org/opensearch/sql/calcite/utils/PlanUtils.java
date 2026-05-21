@@ -474,6 +474,7 @@ public interface PlanUtils {
   /** Check if contains dedup, it should be put in the last position */
   static boolean containsRowNumberDedup(RelNode node) {
     List<String> fieldNames = node.getRowType().getFieldNames();
+    if (fieldNames.isEmpty()) return false;
     return fieldNames.get(fieldNames.size() - 1).equals(ROW_NUMBER_COLUMN_FOR_DEDUP);
   }
 

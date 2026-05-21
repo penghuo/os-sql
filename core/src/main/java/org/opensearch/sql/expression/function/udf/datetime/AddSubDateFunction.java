@@ -74,10 +74,15 @@ public class AddSubDateFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
+    // Also accept CHARACTER as the first operand: OpenSearch's EXPR_DATE/EXPR_TIMESTAMP UDTs
+    // report SqlTypeName=VARCHAR (CHARACTER family). Strict DATETIME-only checks reject them
+    // even though the runtime implementor coerces strings into dates.
     return UDFOperandMetadata.wrap(
         (CompositeOperandTypeChecker)
-            OperandTypes.DATETIME_INTERVAL.or(
-                OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER)));
+            OperandTypes.DATETIME_INTERVAL
+                .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER))
+                .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME_INTERVAL))
+                .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.INTEGER)));
   }
 
   @RequiredArgsConstructor

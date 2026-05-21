@@ -43,6 +43,15 @@ public class TransformFunctionImpl extends ImplementorUDF {
   public SqlReturnTypeInference getReturnTypeInference() {
     return sqlOperatorBinding -> {
       RelDataTypeFactory typeFactory = sqlOperatorBinding.getTypeFactory();
+      // SqlValidator deriveType phase passes a SqlCallBinding; only the v2 RelBuilder path
+      // gives RexCallBinding. Fall back to ANY ARRAY in the SqlNode-path case.
+      if (!(sqlOperatorBinding instanceof RexCallBinding)) {
+        return createArrayType(
+            typeFactory,
+            typeFactory.createTypeWithNullability(
+                typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.ANY), true),
+            true);
+      }
       RexCallBinding rexCallBinding = (RexCallBinding) sqlOperatorBinding;
       List<RexNode> operands = rexCallBinding.operands();
       RelDataType lambdaReturnType = ((RexLambda) operands.get(1)).getExpression().getType();

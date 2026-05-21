@@ -39,6 +39,12 @@ public abstract class Settings {
 
     /** Enable Calcite as execution engine */
     CALCITE_ENGINE_ENABLED("plugins.calcite.enabled"),
+    /**
+     * EXPERIMENTAL: when true, PPL is compiled via PPL→SqlNode→SqlValidator→SqlToRelConverter
+     * instead of the direct CalciteRelNodeVisitor RelBuilder path. Falls back to the existing path
+     * on translation errors. Default: false.
+     */
+    CALCITE_SQLNODE_ENABLED("plugins.calcite.sqlnode.enabled"),
     CALCITE_FALLBACK_ALLOWED("plugins.calcite.fallback.allowed"),
     CALCITE_PUSHDOWN_ENABLED("plugins.calcite.pushdown.enabled"),
     CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR(

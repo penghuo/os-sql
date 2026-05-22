@@ -359,6 +359,29 @@ public class PplToSqlNode {
     return rowTypeOracle.apply(probe);
   }
 
+  /**
+   * Mirror v2's {@code containsNestedAggregator}: a dotted aggregation arg (e.g. {@code
+   * count(addr.area)}) is "nested" only when its ROOT field (e.g. {@code addr}) is ARRAY-typed in
+   * the source schema — that's the OpenSearch {@code type: nested} mapping shape. Plain {@code
+   * object}/{@code properties} dotted fields ({@code event.netflow.bytes}) appear as regular
+   * columns whose name happens to contain a dot, so they're not nested aggregations.
+   */
+  private boolean isArrayRootedDottedField(String dottedName) {
+    if (rowTypeOracle == null || currentFrom == null) return false;
+    int firstDot = dottedName.indexOf('.');
+    if (firstDot <= 0) return false;
+    String root = dottedName.substring(0, firstDot);
+    try {
+      org.apache.calcite.rel.type.RelDataType rowType = deriveRowType(currentFrom);
+      org.apache.calcite.rel.type.RelDataTypeField rootField =
+          rowType.getField(root, /* caseSensitive */ false, /* elideRecord */ false);
+      return rootField != null
+          && rootField.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.ARRAY;
+    } catch (RuntimeException ignored) {
+      return false;
+    }
+  }
+
   /** Public entry point. */
   public SqlNode visit(UnresolvedPlan plan) {
     Pipeline state = new Pipeline();
@@ -3063,11 +3086,11 @@ public class PplToSqlNode {
           groupSelects.add(alias != null ? asAlias(key, alias) : key);
         }
       }
-      // PPL `stats <agg(group.leaf)> by group` requires nested-aggregation pushdown which the
+      // PPL `stats <agg(addr.area)> by addr` requires nested-aggregation pushdown which the
       // SqlNode pipeline does not implement. Mirror v2's CalciteEnumerableNestedAggregate runtime
-      // error at translation time: if any agg arg dotted-name shares a prefix with a group key,
-      // fail with the documented "Cannot execute nested aggregation" message. v2 raises this at
-      // execution time when the rule can't apply; we surface it earlier via ErrorReport.
+      // error at translation time: only fields whose ROOT is ARRAY-typed in the source schema are
+      // OpenSearch `type: nested` mappings; dotted names over plain `object`/`properties` are
+      // regular columns whose name happens to contain a dot.
       for (UnresolvedExpression a : node.getAggExprList()) {
         UnresolvedExpression core = a instanceof Alias al ? al.getDelegated() : a;
         if (core instanceof org.opensearch.sql.ast.expression.AggregateFunction af) {
@@ -3077,25 +3100,20 @@ public class PplToSqlNode {
           }
           if (argExpr instanceof QualifiedName qn) {
             String argName = qn.toString();
+            // Group-key prefix path: only flag when the root is array-typed (true `nested`).
             for (String gk : groupKeyNames) {
-              if (argName.startsWith(gk + ".")) {
+              if (argName.startsWith(gk + ".") && isArrayRootedDottedField(argName)) {
                 throw org.opensearch.sql.common.error.ErrorReport.wrap(
                         new IllegalArgumentException(
                             "Cannot execute nested aggregation on " + argName))
                     .build();
               }
             }
-            // Nested aggregation pushdown only applies when the upstream input is the raw scan
-            // (no `head N`, filter, eval, or other complexity that would force the agg to run
-            // post-pushdown). When `head` is upstream of stats with a dotted agg arg, v2's
-            // pushdown rule fails to apply at the OpenSearch composite-source level and the
-            // execution-time check raises "Cannot execute nested aggregation on ...". Surface
-            // this earlier (before execution).
-            //
-            // Skip when the dotted path is a MAP/STRUCT-leaf access (e.g. spath-rewritten
-            // `doc.user.age` after `eval doc = json_extract_all(doc)`). Those navigate into a
-            // MAP-typed column via tryMapOrStructItemAccess and don't go through OpenSearch
-            // nested-aggregation pushdown — they're plain SQL ITEM access aggregations.
+            // Pre-agg complexity path: same logic as v2's pushdown rule — only ARRAY-rooted
+            // dotted fields require the nested-aggregation rule that we don't implement.
+            // Skip when the dotted path is a MAP/STRUCT-leaf access (spath-rewritten
+            // `doc.user.age` after `eval doc = json_extract_all(doc)`), which goes through
+            // plain SQL ITEM access.
             int lastDot = argName.lastIndexOf('.');
             boolean isMapLeafAccess = false;
             if (lastDot >= 0) {
@@ -3107,7 +3125,8 @@ public class PplToSqlNode {
             if (lastDot >= 0
                 && hadPreAggComplexity
                 && !groupKeyNames.isEmpty()
-                && !isMapLeafAccess) {
+                && !isMapLeafAccess
+                && isArrayRootedDottedField(argName)) {
               throw org.opensearch.sql.common.error.ErrorReport.wrap(
                       new IllegalArgumentException(
                           "Cannot execute nested aggregation on " + argName))

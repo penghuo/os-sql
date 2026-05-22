@@ -152,6 +152,106 @@ public final class SqlNodePlanner {
     }
   }
 
+  /**
+   * Walk the rel tree and rewrite each {@code LogicalTableFunctionScan(GRAPH_LOOKUP)} to a {@link
+   * org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup}. We use a custom shuttle (rather than
+   * HepPlanner) because the parent's input-ref types must be re-derived from the new child's row
+   * type — HepPlanner's {@code transformTo} doesn't propagate that.
+   */
+  private RelNode applyGraphLookupRule(RelNode rel) {
+    return rewriteGraphLookupTfs(rel);
+  }
+
+  /**
+   * Recursively walk the rel tree (children first), rewriting LTFS(GRAPH_LOOKUP) → LGL. When a
+   * child's row type changes, rebuild the parent (Project / LogicalSort / etc.) so its RexInputRefs
+   * point at the new child's actual type — avoiding assertion failures in downstream
+   * RelShuttle.copy() invocations.
+   */
+  private RelNode rewriteGraphLookupTfs(RelNode rel) {
+    boolean anyChildChanged = false;
+    java.util.List<RelNode> newInputs = new java.util.ArrayList<>();
+    for (RelNode oldChild : rel.getInputs()) {
+      RelNode newChild = rewriteGraphLookupTfs(oldChild);
+      if (newChild != oldChild) anyChildChanged = true;
+      newInputs.add(newChild);
+    }
+    // Rewrite this node first (in case it's a TFS).
+    RelNode self = rel;
+    if (rel instanceof org.apache.calcite.rel.core.TableFunctionScan tfs
+        && tfs.getCall() instanceof org.apache.calcite.rex.RexCall rexCall
+        && rexCall.getOperator() instanceof GraphLookupTableFunction) {
+      // Use the new (already-rewritten) inputs.
+      org.apache.calcite.rel.core.TableFunctionScan refreshedTfs =
+          (org.apache.calcite.rel.core.TableFunctionScan)
+              tfs.copy(
+                  tfs.getTraitSet(),
+                  newInputs,
+                  tfs.getCall(),
+                  tfs.getElementType(),
+                  tfs.getRowType(),
+                  tfs.getColumnMappings());
+      return GraphLookupTableFunctionRule.rewrite(refreshedTfs);
+    }
+    if (anyChildChanged) {
+      // Children changed; rebuild this node carefully. Project needs its RexInputRefs re-typed
+      // because the new child's row type may differ.
+      if (self instanceof org.apache.calcite.rel.logical.LogicalProject proj) {
+        return rebuildProject(proj, newInputs.get(0));
+      }
+      return self.copy(self.getTraitSet(), newInputs);
+    }
+    return self;
+  }
+
+  /**
+   * Rebuild a Project after its child's row type changed. Re-derives each project expression's type
+   * by re-creating RexInputRefs against the new child rowType (positions stay the same).
+   */
+  private RelNode rebuildProject(
+      org.apache.calcite.rel.logical.LogicalProject proj, RelNode newChild) {
+    org.apache.calcite.rex.RexBuilder rb = proj.getCluster().getRexBuilder();
+    java.util.List<org.apache.calcite.rex.RexNode> newProjects = new java.util.ArrayList<>();
+    for (org.apache.calcite.rex.RexNode oldExpr : proj.getProjects()) {
+      newProjects.add(reTypeRex(oldExpr, newChild, rb));
+    }
+    return org.apache.calcite.rel.logical.LogicalProject.create(
+        newChild,
+        proj.getHints(),
+        newProjects,
+        proj.getRowType().getFieldNames(),
+        proj.getVariablesSet());
+  }
+
+  /** If the rex is a RexInputRef, rebuild it against newChild's row type at the same index. */
+  private org.apache.calcite.rex.RexNode reTypeRex(
+      org.apache.calcite.rex.RexNode expr, RelNode newChild, org.apache.calcite.rex.RexBuilder rb) {
+    if (expr instanceof org.apache.calcite.rex.RexInputRef ref) {
+      // Direct construction with the CHILD's exact field type — RexBuilder.makeInputRef may
+      // canonicalize/strip nullability when constructing through type coercion. We want the
+      // exact stored type to match child.getRowType().getFieldList().get(index).getType()
+      // because Calcite's RexChecker compares stored type byte-for-byte.
+      return new org.apache.calcite.rex.RexInputRef(
+          ref.getIndex(), newChild.getRowType().getFieldList().get(ref.getIndex()).getType());
+    }
+    return expr;
+  }
+
+  /** Compute what the project's row type would be against the (possibly new) child. */
+  private org.apache.calcite.rel.type.RelDataType recomputeRowType(
+      org.apache.calcite.rel.logical.LogicalProject proj, RelNode child) {
+    org.apache.calcite.rex.RexBuilder rb = proj.getCluster().getRexBuilder();
+    org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder =
+        proj.getCluster().getTypeFactory().builder();
+    for (int i = 0; i < proj.getProjects().size(); i++) {
+      org.apache.calcite.rex.RexNode pi = proj.getProjects().get(i);
+      String name = proj.getRowType().getFieldList().get(i).getName();
+      org.apache.calcite.rex.RexNode rebuilt = reTypeRex(pi, child, rb);
+      builder.add(name, rebuilt.getType());
+    }
+    return builder.build();
+  }
+
   private SqlOperatorTable buildOperatorTable() {
     java.util.List<SqlOperatorTable> tables = new java.util.ArrayList<>();
     // Permissive relevance UDFs come FIRST so they shadow PPLBuiltinOperators' strict
@@ -182,6 +282,9 @@ public final class SqlNodePlanner {
     // postfix IS_EMPTY's collection-only operand check. A post-conversion RexShuttle rewrites
     // this back to SqlStdOperatorTable.IS_EMPTY so the explain output matches v2.
     tables.add(new SingleOperatorTable(PplToSqlNode.PERMISSIVE_IS_EMPTY));
+    // GRAPH_LOOKUP polymorphic table function — used by PPL's graphLookup pipe. Validator routes
+    // the call to LogicalTableFunctionScan; a planner rule rewrites that to LogicalGraphLookup.
+    tables.add(new SingleOperatorTable(GraphLookupTableFunction.INSTANCE));
     if (config.getOperatorTable() != null) {
       tables.add(config.getOperatorTable());
     }
@@ -332,7 +435,7 @@ public final class SqlNodePlanner {
     RexBuilder rexBuilder = new RexBuilder(cluster.getTypeFactory());
     RelOptCluster relCluster = RelOptCluster.create(cluster.getPlanner(), rexBuilder);
     SqlToRelConverter converter =
-        new SqlToRelConverter(
+        new PplSqlToRelConverter(
             ViewExpanders.simpleContext(relCluster),
             validator,
             catalogReader,
@@ -347,6 +450,10 @@ public final class SqlNodePlanner {
       throw translateValidationError(e);
     }
     RelNode rel = root.rel;
+    // Rewrite LogicalTableFunctionScan(GRAPH_LOOKUP) → LogicalGraphLookup before the rest of the
+    // post-conversion pipeline runs. Downstream rules expect a real LogicalGraphLookup, not the
+    // PTF wrapper that the validator/converter route through.
+    rel = applyGraphLookupRule(rel);
     // After conversion, traverse the rel tree and inject alias-field projections atop any
     // AliasFieldsWrappable scans. v2's CalciteRelNodeVisitor.visitRelation does this immediately
     // after the scan; doing it post-conversion on the SqlNode path achieves the same result.

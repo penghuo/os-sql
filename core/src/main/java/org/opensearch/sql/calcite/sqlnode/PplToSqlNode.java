@@ -6803,11 +6803,198 @@ public class PplToSqlNode {
 
     @Override
     public Void visitGraphLookup(org.opensearch.sql.ast.tree.GraphLookup node, Void ignored) {
-      walkChild(node);
-      // graphlookup: recursive CTE for graph traversal. Calcite supports WITH RECURSIVE syntax,
-      // but PPL's variant uses correlated subqueries with depth-first / breadth-first toggling.
-      // Defer.
-      throw new UnsupportedOperationException("graphlookup is not yet supported in SqlNode POC");
+      // GraphLookup is implemented as a polymorphic table function (PTF). Emission shape:
+      //
+      //   FROM TABLE(GRAPH_LOOKUP(
+      //     TABLE (<source pipeline with FETCH 100>),  -- previous pipes
+      //     TABLE (<lookup table [with WHERE filter]>),
+      //     'startField' | NULL,        -- string, NULL when literal-start mode
+      //     'fromField',                -- string
+      //     'toField',                  -- string
+      //     'outputField',              -- string
+      //     'depthField' | NULL,        -- string, optional
+      //     maxDepth, bidirectional, supportArray, batchMode, usePIT))
+      //
+      // A planner rule rewrites LogicalTableFunctionScan(GRAPH_LOOKUP(...)) → LogicalGraphLookup
+      // so the existing OpenSearch storage machinery picks it up.
+      SqlNode sourceSqlNode;
+      if (node.getStartValues() != null) {
+        // Literal-start mode: SELECT 0 AS _dummy_ — one-row dummy source. VALUES (0) by itself
+        // doesn't validate cleanly through the rowTypeOracle probe; a proper SELECT does.
+        org.apache.calcite.sql.SqlNodeList sel = new SqlNodeList(POS);
+        sel.add(
+            org.apache.calcite.sql.fun.SqlStdOperatorTable.AS.createCall(
+                POS, SqlLiteral.createExactNumeric("0", POS), new SqlIdentifier("_dummy_", POS)));
+        sourceSqlNode =
+            new SqlSelect(
+                POS,
+                null,
+                sel,
+                /* from */ null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null);
+      } else {
+        if (node.getChild() == null || node.getChild().isEmpty()) {
+          throw new IllegalArgumentException(
+              "graphLookup field-reference start requires a piped source. Use literal start values"
+                  + " (e.g. start='value') for top-level graphLookup.");
+        }
+        walkChild(node);
+        // SELECT <non-meta cols> FROM <innerFrom> FETCH 100 — explicit non-meta columns mirror
+        // v2's tryToRemoveMetaFields and prevent _id/_index/_score from showing in graphLookup
+        // output.
+        SqlNode innerFrom = state.from;
+        sourceSqlNode =
+            new SqlSelect(
+                POS,
+                /* keywordList */ null,
+                buildNonMetaSelectList(innerFrom),
+                /* from */ innerFrom,
+                /* where */ state.where,
+                /* groupBy */ null,
+                /* having */ null,
+                /* windowDecls */ null,
+                /* qualify */ null,
+                /* orderBy */ null,
+                /* offset */ null,
+                /* fetch */ intLiteral(100),
+                /* hints */ null);
+        // Save user-set outer fetch/order so they apply to the post-graphLookup pipeline (not the
+        // pre-graphLookup source which is captured in sourceSqlNode).
+        SqlNode savedOuterFetch = state.outerFetch;
+        SqlNode savedOuterOffset = state.outerOffset;
+        java.util.List<SqlNode> savedOuterOrderBy = state.outerOrderBy;
+        state.reset();
+        state.outerFetch = savedOuterFetch;
+        state.outerOffset = savedOuterOffset;
+        state.outerOrderBy = savedOuterOrderBy;
+      }
+
+      // Lookup side: SqlIdentifier for the table reference, optionally wrapped with WHERE filter.
+      // Always wrap in `SELECT * FROM <id>` because SET_SEMANTICS_TABLE expects a query, not a
+      // bare table identifier.
+      org.opensearch.sql.ast.tree.UnresolvedPlan fromTablePlan = node.getFromTable();
+      SqlNode lookupBase;
+      if (fromTablePlan instanceof org.opensearch.sql.ast.tree.Relation rel) {
+        lookupBase = qualifiedNameToIdentifier(rel.getTableQualifiedName());
+      } else {
+        PplToSqlNode lookupVisitor = new PplToSqlNode(rowTypeOracle);
+        lookupBase = lookupVisitor.visit(fromTablePlan);
+      }
+      SqlNode lookupSqlNode;
+      {
+        SqlNode lookupWhere = node.getFilter() != null ? expr(node.getFilter()) : null;
+        lookupSqlNode =
+            new SqlSelect(
+                POS,
+                null,
+                buildNonMetaSelectList(lookupBase),
+                lookupBase,
+                lookupWhere,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null);
+      }
+
+      // Build the GRAPH_LOOKUP function call operands.
+      String fromFieldName = node.getFromField().getField().toString();
+      String toFieldName = node.getToField().getField().toString();
+      String outputFieldName = node.getAs().getField().toString();
+      String depthFieldName = node.getDepthFieldName();
+      Object maxDepthLitValue = node.getMaxDepth().getValue();
+      int maxDepthValue =
+          maxDepthLitValue instanceof Number n
+              ? n.intValue()
+              : Integer.parseInt(maxDepthLitValue.toString());
+      boolean bidirectional =
+          node.getDirection() == org.opensearch.sql.ast.tree.GraphLookup.Direction.BI;
+
+      String startFieldName =
+          node.getStartField() != null ? node.getStartField().getField().toString() : null;
+
+      java.util.List<SqlNode> ptfArgs = new java.util.ArrayList<>();
+      ptfArgs.add(setSemanticsTable(sourceSqlNode));
+      ptfArgs.add(setSemanticsTable(lookupSqlNode));
+      ptfArgs.add(stringOrNull(startFieldName));
+      ptfArgs.add(SqlLiteral.createCharString(fromFieldName, POS));
+      ptfArgs.add(SqlLiteral.createCharString(toFieldName, POS));
+      ptfArgs.add(SqlLiteral.createCharString(outputFieldName, POS));
+      ptfArgs.add(stringOrNull(depthFieldName));
+      ptfArgs.add(SqlLiteral.createExactNumeric(String.valueOf(maxDepthValue), POS));
+      ptfArgs.add(SqlLiteral.createBoolean(bidirectional, POS));
+      ptfArgs.add(SqlLiteral.createBoolean(node.isSupportArray(), POS));
+      ptfArgs.add(SqlLiteral.createBoolean(node.isBatchMode(), POS));
+      ptfArgs.add(SqlLiteral.createBoolean(node.isUsePIT(), POS));
+      // Trailing literal start values (only in literal-start mode) — for now stored separately;
+      // the planner rule will pick them up via a side-channel. TODO: thread through the call.
+      if (node.getStartValues() != null) {
+        for (org.opensearch.sql.ast.expression.Literal lit : node.getStartValues()) {
+          ptfArgs.add(literal(lit));
+        }
+      }
+
+      SqlNode graphLookupCall = new SqlBasicCall(GraphLookupTableFunction.INSTANCE, ptfArgs, POS);
+      // Wrap with COLLECTION_TABLE so it parses as `TABLE(fn(...))` in FROM.
+      SqlNode tableExpr =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlStdOperatorTable.COLLECTION_TABLE,
+              List.of(graphLookupCall),
+              POS);
+      // Install as the new FROM. Downstream pipes operate on graphLookup's output.
+      state.setFrom(tableExpr);
+      return null;
+    }
+
+    /** Emit a string SqlNode or NULL literal when the value is null. */
+    private SqlNode stringOrNull(String s) {
+      return s == null ? SqlLiteral.createNull(POS) : SqlLiteral.createCharString(s, POS);
+    }
+
+    /**
+     * Build a select list containing every non-meta column of {@code from}. Falls back to SELECT *
+     * when the row type can't be probed.
+     */
+    private SqlNodeList buildNonMetaSelectList(SqlNode from) {
+      SqlNodeList list = new SqlNodeList(POS);
+      if (rowTypeOracle != null) {
+        try {
+          java.util.List<String> cols = deriveColumnNames(from);
+          for (String c : cols) {
+            if (!org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                .containsKey(c)) {
+              list.add(new SqlIdentifier(c, POS));
+            }
+          }
+          if (!list.isEmpty()) return list;
+        } catch (RuntimeException ignored) {
+          // probe failed — fall through to *
+        }
+      }
+      list.add(SqlIdentifier.star(POS));
+      return list;
+    }
+
+    /**
+     * Wrap a relation-valued SqlNode with SET_SEMANTICS_TABLE so the validator/converter recognize
+     * it as a table argument to a PTF (Polymorphic Table Function).
+     */
+    private SqlNode setSemanticsTable(SqlNode tableExpr) {
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlStdOperatorTable.SET_SEMANTICS_TABLE,
+          List.of(tableExpr, new SqlNodeList(POS), new SqlNodeList(POS)),
+          POS);
     }
 
     @Override

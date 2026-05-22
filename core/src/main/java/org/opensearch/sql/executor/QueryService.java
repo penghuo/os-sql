@@ -298,8 +298,16 @@ public class QueryService {
     // Every PPL query goes through PPL→SqlNode→SqlValidator→SqlToRelConverter.
     org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
         new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
-    int subsearchLimit = context.sysLimit != null ? context.sysLimit.subsearchLimit() : 0;
-    int joinSubsearchLimit = context.sysLimit != null ? context.sysLimit.joinSubsearchLimit() : 0;
+    // SysLimit fields are boxed Integers and can be null when settings haven't been wired
+    // (e.g. standalone test contexts). Treat null as 0 (no cap).
+    int subsearchLimit = 0;
+    int joinSubsearchLimit = 0;
+    if (context.sysLimit != null) {
+      Integer sl = context.sysLimit.subsearchLimit();
+      if (sl != null) subsearchLimit = sl;
+      Integer jsl = context.sysLimit.joinSubsearchLimit();
+      if (jsl != null) joinSubsearchLimit = jsl;
+    }
     org.apache.calcite.sql.SqlNode sqlNode =
         new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(
                 planner.rowTypeOracle(), subsearchLimit, joinSubsearchLimit)

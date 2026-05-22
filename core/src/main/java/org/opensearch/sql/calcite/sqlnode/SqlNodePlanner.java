@@ -494,7 +494,9 @@ public final class SqlNodePlanner {
     // (testSimpleExistsSubqueryInFilter regresses); v2's RelBuilder-based path doesn't suffer
     // because it operates pre-conversion. Limit only IN — that fixes testSubsearchMaxOut and
     // testInCorrelatedSubqueryMaxOut without touching EXISTS.
-    if (context != null && context.sysLimit != null && context.sysLimit.subsearchLimit() > 0) {
+    Integer ssLimit =
+        context != null && context.sysLimit != null ? context.sysLimit.subsearchLimit() : null;
+    if (ssLimit != null && ssLimit > 0) {
       rel = applySubsearchLimitForIn(rel);
     }
     // Relabel join-right LogicalSort(fetch=joinSubsearchLimit, no collation) to
@@ -502,8 +504,10 @@ public final class SqlNodePlanner {
     // addSysLimitForJoinSubsearch wraps the right side in a LogicalSystemLimit; the SqlNode
     // path emits FETCH which becomes plain LogicalSort. Only the explain output differs —
     // execution semantics are identical.
-    if (context != null && context.sysLimit != null && context.sysLimit.joinSubsearchLimit() > 0) {
-      rel = relabelJoinSubsearchSort(rel, context.sysLimit.joinSubsearchLimit());
+    Integer jsLimit =
+        context != null && context.sysLimit != null ? context.sysLimit.joinSubsearchLimit() : null;
+    if (jsLimit != null && jsLimit > 0) {
+      rel = relabelJoinSubsearchSort(rel, jsLimit);
     }
     // Rewrite RexCalls on PERMISSIVE_IS_EMPTY (registered as a `IS_EMPTY` function) back to the
     // standard SqlStdOperatorTable.IS_EMPTY postfix operator so explain output matches v2's

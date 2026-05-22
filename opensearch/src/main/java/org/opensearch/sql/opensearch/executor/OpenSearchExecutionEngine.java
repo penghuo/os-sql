@@ -55,7 +55,6 @@ import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
-import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
@@ -331,7 +330,6 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     if (nodeClient.isPresent()) {
       SqlUserDefinedFunction geoIpFunction =
           new GeoIpFunction(nodeClient.get()).toUDF(BuiltinFunctionName.GEOIP.name());
-      PPLFuncImpTable.INSTANCE.registerExternalOperator(BuiltinFunctionName.GEOIP, geoIpFunction);
       OperatorTable.addOperator(BuiltinFunctionName.GEOIP.name(), geoIpFunction);
     } else {
       logger.info(
@@ -345,8 +343,6 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             BuiltinFunctionName.DISTINCT_COUNT_APPROX.name(),
             ReturnTypes.BIGINT_FORCE_NULLABLE,
             null);
-    PPLFuncImpTable.INSTANCE.registerExternalAggOperator(
-        BuiltinFunctionName.DISTINCT_COUNT_APPROX, approxDistinctCountFunction);
     OperatorTable.addOperator(
         BuiltinFunctionName.DISTINCT_COUNT_APPROX.name(), approxDistinctCountFunction);
 

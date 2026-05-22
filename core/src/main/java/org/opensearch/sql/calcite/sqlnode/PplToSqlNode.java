@@ -3868,6 +3868,13 @@ public class PplToSqlNode {
       // differ — PPL pads missing columns with NULL on each side. Resolve both sides' column
       // sets via the oracle and emit explicit NULL-padded SELECT lists so the UNION succeeds.
       SqlNode mainBody = state.toFinalSqlNode();
+      // toFinalSqlNode bakes outerOrderBy/outerFetch into mainBody. state.reset() preserves
+      // them by design (so other commands can re-apply); clear them here so they don't get
+      // applied AGAIN on top of the union (which would cap the post-union row set with the
+      // main's `head N` — losing subsearch rows).
+      state.outerOrderBy = null;
+      state.outerFetch = null;
+      state.outerOffset = null;
       // Apply v2's EmptySourcePropagateVisitor so `append [ ]` / `append [ | stats ... ]`
       // (empty-source subsearch) collapses to a Values([]) which we render as a no-op SELECT.
       UnresolvedPlan prunedSubSearch =

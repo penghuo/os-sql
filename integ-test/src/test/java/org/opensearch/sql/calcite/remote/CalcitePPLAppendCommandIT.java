@@ -33,6 +33,27 @@ public class CalcitePPLAppendCommandIT extends PPLIntegTestCase {
     loadIndex(Index.WEBLOG);
   }
 
+  /** `head N | append [ ... ]` — main's head must NOT cap the post-append union. */
+  @Test
+  public void testHeadBeforeAppend() throws IOException {
+    JSONObject actual =
+        executeQuery(
+            String.format(
+                Locale.ROOT,
+                "source=%s | stats sum(age) as sum_age by gender, state | sort -sum_age | head 5"
+                    + " | append [ source=%s | stats count(age) as cnt by gender ]",
+                TEST_INDEX_ACCOUNT,
+                TEST_INDEX_ACCOUNT));
+    // 5 main rows + 2 sub rows = 7 total. Without the fix, only 5 (truncated by main's head).
+    verifySchemaInOrder(
+        actual,
+        schema("sum_age", "bigint"),
+        schema("gender", "string"),
+        schema("state", "string"),
+        schema("cnt", "bigint"));
+    org.junit.Assert.assertEquals(7, actual.getInt("total"));
+  }
+
   @Test
   public void testAppend() throws IOException {
     JSONObject actual =

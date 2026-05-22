@@ -60,3 +60,8 @@ http-client.env.json
 .claude/settings.local.json
 .clinerules
 memory-bank
+
+# Coding agent / tool config — top-level dotfile dirs
+/.[!.]*/
+**/AGENTS.md
+docs/superpowers/

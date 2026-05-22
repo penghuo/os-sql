@@ -313,11 +313,45 @@ public class OpenSearchTypeFactory extends JavaTypeFactoryImpl {
     List<RelDataType> typeList = new ArrayList<>();
     Map<String, ExprType> fieldTypes = new LinkedHashMap<>(table.getFieldTypes());
     fieldTypes.putAll(table.getReservedFieldTypes());
+    Map<String, ExprType> aliasFields = new LinkedHashMap<>();
     for (Entry<String, ExprType> entry : fieldTypes.entrySet()) {
-      // skip alias type fields when constructing schema
-      if (entry.getValue().getOriginalPath().isPresent()) continue;
+      // Defer alias-typed fields and emit them after the regular columns. The alias points to an
+      // existing field via getOriginalPath(); we surface the alias name in the schema so PPL
+      // queries that reference the alias name resolve at validation time. The downstream
+      // OpenSearch storage layer resolves alias-typed fields transparently at search time.
+      if (entry.getValue().getOriginalPath().isPresent()) {
+        aliasFields.put(entry.getKey(), entry.getValue());
+        continue;
+      }
       fieldNameList.add(entry.getKey());
       typeList.add(OpenSearchTypeFactory.convertExprTypeToRelDataType(entry.getValue()));
+    }
+    // Add alias fields with the original field's resolved type.
+    for (Entry<String, ExprType> aliasEntry : aliasFields.entrySet()) {
+      String aliasName = aliasEntry.getKey();
+      ExprType aliasType = aliasEntry.getValue();
+      // Resolve to the original field's type when it's already in the schema; otherwise use
+      // the alias type itself (it carries the underlying value type via getExprType()).
+      String originalPath = aliasType.getOriginalPath().orElse(null);
+      ExprType resolvedType = aliasType;
+      if (originalPath != null && fieldTypes.containsKey(originalPath)) {
+        resolvedType = fieldTypes.get(originalPath);
+      }
+      fieldNameList.add(aliasName);
+      typeList.add(OpenSearchTypeFactory.convertExprTypeToRelDataType(resolvedType));
+    }
+    // Calcite's RelFieldTrimmer (invoked during prepare) asserts source >= target via
+    // Mappings.create(INVERSE_SURJECTION, fieldCount, 1) when fieldsUsed is empty — failing on
+    // indices with no user-mapped fields (e.g., freshly-created empty index, special index names
+    // from `PUT /<name>`). The validator's `*` expansion excludes metadata fields, so we add a
+    // `_dummy_` non-metadata field when no user fields exist so that `*` expands to at least one
+    // column. SqlNodePlanner.stripSyntheticSeqColumns drops it from downstream output unless it's
+    // the sole remaining column.
+    if (table.getFieldTypes().isEmpty()) {
+      fieldNameList.add("_dummy_");
+      typeList.add(
+          TYPE_FACTORY.createTypeWithNullability(
+              TYPE_FACTORY.createSqlType(org.apache.calcite.sql.type.SqlTypeName.VARCHAR), true));
     }
     return TYPE_FACTORY.createStructType(typeList, fieldNameList, true);
   }

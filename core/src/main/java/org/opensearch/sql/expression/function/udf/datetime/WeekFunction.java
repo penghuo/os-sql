@@ -14,6 +14,7 @@ import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.data.model.ExprDateValue;
@@ -21,7 +22,6 @@ import org.opensearch.sql.data.model.ExprIntegerValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.expression.datetime.DateTimeFunctions;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * <code>week(date[, mode])</code> returns the week number for date. Mode means the start of the
@@ -49,7 +49,7 @@ public class WeekFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     return PPLOperandTypes.DATETIME_OPTIONAL_INTEGER;
   }
 

@@ -22,7 +22,7 @@ public class ToNumberFunctionTest {
 
   @Test
   void testGetOperandMetadata() {
-    assertEquals(PPLOperandTypes.STRING_OR_STRING_INTEGER, function.getOperandMetadata());
+    assertEquals(PPLOperandTypes.STRING_OR_STRING_INTEGER, function.getOperandTypeChecker());
   }
 
   @Test

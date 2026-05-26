@@ -14,6 +14,7 @@ import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.opensearch.sql.calcite.utils.PPLReturnTypes;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
@@ -22,7 +23,6 @@ import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.expression.datetime.DateTimeFunctions;
 import org.opensearch.sql.expression.function.FunctionProperties;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * <code>DATETIME(timestamp)/ DATETIME(date, to_timezone) </code>Converts the datetime to a new
@@ -46,13 +46,12 @@ public class DatetimeFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.TIMESTAMP_STRING
-                .or(OperandTypes.CHARACTER_CHARACTER)
-                .or(OperandTypes.TIMESTAMP)
-                .or(OperandTypes.CHARACTER));
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return (CompositeOperandTypeChecker)
+        OperandTypes.TIMESTAMP_STRING
+            .or(OperandTypes.CHARACTER_CHARACTER)
+            .or(OperandTypes.TIMESTAMP)
+            .or(OperandTypes.CHARACTER);
   }
 
   public static class DatetimeImplementor implements NotNullImplementor {

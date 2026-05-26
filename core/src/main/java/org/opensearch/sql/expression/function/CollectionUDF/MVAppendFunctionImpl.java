@@ -18,10 +18,10 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.SqlOperatorBinding;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * MVAppend function that appends all elements from arguments to create an array. Always returns an
@@ -49,7 +49,7 @@ public class MVAppendFunctionImpl extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     return null;
   }
 

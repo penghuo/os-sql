@@ -21,11 +21,11 @@ import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * MVZip function that combines two multivalue fields pairwise with a delimiter.
@@ -62,14 +62,13 @@ public class MVZipFunctionImpl extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     // First two arguments must be arrays, optional STRING delimiter
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(SqlTypeFamily.ARRAY, SqlTypeFamily.ARRAY)
-                .or(
-                    OperandTypes.family(
-                        SqlTypeFamily.ARRAY, SqlTypeFamily.ARRAY, SqlTypeFamily.CHARACTER)));
+    return (CompositeOperandTypeChecker)
+        OperandTypes.family(SqlTypeFamily.ARRAY, SqlTypeFamily.ARRAY)
+            .or(
+                OperandTypes.family(
+                    SqlTypeFamily.ARRAY, SqlTypeFamily.ARRAY, SqlTypeFamily.CHARACTER));
   }
 
   public static class MVZipImplementor implements NotNullImplementor {

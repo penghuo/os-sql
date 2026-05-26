@@ -357,7 +357,7 @@ public class StrftimeFunctionTest {
     StrftimeFunction function = new StrftimeFunction();
     assertNotNull(function);
     assertNotNull(function.getReturnTypeInference());
-    assertNotNull(function.getOperandMetadata());
+    assertNotNull(function.getOperandTypeChecker());
   }
 
   @Test

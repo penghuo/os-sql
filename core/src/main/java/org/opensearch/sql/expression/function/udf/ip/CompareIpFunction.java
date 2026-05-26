@@ -22,14 +22,15 @@ import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.InferTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.data.model.ExprIpValue;
-import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.expression.function.ImplementorUDF;
 import org.opensearch.sql.expression.function.PPLBuiltinOperators;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
+import org.opensearch.sql.expression.function.UserDefinedFunctionBuilder;
 
 /**
  * {@code compare(ip1, ip2)} compares two IP addresses using a provided op.
@@ -83,7 +84,7 @@ public class CompareIpFunction extends ImplementorUDF {
         kind,
         getReturnTypeInference(),
         InferTypes.ANY_NULLABLE,
-        getOperandMetadata(),
+        UserDefinedFunctionBuilder.asMetadata(getOperandTypeChecker()),
         getFunction()) {
       @Override
       public boolean isDeterministic() {
@@ -119,8 +120,8 @@ public class CompareIpFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrapUDT(List.of(List.of(ExprCoreType.IP, ExprCoreType.IP)));
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return PPLOperandTypes.udt(List.of(List.of(PPLOperandTypes.IP_UDT, PPLOperandTypes.IP_UDT)));
   }
 
   public static class CompareImplementor implements NotNullImplementor {

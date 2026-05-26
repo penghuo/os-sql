@@ -18,10 +18,10 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * MVFIND function implementation that finds the index of the first element in a multivalue array
@@ -45,10 +45,9 @@ public class MVFindFunctionImpl extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     // Accept ARRAY and STRING for the regex pattern
-    return UDFOperandMetadata.wrap(
-        OperandTypes.family(SqlTypeFamily.ARRAY, SqlTypeFamily.CHARACTER));
+    return OperandTypes.family(SqlTypeFamily.ARRAY, SqlTypeFamily.CHARACTER);
   }
 
   public static class MVFindImplementor implements NotNullImplementor {

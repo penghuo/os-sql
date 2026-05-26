@@ -34,6 +34,7 @@ import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
@@ -47,7 +48,7 @@ import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.expression.function.FunctionProperties;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
+import org.opensearch.sql.expression.function.UserDefinedFunctionBuilder;
 
 public class UserDefinedFunctionUtils {
   public static final RelDataType NULLABLE_DATE_UDT = TYPE_FACTORY.createUDT(EXPR_DATE, true);
@@ -93,13 +94,13 @@ public class UserDefinedFunctionUtils {
       Class<? extends UserDefinedAggFunction<?>> udafClass,
       String functionName,
       SqlReturnTypeInference returnType,
-      @Nullable UDFOperandMetadata operandMetadata) {
+      @Nullable SqlOperandTypeChecker operandTypeChecker) {
     return new SqlUserDefinedAggFunction(
         new SqlIdentifier(functionName, SqlParserPos.ZERO),
         SqlKind.OTHER_FUNCTION,
         returnType,
         null,
-        operandMetadata,
+        UserDefinedFunctionBuilder.asMetadata(operandTypeChecker),
         Objects.requireNonNull(AggregateFunctionImpl.create(udafClass)),
         false,
         false,
@@ -213,7 +214,7 @@ public class UserDefinedFunctionUtils {
       String methodName,
       SqlReturnTypeInference returnTypeInference,
       NullPolicy nullPolicy,
-      @Nullable UDFOperandMetadata operandMetadata) {
+      @Nullable SqlOperandTypeChecker operandTypeChecker) {
     NotNullImplementor implementor =
         (translator, call, translatedOperands) -> {
           List<Expression> operands =
@@ -229,8 +230,8 @@ public class UserDefinedFunctionUtils {
       }
 
       @Override
-      public UDFOperandMetadata getOperandMetadata() {
-        return operandMetadata;
+      public SqlOperandTypeChecker getOperandTypeChecker() {
+        return operandTypeChecker;
       }
     };
   }
@@ -244,7 +245,7 @@ public class UserDefinedFunctionUtils {
       String methodName,
       SqlReturnTypeInference returnTypeInference,
       NullPolicy nullPolicy,
-      UDFOperandMetadata operandMetadata) {
+      SqlOperandTypeChecker operandTypeChecker) {
     NotNullImplementor implementor =
         (translator, call, translatedOperands) -> {
           List<Expression> operands =
@@ -261,8 +262,8 @@ public class UserDefinedFunctionUtils {
       }
 
       @Override
-      public UDFOperandMetadata getOperandMetadata() {
-        return operandMetadata;
+      public SqlOperandTypeChecker getOperandTypeChecker() {
+        return operandTypeChecker;
       }
     };
   }
@@ -285,7 +286,7 @@ public class UserDefinedFunctionUtils {
       String methodName,
       SqlReturnTypeInference returnTypeInference,
       NullPolicy nullPolicy,
-      UDFOperandMetadata operandMetadata) {
+      SqlOperandTypeChecker operandTypeChecker) {
 
     NotNullImplementor implementor =
         (translator, call, translatedOperands) -> {
@@ -302,8 +303,8 @@ public class UserDefinedFunctionUtils {
       }
 
       @Override
-      public UDFOperandMetadata getOperandMetadata() {
-        return operandMetadata;
+      public SqlOperandTypeChecker getOperandTypeChecker() {
+        return operandTypeChecker;
       }
     };
   }

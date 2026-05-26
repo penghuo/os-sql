@@ -16,17 +16,17 @@ import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.geospatial.action.IpEnrichmentActionClient;
+import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.data.model.ExprIpValue;
 import org.opensearch.sql.data.model.ExprStringValue;
 import org.opensearch.sql.data.model.ExprTupleValue;
 import org.opensearch.sql.data.model.ExprValue;
-import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -57,11 +57,11 @@ public class GeoIpFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrapUDT(
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return PPLOperandTypes.udt(
         List.of(
-            List.of(ExprCoreType.STRING, ExprCoreType.IP),
-            List.of(ExprCoreType.STRING, ExprCoreType.IP, ExprCoreType.STRING)));
+            List.of(PPLOperandTypes.STRING_T, PPLOperandTypes.IP_UDT),
+            List.of(PPLOperandTypes.STRING_T, PPLOperandTypes.IP_UDT, PPLOperandTypes.STRING_T)));
   }
 
   public static class GeoIPImplementor implements NotNullImplementor {

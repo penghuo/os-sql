@@ -205,7 +205,7 @@ public class RexExtractFunctionTest {
 
   @Test
   public void testOperandMetadata() {
-    assertNotNull(function.getOperandMetadata(), "Operand metadata should not be null");
+    assertNotNull(function.getOperandTypeChecker(), "Operand metadata should not be null");
   }
 
   @Test

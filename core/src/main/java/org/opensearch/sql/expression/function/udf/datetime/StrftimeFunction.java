@@ -18,6 +18,7 @@ import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.*;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.opensearch.sql.data.model.ExprDateValue;
 import org.opensearch.sql.data.model.ExprDoubleValue;
 import org.opensearch.sql.data.model.ExprFloatValue;
@@ -27,7 +28,6 @@ import org.opensearch.sql.data.model.ExprTimestampValue;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.expression.datetime.StrftimeFormatterUtil;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * Implementation of the STRFTIME function. This function takes a UNIX timestamp (in seconds) and
@@ -53,7 +53,7 @@ public class StrftimeFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     // Accepts (NUMERIC|TIMESTAMP|CHARACTER, STRING) -> STRING. The runtime impl handles each
     // input type explicitly. Permitting CHARACTER here avoids an automatic CHAR→NUMERIC
     // coercion at validation time that triggers a runtime BigDecimal-scientific parse error
@@ -63,11 +63,10 @@ public class StrftimeFunction extends ImplementorUDF {
     // TIMESTAMP variants before NUMERIC so a UDT timestamp (which reports VARCHAR via UDT
     // unwrap) matches CHARACTER directly without a CAST→NUMERIC insertion that throws at
     // runtime ("Character array is missing 'e' notation exponential mark.").
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER)
-                .or(OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.CHARACTER))
-                .or(OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER)));
+    return (CompositeOperandTypeChecker)
+        OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER)
+            .or(OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.CHARACTER))
+            .or(OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER));
   }
 
   public static class StrftimeImplementor implements NotNullImplementor {

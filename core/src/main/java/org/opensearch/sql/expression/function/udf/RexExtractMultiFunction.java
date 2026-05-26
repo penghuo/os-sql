@@ -16,14 +16,12 @@ import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
-import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
-import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 import org.opensearch.sql.expression.parse.RegexCommonUtils;
 
 /** Custom REX_EXTRACT_MULTI function for extracting multiple regex matches. */
@@ -43,18 +41,19 @@ public final class RexExtractMultiFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     // Support both (field, pattern, groupIndex, maxMatch) and (field, pattern, groupName, maxMatch)
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            PPLOperandTypes.STRING_STRING_INTEGER_INTEGER
-                .getInnerTypeChecker()
-                .or(
-                    OperandTypes.family(
-                        SqlTypeFamily.CHARACTER,
-                        SqlTypeFamily.CHARACTER,
-                        SqlTypeFamily.CHARACTER,
-                        SqlTypeFamily.INTEGER)));
+    return OperandTypes.family(
+            SqlTypeFamily.CHARACTER,
+            SqlTypeFamily.CHARACTER,
+            SqlTypeFamily.INTEGER,
+            SqlTypeFamily.INTEGER)
+        .or(
+            OperandTypes.family(
+                SqlTypeFamily.CHARACTER,
+                SqlTypeFamily.CHARACTER,
+                SqlTypeFamily.CHARACTER,
+                SqlTypeFamily.INTEGER));
   }
 
   private static class RexExtractMultiImplementor implements NotNullImplementor {

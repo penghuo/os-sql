@@ -15,12 +15,12 @@ import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
-import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
+import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
-import org.opensearch.sql.calcite.utils.PPLOperandTypes;
+import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 import org.opensearch.sql.expression.parse.RegexCommonUtils;
 
 /** Custom REX_EXTRACT function for extracting regex named capture groups. */
@@ -36,13 +36,13 @@ public final class RexExtractFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
+  public SqlOperandTypeChecker getOperandTypeChecker() {
     // Support both (field, pattern, groupIndex) and (field, pattern, groupName)
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            PPLOperandTypes.STRING_STRING_INTEGER
-                .getInnerTypeChecker()
-                .or(PPLOperandTypes.STRING_STRING_STRING.getInnerTypeChecker()));
+    return OperandTypes.family(
+            SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER, SqlTypeFamily.INTEGER)
+        .or(
+            OperandTypes.family(
+                SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER));
   }
 
   private static class RexExtractImplementor implements NotNullImplementor {

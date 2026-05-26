@@ -12,11 +12,11 @@ import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
+import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 import org.opensearch.sql.calcite.utils.PPLReturnTypes;
-import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /** Cast an EXPR_IP UDT value to its canonical string form via {@code Object.toString()}. */
 public class IpToStringFunction extends ImplementorUDF {
@@ -26,8 +26,8 @@ public class IpToStringFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrapUDT(List.of(List.of(ExprCoreType.IP)));
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return PPLOperandTypes.udt(List.of(List.of(PPLOperandTypes.IP_UDT)));
   }
 
   @Override

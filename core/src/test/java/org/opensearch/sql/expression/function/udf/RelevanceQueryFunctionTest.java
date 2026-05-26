@@ -8,9 +8,9 @@ package org.opensearch.sql.expression.function.udf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 public class RelevanceQueryFunctionTest {
 
@@ -23,37 +23,26 @@ public class RelevanceQueryFunctionTest {
 
   @Test
   public void testGetOperandMetadata() {
-    UDFOperandMetadata operandMetadata = relevanceQueryFunction.getOperandMetadata();
+    SqlOperandTypeChecker operandMetadata = relevanceQueryFunction.getOperandTypeChecker();
     assertNotNull(operandMetadata);
-    assertNotNull(operandMetadata.getInnerTypeChecker());
+    assertNotNull(operandMetadata.getOperandCountRange());
   }
 
   @Test
   public void testOperandMetadataSupportsOptionalParameters() {
-    UDFOperandMetadata operandMetadata = relevanceQueryFunction.getOperandMetadata();
-
-    // The operand checker should accept single parameter (query only) for multi-field functions
-    // This tests the change from "i > 1" to "i > 0" in the operand metadata
-    var checker = operandMetadata.getInnerTypeChecker();
-    assertNotNull(checker);
-
-    // Test that the operand checker exists and is properly configured
-    // The actual validation logic is complex and involves Calcite's OperandTypes,
-    // so we just verify the metadata is properly constructed
+    SqlOperandTypeChecker operandMetadata = relevanceQueryFunction.getOperandTypeChecker();
+    assertNotNull(operandMetadata);
+    // Optional-parameter signatures are validated at call-binding time; here we just check the
+    // metadata is wired up.
     assertTrue(true, "Operand metadata should be properly constructed for optional parameters");
   }
 
   @Test
   public void testMultipleOperandFamilySupport() {
-    UDFOperandMetadata operandMetadata = relevanceQueryFunction.getOperandMetadata();
-
-    // Test that operand metadata supports both syntax patterns:
-    // 1. Traditional: func([fields], query, options...)
-    // 2. New: func(query, options...)
-    var checker = operandMetadata.getInnerTypeChecker();
-    assertNotNull(checker);
-
-    // Verify the operand families include MAP type for both fields and options
+    SqlOperandTypeChecker operandMetadata = relevanceQueryFunction.getOperandTypeChecker();
+    assertNotNull(operandMetadata);
+    // Multi-family support (MAP for fields/options + CHARACTER for query) is exercised at
+    // validation time.
     assertTrue(true, "Should support MAP type operands for fields and optional parameters");
   }
 }

@@ -18,13 +18,13 @@ import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.opensearch.sql.calcite.utils.PPLReturnTypes;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.expression.function.FunctionProperties;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 /**
  * It constructs a timestamp based on the input datetime value. If a second argument is provided, it
@@ -48,15 +48,14 @@ public class TimestampFunction extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.CHARACTER
-                .or(OperandTypes.DATETIME)
-                .or(OperandTypes.CHARACTER_CHARACTER)
-                .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME))
-                .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME))
-                .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.CHARACTER)));
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return (CompositeOperandTypeChecker)
+        OperandTypes.CHARACTER
+            .or(OperandTypes.DATETIME)
+            .or(OperandTypes.CHARACTER_CHARACTER)
+            .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME))
+            .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME))
+            .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.CHARACTER));
   }
 
   public static class TimestampImplementor implements NotNullImplementor {

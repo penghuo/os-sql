@@ -27,6 +27,7 @@ import org.apache.calcite.schema.impl.ScalarFunctionImpl;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -50,12 +51,11 @@ public class PatternParserFunctionImpl extends ImplementorUDF {
   }
 
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.ARRAY, SqlTypeFamily.BOOLEAN)
-                .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER))
-                .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.ARRAY)));
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return (CompositeOperandTypeChecker)
+        OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.ARRAY, SqlTypeFamily.BOOLEAN)
+            .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER))
+            .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.ARRAY));
   }
 
   public static class PatternParserImplementor implements NotNullImplementor {

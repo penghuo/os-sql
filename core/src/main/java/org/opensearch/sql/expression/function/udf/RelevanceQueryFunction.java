@@ -15,10 +15,10 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.opensearch.sql.expression.function.ImplementorUDF;
-import org.opensearch.sql.expression.function.UDFOperandMetadata;
 
 public class RelevanceQueryFunction extends ImplementorUDF {
 
@@ -39,10 +39,27 @@ public class RelevanceQueryFunction extends ImplementorUDF {
    * Query parameter is always required and cannot be null.
    */
   @Override
-  public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(
+  public SqlOperandTypeChecker getOperandTypeChecker() {
+    return (CompositeOperandTypeChecker)
+        OperandTypes.family(
+                ImmutableList.of(
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP,
+                    SqlTypeFamily.MAP),
+                i -> i > 0 && i < 14) // Parameters 3-14 are optional
+            .or(
+                OperandTypes.family(
                     ImmutableList.of(
                         SqlTypeFamily.MAP,
                         SqlTypeFamily.MAP,
@@ -57,37 +74,19 @@ public class RelevanceQueryFunction extends ImplementorUDF {
                         SqlTypeFamily.MAP,
                         SqlTypeFamily.MAP,
                         SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
+                        SqlTypeFamily.MAP,
                         SqlTypeFamily.MAP),
-                    i -> i > 0 && i < 14) // Parameters 3-14 are optional
-                .or(
-                    OperandTypes.family(
-                        ImmutableList.of(
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP),
-                        i -> i > 0 && i < 25))); // Parameters 3-25 are optional
+                    i -> i > 0 && i < 25)); // Parameters 3-25 are optional
   }
 
   public static class RelevanceQueryImplementor implements NotNullImplementor {

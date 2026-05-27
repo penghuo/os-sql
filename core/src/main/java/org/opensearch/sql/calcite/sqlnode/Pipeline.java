@@ -13,6 +13,7 @@ import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlOrderBy;
 import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -147,6 +148,50 @@ final class Pipeline {
 
   void setOuterFetch(SqlNode f) {
     outerFetch = f;
+  }
+
+  /**
+   * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
+   * NULLS_LAST). Returns null if no prior sort exists. Used by {@code reverse} to flip whatever
+   * ordering is currently in effect.
+   */
+  List<SqlNode> reversedLastOrderBy() {
+    if (lastOrderBy == null || lastOrderBy.isEmpty()) {
+      return null;
+    }
+    List<SqlNode> reversed = new ArrayList<>(lastOrderBy.size());
+    for (SqlNode key : lastOrderBy) {
+      reversed.add(reverseSortKey(key));
+    }
+    return reversed;
+  }
+
+  /**
+   * Flip a single sort key. Recognizes the {@code NULLS_FIRST/LAST(DESC?(expr))} shape produced by
+   * the visitor's sort-key builder and inverts both the direction and the null-order. Non-matching
+   * shapes pass through unchanged.
+   */
+  static SqlNode reverseSortKey(SqlNode key) {
+    if (key instanceof SqlBasicCall outer
+        && (outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
+            || outer.getOperator() == SqlStdOperatorTable.NULLS_LAST)) {
+      SqlOperator flippedNulls =
+          outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
+              ? SqlStdOperatorTable.NULLS_LAST
+              : SqlStdOperatorTable.NULLS_FIRST;
+      SqlNode inner = outer.operand(0);
+      SqlNode flippedInner;
+      if (inner instanceof SqlBasicCall innerCall
+          && innerCall.getOperator() == SqlStdOperatorTable.DESC) {
+        // DESC -> ASC (drop the DESC wrapper)
+        flippedInner = innerCall.operand(0);
+      } else {
+        // ASC -> DESC (wrap in DESC)
+        flippedInner = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(inner), POS);
+      }
+      return new SqlBasicCall(flippedNulls, List.of(flippedInner), POS);
+    }
+    return key;
   }
 
   /** Close the current SqlSelect and start a new one whose FROM is the just-closed select. */

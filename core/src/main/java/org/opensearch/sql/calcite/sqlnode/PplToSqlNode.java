@@ -3318,71 +3318,52 @@ public class PplToSqlNode {
     @Override
     public Void visitReverse(org.opensearch.sql.ast.tree.Reverse node, Void ignored) {
       walkChild(node);
-      // PPL `reverse` flips the existing ordering. SQL has no "reverse" — but if the pipeline has
-      // an outer ORDER BY (from sort/head), we can flip every key's direction. Without an existing
-      // sort, fall back: try a default `@timestamp DESC` (matches v2's behavior). If neither is
-      // available, the command becomes a no-op.
-      if (state.outerOrderBy != null && !state.outerOrderBy.isEmpty()) {
-        List<SqlNode> reversed = new ArrayList<>(state.outerOrderBy.size());
-        for (SqlNode key : state.outerOrderBy) {
-          reversed.add(reverseSortKey(key));
-        }
-        state.setOuterOrderBy(reversed);
+      // PPL `reverse` flips the existing ordering. Pick keys in priority:
+      //   1. The most recent sort recorded on the pipeline (lastOrderBy).
+      //   2. An implicit ordering column in the in-flight row type (`__stream_seq__` from
+      //      streamstats, or `@timestamp` for time-series indices).
+      // If neither is available, reverse is a no-op.
+      List<SqlNode> keys = state.reversedLastOrderBy();
+      if (keys == null) {
+        keys = findImplicitReverseKey();
+      }
+      if (keys == null) {
         return null;
       }
-      // The outer order may have been flushed into the inner pipeline already (e.g. by an
-      // upstream where/aggregation). Reverse the flushed orderBy in place if present.
-      if (state.orderBy != null && !state.orderBy.isEmpty()) {
-        List<SqlNode> reversed = new ArrayList<>(state.orderBy.size());
-        for (SqlNode key : state.orderBy) {
-          reversed.add(reverseSortKey(key));
-        }
-        state.orderBy = reversed;
-        state.lastOrderBy = reversed;
-        return null;
-      }
-      // After projection-driven wraps, both inner and outer order may have been swallowed by
-      // the subquery boundary. Fall back to lastOrderBy — the latest sort keys we've seen —
-      // and apply them as a NEW outer ORDER BY in reversed direction. The keys may reference
-      // columns that the current projection has dropped, but those columns are still visible
-      // in the wrapped subquery's row type.
-      if (state.lastOrderBy != null && !state.lastOrderBy.isEmpty()) {
-        List<SqlNode> reversed = new ArrayList<>(state.lastOrderBy.size());
-        for (SqlNode key : state.lastOrderBy) {
-          reversed.add(reverseSortKey(key));
-        }
-        state.setOuterOrderBy(reversed);
-        return null;
-      }
-      // No prior sort. Probe the in-flight pipeline row type for either:
-      //   1. An upstream `__stream_seq__` (kept by streamstats so reverse can reverse the
-      //      synthetic ROW_NUMBER ordering) — flip to DESC so the rows come back in reverse seq.
-      //   2. The `@timestamp` implicit field — fall back to @timestamp DESC.
-      // The strip pass at SqlNodePlanner removes __stream_seq__ from the user-facing schema.
-      if (rowTypeOracle != null) {
-        try {
-          SqlNode pipelineSnapshot = state.toFinalSqlNode();
-          List<String> cols = deriveColumnNames(pipelineSnapshot);
-          SqlNode chosenKey = null;
-          if (cols.contains("__stream_seq__")) {
-            chosenKey = new SqlIdentifier("__stream_seq__", POS);
-          } else if (cols.contains(
-              org.opensearch.sql.calcite.plan.OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP)) {
-            chosenKey =
-                new SqlIdentifier(
-                    org.opensearch.sql.calcite.plan.OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP,
-                    POS);
-          }
-          if (chosenKey != null) {
-            SqlNode key = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(chosenKey), POS);
-            key = new SqlBasicCall(SqlStdOperatorTable.NULLS_FIRST, List.of(key), POS);
-            state.setOuterOrderBy(List.of(key));
-          }
-        } catch (RuntimeException ignored2) {
-          // probe failed; reverse becomes a no-op
-        }
-      }
+      state.wrap();
+      state.setOrderBy(keys);
       return null;
+    }
+
+    /**
+     * Probe the in-flight pipeline's row type for an implicit ordering column. Returns a
+     * single-element {@code [<col> DESC NULLS_FIRST]} key list when found, else null.
+     */
+    private List<SqlNode> findImplicitReverseKey() {
+      if (rowTypeOracle == null) {
+        return null;
+      }
+      try {
+        SqlNode pipelineSnapshot = state.toFinalSqlNode();
+        List<String> cols = deriveColumnNames(pipelineSnapshot);
+        SqlNode chosenKey = null;
+        if (cols.contains("__stream_seq__")) {
+          chosenKey = new SqlIdentifier("__stream_seq__", POS);
+        } else if (cols.contains(
+            org.opensearch.sql.calcite.plan.OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP)) {
+          chosenKey =
+              new SqlIdentifier(
+                  org.opensearch.sql.calcite.plan.OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP,
+                  POS);
+        }
+        if (chosenKey == null) {
+          return null;
+        }
+        SqlNode key = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(chosenKey), POS);
+        return List.of(new SqlBasicCall(SqlStdOperatorTable.NULLS_FIRST, List.of(key), POS));
+      } catch (RuntimeException ignored2) {
+        return null;
+      }
     }
 
     @Override
@@ -7518,32 +7499,6 @@ public class PplToSqlNode {
         && list.size() == 1
         && list.get(0) instanceof SqlIdentifier id
         && id.isStar();
-  }
-
-  /**
-   * Reverse the direction of a sort key produced by visitSort (ASC <-> DESC, NULLS_F <-> NULLS_L).
-   */
-  private static SqlNode reverseSortKey(SqlNode key) {
-    if (key instanceof SqlBasicCall outer
-        && (outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
-            || outer.getOperator() == SqlStdOperatorTable.NULLS_LAST)) {
-      SqlOperator flippedNulls =
-          outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
-              ? SqlStdOperatorTable.NULLS_LAST
-              : SqlStdOperatorTable.NULLS_FIRST;
-      SqlNode inner = outer.operand(0);
-      SqlNode flippedInner;
-      if (inner instanceof SqlBasicCall innerCall
-          && innerCall.getOperator() == SqlStdOperatorTable.DESC) {
-        // DESC -> ASC (drop the DESC wrapper)
-        flippedInner = innerCall.operand(0);
-      } else {
-        // ASC -> DESC (wrap in DESC)
-        flippedInner = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(inner), POS);
-      }
-      return new SqlBasicCall(flippedNulls, List.of(flippedInner), POS);
-    }
-    return key;
   }
 
   /** Mirror of {@code CalciteRelNodeVisitor.analyzeSortOption} kept lightweight here. */

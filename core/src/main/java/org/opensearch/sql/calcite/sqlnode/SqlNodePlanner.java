@@ -441,7 +441,10 @@ public final class SqlNodePlanner {
             catalogReader,
             relCluster,
             StandardConvertletTable.INSTANCE,
-            SqlToRelConverter.config().withTrimUnusedFields(false).withExpand(false));
+            SqlToRelConverter.config()
+                .withTrimUnusedFields(false)
+                .withExpand(false)
+                .withRemoveSortInSubQuery(false));
 
     RelRoot root;
     try {

@@ -3269,23 +3269,18 @@ public class PplToSqlNode {
     @Override
     public Void visitSort(Sort node, Void ignored) {
       walkChild(node);
-      // Consecutive sorts: PPL `... | sort A | sort B` should produce TWO LogicalSort nodes (the
-      // outer sort wins, but the inner sort is preserved for stable ordering on ties). v2 keeps
-      // both. Without flushing, the second sort overwrites the first and the inner ordering is
-      // lost (issue 5125). Flush the prior outer ORDER BY into the inner pipeline (wrap) before
-      // applying the new outer sort.
-      //
-      // Also flush when there's a pending outerFetch (from `head N`). PPL `head N | sort A`
-      // semantically applies head first, then sorts the N retained rows; v2 emits this as
-      // `Sort(sort0=A) > Sort(fetch=N) > Scan` (two separate LogicalSort nodes). Without
-      // flushing, both ORDER BY and FETCH would attach to the same SqlSelect and Calcite
-      // would collapse them into a single LogicalSort.
-      if (state.outerOrderBy != null || state.outerFetch != null) {
-        flushOuterIntoInner();
-        state.wrap();
+      state.wrap();
+      state.setOrderBy(buildSortKeys(node.getSortList()));
+      if (node.getCount() != null && node.getCount() != 0) {
+        state.setFetch(intLiteral(node.getCount()));
       }
-      List<SqlNode> keys = new ArrayList<>(node.getSortList().size());
-      for (Field f : node.getSortList()) {
+      return null;
+    }
+
+    /** Build SqlNode ORDER BY keys from PPL sort fields. */
+    private List<SqlNode> buildSortKeys(List<Field> sortList) {
+      List<SqlNode> keys = new ArrayList<>(sortList.size());
+      for (Field f : sortList) {
         SqlNode key = expr(f.getField());
         Sort.SortOption opt = analyzeSortOption(f.getFieldArgs());
         if (opt.getSortOrder() == Sort.SortOrder.DESC) {
@@ -3295,32 +3290,19 @@ public class PplToSqlNode {
             opt.getNullOrder() == Sort.NullOrder.NULL_LAST
                 ? SqlStdOperatorTable.NULLS_LAST
                 : SqlStdOperatorTable.NULLS_FIRST;
-        key = new SqlBasicCall(nullsOp, List.of(key), POS);
-        keys.add(key);
+        keys.add(new SqlBasicCall(nullsOp, List.of(key), POS));
       }
-      state.setOuterOrderBy(keys);
-      if (node.getCount() != null && node.getCount() != 0) {
-        state.setOuterFetch(intLiteral(node.getCount()));
-      }
-      return null;
+      return keys;
     }
 
     @Override
     public Void visitHead(Head node, Void ignored) {
       walkChild(node);
-      // Consecutive limit/head: PPL `... | head 5 | head 10` should produce TWO LogicalSort
-      // nodes (5 inside 10) so the inner cap takes effect first. v2 preserves both. Without
-      // flushing, the second head overwrites the first and the inner cap is lost. Only flush
-      // when an existing outerFetch is present (sort+head is a single composite outer order +
-      // limit; flushing those splits them inappropriately).
-      if (state.outerFetch != null) {
-        flushOuterIntoInner();
-        state.wrap();
-      }
-      state.setOuterFetch(intLiteral(node.getSize()));
+      state.wrap();
+      state.setFetch(intLiteral(node.getSize()));
       Integer fromOffset = node.getFrom();
       if (fromOffset != null && fromOffset > 0) {
-        state.outerOffset = intLiteral(fromOffset);
+        state.setOffset(intLiteral(fromOffset));
       }
       return null;
     }
@@ -3328,13 +3310,8 @@ public class PplToSqlNode {
     @Override
     public Void visitLimit(Limit node, Void ignored) {
       walkChild(node);
-      // Consecutive limit: same flush-and-wrap as visitHead so two limits stack rather than
-      // the second overwriting the first.
-      if (state.outerFetch != null) {
-        flushOuterIntoInner();
-        state.wrap();
-      }
-      state.setOuterFetch(intLiteral(node.getLimit()));
+      state.wrap();
+      state.setFetch(intLiteral(node.getLimit()));
       return null;
     }
 

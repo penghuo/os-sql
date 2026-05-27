@@ -136,6 +136,10 @@ final class Pipeline {
     fetch = f;
   }
 
+  void setOffset(SqlNode o) {
+    offset = o;
+  }
+
   void setOuterOrderBy(List<SqlNode> keys) {
     outerOrderBy = keys;
     lastOrderBy = keys;

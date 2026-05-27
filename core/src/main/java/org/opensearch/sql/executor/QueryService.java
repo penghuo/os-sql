@@ -35,6 +35,7 @@ import org.opensearch.sql.calcite.OpenSearchSchema;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType;
+import org.opensearch.sql.calcite.sqlnode.PPLSqlNodePlanner;
 import org.opensearch.sql.calcite.utils.CalciteClassLoaderHelper;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.common.error.QueryProcessingStage;
@@ -309,7 +310,19 @@ public class QueryService {
   }
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
-    return getRelNodeVisitor().analyze(plan, context);
+    // Spike: route fields/table commands through PPL → SqlNode → SqlValidator/SqlToRelConverter.
+    // Other commands intentionally break — see CalciteFieldsCommandIT.
+    OpenSearchSchema schema = getOpenSearchSchema(context);
+    return new PPLSqlNodePlanner(schema).plan(plan, context);
+  }
+
+  private static OpenSearchSchema getOpenSearchSchema(CalcitePlanContext context) {
+    SchemaPlus defaultSchema = context.config.getDefaultSchema();
+    OpenSearchSchema unwrapped = defaultSchema.unwrap(OpenSearchSchema.class);
+    if (unwrapped != null) {
+      return unwrapped;
+    }
+    throw new IllegalStateException("Default schema is not an OpenSearchSchema");
   }
 
   /** Analyze {@link UnresolvedPlan}. */

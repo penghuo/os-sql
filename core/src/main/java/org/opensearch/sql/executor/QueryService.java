@@ -309,9 +309,8 @@ public class QueryService {
       if (jsl != null) joinSubsearchLimit = jsl;
     }
     org.apache.calcite.sql.SqlNode sqlNode =
-        new org.opensearch.sql.calcite.sqlnode.PplToSqlNode(
-                planner.rowTypeOracle(), subsearchLimit, joinSubsearchLimit)
-            .visit(plan);
+        new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(planner.tableFields())
+            .translate(plan);
     RelNode rel = planner.plan(sqlNode);
     // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
     // from the request body's `highlight` parameter, parallel to the PPL pipe). Rewrite each

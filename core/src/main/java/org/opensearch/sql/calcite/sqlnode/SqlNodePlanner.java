@@ -60,6 +60,23 @@ public final class SqlNodePlanner {
   }
 
   /**
+   * Resolve a table qualified name (e.g. {@code ["my_index"]}) to its column names via a direct
+   * catalog lookup — no validator involved.
+   */
+  public java.util.function.Function<java.util.List<String>, java.util.List<String>> tableFields() {
+    return parts ->
+        runWithPrepare(
+            (cluster, catalogReader) -> {
+              org.apache.calcite.prepare.Prepare.PreparingTable table =
+                  catalogReader.getTable(parts);
+              if (table == null) {
+                throw new IllegalStateException("Table not found in catalog: " + parts);
+              }
+              return table.getRowType().getFieldNames();
+            });
+  }
+
+  /**
    * Build a row-type oracle suitable for {@link PplToSqlNode}'s schema-introspection-backed
    * commands. Validates a probe SqlNode in the same prepare context and returns its row type.
    */

@@ -17,9 +17,12 @@ import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlSelectKeyword;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.opensearch.sql.ast.AbstractNodeVisitor;
+import org.opensearch.sql.ast.expression.AggregateFunction;
+import org.opensearch.sql.ast.expression.Alias;
 import org.opensearch.sql.ast.expression.AllFields;
 import org.opensearch.sql.ast.expression.AllFieldsExcludeMeta;
 import org.opensearch.sql.ast.expression.And;
@@ -34,6 +37,7 @@ import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
@@ -314,6 +318,87 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
     return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitAggregation(Aggregation node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // SELECT list = group keys (aliased) + aggregate calls (aliased). FROM = child. GROUP BY =
+    // group key expressions (without aliases). The visible field list for the next pipe is the
+    // ordered list of agg-output names (PPL convention: aggregates first, then group keys).
+    SqlNodeList items = new SqlNodeList(POS);
+    List<SqlNode> groupKeys = new ArrayList<>();
+    List<String> visible = new ArrayList<>();
+
+    for (UnresolvedExpression aggExpr : node.getAggExprList()) {
+      String alias = aggLabel(aggExpr);
+      UnresolvedExpression core = (aggExpr instanceof Alias a) ? a.getDelegated() : aggExpr;
+      SqlNode call = aggCall(core);
+      items.add(asAliased(call, alias));
+      visible.add(alias);
+    }
+    for (UnresolvedExpression groupExpr : node.getGroupExprList()) {
+      String alias = aggLabel(groupExpr);
+      UnresolvedExpression core = (groupExpr instanceof Alias a) ? a.getDelegated() : groupExpr;
+      SqlNode keyExpr = expr(core);
+      groupKeys.add(keyExpr);
+      items.add(asAliased(keyExpr, alias));
+      visible.add(alias);
+    }
+    // Aggregations destroy row-level collation; clear the lastOrderBy hint.
+    frame.lastOrderBy = null;
+    return SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * Build a Calcite aggregate call from a PPL {@link AggregateFunction}. Currently supports
+   * count/sum/avg/min/max plus the {@code distinct_count} family ({@code dc}/{@code
+   * distinct_count}). count() with {@link AllFields} arg becomes {@code COUNT(*)}.
+   */
+  private SqlNode aggCall(UnresolvedExpression e) {
+    if (!(e instanceof AggregateFunction af)) {
+      throw new UnsupportedOperationException(
+          "stats aggregator must be an AggregateFunction, got: " + e.getClass().getSimpleName());
+    }
+    String fnLower = af.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    boolean distinct = Boolean.TRUE.equals(af.getDistinct());
+    if (fnLower.equals("dc") || fnLower.equals("distinct_count")) {
+      fnLower = "count";
+      distinct = true;
+    } else if (fnLower.equals("c")) {
+      fnLower = "count";
+    }
+    org.apache.calcite.sql.SqlAggFunction op =
+        switch (fnLower) {
+          case "count" -> SqlStdOperatorTable.COUNT;
+          case "sum" -> SqlStdOperatorTable.SUM;
+          case "avg" -> SqlStdOperatorTable.AVG;
+          case "min" -> SqlStdOperatorTable.MIN;
+          case "max" -> SqlStdOperatorTable.MAX;
+          default ->
+              throw new UnsupportedOperationException(
+                  "Aggregate function not yet supported in PPLToSqlNodeVisitor: " + fnLower);
+        };
+    UnresolvedExpression argExpr = af.getField();
+    SqlNode arg;
+    if (argExpr instanceof AllFields) {
+      arg = SqlIdentifier.star(POS);
+    } else {
+      arg = expr(argExpr);
+    }
+    org.apache.calcite.sql.SqlLiteral quantifier =
+        distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
+    return new SqlBasicCall(op, List.of(arg), POS, quantifier);
+  }
+
+  /**
+   * Compute the user-facing label for a stats agg/group expression. {@code Alias("name", expr)}
+   * carries the user's explicit `as name`; otherwise the AST's toString() (e.g. {@code "avg(age)"})
+   * is used.
+   */
+  private static String aggLabel(UnresolvedExpression e) {
+    if (e instanceof Alias a) return a.getName();
+    return e.toString();
   }
 
   /** Build {@code <expr> AS "<alias>"} with the alias quoted (preserves dots in the label). */

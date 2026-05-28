@@ -79,6 +79,7 @@ final class SqlBuilder {
     private final SqlNodeList items;
     private SqlNode from;
     private SqlNode where;
+    private List<SqlNode> groupBy;
     private List<SqlNode> orderBy;
     private SqlLiteral fetch;
     private SqlLiteral offset;
@@ -95,6 +96,12 @@ final class SqlBuilder {
 
     SelectBuilder where(SqlNode where) {
       this.where = where;
+      return this;
+    }
+
+    /** Set GROUP BY keys. Pass an empty/null list for no grouping (aggregate-over-everything). */
+    SelectBuilder groupBy(List<SqlNode> keys) {
+      this.groupBy = keys;
       return this;
     }
 
@@ -146,6 +153,13 @@ final class SqlBuilder {
       // Build a plain SELECT ... FROM ... [WHERE ...]; ORDER BY / FETCH / OFFSET go on a wrapping
       // SqlOrderBy. Putting them directly on SqlSelect trips Calcite's precedence-driven
       // subquery-wrap path during unparse, dropping the order on the outermost select.
+      SqlNodeList groupList = null;
+      if (groupBy != null && !groupBy.isEmpty()) {
+        groupList = new SqlNodeList(POS);
+        for (SqlNode k : groupBy) {
+          groupList.add(k);
+        }
+      }
       SqlSelect select =
           new SqlSelect(
               POS,
@@ -153,7 +167,7 @@ final class SqlBuilder {
               items,
               from,
               where,
-              /* groupBy */ null,
+              groupList,
               /* having */ null,
               /* windowDecls */ null,
               /* orderBy */ null,

@@ -52,13 +52,13 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | 11 | CalciteInformationSchemaCommandIT | ⏭️ | Excluded by build exclude rules. |
 | 12 | CalciteSettingsIT | ✅ | 4/4 pass. |
 | 13 | CalciteResourceMonitorIT | ❌ | 1/2 fail (`queryExceedResourceLimitShouldFail`). Test sets memory_limit=1% and expects 500 "Insufficient resources"; query succeeds. Runtime-engine concern, not round-trip. **Deferred.** |
-| 14 | CalciteErrorReportStageIT | ⏳ | |
+| 14 | CalciteErrorReportStageIT | ✅ | 7/7 pass. |
 
 ## Phase 2 — IP comparisons (expected REGRESSION: rewriteIpComparisons removed)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 15 | CalciteIPComparisonIT | ⏳ | |
+| 15 | CalciteIPComparisonIT | ✅ | 12/12 pass after two fixes: (a) drop SqlSyntax.BINARY override in CompareIpFunction (was unparsing as `host EQUALS_IP ip` which Babel parser rejects); (b) compute valid SqlOperandCountRange + checkOperandTypes from allowedParamTypes in UDFOperandMetadata.UDTOperandMetadata (validator path needs them; visitor path tolerated null). |
 | 16 | CalciteIPFunctionsIT | ⏳ | |
 | 17 | CalcitePPLIPFunctionIT | ⏳ | |
 

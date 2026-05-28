@@ -18,7 +18,6 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlOperator;
-import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.InferTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
@@ -104,11 +103,6 @@ public class CompareIpFunction extends ImplementorUDF {
                   String.format(
                       Locale.ROOT, "CompareIpFunction is not supposed to be of kind: %s", kind));
         };
-      }
-
-      @Override
-      public SqlSyntax getSyntax() {
-        return SqlSyntax.BINARY;
       }
     };
   }

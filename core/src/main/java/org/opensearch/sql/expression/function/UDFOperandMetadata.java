@@ -128,12 +128,43 @@ public interface UDFOperandMetadata extends SqlOperandMetadata {
 
     @Override
     public boolean checkOperandTypes(SqlCallBinding callBinding, boolean throwOnFailure) {
+      int actual = callBinding.getOperandCount();
+      for (List<RelDataType> sig : allowedParamTypes) {
+        if (sig.size() == actual) {
+          return true;
+        }
+      }
       return false;
     }
 
     @Override
     public SqlOperandCountRange getOperandCountRange() {
-      return null;
+      int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
+      for (List<RelDataType> sig : allowedParamTypes) {
+        min = Math.min(min, sig.size());
+        max = Math.max(max, sig.size());
+      }
+      if (allowedParamTypes.isEmpty()) {
+        min = 0;
+        max = 0;
+      }
+      final int finalMin = min, finalMax = max;
+      return new SqlOperandCountRange() {
+        @Override
+        public boolean isValidCount(int count) {
+          return count >= finalMin && count <= finalMax;
+        }
+
+        @Override
+        public int getMin() {
+          return finalMin;
+        }
+
+        @Override
+        public int getMax() {
+          return finalMax;
+        }
+      };
     }
 
     @Override

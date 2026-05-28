@@ -73,9 +73,13 @@ import org.opensearch.sql.ast.expression.WindowFrame;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.type.ExprBinaryType;
+import org.opensearch.sql.calcite.type.ExprDateType;
+import org.opensearch.sql.calcite.type.ExprIPType;
+import org.opensearch.sql.calcite.type.ExprTimeStampType;
+import org.opensearch.sql.calcite.type.ExprTimeType;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
-import org.opensearch.sql.expression.function.PPLTypeChecker;
 
 public interface PlanUtils {
 
@@ -573,8 +577,30 @@ public interface PlanUtils {
    */
   static String getActualSignature(List<RelDataType> argTypes) {
     return "["
-        + argTypes.stream().map(PPLTypeChecker::renderTypeName).collect(Collectors.joining(","))
+        + argTypes.stream().map(PlanUtils::renderTypeName).collect(Collectors.joining(","))
         + "]";
+  }
+
+  /**
+   * Render a {@link RelDataType} as a PPL-friendly type name. PPL UDTs (DATE/TIME/TIMESTAMP/IP/
+   * BINARY) are reported by their PPL name, otherwise we collapse Calcite's SQL type names to the
+   * names PPL exposes to users (BIGINT → LONG, VARCHAR → STRING, etc.).
+   */
+  public static String renderTypeName(RelDataType type) {
+    if (type instanceof ExprDateType) return "DATE";
+    if (type instanceof ExprTimeType) return "TIME";
+    if (type instanceof ExprTimeStampType) return "TIMESTAMP";
+    if (type instanceof ExprIPType) return "IP";
+    if (type instanceof ExprBinaryType) return "BINARY";
+    SqlTypeName name = type.getSqlTypeName();
+    if (name == SqlTypeName.ANY || name == SqlTypeName.NULL) return "ANY";
+    if (name == SqlTypeName.VARCHAR || name == SqlTypeName.CHAR) return "STRING";
+    if (name == SqlTypeName.BIGINT) return "LONG";
+    if (name == SqlTypeName.SMALLINT) return "SHORT";
+    if (name == SqlTypeName.TINYINT) return "BYTE";
+    if (name == SqlTypeName.REAL) return "FLOAT";
+    if (SqlTypeName.INTERVAL_TYPES.contains(name)) return "INTERVAL";
+    return name.getName();
   }
 
   /**

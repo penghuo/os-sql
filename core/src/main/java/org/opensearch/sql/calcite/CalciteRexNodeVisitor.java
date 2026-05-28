@@ -22,6 +22,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import javax.annotation.Nullable;
 import lombok.RequiredArgsConstructor;
+import org.apache.calcite.avatica.util.TimeUnit;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -34,6 +35,7 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlIntervalQualifier;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.ArraySqlType;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
@@ -84,7 +86,6 @@ import org.opensearch.sql.exception.ExpressionEvaluationException;
 import org.opensearch.sql.exception.SemanticCheckException;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
-import org.opensearch.sql.expression.function.PPLTypeChecker;
 
 @RequiredArgsConstructor
 public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalcitePlanContext> {
@@ -164,8 +165,24 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
     RexNode value = analyze(node.getValue(), context);
     SqlIntervalQualifier intervalQualifier =
         context.rexBuilder.createIntervalUntil(PlanUtils.intervalUnitToSpanUnit(node.getUnit()));
-    return context.rexBuilder.makeIntervalLiteral(
-        new BigDecimal(value.toString()), intervalQualifier);
+    // Calcite stores INTERVAL literals in the qualifier-startUnit's smallest non-fractional
+    // resolution (e.g. milliseconds for DAY, months for MONTH). Pre-multiply by that unit's
+    // multiplier so the literal survives the RelToSqlConverter -> SqlValidator round-trip.
+    //
+    // Special-case for QUARTER: the qualifier's typeName is INTERVAL_MONTH (Calcite folds
+    // QUARTER into MONTH), so RelToSqlConverter divides by MONTH.multiplier (1) when emitting
+    // the literal value but still prints "QUARTER" as the keyword. The SqlValidator then
+    // re-multiplies the value by 3 when parsing back, producing a 3x-too-large interval.
+    // Avoid this by remapping QUARTER -> MONTH at construction: the user's `INTERVAL N QUARTER`
+    // becomes the literal `INTERVAL N*3 MONTH`. The qualifier and storage are now consistent
+    // (both MONTH-based), the round-trip is faithful, and the runtime semantics are unchanged
+    // (3 months = 1 quarter).
+    BigDecimal raw = new BigDecimal(value.toString());
+    BigDecimal scaled = raw.multiply(intervalQualifier.getStartUnit().multiplier);
+    if (intervalQualifier.getStartUnit() == TimeUnit.QUARTER) {
+      intervalQualifier = new SqlIntervalQualifier(TimeUnit.MONTH, TimeUnit.MONTH, SqlParserPos.ZERO);
+    }
+    return context.rexBuilder.makeIntervalLiteral(scaled, intervalQualifier);
   }
 
   @Override
@@ -218,7 +235,7 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
           valueList.stream().map(value -> context.rexBuilder.makeCast(commonType, value)).toList();
       return context.rexBuilder.makeIn(field, newValueList);
     } else {
-      List<String> typeNames = dataTypes.stream().map(PPLTypeChecker::renderTypeName).toList();
+      List<String> typeNames = dataTypes.stream().map(CalciteRexNodeVisitor::renderTypeName).toList();
       throw new SemanticCheckException(
           StringUtils.format(
               "In expression types are incompatible: fields type %s, values type %s",
@@ -254,9 +271,9 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
       throw new SemanticCheckException(
           StringUtils.format(
               "BETWEEN expression types are incompatible: [%s, %s, %s]",
-              PPLTypeChecker.renderTypeName(value.getType()),
-              PPLTypeChecker.renderTypeName(lowerBound.getType()),
-              PPLTypeChecker.renderTypeName(upperBound.getType())));
+              renderTypeName(value.getType()),
+              renderTypeName(lowerBound.getType()),
+              renderTypeName(upperBound.getType())));
     }
     return context.relBuilder.between(value, lowerBound, upperBound);
   }
@@ -578,26 +595,14 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                   (arguments.isEmpty() || arguments.size() == 1)
                       ? Collections.emptyList()
                       : arguments.subList(1, arguments.size());
-              List<RexNode> nodes =
-                  PPLFuncImpTable.INSTANCE.validateAggFunctionSignature(
-                      functionName, field, args, context.rexBuilder);
-              return nodes != null
-                  ? PlanUtils.makeOver(
-                      context,
-                      functionName,
-                      nodes.getFirst(),
-                      nodes.size() <= 1 ? Collections.emptyList() : nodes.subList(1, nodes.size()),
-                      partitions,
-                      List.of(),
-                      node.getWindowFrame())
-                  : PlanUtils.makeOver(
-                      context,
-                      functionName,
-                      field,
-                      args,
-                      partitions,
-                      List.of(),
-                      node.getWindowFrame());
+              return PlanUtils.makeOver(
+                  context,
+                  functionName,
+                  field,
+                  args,
+                  partitions,
+                  List.of(),
+                  node.getWindowFrame());
             })
         .orElseThrow(
             () ->
@@ -720,7 +725,9 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                   "INTERVAL must carry a unit; cannot map to RelDataType directly.");
           case IP -> TYPE_FACTORY.createUDT(ExprUDT.EXPR_IP, true);
         };
-    // call makeCast() instead of cast() because the saft parameter is true could avoid exception.
+    // safe=true so the cast returns NULL on invalid input instead of throwing. PPL/Spark
+    // semantics: cast('xx' as int) → null, cast('2' as boolean) → null. SAFE_CAST is registered
+    // in the SqlValidator's library operator table so the round-trip resolves it.
     return context.rexBuilder.makeCast(nullableType, expr, true, true);
   }
 
@@ -793,5 +800,42 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
         SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR,
         context.rexBuilder.makeLiteral(node.getArgName()),
         value);
+  }
+
+  /**
+   * Renders a single {@link RelDataType} using the PPL convention: UDT short name for UDTs,
+   * canonical PPL names for plain SQL types ({@code STRING}, {@code LONG}, {@code SHORT}, etc.),
+   * {@code ANY} for ANY/NULL, {@code INTERVAL} for any interval type, otherwise the {@code
+   * SqlTypeName} name.
+   */
+  static String renderTypeName(RelDataType type) {
+    if (type instanceof org.opensearch.sql.calcite.type.ExprDateType) return "DATE";
+    if (type instanceof org.opensearch.sql.calcite.type.ExprTimeType) return "TIME";
+    if (type instanceof org.opensearch.sql.calcite.type.ExprTimeStampType) return "TIMESTAMP";
+    if (type instanceof org.opensearch.sql.calcite.type.ExprIPType) return "IP";
+    if (type instanceof org.opensearch.sql.calcite.type.ExprBinaryType) return "BINARY";
+    SqlTypeName name = type.getSqlTypeName();
+    if (name == SqlTypeName.ANY || name == SqlTypeName.NULL) {
+      return "ANY";
+    }
+    if (name == SqlTypeName.VARCHAR || name == SqlTypeName.CHAR) {
+      return "STRING";
+    }
+    if (name == SqlTypeName.BIGINT) {
+      return "LONG";
+    }
+    if (name == SqlTypeName.SMALLINT) {
+      return "SHORT";
+    }
+    if (name == SqlTypeName.TINYINT) {
+      return "BYTE";
+    }
+    if (name == SqlTypeName.REAL) {
+      return "FLOAT";
+    }
+    if (SqlTypeName.INTERVAL_TYPES.contains(name)) {
+      return "INTERVAL";
+    }
+    return name.getName();
   }
 }

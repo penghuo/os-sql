@@ -553,12 +553,37 @@ public class PredicateAnalyzer {
       return call;
     }
 
+    /**
+     * Accept either {@link SqlStdOperatorTable#MAP_VALUE_CONSTRUCTOR} (the visitor's direct
+     * output, SPECIAL syntax) or {@link
+     * org.apache.calcite.sql.fun.SqlLibraryOperators#MAP} (Spark's variadic {@code map(k, v, ...)}
+     * function). The two carry the same semantics — a key/value pair list — but are different
+     * {@link SqlOperator} instances. After a {@code SqlNodePipeline.revalidate} round-trip the
+     * Spark dialect unparses {@code MAP_VALUE_CONSTRUCTOR} as bare {@code MAP(k, v)}, the parser
+     * re-parses it as a FUNCTION-syntax call, and the validator binds it to {@code
+     * SqlLibraryOperators.MAP}. Pattern-matching on a single operator identity would miss the
+     * round-tripped form and break relevance pushdown.
+     */
+    private static RexCall expectMapCall(RexNode node, String funcName) {
+      if (node instanceof RexCall call
+          && (call.getOperator() == SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR
+              || call.getOperator() == org.apache.calcite.sql.fun.SqlLibraryOperators.MAP)) {
+        return call;
+      }
+      throw new IllegalArgumentException(
+          format(
+              Locale.ROOT,
+              "Expect [MAP] RexCall but get [%s] for function [%s]",
+              node.toString(),
+              funcName));
+    }
+
     private static class AliasPair {
       final RexNode value;
       final RexNode alias;
 
       static AliasPair from(RexNode node, String funcName) {
-        RexCall mapCall = expectCall(node, SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR, funcName);
+        RexCall mapCall = expectMapCall(node, funcName);
         return new AliasPair(mapCall.getOperands().get(1), mapCall.getOperands().get(0));
       }
 

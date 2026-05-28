@@ -8,31 +8,50 @@ package org.opensearch.sql.calcite;
 import com.google.common.collect.ImmutableList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import org.apache.calcite.avatica.util.TimeUnit;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlIntervalQualifier;
+import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
-import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.opensearch.sql.ast.expression.SpanUnit;
-import org.opensearch.sql.calcite.type.ExprDateType;
-import org.opensearch.sql.calcite.type.ExprIPType;
-import org.opensearch.sql.calcite.type.ExprTimeStampType;
-import org.opensearch.sql.calcite.type.ExprTimeType;
-import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
-import org.opensearch.sql.exception.ExpressionEvaluationException;
-import org.opensearch.sql.exception.SemanticCheckException;
-import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 
 public class ExtendedRexBuilder extends RexBuilder {
 
   public ExtendedRexBuilder(RexBuilder rexBuilder) {
     super(rexBuilder.getTypeFactory());
+  }
+
+  /**
+   * Build a RexCall without rejecting mixed operand types. Calcite's stock makeCall asks the
+   * operator to {@code inferReturnType} on the operand types and throws if the operator refuses
+   * (e.g. {@code +(NUMERIC, STRING)}). Visitor-side type checking is being removed in favor of
+   * SqlValidator handling coercion after RelToSql, so this override falls back to the first
+   * operand's type when inferReturnType fails. The loose type is harmless: RelToSqlConverter drops
+   * it when writing the SQL string, and SqlValidator re-derives the real type on round-trip.
+   *
+   * <p>The varargs entry point {@code makeCall(SqlOperator, RexNode...)} is {@code final} on the
+   * stock {@code RexBuilder} and routes through {@code makeCall(SqlParserPos, SqlOperator, List)}
+   * rather than {@code makeCall(SqlOperator, List)}. Override the {@code SqlParserPos} variant so
+   * both call shapes hit the fallback.
+   */
+  @Override
+  public RexNode makeCall(SqlOperator op, List<? extends RexNode> exprs) {
+    return makeCall(SqlParserPos.ZERO, op, exprs);
+  }
+
+  @Override
+  public RexNode makeCall(SqlParserPos pos, SqlOperator op, List<? extends RexNode> exprs) {
+    try {
+      return super.makeCall(pos, op, exprs);
+    } catch (RuntimeException e) {
+      RelDataType fallback = exprs.get(0).getType();
+      return super.makeCall(pos, fallback, op, ImmutableList.copyOf(exprs));
+    }
   }
 
   public RexNode coalesce(RexNode... nodes) {
@@ -127,67 +146,84 @@ public class ExtendedRexBuilder extends RexBuilder {
       boolean matchNullability,
       boolean safe,
       RexLiteral format) {
-    final SqlTypeName sqlType = type.getSqlTypeName();
-    RelDataType sourceType = exp.getType();
-    // Calcite bug which doesn't consider to cast literal to boolean
-    if (exp instanceof RexLiteral && sqlType == SqlTypeName.BOOLEAN) {
-      if (exp.equals(makeLiteral("1", typeFactory.createSqlType(SqlTypeName.CHAR, 1)))) {
+    final org.apache.calcite.sql.type.SqlTypeName sqlType = type.getSqlTypeName();
+    final RelDataType sourceType = exp.getType();
+    // Tree-shape choice for boolean cast: Calcite's stock cast on string literal "1"/"0" returns
+    // null because there's no implicit conversion rule. PPL/V1 semantics: cast("1"/"0" AS BOOLEAN)
+    // → true/false; cast(numeric AS BOOLEAN) → numeric != 0. Wire up these cases as RexNode-shape
+    // rewrites here so the caller's intent reads through.
+    if (exp instanceof RexLiteral && sqlType == org.apache.calcite.sql.type.SqlTypeName.BOOLEAN) {
+      RexLiteral one = (RexLiteral) makeLiteral("1", typeFactory.createSqlType(
+          org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
+      RexLiteral zero = (RexLiteral) makeLiteral("0", typeFactory.createSqlType(
+          org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
+      if (exp.equals(one)) {
         return makeLiteral(true, type);
-      } else if (exp.equals(makeLiteral("0", typeFactory.createSqlType(SqlTypeName.CHAR, 1)))) {
+      }
+      if (exp.equals(zero)) {
         return makeLiteral(false, type);
-      } else if (SqlTypeUtil.isExactNumeric(sourceType)) {
+      }
+      if (org.apache.calcite.sql.type.SqlTypeUtil.isExactNumeric(sourceType)) {
         return makeCall(
             type,
-            SqlStdOperatorTable.NOT_EQUALS,
-            ImmutableList.of(exp, makeZeroLiteral(sourceType)));
-        // TODO https://github.com/opensearch-project/sql/issues/3443
-        // Current, we align the behaviour of Spark and Postgres, to align with OpenSearch V2,
-        // enable following commented codes.
-        //      } else {
-        //        return makeCall(type,
-        //            SqlStdOperatorTable.NOT_EQUALS,
-        //            ImmutableList.of(exp, makeZeroLiteral(sourceType)));
+            org.apache.calcite.sql.fun.SqlStdOperatorTable.NOT_EQUALS,
+            com.google.common.collect.ImmutableList.of(exp, makeZeroLiteral(sourceType)));
       }
-    } else if (OpenSearchTypeFactory.isUserDefinedType(type)) {
+    }
+    // Tree-shape choice: when asked to cast to a PPL UDT, build a call to the corresponding
+    // PPL UDF instead of a stock CAST. The UDF carries the right runtime semantics for the
+    // UDT (e.g. DATE → TIMESTAMP UDT promotes to start-of-day at runtime via TIMESTAMP UDF).
+    // This is not coercion injection — callers (visitor, validator-side coercion) decide the
+    // target type; we only choose the right RexNode shape.
+    if (org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.isUserDefinedType(type)) {
       if (RexLiteral.isNullLiteral(exp)) {
         return super.makeCast(pos, type, exp, matchNullability, safe, format);
       }
-      if (type instanceof ExprDateType) {
-        return makeCall(type, PPLBuiltinOperators.DATE, List.of(exp));
-      } else if (type instanceof ExprTimeType) {
-        return makeCall(type, PPLBuiltinOperators.TIME, List.of(exp));
-      } else if (type instanceof ExprTimeStampType) {
-        return makeCall(type, PPLBuiltinOperators.TIMESTAMP, List.of(exp));
-      } else if (type instanceof ExprIPType) {
-        if (sourceType instanceof ExprIPType) {
-          return exp;
-        } else if (SqlTypeUtil.isCharacter(sourceType)) {
-          return makeCall(type, PPLBuiltinOperators.IP, List.of(exp));
-        }
-        // Throwing error inside implementation will be suppressed by Calcite, thus
-        // throwing 500 error. Therefore, we throw error here to ensure the error
-        // information is displayed properly.
-        throw new ExpressionEvaluationException(
-            String.format(
-                Locale.ROOT,
-                "Cannot convert %s to IP, only STRING and IP types are supported",
-                sourceType));
+      if (type instanceof org.opensearch.sql.calcite.type.ExprDateType) {
+        return makeCall(
+            type, org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE, List.of(exp));
       }
-      throw new SemanticCheckException(
-          String.format(Locale.ROOT, "Cannot cast from %s to %s", sourceType, type));
+      if (type instanceof org.opensearch.sql.calcite.type.ExprTimeType) {
+        return makeCall(
+            type, org.opensearch.sql.expression.function.PPLBuiltinOperators.TIME, List.of(exp));
+      }
+      if (type instanceof org.opensearch.sql.calcite.type.ExprTimeStampType) {
+        return makeCall(
+            type,
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
+            List.of(exp));
+      }
+      if (type instanceof org.opensearch.sql.calcite.type.ExprIPType) {
+        if (sourceType instanceof org.opensearch.sql.calcite.type.ExprIPType) {
+          return exp;
+        }
+        if (org.apache.calcite.sql.type.SqlTypeUtil.isCharacter(sourceType)) {
+          return makeCall(
+              type, org.opensearch.sql.expression.function.PPLBuiltinOperators.IP, List.of(exp));
+        }
+        // Throwing inside an implementor's runtime would be wrapped as a 500 error and the
+        // message buried; throw here so the user sees a clear 400 error explaining the
+        // type mismatch.
+        throw new org.opensearch.sql.exception.ExpressionEvaluationException(
+            String.format(
+                java.util.Locale.ROOT,
+                "Cannot convert %s to IP, only STRING and IP types are supported",
+                org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.convertRelDataTypeToExprType(
+                    sourceType)));
+      }
     }
-    // Use a custom operator when casting floating point or decimal number to a character type.
-    // This patch is necessary because in Calcite, 0.0F is cast to 0E0, decimal 0.x to x
-    else if ((SqlTypeUtil.isApproximateNumeric(sourceType) || SqlTypeUtil.isDecimal(sourceType))
-        && SqlTypeUtil.isCharacter(type)) {
-      // NUMBER_TO_STRING uses java's built-in method to get the string representation of a number
-      return makeCall(type, PPLBuiltinOperators.NUMBER_TO_STRING, List.of(exp));
-    }
-    // VARCHAR → VARBINARY for ip/binary fields. Emit BINARY(varchar) as a placeholder
-    // RexCall the analytics backend adapter rewrites into a VARBINARY literal.
-    else if (sqlType == SqlTypeName.VARBINARY
-        && sourceType.getSqlTypeName() == SqlTypeName.VARCHAR) {
-      return makeCall(type, PPLBuiltinOperators.BINARY, List.of(exp));
+    // Tree-shape choice: cast FROM (APPROXIMATE | DECIMAL) TO VARCHAR routes through
+    // NUMBER_TO_STRING. Calcite's stock CAST goes through SqlFunctions.toString(double|BigDecimal)
+    // which emits "0E0" for 0.0 and ".99" for 0.99 — non-Spark-compatible. The PPL UDF calls
+    // Java's Double.toString / BigDecimal.toString and produces "0.0" / "0.99". The UDF is
+    // deterministic, so RexSimplify still folds it at compile time when the operand is constant.
+    if (org.apache.calcite.sql.type.SqlTypeUtil.isCharacter(type)
+        && (org.apache.calcite.sql.type.SqlTypeUtil.isApproximateNumeric(sourceType)
+            || org.apache.calcite.sql.type.SqlTypeUtil.isDecimal(sourceType))) {
+      return makeCall(
+          type,
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.NUMBER_TO_STRING,
+          List.of(exp));
     }
     return super.makeCast(pos, type, exp, matchNullability, safe, format);
   }

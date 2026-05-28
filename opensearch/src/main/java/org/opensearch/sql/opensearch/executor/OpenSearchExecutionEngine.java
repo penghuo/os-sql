@@ -40,6 +40,7 @@ import org.apache.logging.log4j.Logger;
 import org.locationtech.jts.geom.Point;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.sqlnode.SqlNodePipeline;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.calcite.utils.UserDefinedFunctionUtils;
@@ -350,6 +351,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     OperatorTable.addOperator(
         BuiltinFunctionName.DISTINCT_COUNT_APPROX.name(), approxDistinctCountFunction);
 
+    // Surface the dynamic operator table to the SqlValidator round-trip so storage-side
+    // operators (DISTINCT_COUNT_APPROX, GEOIP, ...) survive the RelNode -> SQL -> RelNode hop.
+    SqlNodePipeline.registerExtensionOperatorTable(OperatorTable.instance());
+
     // Note: GraphLookup is now implemented as a custom RelNode (LogicalGraphLookup)
     // instead of a UDF, so no registration is needed here.
   }
@@ -376,6 +381,11 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
 
     public static synchronized void addOperator(String name, SqlOperator operator) {
       operators.put(name, operator);
+      // Rebuild the in-memory index so the SqlNodePipeline sees the new operator. Without
+      // this, addOperator only mutates the map and the memoized instance keeps its empty
+      // index, leaving the SqlValidator unable to resolve runtime-registered operators
+      // such as DISTINCT_COUNT_APPROX.
+      INSTANCE.get().init();
     }
   }
 }

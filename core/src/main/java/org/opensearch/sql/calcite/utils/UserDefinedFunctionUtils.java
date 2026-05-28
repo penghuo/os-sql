@@ -97,8 +97,16 @@ public class UserDefinedFunctionUtils {
       String functionName,
       SqlReturnTypeInference returnType,
       @Nullable UDFOperandMetadata operandMetadata) {
+    // QUOTED_ZERO so the unparser emits the function name as a (dialect-quoted) identifier
+    // rather than as a keyword. Names that collide with Calcite built-ins (FIRST, LAST, ...)
+    // would otherwise be unparsed as keywords and routed by the validator's parser to the
+    // built-in (e.g. MATCH_RECOGNIZE-only `FIRST`) instead of our PPL UDAF.
     return new SqlUserDefinedAggFunction(
-        new SqlIdentifier(functionName, SqlParserPos.ZERO),
+        new SqlIdentifier(
+            java.util.Collections.singletonList(functionName),
+            null,
+            SqlParserPos.QUOTED_ZERO,
+            null),
         SqlKind.OTHER_FUNCTION,
         returnType,
         null,

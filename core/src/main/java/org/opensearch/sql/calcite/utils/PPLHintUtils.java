@@ -49,6 +49,11 @@ public class PPLHintUtils {
                   // add more here
                   .build());
 
+  /** Returns the shared {@link HintStrategyTable} configured for PPL hints. */
+  public static HintStrategyTable getHintStrategyTable() {
+    return HINT_STRATEGY_TABLE.get();
+  }
+
   /**
    * Add hint to aggregate to indicate that the aggregate will ignore null value bucket. Notice, the
    * current peek of relBuilder is expected to be LogicalAggregate.

@@ -3570,7 +3570,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       colSplit =
           relBuilder.alias(
               context.rexBuilder.makeCast(
-                  UserDefinedFunctionUtils.NULLABLE_STRING, colSplit, true, true),
+                  UserDefinedFunctionUtils.NULLABLE_STRING, colSplit, true, false),
               columnSplitName);
     }
     relBuilder.project(relBuilder.field(0), colSplit, relBuilder.field(2));
@@ -4302,6 +4302,8 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     List<RexNode> fattenedNodes = new ArrayList<>();
     List<String> projectNames = new ArrayList<>();
     // Flatten map struct fields
+    // safe=false: SAFE_CAST unparses as Spark TRY_CAST which the SqlNodePipeline parser
+    // cannot resolve. Use standard CAST so the round-trip survives validation.
     RexNode patternExpr =
         context.rexBuilder.makeCast(
             context.rexBuilder.getTypeFactory().createSqlType(SqlTypeName.VARCHAR),
@@ -4311,7 +4313,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
                 parsedNode,
                 context.rexBuilder.makeLiteral(PatternUtils.PATTERN)),
             true,
-            true);
+            false);
     fattenedNodes.add(context.relBuilder.alias(patternExpr, originalPatternResultAlias));
     projectNames.add(originalPatternResultAlias);
     if (flattenPatternAggResult) {
@@ -4324,7 +4326,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
                   parsedNode,
                   context.rexBuilder.makeLiteral(PatternUtils.PATTERN_COUNT)),
               true,
-              true);
+              false);
       fattenedNodes.add(context.relBuilder.alias(patternCountExpr, PatternUtils.PATTERN_COUNT));
       projectNames.add(PatternUtils.PATTERN_COUNT);
     }
@@ -4338,7 +4340,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
                   parsedNode,
                   context.rexBuilder.makeLiteral(PatternUtils.TOKENS)),
               true,
-              true);
+              false);
       fattenedNodes.add(context.relBuilder.alias(tokensExpr, PatternUtils.TOKENS));
       projectNames.add(PatternUtils.TOKENS);
     }
@@ -4356,7 +4358,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
                   explicitMapType(context, parsedNode, SqlTypeName.VARCHAR),
                   context.rexBuilder.makeLiteral(PatternUtils.SAMPLE_LOGS)),
               true,
-              true);
+              false);
       fattenedNodes.add(context.relBuilder.alias(sampleLogsExpr, PatternUtils.SAMPLE_LOGS));
       projectNames.add(PatternUtils.SAMPLE_LOGS);
     }

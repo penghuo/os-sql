@@ -37,57 +37,40 @@ public class RelevanceQueryFunction extends ImplementorUDF {
    * Starting from the 3rd parameter (or 2nd when no fields), they are optional parameters for relevance queries.
    * Different query has different parameter set, which will be validated in dedicated query builder.
    * Query parameter is always required and cannot be null.
+   *
+   * <p>Encoding note: the operand list is variadic (1..MAX_OPERANDS MAP arguments). Calcite's
+   * {@code OperandTypes.family(List, optionalPredicate)} does <em>not</em> implement variadic
+   * arity in {@code checkOperandTypes} — that path requires the family list length to equal the
+   * actual operand count, ignoring the {@code optional} predicate. To express "1..N MAP operands"
+   * we OR together one strictly-sized {@code family(MAP repeated k times)} checker for each
+   * supported arity {@code k} from 1 through {@link #MAX_OPERANDS}. PPL's own type-check wrapper
+   * ({@code PPLFamilyTypeCheckerWrapper}) goes through {@code getOperandCountRange} which the
+   * earlier (predicate-based) form handled correctly, so the visitor-side path already works; the
+   * SqlValidator round-trip path goes through Calcite's {@code checkOperandTypes} directly and
+   * needs the strictly-sized form.
    */
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(
-                    ImmutableList.of(
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP,
-                        SqlTypeFamily.MAP),
-                    i -> i > 0 && i < 14) // Parameters 3-14 are optional
-                .or(
-                    OperandTypes.family(
-                        ImmutableList.of(
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP,
-                            SqlTypeFamily.MAP),
-                        i -> i > 0 && i < 25))); // Parameters 3-25 are optional
+    return UDFOperandMetadata.wrap((CompositeOperandTypeChecker) buildVariadicMapChecker());
+  }
+
+  /** Maximum supported number of MAP operands. */
+  private static final int MAX_OPERANDS = 25;
+
+  private static org.apache.calcite.sql.type.SqlSingleOperandTypeChecker buildVariadicMapChecker() {
+    org.apache.calcite.sql.type.SqlSingleOperandTypeChecker checker = familyOfMaps(1);
+    for (int k = 2; k <= MAX_OPERANDS; k++) {
+      checker = checker.or(familyOfMaps(k));
+    }
+    return checker;
+  }
+
+  private static org.apache.calcite.sql.type.FamilyOperandTypeChecker familyOfMaps(int arity) {
+    ImmutableList.Builder<SqlTypeFamily> families = ImmutableList.builderWithExpectedSize(arity);
+    for (int i = 0; i < arity; i++) {
+      families.add(SqlTypeFamily.MAP);
+    }
+    return OperandTypes.family(families.build());
   }
 
   public static class RelevanceQueryImplementor implements NotNullImplementor {

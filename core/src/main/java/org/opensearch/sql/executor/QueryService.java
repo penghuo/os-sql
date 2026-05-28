@@ -35,6 +35,7 @@ import org.opensearch.sql.calcite.OpenSearchSchema;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType;
+import org.opensearch.sql.calcite.sqlnode.SqlNodePipeline;
 import org.opensearch.sql.calcite.utils.CalciteClassLoaderHelper;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.common.error.QueryProcessingStage;
@@ -155,7 +156,7 @@ public class QueryService {
                   RelNode relNode =
                       StageErrorHandler.executeStage(
                           QueryProcessingStage.ANALYZING,
-                          () -> analyze(plan, context),
+                          () -> revalidateThroughSqlNode(analyze(plan, context), context),
                           "while preparing and validating the query plan");
 
                   // Wrap plan conversion with PLAN_CONVERSION stage tracking
@@ -204,7 +205,7 @@ public class QueryService {
                   context.setHighlightConfig(highlightConfig);
                   context.run(
                       () -> {
-                        RelNode relNode = analyze(plan, context);
+                        RelNode relNode = revalidateThroughSqlNode(analyze(plan, context), context);
                         RelNode calcitePlan = convertToCalcitePlan(relNode, context);
                         executionEngine.explain(calcitePlan, mode, context, listener);
                       },
@@ -369,6 +370,17 @@ public class QueryService {
     final SchemaPlus opensearchSchema =
         rootSchema.add(
             OpenSearchSchema.OPEN_SEARCH_SCHEMA_NAME, new OpenSearchSchema(dataSourceService));
+    // Register PPL UDT names on the schema so the SqlValidator round-trip's catalog reader can
+    // resolve `CAST(x AS EXPR_DATE)` etc back to the same RelDataType. Without this, the dialect
+    // emits a UDT type name spec but the validator's getNamedType returns null and the cast
+    // falls back to losing UDT identity. Registered on opensearchSchema (the validator's
+    // rootSchema) — see SqlNodePipeline.sqlToRel.
+    org.opensearch.sql.calcite.utils.OpenSearchTypeFactory tf =
+        org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.TYPE_FACTORY;
+    for (org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT udt :
+        org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT.values()) {
+      opensearchSchema.add(udt.name(), typeFactory -> tf.createUDT(udt));
+    }
     Frameworks.ConfigBuilder configBuilder =
         Frameworks.newConfigBuilder()
             .parserConfig(SqlParser.Config.DEFAULT) // TODO check
@@ -386,6 +398,10 @@ public class QueryService {
    * @param osPlan Logical Plan derived from OpenSearch PPL
    * @param context Calcite context
    */
+  private RelNode revalidateThroughSqlNode(RelNode relNode, CalcitePlanContext context) {
+    return SqlNodePipeline.revalidate(relNode, context);
+  }
+
   private static RelNode convertToCalcitePlan(RelNode osPlan, CalcitePlanContext context) {
     // Explicitly add a limit operator to enforce query size limit
     RelNode calcitePlan =

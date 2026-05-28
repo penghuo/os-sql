@@ -59,8 +59,8 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
 | 15 | CalciteIPComparisonIT | ✅ | 12/12 pass after two fixes: (a) drop SqlSyntax.BINARY override in CompareIpFunction (was unparsing as `host EQUALS_IP ip` which Babel parser rejects); (b) compute valid SqlOperandCountRange + checkOperandTypes from allowedParamTypes in UDFOperandMetadata.UDTOperandMetadata (validator path needs them; visitor path tolerated null). |
-| 16 | CalciteIPFunctionsIT | ⏳ | |
-| 17 | CalcitePPLIPFunctionIT | ⏳ | |
+| 16 | CalciteIPFunctionsIT | ✅ | 2/2 pass. |
+| 17 | CalcitePPLIPFunctionIT | ✅ | 2/2 pass. |
 
 ## Phase 3 — Float / Varchar literal handling (expected REGRESSION: wrap*ForRoundTrip removed)
 

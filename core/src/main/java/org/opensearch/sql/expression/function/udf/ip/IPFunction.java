@@ -59,7 +59,11 @@ public class IPFunction extends ImplementorUDF {
       if (argType instanceof org.opensearch.sql.calcite.type.ExprIPType) {
         return translatedOperands.getFirst();
       } else if (org.apache.calcite.sql.type.SqlTypeUtil.isCharacter(argType)) {
-        return Expressions.new_(ExprIpValue.class, translatedOperands);
+        // ExprIPType is now VARCHAR-tagged: the runtime value is the canonical IP string. Build a
+        // new ExprIpValue to validate the input and normalise it to canonical form (e.g. trims
+        // padding zeros), then expose its canonical text representation.
+        return Expressions.call(
+            Expressions.new_(ExprIpValue.class, translatedOperands), "value");
       } else {
         throw new ExpressionEvaluationException(
             String.format(

@@ -26,8 +26,8 @@ public class ExprIpValue extends AbstractExprValue {
   }
 
   @Override
-  public ExprIpValue valueForCalcite() {
-    return this;
+  public String valueForCalcite() {
+    return value();
   }
 
   @Override

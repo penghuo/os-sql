@@ -103,6 +103,44 @@ public class EnhancedCoalesceFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    // Variadic: 1+ operands of any type. SqlValidator's overload-resolution path calls
+    // getOperandCountRange() to filter routines by parameter count; returning null here makes
+    // SqlOperator throw UnsupportedOperationException at validation time. Provide a permissive
+    // metadata so the validator can accept the call; per-operand type checking is done by PPL's
+    // own dispatch on the visitor side.
+    return new UDFOperandMetadata() {
+      @Override
+      public org.apache.calcite.sql.type.SqlOperandTypeChecker getInnerTypeChecker() {
+        return this;
+      }
+
+      @Override
+      public java.util.List<org.apache.calcite.rel.type.RelDataType> paramTypes(
+          org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
+        return java.util.List.of();
+      }
+
+      @Override
+      public java.util.List<String> paramNames() {
+        return java.util.List.of();
+      }
+
+      @Override
+      public boolean checkOperandTypes(
+          org.apache.calcite.sql.SqlCallBinding callBinding, boolean throwOnFailure) {
+        return callBinding.getOperandCount() >= 1;
+      }
+
+      @Override
+      public org.apache.calcite.sql.SqlOperandCountRange getOperandCountRange() {
+        return org.apache.calcite.sql.type.SqlOperandCountRanges.from(1);
+      }
+
+      @Override
+      public String getAllowedSignatures(
+          org.apache.calcite.sql.SqlOperator op, String opName) {
+        return opName + "(<ANY>...)";
+      }
+    };
   }
 }

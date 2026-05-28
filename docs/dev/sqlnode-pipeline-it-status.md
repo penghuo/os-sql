@@ -67,8 +67,8 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
 | 18 | CalcitePPLCaseFunctionIT | ⚠️ | 8/9 pass after two fixes: (a) `withIdentifierExpansion(true)` in SqlValidator config (resolves `RexInputRef out of range` on CASE-as-GROUP-BY-key — matches Calcite's own SqlToRelFixture default); (b) `wrapVarcharCaseBranchesForRoundTrip` (Spark-style VARCHAR for CASE branches; without it, ANSI CHAR semantics pad `'low'` → `'low '`, verified against Calcite's own SqlOperatorTest.testCase). Remaining 1 fail (`testNestedCaseAggWithAutoDateHistogram`): `Windowed aggregate expression is illegal in GROUP BY clause` — separate WIDTH_BUCKET-with-window shape, deferred. |
-| 19 | CalcitePPLCastFunctionIT | ⏳ | |
-| 20 | CalcitePPLConditionBuiltinFunctionIT | ⏳ | |
+| 19 | CalcitePPLCastFunctionIT | ✅ | 42/42 after refactoring ExprIPType to extend ExprSqlType(VARCHAR). `cast(ip as STRING)` is now a trivial identity cast; no custom UDF needed. IP comparisons still dispatch via EQUALS_IP/LESS_IP (matched by class identity). |
+| 20 | CalcitePPLConditionBuiltinFunctionIT | ✅ | 24/24 pass after two R3 fixes: (a) EnhancedCoalesceFunction `getOperandMetadata` was `null`, validator's overload-filter called `SqlOperator.getOperandCountRange()` which throws by default. Provided permissive variadic metadata accepting 1+ operands. (b) STRING_TIMESTAMP was `family(CHARACTER, TIMESTAMP)`; EXPR_TIMESTAMP UDT reports as VARCHAR/CHARACTER not TIMESTAMP, so EARLIEST/LATEST validator rejected the call. Switched to `wrapUDT(List.of(STRING_T, TIMESTAMP_UDT))`. |
 | 21 | CalciteMathematicalFunctionIT | ⏳ | |
 | 22 | CalciteOperatorIT | ⏳ | |
 

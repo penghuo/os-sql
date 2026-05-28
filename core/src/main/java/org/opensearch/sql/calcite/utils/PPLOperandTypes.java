@@ -284,9 +284,11 @@ public class PPLOperandTypes {
                   .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME))
                   .or(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.CHARACTER))
                   .or(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME)));
+  // (STRING, TIMESTAMP). Uses wrapUDT so EXPR_TIMESTAMP UDT (which reports as VARCHAR/CHARACTER
+  // family, not TIMESTAMP family) is accepted. A plain family(CHARACTER, TIMESTAMP) check would
+  // reject EXPR_TIMESTAMP arguments at the SqlValidator layer.
   public static final UDFOperandMetadata STRING_TIMESTAMP =
-      UDFOperandMetadata.wrap(
-          OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.TIMESTAMP));
+      UDFOperandMetadata.wrapUDT(List.of(List.of(STRING_T, TIMESTAMP_UDT)));
   public static final UDFOperandMetadata STRING_DATETIME =
       UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME));
   public static final UDFOperandMetadata DATETIME_INTERVAL =

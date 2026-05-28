@@ -154,10 +154,79 @@ public final class SqlNodePipeline {
 
   static String relToSql(RelNode rel) {
     RelNode prepared = wrapFloatLiteralsForRoundTrip(rel);
+    prepared = wrapVarcharCaseBranchesForRoundTrip(prepared);
     RelToSqlConverter converter = new RelToSqlConverter(OpenSearchSparkSqlDialect.DEFAULT);
     SqlImplementor.Result result = converter.visitRoot(prepared);
     SqlNode sqlNode = result.asStatement();
     return sqlNode.toSqlString(OpenSearchSparkSqlDialect.DEFAULT).getSql();
+  }
+
+  /**
+   * Wrap each VARCHAR/CHAR {@link org.apache.calcite.rex.RexLiteral} that appears as a direct
+   * branch (THEN/ELSE) of a {@code CASE} call with an explicit {@code CAST(... AS VARCHAR)}.
+   *
+   * <p>The unparser writes a VARCHAR literal as a bare quoted string (e.g. {@code 'old'}). The
+   * Babel parser re-types bare quoted strings as {@code CHAR(N)}. When such literals appear as
+   * branches of a {@code CASE}, Calcite's least-restrictive type computation widens the result to
+   * {@code CHAR(max-of-branch-lengths)}, and SQL CHAR semantics pad shorter values with trailing
+   * spaces — so {@code case(..., 'adult', ...)} returns {@code "adult   "} instead of
+   * {@code "adult"}. Wrapping the branches in {@code CAST(... AS VARCHAR)} forces the parser to
+   * type them as VARCHAR; the CASE result type stays VARCHAR and the values keep their actual
+   * length.
+   *
+   * <p>The wrapping is scoped to CASE branches because broader wrapping (every VARCHAR literal)
+   * defeats OpenSearch pushdown analyzers that pattern-match on {@code RexInputRef = RexLiteral}
+   * pairs. Comparisons like {@code name = 'Jake'} keep their bare literal RHS and continue to
+   * push down.
+   */
+  private static RelNode wrapVarcharCaseBranchesForRoundTrip(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    org.apache.calcite.rex.RexShuttle shuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexNode visited = super.visitCall(call);
+            if (!(visited instanceof org.apache.calcite.rex.RexCall outer)) {
+              return visited;
+            }
+            if (outer.getOperator() != SqlStdOperatorTable.CASE) {
+              return outer;
+            }
+            // CASE operand layout: [whenA, thenA, whenB, thenB, ..., elseExpr]
+            // Wrap odd-index branches (the THENs) and the trailing ELSE.
+            java.util.List<org.apache.calcite.rex.RexNode> ops = outer.getOperands();
+            java.util.List<org.apache.calcite.rex.RexNode> rewritten =
+                new java.util.ArrayList<>(ops.size());
+            boolean changed = false;
+            for (int i = 0; i < ops.size(); i++) {
+              org.apache.calcite.rex.RexNode op = ops.get(i);
+              boolean isBranch = (i % 2 == 1) || (i == ops.size() - 1 && i % 2 == 0);
+              if (isBranch
+                  && op instanceof org.apache.calcite.rex.RexLiteral
+                  && (op.getType().getSqlTypeName()
+                          == org.apache.calcite.sql.type.SqlTypeName.VARCHAR
+                      || op.getType().getSqlTypeName()
+                          == org.apache.calcite.sql.type.SqlTypeName.CHAR)) {
+                rewritten.add(rexBuilder.makeAbstractCast(op.getType(), op));
+                changed = true;
+              } else {
+                rewritten.add(op);
+              }
+            }
+            if (!changed) {
+              return outer;
+            }
+            return rexBuilder.makeCall(outer.getType(), outer.getOperator(), rewritten);
+          }
+        };
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            return visited.accept(shuttle);
+          }
+        });
   }
 
   /**
@@ -230,7 +299,8 @@ public final class SqlNodePipeline {
             tf,
             SqlValidator.Config.DEFAULT
                 .withTypeCoercionFactory(PPLTypeCoercion.FACTORY)
-                .withDefaultNullCollation(NullCollation.LOW));
+                .withDefaultNullCollation(NullCollation.LOW)
+                .withIdentifierExpansion(true));
 
     SqlParser.Config parserConfig =
         fc.getParserConfig()

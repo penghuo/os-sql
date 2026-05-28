@@ -66,7 +66,7 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 18 | CalcitePPLCaseFunctionIT | ⏳ | |
+| 18 | CalcitePPLCaseFunctionIT | ⚠️ | 8/9 pass after two fixes: (a) `withIdentifierExpansion(true)` in SqlValidator config (resolves `RexInputRef out of range` on CASE-as-GROUP-BY-key — matches Calcite's own SqlToRelFixture default); (b) `wrapVarcharCaseBranchesForRoundTrip` (Spark-style VARCHAR for CASE branches; without it, ANSI CHAR semantics pad `'low'` → `'low '`, verified against Calcite's own SqlOperatorTest.testCase). Remaining 1 fail (`testNestedCaseAggWithAutoDateHistogram`): `Windowed aggregate expression is illegal in GROUP BY clause` — separate WIDTH_BUCKET-with-window shape, deferred. |
 | 19 | CalcitePPLCastFunctionIT | ⏳ | |
 | 20 | CalcitePPLConditionBuiltinFunctionIT | ⏳ | |
 | 21 | CalciteMathematicalFunctionIT | ⏳ | |

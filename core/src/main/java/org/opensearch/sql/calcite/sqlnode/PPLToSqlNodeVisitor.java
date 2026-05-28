@@ -24,19 +24,24 @@ import org.opensearch.sql.ast.expression.AllFields;
 import org.opensearch.sql.ast.expression.AllFieldsExcludeMeta;
 import org.opensearch.sql.ast.expression.And;
 import org.opensearch.sql.ast.expression.Argument;
+import org.opensearch.sql.ast.expression.Cast;
 import org.opensearch.sql.ast.expression.Compare;
+import org.opensearch.sql.ast.expression.DataType;
 import org.opensearch.sql.ast.expression.Field;
+import org.opensearch.sql.ast.expression.Let;
 import org.opensearch.sql.ast.expression.Literal;
 import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
+import org.opensearch.sql.ast.tree.Rename;
 import org.opensearch.sql.ast.tree.Reverse;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
@@ -247,6 +252,92 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlNode where = expr(node.getCondition());
     return SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitEval(Eval node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL eval extends the row with N new columns: `SELECT *, e1 AS a1, e2 AS a2, ... FROM
+    // <child>`.
+    // Within a single eval, later lets may reference earlier aliases (PPL's left-to-right
+    // semantics); SQL doesn't allow SELECT-list aliases inside the same SELECT. We honour that by
+    // wrapping when a let references a name introduced earlier in this same eval.
+    List<String> visible =
+        new ArrayList<>(frame.currentFields == null ? List.of() : frame.currentFields);
+    Set<String> existingNames = new LinkedHashSet<>(visible);
+    SqlNodeList items = new SqlNodeList(POS);
+    items.add(SqlIdentifier.star(POS));
+    Set<String> aliasesInThisSelect = new LinkedHashSet<>();
+    for (Let let : node.getExpressionList()) {
+      String alias = let.getVar().getField().toString();
+      // If this let's RHS references an alias introduced earlier in this same eval, the previous
+      // SELECT can't expose that alias to its own list — wrap and start a new SELECT.
+      if (referencesAny(let.getExpression(), aliasesInThisSelect)) {
+        from = SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+        items = new SqlNodeList(POS);
+        items.add(SqlIdentifier.star(POS));
+        aliasesInThisSelect = new LinkedHashSet<>();
+      }
+      SqlNode rhs = expr(let.getExpression());
+      items.add(asAliased(rhs, alias));
+      aliasesInThisSelect.add(alias);
+      if (existingNames.add(alias)) {
+        visible.add(alias);
+      }
+    }
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitRename(Rename node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `rename old1 as new1, old2 as new2` produces a new SELECT list with each renamed
+    // column as `<old> AS <new>` and all other columns passed through. Build the list explicitly
+    // so the row type's field names reflect the renames; downstream pipes see the new names.
+    java.util.Map<String, String> renames = new java.util.LinkedHashMap<>();
+    for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+      String oldName = ((Field) m.getOrigin()).getField().toString();
+      String newName = ((Field) m.getTarget()).getField().toString();
+      renames.put(oldName, newName);
+    }
+    List<String> incoming = frame.currentFields == null ? List.of() : frame.currentFields;
+    List<String> newVisible = new ArrayList<>(incoming.size());
+    SqlNodeList items = new SqlNodeList(POS);
+    for (String name : incoming) {
+      String mapped = renames.get(name);
+      if (mapped != null) {
+        items.add(asAliased(toIdentifier(name), mapped));
+        newVisible.add(mapped);
+      } else {
+        items.add(toIdentifier(name));
+        newVisible.add(name);
+      }
+    }
+    return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
+  }
+
+  /** Build {@code <expr> AS "<alias>"} with the alias quoted (preserves dots in the label). */
+  private static SqlNode asAliased(SqlNode rhs, String alias) {
+    SqlIdentifier id =
+        new SqlIdentifier(
+            java.util.Collections.singletonList(alias),
+            null,
+            POS,
+            List.of(SqlParserPos.ZERO.withQuoting(true)));
+    return new SqlBasicCall(SqlStdOperatorTable.AS, List.of(rhs, id), POS);
+  }
+
+  /** True when {@code e} references any name in {@code names} (recursive walk). */
+  private static boolean referencesAny(UnresolvedExpression e, Set<String> names) {
+    if (names == null || names.isEmpty()) return false;
+    if (e instanceof QualifiedName qn && names.contains(qn.toString())) return true;
+    if (e instanceof Field f
+        && f.getField() instanceof QualifiedName qn
+        && names.contains(qn.toString())) return true;
+    for (Object child : e.getChild()) {
+      if (child instanceof UnresolvedExpression ce && referencesAny(ce, names)) return true;
+    }
+    return false;
   }
 
   @Override
@@ -603,7 +694,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   /**
    * Translate a PPL UnresolvedExpression to a Calcite SqlNode. Grows incrementally as visitors land
-   * — current cases are what visitJoin's ON clauses and visitFilter's WHERE conditions exercise.
+   * — current cases cover what visitJoin/visitFilter/visitEval exercise.
    */
   private SqlNode expr(UnresolvedExpression e) {
     if (e instanceof Literal lit) {
@@ -631,8 +722,114 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof Not n) {
       return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
     }
+    if (e instanceof Cast c) {
+      return castExpr(c);
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
+      return funcExpr(fn);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate a {@link Function} call. Arithmetic operators (PPL parses {@code +}/{@code -}/etc. as
+   * Functions) bind to the corresponding Calcite operator; PPL's {@code +} between strings desugars
+   * to {@code CONCAT}. Other named functions go through {@link
+   * org.apache.calcite.sql.SqlUnresolvedFunction} so the validator's name lookup resolves them.
+   */
+  private SqlNode funcExpr(org.opensearch.sql.ast.expression.Function fn) {
+    List<SqlNode> args = new ArrayList<>(fn.getFuncArgs().size());
+    for (UnresolvedExpression a : fn.getFuncArgs()) {
+      args.add(expr(a));
+    }
+    org.apache.calcite.sql.SqlOperator op = arithmeticOperator(fn.getFuncName());
+    if (op != null) {
+      // PPL overloads `+` as both numeric addition and string concatenation. When any operand is
+      // statically a string (literal, CAST(... AS STRING), or a `+` chain ending in one), emit
+      // CONCAT so the validator picks the string-concat overload.
+      if (op == SqlStdOperatorTable.PLUS && hasStringOperand(fn.getFuncArgs())) {
+        return new SqlBasicCall(SqlStdOperatorTable.CONCAT, args, POS);
+      }
+      return new SqlBasicCall(op, args, POS);
+    }
+    return new SqlBasicCall(
+        new org.apache.calcite.sql.SqlUnresolvedFunction(
+            new SqlIdentifier(fn.getFuncName(), POS),
+            null,
+            null,
+            null,
+            null,
+            org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+        args,
+        POS);
+  }
+
+  /**
+   * Translate {@code CAST(expr AS type)}. Currently only STRING/numeric/boolean — date/IP UDT casts
+   * stay deferred until those visitors land.
+   */
+  private SqlNode castExpr(Cast c) {
+    SqlNode value = expr(c.getExpression());
+    org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(c.getDataType());
+    org.apache.calcite.sql.SqlDataTypeSpec spec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(tn, POS), POS);
+    return new SqlBasicCall(
+        org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST, List.of(value, spec), POS);
+  }
+
+  private static org.apache.calcite.sql.type.SqlTypeName pplTypeToSqlType(DataType t) {
+    return switch (t) {
+      case BOOLEAN -> org.apache.calcite.sql.type.SqlTypeName.BOOLEAN;
+      case SHORT -> org.apache.calcite.sql.type.SqlTypeName.SMALLINT;
+      case INTEGER -> org.apache.calcite.sql.type.SqlTypeName.INTEGER;
+      case LONG -> org.apache.calcite.sql.type.SqlTypeName.BIGINT;
+      case FLOAT -> org.apache.calcite.sql.type.SqlTypeName.FLOAT;
+      case DOUBLE -> org.apache.calcite.sql.type.SqlTypeName.DOUBLE;
+      case DECIMAL -> org.apache.calcite.sql.type.SqlTypeName.DECIMAL;
+      case STRING -> org.apache.calcite.sql.type.SqlTypeName.VARCHAR;
+      default ->
+          throw new UnsupportedOperationException(
+              "Cast target type not yet supported in PPLToSqlNodeVisitor: " + t);
+    };
+  }
+
+  private static org.apache.calcite.sql.SqlOperator arithmeticOperator(String name) {
+    if (name == null) return null;
+    return switch (name) {
+      case "+" -> SqlStdOperatorTable.PLUS;
+      case "-" -> SqlStdOperatorTable.MINUS;
+      case "*" -> SqlStdOperatorTable.MULTIPLY;
+      case "/" -> SqlStdOperatorTable.DIVIDE;
+      case "%" -> SqlStdOperatorTable.MOD;
+      default -> null;
+    };
+  }
+
+  /**
+   * True if any operand of a {@code +} expression is statically a string — used to pick CONCAT over
+   * PLUS when PPL's {@code +} acts as string concatenation.
+   */
+  private static boolean hasStringOperand(List<UnresolvedExpression> args) {
+    for (UnresolvedExpression a : args) {
+      if (isStringExpr(a)) return true;
+    }
+    return false;
+  }
+
+  private static boolean isStringExpr(UnresolvedExpression e) {
+    if (e instanceof Literal lit) {
+      return lit.getType() == DataType.STRING;
+    }
+    if (e instanceof Cast c) {
+      return c.getDataType() == DataType.STRING;
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.Function fn
+        && "+".equals(fn.getFuncName())) {
+      return hasStringOperand(fn.getFuncArgs());
+    }
+    return false;
   }
 
   private static org.apache.calcite.sql.SqlOperator comparisonOperator(String op) {

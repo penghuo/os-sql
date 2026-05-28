@@ -312,6 +312,11 @@ public class QueryService {
         new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(planner.tableFields())
             .translate(plan);
     RelNode rel = planner.plan(sqlNode);
+    // OpenSearch tables expose metadata fields (`_id`, `_index`, `_score`, ...) in their row
+    // type, but PPL hides them from user-facing output. The PPL→SqlNode visitor strips them at
+    // every explicit projection; queries with no outer projection (e.g. bare `source=X`) reach
+    // here with metadata still present. Add a top-level Project that drops them.
+    rel = stripMetadataFields(rel);
     // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
     // from the request body's `highlight` parameter, parallel to the PPL pipe). Rewrite each
     // LogicalTableScan to its pushDownHighlight form and add an outer Project that surfaces
@@ -321,6 +326,41 @@ public class QueryService {
       context.setHighlightConfig(null);
     }
     return rel;
+  }
+
+  /**
+   * Drop OpenSearch metadata fields ({@code _id}, {@code _index}, {@code _score}, ...) from the
+   * top-level row type. PPL hides these from user-facing output; only explicit references (e.g.
+   * {@code | fields _id, name}) keep them.
+   */
+  private static RelNode stripMetadataFields(RelNode rel) {
+    java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+        rel.getRowType().getFieldList();
+    boolean anyMeta =
+        fields.stream()
+            .anyMatch(
+                f ->
+                    org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                        .containsKey(f.getName()));
+    if (!anyMeta) {
+      return rel;
+    }
+    org.apache.calcite.rex.RexBuilder rb = rel.getCluster().getRexBuilder();
+    java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>();
+    java.util.List<String> names = new java.util.ArrayList<>();
+    for (org.apache.calcite.rel.type.RelDataTypeField f : fields) {
+      if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(
+          f.getName())) {
+        continue;
+      }
+      projects.add(rb.makeInputRef(rel, f.getIndex()));
+      names.add(f.getName());
+    }
+    if (projects.isEmpty()) {
+      return rel;
+    }
+    return org.apache.calcite.rel.logical.LogicalProject.create(
+        rel, java.util.Collections.emptyList(), projects, names, java.util.Set.of());
   }
 
   private static RelNode injectHighlight(

@@ -122,6 +122,19 @@ The execution engine is Apache Calcite-based, toggled via `plugins.calcite.enabl
 - Some features require pushdown optimization — use `enabledOnlyWhenPushdownIsEnabled()` to skip tests in `CalciteNoPushdownIT`
 - `CalciteNoPushdownIT` re-runs Calcite test classes with pushdown disabled; add new test classes to its `@Suite.SuiteClasses` list
 
+## PPL → SqlNode Translation
+
+PPL queries reach Calcite via `PPLToSqlNodeVisitor` (`core/src/main/java/org/opensearch/sql/calcite/sqlnode/`): PPL AST → SqlNode → Calcite SqlValidator → SqlToRelConverter → RelNode.
+
+When adding or modifying visitor logic, follow `docs/dev/ppl-sqlnode-translation.md`. Key conventions:
+
+- **Compositional**: each `visit*` returns a SqlNode; parents compose. No mutable in-flight pipeline state.
+- **Frame** carries minimal cross-pipe state (`currentFields`, `joinHints`). Coupled state goes in records, not loose fields.
+- **SqlBuilder DSL** centralises both SqlNode construction and frame transitions. `.wrap(frame)` for SELECT (seals scope); `.build(frame)` for JOIN/AS/relation (participates in scope).
+- **AST pre-pass** strips AstBuilder-injected v2-engine markers (e.g. `Project(AllFieldsExcludeMeta)`) before visiting.
+- **Post-RelNode shuttles** enforce final-output policies the validator can't express (e.g. metadata field stripping).
+- **Let the validator do its job**: multi-part identifier resolution, type coercion, `*` expansion. Don't reimplement.
+
 ## Integration Tests
 
 Located in `integ-test/src/test/java/`. Organized by area: `sql/`, `ppl/`, `calcite/`, `legacy/`, `jdbc/`, `datasource/`, `asyncquery/`, `security/`. Uses OpenSearch test framework (in-memory cluster per test class). YAML REST tests in `integ-test/src/yamlRestTest/resources/rest-api-spec/test/`.

@@ -97,10 +97,14 @@ public final class SqlNodePipeline {
     //     bare MAP(k, v) function calls. Without SqlLibrary.SPARK, the validator can't resolve
     //     "MAP" as a FUNCTION-syntax operator and rejects the round-tripped SQL with "No match
     //     found for function signature MAP(<CHARACTER>, <CHARACTER>)".)
+    //   - PostgreSQL: ILIKE / NOT ILIKE (PPL `where x like* '...'` or case-insensitive
+    //     comparisons lower to ILIKE; the dialect unparses as ILIKE which only resolves under
+    //     the PostgreSQL library).
     SqlOperatorTable lib =
         org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(
             org.apache.calcite.sql.fun.SqlLibrary.BIG_QUERY,
-            org.apache.calcite.sql.fun.SqlLibrary.SPARK);
+            org.apache.calcite.sql.fun.SqlLibrary.SPARK,
+            org.apache.calcite.sql.fun.SqlLibrary.POSTGRESQL);
     return new ChainedSqlOperatorTable(
         extension == null
             ? java.util.Arrays.asList(ppl, std, lib)

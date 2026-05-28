@@ -40,18 +40,18 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
 | 1 | CalcitePPLBasicIT | ✅ | All 42 pass after Layers 1+3 + PredicateAnalyzer.expectMapCall + wrapFloatLiteralsForRoundTrip. (Layers 2 + 4 turned out misplaced — Layer 2 was redundant after Layer 3, Layer 4 belonged in PredicateAnalyzer.) |
-| 2 | CalcitePPLPluginIT | ⏳ | |
-| 3 | CalciteFieldsCommandIT | ⏳ | |
-| 4 | CalciteHeadCommandIT | ⏳ | |
-| 5 | CalcitePPLRenameIT | ⏳ | |
-| 6 | CalciteRenameCommandIT | ⏳ | |
-| 7 | CalciteWhereCommandIT | ⏳ | |
-| 8 | CalciteSearchCommandIT | ⏳ | |
-| 9 | CalciteDescribeCommandIT | ⏳ | |
-| 10 | CalciteShowDataSourcesCommandIT | ⏳ | |
-| 11 | CalciteInformationSchemaCommandIT | ⏳ | |
-| 12 | CalciteSettingsIT | ⏳ | |
-| 13 | CalciteResourceMonitorIT | ⏳ | |
+| 2 | CalcitePPLPluginIT | ✅ | 10/10 pass. |
+| 3 | CalciteFieldsCommandIT | ✅ | 78/78 pass. |
+| 4 | CalciteHeadCommandIT | ✅ | 12/12 pass. |
+| 5 | CalcitePPLRenameIT | ✅ | 48/48 pass. |
+| 6 | CalciteRenameCommandIT | ✅ | 4/4 pass. |
+| 7 | CalciteWhereCommandIT | ✅ | 82/82 pass after adding SqlLibrary.POSTGRESQL (for ILIKE). |
+| 8 | CalciteSearchCommandIT | ✅ | 104/104 pass. |
+| 9 | CalciteDescribeCommandIT | ✅ | 6/6 pass. |
+| 10 | CalciteShowDataSourcesCommandIT | ⏭️ | Excluded by build exclude rules (datasource IT). |
+| 11 | CalciteInformationSchemaCommandIT | ⏭️ | Excluded by build exclude rules. |
+| 12 | CalciteSettingsIT | ✅ | 4/4 pass. |
+| 13 | CalciteResourceMonitorIT | ❌ | 1/2 fail (`queryExceedResourceLimitShouldFail`). Test sets memory_limit=1% and expects 500 "Insufficient resources"; query succeeds. Runtime-engine concern, not round-trip. **Deferred.** |
 | 14 | CalciteErrorReportStageIT | ⏳ | |
 
 ## Phase 2 — IP comparisons (expected REGRESSION: rewriteIpComparisons removed)

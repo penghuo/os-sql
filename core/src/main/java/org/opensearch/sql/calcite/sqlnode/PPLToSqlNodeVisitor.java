@@ -23,6 +23,7 @@ import org.opensearch.sql.ast.AbstractNodeVisitor;
 import org.opensearch.sql.ast.expression.AllFields;
 import org.opensearch.sql.ast.expression.AllFieldsExcludeMeta;
 import org.opensearch.sql.ast.expression.And;
+import org.opensearch.sql.ast.expression.Argument;
 import org.opensearch.sql.ast.expression.Compare;
 import org.opensearch.sql.ast.expression.Field;
 import org.opensearch.sql.ast.expression.Literal;
@@ -33,8 +34,11 @@ import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
+import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
+import org.opensearch.sql.ast.tree.Reverse;
+import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.plan.OpenSearchConstants;
@@ -66,6 +70,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
      * three-field invariant (all-or-none) is enforced by type, not by setter convention.
      */
     JoinHints joinHints;
+
+    /**
+     * Most-recent sort keys seen anywhere in the pipeline. Used by {@code visitReverse} to flip the
+     * active ordering. Set by {@link SqlBuilder.SelectBuilder#orderBy} via {@code wrap}. Survives a
+     * wrap (the keys themselves remain semantically valid even when the SqlSelect changes scope) —
+     * only cleared by visitors that destroy row-level collation (e.g. visitAggregation).
+     */
+    List<SqlNode> lastOrderBy;
+
+    /**
+     * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
+     * NULLS_LAST). Returns {@code null} if no prior sort exists. Used by {@code visitReverse}.
+     */
+    List<SqlNode> reversedLastOrderBy() {
+      return reverseSortKeys(lastOrderBy);
+    }
   }
 
   /** Bind-bare-to-LEFT semantics state for the current join scope. */
@@ -214,7 +234,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   public SqlNode visitHead(Head node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getSize().toString(), POS);
-    return SqlBuilder.select(starList()).from(from).fetch(fetch).wrap(frame);
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
+    Integer fromOffset = node.getFrom();
+    if (fromOffset != null && fromOffset > 0) {
+      b.offset(SqlLiteral.createExactNumeric(fromOffset.toString(), POS));
+    }
+    return b.wrap(frame);
   }
 
   @Override
@@ -222,6 +247,101 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlNode where = expr(node.getCondition());
     return SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitSort(Sort node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    SqlBuilder.SelectBuilder b =
+        SqlBuilder.select(starList()).from(from).orderBy(buildSortKeys(node.getSortList()));
+    if (node.getCount() != null && node.getCount() != 0) {
+      b.fetch(SqlLiteral.createExactNumeric(node.getCount().toString(), POS));
+    }
+    return b.wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitLimit(Limit node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getLimit().toString(), POS);
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
+    if (node.getOffset() != null && node.getOffset() > 0) {
+      b.offset(SqlLiteral.createExactNumeric(node.getOffset().toString(), POS));
+    }
+    return b.wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitReverse(Reverse node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `reverse` flips whatever ordering is currently in effect. We only handle the
+    // explicit-prior-sort case here; the implicit-`__stream_seq__` / @timestamp fallback used by
+    // streamstats is deferred until those visitors land.
+    List<SqlNode> reversed = frame.reversedLastOrderBy();
+    if (reversed == null) {
+      throw new UnsupportedOperationException(
+          "reverse without a prior sort is not yet supported in PPLToSqlNodeVisitor");
+    }
+    return SqlBuilder.select(starList()).from(from).orderBy(reversed).wrap(frame);
+  }
+
+  /** Build SqlNode ORDER BY keys from PPL sort fields. */
+  private List<SqlNode> buildSortKeys(List<Field> sortList) {
+    List<SqlNode> keys = new ArrayList<>(sortList.size());
+    for (Field f : sortList) {
+      SqlNode key = expr(f.getField());
+      Sort.SortOption opt = analyzeSortOption(f.getFieldArgs());
+      if (opt.getSortOrder() == Sort.SortOrder.DESC) {
+        key = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(key), POS);
+      }
+      org.apache.calcite.sql.SqlOperator nullsOp =
+          opt.getNullOrder() == Sort.NullOrder.NULL_LAST
+              ? SqlStdOperatorTable.NULLS_LAST
+              : SqlStdOperatorTable.NULLS_FIRST;
+      keys.add(new SqlBasicCall(nullsOp, List.of(key), POS));
+    }
+    return keys;
+  }
+
+  private static Sort.SortOption analyzeSortOption(List<Argument> args) {
+    boolean desc = false;
+    for (Argument a : args) {
+      if ("asc".equalsIgnoreCase(a.getArgName())) {
+        desc = !((Boolean) a.getValue().getValue());
+      }
+    }
+    return desc ? Sort.SortOption.DEFAULT_DESC : Sort.SortOption.DEFAULT_ASC;
+  }
+
+  /**
+   * Flip each sort key (ASC ↔ DESC, NULLS_FIRST ↔ NULLS_LAST). Recognises the {@code
+   * NULLS_FIRST/LAST(DESC?(expr))} shape produced by {@link #buildSortKeys}.
+   */
+  private static List<SqlNode> reverseSortKeys(List<SqlNode> keys) {
+    if (keys == null || keys.isEmpty()) return null;
+    List<SqlNode> out = new ArrayList<>(keys.size());
+    for (SqlNode k : keys) {
+      if (k instanceof SqlBasicCall outer
+          && (outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
+              || outer.getOperator() == SqlStdOperatorTable.NULLS_LAST)) {
+        org.apache.calcite.sql.SqlOperator flippedNulls =
+            outer.getOperator() == SqlStdOperatorTable.NULLS_FIRST
+                ? SqlStdOperatorTable.NULLS_LAST
+                : SqlStdOperatorTable.NULLS_FIRST;
+        SqlNode inner = outer.operand(0);
+        SqlNode flippedInner;
+        if (inner instanceof SqlBasicCall innerCall
+            && innerCall.getOperator() == SqlStdOperatorTable.DESC) {
+          flippedInner = innerCall.operand(0);
+        } else {
+          flippedInner = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(inner), POS);
+        }
+        out.add(new SqlBasicCall(flippedNulls, List.of(flippedInner), POS));
+      } else {
+        out.add(k);
+      }
+    }
+    return out;
   }
 
   @Override

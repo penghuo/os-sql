@@ -79,7 +79,9 @@ final class SqlBuilder {
     private final SqlNodeList items;
     private SqlNode from;
     private SqlNode where;
+    private List<SqlNode> orderBy;
     private SqlLiteral fetch;
+    private SqlLiteral offset;
     private List<String> newFields;
 
     private SelectBuilder(SqlNodeList items) {
@@ -96,8 +98,23 @@ final class SqlBuilder {
       return this;
     }
 
+    /**
+     * Set ORDER BY. Each key should already carry direction/nulls wrappers (DESC, NULLS_FIRST). The
+     * keys are also recorded on the frame as the "most recent ordering" so a downstream {@code
+     * visitReverse} can flip them.
+     */
+    SelectBuilder orderBy(List<SqlNode> keys) {
+      this.orderBy = keys;
+      return this;
+    }
+
     SelectBuilder fetch(SqlLiteral fetch) {
       this.fetch = fetch;
+      return this;
+    }
+
+    SelectBuilder offset(SqlLiteral offset) {
+      this.offset = offset;
       return this;
     }
 
@@ -122,19 +139,37 @@ final class SqlBuilder {
         frame.currentFields = newFields;
       }
       frame.joinHints = null;
-      return new SqlSelect(
-          POS,
-          /* keywordList */ SqlNodeList.EMPTY,
-          items,
-          from,
-          where,
-          /* groupBy */ null,
-          /* having */ null,
-          /* windowDecls */ null,
-          /* orderBy */ null,
-          /* offset */ null,
-          fetch,
-          /* hints */ null);
+      if (orderBy != null) {
+        // Record so a downstream visitReverse can flip the active ordering.
+        frame.lastOrderBy = orderBy;
+      }
+      // Build a plain SELECT ... FROM ... [WHERE ...]; ORDER BY / FETCH / OFFSET go on a wrapping
+      // SqlOrderBy. Putting them directly on SqlSelect trips Calcite's precedence-driven
+      // subquery-wrap path during unparse, dropping the order on the outermost select.
+      SqlSelect select =
+          new SqlSelect(
+              POS,
+              /* keywordList */ SqlNodeList.EMPTY,
+              items,
+              from,
+              where,
+              /* groupBy */ null,
+              /* having */ null,
+              /* windowDecls */ null,
+              /* orderBy */ null,
+              /* offset */ null,
+              /* fetch */ null,
+              /* hints */ null);
+      if (orderBy != null || fetch != null || offset != null) {
+        SqlNodeList ord = new SqlNodeList(POS);
+        if (orderBy != null) {
+          for (SqlNode k : orderBy) {
+            ord.add(k);
+          }
+        }
+        return new org.apache.calcite.sql.SqlOrderBy(POS, select, ord, offset, fetch);
+      }
+      return select;
     }
   }
 

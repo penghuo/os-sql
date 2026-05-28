@@ -70,7 +70,7 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | 19 | CalcitePPLCastFunctionIT | ✅ | 42/42 after refactoring ExprIPType to extend ExprSqlType(VARCHAR). `cast(ip as STRING)` is now a trivial identity cast; no custom UDF needed. IP comparisons still dispatch via EQUALS_IP/LESS_IP (matched by class identity). |
 | 20 | CalcitePPLConditionBuiltinFunctionIT | ✅ | 24/24 pass after two R3 fixes: (a) EnhancedCoalesceFunction `getOperandMetadata` was `null`, validator's overload-filter called `SqlOperator.getOperandCountRange()` which throws by default. Provided permissive variadic metadata accepting 1+ operands. (b) STRING_TIMESTAMP was `family(CHARACTER, TIMESTAMP)`; EXPR_TIMESTAMP UDT reports as VARCHAR/CHARACTER not TIMESTAMP, so EARLIEST/LATEST validator rejected the call. Switched to `wrapUDT(List.of(STRING_T, TIMESTAMP_UDT))`. |
 | 21 | CalciteMathematicalFunctionIT | ✅ | 62/62 pass after renaming the CONV UDF from "CONVERT" to "CONV". CONVERT is reserved special-syntax in SQL (CONVERT(value USING charset)); the unparsed `CONVERT(age, 10, 16)` failed Babel parsing. Renamed to the canonical Spark/MySQL name. |
-| 22 | CalciteOperatorIT | ⏳ | |
+| 22 | CalciteOperatorIT | ✅ | 42/42 pass. |
 
 ## Phase 4 — Aggregate hints (expected REGRESSION: reapplyAggregateHints removed)
 

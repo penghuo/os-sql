@@ -122,6 +122,10 @@ The execution engine is Apache Calcite-based, toggled via `plugins.calcite.enabl
 - Some features require pushdown optimization — use `enabledOnlyWhenPushdownIsEnabled()` to skip tests in `CalciteNoPushdownIT`
 - `CalciteNoPushdownIT` re-runs Calcite test classes with pushdown disabled; add new test classes to its `@Suite.SuiteClasses` list
 
+## RelNode → SQL → RelNode Round Trip
+
+`SqlNodePipeline.revalidate` routes every PPL plan through `RelToSqlConverter → SqlValidator → SqlToRelConverter`, making the validator the single source of type truth. When a round-trip failure surfaces, **diagnose to the actual layer** — operator-table coverage, operand metadata, dialect unparse, pushdown pattern match, or literal-type drift — rather than adding a bypass guard. Full guideline (principles, rules, decision flow, cookbook) at `docs/dev/rel-to-sql-guideline.md`.
+
 ## Integration Tests
 
 Located in `integ-test/src/test/java/`. Organized by area: `sql/`, `ppl/`, `calcite/`, `legacy/`, `jdbc/`, `datasource/`, `asyncquery/`, `security/`. Uses OpenSearch test framework (in-memory cluster per test class). YAML REST tests in `integ-test/src/yamlRestTest/resources/rest-api-spec/test/`.

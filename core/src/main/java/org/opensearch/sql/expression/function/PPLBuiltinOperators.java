@@ -138,7 +138,10 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   // Math functions
   public static final SqlOperator SPAN = new SpanFunction().toUDF("SPAN");
   public static final SqlOperator E = new EulerFunction().toUDF("E");
-  public static final SqlOperator CONV = new ConvFunction().toUDF("CONVERT");
+  // Use CONV (Spark/MySQL name), NOT "CONVERT": CONVERT is a reserved special-syntax keyword in
+  // Calcite's parser (CONVERT(value USING charset)) and the Babel parser cannot accept a 3-arg
+  // CONVERT(value, fromBase, toBase). Round-trip would fail re-parsing the unparsed SQL.
+  public static final SqlOperator CONV = new ConvFunction().toUDF("CONV");
   public static final SqlOperator MOD = new ModFunction().toUDF("MOD");
   public static final SqlOperator DIVIDE = new DivideFunction().toUDF("DIVIDE");
   public static final SqlOperator SHA2 = CryptographicFunction.sha2().toUDF("SHA2");

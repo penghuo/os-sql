@@ -78,6 +78,7 @@ final class SqlBuilder {
   static final class SelectBuilder {
     private final SqlNodeList items;
     private SqlNode from;
+    private SqlNode where;
     private SqlLiteral fetch;
     private List<String> newFields;
 
@@ -87,6 +88,11 @@ final class SqlBuilder {
 
     SelectBuilder from(SqlNode from) {
       this.from = from;
+      return this;
+    }
+
+    SelectBuilder where(SqlNode where) {
+      this.where = where;
       return this;
     }
 
@@ -121,7 +127,7 @@ final class SqlBuilder {
           /* keywordList */ SqlNodeList.EMPTY,
           items,
           from,
-          /* where */ null,
+          where,
           /* groupBy */ null,
           /* having */ null,
           /* windowDecls */ null,

@@ -30,6 +30,7 @@ import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Project;
@@ -217,6 +218,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   @Override
+  public SqlNode visitFilter(Filter node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    SqlNode where = expr(node.getCondition());
+    return SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+  }
+
+  @Override
   public SqlNode visitJoin(Join node, Frame frame) {
     // Compose: walk the left side into the parent frame (so currentFields reflects the LEFT side
     // post-walk), then walk the right side in a fresh frame so its independent table/column scope
@@ -250,7 +258,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
     SqlNode condition;
     if (node.getJoinCondition().isPresent()) {
-      condition = exprForOn(node.getJoinCondition().get());
+      condition = expr(node.getJoinCondition().get());
     } else if (node.getJoinFields().isPresent() && !node.getJoinFields().get().isEmpty()) {
       // PPL `join F1, F2 ...` — expand to `ON l.F = r.F AND ...` so qualified refs survive
       // (USING auto-dedupes columns and prevents qualified access; we want the explicit shape).
@@ -474,10 +482,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
-   * Translate ON-clause expressions. Limited subset: literals, qualified names, comparisons,
-   * AND/OR/NOT. Anything else throws — JoinIT exercises only this shape.
+   * Translate a PPL UnresolvedExpression to a Calcite SqlNode. Grows incrementally as visitors land
+   * — current cases are what visitJoin's ON clauses and visitFilter's WHERE conditions exercise.
    */
-  private SqlNode exprForOn(UnresolvedExpression e) {
+  private SqlNode expr(UnresolvedExpression e) {
     if (e instanceof Literal lit) {
       return literalToSqlNode(lit);
     }
@@ -485,27 +493,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return new SqlIdentifier(qn.getParts(), POS);
     }
     if (e instanceof Field f) {
-      return exprForOn(f.getField());
+      return expr(f.getField());
     }
     if (e instanceof Compare c) {
-      SqlNode l = exprForOn(c.getLeft());
-      SqlNode r = exprForOn(c.getRight());
+      SqlNode l = expr(c.getLeft());
+      SqlNode r = expr(c.getRight());
       return new SqlBasicCall(comparisonOperator(c.getOperator()), List.of(l, r), POS);
     }
     if (e instanceof And a) {
       return new SqlBasicCall(
-          SqlStdOperatorTable.AND, List.of(exprForOn(a.getLeft()), exprForOn(a.getRight())), POS);
+          SqlStdOperatorTable.AND, List.of(expr(a.getLeft()), expr(a.getRight())), POS);
     }
     if (e instanceof Or o) {
       return new SqlBasicCall(
-          SqlStdOperatorTable.OR, List.of(exprForOn(o.getLeft()), exprForOn(o.getRight())), POS);
+          SqlStdOperatorTable.OR, List.of(expr(o.getLeft()), expr(o.getRight())), POS);
     }
     if (e instanceof Not n) {
-      return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(exprForOn(n.getExpression())), POS);
+      return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
     }
     throw new UnsupportedOperationException(
-        "ON-clause expression not yet supported in PPLToSqlNodeVisitor: "
-            + e.getClass().getSimpleName());
+        "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
   }
 
   private static org.apache.calcite.sql.SqlOperator comparisonOperator(String op) {

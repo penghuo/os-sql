@@ -41,6 +41,7 @@ import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.AddColTotals;
 import org.opensearch.sql.ast.tree.AddTotals;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Append;
@@ -1942,6 +1943,107 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.joinHints = null;
     frame.lastOrderBy = null;
     return wrapper;
+  }
+
+  @Override
+  public SqlNode visitAddColTotals(AddColTotals node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "addcoltotals requires a known column list — call after a `| fields ...` pipe");
+    }
+    java.util.Map<String, Literal> options = node.getOptions();
+    String labelField = null;
+    if (options != null && options.containsKey("labelfield")) {
+      labelField = options.get("labelfield").getValue().toString();
+    }
+    String label = "Total";
+    if (options != null && options.containsKey("label")) {
+      label = options.get("label").getValue().toString();
+    }
+    java.util.Set<String> aggFieldNames = new java.util.LinkedHashSet<>();
+    if (node.getFieldList() != null) {
+      for (Field f : node.getFieldList()) {
+        aggFieldNames.add(f.getField().toString());
+      }
+    }
+    // Without a row-type oracle, treat every visible column as eligible for SUM unless an
+    // explicit field list is given. Non-numeric columns will surface as a runtime cast error
+    // (matches PPL behaviour: addcoltotals on non-numeric throws).
+    boolean explicitFields = !aggFieldNames.isEmpty();
+    boolean appendLabelField = labelField != null && !frame.currentFields.contains(labelField);
+
+    // Wrap the main pipeline as a subquery so we can UNION ALL it with the summary row.
+    SqlNodeList mainProj = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      mainProj.add(toIdentifier(c));
+    }
+    if (appendLabelField) {
+      // Pad the data side with an empty-VARCHAR placeholder so the UNION's row-type derivation
+      // resolves to VARCHAR (not BIGINT-from-NULL). Match label length so the union doesn't
+      // widen to a longer CHAR(N).
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+              POS);
+      SqlNode pad =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(SqlLiteral.createCharString(" ".repeat(label.length()), POS), varcharSpec),
+              POS);
+      mainProj.add(asAliased(pad, labelField));
+    }
+    SqlSelect mainProjected =
+        new SqlSelect(POS, null, mainProj, from, null, null, null, null, null, null, null, null);
+
+    // Summary row: SELECT SUM(c) AS c (or NULL/label) FROM (mainProjected).
+    SqlNodeList summaryProj = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      boolean shouldAgg = !explicitFields || aggFieldNames.contains(c);
+      if (shouldAgg) {
+        SqlNode sum =
+            new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(c, POS)), POS);
+        summaryProj.add(asAliased(sum, c));
+      } else if (labelField != null && c.equals(labelField)) {
+        summaryProj.add(asAliased(SqlLiteral.createCharString(label, POS), c));
+      } else {
+        summaryProj.add(asAliased(SqlLiteral.createNull(POS), c));
+      }
+    }
+    if (appendLabelField) {
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+              POS);
+      SqlNode lab =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(SqlLiteral.createCharString(label, POS), varcharSpec),
+              POS);
+      summaryProj.add(asAliased(lab, labelField));
+    }
+    SqlNode aggFrom =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS,
+            List.of(mainProjected, new SqlIdentifier("_addct_main_", POS)),
+            POS);
+    SqlSelect summarySelect =
+        new SqlSelect(
+            POS, null, summaryProj, aggFrom, null, null, null, null, null, null, null, null);
+    SqlNode union =
+        new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(mainProjected, summarySelect), POS);
+    SqlNodeList wrapItems = new SqlNodeList(POS);
+    wrapItems.add(SqlIdentifier.star(POS));
+    SqlNode wrapped =
+        new SqlSelect(POS, null, wrapItems, union, null, null, null, null, null, null, null, null);
+    List<String> visible = new ArrayList<>(frame.currentFields);
+    if (appendLabelField) visible.add(labelField);
+    frame.currentFields = visible;
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapped;
   }
 
   @Override

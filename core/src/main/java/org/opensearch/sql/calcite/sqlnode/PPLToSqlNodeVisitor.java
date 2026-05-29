@@ -2163,6 +2163,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           // median(x) is shorthand for percentile_approx(x, 50).
           case "percentile", "percentile_approx", "median" ->
               org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX;
+          // Multi-value aggregates: list/values collect group rows into a string array;
+          // first/last return the first/last value in the group's natural order; take returns
+          // the first N values (the N is passed as a second positional arg).
+          case "list" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LIST;
+          case "values" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.VALUES;
+          case "first" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.FIRST;
+          case "last" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST;
+          case "take" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE;
           default ->
               throw new UnsupportedOperationException(
                   "Aggregate function not yet supported in PPLToSqlNodeVisitor: " + fnLower);
@@ -2176,10 +2184,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     org.apache.calcite.sql.SqlLiteral quantifier =
         distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
-    // percentile/percentile_approx accept an extra `<percent>` arg (and an optional
-    // `<compression>` arg) that PPL stores as the second positional arg on AggregateFunction.
-    // median appends a default 50 when the user didn't supply a percent.
-    if (op == org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX) {
+    // percentile/percentile_approx (extra <percent> arg, with median defaulting to 50),
+    // first/last/take (optional <N>) all carry positional args that PPL stores in
+    // AggregateFunction.argList. Pass them through verbatim.
+    boolean takesExtraArgs =
+        op == org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX
+            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.FIRST
+            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST
+            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE;
+    if (takesExtraArgs) {
       List<SqlNode> args = new ArrayList<>();
       args.add(arg);
       if (af.getArgList() != null) {

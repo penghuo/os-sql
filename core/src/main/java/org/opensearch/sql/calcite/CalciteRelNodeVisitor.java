@@ -299,6 +299,17 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   public RelNode visitFilter(Filter node, CalcitePlanContext context) {
     visitChildren(node, context);
     boolean containsSubqueryExpression = containsSubqueryExpression(node.getCondition());
+    // When the filter holds a subquery and the user did NOT request highlighting, drop
+    // _highlight from the outer relbuilder before creating the correlation variable. After
+    // Track C6 the catalog adds _highlight (MAP<VARCHAR, ANY>) to every TableScan; the
+    // correlation variable captures the outer row's row-type at this point, so _highlight
+    // would otherwise leak into the inner subquery's correlated reference. Calcite's
+    // enumerable codegen materialises the correlation row including all columns and trips
+    // on the non-Comparable MAP. Stripping here is safe — the outer plan's downstream
+    // operators don't reference _highlight when highlight wasn't requested.
+    if (containsSubqueryExpression) {
+      dropHighlightIfNotRequested(context);
+    }
     final Holder<@Nullable RexCorrelVariable> v = Holder.empty();
     if (containsSubqueryExpression) {
       context.relBuilder.variable(v::set);

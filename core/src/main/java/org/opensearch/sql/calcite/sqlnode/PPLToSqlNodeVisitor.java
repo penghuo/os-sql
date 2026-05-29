@@ -53,6 +53,7 @@ import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.Multisearch;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
@@ -930,6 +931,53 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
     return new SqlSelect(POS, null, items, body, null, null, null, null, null, null, null, null);
+  }
+
+  @Override
+  public SqlNode visitMultisearch(Multisearch node, Frame frame) {
+    // PPL `| multisearch [<sub1>] [<sub2>] ...` is N-way UNION ALL with NULL-padding for
+    // missing columns on each branch. Resolve each branch in a fresh frame so we know its
+    // column-set, then pad to the unified schema (preserving each branch's left-to-right
+    // column order).
+    if (node.getSubsearches() == null || node.getSubsearches().isEmpty()) {
+      throw new IllegalArgumentException("Multisearch requires at least one subsearch");
+    }
+    List<SqlNode> branchNodes = new ArrayList<>();
+    List<List<String>> branchCols = new ArrayList<>();
+    List<String> unified = new ArrayList<>();
+    for (UnresolvedPlan sub : node.getSubsearches()) {
+      Frame subFrame = new Frame();
+      Frame savedExpr = this.exprFrame;
+      this.exprFrame = subFrame;
+      try {
+        branchNodes.add(stripImplicitMetaProjects(sub).accept(this, subFrame));
+      } finally {
+        this.exprFrame = savedExpr;
+      }
+      if (subFrame.currentFields == null) {
+        throw new UnsupportedOperationException(
+            "multisearch subsearch requires a known column list");
+      }
+      branchCols.add(new ArrayList<>(subFrame.currentFields));
+      for (String c : subFrame.currentFields) {
+        if (!unified.contains(c)) {
+          unified.add(c);
+        }
+      }
+    }
+    SqlNode union = padToUnifiedSchema(branchNodes.get(0), branchCols.get(0), unified);
+    for (int i = 1; i < branchNodes.size(); i++) {
+      SqlNode padded = padToUnifiedSchema(branchNodes.get(i), branchCols.get(i), unified);
+      union = new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, padded), POS);
+    }
+    SqlNodeList wrapItems = new SqlNodeList(POS);
+    wrapItems.add(SqlIdentifier.star(POS));
+    SqlNode wrapped =
+        new SqlSelect(POS, null, wrapItems, union, null, null, null, null, null, null, null, null);
+    frame.currentFields = unified;
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapped;
   }
 
   @Override

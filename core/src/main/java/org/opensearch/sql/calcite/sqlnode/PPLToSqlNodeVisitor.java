@@ -3053,6 +3053,39 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * row-type oracle and is deferred — Calcite's validator coerces silently in the meantime.
    */
   private SqlNode inExpr(org.opensearch.sql.ast.expression.In in) {
+    // PPL forbids mixing string and numeric literals inside the IN value list. v2 raises a
+    // SemanticCheckException at analyze time. Without a row-type oracle on the field side, do a
+    // best-effort check on the literals themselves: if the list contains both string and
+    // numeric literals, reject. This catches `field in (4180, 5686, '6077')`-style typos.
+    boolean hasString = false;
+    boolean hasNumeric = false;
+    for (UnresolvedExpression v : in.getValueList()) {
+      if (v instanceof Literal lit) {
+        DataType t = lit.getType();
+        if (t == DataType.STRING) hasString = true;
+        else if (t == DataType.INTEGER
+            || t == DataType.LONG
+            || t == DataType.SHORT
+            || t == DataType.DOUBLE
+            || t == DataType.FLOAT
+            || t == DataType.DECIMAL) hasNumeric = true;
+      }
+    }
+    if (hasString && hasNumeric) {
+      // Match v2's error-message shape so PPL clients (and tests) get a stable string.
+      // The "fields type" is reported as the wider numeric (LONG) since the literal types
+      // alone don't tell us the column type — without an oracle this is a best-effort check.
+      List<String> typeNames = new ArrayList<>();
+      for (UnresolvedExpression v : in.getValueList()) {
+        if (v instanceof Literal lit) {
+          typeNames.add(lit.getType().name());
+        } else {
+          typeNames.add("UNKNOWN");
+        }
+      }
+      throw new IllegalArgumentException(
+          "In expression types are incompatible: fields type LONG, values type " + typeNames);
+    }
     SqlNode field = expr(in.getField());
     SqlNodeList values = new SqlNodeList(POS);
     for (UnresolvedExpression v : in.getValueList()) {

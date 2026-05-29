@@ -66,6 +66,7 @@ import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SpanBin;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
+import org.opensearch.sql.ast.tree.Trendline;
 import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.plan.OpenSearchConstants;
@@ -857,6 +858,188 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     items.add(asAliased(bucketCall, alias));
     visible.add(alias);
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitTrendline(Trendline node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `trendline [sort F] sma(N, fld) [as alias] ...`:
+    //   1. Pre-filter NULL values for each computation's data field — rows with NULL in fld
+    //      don't contribute to the rolling window (SQL convention; v2 enforces by WHERE
+    //      fld IS NOT NULL).
+    //   2. Window expression per computation: ROWS N-1 PRECEDING, ORDER BY <sortField if any>.
+    //      SMA → AVG(fld) OVER (window). WMA → Σ(i * NTH_VALUE(fld, i)) / (N*(N+1)/2) over the
+    //      same window.
+    //   3. CASE WHEN COUNT(*) OVER (window) > N-1 THEN <agg> ELSE NULL END — first N-1 rows
+    //      yield NULL while the window isn't full.
+    //   4. Project: when alias collides with an existing field name, override that column
+    //      in place; otherwise append the trendline column at the end.
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "trendline requires a known column list — call after a `| fields ...` pipe");
+    }
+
+    // Step 1: NULL pre-filter for each computation's data field. Combine into a single WHERE.
+    SqlNode whereCond = null;
+    for (Trendline.TrendlineComputation c : node.getComputations()) {
+      SqlNode fieldRef = expr(c.getDataField().getField());
+      SqlNode notNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(fieldRef), POS);
+      whereCond =
+          (whereCond == null)
+              ? notNull
+              : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(whereCond, notNull), POS);
+    }
+
+    // Sort embedded in the OVER clause's ORDER BY. PPL `trendline sort <fld> sma(...)` puts the
+    // ordering inside the window; an outer ORDER BY on the same key is also retained so the
+    // result preserves the requested sort.
+    SqlNodeList windowOrderBy = new SqlNodeList(POS);
+    List<SqlNode> outerOrderBy = null;
+    if (node.getSortByField().isPresent()) {
+      Field sortField = node.getSortByField().get();
+      Sort.SortOption opt = analyzeSortOption(sortField.getFieldArgs());
+      SqlNode key = expr(sortField.getField());
+      if (opt.getSortOrder() == Sort.SortOrder.DESC) {
+        key = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(key), POS);
+      }
+      windowOrderBy.add(key);
+      outerOrderBy = List.of(key);
+    }
+
+    // Wrap the child with the NULL pre-filter so the trendline columns and pre-existing columns
+    // come from the same SELECT scope.
+    SqlNode filtered =
+        new SqlSelect(
+            POS,
+            null,
+            new SqlNodeList(List.of(SqlIdentifier.star(POS)), POS),
+            from,
+            whereCond,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+
+    // Step 2-3: build CASE expressions per computation.
+    java.util.Map<String, SqlNode> aliasOverrides = new java.util.LinkedHashMap<>();
+    List<SqlNode> appended = new ArrayList<>();
+    List<String> appendedNames = new ArrayList<>();
+    for (Trendline.TrendlineComputation c : node.getComputations()) {
+      int n = c.getNumberOfDataPoints();
+      SqlNode lower =
+          new SqlBasicCall(
+              SqlWindow.PRECEDING_OPERATOR,
+              List.of(SqlLiteral.createExactNumeric(Integer.toString(n - 1), POS)),
+              POS);
+      SqlNode upper = SqlWindow.createCurrentRow(POS);
+      SqlNode window =
+          SqlWindow.create(
+              null,
+              null,
+              new SqlNodeList(POS),
+              windowOrderBy,
+              SqlLiteral.createBoolean(true, POS),
+              lower,
+              upper,
+              null,
+              POS);
+      SqlNode fieldRef = expr(c.getDataField().getField());
+      SqlNode countCall =
+          new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(SqlIdentifier.star(POS)), POS);
+      SqlNode countOver =
+          new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCall, window), POS);
+      SqlNode countCondition =
+          new SqlBasicCall(
+              SqlStdOperatorTable.GREATER_THAN,
+              List.of(countOver, SqlLiteral.createExactNumeric(Integer.toString(n - 1), POS)),
+              POS);
+      SqlNode windowedAgg;
+      switch (c.getComputationType()) {
+        case SMA -> {
+          SqlNode agg = new SqlBasicCall(SqlStdOperatorTable.AVG, List.of(fieldRef), POS);
+          windowedAgg = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(agg, window), POS);
+        }
+        case WMA -> {
+          // WMA = Σ(i * NTH_VALUE(field, i)) / (N*(N+1)/2). Cast the divisor to DOUBLE so the
+          // result is double-precision (matches v2's type promotion).
+          SqlNode divider = null;
+          for (int i = 1; i <= n; i++) {
+            SqlNode nth =
+                new SqlBasicCall(
+                    SqlStdOperatorTable.NTH_VALUE,
+                    List.of(fieldRef, SqlLiteral.createExactNumeric(Integer.toString(i), POS)),
+                    POS);
+            SqlNode nthOver = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(nth, window), POS);
+            SqlNode weighted =
+                new SqlBasicCall(
+                    SqlStdOperatorTable.MULTIPLY,
+                    List.of(SqlLiteral.createExactNumeric(Integer.toString(i), POS), nthOver),
+                    POS);
+            divider =
+                divider == null
+                    ? weighted
+                    : new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(divider, weighted), POS);
+          }
+          org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
+              new org.apache.calcite.sql.SqlDataTypeSpec(
+                  new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                      org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+                  POS);
+          SqlNode divisor =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                  List.of(
+                      SqlLiteral.createExactNumeric(Integer.toString(n * (n + 1) / 2), POS),
+                      doubleSpec),
+                  POS);
+          windowedAgg =
+              new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(divider, divisor), POS);
+        }
+        default ->
+            throw new UnsupportedOperationException(
+                "Unsupported trendline type: " + c.getComputationType());
+      }
+      SqlNodeList whens = new SqlNodeList(POS);
+      whens.add(countCondition);
+      SqlNodeList thens = new SqlNodeList(POS);
+      thens.add(windowedAgg);
+      SqlNode caseExpr =
+          new org.apache.calcite.sql.fun.SqlCase(
+              POS, null, whens, thens, SqlLiteral.createNull(POS));
+      String alias = c.getAlias();
+      if (frame.currentFields.contains(alias)) {
+        aliasOverrides.put(alias, caseExpr);
+      } else {
+        appended.add(caseExpr);
+        appendedNames.add(alias);
+      }
+    }
+
+    // Step 4: build SELECT list — original columns (overridden where alias collides), then
+    // appended trendline columns.
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : frame.currentFields) {
+      if (aliasOverrides.containsKey(c)) {
+        items.add(asAliased(aliasOverrides.get(c), c));
+      } else {
+        items.add(toIdentifier(c));
+      }
+      visible.add(c);
+    }
+    for (int i = 0; i < appended.size(); i++) {
+      items.add(asAliased(appended.get(i), appendedNames.get(i)));
+      visible.add(appendedNames.get(i));
+    }
+
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(items).from(filtered).withFields(visible);
+    if (outerOrderBy != null) {
+      b.orderBy(outerOrderBy);
+    }
+    return b.wrap(frame);
   }
 
   @Override

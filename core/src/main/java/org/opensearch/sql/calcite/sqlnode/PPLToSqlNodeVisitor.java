@@ -42,6 +42,7 @@ import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Convert;
 import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
@@ -682,6 +683,89 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitConvert(Convert node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `convert [timeformat="<fmt>"] fn(field) [AS alias] [, ...]`. When alias == source,
+    // replace the source column in-place; with an alias, append a new column.
+    // ctime/mktime accept a custom timeformat as a second arg when supplied.
+    List<Let> conversions = node.getConversions();
+    if (conversions == null || conversions.isEmpty()) {
+      return from;
+    }
+    java.util.Map<String, SqlNode> replacements = new java.util.LinkedHashMap<>();
+    java.util.LinkedHashMap<String, SqlNode> additions = new java.util.LinkedHashMap<>();
+    String timeFormat = node.getTimeFormat();
+    for (Let conv : conversions) {
+      String target = conv.getVar().getField().toString();
+      UnresolvedExpression rhs = conv.getExpression();
+      if (rhs instanceof Field srcField) {
+        // `convert none(field) AS alias` — copy/rename only, no conversion.
+        String source = srcField.getField().toString();
+        if (!target.equals(source)) {
+          additions.put(target, expr(srcField));
+        }
+        continue;
+      }
+      if (!(rhs instanceof org.opensearch.sql.ast.expression.Function fn)) {
+        throw new IllegalArgumentException("Convert command requires function call expressions");
+      }
+      if (fn.getFuncArgs().size() != 1 || !(fn.getFuncArgs().get(0) instanceof Field srcField)) {
+        throw new IllegalArgumentException("Convert function must have exactly one field argument");
+      }
+      String source = srcField.getField().toString();
+      SqlNode call;
+      String fnName = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+      if (timeFormat != null && (fnName.equals("ctime") || fnName.equals("mktime"))) {
+        call =
+            new SqlBasicCall(
+                new org.apache.calcite.sql.SqlUnresolvedFunction(
+                    new SqlIdentifier(fn.getFuncName(), POS),
+                    null,
+                    null,
+                    null,
+                    null,
+                    org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                List.of(expr(srcField), SqlLiteral.createCharString(timeFormat, POS)),
+                POS);
+      } else {
+        call = expr(fn);
+      }
+      if (target.equals(source)) {
+        replacements.put(source, call);
+      } else {
+        additions.put(target, call);
+      }
+    }
+    // Build the final projection list. When frame.currentFields is null (bare relation), fall
+    // back to `*` plus the appended columns; explicit replacements need the full column list.
+    List<String> visible = frame.currentFields == null ? List.of() : frame.currentFields;
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> newVisible = new ArrayList<>();
+    if (!visible.isEmpty()) {
+      for (String c : visible) {
+        if (replacements.containsKey(c)) {
+          items.add(asAliased(replacements.get(c), c));
+        } else {
+          items.add(toIdentifier(c));
+        }
+        newVisible.add(c);
+      }
+    } else {
+      // No oracle: emit `*` and trust replacements via additional aliased projections. Will not
+      // override an existing column, but works for the common case of new aliases.
+      items.add(SqlIdentifier.star(POS));
+    }
+    for (java.util.Map.Entry<String, SqlNode> e : additions.entrySet()) {
+      items.add(asAliased(e.getValue(), e.getKey()));
+      newVisible.add(e.getKey());
+    }
+    return SqlBuilder.select(items)
+        .from(from)
+        .withFields(newVisible.isEmpty() ? null : newVisible)
+        .wrap(frame);
   }
 
   @Override

@@ -2318,12 +2318,48 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
-   * Translate {@code CAST(expr AS type)}. Currently only STRING/numeric/boolean — date/IP UDT casts
-   * stay deferred until those visitors land.
+   * Translate {@code CAST(expr AS type)}. Numeric/string casts use SAFE_CAST. The OpenSearch UDTs
+   * (DATE/TIME/TIMESTAMP/IP) dispatch to PPL UDFs because SQL's CAST cannot represent the UDT's
+   * row-type — the UDF call establishes the EXPR_* type and uses PPL's format-permissive parser.
    */
   private SqlNode castExpr(Cast c) {
     SqlNode value = expr(c.getExpression());
-    org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(c.getDataType());
+    DataType targetType = c.getDataType();
+    // PPL `cast(<numeric> as ip)` is rejected: only STRING and IP types convert to IP.
+    if (targetType == DataType.IP) {
+      UnresolvedExpression src = c.getExpression();
+      if (src instanceof Literal lit) {
+        switch (lit.getType()) {
+          case SHORT, INTEGER, LONG, FLOAT, DOUBLE, DECIMAL ->
+              throw new IllegalArgumentException(
+                  String.format(
+                      "Cannot convert %s to IP, only STRING and IP types are supported",
+                      lit.getType()));
+          default -> {}
+        }
+      }
+    }
+    String udtFunc =
+        switch (targetType) {
+          case IP -> "IP";
+          case DATE -> "DATE";
+          case TIME -> "TIME";
+          case TIMESTAMP -> "TIMESTAMP";
+          default -> null;
+        };
+    if (udtFunc != null) {
+      return new SqlBasicCall(
+          new org.apache.calcite.sql.SqlUnresolvedFunction(
+              new SqlIdentifier(udtFunc, POS),
+              null,
+              null,
+              null,
+              null,
+              org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+          List.of(value),
+          POS);
+    }
+    org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(targetType);
     org.apache.calcite.sql.SqlDataTypeSpec spec =
         new org.apache.calcite.sql.SqlDataTypeSpec(
             new org.apache.calcite.sql.SqlBasicTypeNameSpec(tn, POS), POS);

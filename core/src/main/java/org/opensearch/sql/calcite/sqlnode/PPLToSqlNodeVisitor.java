@@ -69,6 +69,7 @@ import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.Trendline;
 import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
+import org.opensearch.sql.ast.tree.Window;
 import org.opensearch.sql.calcite.plan.OpenSearchConstants;
 import org.opensearch.sql.calcite.utils.WildcardUtils;
 
@@ -857,6 +858,90 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     items.add(asAliased(bucketCall, alias));
     visible.add(alias);
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitWindow(Window node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `eventstats <agg1>[ as a1], <agg2>[ as a2], ... [by g1, g2, ...]` appends one column
+    // per agg to every input row using a window function: `<agg> OVER (PARTITION BY <gs>)`.
+    // The result preserves the input row count (in contrast to `stats` which collapses to one
+    // row per group).
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "eventstats requires a known column list — call after a `| fields ...` pipe");
+    }
+    if (!node.isBucketNullable()) {
+      // bucket_nullable=false requires CASE-WHEN-IS-NOT-NULL wrapping per-agg; deferred.
+      throw new UnsupportedOperationException(
+          "eventstats bucket_nullable=false not yet supported in PPLToSqlNodeVisitor");
+    }
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    for (UnresolvedExpression p : node.getGroupList()) {
+      UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+      partitionBy.add(expr(core));
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : frame.currentFields) {
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    for (UnresolvedExpression item : node.getWindowFunctionList()) {
+      Alias al = (Alias) item;
+      org.opensearch.sql.ast.expression.WindowFunction wf =
+          (org.opensearch.sql.ast.expression.WindowFunction) al.getDelegated();
+      // PPL eventstats wraps aggs as `WindowFunction(Function(name, args))` (parser path), while
+      // stats wraps them as `AggregateFunction`. Normalize the Function shape into
+      // AggregateFunction so aggCall's dispatch sees a uniform input.
+      UnresolvedExpression aggInput = wf.getFunction();
+      if (aggInput instanceof org.opensearch.sql.ast.expression.Function f) {
+        // count() parses as Function("count", []). Default to AllFields so aggCall emits
+        // COUNT(*); other zero-arg aggs are not valid in eventstats and would surface a
+        // validator error downstream.
+        UnresolvedExpression argExpr =
+            f.getFuncArgs().isEmpty() ? AllFields.of() : f.getFuncArgs().get(0);
+        java.util.List<UnresolvedExpression> rest =
+            f.getFuncArgs().size() > 1
+                ? f.getFuncArgs().subList(1, f.getFuncArgs().size())
+                : java.util.List.of();
+        aggInput = new AggregateFunction(f.getFuncName(), argExpr, rest);
+      }
+      String fnLower =
+          aggInput instanceof AggregateFunction afn
+              ? afn.getFuncName().toLowerCase(java.util.Locale.ROOT)
+              : "";
+      if (fnLower.equals("dc")
+          || fnLower.equals("distinct_count")
+          || fnLower.equals("distinct_count_approx")) {
+        // Calcite forbids COUNT(DISTINCT) inside OVER. Emulation via dual-DENSE_RANK windows
+        // requires extra plumbing — defer.
+        throw new UnsupportedOperationException(
+            "eventstats distinct_count not yet supported in PPLToSqlNodeVisitor");
+      }
+      if (fnLower.equals("percentile")
+          || fnLower.equals("percentile_approx")
+          || fnLower.equals("median")) {
+        throw new UnsupportedOperationException(
+            "eventstats percentile aggregates have no window form");
+      }
+      SqlNode aggNode = aggCall(aggInput);
+      SqlNode window =
+          SqlWindow.create(
+              null,
+              null,
+              partitionBy,
+              new SqlNodeList(POS),
+              SqlLiteral.createBoolean(false, POS),
+              null,
+              null,
+              null,
+              POS);
+      SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      items.add(asAliased(over, al.getName()));
+      visible.add(al.getName());
+    }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 

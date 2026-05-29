@@ -3505,7 +3505,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     String fnLower = af.getFuncName().toLowerCase(java.util.Locale.ROOT);
     boolean distinct = Boolean.TRUE.equals(af.getDistinct());
-    if (fnLower.equals("dc") || fnLower.equals("distinct_count")) {
+    if (fnLower.equals("dc")
+        || fnLower.equals("distinct_count")
+        || fnLower.equals("distinct_count_approx")) {
+      // distinct_count_approx is HLL-style in v2 PPL but the legacy SqlNode visitor maps it to
+      // plain COUNT(DISTINCT) — match that behaviour.
       fnLower = "count";
       distinct = true;
     } else if (fnLower.equals("c")) {

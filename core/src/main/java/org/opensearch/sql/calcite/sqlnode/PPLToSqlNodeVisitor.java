@@ -77,6 +77,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<String> currentFields;
 
     /**
+     * Alias-name synonyms: when AstBuilder injects {@code SubqueryAlias("outer", SubqueryAlias(
+     * "inner", X))} for a side that has both an inner {@code as inner} AND an explicit {@code
+     * left=outer} or {@code right=outer} join arg, the outer name overrides for the validator while
+     * {@code inner} is recorded here so a downstream {@code | fields inner.col} still resolves
+     * under {@code outer.col}. Empty when no synonyms are active.
+     */
+    java.util.Map<String, String> aliasSynonyms = new java.util.LinkedHashMap<>();
+
+    /**
      * Set by an upstream {@code visitJoin} when the explicit-ON path leaves alias scope live for
      * the next pipe (so a downstream {@code | fields t1.col} can resolve). Cleared when a wrap
      * seals scope. {@code null} when no join hint applies. Stored as a single record so the
@@ -107,6 +116,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   /** Resolves a table qualified name (e.g. {@code ["my_index"]}) to its column names. */
   private final Function<List<String>, List<String>> tableFields;
 
+  /**
+   * The Frame currently in scope at expression-translation time. Set by {@link #translate} and
+   * swapped by {@link #visitJoin} during the right walk so {@link #expr} and {@link #toIdentifier}
+   * can apply alias synonyms recorded by upstream {@code visitSubqueryAlias} chain collapse or
+   * {@code applyExplicitAlias} alias displacement. Threading the Frame through every {@code expr()}
+   * call would cascade through many helpers; a transient pointer is simpler and the visit is
+   * single-threaded.
+   */
+  private Frame exprFrame;
+
   public PPLToSqlNodeVisitor(Function<List<String>, List<String>> tableFields) {
     this.tableFields = tableFields;
   }
@@ -114,6 +133,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   /** Public entry point. */
   public SqlNode translate(UnresolvedPlan plan) {
     Frame frame = new Frame();
+    this.exprFrame = frame;
     return stripImplicitMetaProjects(plan).accept(this, frame);
   }
 
@@ -192,7 +212,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   @Override
   public SqlNode visitSubqueryAlias(SubqueryAlias node, Frame frame) {
-    SqlNode inner = node.getChild().get(0).accept(this, frame);
+    // Collapse `SubqueryAlias("outer", SubqueryAlias("inner", X))` chains. AstBuilder produces
+    // this shape when both an explicit `left=outer` (or `right=outer`) join arg AND an inner
+    // `as inner` are given on the same side. SQL only accepts one alias per relation; the outer
+    // join-arg alias wins, and each inner name is recorded as a synonym so a downstream
+    // `| fields inner.col` still resolves.
+    UnresolvedPlan child = node.getChild().get(0);
+    while (child instanceof SubqueryAlias innerSa) {
+      frame.aliasSynonyms.put(innerSa.getAlias(), node.getAlias());
+      child = innerSa.getChild().get(0);
+    }
+    SqlNode inner = child.accept(this, frame);
     // PPL allows `source = X as i` and `[ source = X ] as i`; both produce a SubqueryAlias around
     // either a bare Relation or a sub-pipeline. Calcite needs the alias attached as a SqlNode
     // AS-call so qualified refs `i.col` resolve.
@@ -557,7 +587,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // doesn't leak back. Build the SqlJoin from both sides plus the ON condition.
     SqlNode leftSide = node.getChildren().get(0).accept(this, frame);
     Frame rightFrame = new Frame();
+    Frame savedExprFrame = this.exprFrame;
+    this.exprFrame = rightFrame;
     SqlNode rightSide = node.getRight().accept(this, rightFrame);
+    this.exprFrame = savedExprFrame;
+    // Promote synonyms recorded during the right walk into the parent frame: they're scoped to
+    // this join's outer pipeline (e.g. `[Y as tt] right=t2 | ... | fields tt.col` resolves through
+    // the join's lifetime, not just inside the right subsearch).
+    if (!rightFrame.aliasSynonyms.isEmpty()) {
+      frame.aliasSynonyms.putAll(rightFrame.aliasSynonyms);
+    }
 
     // Apply max=N per-partition cap on the right side BEFORE attaching the join-arg alias so the
     // cap is invisible to the outer scope. The cluster-wide subsearch_maxout cap is applied
@@ -576,8 +615,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Settle the left/right alias if explicit. When the side is already AS-wrapped under a
     // different name (e.g. user wrote `source=X as tt | JOIN left=t1 ...`), the explicit join-arg
     // alias OVERRIDES the inner SubqueryAlias name — the outer scope sees only the new alias.
-    leftSide = applyExplicitAlias(leftSide, leftAlias);
-    rightSide = applyExplicitAlias(rightSide, rightAlias);
+    // Record the displaced inner alias as a synonym so a downstream `| fields tt.col` resolves.
+    leftSide = applyExplicitAlias(leftSide, leftAlias, frame);
+    rightSide = applyExplicitAlias(rightSide, rightAlias, frame);
 
     JoinType jt = mapJoinType(node.getJoinType());
 
@@ -950,7 +990,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return literalToSqlNode(lit);
     }
     if (e instanceof QualifiedName qn) {
-      return new SqlIdentifier(qn.getParts(), POS);
+      List<String> parts = qn.getParts();
+      if (exprFrame != null
+          && !exprFrame.aliasSynonyms.isEmpty()
+          && parts.size() >= 2
+          && exprFrame.aliasSynonyms.containsKey(parts.get(0))) {
+        List<String> rewritten = new ArrayList<>(parts);
+        rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
+        return new SqlIdentifier(rewritten, POS);
+      }
+      return new SqlIdentifier(parts, POS);
     }
     if (e instanceof Field f) {
       return expr(f.getField());
@@ -1250,10 +1299,23 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return out;
   }
 
-  /** Convert a possibly-dotted field name into a {@link SqlIdentifier} with multiple parts. */
-  private static SqlIdentifier toIdentifier(String name) {
-    if (name.indexOf('.') < 0) return new SqlIdentifier(name, POS);
-    return new SqlIdentifier(Arrays.asList(name.split("\\.")), POS);
+  /**
+   * Convert a possibly-dotted field name into a {@link SqlIdentifier}. Applies any active alias
+   * synonyms (recorded by {@code visitSubqueryAlias} chain collapse or {@code applyExplicitAlias}
+   * displacement) so a downstream {@code | fields tt.col} on a `[Y as tt] right=t2` join still
+   * resolves under {@code t2.col} for the validator.
+   */
+  private SqlIdentifier toIdentifier(String name) {
+    List<String> parts = name.indexOf('.') < 0 ? List.of(name) : Arrays.asList(name.split("\\."));
+    if (exprFrame != null
+        && !exprFrame.aliasSynonyms.isEmpty()
+        && parts.size() >= 2
+        && exprFrame.aliasSynonyms.containsKey(parts.get(0))) {
+      List<String> rewritten = new ArrayList<>(parts);
+      rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
+      return new SqlIdentifier(rewritten, POS);
+    }
+    return new SqlIdentifier(parts, POS);
   }
 
   /**
@@ -1262,7 +1324,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * references to the LEFT side. Names that are already qualified ({@code a.col}) pass through
    * unchanged.
    */
-  private static SqlIdentifier qualifyIfAmbiguous(String name, Frame frame) {
+  private SqlIdentifier qualifyIfAmbiguous(String name, Frame frame) {
     JoinHints hints = frame.joinHints;
     if (name.indexOf('.') < 0
         && hints != null
@@ -1280,12 +1342,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * semantics: an explicit {@code left=t1}/{@code right=t2} on the JOIN command overrides any inner
    * SubqueryAlias for the join's outer scope.
    */
-  private static SqlNode applyExplicitAlias(SqlNode side, String explicitAlias) {
+  private static SqlNode applyExplicitAlias(SqlNode side, String explicitAlias, Frame frame) {
     if (explicitAlias == null) return side;
-    SqlNode inner =
-        side instanceof SqlBasicCall sbc && sbc.getOperator() == SqlStdOperatorTable.AS
-            ? sbc.operand(0)
-            : side;
+    SqlNode inner = side;
+    if (side instanceof SqlBasicCall sbc && sbc.getOperator() == SqlStdOperatorTable.AS) {
+      inner = sbc.operand(0);
+      // Inner alias is being displaced; remember the mapping so qualified refs `<displaced>.col`
+      // still resolve in downstream pipes via the same scope's synonym map.
+      SqlNode displacedAlias = sbc.operand(1);
+      if (displacedAlias instanceof SqlIdentifier id && !id.names.isEmpty()) {
+        String displaced = id.names.get(0);
+        if (!displaced.equals(explicitAlias)) {
+          frame.aliasSynonyms.put(displaced, explicitAlias);
+        }
+      }
+    }
     return new SqlBasicCall(
         SqlStdOperatorTable.AS, List.of(inner, new SqlIdentifier(explicitAlias, POS)), POS);
   }

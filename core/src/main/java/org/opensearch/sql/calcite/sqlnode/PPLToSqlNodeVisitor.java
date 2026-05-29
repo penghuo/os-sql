@@ -500,19 +500,58 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       items.add(asAliased(keyExpr, spanAlias));
       visible.add(spanAlias);
     }
+    List<SqlNode> nonSpanGroupExprs = new ArrayList<>();
     for (UnresolvedExpression groupExpr : node.getGroupExprList()) {
       String alias = aggLabel(groupExpr);
       UnresolvedExpression core = (groupExpr instanceof Alias a) ? a.getDelegated() : groupExpr;
       SqlNode keyExpr = expr(core);
       groupKeys.add(keyExpr);
+      nonSpanGroupExprs.add(keyExpr);
       items.add(asAliased(keyExpr, alias));
       visible.add(alias);
     }
     // Aggregations destroy row-level collation; clear the lastOrderBy hint.
     frame.lastOrderBy = null;
 
+    // PPL `stats bucket_nullable=false ... by X, Y` excludes rows where any group key is NULL.
+    // Default true keeps NULL buckets. The argExprList carries the option literal.
+    boolean bucketNullable = true;
+    if (node.getArgExprList() != null) {
+      for (Argument arg : node.getArgExprList()) {
+        if (Argument.BUCKET_NULLABLE.equals(arg.getArgName())
+            && arg.getValue() != null
+            && Boolean.FALSE.equals(arg.getValue().getValue())) {
+          bucketNullable = false;
+        }
+      }
+    }
+    SqlNode where = null;
+    if (!bucketNullable) {
+      // For span-based group keys, filter on the source field (not the SPAN call) so the inner
+      // SELECT exposes the bare column. Mirrors v2's emission shape.
+      List<SqlNode> filterKeys = new ArrayList<>();
+      if (node.getSpan() != null) {
+        UnresolvedExpression spanCore =
+            (node.getSpan() instanceof Alias al) ? al.getDelegated() : node.getSpan();
+        if (spanCore instanceof Span sp) {
+          filterKeys.add(expr(sp.getField()));
+        }
+      }
+      filterKeys.addAll(nonSpanGroupExprs);
+      for (SqlNode k : filterKeys) {
+        SqlNode notNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(k), POS);
+        where =
+            (where == null)
+                ? notNull
+                : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(where, notNull), POS);
+      }
+    }
+
     SqlBuilder.SelectBuilder b =
         SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible);
+    if (where != null) {
+      b.where(where);
+    }
     // Implicit ORDER BY on the span column when the upstream contains a JOIN. v2's RelBuilder
     // pipeline preserves the OpenSearch terms-aggregation collation from the post-join scan; the
     // SqlNode pipeline emits a plain SQL Aggregate which Calcite is free to render without
@@ -1279,6 +1318,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           case "stddev_pop" -> SqlStdOperatorTable.STDDEV_POP;
           case "variance", "var_samp" -> SqlStdOperatorTable.VAR_SAMP;
           case "var_pop" -> SqlStdOperatorTable.VAR_POP;
+          // percentile/percentile_approx/median dispatch to the OpenSearch T-Digest UDAF.
+          // median(x) is shorthand for percentile_approx(x, 50).
+          case "percentile", "percentile_approx", "median" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX;
           default ->
               throw new UnsupportedOperationException(
                   "Aggregate function not yet supported in PPLToSqlNodeVisitor: " + fnLower);
@@ -1292,6 +1335,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     org.apache.calcite.sql.SqlLiteral quantifier =
         distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
+    // percentile/percentile_approx accept an extra `<percent>` arg (and an optional
+    // `<compression>` arg) that PPL stores as the second positional arg on AggregateFunction.
+    // median appends a default 50 when the user didn't supply a percent.
+    if (op == org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX) {
+      List<SqlNode> args = new ArrayList<>();
+      args.add(arg);
+      if (af.getArgList() != null) {
+        for (UnresolvedExpression extra : af.getArgList()) {
+          // PPL passes extra args as named UnresolvedArgument(name, value); unwrap the value.
+          if (extra instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
+            args.add(expr(ua.getValue()));
+          } else {
+            args.add(expr(extra));
+          }
+        }
+      }
+      if (fnLower.equals("median") && args.size() == 1) {
+        args.add(SqlLiteral.createExactNumeric("50", POS));
+      }
+      return new SqlBasicCall(op, args, POS, quantifier);
+    }
     return new SqlBasicCall(op, List.of(arg), POS, quantifier);
   }
 

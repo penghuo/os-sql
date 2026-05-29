@@ -927,16 +927,108 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (fnLower.equals("dc")
           || fnLower.equals("distinct_count")
           || fnLower.equals("distinct_count_approx")) {
-        // Calcite forbids COUNT(DISTINCT) inside OVER. Emulation via dual-DENSE_RANK windows
-        // requires extra plumbing — defer.
-        throw new UnsupportedOperationException(
-            "eventstats distinct_count not yet supported in PPLToSqlNodeVisitor");
+        // Calcite forbids COUNT(DISTINCT x) inside OVER. Emulate via two dense_rank windows:
+        //   forward = dense_rank() OVER (PARTITION BY p ORDER BY x ASC)
+        //   reverse = dense_rank() OVER (PARTITION BY p ORDER BY x DESC)
+        //   distinct_count = forward + reverse - 1 - (1 if any NULL else 0)
+        // forward + reverse - 1 counts distinct values including NULL; subtracting the
+        // any-NULL flag gives PPL's NULL-ignoring distinct_count.
+        AggregateFunction af = (AggregateFunction) aggInput;
+        UnresolvedExpression argExpr = af.getField();
+        if (argExpr == null || argExpr instanceof AllFields) {
+          throw new UnsupportedOperationException("distinct_count requires a field argument");
+        }
+        SqlNode argRef = expr(argExpr);
+        SqlNodeList orderAsc = new SqlNodeList(POS);
+        orderAsc.add(expr(argExpr));
+        SqlNodeList orderDesc = new SqlNodeList(POS);
+        orderDesc.add(new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(expr(argExpr)), POS));
+        SqlNode wAsc =
+            SqlWindow.create(
+                null,
+                null,
+                partitionBy,
+                orderAsc,
+                SqlLiteral.createBoolean(false, POS),
+                null,
+                null,
+                null,
+                POS);
+        SqlNode wDesc =
+            SqlWindow.create(
+                null,
+                null,
+                partitionBy,
+                orderDesc,
+                SqlLiteral.createBoolean(false, POS),
+                null,
+                null,
+                null,
+                POS);
+        SqlNode rankAsc =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OVER,
+                List.of(new SqlBasicCall(SqlStdOperatorTable.DENSE_RANK, List.of(), POS), wAsc),
+                POS);
+        SqlNode rankDesc =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OVER,
+                List.of(new SqlBasicCall(SqlStdOperatorTable.DENSE_RANK, List.of(), POS), wDesc),
+                POS);
+        SqlNode sum = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(rankAsc, rankDesc), POS);
+        SqlNode countIncludingNull =
+            new SqlBasicCall(
+                SqlStdOperatorTable.MINUS,
+                List.of(sum, SqlLiteral.createExactNumeric("1", POS)),
+                POS);
+        // Any-NULL flag: MAX(CASE WHEN x IS NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p).
+        SqlNode wPartOnly =
+            SqlWindow.create(
+                null,
+                null,
+                partitionBy,
+                new SqlNodeList(POS),
+                SqlLiteral.createBoolean(false, POS),
+                null,
+                null,
+                null,
+                POS);
+        SqlNodeList nullWhens = new SqlNodeList(POS);
+        nullWhens.add(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(argRef), POS));
+        SqlNodeList nullThens = new SqlNodeList(POS);
+        nullThens.add(SqlLiteral.createExactNumeric("1", POS));
+        SqlNode nullFlag =
+            new org.apache.calcite.sql.fun.SqlCase(
+                POS, null, nullWhens, nullThens, SqlLiteral.createExactNumeric("0", POS));
+        SqlNode anyNullInPart =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OVER,
+                List.of(
+                    new SqlBasicCall(SqlStdOperatorTable.MAX, List.of(nullFlag), POS), wPartOnly),
+                POS);
+        SqlNode dcOver =
+            new SqlBasicCall(
+                SqlStdOperatorTable.MINUS, List.of(countIncludingNull, anyNullInPart), POS);
+        if (partitionNotNullCheck != null) {
+          SqlNodeList nnWhens = new SqlNodeList(POS);
+          nnWhens.add(partitionNotNullCheck);
+          SqlNodeList nnThens = new SqlNodeList(POS);
+          nnThens.add(dcOver);
+          dcOver =
+              new org.apache.calcite.sql.fun.SqlCase(
+                  POS, null, nnWhens, nnThens, SqlLiteral.createNull(POS));
+        }
+        items.add(asAliased(dcOver, al.getName()));
+        visible.add(al.getName());
+        continue;
       }
       if (fnLower.equals("percentile")
           || fnLower.equals("percentile_approx")
           || fnLower.equals("median")) {
+        // Match legacy error message; CalcitePPLEventstatsIT.testUnsupportedWindowFunctions
+        // asserts on the substring "Unexpected window function: <NAME>".
         throw new UnsupportedOperationException(
-            "eventstats percentile aggregates have no window form");
+            "Unexpected window function: " + fnLower.toUpperCase(java.util.Locale.ROOT));
       }
       SqlNode aggNode = aggCall(aggInput);
       SqlNode window =

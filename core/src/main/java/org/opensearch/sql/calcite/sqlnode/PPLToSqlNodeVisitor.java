@@ -3077,6 +3077,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           case "round" -> SqlStdOperatorTable.ROUND;
           case "mod" -> SqlStdOperatorTable.MOD;
           case "pow", "power" -> SqlStdOperatorTable.POWER;
+          // PPL named-arithmetic forms parse as regular function calls; route them to the
+          // matching binary operator. These differ from the operator forms (`a + b`) which
+          // arithmeticOperator() handles above.
+          case "add" -> SqlStdOperatorTable.PLUS;
+          case "subtract" -> SqlStdOperatorTable.MINUS;
+          case "multiply" -> SqlStdOperatorTable.MULTIPLY;
+          case "divide" -> SqlStdOperatorTable.DIVIDE;
+          case "modulus" -> SqlStdOperatorTable.MOD;
+          // Two-arg atan: PPL `atan(y, x)` is mathematically atan2; map to ATAN2.
+          case "atan2" -> SqlStdOperatorTable.ATAN2;
+          // PPL `signum` / `sign` both return -1/0/1 of a numeric; Calcite's SIGN op handles both.
+          case "sign", "signum" -> SqlStdOperatorTable.SIGN;
+          // PPL `conv(x, from, to)` — base conversion. Registered in PPLBuiltinOperators under
+          // the SQL-conventional name CONVERT.
+          case "conv" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.CONV;
           case "lower", "lcase" -> SqlStdOperatorTable.LOWER;
           case "upper", "ucase" -> SqlStdOperatorTable.UPPER;
           case "substring", "substr" -> SqlStdOperatorTable.SUBSTRING;
@@ -3123,6 +3138,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           SqlStdOperatorTable.OR,
           List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
           POS);
+    }
+    // atan: 1-arg → ATAN, 2-arg → ATAN2 (PPL allows both arities under the same name).
+    if ("atan".equals(name)) {
+      return new SqlBasicCall(
+          args.size() == 2 ? SqlStdOperatorTable.ATAN2 : SqlStdOperatorTable.ATAN, args, POS);
+    }
+    // log: 1-arg natural log; 2-arg log(b, x) is log_x(b) per PPL semantics. Calcite's
+    // SqlLibraryOperators.LOG signature is LOG(x, base), so swap operand order for the 2-arg form.
+    if ("log".equals(name)) {
+      if (args.size() == 1) {
+        return new SqlBasicCall(SqlStdOperatorTable.LN, args, POS);
+      }
+      if (args.size() == 2) {
+        return new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.LOG,
+            List.of(args.get(1), args.get(0)),
+            POS);
+      }
     }
     if (opOverride != null) {
       return new SqlBasicCall(opOverride, args, POS);

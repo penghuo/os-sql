@@ -1273,6 +1273,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           case "avg" -> SqlStdOperatorTable.AVG;
           case "min" -> SqlStdOperatorTable.MIN;
           case "max" -> SqlStdOperatorTable.MAX;
+          // PPL `stddev` is sample-stddev (Bessel's correction), `stddev_pop` is population
+          // form. Mirror Calcite's SqlStdOperatorTable directly. `var_samp`/`var_pop` likewise.
+          case "stddev", "stddev_samp" -> SqlStdOperatorTable.STDDEV_SAMP;
+          case "stddev_pop" -> SqlStdOperatorTable.STDDEV_POP;
+          case "variance", "var_samp" -> SqlStdOperatorTable.VAR_SAMP;
+          case "var_pop" -> SqlStdOperatorTable.VAR_POP;
           default ->
               throw new UnsupportedOperationException(
                   "Aggregate function not yet supported in PPLToSqlNodeVisitor: " + fnLower);
@@ -2149,6 +2155,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return switch (lit.getType()) {
       case BOOLEAN -> SqlLiteral.createBoolean((Boolean) v, POS);
       case INTEGER, LONG, SHORT -> SqlLiteral.createExactNumeric(v.toString(), POS);
+      // Calcite's createExactNumeric accepts decimal strings — DECIMAL/FLOAT/DOUBLE literals
+      // surface as `1.5`/`3.14e0`-style numerics in PPL ASTs. createApproxNumeric requires
+      // scientific notation (e/E exponent), so coerce missing-exponent doubles to a non-exact
+      // form first.
+      case DECIMAL -> {
+        java.math.BigDecimal bd =
+            (v instanceof java.math.BigDecimal b) ? b : new java.math.BigDecimal(v.toString());
+        yield SqlLiteral.createExactNumeric(bd.toPlainString(), POS);
+      }
+      case FLOAT, DOUBLE -> {
+        String s = v.toString();
+        if (!s.contains("e") && !s.contains("E")) {
+          s = s + "E0";
+        }
+        yield SqlLiteral.createApproxNumeric(s, POS);
+      }
       case STRING -> SqlLiteral.createCharString(v.toString(), POS);
       default ->
           throw new UnsupportedOperationException(

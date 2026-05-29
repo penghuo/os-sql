@@ -992,6 +992,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     wrapItems.add(SqlIdentifier.star(POS));
     SqlNode wrapped =
         new SqlSelect(POS, null, wrapItems, union, null, null, null, null, null, null, null, null);
+    // PPL multisearch interleaves the union by @timestamp DESC when the column is present in
+    // the unified row. Without it, multisearch is just plain UNION ALL (subsearch order).
+    if (unified.contains(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP)) {
+      SqlNodeList ord = new SqlNodeList(POS);
+      ord.add(
+          new SqlBasicCall(
+              SqlStdOperatorTable.DESC,
+              List.of(new SqlIdentifier(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP, POS)),
+              POS));
+      wrapped = new org.apache.calcite.sql.SqlOrderBy(POS, wrapped, ord, null, null);
+    }
     frame.currentFields = unified;
     frame.joinHints = null;
     frame.lastOrderBy = null;

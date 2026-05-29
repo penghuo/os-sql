@@ -164,7 +164,51 @@ public final class SqlNodePipeline {
     }
     String sql = relToSql(original);
     RelNode roundTripped = sqlToRel(sql, context);
+    roundTripped = stripIdentityProjects(roundTripped);
     return reattachAggregateHints(original, roundTripped);
+  }
+
+  /**
+   * The round-trip's {@code SqlToRelConverter} emits a {@code LogicalProject} for every
+   * SELECT/sub-SELECT level — including identity star-projections like {@code SELECT * FROM (
+   * SELECT * FROM t WHERE x) WHERE y}, which RelToSql produces from a chain of PPL filters.
+   *
+   * <p>Identity = the project's expression list is the same length as its input row-type, every
+   * project expression is a {@link org.apache.calcite.rex.RexInputRef} pointing to the
+   * corresponding input column index in order, and the field names match. Stripping these
+   * collapses the round-tripped plan back toward the visitor's shape, which keeps explain output
+   * stable and reduces redundant runtime materialisation.
+   */
+  private static RelNode stripIdentityProjects(RelNode root) {
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (!(visited instanceof org.apache.calcite.rel.core.Project project)) {
+              return visited;
+            }
+            org.apache.calcite.rel.type.RelDataType inputType = project.getInput().getRowType();
+            org.apache.calcite.rel.type.RelDataType projectType = project.getRowType();
+            if (inputType.getFieldCount() != projectType.getFieldCount()) {
+              return visited;
+            }
+            for (int i = 0; i < project.getProjects().size(); i++) {
+              org.apache.calcite.rex.RexNode e = project.getProjects().get(i);
+              if (!(e instanceof org.apache.calcite.rex.RexInputRef ref) || ref.getIndex() != i) {
+                return visited;
+              }
+              if (!inputType
+                  .getFieldList()
+                  .get(i)
+                  .getName()
+                  .equals(projectType.getFieldList().get(i).getName())) {
+                return visited;
+              }
+            }
+            return project.getInput();
+          }
+        });
   }
 
   private static boolean containsGraphLookup(RelNode root) {

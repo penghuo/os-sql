@@ -2926,8 +2926,59 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.Case caseExpr) {
       return caseExpr(caseExpr);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.Interval interval) {
+      return intervalExpr(interval);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate PPL {@code INTERVAL N <unit>} to a Calcite {@link SqlLiteral#createInterval}. The AST
+   * stores the value as an {@link Literal} and the unit as an enum; map the unit to Calcite's
+   * {@link org.apache.calcite.avatica.util.TimeUnit} and emit the literal with the appropriate
+   * {@link org.apache.calcite.sql.SqlIntervalQualifier}. Non-literal values fall back to an
+   * unresolved-function call (matches v2 emission for that rare path).
+   */
+  private SqlNode intervalExpr(org.opensearch.sql.ast.expression.Interval i) {
+    Object v = i.getValue() instanceof Literal lit ? lit.getValue() : null;
+    if (v == null) {
+      SqlNode value = expr(i.getValue());
+      return new SqlBasicCall(
+          new org.apache.calcite.sql.SqlUnresolvedFunction(
+              new SqlIdentifier("interval", POS),
+              null,
+              null,
+              null,
+              null,
+              org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+          List.of(value, SqlLiteral.createCharString(i.getUnit().name(), POS)),
+          POS);
+    }
+    String literalStr = v.toString();
+    org.apache.calcite.avatica.util.TimeUnit unit =
+        switch (i.getUnit()) {
+          case MICROSECOND -> org.apache.calcite.avatica.util.TimeUnit.MICROSECOND;
+          case MILLISECOND -> org.apache.calcite.avatica.util.TimeUnit.MILLISECOND;
+          case SECOND -> org.apache.calcite.avatica.util.TimeUnit.SECOND;
+          case MINUTE -> org.apache.calcite.avatica.util.TimeUnit.MINUTE;
+          case HOUR -> org.apache.calcite.avatica.util.TimeUnit.HOUR;
+          case DAY -> org.apache.calcite.avatica.util.TimeUnit.DAY;
+          case WEEK -> org.apache.calcite.avatica.util.TimeUnit.WEEK;
+          case MONTH -> org.apache.calcite.avatica.util.TimeUnit.MONTH;
+          case QUARTER -> org.apache.calcite.avatica.util.TimeUnit.QUARTER;
+          case YEAR -> org.apache.calcite.avatica.util.TimeUnit.YEAR;
+          default ->
+              throw new UnsupportedOperationException("Unsupported interval unit: " + i.getUnit());
+        };
+    org.apache.calcite.sql.SqlIntervalQualifier qualifier =
+        new org.apache.calcite.sql.SqlIntervalQualifier(unit, null, POS);
+    int sign = 1;
+    if (literalStr.startsWith("-")) {
+      sign = -1;
+      literalStr = literalStr.substring(1);
+    }
+    return SqlLiteral.createInterval(sign, literalStr, qualifier, POS);
   }
 
   /**
@@ -3092,6 +3143,45 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           // PPL `conv(x, from, to)` — base conversion. Registered in PPLBuiltinOperators under
           // the SQL-conventional name CONVERT.
           case "conv" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.CONV;
+          // Date-part extractors: bind to PPL UDFs that handle EXPR_DATE / EXPR_TIMESTAMP. The
+          // standard YEAR/QUARTER/MONTH/HOUR/MINUTE/SECOND operators rewrite to EXTRACT(<unit>
+          // FROM <datetime>) and EXTRACT only accepts Calcite's built-in DATETIME types.
+          case "year" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.YEAR;
+          case "quarter" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.QUARTER;
+          case "month", "month_of_year" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.MONTH;
+          case "dayofyear", "day_of_year" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY_OF_YEAR;
+          case "dayofmonth", "day_of_month", "day" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY;
+          case "dayofweek", "day_of_week" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY_OF_WEEK;
+          case "hour", "hour_of_day" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.HOUR;
+          case "minute", "minute_of_hour" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.MINUTE;
+          case "second", "second_of_minute" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.SECOND;
+          case "week", "week_of_year", "weekofyear" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.WEEK;
+          case "weekday" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.WEEKDAY;
+          case "yearweek" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.YEARWEEK;
+          // Date-arithmetic UDFs that share names with Calcite-standard operators (which expect
+          // INTERVAL qualifiers as the first arg, not strings). Bind directly to PPL UDFs.
+          case "timestampadd" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMPADD;
+          case "timestampdiff" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMPDIFF;
+          case "last_day" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST_DAY;
+          case "extract" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.EXTRACT;
+          case "adddate", "date_add" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDDATE;
+          case "subdate", "date_sub" ->
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBDATE;
+          case "addtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDTIME;
+          case "subtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBTIME;
+          case "datediff" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATEDIFF;
+          case "timediff" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMEDIFF;
           case "lower", "lcase" -> SqlStdOperatorTable.LOWER;
           case "upper", "ucase" -> SqlStdOperatorTable.UPPER;
           case "substring", "substr" -> SqlStdOperatorTable.SUBSTRING;

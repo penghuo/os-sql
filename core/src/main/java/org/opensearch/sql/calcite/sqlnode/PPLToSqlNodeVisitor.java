@@ -4411,6 +4411,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
       return relevanceFieldListExpr(rfl);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.LambdaFunction lf) {
+      // PPL lambdas (forall/exists/filter/transform/reduce/...) emit as Calcite SqlLambda whose
+      // parameter list is the PPL argument identifiers and whose body is the translated body.
+      // SqlToRelConverter turns this into a RexLambda that the PPL array UDFs invoke directly.
+      SqlNodeList paramList = new SqlNodeList(POS);
+      for (QualifiedName qn : lf.getFuncArgs()) {
+        paramList.add(new SqlIdentifier(qn.toString(), POS));
+      }
+      SqlNode body = expr(lf.getFunction());
+      return new org.apache.calcite.sql.SqlLambda(POS, paramList, body);
+    }
     if (e instanceof org.opensearch.sql.ast.expression.subquery.InSubquery is) {
       return inSubqueryExpr(is);
     }

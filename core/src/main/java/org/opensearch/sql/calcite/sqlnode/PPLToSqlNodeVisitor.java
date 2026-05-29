@@ -1042,6 +1042,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return null;
   }
 
+  /** {@code CASE WHEN <cond> THEN 1 ELSE 0 END} — used for streamstats reset flags. */
+  private SqlNode caseFlagOneZero(SqlNode cond) {
+    SqlNodeList whens = new SqlNodeList(POS);
+    whens.add(cond);
+    SqlNodeList thens = new SqlNodeList(POS);
+    thens.add(SqlLiteral.createExactNumeric("1", POS));
+    return new org.apache.calcite.sql.fun.SqlCase(
+        POS, null, whens, thens, SqlLiteral.createExactNumeric("0", POS));
+  }
+
   private SqlNode padToUnifiedSchema(SqlNode body, List<String> present, List<String> unified) {
     Set<String> presentSet = new java.util.LinkedHashSet<>(present);
     SqlNodeList items = new SqlNodeList(POS);
@@ -1357,10 +1367,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "streamstats requires a known column list — call after a `| fields ...` pipe");
     }
-    if (node.getResetBefore() != null || node.getResetAfter() != null) {
-      throw new UnsupportedOperationException(
-          "streamstats reset_before/reset_after not yet supported in PPLToSqlNodeVisitor");
-    }
+    boolean hasReset = node.getResetBefore() != null || node.getResetAfter() != null;
     // ROWS frame:
     //   current=true,  window=N>0 : lower = (N-1) PRECEDING, upper = CURRENT ROW (N rows total)
     //   current=false, window=N>0 : lower = N     PRECEDING, upper = 1 PRECEDING (N rows excl)
@@ -1391,8 +1398,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     boolean hasGroup = !partitionExprs.isEmpty();
     // global=true with a by-partition switches the frame from ROWS to RANGE on the global seq
-    // column. Bounds then reflect global-row distance (not partition-local row count).
-    boolean useRange = node.isGlobal() && hasGroup && win > 0;
+    // column. Bounds then reflect global-row distance (not partition-local row count). Reset
+    // also uses RANGE on the seq so the cumulative aggregate restarts at segment boundaries.
+    boolean useRange = (node.isGlobal() && hasGroup && win > 0) || hasReset;
     // ORDER BY uses upstream sort keys when present; otherwise reuse an upstream
     // __stream_seq__ column (from a prior streamstats) when in scope, else synthesise one.
     // Calcite forbids OVER clauses inside another window's ORDER BY, so a freshly synthesised
@@ -1434,6 +1442,89 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       postSeqFields = new ArrayList<>(frame.currentFields);
       postSeqFields.add("__stream_seq__");
       orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+    }
+    // Reset support: each row's reset flag bumps a __seg_id__; cumulative aggregate restarts
+    // when segment id changes. Compute __seg_id__ in a wrapping SELECT and prepend it to the
+    // partition-by so the cumulative window restarts on segment boundaries.
+    if (hasReset) {
+      SqlNode beforeFlag =
+          node.getResetBefore() != null
+              ? caseFlagOneZero(expr(node.getResetBefore()))
+              : SqlLiteral.createExactNumeric("0", POS);
+      SqlNode afterFlag =
+          node.getResetAfter() != null
+              ? caseFlagOneZero(expr(node.getResetAfter()))
+              : SqlLiteral.createExactNumeric("0", POS);
+      SqlNodeList orderBySeq = new SqlNodeList(POS);
+      orderBySeq.add(new SqlIdentifier("__stream_seq__", POS));
+      SqlNode beforeSumWindow =
+          SqlWindow.create(
+              null,
+              null,
+              new SqlNodeList(POS),
+              orderBySeq,
+              SqlLiteral.createBoolean(true, POS),
+              SqlWindow.createUnboundedPreceding(POS),
+              SqlWindow.createCurrentRow(POS),
+              null,
+              POS);
+      SqlNode afterSumWindow =
+          SqlWindow.create(
+              null,
+              null,
+              new SqlNodeList(POS),
+              orderBySeq,
+              SqlLiteral.createBoolean(true, POS),
+              SqlWindow.createUnboundedPreceding(POS),
+              new SqlBasicCall(
+                  SqlWindow.PRECEDING_OPERATOR,
+                  List.of(SqlLiteral.createExactNumeric("1", POS)),
+                  POS),
+              null,
+              POS);
+      SqlNode beforeSum =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(beforeFlag), POS),
+                  beforeSumWindow),
+              POS);
+      SqlNode afterSum =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(afterFlag), POS),
+                  afterSumWindow),
+              POS);
+      SqlNode afterSumZero =
+          new SqlBasicCall(
+              SqlStdOperatorTable.COALESCE,
+              List.of(afterSum, SqlLiteral.createExactNumeric("0", POS)),
+              POS);
+      SqlNode segId =
+          new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(beforeSum, afterSumZero), POS);
+      SqlNodeList segWrap = new SqlNodeList(POS);
+      segWrap.add(SqlIdentifier.star(POS));
+      segWrap.add(asAliased(segId, "__seg_id__"));
+      wrappedFrom =
+          new SqlSelect(
+              POS,
+              null,
+              segWrap,
+              wrappedFrom,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null);
+      SqlNodeList newPartitionBy = new SqlNodeList(POS);
+      newPartitionBy.add(new SqlIdentifier("__seg_id__", POS));
+      for (SqlNode p : partitionBy.getList()) newPartitionBy.add(p);
+      partitionBy = newPartitionBy;
     }
     SqlNode partitionNotNullCheck = null;
     if (!node.isBucketNullable() && !partitionExprs.isEmpty()) {

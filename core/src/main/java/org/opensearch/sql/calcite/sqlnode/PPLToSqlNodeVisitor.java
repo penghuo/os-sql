@@ -4054,6 +4054,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     //   2. No prior sort but @timestamp visible in scope: ORDER BY @timestamp DESC (matches
     //      v2's reverse semantic for time-series indices like TIME_TEST_DATA).
     //   3. Otherwise: pass through (e.g. after aggregation, bare source, data-dependent input).
+    //
+    // Reverse-after-streamstats is intentionally a no-op without an explicit prior sort —
+    // PPL semantics: `__stream_seq__` is internal scaffolding, not a user-visible collation,
+    // so a downstream `reverse` cannot pick it up. Tests testStreamstatsWithReverse and
+    // testStreamstatsWindowWithReverse codify this.
     List<SqlNode> reversed = frame.reversedLastOrderBy();
     if (reversed != null) {
       return SqlBuilder.select(starList()).from(from).orderBy(reversed).wrap(frame);

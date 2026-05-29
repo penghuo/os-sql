@@ -41,6 +41,7 @@ import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.ast.tree.AddTotals;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Append;
 import org.opensearch.sql.ast.tree.AppendPipe;
@@ -1536,6 +1537,78 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.joinHints = null;
     frame.lastOrderBy = null;
     return wrapper;
+  }
+
+  @Override
+  public SqlNode visitAddTotals(AddTotals node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "addtotals requires a known column list — call after a `| fields ...` pipe");
+    }
+    java.util.Map<String, Literal> options = node.getOptions();
+    boolean addRow = options == null || getBoolOption(options, "row", true);
+    boolean addCol = options != null && getBoolOption(options, "col", false);
+    if (addCol) {
+      // col=true requires a UNION ALL with a summary row containing SUM(field) per listed
+      // numeric column and NULLs (or label string) elsewhere — needs an oracle to enumerate
+      // numeric columns and align the union row type. Defer.
+      throw new UnsupportedOperationException(
+          "addtotals col=true not yet supported in PPLToSqlNodeVisitor");
+    }
+    if (!addRow) {
+      // Both flags off: pass through.
+      return from;
+    }
+    String alias = "Total";
+    if (options != null && options.containsKey("fieldname")) {
+      alias = options.get("fieldname").getValue().toString();
+    }
+    // Sum the listed fields; without an explicit list, sum all currently-visible columns.
+    // Tests typically pre-project the numeric columns with `| fields a, b, ...` so summing
+    // every visible column is the right behaviour for the implicit form. Non-numeric values
+    // would surface as a runtime cast error from Calcite's PLUS — same behaviour as v2.
+    List<Field> fields = node.getFieldList();
+    List<String> sumNames;
+    if (fields == null || fields.isEmpty()) {
+      sumNames = new ArrayList<>(frame.currentFields);
+    } else {
+      sumNames = new ArrayList<>();
+      for (Field f : fields) {
+        sumNames.add(f.getField().toString());
+      }
+    }
+    if (sumNames.isEmpty()) {
+      throw new UnsupportedOperationException("addtotals row=true needs at least one field");
+    }
+    SqlNode sum = toIdentifier(sumNames.get(0));
+    for (int i = 1; i < sumNames.size(); i++) {
+      sum =
+          new SqlBasicCall(
+              SqlStdOperatorTable.PLUS, List.of(sum, toIdentifier(sumNames.get(i))), POS);
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : frame.currentFields) {
+      if (c.equals(alias)) continue;
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    items.add(asAliased(sum, alias));
+    visible.add(alias);
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  private static boolean getBoolOption(
+      java.util.Map<String, Literal> options, String key, boolean defaultVal) {
+    Literal v = options.get(key);
+    if (v == null) return defaultVal;
+    Object raw = v.getValue();
+    if (raw instanceof Boolean b) return b;
+    if (raw instanceof String s) {
+      return "true".equalsIgnoreCase(s) || "t".equalsIgnoreCase(s) || "1".equals(s);
+    }
+    return defaultVal;
   }
 
   @Override

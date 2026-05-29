@@ -93,6 +93,29 @@ public class EnhancedCoalesceFunction extends ImplementorUDF {
     return opBinding -> {
       var operandTypes = opBinding.collectOperandTypes();
 
+      // PPL coercion semantics: if any operand is a CHARACTER type, fall back to VARCHAR. PPL
+      // treats COALESCE result as a string when string is one of the operand types, since PPL
+      // semantics widen mixed-type COALESCE to string. Calcite's stock leastRestrictive picks
+      // the narrowest numeric and ignores CHARACTER, which produces INT for `coalesce(NULL,
+      // int_field, 'default')`. The visitor's pre-round-trip coercion would have produced
+      // VARCHAR; preserve that behaviour at the validator stage.
+      boolean hasCharacterOperand =
+          operandTypes.stream()
+              .anyMatch(
+                  t ->
+                      t.getSqlTypeName() == SqlTypeName.VARCHAR
+                          || t.getSqlTypeName() == SqlTypeName.CHAR);
+      boolean hasNonCharacterOperand =
+          operandTypes.stream()
+              .anyMatch(
+                  t ->
+                      t.getSqlTypeName() != SqlTypeName.VARCHAR
+                          && t.getSqlTypeName() != SqlTypeName.CHAR
+                          && t.getSqlTypeName() != SqlTypeName.NULL);
+      if (hasCharacterOperand && hasNonCharacterOperand) {
+        return opBinding.getTypeFactory().createSqlType(SqlTypeName.VARCHAR);
+      }
+
       // Let Calcite determine the least restrictive common type
       var commonType = opBinding.getTypeFactory().leastRestrictive(operandTypes);
       return commonType != null
@@ -137,8 +160,7 @@ public class EnhancedCoalesceFunction extends ImplementorUDF {
       }
 
       @Override
-      public String getAllowedSignatures(
-          org.apache.calcite.sql.SqlOperator op, String opName) {
+      public String getAllowedSignatures(org.apache.calcite.sql.SqlOperator op, String opName) {
         return opName + "(<ANY>...)";
       }
     };

@@ -42,7 +42,7 @@ public class MapRemoveFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class MapRemoveImplementor implements NotNullImplementor {

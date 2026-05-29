@@ -38,7 +38,7 @@ public class JsonExtendFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class JsonExtendImplementor implements NotNullImplementor {

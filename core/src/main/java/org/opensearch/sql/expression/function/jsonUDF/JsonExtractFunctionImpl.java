@@ -41,7 +41,7 @@ public class JsonExtractFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class JsonExtractImplementor implements NotNullImplementor {

@@ -45,7 +45,7 @@ public class MapAppendFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class MapAppendImplementor implements NotNullImplementor {

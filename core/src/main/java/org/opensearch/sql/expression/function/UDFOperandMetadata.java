@@ -109,6 +109,65 @@ public interface UDFOperandMetadata extends SqlOperandMetadata {
     return new UDTOperandMetadata(allowSignatures);
   }
 
+  /**
+   * Permissive variadic operand metadata: accepts any number of operands of any type. Used by UDFs
+   * whose visitor-side validation is the source of truth (e.g. lambda collection UDFs like {@code
+   * array}, {@code mvappend}). Without explicit metadata, the SqlValidator round-trip reaches
+   * {@code SqlOperator.getOperandCountRange}'s default which throws {@code
+   * UnsupportedOperationException: class UserDefinedFunctionBuilder$1: <name>}.
+   */
+  static UDFOperandMetadata permissiveVariadic() {
+    return PERMISSIVE_VARIADIC;
+  }
+
+  UDFOperandMetadata PERMISSIVE_VARIADIC =
+      new UDFOperandMetadata() {
+        @Override
+        public org.apache.calcite.sql.type.SqlOperandTypeChecker getInnerTypeChecker() {
+          return new org.apache.calcite.sql.type.SqlOperandTypeChecker() {
+            @Override
+            public boolean checkOperandTypes(SqlCallBinding callBinding, boolean throwOnFailure) {
+              return true;
+            }
+
+            @Override
+            public org.apache.calcite.sql.SqlOperandCountRange getOperandCountRange() {
+              return org.apache.calcite.sql.type.SqlOperandCountRanges.from(0);
+            }
+
+            @Override
+            public String getAllowedSignatures(SqlOperator op, String opName) {
+              return opName + "(...)";
+            }
+          };
+        }
+
+        @Override
+        public List<RelDataType> paramTypes(RelDataTypeFactory typeFactory) {
+          return Collections.emptyList();
+        }
+
+        @Override
+        public List<String> paramNames() {
+          return Collections.emptyList();
+        }
+
+        @Override
+        public boolean checkOperandTypes(SqlCallBinding callBinding, boolean throwOnFailure) {
+          return true;
+        }
+
+        @Override
+        public org.apache.calcite.sql.SqlOperandCountRange getOperandCountRange() {
+          return org.apache.calcite.sql.type.SqlOperandCountRanges.from(0);
+        }
+
+        @Override
+        public String getAllowedSignatures(SqlOperator op, String opName) {
+          return opName + "(...)";
+        }
+      };
+
   record UDTOperandMetadata(List<List<RelDataType>> allowedParamTypes)
       implements UDFOperandMetadata {
     @Override

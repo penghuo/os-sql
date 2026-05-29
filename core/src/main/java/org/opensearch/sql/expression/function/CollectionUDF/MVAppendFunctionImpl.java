@@ -53,7 +53,10 @@ public class MVAppendFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    // Variadic any-type. Without explicit metadata, SqlOperator.getOperandCountRange falls
+    // through to Util.needToImplement which fails the SqlValidator round-trip with
+    // "UnsupportedOperationException: class UserDefinedFunctionBuilder$1: mvappend".
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   private static RelDataType determineElementType(

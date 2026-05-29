@@ -33,7 +33,7 @@ public class JsonKeysFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class JsonKeysImplementor implements NotNullImplementor {

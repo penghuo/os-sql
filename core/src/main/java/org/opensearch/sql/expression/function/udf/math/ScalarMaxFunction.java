@@ -37,7 +37,7 @@ public class ScalarMaxFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class MaxImplementor implements NotNullImplementor {

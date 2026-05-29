@@ -36,7 +36,7 @@ public class ExistsFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class ExistsImplementor implements NotNullImplementor {

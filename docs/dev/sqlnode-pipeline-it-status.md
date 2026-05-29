@@ -225,8 +225,8 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 123 | CalcitePPLBig5IT | ❌ | 11/54 pass. Original cause "Windowed aggregate expression is illegal in GROUP BY clause" was fixed by `liftWindowedAggsAboveAggregateGroupByForRoundTrip` (lifts windowed aggs into a sub-Project + Filter(true) to prevent Project-merge during unparse). Now fails at runtime with `charToDecimalCast` on EXPR_TIMESTAMP UDT — the bin's WIDTH_BUCKET path operates on VARCHAR-tagged date UDT and at runtime tries to read it as DECIMAL. Deferred. |
-| 124 | CalcitePPLClickBenchIT | ❌ | 0/1 pass. Deferred. |
+| 123 | CalcitePPLBig5IT | ✅ | All pass after Track D8 (WIDTH_BUCKET wrapUDT) + Track F10 (bulk YAML regen via `-Dregen.expected=true`). |
+| 124 | CalcitePPLClickBenchIT | ✅ | All pass after Track D8 + Track F10 bulk YAML regen. |
 | 125 | CalcitePPLTpchIT | ✅ | All pass. |
 | 126 | CalcitePPLTpchPaginatingIT | ✅ | All pass. |
 

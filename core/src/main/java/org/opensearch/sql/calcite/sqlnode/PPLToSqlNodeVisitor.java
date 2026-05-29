@@ -531,6 +531,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (select.getHaving() != null) return null;
     if (select.getOrderList() != null && !select.getOrderList().getList().isEmpty()) return null;
     if (select.getFetch() != null || select.getOffset() != null) return null;
+    // Bail out when any of our new items references an alias already introduced by the existing
+    // SELECT list. SQL doesn't let SELECT-list aliases reference each other within the same
+    // SELECT — appending here would emit `SELECT *, prev AS x, f(x) AS y FROM ...` which the
+    // validator rejects with "Field [x] not found".
+    Set<String> existingAliases = new java.util.LinkedHashSet<>();
+    for (int i = 1; i < existing.size(); i++) {
+      SqlNode item = existing.get(i);
+      if (item instanceof SqlBasicCall call
+          && call.getOperator() == SqlStdOperatorTable.AS
+          && call.operandCount() == 2
+          && call.operand(1) instanceof SqlIdentifier aliasId
+          && !aliasId.isStar()) {
+        existingAliases.add(aliasId.getSimple());
+      }
+    }
+    if (!existingAliases.isEmpty()) {
+      for (int i = 1; i < newList.size(); i++) {
+        if (refsAnyName(newList.get(i), existingAliases)) {
+          return null;
+        }
+      }
+    }
     // newList starts with `*` then our eval items. Skip its leading `*` (already in `existing`)
     // and append the rest.
     for (int i = 1; i < newList.size(); i++) {
@@ -539,6 +561,31 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.currentFields = visible;
     frame.joinHints = null;
     return select;
+  }
+
+  /**
+   * Recursive identifier scan: does any descendant of {@code node} refer to an unqualified column
+   * name in {@code names}? Multi-part identifiers (e.g. {@code a.col}) are skipped — those resolve
+   * through their alias scope, not through SELECT-list aliases.
+   */
+  private static boolean refsAnyName(SqlNode node, Set<String> names) {
+    if (node == null) return false;
+    if (node instanceof SqlIdentifier id) {
+      if (id.isStar()) return false;
+      if (!id.isSimple()) return false;
+      return names.contains(id.getSimple());
+    }
+    if (node instanceof SqlBasicCall call) {
+      for (SqlNode operand : call.getOperandList()) {
+        if (refsAnyName(operand, names)) return true;
+      }
+    }
+    if (node instanceof SqlNodeList list) {
+      for (SqlNode child : list.getList()) {
+        if (refsAnyName(child, names)) return true;
+      }
+    }
+    return false;
   }
 
   @Override

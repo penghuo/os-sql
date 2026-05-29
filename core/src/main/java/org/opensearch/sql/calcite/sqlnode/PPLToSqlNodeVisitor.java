@@ -43,6 +43,7 @@ import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Append;
+import org.opensearch.sql.ast.tree.AppendPipe;
 import org.opensearch.sql.ast.tree.Bin;
 import org.opensearch.sql.ast.tree.Chart;
 import org.opensearch.sql.ast.tree.Convert;
@@ -949,6 +950,76 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
     return new SqlSelect(POS, null, items, body, null, null, null, null, null, null, null, null);
+  }
+
+  @Override
+  public SqlNode visitAppendPipe(AppendPipe node, Frame frame) {
+    // PPL `<main> | appendpipe [<sub>]` ≡ `(<main>) UNION ALL (<main> | <sub>)`. The subquery
+    // is appended to the current pipeline. Walk the subquery from its root down to the
+    // placeholder leaf (Values) and attach our main child there, then visit it as a normal
+    // pipeline.
+    UnresolvedPlan mainChild = node.getChild().get(0);
+    Frame mainFrame = new Frame();
+    Frame savedExprMain = this.exprFrame;
+    this.exprFrame = mainFrame;
+    SqlNode mainBody;
+    try {
+      mainBody = stripImplicitMetaProjects(mainChild).accept(this, mainFrame);
+    } finally {
+      this.exprFrame = savedExprMain;
+    }
+    if (mainFrame.currentFields == null) {
+      throw new UnsupportedOperationException("appendpipe main side requires a known column list");
+    }
+    List<String> mainCols = new ArrayList<>(mainFrame.currentFields);
+
+    // Walk subquery to its leaf Values placeholder (or to the deepest single-child node) and
+    // attach main as its source.
+    UnresolvedPlan subqueryPlan = node.getSubQuery();
+    UnresolvedPlan subTail = subqueryPlan;
+    while (subTail.getChild() != null
+        && !subTail.getChild().isEmpty()
+        && !(subTail.getChild().get(0) instanceof org.opensearch.sql.ast.tree.Values)) {
+      if (subTail.getChild().size() > 1) {
+        throw new RuntimeException("AppendPipe doesn't support multiply children subquery.");
+      }
+      subTail = (UnresolvedPlan) subTail.getChild().get(0);
+    }
+    subTail.attach(mainChild);
+
+    Frame subFrame = new Frame();
+    Frame savedExprSub = this.exprFrame;
+    this.exprFrame = subFrame;
+    SqlNode subBody;
+    try {
+      subBody = stripImplicitMetaProjects(subqueryPlan).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExprSub;
+    }
+    if (subFrame.currentFields == null) {
+      throw new UnsupportedOperationException("appendpipe subquery requires a known column list");
+    }
+    List<String> subCols = new ArrayList<>(subFrame.currentFields);
+
+    List<String> unified = new ArrayList<>(mainCols);
+    for (String c : subCols) {
+      if (!unified.contains(c)) {
+        unified.add(c);
+      }
+    }
+    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified);
+    SqlNode subPadded = padToUnifiedSchema(subBody, subCols, unified);
+    SqlNode unioned =
+        new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(mainPadded, subPadded), POS);
+    SqlNodeList wrapItems = new SqlNodeList(POS);
+    wrapItems.add(SqlIdentifier.star(POS));
+    SqlNode wrapped =
+        new SqlSelect(
+            POS, null, wrapItems, unioned, null, null, null, null, null, null, null, null);
+    frame.currentFields = unified;
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapped;
   }
 
   @Override

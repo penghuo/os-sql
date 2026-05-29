@@ -460,12 +460,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitAggregation(Aggregation node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
+    // Detect upstream join AFTER walking the child — only then has visitJoin's joinHints been
+    // populated on the frame. (Before recursion the frame still reflects the calling pipe.)
+    boolean joinUpstream = isJoinUpstream(frame);
     // SELECT list = aggregates (aliased) + group keys (aliased). FROM = child. GROUP BY = group
     // key expressions (without aliases). The visible field list for the next pipe is the ordered
     // list of agg-output names (PPL convention: aggregates first, span (if any), then by-fields).
     SqlNodeList items = new SqlNodeList(POS);
     List<SqlNode> groupKeys = new ArrayList<>();
     List<String> visible = new ArrayList<>();
+    String spanAlias = null;
 
     for (UnresolvedExpression aggExpr : node.getAggExprList()) {
       String alias = aggLabel(aggExpr);
@@ -478,7 +482,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // list to match PPL's `<aggs> by span(...), <by_fields>` row layout.
     if (node.getSpan() != null) {
       UnresolvedExpression spanExpr = node.getSpan();
-      String spanAlias = (spanExpr instanceof Alias a) ? a.getName() : spanAutoLabel(spanExpr);
+      spanAlias = (spanExpr instanceof Alias a) ? a.getName() : spanAutoLabel(spanExpr);
       UnresolvedExpression spanCore = (spanExpr instanceof Alias a) ? a.getDelegated() : spanExpr;
       SqlNode keyExpr = expr(spanCore);
       groupKeys.add(keyExpr);
@@ -495,7 +499,33 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     // Aggregations destroy row-level collation; clear the lastOrderBy hint.
     frame.lastOrderBy = null;
-    return SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible).wrap(frame);
+
+    SqlBuilder.SelectBuilder b =
+        SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible);
+    // Implicit ORDER BY on the span column when the upstream contains a JOIN. v2's RelBuilder
+    // pipeline preserves the OpenSearch terms-aggregation collation from the post-join scan; the
+    // SqlNode pipeline emits a plain SQL Aggregate which Calcite is free to render without
+    // ordering. Adding an explicit ORDER BY on the span gives deterministic group-output order
+    // for `... | join ... | stats ... by span(...)`. Skip when the upstream is unjoined — v2's
+    // RelBuilder produces an unordered aggregate too, and adding our own would create cosmetic
+    // plan-shape diffs in CalciteExplainIT/Big5.
+    if (joinUpstream && spanAlias != null) {
+      SqlNode sortKey =
+          new SqlBasicCall(
+              SqlStdOperatorTable.NULLS_FIRST, List.of(new SqlIdentifier(spanAlias, POS)), POS);
+      b.orderBy(java.util.List.of(sortKey));
+    }
+    return b.wrap(frame);
+  }
+
+  /**
+   * True when the visitor is operating on output from an upstream JOIN — either the recent join
+   * left {@link Frame#joinHints} live on the frame, or the FROM tree of in-flight wraps contains a
+   * SqlJoin. Used by {@link #visitAggregation} to add an implicit deterministic ORDER BY on
+   * span/group keys (matching v2's RelBuilder collation from terms-aggregation pushdown).
+   */
+  private static boolean isJoinUpstream(Frame frame) {
+    return frame.joinHints != null;
   }
 
   /**

@@ -869,13 +869,18 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       // Time span like "1d", "4h", "45minute". Parse into <intValue><unit> and dispatch to
       // SPAN(field, value, unit). The SPAN UDF detects the field type at runtime.
       SqlNode timeSpan = tryTimeSpanCall(fieldRef, stringLit.getValue().toString());
-      if (timeSpan == null) {
+      SqlNode logSpan =
+          timeSpan == null ? tryLogSpanCall(fieldRef, stringLit.getValue().toString()) : null;
+      if (timeSpan != null) {
+        bucketCall = timeSpan;
+      } else if (logSpan != null) {
+        bucketCall = logSpan;
+      } else {
         throw new UnsupportedOperationException(
             "bin span variant "
                 + stringLit.getValue()
                 + " not yet supported in PPLToSqlNodeVisitor");
       }
-      bucketCall = timeSpan;
     } else {
       throw new UnsupportedOperationException(
           "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
@@ -1675,6 +1680,100 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             SqlLiteral.createExactNumeric(Integer.toString(value), POS),
             SqlLiteral.createCharString(unit, POS)),
         POS);
+  }
+
+  /**
+   * Parse a log-span literal like {@code "log10"}, {@code "1.5log10"}, {@code "log2"}, {@code
+   * "loge"} into a CASE expression that emits {@code "<lower>-<upper>"} for a positive field value
+   * (and {@code "Invalid"} for non-positive). Mirrors v2's tryLogSpanCall:
+   *
+   * <pre>
+   *   coef = optional leading number (default 1.0)
+   *   base = required digits after "log"
+   *   bin  = floor(ln(field/coef) / ln(base))
+   *   range = coef*base^bin .. coef*base^(bin+1)
+   * </pre>
+   *
+   * Returns null when the literal isn't a recognised log-span pattern.
+   */
+  private SqlNode tryLogSpanCall(SqlNode fieldRef, String spanStr) {
+    String lowered =
+        spanStr.replace("'", "").replace("\"", "").trim().toLowerCase(java.util.Locale.ROOT);
+    double base;
+    double coefficient = 1.0;
+    if ("log10".equals(lowered)) {
+      base = 10.0;
+    } else if ("log2".equals(lowered)) {
+      base = 2.0;
+    } else if ("loge".equals(lowered) || "ln".equals(lowered)) {
+      base = Math.E;
+    } else {
+      java.util.regex.Matcher m =
+          java.util.regex.Pattern.compile("^(\\d*\\.?\\d*)?log(\\d+\\.?\\d*)$").matcher(lowered);
+      if (!m.matches()) return null;
+      String coeffStr = m.group(1);
+      String baseStr = m.group(2);
+      coefficient = (coeffStr == null || coeffStr.isEmpty()) ? 1.0 : Double.parseDouble(coeffStr);
+      base = Double.parseDouble(baseStr);
+      if (base <= 1.0 || coefficient <= 0.0) return null;
+    }
+    SqlNode coefLit = SqlLiteral.createApproxNumeric(coefficient + "E0", POS);
+    SqlNode baseLit = SqlLiteral.createApproxNumeric(base + "E0", POS);
+    SqlNode lnBaseLit = SqlLiteral.createApproxNumeric(Math.log(base) + "E0", POS);
+    SqlNode adjustedField =
+        coefficient == 1.0
+            ? fieldRef
+            : new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(fieldRef, coefLit), POS);
+    SqlNode lnField = new SqlBasicCall(SqlStdOperatorTable.LN, List.of(adjustedField), POS);
+    SqlNode logValue =
+        new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(lnField, lnBaseLit), POS);
+    SqlNode binNumber = new SqlBasicCall(SqlStdOperatorTable.FLOOR, List.of(logValue), POS);
+    SqlNode basePowerBin =
+        new SqlBasicCall(SqlStdOperatorTable.POWER, List.of(baseLit, binNumber), POS);
+    SqlNode lowerBound =
+        new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(coefLit, basePowerBin), POS);
+    SqlNode binPlusOne =
+        new SqlBasicCall(
+            SqlStdOperatorTable.PLUS,
+            List.of(binNumber, SqlLiteral.createApproxNumeric("1.0E0", POS)),
+            POS);
+    SqlNode basePowerBinPlusOne =
+        new SqlBasicCall(SqlStdOperatorTable.POWER, List.of(baseLit, binPlusOne), POS);
+    SqlNode upperBound =
+        new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(coefLit, basePowerBinPlusOne), POS);
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    SqlNode lowerStr =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(lowerBound, varcharSpec),
+            POS);
+    SqlNode upperStr =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(upperBound, varcharSpec),
+            POS);
+    SqlNode firstConcat =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CONCAT,
+            List.of(lowerStr, SqlLiteral.createCharString("-", POS)),
+            POS);
+    SqlNode rangeStr =
+        new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(firstConcat, upperStr), POS);
+    SqlNode positiveCheck =
+        new SqlBasicCall(
+            SqlStdOperatorTable.GREATER_THAN,
+            List.of(fieldRef, SqlLiteral.createApproxNumeric("0.0E0", POS)),
+            POS);
+    SqlNodeList whens = new SqlNodeList(POS);
+    whens.add(positiveCheck);
+    SqlNodeList thens = new SqlNodeList(POS);
+    thens.add(rangeStr);
+    return new org.apache.calcite.sql.fun.SqlCase(
+        POS, null, whens, thens, SqlLiteral.createCharString("Invalid", POS));
   }
 
   private static boolean getBoolOption(

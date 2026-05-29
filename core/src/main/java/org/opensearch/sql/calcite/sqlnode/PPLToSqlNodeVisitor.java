@@ -53,6 +53,8 @@ import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Rename;
+import org.opensearch.sql.ast.tree.Replace;
+import org.opensearch.sql.ast.tree.ReplacePair;
 import org.opensearch.sql.ast.tree.Reverse;
 import org.opensearch.sql.ast.tree.Rex;
 import org.opensearch.sql.ast.tree.Sort;
@@ -679,6 +681,92 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitReplace(Replace node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `replace "p1" WITH "r1" [, "p2" WITH "r2", ...] IN field1, field2, ...` rewrites each
+    // listed field's value with chained REPLACE calls (one per pair). Other columns pass through.
+    // Patterns containing `*` are wildcard patterns that desugar to REGEXP_REPLACE; literal
+    // patterns use plain REPLACE. The visitor builds an explicit projection that retains all
+    // visible columns, swapping target fields for their REPLACE-chain.
+    java.util.Set<String> targets = new java.util.LinkedHashSet<>();
+    for (Field f : node.getFieldList()) {
+      targets.add(f.getField().toString());
+    }
+    List<String> visible = frame.currentFields == null ? List.of() : frame.currentFields;
+    java.util.Set<String> visibleSet = new java.util.LinkedHashSet<>(visible);
+    for (String t : targets) {
+      if (!visibleSet.contains(t)) {
+        throw new IllegalArgumentException(
+            "field [" + t + "] not found; input fields are: " + visible);
+      }
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> newVisible = new ArrayList<>(visible.size());
+    for (String c : visible) {
+      SqlNode fieldRef = toIdentifier(c);
+      if (targets.contains(c)) {
+        items.add(asAliased(buildReplaceChain(fieldRef, node), c));
+      } else {
+        items.add(fieldRef);
+      }
+      newVisible.add(c);
+    }
+    return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
+  }
+
+  /**
+   * Apply each {@link ReplacePair} of a {@link Replace} command to {@code value}, returning the
+   * chained call. Wildcard patterns (containing {@code *}) desugar to REGEXP_REPLACE_3 with
+   * symmetry validation; literal patterns use plain REPLACE. Operands are cast to VARCHAR to avoid
+   * Calcite widening unequal-length CHAR literals (which would right-pad shorter values).
+   */
+  private SqlNode buildReplaceChain(SqlNode value, Replace node) {
+    for (ReplacePair pair : node.getReplacePairs()) {
+      String patternStr = pair.getPattern().getValue().toString();
+      String replacementStr = pair.getReplacement().getValue().toString();
+      if (patternStr.contains("*")) {
+        org.opensearch.sql.calcite.utils.WildcardUtils.validateWildcardSymmetry(
+            patternStr, replacementStr);
+        String regexPattern =
+            org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardPatternToRegex(
+                patternStr);
+        String regexReplacement =
+            org.opensearch.sql.calcite.utils.WildcardUtils.convertWildcardReplacementToRegex(
+                replacementStr);
+        value =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
+                List.of(
+                    value,
+                    castStringToVarchar(regexPattern),
+                    castStringToVarchar(regexReplacement)),
+                POS);
+      } else {
+        value =
+            new SqlBasicCall(
+                SqlStdOperatorTable.REPLACE,
+                List.of(
+                    value, castStringToVarchar(patternStr), castStringToVarchar(replacementStr)),
+                POS);
+      }
+    }
+    return value;
+  }
+
+  /** Cast a string literal to VARCHAR. */
+  private static SqlNode castStringToVarchar(String s) {
+    org.apache.calcite.sql.SqlDataTypeSpec spec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    return new SqlBasicCall(
+        org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+        List.of(SqlLiteral.createCharString(s, POS), spec),
+        POS);
   }
 
   @Override

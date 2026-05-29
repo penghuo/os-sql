@@ -383,6 +383,35 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   @Override
+  public SqlNode visitSearch(org.opensearch.sql.ast.tree.Search node, Frame frame) {
+    // PPL `source=T <searchExprs>` desugars to a query_string filter against T. Mirrors the legacy
+    // visitor: build MAP('query', VARCHAR(text)) and pass through PermissiveRelevanceFunctions's
+    // QUERY_STRING wrapper (the real operator's operand-checker rejects single-MAP arity).
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    SqlNode queryArg =
+        new SqlBasicCall(
+            SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR,
+            List.of(
+                SqlLiteral.createCharString("query", POS),
+                new SqlBasicCall(
+                    org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                    List.of(
+                        SqlLiteral.createCharString(node.getQueryString(), POS),
+                        new org.apache.calcite.sql.SqlDataTypeSpec(
+                            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                            POS)),
+                    POS)),
+            POS);
+    SqlNode where =
+        new SqlBasicCall(
+            org.opensearch.sql.calcite.sqlnode.PermissiveRelevanceFunctions.QUERY_STRING,
+            List.of(queryArg),
+            POS);
+    return SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+  }
+
+  @Override
   public SqlNode visitEval(Eval node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
     // PPL eval extends the row with N new columns: `SELECT *, e1 AS a1, e2 AS a2, ... FROM

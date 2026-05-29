@@ -3951,7 +3951,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         op == org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX
             || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.FIRST
             || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST
-            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE;
+            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE
+            // VALUES carries an optional UnresolvedArgument("limit", n) injected by the parser
+            // when plugins.ppl.values.max.limit is configured. The runtime VALUES UDAF reads
+            // the limit from values[1].
+            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.VALUES;
     if (takesExtraArgs) {
       List<SqlNode> args = new ArrayList<>();
       args.add(arg);

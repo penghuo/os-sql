@@ -78,17 +78,28 @@ public class CalcitePPLStreamstatsTest extends CalcitePPLAbstractTest {
   public void testStreamstatsCurrent() {
     String ppl = "source=EMP | streamstats current = false max(SAL)";
     RelNode root = getRelNode(ppl);
+    // No-group streamstats wraps the window aggregate in a `__stream_seq__` decorator + outer
+    // Sort($seq) so the SqlNodePipeline round-trip preserves upstream input order through the
+    // OVER() evaluation (ANSI SQL leaves OVER() without ORDER BY undefined).
     String expectedLogical =
         "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
-            + " COMM=[$6], DEPTNO=[$7], max(SAL)=[MAX($5) OVER (ROWS BETWEEN UNBOUNDED PRECEDING"
-            + " AND 1 PRECEDING)])\n"
-            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+            + " COMM=[$6], DEPTNO=[$7], max(SAL)=[$9])\n"
+            + "  LogicalSort(sort0=[$8], dir0=[ASC])\n"
+            + "    LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], __stream_seq__=[$8], max(SAL)=[MAX($5) OVER"
+            + " (ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)])\n"
+            + "      LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], __stream_seq__=[ROW_NUMBER() OVER ()])\n"
+            + "        LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
         "SELECT `EMPNO`, `ENAME`, `JOB`, `MGR`, `HIREDATE`, `SAL`, `COMM`, `DEPTNO`, MAX(`SAL`)"
             + " OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) `max(SAL)`\n"
-            + "FROM `scott`.`EMP`";
+            + "FROM (SELECT `EMPNO`, `ENAME`, `JOB`, `MGR`, `HIREDATE`, `SAL`, `COMM`, `DEPTNO`,"
+            + " ROW_NUMBER() OVER () `__stream_seq__`\n"
+            + "FROM `scott`.`EMP`) `t`\n"
+            + "ORDER BY `__stream_seq__` NULLS LAST";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
 

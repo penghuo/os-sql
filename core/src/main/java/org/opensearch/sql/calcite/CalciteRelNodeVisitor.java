@@ -2222,9 +2222,13 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
           new String[] {ROW_NUMBER_COLUMN_FOR_STREAMSTATS});
     }
 
-    // Default: first get rawExpr
-    List<RexNode> overExpressions =
-        node.getWindowFunctionList().stream().map(w -> rexVisitor.analyze(w, context)).toList();
+    // For both with-group and no-group paths, add a __stream_seq__ column and the surrounding
+    // Sort by it so the SqlNodePipeline round-trip preserves the upstream input ordering as
+    // input to the window aggregate. ANSI SQL leaves OVER() without ORDER BY undefined, and on
+    // the round-tripped plan Calcite re-evaluates the window in scan order — losing the
+    // upstream Sort. Adding the seq column + outer sort survives the unparse via
+    // `withRemoveSortInSubQuery(false)` in SqlToRelConverter.config.
+    List<RexNode> overExpressions;
 
     if (hasGroup) {
       // only build sequence when there is by condition
@@ -2236,6 +2240,8 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
               .rowsTo(RexWindowBounds.CURRENT_ROW)
               .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
       context.relBuilder.projectPlus(streamSeq);
+      overExpressions =
+          node.getWindowFunctionList().stream().map(w -> rexVisitor.analyze(w, context)).toList();
 
       if (!node.isBucketNullable()) {
         // construct groupNotNull predicate
@@ -2260,7 +2266,26 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       context.relBuilder.sort(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
       context.relBuilder.projectExcept(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
     } else {
-      context.relBuilder.projectPlus(overExpressions);
+      // Add __stream_seq__ then sort by it so the unparsed SQL preserves the upstream input
+      // ordering across the SqlNodePipeline round-trip. Without this, the window aggregate
+      // OVER (ROWS ... PRECEDING) executes in scan order at the validator side because ANSI
+      // SQL evaluates window aggregates in unspecified order without ORDER BY in OVER. The
+      // surrounding Sort($N) survives via `withRemoveSortInSubQuery(false)` and feeds the
+      // window evaluation.
+      RexNode streamSeq =
+          context
+              .relBuilder
+              .aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
+              .over()
+              .rowsTo(RexWindowBounds.CURRENT_ROW)
+              .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
+      context.relBuilder.projectPlus(streamSeq);
+      // Now compute window expressions on the seq-decorated input.
+      List<RexNode> reanalysed =
+          node.getWindowFunctionList().stream().map(w -> rexVisitor.analyze(w, context)).toList();
+      context.relBuilder.projectPlus(reanalysed);
+      context.relBuilder.sort(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
+      context.relBuilder.projectExcept(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
     }
 
     return context.relBuilder.peek();

@@ -45,6 +45,7 @@ import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Convert;
 import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
+import org.opensearch.sql.ast.tree.FillNull;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
@@ -685,6 +686,47 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitFillNull(FillNull node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `fillnull with <repl> in <f1>, <f2>, ...` (or `fillnull value=<repl> [<f1>...]`)
+    // replaces NULLs with the given value via COALESCE. The new visitor lacks a row-type
+    // oracle, so the "all fields" form (replacementForAll without explicit field list) walks
+    // frame.currentFields. Per-field replacements walk the same list and only rewrite the
+    // listed fields.
+    java.util.Map<String, UnresolvedExpression> perField = new java.util.LinkedHashMap<>();
+    for (org.apache.commons.lang3.tuple.Pair<Field, UnresolvedExpression> p :
+        node.getReplacementPairs()) {
+      perField.put(p.getLeft().getField().toString(), p.getRight());
+    }
+    UnresolvedExpression forAll =
+        node.getReplacementForAll().isPresent() ? node.getReplacementForAll().get() : null;
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "fillnull requires a known column list — call after a `| fields ...` pipe");
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      SqlNode fieldRef = toIdentifier(c);
+      UnresolvedExpression repl = perField.get(c);
+      if (repl == null && forAll != null && perField.isEmpty()) {
+        repl = forAll;
+      }
+      if (repl != null) {
+        SqlNode replExpr = expr(repl);
+        SqlNode coalesce =
+            new SqlBasicCall(SqlStdOperatorTable.COALESCE, List.of(fieldRef, replExpr), POS);
+        items.add(asAliased(coalesce, c));
+      } else {
+        items.add(fieldRef);
+      }
+    }
+    return SqlBuilder.select(items)
+        .from(from)
+        .withFields(new ArrayList<>(frame.currentFields))
+        .wrap(frame);
   }
 
   @Override

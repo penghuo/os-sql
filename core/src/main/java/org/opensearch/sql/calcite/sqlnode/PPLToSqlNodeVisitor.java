@@ -2306,6 +2306,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           // dispatch directly.
           case "coalesce" -> SqlStdOperatorTable.COALESCE;
           case "nullif" -> SqlStdOperatorTable.NULLIF;
+          // Common scalar functions whose case-sensitive validator lookup misses the lowercase
+          // PPL form. Direct mapping eliminates the "No match found for function signature"
+          // error for these names.
+          case "abs" -> SqlStdOperatorTable.ABS;
+          case "ceil", "ceiling" -> SqlStdOperatorTable.CEIL;
+          case "floor" -> SqlStdOperatorTable.FLOOR;
+          case "exp" -> SqlStdOperatorTable.EXP;
+          case "ln" -> SqlStdOperatorTable.LN;
+          case "log10" -> SqlStdOperatorTable.LOG10;
+          case "sqrt" -> SqlStdOperatorTable.SQRT;
+          case "round" -> SqlStdOperatorTable.ROUND;
+          case "mod" -> SqlStdOperatorTable.MOD;
+          case "pow", "power" -> SqlStdOperatorTable.POWER;
+          case "lower", "lcase" -> SqlStdOperatorTable.LOWER;
+          case "upper", "ucase" -> SqlStdOperatorTable.UPPER;
+          case "substring", "substr" -> SqlStdOperatorTable.SUBSTRING;
+          // PPL `replace` is regex-replace (AstExpressionBuilder remaps `regexp_replace` → REPLACE
+          // builtin name). Don't intercept via SqlStdOperatorTable.REPLACE (literal-replace);
+          // let it flow through the validator-resolved unresolved-function path which finds
+          // PPLBuiltinOperators.REGEXP_REPLACE.
+          // PPL `concat` is variadic; Calcite's std CONCAT is binary `||`. Use the library's
+          // CONCAT_FUNCTION which accepts arbitrary arity.
+          case "concat" -> org.apache.calcite.sql.fun.SqlLibraryOperators.CONCAT_FUNCTION;
+          case "length", "char_length", "character_length" ->
+              org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH;
+          // PPL `locate`/`position` need a function-call shape that Calcite POSITION doesn't
+          // accept directly (POSITION uses `IN` keyword syntax). Defer to PPLBuiltinOperators
+          // via the unresolved-function path; the validator's name lookup will find LOCATE.
           default -> null;
         };
     // PPL `isempty(x)` — NULL or empty string. PPL `isblank(x)` — NULL or whitespace-only.

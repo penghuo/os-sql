@@ -543,10 +543,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitSort(Sort node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    SqlBuilder.SelectBuilder b =
-        SqlBuilder.select(starList()).from(from).orderBy(buildSortKeys(node.getSortList()));
-    if (node.getCount() != null && node.getCount() != 0) {
-      b.fetch(SqlLiteral.createExactNumeric(node.getCount().toString(), POS));
+    List<SqlNode> orderKeys = buildSortKeys(node.getSortList());
+    SqlLiteral fetch =
+        node.getCount() != null && node.getCount() != 0
+            ? SqlLiteral.createExactNumeric(node.getCount().toString(), POS)
+            : null;
+    // Peephole: when child is a SELECT * already (e.g. SEMI/ANTI's `SELECT * FROM <X AS a> WHERE
+    // EXISTS(...)`), wrap with SqlOrderBy directly instead of building a new SELECT around it.
+    // The new SELECT would seal the alias `a` inside its FROM subquery, breaking `ORDER BY a.col`.
+    SqlNode peep = orderByOnChildSelectStar(from, orderKeys, null, fetch, frame);
+    if (peep != null) return peep;
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).orderBy(orderKeys);
+    if (fetch != null) {
+      b.fetch(fetch);
     }
     return b.wrap(frame);
   }
@@ -555,11 +564,50 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   public SqlNode visitLimit(Limit node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getLimit().toString(), POS);
+    SqlLiteral offset =
+        node.getOffset() != null && node.getOffset() > 0
+            ? SqlLiteral.createExactNumeric(node.getOffset().toString(), POS)
+            : null;
+    SqlNode peep =
+        orderByOnChildSelectStar(from, java.util.Collections.emptyList(), offset, fetch, frame);
+    if (peep != null) return peep;
     SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
-    if (node.getOffset() != null && node.getOffset() > 0) {
-      b.offset(SqlLiteral.createExactNumeric(node.getOffset().toString(), POS));
+    if (offset != null) {
+      b.offset(offset);
     }
     return b.wrap(frame);
+  }
+
+  /**
+   * Install ORDER BY / FETCH / OFFSET on a child {@code SELECT *} without nesting a new outer
+   * SELECT. When the child is a {@code SELECT * FROM <inner> [WHERE ...]} (no GROUP BY / HAVING /
+   * existing ORDER BY / FETCH / OFFSET, and the SELECT list is just {@code *}), wrap it with a
+   * {@link org.apache.calcite.sql.SqlOrderBy} that operates on the same SELECT's namespace —
+   * keeping the inner FROM's aliases visible to the new ORDER BY expressions. Returns null when the
+   * shape doesn't match; caller falls back to the standard {@link SqlBuilder} wrap.
+   */
+  private static SqlNode orderByOnChildSelectStar(
+      SqlNode from, List<SqlNode> orderKeys, SqlLiteral offset, SqlLiteral fetch, Frame frame) {
+    if (!(from instanceof SqlSelect select)) return null;
+    SqlNodeList items = select.getSelectList();
+    if (items == null || items.size() != 1) return null;
+    SqlNode lone = items.get(0);
+    if (!(lone instanceof SqlIdentifier id) || !id.isStar()) return null;
+    if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
+    if (select.getHaving() != null) return null;
+    if (select.getOrderList() != null && !select.getOrderList().getList().isEmpty()) return null;
+    if (select.getFetch() != null || select.getOffset() != null) return null;
+    SqlNodeList ord = new SqlNodeList(POS);
+    if (orderKeys != null) {
+      for (SqlNode k : orderKeys) {
+        ord.add(k);
+      }
+    }
+    if (orderKeys != null && !orderKeys.isEmpty()) {
+      frame.lastOrderBy = orderKeys;
+    }
+    frame.joinHints = null;
+    return new org.apache.calcite.sql.SqlOrderBy(POS, select, ord, offset, fetch);
   }
 
   @Override
@@ -673,6 +721,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Record the displaced inner alias as a synonym so a downstream `| fields tt.col` resolves.
     leftSide = applyExplicitAlias(leftSide, leftAlias, frame);
     rightSide = applyExplicitAlias(rightSide, rightAlias, frame);
+
+    // SEMI/ANTI joins aren't supported in Calcite's SqlNode dialect (raises "Dialect does not
+    // support feature"). Rewrite as `<left> WHERE [NOT] EXISTS (SELECT * FROM <right> WHERE
+    // <on-cond>)`. Returning a SqlSelect (rather than a SqlJoin) means `frame.currentFields`
+    // becomes the LEFT-side fields only — SEMI/ANTI don't add right-side columns to the output.
+    if (node.getJoinType() == Join.JoinType.SEMI || node.getJoinType() == Join.JoinType.ANTI) {
+      return semiAntiAsExists(node, leftSide, rightSide, leftAlias, rightAlias, frame);
+    }
 
     JoinType jt = mapJoinType(node.getJoinType());
 
@@ -811,6 +867,77 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   private record DedupedProjection(SqlNodeList selectList, List<String> names) {}
+
+  /**
+   * Rewrite {@code <left> [LEFT] SEMI/ANTI JOIN <right> ON cond} as {@code <left> WHERE [NOT]
+   * EXISTS (SELECT * FROM <right> WHERE cond)}. Calcite's SqlNode dialect doesn't accept
+   * LEFT_SEMI/LEFT_ANTI directly (raises "Dialect does not support feature"); the EXISTS rewrite is
+   * semantically equivalent and works through the standard validator/SqlToRelConverter path.
+   *
+   * <p>Both sides are force-aliased (explicit join-arg or default {@code __l}/{@code __r}) so the
+   * correlated subquery's {@code <left-alias>.<col> = <right-alias>.<col>} ON-clause can resolve.
+   * The wrapping SELECT keeps the LEFT side's row type intact — SEMI/ANTI don't add right-side
+   * columns to the output.
+   */
+  private SqlNode semiAntiAsExists(
+      Join node,
+      SqlNode leftSide,
+      SqlNode rightSide,
+      String leftAlias,
+      String rightAlias,
+      Frame frame) {
+    boolean isAnti = node.getJoinType() == Join.JoinType.ANTI;
+    String lAlias = leftAliasOrDefault(leftAlias);
+    String rAlias = rightAliasOrDefault(rightAlias);
+    SqlNode aliasedLeft = ensureAliased(leftSide, leftAlias, "__l");
+    SqlNode aliasedRight = ensureAliased(rightSide, rightAlias, "__r");
+
+    SqlNode subCond;
+    if (node.getJoinCondition().isPresent()) {
+      subCond = expr(node.getJoinCondition().get());
+    } else if (node.getJoinFields().isPresent() && !node.getJoinFields().get().isEmpty()) {
+      SqlNode acc = null;
+      for (Field f : node.getJoinFields().get()) {
+        String name = f.getField().toString();
+        SqlNode l = new SqlIdentifier(Arrays.asList(lAlias, name), POS);
+        SqlNode r = new SqlIdentifier(Arrays.asList(rAlias, name), POS);
+        SqlNode eq = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(l, r), POS);
+        acc = (acc == null) ? eq : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(acc, eq), POS);
+      }
+      subCond = acc;
+    } else {
+      subCond = SqlLiteral.createBoolean(true, POS);
+    }
+
+    SqlNodeList subSelectList = new SqlNodeList(POS);
+    subSelectList.add(SqlIdentifier.star(POS));
+    SqlNode subQuery =
+        new SqlSelect(
+            POS,
+            null,
+            subSelectList,
+            aliasedRight,
+            subCond,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+    SqlNode existsCall = new SqlBasicCall(SqlStdOperatorTable.EXISTS, List.of(subQuery), POS);
+    SqlNode whereCond =
+        isAnti ? new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(existsCall), POS) : existsCall;
+
+    // SEMI/ANTI keeps only the LEFT side's columns — frame.currentFields stays as-is (already
+    // populated by the left walk). Clear joinHints; SEMI/ANTI doesn't expose the right alias.
+    frame.joinHints = null;
+
+    SqlNodeList topSelectList = new SqlNodeList(POS);
+    topSelectList.add(SqlIdentifier.star(POS));
+    return new SqlSelect(
+        POS, null, topSelectList, aliasedLeft, whereCond, null, null, null, null, null, null, null);
+  }
 
   /**
    * Cap the right side of a JOIN to N rows per partition when the user wrote {@code max=N}. PPL

@@ -939,6 +939,39 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               null,
               POS);
       SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      // Calcite's standard AVG over a partition with all-NULL values returns 0 (the SUM/COUNT
+      // convertlet yields 0/0 in the enumerable runtime). PPL semantics: NULL when no non-NULL
+      // rows contributed. Wrap AVG with `CASE WHEN COUNT(field) > 0 THEN <avg> ELSE NULL END`.
+      // VAR_SAMP/STDDEV_SAMP need n>1 for Bessel's correction; VAR_POP/STDDEV_POP need n>0.
+      if (aggNode instanceof SqlBasicCall bc && bc.getOperandList().size() == 1) {
+        org.apache.calcite.sql.SqlOperator op = bc.getOperator();
+        boolean needsZeroGuard =
+            op == SqlStdOperatorTable.AVG
+                || op == SqlStdOperatorTable.VAR_POP
+                || op == SqlStdOperatorTable.STDDEV_POP;
+        boolean needsOneGuard =
+            op == SqlStdOperatorTable.VAR_SAMP || op == SqlStdOperatorTable.STDDEV_SAMP;
+        if (needsZeroGuard || needsOneGuard) {
+          int minCount = needsOneGuard ? 1 : 0;
+          SqlNode countCall =
+              new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(bc.getOperandList().get(0)), POS);
+          SqlNode countOver =
+              new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCall, window), POS);
+          SqlNode countCondition =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.GREATER_THAN,
+                  List.of(
+                      countOver, SqlLiteral.createExactNumeric(Integer.toString(minCount), POS)),
+                  POS);
+          SqlNodeList whens = new SqlNodeList(POS);
+          whens.add(countCondition);
+          SqlNodeList thens = new SqlNodeList(POS);
+          thens.add(over);
+          over =
+              new org.apache.calcite.sql.fun.SqlCase(
+                  POS, null, whens, thens, SqlLiteral.createNull(POS));
+        }
+      }
       items.add(asAliased(over, al.getName()));
       visible.add(al.getName());
     }

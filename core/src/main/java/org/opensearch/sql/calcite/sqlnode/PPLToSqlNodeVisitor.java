@@ -1367,14 +1367,18 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       partitionBy.add(key);
       partitionExprs.add(key);
     }
-    // ORDER BY uses upstream sort keys when present; otherwise synthesise an upstream
-    // __stream_seq__ column (ROW_NUMBER OVER ()) so the cumulative-aggregate window has a
-    // stable order. Calcite forbids OVER clauses inside another window's ORDER BY, so the seq
-    // column has to be materialised in a wrapping SELECT before this window references it.
+    // ORDER BY uses upstream sort keys when present; otherwise reuse an upstream
+    // __stream_seq__ column (from a prior streamstats) when in scope, else synthesise one.
+    // Calcite forbids OVER clauses inside another window's ORDER BY, so a freshly synthesised
+    // seq has to be materialised in a wrapping SELECT before this window references it.
     SqlNodeList orderBy = new SqlNodeList(POS);
     SqlNode wrappedFrom = from;
     List<String> postSeqFields = frame.currentFields;
-    if (frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
+    if (frame.currentFields.contains("__stream_seq__")) {
+      // Upstream streamstats already provides the seq — reuse it for stable ordering. Don't
+      // re-synthesise.
+      orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+    } else if (frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
       for (SqlNode k : frame.lastOrderBy) orderBy.add(k);
     } else {
       SqlNode rowNum =
@@ -1416,10 +1420,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     SqlNodeList items = new SqlNodeList(POS);
     List<String> visible = new ArrayList<>();
-    for (String c : frame.currentFields) {
-      // Skip the synthetic __stream_seq__ from the user-visible output (it's only for the OVER
-      // ORDER BY).
-      if ("__stream_seq__".equals(c)) continue;
+    // Pass through every column from postSeqFields (which includes the just-synthesised or
+    // upstream __stream_seq__) so a downstream streamstats can reuse the same row ordering.
+    // SqlNodePlanner.stripSyntheticSeqColumns drops __stream_seq__ from the user-facing
+    // top-level row type after RelNode conversion.
+    for (String c : postSeqFields) {
       items.add(toIdentifier(c));
       visible.add(c);
     }

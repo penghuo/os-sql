@@ -4881,7 +4881,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   private static org.apache.calcite.sql.SqlOperator comparisonOperator(String op) {
-    return switch (op) {
+    return switch (op.toLowerCase(java.util.Locale.ROOT)) {
       case "=" -> SqlStdOperatorTable.EQUALS;
       case "!=", "<>" -> SqlStdOperatorTable.NOT_EQUALS;
       case "<" -> SqlStdOperatorTable.LESS_THAN;

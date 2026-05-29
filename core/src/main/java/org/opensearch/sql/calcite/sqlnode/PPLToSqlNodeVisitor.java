@@ -194,12 +194,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       return p;
     }
-    if (plan instanceof Head h && !h.getChild().isEmpty()) {
-      UnresolvedPlan rewritten = stripImplicitMetaProjects(h.getChild().get(0));
-      if (rewritten != h.getChild().get(0)) {
-        return (UnresolvedPlan) h.attach(rewritten);
+    // Generic unary descent: any other plan with a single child (Aggregation, Sort, Filter,
+    // Eval, Rename, Limit, Reverse, Head, ...) re-attaches its rewritten child. Required because
+    // AstBuilder injects `Project(AllFieldsExcludeMeta, ...)` markers around join sides and
+    // subsearches at any depth, including under non-Project parents like `Aggregation` (which
+    // appears at the top of `... | join ... | stats ...` queries).
+    if (plan.getChild() != null && plan.getChild().size() == 1) {
+      UnresolvedPlan child = (UnresolvedPlan) plan.getChild().get(0);
+      UnresolvedPlan rewritten = stripImplicitMetaProjects(child);
+      if (rewritten != child) {
+        return (UnresolvedPlan) plan.attach(rewritten);
       }
-      return h;
     }
     return plan;
   }
@@ -234,6 +239,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     UnresolvedPlan childPlan = node.getChild().get(0);
     SqlNode from = childPlan.accept(this, frame);
 
+    // Short-circuit: a `Project([AllFields])` (the implicit-final `| fields *` injected by
+    // AstStatementBuilder, or a user-written `| fields *`) has no projection effect when the
+    // child is already a top-level-valid SELECT shape. Returning the child avoids nesting an
+    // outer SELECT that seals projection columns inside the FROM subquery — e.g. an aggregation
+    // `b.country AS "b.country"` becomes invisible to an outer `SELECT b.country FROM (...)`.
+    // Bare SqlJoin / AS-wrapped children still need wrapping so the validator sees a top-level
+    // SELECT.
+    if (!node.isExcluded()
+        && node.getProjectList().size() == 1
+        && node.getProjectList().getFirst() instanceof AllFields
+        && (from instanceof SqlSelect || from instanceof org.apache.calcite.sql.SqlOrderBy)) {
+      return from;
+    }
+
     List<String> selected = resolveSelectedFields(node, frame.currentFields);
 
     // Build the SELECT list. Two responsibilities here:
@@ -267,10 +286,46 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
 
+    // Peephole: if the child is a SELECT * with no projection of its own (visitSort/visitFilter/
+    // visitHead style), pull the user-projection into THAT SELECT instead of nesting a new outer
+    // SELECT. Nesting would seal join aliases inside a subquery — `| sort a.age | fields a.name`
+    // produces `SELECT a.name FROM (SELECT * FROM <join> ORDER BY a.age)` where the outer SELECT
+    // can no longer see `a` from the inner FROM. Rewriting the inner select list keeps the join
+    // aliases live in the same SELECT scope.
+    SqlNode rewritten = projectIntoChildSelectStar(from, selectList);
+    if (rewritten != null) {
+      frame.currentFields = stripAliasPrefix(selected);
+      return rewritten;
+    }
     return SqlBuilder.select(selectList)
         .from(from)
         .withFields(stripAliasPrefix(selected))
         .wrap(frame);
+  }
+
+  /**
+   * If {@code from} is a {@code SELECT * FROM <inner>} (optionally wrapped in a SqlOrderBy or
+   * carrying ORDER BY/FETCH/OFFSET) and no GROUP BY / HAVING, swap its select list for {@code
+   * newList} in place and return the rewritten node. Returns null when the shape doesn't match —
+   * caller falls back to normal wrapping.
+   */
+  private static SqlNode projectIntoChildSelectStar(SqlNode from, SqlNodeList newList) {
+    SqlSelect select = null;
+    if (from instanceof SqlSelect s) {
+      select = s;
+    } else if (from instanceof org.apache.calcite.sql.SqlOrderBy ob
+        && ob.query instanceof SqlSelect s) {
+      select = s;
+    }
+    if (select == null) return null;
+    SqlNodeList items = select.getSelectList();
+    if (items == null || items.size() != 1) return null;
+    SqlNode lone = items.get(0);
+    if (!(lone instanceof SqlIdentifier id) || !id.isStar()) return null;
+    if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
+    if (select.getHaving() != null) return null;
+    select.setSelectList(newList);
+    return from;
   }
 
   @Override

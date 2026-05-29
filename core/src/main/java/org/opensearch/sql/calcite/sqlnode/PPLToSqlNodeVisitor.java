@@ -831,59 +831,101 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitBin(Bin node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    if (!(node instanceof SpanBin sb)) {
-      throw new UnsupportedOperationException(
-          "bin command subtype " + node.getClass().getSimpleName() + " not yet supported");
-    }
-    UnresolvedExpression spanExpr = sb.getSpan();
-    if (sb.getAligntime() != null) {
-      throw new UnsupportedOperationException("bin aligntime not yet supported");
-    }
-    UnresolvedExpression rawFieldExpr = sb.getField();
+    UnresolvedExpression rawFieldExpr = node.getField();
     if (rawFieldExpr instanceof Field f) {
       rawFieldExpr = f.getField();
     }
     String fieldName =
         (rawFieldExpr instanceof QualifiedName qn) ? qn.toString() : rawFieldExpr.toString();
-    String alias = sb.getAlias() != null ? sb.getAlias() : fieldName;
-    SqlNode fieldRef = expr(sb.getField());
+    String alias = node.getAlias() != null ? node.getAlias() : fieldName;
+    SqlNode fieldRef = expr(node.getField());
     SqlNode bucketCall;
-    boolean numericSpan =
-        spanExpr instanceof Literal lit
-            && (lit.getType() == DataType.INTEGER
-                || lit.getType() == DataType.LONG
-                || lit.getType() == DataType.SHORT
-                || lit.getType() == DataType.DOUBLE
-                || lit.getType() == DataType.FLOAT
-                || lit.getType() == DataType.DECIMAL);
-    if (numericSpan) {
-      // `span=10` → SPAN_BUCKET(field, n).
-      bucketCall =
-          new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN_BUCKET,
-              List.of(fieldRef, expr(spanExpr)),
-              POS);
-    } else if (spanExpr instanceof Literal stringLit
-        && stringLit.getType() == DataType.STRING
-        && stringLit.getValue() != null) {
-      // Time span like "1d", "4h", "45minute". Parse into <intValue><unit> and dispatch to
-      // SPAN(field, value, unit). The SPAN UDF detects the field type at runtime.
-      SqlNode timeSpan = tryTimeSpanCall(fieldRef, stringLit.getValue().toString());
-      SqlNode logSpan =
-          timeSpan == null ? tryLogSpanCall(fieldRef, stringLit.getValue().toString()) : null;
-      if (timeSpan != null) {
-        bucketCall = timeSpan;
-      } else if (logSpan != null) {
-        bucketCall = logSpan;
+    if (node instanceof SpanBin sb) {
+      if (sb.getAligntime() != null) {
+        throw new UnsupportedOperationException("bin aligntime not yet supported");
+      }
+      UnresolvedExpression spanExpr = sb.getSpan();
+      boolean numericSpan =
+          spanExpr instanceof Literal lit
+              && (lit.getType() == DataType.INTEGER
+                  || lit.getType() == DataType.LONG
+                  || lit.getType() == DataType.SHORT
+                  || lit.getType() == DataType.DOUBLE
+                  || lit.getType() == DataType.FLOAT
+                  || lit.getType() == DataType.DECIMAL);
+      if (numericSpan) {
+        bucketCall =
+            new SqlBasicCall(
+                org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN_BUCKET,
+                List.of(fieldRef, expr(spanExpr)),
+                POS);
+      } else if (spanExpr instanceof Literal stringLit
+          && stringLit.getType() == DataType.STRING
+          && stringLit.getValue() != null) {
+        SqlNode timeSpan = tryTimeSpanCall(fieldRef, stringLit.getValue().toString());
+        SqlNode logSpan =
+            timeSpan == null ? tryLogSpanCall(fieldRef, stringLit.getValue().toString()) : null;
+        if (timeSpan != null) {
+          bucketCall = timeSpan;
+        } else if (logSpan != null) {
+          bucketCall = logSpan;
+        } else {
+          throw new UnsupportedOperationException(
+              "bin span variant "
+                  + stringLit.getValue()
+                  + " not yet supported in PPLToSqlNodeVisitor");
+        }
       } else {
         throw new UnsupportedOperationException(
-            "bin span variant "
-                + stringLit.getValue()
-                + " not yet supported in PPLToSqlNodeVisitor");
+            "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
       }
+    } else if (node instanceof org.opensearch.sql.ast.tree.CountBin cb) {
+      // WIDTH_BUCKET(field, num_bins, data_range=max-min, max_value=max).
+      SqlNode minVal = minOver(fieldRef);
+      SqlNode maxVal = maxOver(fieldRef);
+      SqlNode dataRange = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(maxVal, minVal), POS);
+      bucketCall =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.WIDTH_BUCKET,
+              List.of(
+                  fieldRef,
+                  SqlLiteral.createExactNumeric(cb.getBins().toString(), POS),
+                  dataRange,
+                  maxVal),
+              POS);
+    } else if (node instanceof org.opensearch.sql.ast.tree.MinSpanBin msb) {
+      // MINSPAN_BUCKET(field, min_span, data_range=max-min, max_value=max).
+      SqlNode minVal = minOver(fieldRef);
+      SqlNode maxVal = maxOver(fieldRef);
+      SqlNode dataRange = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(maxVal, minVal), POS);
+      bucketCall =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.MINSPAN_BUCKET,
+              List.of(fieldRef, expr(msb.getMinspan()), dataRange, maxVal),
+              POS);
+    } else if (node instanceof org.opensearch.sql.ast.tree.RangeBin rb) {
+      // RANGE_BUCKET(field, MIN OVER, MAX OVER, start, end).
+      SqlNode start = rb.getStart() != null ? expr(rb.getStart()) : minOver(fieldRef);
+      SqlNode end = rb.getEnd() != null ? expr(rb.getEnd()) : maxOver(fieldRef);
+      bucketCall =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.RANGE_BUCKET,
+              List.of(fieldRef, minOver(fieldRef), maxOver(fieldRef), start, end),
+              POS);
+    } else if (node instanceof org.opensearch.sql.ast.tree.DefaultBin) {
+      bucketCall =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.RANGE_BUCKET,
+              List.of(
+                  fieldRef,
+                  minOver(fieldRef),
+                  maxOver(fieldRef),
+                  minOver(fieldRef),
+                  maxOver(fieldRef)),
+              POS);
     } else {
       throw new UnsupportedOperationException(
-          "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
+          "bin command subtype " + node.getClass().getSimpleName() + " not yet supported");
     }
     // Project: emit non-bin columns in original order, then append the bin column at the end
     // (mirrors v2's emission shape). Without a row-type oracle, walk frame.currentFields.
@@ -1774,6 +1816,31 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     thens.add(rangeStr);
     return new org.apache.calcite.sql.fun.SqlCase(
         POS, null, whens, thens, SqlLiteral.createCharString("Invalid", POS));
+  }
+
+  /** {@code MIN(field) OVER ()} — used as a default range bound for CountBin/RangeBin. */
+  private SqlNode minOver(SqlNode field) {
+    return aggOver(SqlStdOperatorTable.MIN, field);
+  }
+
+  private SqlNode maxOver(SqlNode field) {
+    return aggOver(SqlStdOperatorTable.MAX, field);
+  }
+
+  private SqlNode aggOver(org.apache.calcite.sql.SqlOperator agg, SqlNode field) {
+    SqlNode window =
+        SqlWindow.create(
+            null,
+            null,
+            new SqlNodeList(POS),
+            new SqlNodeList(POS),
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    return new SqlBasicCall(
+        SqlStdOperatorTable.OVER, List.of(new SqlBasicCall(agg, List.of(field), POS), window), POS);
   }
 
   private static boolean getBoolOption(

@@ -49,6 +49,13 @@ public class ExtendedRexBuilder extends RexBuilder {
     try {
       return super.makeCall(pos, op, exprs);
     } catch (RuntimeException e) {
+      // PPL_ARRAY explicitly throws "fail to create array with fixed type" for heterogeneous
+      // operands (e.g. ARRAY(1, TRUE) — INTEGER+BOOLEAN have no leastRestrictive). The user
+      // contract is that this surfaces as a 4xx; do not silently substitute the first-operand
+      // type as a fallback.
+      if ("PPL_ARRAY".equals(op.getName())) {
+        throw e;
+      }
       RelDataType fallback = exprs.get(0).getType();
       return super.makeCall(pos, fallback, op, ImmutableList.copyOf(exprs));
     }

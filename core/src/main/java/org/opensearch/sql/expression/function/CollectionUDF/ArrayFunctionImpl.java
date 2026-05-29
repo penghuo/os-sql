@@ -58,8 +58,13 @@ public class ArrayFunctionImpl extends ImplementorUDF {
             typeFactory, typeFactory.createTypeWithNullability(innerType, true), true);
       } catch (Exception e) {
         // Calcite's ARRAY rejects mixed-type operands (e.g. ARRAY(1, TRUE) — INTEGER+BOOLEAN
-        // have no leastRestrictive). PPL allows heterogeneous arrays; fall back to ANY element
-        // so the SqlValidator round-trip still types the call.
+        // have no leastRestrictive). PPL surfaces this to the user as "fail to create array
+        // with fixed type", so on the visitor side (RexCallBinding) preserve that contract by
+        // re-throwing. On the SqlValidator round-trip side (SqlCallBinding), fall back to
+        // ARRAY<ANY> so already-validated heterogeneous arrays still type at the validator.
+        if (sqlOperatorBinding instanceof org.apache.calcite.rex.RexCallBinding) {
+          throw new RuntimeException("fail to create array with fixed type: " + e.getMessage());
+        }
         RelDataType anyType = typeFactory.createSqlType(SqlTypeName.ANY);
         return createArrayType(
             typeFactory, typeFactory.createTypeWithNullability(anyType, true), true);

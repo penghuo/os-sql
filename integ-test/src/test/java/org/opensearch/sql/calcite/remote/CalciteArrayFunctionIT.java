@@ -64,10 +64,12 @@ public class CalciteArrayFunctionIT extends PPLIntegTestCase {
                         "source=%s | eval array = array(1, true) | head 1 | fields array",
                         TEST_INDEX_BANK)));
 
+    // Operator name is PPL_ARRAY since the rename to avoid Babel parser keyword collision
+    // (Babel binds bare ARRAY as the SQL standard ARRAY constructor with special syntax).
     verifyErrorMessageContains(
         e,
         "fail to create array with fixed type: At line 0, column 0: Cannot infer return type for"
-            + " array; operand types: [INTEGER, BOOLEAN]");
+            + " PPL_ARRAY; operand types: [INTEGER, BOOLEAN]");
   }
 
   @Test

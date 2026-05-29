@@ -51,15 +51,25 @@ public class ReduceFunctionImpl extends ImplementorUDF {
       // lambda's own return type which Calcite tracks in the operand RelDataType.
       RelDataTypeFactory typeFactory = sqlOperatorBinding.getTypeFactory();
       if (!(sqlOperatorBinding instanceof RexCallBinding rexCallBinding)) {
-        // SqlCallBinding path (validator). The trailing optional lambda — if present — is the
-        // final accumulator transform; its return type is the call's return type. Otherwise,
-        // the merge lambda's return type is the result. Lambda operand types are
-        // FunctionSqlType; unwrap to the body return type.
-        int lambdaIdx = sqlOperatorBinding.getOperandCount() > 3 ? 3 : 2;
-        RelDataType lambdaType = sqlOperatorBinding.getOperandType(lambdaIdx);
-        return (lambdaType instanceof org.apache.calcite.sql.type.FunctionSqlType fst)
-            ? fst.getReturnType()
-            : lambdaType;
+        // SqlCallBinding path (validator). At validate-time, SqlLambdaScope initialises every
+        // lambda parameter as SqlTypeName.ANY, so PLUS-on-ANY+ANY drifts to DECIMAL/DOUBLE in
+        // FunctionSqlType.getReturnType — wrong for `reduce(int_array, 0, (acc,x) -> acc+x)`
+        // which should return INT. Use a structural rule instead:
+        //   - 3-arg `reduce(arr, seed, mergeLambda)` — return type is the seed type
+        //     (operandType(1)), since the merge lambda preserves the accumulator type by
+        //     definition of the reduction.
+        //   - 4-arg `reduce(arr, seed, mergeLambda, finalizeLambda)` — the trailing finalize
+        //     lambda transforms the accumulator; its declared return type wins.
+        // The RexCallBinding branch (sql2rel) re-derives the precise type when SqlToRelConverter
+        // rebuilds the call.
+        int operandCount = sqlOperatorBinding.getOperandCount();
+        if (operandCount > 3) {
+          RelDataType lambdaType = sqlOperatorBinding.getOperandType(3);
+          return (lambdaType instanceof org.apache.calcite.sql.type.FunctionSqlType fst)
+              ? fst.getReturnType()
+              : lambdaType;
+        }
+        return sqlOperatorBinding.getOperandType(1);
       }
       List<RexNode> rexNodes = rexCallBinding.operands();
       ArraySqlType listType = (ArraySqlType) rexNodes.get(0).getType();

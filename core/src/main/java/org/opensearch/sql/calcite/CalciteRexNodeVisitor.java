@@ -767,19 +767,15 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
   @Override
   public RexNode visitRelevanceFieldList(RelevanceFieldList node, CalcitePlanContext context) {
     List<RexNode> varArgRexNodeList = new ArrayList<>();
+    org.apache.calcite.rel.type.RelDataType varcharType =
+        context.rexBuilder.getTypeFactory().createSqlType(SqlTypeName.VARCHAR);
+    org.apache.calcite.rel.type.RelDataType doubleType =
+        context.rexBuilder.getTypeFactory().createSqlType(SqlTypeName.DOUBLE);
     node.getFieldList()
         .forEach(
             (k, v) -> {
-              varArgRexNodeList.add(
-                  context.rexBuilder.makeLiteral(
-                      k,
-                      context.rexBuilder.getTypeFactory().createSqlType(SqlTypeName.VARCHAR),
-                      true));
-              varArgRexNodeList.add(
-                  context.rexBuilder.makeLiteral(
-                      v,
-                      context.rexBuilder.getTypeFactory().createSqlType(SqlTypeName.DOUBLE),
-                      true));
+              varArgRexNodeList.add(context.rexBuilder.makeLiteral(k, varcharType, true));
+              varArgRexNodeList.add(context.rexBuilder.makeLiteral(v, doubleType, true));
             });
     return context.rexBuilder.makeCall(
         SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR, varArgRexNodeList);

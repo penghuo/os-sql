@@ -409,10 +409,10 @@ public class QueryService {
    * The {@link SqlNodePipeline} round-trip rebuilds every {@code TableScan} via {@link
    * org.apache.calcite.plan.RelOptTable#toRel(org.apache.calcite.plan.RelOptTable.ToRelContext)},
    * producing a fresh {@code CalciteLogicalIndexScan} whose {@code PushDownContext} is empty.
-   * Highlight is the only scan-level pushdown configured pre-revalidate (other pushdowns are
-   * driven by HepProgram rules that fire after this point). Re-apply it here using the still-
-   * populated {@code highlightConfig} on the context so the highlight clause survives the
-   * round-trip and reaches the OpenSearch request builder.
+   * Highlight is the only scan-level pushdown configured pre-revalidate (other pushdowns are driven
+   * by HepProgram rules that fire after this point). Re-apply it here using the still- populated
+   * {@code highlightConfig} on the context so the highlight clause survives the round-trip and
+   * reaches the OpenSearch request builder.
    */
   private static RelNode reapplyHighlightPushDown(RelNode root, CalcitePlanContext context) {
     org.opensearch.sql.ast.tree.HighlightConfig hl = context.getHighlightConfig();

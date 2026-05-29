@@ -168,6 +168,7 @@ import org.opensearch.sql.calcite.plan.OpenSearchConstants;
 import org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType;
+import org.opensearch.sql.calcite.type.ExprIPType;
 import org.opensearch.sql.calcite.utils.BinUtils;
 import org.opensearch.sql.calcite.utils.JoinAndLookupUtils;
 import org.opensearch.sql.calcite.utils.PPLHintUtils;
@@ -182,7 +183,6 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.SemanticCheckException;
 import org.opensearch.sql.expression.HighlightExpression;
-import org.opensearch.sql.calcite.type.ExprIPType;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
@@ -662,9 +662,9 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   /**
    * Drop the synthetic {@code _highlight} column from the current top-of-stack row-type when
    * highlight was not requested. The column is part of the table catalog (post-C6) so the
-   * SqlValidator can resolve references after the round-trip; it must be removed before
-   * commands that would otherwise treat it as a regular grouping/aggregation column (e.g.
-   * streamstats Aggregate, which fails on MAP-typed group keys).
+   * SqlValidator can resolve references after the round-trip; it must be removed before commands
+   * that would otherwise treat it as a regular grouping/aggregation column (e.g. streamstats
+   * Aggregate, which fails on MAP-typed group keys).
    */
   private static void dropHighlightIfNotRequested(CalcitePlanContext context) {
     if (context.isHighlightRequested()) {
@@ -688,8 +688,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       List<RexNode> metaFieldsRef =
           originalFields.stream()
               .filter(OpenSearchConstants.METADATAFIELD_TYPE_MAP::containsKey)
-              .filter(
-                  f -> !(keepHighlight && HighlightExpression.HIGHLIGHT_FIELD.equals(f)))
+              .filter(f -> !(keepHighlight && HighlightExpression.HIGHLIGHT_FIELD.equals(f)))
               .map(metaField -> (RexNode) context.relBuilder.field(metaField))
               .toList();
       // Remove metadata fields if there is and ensure there are other fields.
@@ -4172,8 +4171,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
               new org.opensearch.sql.ast.expression.Literal(
                   "", org.opensearch.sql.ast.expression.DataType.STRING));
       RexNode rex = rexVisitor.analyze(emptyLet, context);
-      String alias =
-          ((RexLiteral) ((RexCall) rex).getOperands().get(1)).getValueAs(String.class);
+      String alias = ((RexLiteral) ((RexCall) rex).getOperands().get(1)).getValueAs(String.class);
       projectPlusOverriding(List.of(rex), List.of(alias), context);
       return context.relBuilder.peek();
     }

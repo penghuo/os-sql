@@ -165,19 +165,115 @@ public final class SqlNodePipeline {
     String sql = relToSql(original);
     RelNode roundTripped = sqlToRel(sql, context);
     roundTripped = stripIdentityProjects(roundTripped);
+    roundTripped = unpadRelevanceMapKeys(roundTripped);
     roundTripped = reattachCorrelateJoinTypes(original, roundTripped);
     return reattachAggregateHints(original, roundTripped);
   }
 
   /**
+   * The Spark dialect unparses relevance functions' field MAPs as bare {@code MAP('k', v, ...)}
+   * calls. After {@code SqlToRelConverter} reparses, the parser types the bare quoted strings as
+   * {@code CHAR(n)} and {@code MAP_VALUE_CONSTRUCTOR}'s {@code leastRestrictive} widens them to
+   * {@code CHAR(max-of-key-lengths)}, padding shorter keys with trailing spaces (a CHAR semantic).
+   * That corrupts field names — {@code "Body"} becomes {@code "Body "} when paired with longer
+   * {@code "Title"}.
+   *
+   * <p>Walk the round-tripped tree, find {@link RexCall}s whose operator is a multi-fields
+   * relevance UDF ({@code simple_query_string} / {@code query_string} / {@code multi_match}), and
+   * for each {@code MAP_VALUE_CONSTRUCTOR}/{@code MAP} operand whose value is itself a {@code MAP}
+   * of {@code (CHAR, *)}, rebuild that inner map with VARCHAR-typed (untrimmed) key literals. This
+   * restores the original visitor-time semantics without bypassing the round-trip.
+   */
+  private static RelNode unpadRelevanceMapKeys(RelNode root) {
+    final java.util.Set<String> RELEVANCE_NAMES =
+        java.util.Set.of("simple_query_string", "query_string", "multi_match");
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    org.apache.calcite.rel.type.RelDataType varcharType =
+        rexBuilder.getTypeFactory().createSqlType(org.apache.calcite.sql.type.SqlTypeName.VARCHAR);
+    org.apache.calcite.rex.RexShuttle shuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexCall visited =
+                (org.apache.calcite.rex.RexCall) super.visitCall(call);
+            if (!RELEVANCE_NAMES.contains(
+                visited.getOperator().getName().toLowerCase(java.util.Locale.ROOT))) {
+              return visited;
+            }
+            // Each operand is a MAP('alias', value); we want to rebuild any inner MAP of fields.
+            java.util.List<org.apache.calcite.rex.RexNode> newOperands =
+                new java.util.ArrayList<>(visited.getOperands().size());
+            boolean changed = false;
+            for (org.apache.calcite.rex.RexNode op : visited.getOperands()) {
+              org.apache.calcite.rex.RexNode rebuilt =
+                  rebuildMapKeysVarchar(op, rexBuilder, varcharType);
+              if (rebuilt != op) changed = true;
+              newOperands.add(rebuilt);
+            }
+            if (!changed) return visited;
+            return (org.apache.calcite.rex.RexCall)
+                rexBuilder.makeCall(visited.getType(), visited.getOperator(), newOperands);
+          }
+        };
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            return super.visit(node).accept(shuttle);
+          }
+        });
+  }
+
+  private static org.apache.calcite.rex.RexNode rebuildMapKeysVarchar(
+      org.apache.calcite.rex.RexNode node,
+      org.apache.calcite.rex.RexBuilder rexBuilder,
+      org.apache.calcite.rel.type.RelDataType varcharType) {
+    if (!(node instanceof org.apache.calcite.rex.RexCall call)) return node;
+    boolean isMap =
+        call.getOperator() == SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR
+            || call.getOperator() == org.apache.calcite.sql.fun.SqlLibraryOperators.MAP;
+    if (!isMap) return node;
+    java.util.List<org.apache.calcite.rex.RexNode> ops = call.getOperands();
+    java.util.List<org.apache.calcite.rex.RexNode> rebuilt = new java.util.ArrayList<>(ops.size());
+    boolean changed = false;
+    for (int i = 0; i < ops.size(); i += 2) {
+      org.apache.calcite.rex.RexNode key = ops.get(i);
+      org.apache.calcite.rex.RexNode val = i + 1 < ops.size() ? ops.get(i + 1) : null;
+      if (key instanceof org.apache.calcite.rex.RexLiteral lit
+          && lit.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR
+          && lit.getValue() instanceof org.apache.calcite.util.NlsString nls) {
+        String trimmed = stripTrailingSpaces(nls.getValue());
+        rebuilt.add(rexBuilder.makeLiteral(trimmed, varcharType, true));
+        changed = true;
+      } else {
+        rebuilt.add(key);
+      }
+      if (val != null) {
+        // Recurse into nested MAPs (relevance fields use a MAP-of-MAPs shape).
+        org.apache.calcite.rex.RexNode rebuiltVal =
+            rebuildMapKeysVarchar(val, rexBuilder, varcharType);
+        if (rebuiltVal != val) changed = true;
+        rebuilt.add(rebuiltVal);
+      }
+    }
+    if (!changed) return node;
+    return rexBuilder.makeCall(call.getOperator(), rebuilt);
+  }
+
+  private static String stripTrailingSpaces(String s) {
+    int n = s.length();
+    while (n > 0 && s.charAt(n - 1) == ' ') n--;
+    return s.substring(0, n);
+  }
+
+  /**
    * RelToSql turns a {@code Correlate(LEFT)} into a {@code LATERAL} sub-query and the round-trip
-   * re-builds it as {@code Correlate(INNER)} (Calcite's parser default). For
-   * streamstats-with-reset that uses {@code Correlate.LEFT} to keep null-bucket rows, the
-   * INNER drop loses those rows.
+   * re-builds it as {@code Correlate(INNER)} (Calcite's parser default). For streamstats-with-reset
+   * that uses {@code Correlate.LEFT} to keep null-bucket rows, the INNER drop loses those rows.
    *
    * <p>Walk both plans pre-order and copy each {@code Correlate}'s {@code joinType} from the
-   * original to the round-tripped position when shapes match. Mirrors
-   * {@link #reattachAggregateHints}.
+   * original to the round-tripped position when shapes match. Mirrors {@link
+   * #reattachAggregateHints}.
    */
   private static RelNode reattachCorrelateJoinTypes(RelNode original, RelNode roundTripped) {
     java.util.List<org.apache.calcite.rel.core.JoinRelType> origJoinTypes =
@@ -209,8 +305,8 @@ public final class SqlNodePipeline {
         });
   }
 
-  private static java.util.List<org.apache.calcite.rel.core.JoinRelType>
-      collectCorrelateJoinTypes(RelNode node) {
+  private static java.util.List<org.apache.calcite.rel.core.JoinRelType> collectCorrelateJoinTypes(
+      RelNode node) {
     java.util.List<org.apache.calcite.rel.core.JoinRelType> types = new java.util.ArrayList<>();
     node.accept(
         new org.apache.calcite.rel.RelHomogeneousShuttle() {
@@ -232,9 +328,9 @@ public final class SqlNodePipeline {
    *
    * <p>Identity = the project's expression list is the same length as its input row-type, every
    * project expression is a {@link org.apache.calcite.rex.RexInputRef} pointing to the
-   * corresponding input column index in order, and the field names match. Stripping these
-   * collapses the round-tripped plan back toward the visitor's shape, which keeps explain output
-   * stable and reduces redundant runtime materialisation.
+   * corresponding input column index in order, and the field names match. Stripping these collapses
+   * the round-tripped plan back toward the visitor's shape, which keeps explain output stable and
+   * reduces redundant runtime materialisation.
    */
   private static RelNode stripIdentityProjects(RelNode root) {
     org.apache.calcite.rex.RexShuttle subqueryShuttle =
@@ -740,7 +836,8 @@ public final class SqlNodePipeline {
             // Rebuild the one-row Values with the narrowed schema (mirrors the project list).
             com.google.common.collect.ImmutableList.Builder<org.apache.calcite.rex.RexLiteral>
                 narrowRowBuilder = com.google.common.collect.ImmutableList.builder();
-            for (org.apache.calcite.rel.type.RelDataTypeField f : narrowSchema.build().getFieldList()) {
+            for (org.apache.calcite.rel.type.RelDataTypeField f :
+                narrowSchema.build().getFieldList()) {
               narrowRowBuilder.add(rexBuilder.makeNullLiteral(f.getType()));
             }
             oneRow =
@@ -985,9 +1082,7 @@ public final class SqlNodePipeline {
             catalogReader,
             context.relBuilder.getCluster(),
             new PplConvertletTable(),
-            SqlToRelConverter.config()
-                .withTrimUnusedFields(false)
-                .withRemoveSortInSubQuery(false));
+            SqlToRelConverter.config().withTrimUnusedFields(false).withRemoveSortInSubQuery(false));
 
     RelRoot root = sqlToRel.convertQuery(validated, false, true);
     return root.project();

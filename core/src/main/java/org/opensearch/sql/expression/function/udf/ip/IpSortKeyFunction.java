@@ -59,8 +59,7 @@ public class IpSortKeyFunction extends ImplementorUDF {
     @Override
     public Expression implement(
         RexToLixTranslator translator, RexCall call, List<Expression> translatedOperands) {
-      return Expressions.call(
-          IpSortKeyImplementor.class, "toSortKey", translatedOperands.get(0));
+      return Expressions.call(IpSortKeyImplementor.class, "toSortKey", translatedOperands.get(0));
     }
 
     /** Convert the canonical IP string to its 16-byte big-endian IPv6 form. */
@@ -74,7 +73,9 @@ public class IpSortKeyFunction extends ImplementorUDF {
     }
 
     private static IPv6Address toIPv6(inet.ipaddr.IPAddress address) {
-      return address instanceof inet.ipaddr.ipv4.IPv4Address v4 ? v4.toIPv6() : (IPv6Address) address;
+      return address instanceof inet.ipaddr.ipv4.IPv4Address v4
+          ? v4.toIPv6()
+          : (IPv6Address) address;
     }
   }
 }

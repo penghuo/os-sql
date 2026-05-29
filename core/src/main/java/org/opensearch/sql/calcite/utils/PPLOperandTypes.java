@@ -183,63 +183,32 @@ public class PPLOperandTypes {
               SqlTypeFamily.NUMERIC,
               SqlTypeFamily.NUMERIC));
 
+  // bin / WIDTH_BUCKET operand metadata. Uses wrapUDT so PPL UDTs (EXPR_DATE, EXPR_TIME,
+  // EXPR_TIMESTAMP — VARCHAR-tagged) are accepted at the SqlValidator round-trip without falling
+  // into the CHARACTER → DECIMAL coercion path that would otherwise emit
+  // CAST(@timestamp AS DECIMAL) and trip Primitive.charToDecimalCast at runtime.
+  // Variants:
+  //   - numeric path: bin age span=10
+  //   - PPL UDT date/time: bin @timestamp ... — slot 2 is INTEGER, slots 3/4 are STRING (interval
+  //     diff representation) or matching UDT for SCOTT-schema unit tests.
+  //   - SCOTT schema date/time: bare TIMESTAMP/DATE/TIME (validator family check).
   public static final UDFOperandMetadata WIDTH_BUCKET_OPERAND =
-      UDFOperandMetadata.wrap(
-          (CompositeOperandTypeChecker)
-              // 1. Numeric fields: bin age span=10
-              OperandTypes.family(
-                      SqlTypeFamily.NUMERIC,
-                      SqlTypeFamily.INTEGER,
-                      SqlTypeFamily.NUMERIC,
-                      SqlTypeFamily.NUMERIC)
-                  // 2. Timestamp fields with OpenSearch type system
-                  // Used in: Production + Integration tests (CalciteBinCommandIT)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.TIMESTAMP,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.CHARACTER, // TIMESTAMP - TIMESTAMP = INTERVAL (as STRING)
-                          SqlTypeFamily.TIMESTAMP))
-                  // 3. Timestamp fields with Calcite SCOTT schema
-                  // Used in: Unit tests (CalcitePPLBinTest)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.TIMESTAMP,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.TIMESTAMP, // TIMESTAMP - TIMESTAMP = TIMESTAMP
-                          SqlTypeFamily.TIMESTAMP))
-                  // DATE field with OpenSearch type system
-                  // Used in: Production + Integration tests (CalciteBinCommandIT)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.DATE,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.CHARACTER, // DATE - DATE = INTERVAL (as STRING)
-                          SqlTypeFamily.DATE))
-                  // DATE field with Calcite SCOTT schema
-                  // Used in: Unit tests (CalcitePPLBinTest)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.DATE,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.DATE, // DATE - DATE = DATE
-                          SqlTypeFamily.DATE))
-                  // TIME field with OpenSearch type system
-                  // Used in: Production + Integration tests (CalciteBinCommandIT)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.TIME,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.CHARACTER, // TIME - TIME = INTERVAL (as STRING)
-                          SqlTypeFamily.TIME))
-                  // TIME field with Calcite SCOTT schema
-                  // Used in: Unit tests (CalcitePPLBinTest)
-                  .or(
-                      OperandTypes.family(
-                          SqlTypeFamily.TIME,
-                          SqlTypeFamily.INTEGER,
-                          SqlTypeFamily.TIME, // TIME - TIME = TIME
-                          SqlTypeFamily.TIME)));
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              // Numeric variant.
+              List.of(BYTE_T, INTEGER_T, BYTE_T, BYTE_T),
+              List.of(SHORT_T, INTEGER_T, SHORT_T, SHORT_T),
+              List.of(INTEGER_T, INTEGER_T, INTEGER_T, INTEGER_T),
+              List.of(LONG_T, INTEGER_T, LONG_T, LONG_T),
+              List.of(FLOAT_T, INTEGER_T, FLOAT_T, FLOAT_T),
+              List.of(DOUBLE_T, INTEGER_T, DOUBLE_T, DOUBLE_T),
+              // PPL UDT path — slot 3 is STRING (interval-as-string) or matching UDT.
+              List.of(TIMESTAMP_UDT, INTEGER_T, STRING_T, TIMESTAMP_UDT),
+              List.of(TIMESTAMP_UDT, INTEGER_T, TIMESTAMP_UDT, TIMESTAMP_UDT),
+              List.of(DATE_UDT, INTEGER_T, STRING_T, DATE_UDT),
+              List.of(DATE_UDT, INTEGER_T, DATE_UDT, DATE_UDT),
+              List.of(TIME_UDT, INTEGER_T, STRING_T, TIME_UDT),
+              List.of(TIME_UDT, INTEGER_T, TIME_UDT, TIME_UDT)));
 
   public static final UDFOperandMetadata NUMERIC_NUMERIC_NUMERIC_NUMERIC_NUMERIC =
       UDFOperandMetadata.wrap(

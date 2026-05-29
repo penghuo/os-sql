@@ -165,7 +165,64 @@ public final class SqlNodePipeline {
     String sql = relToSql(original);
     RelNode roundTripped = sqlToRel(sql, context);
     roundTripped = stripIdentityProjects(roundTripped);
+    roundTripped = reattachCorrelateJoinTypes(original, roundTripped);
     return reattachAggregateHints(original, roundTripped);
+  }
+
+  /**
+   * RelToSql turns a {@code Correlate(LEFT)} into a {@code LATERAL} sub-query and the round-trip
+   * re-builds it as {@code Correlate(INNER)} (Calcite's parser default). For
+   * streamstats-with-reset that uses {@code Correlate.LEFT} to keep null-bucket rows, the
+   * INNER drop loses those rows.
+   *
+   * <p>Walk both plans pre-order and copy each {@code Correlate}'s {@code joinType} from the
+   * original to the round-tripped position when shapes match. Mirrors
+   * {@link #reattachAggregateHints}.
+   */
+  private static RelNode reattachCorrelateJoinTypes(RelNode original, RelNode roundTripped) {
+    java.util.List<org.apache.calcite.rel.core.JoinRelType> origJoinTypes =
+        collectCorrelateJoinTypes(original);
+    if (origJoinTypes.isEmpty()) {
+      return roundTripped;
+    }
+    int[] idx = {0};
+    return roundTripped.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (visited instanceof org.apache.calcite.rel.core.Correlate c
+                && idx[0] < origJoinTypes.size()) {
+              org.apache.calcite.rel.core.JoinRelType orig = origJoinTypes.get(idx[0]++);
+              if (c.getJoinType() != orig) {
+                return c.copy(
+                    c.getTraitSet(),
+                    c.getLeft(),
+                    c.getRight(),
+                    c.getCorrelationId(),
+                    c.getRequiredColumns(),
+                    orig);
+              }
+            }
+            return visited;
+          }
+        });
+  }
+
+  private static java.util.List<org.apache.calcite.rel.core.JoinRelType>
+      collectCorrelateJoinTypes(RelNode node) {
+    java.util.List<org.apache.calcite.rel.core.JoinRelType> types = new java.util.ArrayList<>();
+    node.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode n) {
+            if (n instanceof org.apache.calcite.rel.core.Correlate c) {
+              types.add(c.getJoinType());
+            }
+            return super.visit(n);
+          }
+        });
+    return types;
   }
 
   /**
@@ -180,11 +237,28 @@ public final class SqlNodePipeline {
    * stable and reduces redundant runtime materialisation.
    */
   private static RelNode stripIdentityProjects(RelNode root) {
+    org.apache.calcite.rex.RexShuttle subqueryShuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitSubQuery(
+              org.apache.calcite.rex.RexSubQuery subQuery) {
+            // Recurse into the subquery's plan so nested EXISTS/IN/Scalar subqueries also get
+            // identity-Project stripping (they hold a RelNode plan in `rel` that the outer
+            // RelHomogeneousShuttle does not visit).
+            RelNode stripped = stripIdentityProjects(subQuery.rel);
+            if (stripped == subQuery.rel) {
+              return super.visitSubQuery(subQuery);
+            }
+            return subQuery.clone(stripped);
+          }
+        };
     return root.accept(
         new org.apache.calcite.rel.RelHomogeneousShuttle() {
           @Override
           public RelNode visit(RelNode node) {
-            RelNode visited = super.visit(node);
+            // Rewrite any RexSubQuery references first — Filter/Project conditions can carry
+            // them and we want stripping inside their nested plans too.
+            RelNode visited = super.visit(node).accept(subqueryShuttle);
             if (!(visited instanceof org.apache.calcite.rel.core.Project project)) {
               return visited;
             }

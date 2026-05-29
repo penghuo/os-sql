@@ -59,6 +59,7 @@ import org.opensearch.sql.ast.tree.Replace;
 import org.opensearch.sql.ast.tree.ReplacePair;
 import org.opensearch.sql.ast.tree.Reverse;
 import org.opensearch.sql.ast.tree.Rex;
+import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -683,6 +684,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitSpath(SPath node, Frame frame) {
+    // SPath is a JSON-extract expressed as eval. The AST node carries the rewriteAsEval()
+    // factory; delegate to visitEval against the rewritten Eval node — no custom translation
+    // needed.
+    return visitEval(node.rewriteAsEval(), frame);
   }
 
   @Override

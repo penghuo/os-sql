@@ -4992,6 +4992,36 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (args.size() == 3) swapped.add(args.get(2));
       return new SqlBasicCall(org.apache.calcite.sql.fun.SqlLibraryOperators.INSTR, swapped, POS);
     }
+    // Niladic datetime helpers — PPL parses `now()`, `current_date()`, etc. as Function calls
+    // with no args. Calcite's SqlStdOperatorTable defines LOCALTIME / CURRENT_DATE as niladic
+    // SqlOperators that reject the SqlBasicCall(empty-args) shape, so dispatch to the PPL UDF
+    // variants which mirror v2's PPLFuncImpTable mappings.
+    if (args.isEmpty()) {
+      switch (name) {
+        case "now":
+        case "current_timestamp":
+        case "localtime":
+        case "localtimestamp":
+          return new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.NOW, args, POS);
+        case "curtime":
+        case "current_time":
+          return new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.CURRENT_TIME, args, POS);
+        case "curdate":
+        case "current_date":
+          return new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.CURRENT_DATE, args, POS);
+        case "utc_timestamp":
+          return new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.UTC_TIMESTAMP, args, POS);
+        case "utc_time":
+          return new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.UTC_TIME, args, POS);
+        default:
+          // fall through to other handlers
+      }
+    }
     // PPL `regexp_match(str, pattern)` / `regexp(str, pattern)` map to REGEXP_CONTAINS. Cast a
     // CHAR-typed pattern literal to VARCHAR so the validator picks the canonical operator
     // overload (CHAR-typed pattern literal would otherwise miss the signature).

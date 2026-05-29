@@ -43,6 +43,7 @@ public class PPLOperandTypes {
   public static final RelDataType DOUBLE_T = TYPE_FACTORY.createSqlType(SqlTypeName.DOUBLE);
   public static final RelDataType STRING_T = TYPE_FACTORY.createSqlType(SqlTypeName.VARCHAR);
   public static final RelDataType BOOLEAN_T = TYPE_FACTORY.createSqlType(SqlTypeName.BOOLEAN);
+  public static final RelDataType ANY_T = TYPE_FACTORY.createSqlType(SqlTypeName.ANY);
 
   /** List of all scalar type signatures (single parameter each) */
   private static final List<List<RelDataType>> SCALAR_TYPES =
@@ -161,14 +162,10 @@ public class PPLOperandTypes {
               OperandTypes.NUMERIC_NUMERIC
                   .or(
                       OperandTypes.family(
-                          SqlTypeFamily.NUMERIC,
-                          SqlTypeFamily.NUMERIC,
-                          SqlTypeFamily.NUMERIC))
+                          SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC))
                   .or(
                       OperandTypes.family(
-                          SqlTypeFamily.NUMERIC,
-                          SqlTypeFamily.NUMERIC,
-                          SqlTypeFamily.CHARACTER))
+                          SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER))
                   .or(
                       OperandTypes.family(
                           SqlTypeFamily.NUMERIC,
@@ -261,10 +258,23 @@ public class PPLOperandTypes {
                       OperandTypes.family(
                           SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER)));
 
+  // Accepts (), (DATE_UDT|TIME_UDT|TIMESTAMP_UDT|numeric). Uses wrapUDT so PPL UDTs (which report
+  // as VARCHAR/CHARACTER family, not DATETIME) are accepted directly. Without wrapUDT, the
+  // validator's CompositeOperandTypeChecker would coerce CHARACTER → NUMERIC via DECIMAL and the
+  // pushdown script would later try to parse a date string as DECIMAL — see UNIX_TIMESTAMP.
   public static final UDFOperandMetadata OPTIONAL_DATE_OR_TIMESTAMP_OR_NUMERIC =
-      UDFOperandMetadata.wrap(
-          (CompositeOperandTypeChecker)
-              OperandTypes.DATETIME.or(OperandTypes.NUMERIC).or(OperandTypes.family()));
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(),
+              List.of(DATE_UDT),
+              List.of(TIME_UDT),
+              List.of(TIMESTAMP_UDT),
+              List.of(BYTE_T),
+              List.of(SHORT_T),
+              List.of(INTEGER_T),
+              List.of(LONG_T),
+              List.of(FLOAT_T),
+              List.of(DOUBLE_T)));
 
   public static final UDFOperandMetadata DATETIME_OR_STRING =
       UDFOperandMetadata.wrap(
@@ -281,11 +291,16 @@ public class PPLOperandTypes {
           (CompositeOperandTypeChecker)
               OperandTypes.DATETIME.or(OperandTypes.CHARACTER).or(OperandTypes.INTEGER));
 
+  // (DATETIME) | (DATETIME, INTEGER). Uses wrapUDT for UDT acceptance through SqlValidator.
   public static final UDFOperandMetadata DATETIME_OPTIONAL_INTEGER =
-      UDFOperandMetadata.wrap(
-          (CompositeOperandTypeChecker)
-              OperandTypes.DATETIME.or(
-                  OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER)));
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(DATE_UDT),
+              List.of(TIME_UDT),
+              List.of(TIMESTAMP_UDT),
+              List.of(DATE_UDT, INTEGER_T),
+              List.of(TIME_UDT, INTEGER_T),
+              List.of(TIMESTAMP_UDT, INTEGER_T)));
   public static final UDFOperandMetadata ANY_DATETIME_OR_STRING =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -293,8 +308,22 @@ public class PPLOperandTypes {
                   .or(OperandTypes.family(SqlTypeFamily.ANY, SqlTypeFamily.DATETIME))
                   .or(OperandTypes.family(SqlTypeFamily.ANY, SqlTypeFamily.STRING)));
 
+  // (DATETIME, DATETIME). Uses wrapUDT so PPL UDTs (which report as VARCHAR/CHARACTER family,
+  // not DATETIME) are accepted directly. Without wrapUDT, the SqlValidator round-trip rejects
+  // EXPR_DATE/EXPR_TIME/EXPR_TIMESTAMP arguments with "Cannot apply 'ADDTIME' to arguments of
+  // type 'ADDTIME(<EXPR_DATE>, <EXPR_DATE>)'".
   public static final UDFOperandMetadata DATETIME_DATETIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME));
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(DATE_UDT, DATE_UDT),
+              List.of(DATE_UDT, TIME_UDT),
+              List.of(DATE_UDT, TIMESTAMP_UDT),
+              List.of(TIME_UDT, DATE_UDT),
+              List.of(TIME_UDT, TIME_UDT),
+              List.of(TIME_UDT, TIMESTAMP_UDT),
+              List.of(TIMESTAMP_UDT, DATE_UDT),
+              List.of(TIMESTAMP_UDT, TIME_UDT),
+              List.of(TIMESTAMP_UDT, TIMESTAMP_UDT)));
   public static final UDFOperandMetadata DATETIME_OR_STRING_STRING =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
@@ -312,12 +341,48 @@ public class PPLOperandTypes {
   // reject EXPR_TIMESTAMP arguments at the SqlValidator layer.
   public static final UDFOperandMetadata STRING_TIMESTAMP =
       UDFOperandMetadata.wrapUDT(List.of(List.of(STRING_T, TIMESTAMP_UDT)));
+  // (STRING, DATETIME). Uses wrapUDT so PPL UDTs are accepted at the SqlValidator round-trip.
   public static final UDFOperandMetadata STRING_DATETIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.DATETIME));
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(STRING_T, DATE_UDT),
+              List.of(STRING_T, TIME_UDT),
+              List.of(STRING_T, TIMESTAMP_UDT)));
+  // (DATETIME, INTERVAL). Uses wrapUDT so PPL UDTs (which report as VARCHAR/CHARACTER family,
+  // not DATETIME) are accepted directly. Without wrapUDT, a family(DATETIME, DATETIME_INTERVAL)
+  // check rejects EXPR_DATE/EXPR_TIME/EXPR_TIMESTAMP at the SqlValidator round-trip with
+  // "Cannot apply 'DATE_ADD' to arguments of type 'DATE_ADD(<EXPR_TIMESTAMP>, <INTERVAL DAY>)'".
+  // The second slot uses ANY_T as a wildcard since interval qualifiers vary (INTERVAL DAY,
+  // INTERVAL MONTH, etc.); PPLTypeChecker.typesMatch treats ANY in the expected slot as a
+  // wildcard. UDTOperandMetadata.checkOperandTypes (the validator-side check) only validates
+  // arity at present, so the round-trip accepts any 2-arg shape.
   public static final UDFOperandMetadata DATETIME_INTERVAL =
-      UDFOperandMetadata.wrap((FamilyOperandTypeChecker) OperandTypes.DATETIME_INTERVAL);
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(DATE_UDT, ANY_T),
+              List.of(TIME_UDT, ANY_T),
+              List.of(TIMESTAMP_UDT, ANY_T),
+              List.of(STRING_T, ANY_T)));
+
+  // (DATETIME, INTERVAL) | (DATETIME, INTEGER). Used by ADDDATE/SUBDATE which accept either.
+  // Includes STRING shapes so PPL frontend accepts string-date inputs (the runtime then parses
+  // and reports "unsupported format" for malformed strings — what error-message tests expect).
+  public static final UDFOperandMetadata DATETIME_INTERVAL_OR_INTEGER =
+      UDFOperandMetadata.wrapUDT(
+          List.of(
+              List.of(DATE_UDT, ANY_T),
+              List.of(TIME_UDT, ANY_T),
+              List.of(TIMESTAMP_UDT, ANY_T),
+              List.of(STRING_T, ANY_T),
+              List.of(DATE_UDT, INTEGER_T),
+              List.of(TIME_UDT, INTEGER_T),
+              List.of(TIMESTAMP_UDT, INTEGER_T),
+              List.of(STRING_T, INTEGER_T)));
+  // (TIME, TIME). Uses wrapUDT so EXPR_TIME UDT (which reports as VARCHAR/CHARACTER, not TIME)
+  // is accepted directly. Without wrapUDT, the validator coerces VARCHAR→DECIMAL and the
+  // pushdown emits CAST(time AS DECIMAL) which fails at runtime parsing the time string.
   public static final UDFOperandMetadata TIME_TIME =
-      UDFOperandMetadata.wrap(OperandTypes.family(SqlTypeFamily.TIME, SqlTypeFamily.TIME));
+      UDFOperandMetadata.wrapUDT(List.of(List.of(TIME_UDT, TIME_UDT)));
 
   public static final UDFOperandMetadata TIMESTAMP_OR_STRING_STRING_STRING =
       UDFOperandMetadata.wrap(

@@ -21,8 +21,6 @@ import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
-import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
-import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.opensearch.sql.calcite.type.ExprDateType;
@@ -74,10 +72,7 @@ public class AddSubDateFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.DATETIME_INTERVAL.or(
-                OperandTypes.family(SqlTypeFamily.DATETIME, SqlTypeFamily.INTEGER)));
+    return org.opensearch.sql.calcite.utils.PPLOperandTypes.DATETIME_INTERVAL_OR_INTEGER;
   }
 
   @RequiredArgsConstructor

@@ -54,13 +54,39 @@ public class StrftimeFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    // Accepts (NUMERIC|TIMESTAMP, STRING) -> STRING
-    // Note: STRING is NOT accepted for first parameter - use unix_timestamp() to convert
-    // Calcite will auto-cast DATE and TIME to TIMESTAMP
-    return UDFOperandMetadata.wrap(
-        (CompositeOperandTypeChecker)
-            OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER)
-                .or(OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.CHARACTER)));
+    // Accepts (NUMERIC|TIMESTAMP_UDT, STRING). Uses wrapUDT so EXPR_TIMESTAMP UDT is accepted at
+    // SqlValidator round-trip (the family(TIMESTAMP, ...) check rejects it because the UDT
+    // reports as VARCHAR). Without this, validator coerces VARCHAR→DECIMAL and runtime fails
+    // with NumberFormatException at Primitive.charToDecimalCast.
+    return org.opensearch.sql.expression.function.UDFOperandMetadata.wrapUDT(
+        java.util.List.of(
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.BYTE_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.SHORT_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.INTEGER_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.LONG_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.FLOAT_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.DOUBLE_T,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.TIMESTAMP_UDT,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.DATE_UDT,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T),
+            java.util.List.of(
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.TIME_UDT,
+                org.opensearch.sql.calcite.utils.PPLOperandTypes.STRING_T)));
   }
 
   public static class StrftimeImplementor implements NotNullImplementor {

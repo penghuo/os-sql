@@ -566,9 +566,16 @@ public interface PPLTypeChecker {
 
   /**
    * Compares two RelDataTypes for signature matching. Two UDTs match if they share the same UDT
-   * class. Plain types match by SqlTypeName.
+   * class. Plain types match by SqlTypeName. {@link SqlTypeName#ANY} on the {@code expected} side
+   * acts as a wildcard so signatures like {@code (TIMESTAMP_UDT, ANY)} accept any second-slot type
+   * — used to express "DATE_ADD takes a UDT plus any INTERVAL/integer kind" without spelling out
+   * every interval qualifier.
    */
   private static boolean typesMatch(RelDataType expected, RelDataType actual) {
+    if (!(expected instanceof AbstractExprRelDataType<?>)
+        && expected.getSqlTypeName() == SqlTypeName.ANY) {
+      return true;
+    }
     if (expected instanceof AbstractExprRelDataType<?>
         || actual instanceof AbstractExprRelDataType<?>) {
       return expected.getClass() == actual.getClass();

@@ -62,8 +62,7 @@ public class IPFunction extends ImplementorUDF {
         // ExprIPType is now VARCHAR-tagged: the runtime value is the canonical IP string. Build a
         // new ExprIpValue to validate the input and normalise it to canonical form (e.g. trims
         // padding zeros), then expose its canonical text representation.
-        return Expressions.call(
-            Expressions.new_(ExprIpValue.class, translatedOperands), "value");
+        return Expressions.call(Expressions.new_(ExprIpValue.class, translatedOperands), "value");
       } else {
         throw new ExpressionEvaluationException(
             String.format(

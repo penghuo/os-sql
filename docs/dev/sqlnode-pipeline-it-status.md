@@ -162,7 +162,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | 72 | CalcitePPLDedupIT | ✅ | All pass. |
 | 73 | CalciteFillNullCommandIT | ✅ | All pass. |
 | 74 | CalcitePPLFillnullIT | ✅ | All pass. |
-| 75 | CalciteSortCommandIT | ⚠️ | 29/30 pass. 1 fail: IP sort order — IP UDT now reports as VARCHAR (after `b95ea81ca` refactor) so sorts alphabetically not as IP. Pre-existing from IP refactor. Defer or write a special IP-comparator override. |
+| 75 | CalciteSortCommandIT | ✅ | 30/30 pass after `IP_SORT_KEY` UDF wrap on IP-typed sort keys. The UDF emits a 16-byte big-endian IPv6-mapped representation whose lexicographic byte-order matches `IPUtils.compare` (instead of canonical-string lexicographic order which puts `'0.0.0.2'` before `'::1'`). Wired in `CalciteRelNodeVisitor.visitSort`. |
 | 76 | CalcitePPLSortIT | ✅ | All pass. |
 | 77 | CalciteEvalCommandIT | ✅ | All pass. |
 | 78 | CalcitePPLEvalMaxMinFunctionIT | ✅ | All pass after `permissiveVariadic` operand metadata fix to `ScalarMaxFunction` / `ScalarMinFunction`. |

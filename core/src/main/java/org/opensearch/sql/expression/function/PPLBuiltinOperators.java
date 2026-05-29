@@ -107,6 +107,7 @@ import org.opensearch.sql.expression.function.udf.datetime.YearweekFunction;
 import org.opensearch.sql.expression.function.udf.ip.CidrMatchFunction;
 import org.opensearch.sql.expression.function.udf.ip.CompareIpFunction;
 import org.opensearch.sql.expression.function.udf.ip.IPFunction;
+import org.opensearch.sql.expression.function.udf.ip.IpSortKeyFunction;
 import org.opensearch.sql.expression.function.udf.math.ConvFunction;
 import org.opensearch.sql.expression.function.udf.math.DivideFunction;
 import org.opensearch.sql.expression.function.udf.math.EulerFunction;
@@ -177,6 +178,10 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator GTE_IP = CompareIpFunction.greaterOrEquals().toUDF("GTE_IP");
   public static final SqlOperator LESS_IP = CompareIpFunction.less().toUDF("LESS_IP");
   public static final SqlOperator LTE_IP = CompareIpFunction.lessOrEquals().toUDF("LTE_IP");
+  // IP_SORT_KEY wraps an IP-typed sort key in a 16-byte big-endian IPv6-mapped representation
+  // so EnumerableSort orders by VARBINARY whose lexicographic byte-order matches IPUtils.compare
+  // (instead of the canonical-string lexicographic order which puts '0.0.0.2' before '::1').
+  public static final SqlOperator IP_SORT_KEY = new IpSortKeyFunction().toUDF("IP_SORT_KEY");
 
   // Condition function
   public static final SqlOperator EARLIEST = new EarliestFunction().toUDF("EARLIEST");

@@ -182,7 +182,9 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.SemanticCheckException;
 import org.opensearch.sql.expression.HighlightExpression;
+import org.opensearch.sql.calcite.type.ExprIPType;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
+import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.expression.parse.RegexCommonUtils;
 import org.opensearch.sql.utils.ParseUtils;
@@ -722,6 +724,13 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
             .map(
                 expr -> {
                   RexNode sortField = rexVisitor.analyze(expr, context);
+                  // IP UDT is VARCHAR-backed (b95ea81ca) so EnumerableSort orders by
+                  // String.compareTo on the canonical string, putting '0.0.0.2' before '::1'.
+                  // Wrap in IP_SORT_KEY which produces a 16-byte big-endian IPv6-mapped form
+                  // whose lexicographic byte-order matches IPUtils.compare.
+                  if (sortField.getType() instanceof ExprIPType) {
+                    sortField = context.relBuilder.call(PPLBuiltinOperators.IP_SORT_KEY, sortField);
+                  }
                   SortOption sortOption = analyzeSortOption(expr.getFieldArgs());
                   // Default is ASC
                   if (sortOption.getSortOrder() == DESC) {

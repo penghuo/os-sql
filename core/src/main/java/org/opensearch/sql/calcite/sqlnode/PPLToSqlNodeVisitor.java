@@ -1715,12 +1715,87 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           };
     }
     if (unit == null) return null;
+    // Monthly span returns a "YYYY-MM" string (PPL's MonthSpanHandler shape) rather than the
+    // SPAN UDF's timestamp output. Mirror v2's emission so the verifySchema's `string` type
+    // assertion passes.
+    if ("M".equals(unit)) {
+      return buildMonthlySpan(fieldRef, value);
+    }
     return new SqlBasicCall(
         org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
         List.of(
             fieldRef,
             SqlLiteral.createExactNumeric(Integer.toString(value), POS),
             SqlLiteral.createCharString(unit, POS)),
+        POS);
+  }
+
+  /**
+   * Build "YYYY-MM" monthly bin label using the v2 emission shape: DATE_FORMAT(MAKEDATE(yearOfBin,
+   * dayOfYear), '%Y-%m') over a months-since-epoch bin start.
+   */
+  private SqlNode buildMonthlySpan(SqlNode fieldRef, int intervalMonths) {
+    SqlNode yearCall =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.YEAR,
+            List.of(fieldRef),
+            POS);
+    SqlNode monthCall =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.MONTH,
+            List.of(fieldRef),
+            POS);
+    SqlLiteral i1970 = SqlLiteral.createExactNumeric("1970", POS);
+    SqlLiteral i12 = SqlLiteral.createExactNumeric("12", POS);
+    SqlLiteral i1 = SqlLiteral.createExactNumeric("1", POS);
+    SqlLiteral i31 = SqlLiteral.createExactNumeric("31", POS);
+    SqlLiteral interval = SqlLiteral.createExactNumeric(Integer.toString(intervalMonths), POS);
+    SqlNode yearsSinceEpoch =
+        new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(yearCall, i1970), POS);
+    SqlNode monthsFromYears =
+        new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(yearsSinceEpoch, i12), POS);
+    SqlNode monthMinus1 = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(monthCall, i1), POS);
+    SqlNode monthsSinceEpoch =
+        new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(monthsFromYears, monthMinus1), POS);
+    SqlNode positionInCycle =
+        new SqlBasicCall(SqlStdOperatorTable.MOD, List.of(monthsSinceEpoch, interval), POS);
+    SqlNode binStartMonths =
+        new SqlBasicCall(
+            SqlStdOperatorTable.MINUS, List.of(monthsSinceEpoch, positionInCycle), POS);
+    SqlNode binStartYear =
+        new SqlBasicCall(
+            SqlStdOperatorTable.PLUS,
+            List.of(
+                i1970,
+                new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(binStartMonths, i12), POS)),
+            POS);
+    SqlNode binStartMonth =
+        new SqlBasicCall(
+            SqlStdOperatorTable.PLUS,
+            List.of(
+                new SqlBasicCall(SqlStdOperatorTable.MOD, List.of(binStartMonths, i12), POS), i1),
+            POS);
+    SqlNode dayOfYear =
+        new SqlBasicCall(
+            SqlStdOperatorTable.PLUS,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.MULTIPLY,
+                    List.of(
+                        new SqlBasicCall(
+                            SqlStdOperatorTable.MINUS, List.of(binStartMonth, i1), POS),
+                        i31),
+                    POS),
+                i1),
+            POS);
+    SqlNode tempDate =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.MAKEDATE,
+            List.of(binStartYear, dayOfYear),
+            POS);
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_FORMAT,
+        List.of(tempDate, SqlLiteral.createCharString("%Y-%m", POS)),
         POS);
   }
 

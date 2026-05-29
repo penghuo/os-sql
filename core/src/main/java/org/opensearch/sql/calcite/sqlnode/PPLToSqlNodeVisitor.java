@@ -4260,6 +4260,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.subquery.InSubquery is) {
       return inSubqueryExpr(is);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.Between b) {
+      return new SqlBasicCall(
+          SqlStdOperatorTable.BETWEEN,
+          List.of(expr(b.getValue()), expr(b.getLowerBound()), expr(b.getUpperBound())),
+          POS);
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.Xor xor) {
+      // a XOR b ≡ (a OR b) AND NOT (a AND b)
+      SqlNode l = expr(xor.getLeft());
+      SqlNode r = expr(xor.getRight());
+      SqlNode or = new SqlBasicCall(SqlStdOperatorTable.OR, List.of(l, r), POS);
+      SqlNode and = new SqlBasicCall(SqlStdOperatorTable.AND, List.of(l, r), POS);
+      SqlNode notAnd = new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(and), POS);
+      return new SqlBasicCall(SqlStdOperatorTable.AND, List.of(or, notAnd), POS);
+    }
     if (e instanceof org.opensearch.sql.ast.expression.subquery.ExistsSubquery es) {
       return existsSubqueryExpr(es);
     }

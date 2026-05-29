@@ -78,12 +78,12 @@ Pushdown shape may change for non-nullable group keys. Some assertions may flip 
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 23 | CalcitePPLAggregationIT | ❌ | After fix: 24 unique fails. Fixed: DISTINCT_COUNT_APPROX null-metadata (R3 pattern, validator's overload-filter NPE'd on getOperandCountRange). Remaining: (a) MEDIAN/PERCENTILE failures — visitor passes `rexBuilder.makeFlag(SqlTypeName)` as the type-discriminator arg; SymbolFlag unparses as a bare identifier (`DECIMAL`/`BIGINT`) that the parser misreads as a column reference. Refactor needed to drop the type-name arg (return type already known at compile time via ARG0_FORCE_NULLABLE). (b) testAvgBySpan/testStatsBySpan — execution-time `Unsupported expr type: INTEGER` from SPAN function planning (separate). **Both deferred.** |
-| 24 | CalcitePPLAggregationPaginatingIT | ⏳ | |
-| 25 | CalcitePPLNestedAggregationIT | ⏳ | |
-| 26 | CalciteStatsCommandIT | ⏳ | |
-| 27 | CalciteTimechartCommandIT | ⏳ | |
-| 28 | CalciteTimechartPerFunctionIT | ⏳ | |
+| 23 | CalcitePPLAggregationIT | ❌ | After fixes: 7 unique fails (down from 28). Fixed: (i) DISTINCT_COUNT_APPROX null-metadata (R3 pattern, validator's overload-filter NPE'd on getOperandCountRange). (ii) MEDIAN/PERCENTILE: visitor used to pass `rexBuilder.makeFlag(SqlTypeName)` as a type-discriminator arg; SymbolFlag unparses as a bare identifier (`DECIMAL`/`BIGINT`) that the parser misreads as a column reference. Switched to a STRING literal carrying SqlTypeName.name(); accumulator parses it back; spec extended to accept `(NUMERIC, NUMERIC, CHARACTER)` and `(NUMERIC, NUMERIC, NUMERIC, CHARACTER)`. Remaining: testSumEmpty (SUM result type DOUBLE vs expected BIGINT), testStatsCountOnFunctionsWithUDTArg (CHAR-array runtime cast), testAvgBySpan/testStatsBySpan/testStatsGroupByDate (SPAN-related, `Unsupported expr type: INTEGER`). **Deferred.** |
+| 24 | CalcitePPLAggregationPaginatingIT | ❌ | After fixes: 3 unique fails (down from 10) — same residual issues as #23 (testSumEmpty, testStatsCountOnFunctionsWithUDTArg, testStatsGroupByDate). MEDIAN/PERCENTILE failures resolved. |
+| 25 | CalcitePPLNestedAggregationIT | ❌ | 1/9 fail (testNestedAggregationThrowExceptionIfPushdownCannotApplied). Test expects an error from nested-aggregation dispatch; removed `reapplyAggregateHints` causes the hint to be dropped on round-trip, so the OpenSearch nested-agg rule doesn't fire and the query unexpectedly succeeds. **Expected from bypass removal; deferred until aggregate-hint preservation is reintroduced.** |
+| 26 | CalciteStatsCommandIT | ❌ | After fixes: 9 unique fails (down from 16) — all SPAN-related (testStatsBySpan, testStatsAliasedSpan, testStatsSpanSortOnMeasure, etc.) plus testStatsPercentileBySpan. PERCENTILE failures resolved. |
+| 27 | CalciteTimechartCommandIT | ✅ | 18/18 pass. |
+| 28 | CalciteTimechartPerFunctionIT | ❌ | 12/12 fail. All hit "failed to re-parse generated SQL"; the parser rejects `TIMESTAMPDIFF('MILLISECOND', ts1, ts2)` because the time-unit must be an unquoted identifier in standard SQL (`TIMESTAMPDIFF(MILLISECOND, ts1, ts2)`), not a string literal. The visitor unparses the time-unit as a string. **Deferred — needs dialect-level unparser override for TIMESTAMPDIFF / TIMESTAMPADD interval-unit args.** |
 
 ## Phase 5 — Joins / Subqueries (was bypassed: containsJoinOrCorrelate)
 

@@ -1449,9 +1449,14 @@ public class PPLFuncImpTable {
             if (field.getType() == null) {
               throw new IllegalArgumentException("Field type cannot be null");
             }
+            // Trailing arg is the field's SqlTypeName as a STRING literal. The accumulator uses
+            // it to coerce the double result back to the field's numeric type so Calcite's
+            // codegen `(Long) result` cast doesn't ClassCastException. A string literal survives
+            // RelToSql round-trip (a SymbolFlag would unparse as a bare identifier and re-parse
+            // as a column reference).
             List<RexNode> newArgList =
                 argList.stream().map(PlanUtils::derefMapCall).collect(Collectors.toList());
-            newArgList.add(ctx.rexBuilder.makeFlag(field.getType().getSqlTypeName()));
+            newArgList.add(ctx.rexBuilder.makeLiteral(field.getType().getSqlTypeName().name()));
             return UserDefinedFunctionUtils.makeAggregateCall(
                 PPLBuiltinOperators.PERCENTILE_APPROX, List.of(field), newArgList, ctx.relBuilder);
           },
@@ -1475,7 +1480,7 @@ public class PPLFuncImpTable {
             List<RexNode> medianArgList =
                 List.of(
                     ctx.rexBuilder.makeExactLiteral(BigDecimal.valueOf(MEDIAN_PERCENTILE)),
-                    ctx.rexBuilder.makeFlag(field.getType().getSqlTypeName()));
+                    ctx.rexBuilder.makeLiteral(field.getType().getSqlTypeName().name()));
             return UserDefinedFunctionUtils.makeAggregateCall(
                 PPLBuiltinOperators.PERCENTILE_APPROX,
                 List.of(field),

@@ -146,12 +146,35 @@ public class PPLOperandTypes {
               (OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.STRING))
                   .or(OperandTypes.family(SqlTypeFamily.STRING, SqlTypeFamily.STRING)));
 
+  // PERCENTILE_APPROX shape:
+  //   user-side : percentile_approx(value, percent[, compression])    (2 or 3 args)
+  //   visitor-side after appending type-name string for result coercion:
+  //               percentile_approx(value, percent, <type>)            (3 args)
+  //               percentile_approx(value, percent, compression, <type>) (4 args)
+  // The visitor appends a trailing string literal carrying the field's SqlTypeName name (e.g.
+  // "BIGINT") so the impl can coerce its double result to the declared return type. Without
+  // accepting STRING (CHARACTER family) in the trailing slot, the SqlValidator round-trip would
+  // try to coerce the string to NUMERIC at runtime and throw NumberFormatException.
   public static final UDFOperandMetadata NUMERIC_NUMERIC_OPTIONAL_NUMERIC =
       UDFOperandMetadata.wrap(
           (CompositeOperandTypeChecker)
-              OperandTypes.NUMERIC_NUMERIC.or(
-                  OperandTypes.family(
-                      SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC)));
+              OperandTypes.NUMERIC_NUMERIC
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC))
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.CHARACTER))
+                  .or(
+                      OperandTypes.family(
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.NUMERIC,
+                          SqlTypeFamily.CHARACTER)));
   public static final UDFOperandMetadata NUMERIC_NUMERIC_NUMERIC =
       UDFOperandMetadata.wrap(
           OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC));

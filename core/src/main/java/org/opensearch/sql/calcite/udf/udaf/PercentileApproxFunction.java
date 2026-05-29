@@ -9,25 +9,29 @@ import com.tdunning.math.stats.MergingDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.sql.calcite.udf.UserDefinedAggFunction;
 
 /** We write by ourselves since it's an approximate algorithm */
 public class PercentileApproxFunction
     implements UserDefinedAggFunction<PercentileApproxFunction.PencentileApproAccumulator> {
-  SqlTypeName returnType;
+  private String returnTypeName;
   private double compression;
   double percentile;
 
   @Override
   public PencentileApproAccumulator init() {
-    returnType = SqlTypeName.DOUBLE;
+    returnTypeName = "DOUBLE";
     compression = 100.0;
     percentile = 1.0;
     return new PencentileApproAccumulator();
   }
 
-  // Add values to the accumulator
+  // Add values to the accumulator. Operand layout (trailing String is the field's SqlTypeName
+  // name, used to coerce the double result back to the declared return type):
+  //   values[0]      = target value (the field being percentile-d)
+  //   values[1]      = percentile (number, 0-100)
+  //   values[2]      = optional compression (number) when present
+  //   values[last]   = SqlTypeName.name() string ("BIGINT", "DOUBLE", "INTEGER", ...)
   @Override
   public PencentileApproAccumulator add(PencentileApproAccumulator acc, Object... values) {
     Object targetValue = values[0];
@@ -35,35 +39,33 @@ public class PercentileApproxFunction
       return acc;
     }
     percentile = ((Number) values[1]).intValue() / 100.0;
-    returnType = (SqlTypeName) values[values.length - 1];
-    if (values.length > 3) { // have compression
+    Object trailing = values[values.length - 1];
+    returnTypeName =
+        (trailing instanceof String) ? (String) trailing : trailing.toString();
+    if (values.length > 3) {
       compression = ((Number) values[values.length - 2]).doubleValue();
     }
-
     acc.evaluate(((Number) targetValue).doubleValue());
     return acc;
   }
 
-  // Calculate the percentile
+  // Calculate the percentile and coerce to the declared return type. Calcite's UDAF codegen
+  // emits a direct unboxing cast (e.g. `(Long) result`) so the runtime type must match the
+  // declared SqlTypeName; otherwise we get ClassCastException at execution time.
   @Override
   public Object result(PencentileApproAccumulator acc) {
     if (acc.size() == 0) {
       return null;
     }
     double retValue = (double) acc.value(compression, percentile);
-    switch (returnType) {
-      case INTEGER:
-        int intRet = (int) retValue;
-        return intRet;
-      case BIGINT:
-        long longRet = (long) retValue;
-        return longRet;
-      case FLOAT:
-        float floatRet = (float) retValue;
-        return floatRet;
-      default:
-        return retValue;
-    }
+    return switch (returnTypeName) {
+      case "TINYINT" -> (byte) retValue;
+      case "SMALLINT" -> (short) retValue;
+      case "INTEGER" -> (int) retValue;
+      case "BIGINT" -> (long) retValue;
+      case "REAL", "FLOAT" -> (float) retValue;
+      default -> retValue;
+    };
   }
 
   public static class PencentileApproAccumulator implements Accumulator {

@@ -84,6 +84,7 @@ import org.opensearch.sql.common.utils.StringUtils;
 import org.opensearch.sql.exception.CalciteUnsupportedException;
 import org.opensearch.sql.exception.ExpressionEvaluationException;
 import org.opensearch.sql.exception.SemanticCheckException;
+import org.opensearch.sql.expression.HighlightExpression;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
 
@@ -667,6 +668,21 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
       context.setResolvingJoinCondition(false);
     }
     subquery.accept(planVisitor, context);
+    // Strip _highlight from EXISTS subquery's top-of-stack if present and not requested.
+    // After C6 the catalog adds _highlight (MAP<VARCHAR, ANY>) to every TableScan; EXISTS
+    // subqueries don't materialise the inner row's columns into the outer result, but Calcite's
+    // enumerable codegen still iterates the inner row through correlation comparators and trips
+    // on the non-Comparable MAP. EXISTS only checks for row existence, so dropping `_highlight`
+    // is semantically transparent. IN/Scalar subqueries reference specific value columns from
+    // the inner subquery output, so do NOT strip there — it could change the result column
+    // ordering and break match semantics.
+    if (subqueryExpression instanceof ExistsSubquery && !context.isHighlightRequested()) {
+      List<String> innerFields = context.relBuilder.peek().getRowType().getFieldNames();
+      int hlIdx = innerFields.indexOf(HighlightExpression.HIGHLIGHT_FIELD);
+      if (hlIdx >= 0) {
+        context.relBuilder.projectExcept(context.relBuilder.field(hlIdx));
+      }
+    }
     // add subsearch.maxout limit to exists-in subsearch, 0 and negative means unlimited
     if (context.sysLimit.subsearchLimit() > 0 && !(subqueryExpression instanceof ScalarSubquery)) {
       // Cannot add system limit to the top of subquery simply.

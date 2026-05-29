@@ -175,16 +175,16 @@ public final class SqlNodePipeline {
    * Pattern aggregations return {@code ARRAY<MAP<VARCHAR, ANY>>}. The visitor's flatten step
    * extracts named values from each MAP via {@code CAST(ITEM(map, 'sample_logs') AS VARCHAR
    * ARRAY)}. Pre-round-trip the visitor uses a typed RexInputRef view so {@code ITEM} returns
-   * {@code ARRAY<VARCHAR>} directly. After the round-trip the typed view is gone — {@code
-   * map}'s declared value type is {@code ANY} so {@code ITEM(map, key)} returns {@code ANY},
-   * and {@code CAST(ANY AS ARRAY<...>)} hits Calcite's {@code RexToLixTranslator} assertion
-   * because {@code source.getComponentType()} returns null.
+   * {@code ARRAY<VARCHAR>} directly. After the round-trip the typed view is gone — {@code map}'s
+   * declared value type is {@code ANY} so {@code ITEM(map, key)} returns {@code ANY}, and {@code
+   * CAST(ANY AS ARRAY<...>)} hits Calcite's {@code RexToLixTranslator} assertion because {@code
+   * source.getComponentType()} returns null.
    *
    * <p>Walk the round-tripped tree, find {@code CAST(ITEM(mapExpr, key) AS ARRAY<X>)} where the
-   * ITEM source is a MAP whose value type is ANY, and replace the inner mapExpr with a typed
-   * view (a {@link org.apache.calcite.rex.RexInputRef} or {@link
-   * org.apache.calcite.rex.RexFieldAccess} re-typed as {@code MAP<key, ARRAY<X>>}). The ITEM
-   * call then returns {@code ARRAY<X>} and the CAST becomes a no-op identity.
+   * ITEM source is a MAP whose value type is ANY, and replace the inner mapExpr with a typed view
+   * (a {@link org.apache.calcite.rex.RexInputRef} or {@link org.apache.calcite.rex.RexFieldAccess}
+   * re-typed as {@code MAP<key, ARRAY<X>>}). The ITEM call then returns {@code ARRAY<X>} and the
+   * CAST becomes a no-op identity.
    */
   private static RelNode retypeItemForArrayCast(RelNode root) {
     org.apache.calcite.rex.RexBuilder rb0 = root.getCluster().getRexBuilder();
@@ -224,7 +224,8 @@ public final class SqlNodePipeline {
             // CAST value returns ARRAY<X> directly.
             org.apache.calcite.rex.RexNode retypedMap = rb.makeAbstractCast(newMapType, mapOperand);
             org.apache.calcite.rex.RexNode newItem =
-                rb.makeCall(target, itemCall.getOperator(), java.util.List.of(retypedMap, keyOperand));
+                rb.makeCall(
+                    target, itemCall.getOperator(), java.util.List.of(retypedMap, keyOperand));
             return newItem;
           }
         };

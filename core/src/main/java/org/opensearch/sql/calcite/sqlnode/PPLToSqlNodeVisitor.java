@@ -1874,6 +1874,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     } else if (fnLower.equals("c")) {
       fnLower = "count";
     }
+    // earliest/latest dispatch to Calcite's ARG_MIN/ARG_MAX with a (value, time-field) signature.
+    // The time-field defaults to @timestamp when not supplied (matches v2's resolveTimeField).
+    if (fnLower.equals("earliest") || fnLower.equals("latest")) {
+      List<SqlNode> args = new ArrayList<>();
+      UnresolvedExpression argExpr0 = af.getField();
+      args.add(argExpr0 instanceof AllFields ? SqlIdentifier.star(POS) : expr(argExpr0));
+      if (af.getArgList() != null) {
+        for (UnresolvedExpression extra : af.getArgList()) {
+          if (extra instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
+            args.add(expr(ua.getValue()));
+          } else {
+            args.add(expr(extra));
+          }
+        }
+      }
+      if (args.size() == 1) {
+        args.add(new SqlIdentifier(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP, POS));
+      }
+      org.apache.calcite.sql.SqlOperator op0 =
+          fnLower.equals("earliest") ? SqlStdOperatorTable.ARG_MIN : SqlStdOperatorTable.ARG_MAX;
+      return new SqlBasicCall(op0, args, POS);
+    }
     org.apache.calcite.sql.SqlAggFunction op =
         switch (fnLower) {
           case "count" -> SqlStdOperatorTable.COUNT;

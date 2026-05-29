@@ -4850,6 +4850,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           && args.get(2) instanceof SqlLiteral lit
           && Boolean.FALSE.equals(lit.getValue())) {
         likeOp = org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
+      } else if (args.size() == 2
+          && Boolean.TRUE.equals(
+              org.opensearch.sql.calcite.CalcitePlanContext.isLegacyPreferred())) {
+        // PPL's legacy v2 syntax binds 2-arg LIKE as case-insensitive — match v2 emission shape.
+        likeOp = org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
       }
       return new SqlBasicCall(likeOp, List.of(args.get(0), args.get(1), escape), POS);
     }

@@ -345,7 +345,13 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             DistinctCountApproxAggFunction.class,
             BuiltinFunctionName.DISTINCT_COUNT_APPROX.name(),
             ReturnTypes.BIGINT_FORCE_NULLABLE,
-            null);
+            // Permissive variadic metadata. Without this, SqlValidator's overload-filter calls
+            // SqlOperator.getOperandCountRange() on the agg function and the default impl throws
+            // "UnsupportedOperationException: SqlUserDefinedAggFunction: DISTINCT_COUNT_APPROX".
+            org.opensearch.sql.expression.function.UDFOperandMetadata.wrap(
+                (org.apache.calcite.sql.type.FamilyOperandTypeChecker)
+                    org.apache.calcite.sql.type.OperandTypes.family(
+                        org.apache.calcite.sql.type.SqlTypeFamily.ANY)));
     PPLFuncImpTable.INSTANCE.registerExternalAggOperator(
         BuiltinFunctionName.DISTINCT_COUNT_APPROX, approxDistinctCountFunction);
     OperatorTable.addOperator(

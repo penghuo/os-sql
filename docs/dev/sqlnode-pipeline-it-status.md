@@ -78,7 +78,7 @@ Pushdown shape may change for non-nullable group keys. Some assertions may flip 
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 23 | CalcitePPLAggregationIT | ⏳ | |
+| 23 | CalcitePPLAggregationIT | ❌ | After fix: 24 unique fails. Fixed: DISTINCT_COUNT_APPROX null-metadata (R3 pattern, validator's overload-filter NPE'd on getOperandCountRange). Remaining: (a) MEDIAN/PERCENTILE failures — visitor passes `rexBuilder.makeFlag(SqlTypeName)` as the type-discriminator arg; SymbolFlag unparses as a bare identifier (`DECIMAL`/`BIGINT`) that the parser misreads as a column reference. Refactor needed to drop the type-name arg (return type already known at compile time via ARG0_FORCE_NULLABLE). (b) testAvgBySpan/testStatsBySpan — execution-time `Unsupported expr type: INTEGER` from SPAN function planning (separate). **Both deferred.** |
 | 24 | CalcitePPLAggregationPaginatingIT | ⏳ | |
 | 25 | CalcitePPLNestedAggregationIT | ⏳ | |
 | 26 | CalciteStatsCommandIT | ⏳ | |

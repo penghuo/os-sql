@@ -422,8 +422,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<String> visible =
         new ArrayList<>(frame.currentFields == null ? List.of() : frame.currentFields);
     Set<String> existingNames = new LinkedHashSet<>(visible);
+    // PPL semantics for `eval x = expr` when `x` already exists: replace the column. SQL's
+    // `SELECT *, expr AS x` would emit BOTH the original `x` (from `*`) and the new aliased one,
+    // producing duplicate-named columns. When ANY let rebinds an existing visible name, expand
+    // `*` into an explicit list of currentFields with the rebound names dropped — the eval's
+    // aliased projections then reintroduce them. Falls back to `*` when no rebind happens.
+    Set<String> rebound = new java.util.HashSet<>();
+    for (Let let : node.getExpressionList()) {
+      String name = let.getVar().getField().toString();
+      if (existingNames.contains(name)) {
+        rebound.add(name);
+      }
+    }
     SqlNodeList items = new SqlNodeList(POS);
-    items.add(SqlIdentifier.star(POS));
+    if (rebound.isEmpty() || frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+    } else {
+      for (String c : frame.currentFields) {
+        if (!rebound.contains(c)) {
+          items.add(toIdentifier(c));
+        }
+      }
+    }
     Set<String> aliasesInThisSelect = new LinkedHashSet<>();
     boolean wrappedMidEval = false;
     for (Let let : node.getExpressionList()) {

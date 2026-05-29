@@ -841,9 +841,6 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode fieldRef = expr(node.getField());
     SqlNode bucketCall;
     if (node instanceof SpanBin sb) {
-      if (sb.getAligntime() != null) {
-        throw new UnsupportedOperationException("bin aligntime not yet supported");
-      }
       UnresolvedExpression spanExpr = sb.getSpan();
       boolean numericSpan =
           spanExpr instanceof Literal lit
@@ -862,7 +859,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       } else if (spanExpr instanceof Literal stringLit
           && stringLit.getType() == DataType.STRING
           && stringLit.getValue() != null) {
-        SqlNode timeSpan = tryTimeSpanCall(fieldRef, stringLit.getValue().toString());
+        SqlNode timeSpan =
+            tryTimeSpanCall(fieldRef, stringLit.getValue().toString(), sb.getAligntime());
         SqlNode logSpan =
             timeSpan == null ? tryLogSpanCall(fieldRef, stringLit.getValue().toString()) : null;
         if (timeSpan != null) {
@@ -1678,7 +1676,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    *   <li>y / yr / year / years
    * </ul>
    */
-  private SqlNode tryTimeSpanCall(SqlNode fieldRef, String spanStr) {
+  private SqlNode tryTimeSpanCall(
+      SqlNode fieldRef, String spanStr, UnresolvedExpression aligntimeExpr) {
     spanStr = spanStr.replace("'", "").replace("\"", "").trim();
     int splitAt = -1;
     for (int i = 0; i < spanStr.length(); i++) {
@@ -1699,6 +1698,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     String unit;
     if ("M".equals(rawUnitOriginal)) {
       unit = "M";
+    } else if ("us".equals(rawUnitOriginal)
+        || "cs".equals(rawUnitOriginal)
+        || "ds".equals(rawUnitOriginal)) {
+      // Subsecond units are case-sensitive — keep the original casing as the unit name.
+      unit = rawUnitOriginal;
     } else {
       unit =
           switch (rawUnit) {
@@ -1721,12 +1725,145 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if ("M".equals(unit)) {
       return buildMonthlySpan(fieldRef, value);
     }
+    // Aligntime support (h/m/s units only — sub-second alignment isn't supported by v2 either).
+    boolean isAlignableUnit =
+        "ms".equals(unit)
+            || "s".equals(unit)
+            || "m".equals(unit)
+            || "h".equals(unit)
+            || "us".equals(unit)
+            || "cs".equals(unit)
+            || "ds".equals(unit);
+    if (aligntimeExpr != null && isAlignableUnit) {
+      Long alignmentOffsetSeconds = parseAlignTimeOffsetSeconds(aligntimeExpr);
+      if (alignmentOffsetSeconds != null) {
+        long intervalSeconds = unitToSeconds(unit, value);
+        if (intervalSeconds > 0) {
+          return buildAlignedTimeSpan(fieldRef, intervalSeconds, alignmentOffsetSeconds);
+        }
+      }
+    }
+    // Sub-second binning: SPAN UDF doesn't accept us/cs/ds; emit the v2 StandardTimeSpanHandler
+    // shape using FROM_UNIXTIME(FLOOR(unix*scale/interval)*interval/scale).
+    if ("us".equals(unit) || "cs".equals(unit) || "ds".equals(unit) || "ms".equals(unit)) {
+      return buildSubsecondSpan(fieldRef, value, unit);
+    }
     return new SqlBasicCall(
         org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
         List.of(
             fieldRef,
             SqlLiteral.createExactNumeric(Integer.toString(value), POS),
             SqlLiteral.createCharString(unit, POS)),
+        POS);
+  }
+
+  private long unitToSeconds(String unit, int value) {
+    return switch (unit) {
+      case "s" -> (long) value;
+      case "m" -> (long) value * 60L;
+      case "h" -> (long) value * 3600L;
+      default -> -1;
+    };
+  }
+
+  private Long parseAlignTimeOffsetSeconds(UnresolvedExpression aligntimeExpr) {
+    if (!(aligntimeExpr instanceof Literal lit) || lit.getValue() == null) return null;
+    String s = lit.getValue().toString().replace("'", "").replace("\"", "").trim();
+    try {
+      return Long.parseLong(s);
+    } catch (NumberFormatException ignored) {
+      // fall through
+    }
+    if (s.startsWith("@d")) {
+      String tail = s.substring(2);
+      if (tail.isEmpty()) return 0L;
+      java.util.regex.Matcher m =
+          java.util.regex.Pattern.compile("^([+-])(\\d+)([smh])$").matcher(tail);
+      if (!m.matches()) return null;
+      long sign = "+".equals(m.group(1)) ? 1L : -1L;
+      long n = Long.parseLong(m.group(2));
+      String u = m.group(3);
+      long perUnit = "s".equals(u) ? 1L : "m".equals(u) ? 60L : 3600L;
+      return sign * n * perUnit;
+    }
+    return null;
+  }
+
+  private SqlNode buildAlignedTimeSpan(
+      SqlNode fieldRef, long intervalSeconds, long alignmentOffsetSeconds) {
+    SqlNode unixSeconds =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.UNIX_TIMESTAMP,
+            List.of(fieldRef),
+            POS);
+    SqlNode shifted =
+        alignmentOffsetSeconds == 0
+            ? unixSeconds
+            : new SqlBasicCall(
+                SqlStdOperatorTable.MINUS,
+                List.of(
+                    unixSeconds,
+                    SqlLiteral.createExactNumeric(Long.toString(alignmentOffsetSeconds), POS)),
+                POS);
+    SqlLiteral intervalLit = SqlLiteral.createExactNumeric(Long.toString(intervalSeconds), POS);
+    SqlNode divided =
+        new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(shifted, intervalLit), POS);
+    SqlNode floored = new SqlBasicCall(SqlStdOperatorTable.FLOOR, List.of(divided), POS);
+    SqlNode multiplied =
+        new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(floored, intervalLit), POS);
+    SqlNode binSeconds =
+        alignmentOffsetSeconds == 0
+            ? multiplied
+            : new SqlBasicCall(
+                SqlStdOperatorTable.PLUS,
+                List.of(
+                    multiplied,
+                    SqlLiteral.createExactNumeric(Long.toString(alignmentOffsetSeconds), POS)),
+                POS);
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.FROM_UNIXTIME,
+        List.of(binSeconds),
+        POS);
+  }
+
+  private SqlNode buildSubsecondSpan(SqlNode fieldRef, int intervalValue, String unit) {
+    long scale =
+        switch (unit) {
+          case "us" -> 1_000_000L;
+          case "ms" -> 1_000L;
+          case "cs" -> 100L;
+          case "ds" -> 10L;
+          default -> 1L;
+        };
+    SqlNode unixSeconds =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.UNIX_TIMESTAMP,
+            List.of(fieldRef),
+            POS);
+    SqlNode scaledUp =
+        new SqlBasicCall(
+            SqlStdOperatorTable.MULTIPLY,
+            List.of(unixSeconds, SqlLiteral.createExactNumeric(Long.toString(scale), POS)),
+            POS);
+    SqlNode divided =
+        new SqlBasicCall(
+            SqlStdOperatorTable.DIVIDE,
+            List.of(scaledUp, SqlLiteral.createExactNumeric(Integer.toString(intervalValue), POS)),
+            POS);
+    SqlNode floored = new SqlBasicCall(SqlStdOperatorTable.FLOOR, List.of(divided), POS);
+    SqlNode multiplied =
+        new SqlBasicCall(
+            SqlStdOperatorTable.MULTIPLY,
+            List.of(floored, SqlLiteral.createExactNumeric(Integer.toString(intervalValue), POS)),
+            POS);
+    SqlNode binSeconds =
+        new SqlBasicCall(
+            SqlStdOperatorTable.DIVIDE,
+            List.of(multiplied, SqlLiteral.createExactNumeric(Long.toString(scale), POS)),
+            POS);
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.FROM_UNIXTIME,
+        List.of(binSeconds),
         POS);
   }
 

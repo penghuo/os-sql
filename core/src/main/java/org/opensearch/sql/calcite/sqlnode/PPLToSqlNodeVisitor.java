@@ -2940,8 +2940,35 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
       return unresolvedArgExpr(ua);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
+      return relevanceFieldListExpr(rfl);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate PPL {@code multi_match(["fld1"^1.5, "fld2"^2], query="x")}'s field-list arg (parsed
+   * as {@link org.opensearch.sql.ast.expression.RelevanceFieldList}) to a {@code MAP["fld1", 1.5,
+   * "fld2", 2.0]} so the OpenSearch pushdown's relevance UDF receives a {@code Map<String,
+   * Double>}. Cast each name to VARCHAR to avoid CHAR(N) length widening across entries.
+   */
+  private SqlNode relevanceFieldListExpr(org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    List<SqlNode> args = new ArrayList<>();
+    for (java.util.Map.Entry<String, Float> entry : rfl.getFieldList().entrySet()) {
+      args.add(
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(SqlLiteral.createCharString(entry.getKey(), POS), varcharSpec),
+              POS));
+      args.add(SqlLiteral.createApproxNumeric(entry.getValue() + "E0", POS));
+    }
+    return new SqlBasicCall(SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR, args, POS);
   }
 
   /**

@@ -490,8 +490,27 @@ public class MatcherUtils {
    */
   public static void assertYamlEqualsIgnoreId(
       String expectedYaml1, String expectedYaml2, String actualYaml) {
-    if (ExpectedPlanRegen.isEnabled() && ExpectedPlanRegen.writeToSourceTree(actualYaml)) {
-      return;
+    // Dual-expected (primary + alternative) variants are used to tolerate non-deterministic map
+    // ordering in the dumped plan output (e.g. script_fields HashMap iteration). Skip regen
+    // mode here so the manually-curated pair survives — overwriting one file with the actual
+    // collapses both branches and breaks the alternate-order run.
+    if (ExpectedPlanRegen.isEnabled()) {
+      // Try primary first, fall back to alternative; if both fail, write back to the primary
+      // (the LAST-loaded resource path) so a regen still has effect when the diff is real.
+      try {
+        assertYamlEquals(cleanUpYaml(expectedYaml1), cleanUpYaml(actualYaml));
+        return;
+      } catch (AssertionError e1) {
+        try {
+          assertYamlEquals(cleanUpYaml(expectedYaml2), cleanUpYaml(actualYaml));
+          return;
+        } catch (AssertionError e2) {
+          // Both failed — write actual back to primary so a real plan-shape change is captured.
+          // The alternative file is preserved; manual review may be needed.
+          ExpectedPlanRegen.writeToSourceTree(actualYaml);
+          return;
+        }
+      }
     }
     try {
       assertYamlEquals(cleanUpYaml(expectedYaml1), cleanUpYaml(actualYaml));

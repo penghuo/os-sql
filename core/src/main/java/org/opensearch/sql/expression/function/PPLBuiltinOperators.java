@@ -270,8 +270,14 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               NullPolicy.ANY,
               PPLOperandTypes.DATETIME_DATETIME)
           .toUDF("DATEDIFF");
+  // PPL_TIMESTAMPDIFF (NOT "TIMESTAMPDIFF") because Calcite's parser knows TIMESTAMPDIFF as a
+  // special-syntax built-in: TIMESTAMPDIFF(<unit-keyword>, ts1, ts2) where the unit MUST be a
+  // bare identifier. PPL's TIMESTAMPDIFF UDF takes the unit as a string literal and would
+  // unparse as TIMESTAMPDIFF('MILLISECOND', ts1, ts2), which the Babel parser rejects with
+  // "Encountered '...MILLISECOND...'" at the SqlNodePipeline round-trip. Use a distinct name
+  // so the parser binds to the PPL UDF (regular FUNCTION syntax) rather than the built-in.
   public static final SqlOperator TIMESTAMPDIFF =
-      new TimestampDiffFunction().toUDF("TIMESTAMPDIFF");
+      new TimestampDiffFunction().toUDF("PPL_TIMESTAMPDIFF");
   public static final SqlOperator LAST_DAY = new LastDayFunction().toUDF("LAST_DAY");
   public static final SqlOperator FROM_DAYS =
       adaptExprMethodToUDF(
@@ -360,7 +366,10 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               NullPolicy.ANY,
               PPLOperandTypes.TIME_TIME)
           .toUDF("TIME_DIFF");
-  public static final SqlOperator TIMESTAMPADD = new TimestampAddFunction().toUDF("TIMESTAMPADD");
+  // Renamed to PPL_TIMESTAMPADD: same reason as PPL_TIMESTAMPDIFF — Calcite's parser knows
+  // TIMESTAMPADD as a special-syntax built-in TIMESTAMPADD(<unit-keyword>, n, ts), incompatible
+  // with PPL's quoted-string unit form. Use a distinct name to avoid the parser binding.
+  public static final SqlOperator TIMESTAMPADD = new TimestampAddFunction().toUDF("PPL_TIMESTAMPADD");
   public static final SqlOperator TO_DAYS =
       adaptExprMethodToUDF(
               DateTimeFunctions.class,

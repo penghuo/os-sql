@@ -83,7 +83,7 @@ Pushdown shape may change for non-nullable group keys. Some assertions may flip 
 | 25 | CalcitePPLNestedAggregationIT | ❌ | 1/9 fail (testNestedAggregationThrowExceptionIfPushdownCannotApplied). Test expects an error from nested-aggregation dispatch; removed `reapplyAggregateHints` causes the hint to be dropped on round-trip, so the OpenSearch nested-agg rule doesn't fire and the query unexpectedly succeeds. **Expected from bypass removal; deferred until aggregate-hint preservation is reintroduced.** |
 | 26 | CalciteStatsCommandIT | ✅ | 63/63 pass after the SPAN unit-operand fix (see #23). |
 | 27 | CalciteTimechartCommandIT | ✅ | 18/18 pass. |
-| 28 | CalciteTimechartPerFunctionIT | ❌ | 12/12 fail. All hit "failed to re-parse generated SQL"; the parser rejects `TIMESTAMPDIFF('MILLISECOND', ts1, ts2)` because the time-unit must be an unquoted identifier in standard SQL (`TIMESTAMPDIFF(MILLISECOND, ts1, ts2)`), not a string literal. The visitor unparses the time-unit as a string. **Deferred — needs dialect-level unparser override for TIMESTAMPDIFF / TIMESTAMPADD interval-unit args.** |
+| 28 | CalciteTimechartPerFunctionIT | ✅ | 12/12 pass. Renamed PPL UDFs from "TIMESTAMPDIFF"/"TIMESTAMPADD" to "PPL_TIMESTAMPDIFF"/"PPL_TIMESTAMPADD". Calcite's parser knows the standard names as special-syntax built-ins (`TIMESTAMPDIFF(<unit-keyword>, ts1, ts2)`); PPL's variant takes a string literal unit and would unparse as `TIMESTAMPDIFF('MILLISECOND', ts1, ts2)` which the parser rejects. Distinct names route to FUNCTION-syntax binding. |
 
 ## Phase 5 — Joins / Subqueries (was bypassed: containsJoinOrCorrelate)
 

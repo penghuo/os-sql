@@ -2937,8 +2937,39 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.Interval interval) {
       return intervalExpr(interval);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
+      return unresolvedArgExpr(ua);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate a PPL named argument {@code name=value} (used by match/match_phrase/multi_match and
+   * other named-arg functions) into a {@code MAP[name, value]} entry. The pushdown layer collects
+   * these into a single MAP-typed argument. String-literal values are cast to VARCHAR to avoid
+   * Calcite's CHAR(N) length widening across entries (which right-pads shorter values and breaks
+   * the OpenSearch pushdown's exact-string match).
+   */
+  private SqlNode unresolvedArgExpr(org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
+    SqlNode value = expr(ua.getValue());
+    if (value instanceof SqlLiteral lit
+        && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+              POS);
+      value =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(value, varcharSpec),
+              POS);
+    }
+    return new SqlBasicCall(
+        SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR,
+        List.of(SqlLiteral.createCharString(ua.getArgName(), POS), value),
+        POS);
   }
 
   /**

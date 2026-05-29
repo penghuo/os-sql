@@ -1367,6 +1367,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       partitionBy.add(key);
       partitionExprs.add(key);
     }
+    boolean hasGroup = !partitionExprs.isEmpty();
+    // global=true with a by-partition switches the frame from ROWS to RANGE on the global seq
+    // column. Bounds then reflect global-row distance (not partition-local row count).
+    boolean useRange = node.isGlobal() && hasGroup && win > 0;
     // ORDER BY uses upstream sort keys when present; otherwise reuse an upstream
     // __stream_seq__ column (from a prior streamstats) when in scope, else synthesise one.
     // Calcite forbids OVER clauses inside another window's ORDER BY, so a freshly synthesised
@@ -1378,7 +1382,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       // Upstream streamstats already provides the seq — reuse it for stable ordering. Don't
       // re-synthesise.
       orderBy.add(new SqlIdentifier("__stream_seq__", POS));
-    } else if (frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
+    } else if (!useRange && frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
+      // useRange needs a numeric seq column for RANGE bounds. Skip the lastOrderBy path so the
+      // synth branch below materialises __stream_seq__.
       for (SqlNode k : frame.lastOrderBy) orderBy.add(k);
     } else {
       SqlNode rowNum =
@@ -1461,13 +1467,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       SqlNode aggNode = aggCall(aggInput, /* windowed */ true);
       // ROWS frame derived from current/window above (current=true window=0 → cumulative;
       // current=true window=N → last N rows; current=false window=N → previous N rows).
+      // useRange=true switches to RANGE frame on __stream_seq__ — bounds reflect global
+      // row distance (for global=true with by-partition).
       SqlNode window =
           SqlWindow.create(
               null,
               null,
               partitionBy,
               orderBy,
-              SqlLiteral.createBoolean(true, POS),
+              SqlLiteral.createBoolean(!useRange, POS),
               frameLower,
               frameUpper,
               null,

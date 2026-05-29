@@ -17,7 +17,9 @@ import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.SqlSelectKeyword;
+import org.apache.calcite.sql.SqlWindow;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.opensearch.sql.ast.AbstractNodeVisitor;
@@ -557,6 +559,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     Frame rightFrame = new Frame();
     SqlNode rightSide = node.getRight().accept(this, rightFrame);
 
+    // Apply max=N per-partition cap on the right side BEFORE attaching the join-arg alias so the
+    // cap is invisible to the outer scope. The cluster-wide subsearch_maxout cap is applied
+    // post-RelNode (in QueryService) instead — wrapping a bare relation here would hide the table
+    // identifier from the JOIN's outer scope.
+    rightSide = applyMaxPerPartition(node, rightSide);
+
     // PPL allows referencing a side via either an explicit `left=l right=r` arg, or — when the
     // side is a SubqueryAlias — by the alias name. The visitor for SubqueryAlias already wrapped
     // the inner in `AS <alias>`. For the bare-table-without-explicit-alias case, attach a
@@ -708,6 +716,134 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   private record DedupedProjection(SqlNodeList selectList, List<String> names) {}
+
+  /**
+   * Cap the right side of a JOIN to N rows per partition when the user wrote {@code max=N}. PPL
+   * semantics: deduplicate rows so each {@code <partition-cols>} group keeps at most N rows. SQL
+   * shape: {@code SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY <cols>) AS __rn FROM
+   * <right>) WHERE __rn <= N}. Partition cols come from the {@code join F1 F2 ...} field list, or
+   * from the right-side equi-join columns when the user wrote {@code on l.X = r.Y}.
+   */
+  private SqlNode applyMaxPerPartition(Join node, SqlNode rightSide) {
+    Integer maxArg = null;
+    if (node.getArgumentMap() != null && node.getArgumentMap().get("max") != null) {
+      Object v = node.getArgumentMap().get("max").getValue();
+      if (v instanceof Integer i) maxArg = i;
+    }
+    if (maxArg == null || maxArg <= 0) return rightSide;
+    List<String> partitionCols = null;
+    if (node.getJoinFields().isPresent() && !node.getJoinFields().get().isEmpty()) {
+      partitionCols = new ArrayList<>();
+      for (Field f : node.getJoinFields().get()) {
+        partitionCols.add(f.getField().toString());
+      }
+    } else if (node.getJoinCondition().isPresent() && node.getRightAlias().isPresent()) {
+      partitionCols =
+          extractRightEquiJoinCols(node.getJoinCondition().get(), node.getRightAlias().get());
+    }
+    if (partitionCols == null || partitionCols.isEmpty()) return rightSide;
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    for (String col : partitionCols) {
+      partitionBy.add(new SqlIdentifier(col, POS));
+    }
+    SqlNode rowNumWindow =
+        SqlWindow.create(
+            null,
+            null,
+            partitionBy,
+            new SqlNodeList(POS),
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode rowNum =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                rowNumWindow),
+            POS);
+    SqlNodeList innerSelects = new SqlNodeList(POS);
+    innerSelects.add(SqlIdentifier.star(POS));
+    innerSelects.add(asAliased(rowNum, "__join_max_rn__"));
+    SqlNode innerSelect =
+        new SqlSelect(
+            POS, null, innerSelects, rightSide, null, null, null, null, null, null, null, null);
+    SqlNode innerAliased =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS,
+            List.of(innerSelect, new SqlIdentifier("__max_inner__", POS)),
+            POS);
+    SqlNodeList outerSelects = new SqlNodeList(POS);
+    outerSelects.add(SqlIdentifier.star(POS));
+    SqlNode outerWhere =
+        new SqlBasicCall(
+            SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+            List.of(
+                new SqlIdentifier("__join_max_rn__", POS),
+                SqlLiteral.createExactNumeric(Integer.toString(maxArg), POS)),
+            POS);
+    return new SqlSelect(
+        POS,
+        null,
+        outerSelects,
+        innerAliased,
+        outerWhere,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  /**
+   * Walk a JOIN ON expression collecting right-side column names from each conjunct of equi-join
+   * shape. {@code l.X = r.Y} contributes {@code Y}; non-equi or non-conjunctive shapes return null
+   * so the caller falls back to "no max-cap partition cols available".
+   */
+  private static List<String> extractRightEquiJoinCols(
+      UnresolvedExpression condition, String rightAlias) {
+    List<String> out = new ArrayList<>();
+    if (!collectRightEquiJoinCols(condition, rightAlias, out)) return null;
+    return out;
+  }
+
+  private static boolean collectRightEquiJoinCols(
+      UnresolvedExpression e, String rightAlias, List<String> out) {
+    if (e instanceof And and) {
+      return collectRightEquiJoinCols(and.getLeft(), rightAlias, out)
+          && collectRightEquiJoinCols(and.getRight(), rightAlias, out);
+    }
+    if (e instanceof Compare c && "=".equals(c.getOperator())) {
+      String l = qualifiedRightCol(c.getLeft(), rightAlias);
+      String r = qualifiedRightCol(c.getRight(), rightAlias);
+      if (l != null) {
+        out.add(l);
+        return true;
+      }
+      if (r != null) {
+        out.add(r);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String qualifiedRightCol(UnresolvedExpression e, String rightAlias) {
+    QualifiedName qn = null;
+    if (e instanceof QualifiedName q) qn = q;
+    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+    if (qn == null) return null;
+    List<String> parts = qn.getParts();
+    if (parts.size() == 2 && rightAlias.equalsIgnoreCase(parts.get(0))) {
+      return parts.get(1);
+    }
+    return null;
+  }
 
   // ---------- Helpers ----------
 

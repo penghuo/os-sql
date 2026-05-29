@@ -312,6 +312,14 @@ public class QueryService {
         new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(planner.tableFields())
             .translate(plan);
     RelNode rel = planner.plan(sqlNode);
+    // PPL setting plugins.ppl.join.subsearch_maxout caps the right side of every JOIN to N rows
+    // total. The SqlNode visitor doesn't model this directly because wrapping a bare relation
+    // would hide the table identifier from the JOIN's outer scope, breaking ON clauses written
+    // as `<table>.col`. Apply post-RelNode by injecting a LogicalSystemLimit on top of each
+    // LogicalJoin's right input.
+    if (joinSubsearchLimit > 0) {
+      rel = applyJoinSubsearchMaxOut(rel, joinSubsearchLimit);
+    }
     // OpenSearch tables expose metadata fields (`_id`, `_index`, `_score`, ...) in their row
     // type, but PPL hides them from user-facing output. The PPL→SqlNode visitor strips them at
     // every explicit projection; queries with no outer projection (e.g. bare `source=X`) reach
@@ -427,6 +435,45 @@ public class QueryService {
   /** Analyze {@link UnresolvedPlan}. */
   public LogicalPlan analyze(UnresolvedPlan plan, QueryType queryType) {
     return analyzer.analyze(plan, new AnalysisContext(queryType));
+  }
+
+  /**
+   * Cap the right side of every {@link org.apache.calcite.rel.logical.LogicalJoin} with a {@link
+   * LogicalSystemLimit} of type {@code JOIN_SUBSEARCH_MAXOUT}. PPL setting {@code
+   * plugins.ppl.join.subsearch_maxout} requires the cluster-wide cap on every join's subsearch
+   * input. Done post-RelNode rather than at SqlNode time because wrapping a bare relation as {@code
+   * (SELECT * FROM X) FETCH N} hides {@code X} from the JOIN's outer scope and breaks ON clauses
+   * written as {@code X.col}.
+   */
+  private static RelNode applyJoinSubsearchMaxOut(RelNode rel, int limit) {
+    org.apache.calcite.rex.RexLiteral capLit =
+        rel.getCluster().getRexBuilder().makeExactLiteral(java.math.BigDecimal.valueOf(limit));
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (visited instanceof org.apache.calcite.rel.logical.LogicalJoin join) {
+              RelNode right = join.getRight();
+              // Don't double-cap if the right side is already a JOIN_SUBSEARCH_MAXOUT.
+              if (right instanceof LogicalSystemLimit lsl
+                  && lsl.getType() == SystemLimitType.JOIN_SUBSEARCH_MAXOUT) {
+                return visited;
+              }
+              RelNode capped =
+                  LogicalSystemLimit.create(SystemLimitType.JOIN_SUBSEARCH_MAXOUT, right, capLit);
+              return join.copy(
+                  join.getTraitSet(),
+                  join.getCondition(),
+                  join.getLeft(),
+                  capped,
+                  join.getJoinType(),
+                  join.isSemiJoinDone());
+            }
+            return visited;
+          }
+        };
+    return rel.accept(shuttle);
   }
 
   /** Translate {@link LogicalPlan} to {@link PhysicalPlan}. */

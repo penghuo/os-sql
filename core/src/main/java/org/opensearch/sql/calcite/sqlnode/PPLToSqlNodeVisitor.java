@@ -4992,6 +4992,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (args.size() == 3) swapped.add(args.get(2));
       return new SqlBasicCall(org.apache.calcite.sql.fun.SqlLibraryOperators.INSTR, swapped, POS);
     }
+    // PPL `regexp_match(str, pattern)` / `regexp(str, pattern)` map to REGEXP_CONTAINS. Cast a
+    // CHAR-typed pattern literal to VARCHAR so the validator picks the canonical operator
+    // overload (CHAR-typed pattern literal would otherwise miss the signature).
+    if (("regexp_match".equals(name) || "regexp".equals(name)) && args.size() == 2) {
+      SqlNode pattern = args.get(1);
+      if (pattern instanceof SqlLiteral lit
+          && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                POS);
+        pattern =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(pattern, varcharSpec),
+                POS);
+      }
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_CONTAINS,
+          List.of(args.get(0), pattern),
+          POS);
+    }
+    // PPL `strcmp(s1, s2)` follows MySQL: returns -1 / 0 / 1. Express via CASE — Calcite's
+    // STRCMP sign convention differs from PPL's.
+    if ("strcmp".equals(name) && args.size() == 2) {
+      SqlNode a = args.get(0);
+      SqlNode b = args.get(1);
+      SqlNodeList whens = new SqlNodeList(POS);
+      whens.add(new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(a, b), POS));
+      whens.add(new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(a, b), POS));
+      SqlNodeList thens = new SqlNodeList(POS);
+      thens.add(SqlLiteral.createExactNumeric("-1", POS));
+      thens.add(SqlLiteral.createExactNumeric("0", POS));
+      return new org.apache.calcite.sql.fun.SqlCase(
+          POS, null, whens, thens, SqlLiteral.createExactNumeric("1", POS));
+    }
     // PPL `split(str, delim)` returns each character as a separate element when delim is empty.
     // Calcite's std SPLIT(str, '') returns a single-element array with the whole string. Mirror
     // PPLFuncImpTable: `CASE WHEN delim='' THEN REGEXP_EXTRACT_ALL(str, '.') ELSE SPLIT(str,

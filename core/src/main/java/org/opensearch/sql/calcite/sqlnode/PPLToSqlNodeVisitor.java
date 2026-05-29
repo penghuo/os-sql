@@ -1267,11 +1267,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<List<String>> branchCols = new ArrayList<>();
     List<String> unified = new ArrayList<>();
     for (UnresolvedPlan sub : node.getSubsearches()) {
+      // Apply EmptySourcePropagateVisitor — drop branches that collapse to Values([]).
+      UnresolvedPlan pruned =
+          sub.accept(new org.opensearch.sql.ast.EmptySourcePropagateVisitor(), null);
+      if (isEmptyValues(pruned)) {
+        continue;
+      }
       Frame subFrame = new Frame();
       Frame savedExpr = this.exprFrame;
       this.exprFrame = subFrame;
       try {
-        branchNodes.add(stripImplicitMetaProjects(sub).accept(this, subFrame));
+        branchNodes.add(stripImplicitMetaProjects(pruned).accept(this, subFrame));
       } finally {
         this.exprFrame = savedExpr;
       }
@@ -1285,6 +1291,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           unified.add(c);
         }
       }
+    }
+    if (branchNodes.isEmpty()) {
+      throw new IllegalArgumentException("Multisearch requires at least one non-empty subsearch");
     }
     SqlNode union = padToUnifiedSchema(branchNodes.get(0), branchCols.get(0), unified);
     for (int i = 1; i < branchNodes.size(); i++) {

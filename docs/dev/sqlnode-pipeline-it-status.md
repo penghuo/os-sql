@@ -173,7 +173,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
 | 80 | CalciteJsonFunctionsIT | ⏭️ | Excluded by build rules. |
-| 81 | CalcitePPLJsonBuiltinFunctionIT | ⚠️ | 20/22 pass after `UDFOperandMetadata.permissiveVariadic()` fix to all JSON UDFs whose `getOperandMetadata` returned `null`. 2 remaining fails. |
+| 81 | CalcitePPLJsonBuiltinFunctionIT | ✅ | 22/22 pass after `permissiveVariadic` operand metadata + IT expectation update for nested `json_object`/`json_array` round-trip. SqlNodePipeline activates SqlValidator's SQL:2016 implicit `FORMAT JSON` wrap on JSON-returning operands, so nested values embed as real sub-objects instead of being Jackson-escaped into strings. Matches Spark/Snowflake semantics. |
 | 82 | CalcitePPLStringBuiltinFunctionIT | ✅ | 27/27 pass after adding `SqlLibrary.MYSQL` to the operator table — `STRCMP` is registered only under `SqlLibrary.MYSQL`; without it, the validator rejects the round-tripped SQL with "No match found for function signature STRCMP(<CHARACTER>, <CHARACTER>)". 2 ordering fails fixed by `withRemoveSortInSubQuery(false)` (see #38). |
 | 83 | CalciteTextFunctionIT | ✅ | 24/24 pass after `SqlLibrary.MYSQL` (see #82) and `withRemoveSortInSubQuery(false)` (see #38). |
 | 84 | CalciteSystemFunctionIT | ✅ | All pass. |

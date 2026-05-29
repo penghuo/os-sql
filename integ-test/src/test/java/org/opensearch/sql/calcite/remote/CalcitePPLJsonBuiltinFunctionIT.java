@@ -58,7 +58,11 @@ public class CalcitePPLJsonBuiltinFunctionIT extends PPLIntegTestCase {
 
     verifySchema(actual, schema("a", "string"), schema("b", "string"));
 
-    verifyDataRows(actual, rows("{\"key\":123.45}", "{\"outer\":\"{\\\"inner\\\":123.45}\"}"));
+    // SqlNodePipeline round-trip activates SqlValidator's SQL:2016 implicit `FORMAT JSON` wrap
+    // on JSON-returning operands, so the inner json_object embeds as a real JSON sub-object
+    // instead of being Jackson-stringified into the outer value. Both forms are valid JSON; the
+    // nested-object form matches Spark/Snowflake semantics and is the new contract.
+    verifyDataRows(actual, rows("{\"key\":123.45}", "{\"outer\":{\"inner\":123.45}}"));
   }
 
   @Test
@@ -85,7 +89,10 @@ public class CalcitePPLJsonBuiltinFunctionIT extends PPLIntegTestCase {
 
     verifySchema(actual, schema("a", "string"));
 
-    verifyDataRows(actual, rows("[1,\"123\",\"{\\\"name\\\":3}\"]"));
+    // See testJsonObject: nested json_object inside json_array embeds as a real sub-object after
+    // the SqlNodePipeline round-trip (SQL:2016 implicit FORMAT JSON), not a Jackson-stringified
+    // child.
+    verifyDataRows(actual, rows("[1,\"123\",{\"name\":3}]"));
   }
 
   @Test

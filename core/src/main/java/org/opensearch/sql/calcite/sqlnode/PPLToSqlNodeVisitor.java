@@ -959,12 +959,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     List<String> mainCols = new ArrayList<>(frame.currentFields);
 
+    // Apply v2's EmptySourcePropagateVisitor so `append [ ]` and `append [ | stats ... ]`
+    // (empty-source subsearch) collapse to a Values([]) we can recognise and skip.
+    UnresolvedPlan prunedSubSearch =
+        node.getSubSearch().accept(new org.opensearch.sql.ast.EmptySourcePropagateVisitor(), null);
+    if (isEmptyValues(prunedSubSearch)) {
+      // Empty subsearch is a no-op for append: return main unchanged.
+      return mainBody;
+    }
+
     Frame subFrame = new Frame();
     Frame savedExpr = this.exprFrame;
     this.exprFrame = subFrame;
     SqlNode sub;
     try {
-      sub = stripImplicitMetaProjects(node.getSubSearch()).accept(this, subFrame);
+      sub = stripImplicitMetaProjects(prunedSubSearch).accept(this, subFrame);
     } finally {
       this.exprFrame = savedExpr;
     }
@@ -1003,6 +1012,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * columns absent from this side. Pads heterogeneous-schema unions so PPL's NULL-pad semantics is
    * preserved.
    */
+  /**
+   * True when {@code plan} is the empty-source sentinel produced by EmptySourcePropagateVisitor.
+   */
+  private static boolean isEmptyValues(UnresolvedPlan plan) {
+    return plan instanceof org.opensearch.sql.ast.tree.Values v
+        && (v.getValues() == null || v.getValues().isEmpty());
+  }
+
   private SqlNode padToUnifiedSchema(SqlNode body, List<String> present, List<String> unified) {
     Set<String> presentSet = new java.util.LinkedHashSet<>(present);
     SqlNodeList items = new SqlNodeList(POS);

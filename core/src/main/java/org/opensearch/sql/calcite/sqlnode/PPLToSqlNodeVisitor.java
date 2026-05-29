@@ -3452,11 +3452,18 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       whereCond = acc;
     }
+    // Outer SELECT projects only the user-visible columns so the helper `__rn_dedup__` column
+    // doesn't leak into the row type (PPL's implicit final `| fields *` should not surface it).
+    // Falls back to SELECT * when we don't know the visible fields (no row-type oracle).
     SqlNodeList outerSelects = new SqlNodeList(POS);
-    outerSelects.add(SqlIdentifier.star(POS));
-    // Wrap returns SELECT * FROM (<inner>) WHERE <cond>. Downstream `| fields` projects away the
-    // helper `__rn_dedup__` column. Without an explicit projection the helper leaks into the
-    // user-facing row type — matches legacy behaviour for the `oracle == null` path.
+    List<String> visible = frame.currentFields;
+    if (visible != null && !visible.isEmpty()) {
+      for (String c : visible) {
+        outerSelects.add(toIdentifier(c));
+      }
+    } else {
+      outerSelects.add(SqlIdentifier.star(POS));
+    }
     return new SqlSelect(
         POS, null, outerSelects, innerSelect, whereCond, null, null, null, null, null, null, null);
   }

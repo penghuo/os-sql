@@ -194,7 +194,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | 94 | CalciteDataTypeIT | ✅ | All pass. |
 | 95 | CalciteExpandCommandIT | ✅ | All pass. |
 | 96 | CalciteExplainIT | ❌ | 113/257 fail. Tests assert exact RelNode plan strings; round-trip changes plan shape. Test expectations need bulk update — separate task from code fixes. Deferred. |
-| 97 | CalcitePPLExplainIT | ❌ | Same as #96 — plan-output drift after round-trip. Deferred. |
+| 97 | CalcitePPLExplainIT | ✅ | All pass. Two expected JSON/.txt files updated to reflect new shape after C6 added `_highlight` to the table catalog row-type (column count expr#0..7 → expr#0..8) and validator typed the comparison literal as `20:BIGINT` (was bare `20`). |
 | 98 | CalciteFieldFormatCommandIT | ✅ | All pass. |
 | 99 | CalciteFlattenCommandIT | ✅ | All pass. |
 | 100 | CalciteFlattenDocValueIT | ✅ | All pass. |

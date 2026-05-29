@@ -2056,14 +2056,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, Literal> options = node.getOptions();
     boolean addRow = options == null || getBoolOption(options, "row", true);
     boolean addCol = options != null && getBoolOption(options, "col", false);
-    if (addCol) {
-      // col=true requires a UNION ALL with a summary row containing SUM(field) per listed
-      // numeric column and NULLs (or label string) elsewhere — needs an oracle to enumerate
-      // numeric columns and align the union row type. Defer.
-      throw new UnsupportedOperationException(
-          "addtotals col=true not yet supported in PPLToSqlNodeVisitor");
-    }
-    if (!addRow) {
+    if (!addRow && !addCol) {
       // Both flags off: pass through.
       return from;
     }
@@ -2071,39 +2064,129 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (options != null && options.containsKey("fieldname")) {
       alias = options.get("fieldname").getValue().toString();
     }
-    // Sum the listed fields; without an explicit list, sum all currently-visible columns.
-    // Tests typically pre-project the numeric columns with `| fields a, b, ...` so summing
-    // every visible column is the right behaviour for the implicit form. Non-numeric values
-    // would surface as a runtime cast error from Calcite's PLUS — same behaviour as v2.
-    List<Field> fields = node.getFieldList();
-    List<String> sumNames;
-    if (fields == null || fields.isEmpty()) {
-      sumNames = new ArrayList<>(frame.currentFields);
-    } else {
-      sumNames = new ArrayList<>();
-      for (Field f : fields) {
-        sumNames.add(f.getField().toString());
+    String labelField = null;
+    if (options != null && options.containsKey("labelfield")) {
+      labelField = options.get("labelfield").getValue().toString();
+    }
+    String label = "Total";
+    if (options != null && options.containsKey("label")) {
+      label = options.get("label").getValue().toString();
+    }
+
+    // Step 1: row=true → append per-row sum column.
+    if (addRow) {
+      List<Field> fields = node.getFieldList();
+      List<String> sumNames;
+      if (fields == null || fields.isEmpty()) {
+        sumNames = new ArrayList<>(frame.currentFields);
+      } else {
+        sumNames = new ArrayList<>();
+        for (Field f : fields) {
+          sumNames.add(f.getField().toString());
+        }
       }
+      if (sumNames.isEmpty()) {
+        throw new UnsupportedOperationException("addtotals row=true needs at least one field");
+      }
+      SqlNode sum = toIdentifier(sumNames.get(0));
+      for (int i = 1; i < sumNames.size(); i++) {
+        sum =
+            new SqlBasicCall(
+                SqlStdOperatorTable.PLUS, List.of(sum, toIdentifier(sumNames.get(i))), POS);
+      }
+      SqlNodeList items = new SqlNodeList(POS);
+      List<String> visible = new ArrayList<>();
+      for (String c : frame.currentFields) {
+        if (c.equals(alias)) continue;
+        items.add(toIdentifier(c));
+        visible.add(c);
+      }
+      items.add(asAliased(sum, alias));
+      visible.add(alias);
+      from = SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
     }
-    if (sumNames.isEmpty()) {
-      throw new UnsupportedOperationException("addtotals row=true needs at least one field");
-    }
-    SqlNode sum = toIdentifier(sumNames.get(0));
-    for (int i = 1; i < sumNames.size(); i++) {
-      sum =
+
+    // Step 2: col=true → UNION ALL the main pipeline with a summary row containing SUM(f) for
+    // each listed (or all) numeric column. Same shape as visitAddColTotals.
+    if (addCol) {
+      java.util.Set<String> aggFieldNames = new java.util.LinkedHashSet<>();
+      if (node.getFieldList() != null) {
+        for (Field f : node.getFieldList()) {
+          aggFieldNames.add(f.getField().toString());
+        }
+      }
+      boolean explicitFields = !aggFieldNames.isEmpty();
+      boolean appendLabelField = labelField != null && !frame.currentFields.contains(labelField);
+
+      SqlNodeList mainProj = new SqlNodeList(POS);
+      for (String c : frame.currentFields) {
+        mainProj.add(toIdentifier(c));
+      }
+      if (appendLabelField) {
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+                POS);
+        SqlNode pad =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(SqlLiteral.createCharString(" ".repeat(label.length()), POS), varcharSpec),
+                POS);
+        mainProj.add(asAliased(pad, labelField));
+      }
+      SqlSelect mainProjected =
+          new SqlSelect(POS, null, mainProj, from, null, null, null, null, null, null, null, null);
+
+      SqlNodeList summaryProj = new SqlNodeList(POS);
+      for (String c : frame.currentFields) {
+        boolean shouldAgg = !explicitFields || aggFieldNames.contains(c);
+        if (shouldAgg) {
+          SqlNode sum =
+              new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(c, POS)), POS);
+          summaryProj.add(asAliased(sum, c));
+        } else if (labelField != null && c.equals(labelField)) {
+          summaryProj.add(asAliased(SqlLiteral.createCharString(label, POS), c));
+        } else {
+          summaryProj.add(asAliased(SqlLiteral.createNull(POS), c));
+        }
+      }
+      if (appendLabelField) {
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+                POS);
+        SqlNode lab =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(SqlLiteral.createCharString(label, POS), varcharSpec),
+                POS);
+        summaryProj.add(asAliased(lab, labelField));
+      }
+      SqlNode aggFrom =
           new SqlBasicCall(
-              SqlStdOperatorTable.PLUS, List.of(sum, toIdentifier(sumNames.get(i))), POS);
+              SqlStdOperatorTable.AS,
+              List.of(mainProjected, new SqlIdentifier("_addt_main_", POS)),
+              POS);
+      SqlSelect summarySelect =
+          new SqlSelect(
+              POS, null, summaryProj, aggFrom, null, null, null, null, null, null, null, null);
+      SqlNode union =
+          new SqlBasicCall(
+              SqlStdOperatorTable.UNION_ALL, List.of(mainProjected, summarySelect), POS);
+      SqlNodeList wrapItems = new SqlNodeList(POS);
+      wrapItems.add(SqlIdentifier.star(POS));
+      from =
+          new SqlSelect(
+              POS, null, wrapItems, union, null, null, null, null, null, null, null, null);
+      List<String> visible2 = new ArrayList<>(frame.currentFields);
+      if (appendLabelField) visible2.add(labelField);
+      frame.currentFields = visible2;
+      frame.joinHints = null;
+      frame.lastOrderBy = null;
     }
-    SqlNodeList items = new SqlNodeList(POS);
-    List<String> visible = new ArrayList<>();
-    for (String c : frame.currentFields) {
-      if (c.equals(alias)) continue;
-      items.add(toIdentifier(c));
-      visible.add(c);
-    }
-    items.add(asAliased(sum, alias));
-    visible.add(alias);
-    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+    return from;
   }
 
   /**

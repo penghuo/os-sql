@@ -22,6 +22,7 @@ import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.util.BuiltInMethod;
 import org.opensearch.sql.calcite.type.ExprDateType;
@@ -87,7 +88,16 @@ public class SpanFunction extends ImplementorUDF {
       if (SqlTypeUtil.isDecimal(intervalType)) {
         interval = Expressions.call(interval, "doubleValue");
       }
-      if (SqlTypeUtil.isNull(unitType)) {
+      // Accept either NULL type (visitor-direct path) or a null literal whose type may have been
+      // widened to ANY by SqlValidator on the SqlNodePipeline round-trip. PPL emits a typed-NULL
+      // for the unit slot when no unit is supplied (numeric span); ANY is the round-tripped form.
+      // Numeric span shape (`span(num_field, n)`) emits a typed-NULL marker for the unit slot.
+      // On the visitor-only path the operand's RelDataType is SqlTypeName.NULL; after the
+      // SqlNodePipeline round-trip the validator widens the marker to ANY (parser cannot
+      // re-emit a typed NULL literal cleanly). Treat both as "no unit".
+      boolean unitIsNull =
+          SqlTypeUtil.isNull(unitType) || unitType.getSqlTypeName() == SqlTypeName.ANY;
+      if (unitIsNull) {
         return switch (call.getType().getSqlTypeName()) {
           case BIGINT, INTEGER, SMALLINT, TINYINT ->
               Expressions.multiply(Expressions.divide(field, interval), interval);

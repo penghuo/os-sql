@@ -44,6 +44,7 @@ import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.AddTotals;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Append;
+import org.opensearch.sql.ast.tree.AppendCol;
 import org.opensearch.sql.ast.tree.AppendPipe;
 import org.opensearch.sql.ast.tree.Bin;
 import org.opensearch.sql.ast.tree.Chart;
@@ -1082,6 +1083,157 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.joinHints = null;
     frame.lastOrderBy = null;
     return wrapped;
+  }
+
+  @Override
+  public SqlNode visitAppendCol(AppendCol node, Frame frame) {
+    // PPL `<main> | appendcol [<sub>]` horizontally merges main and sub by row order. Both
+    // sides get a synthetic ROW_NUMBER(); LEFT JOIN on _rn_main_ = _rn_sub_; project the
+    // chosen columns. Mirrors v2's emission shape.
+    UnresolvedPlan mainChild = (UnresolvedPlan) node.getChild().get(0);
+    Frame mainFrame = new Frame();
+    Frame savedExprMain = this.exprFrame;
+    this.exprFrame = mainFrame;
+    SqlNode mainBody;
+    try {
+      mainBody = stripImplicitMetaProjects(mainChild).accept(this, mainFrame);
+    } finally {
+      this.exprFrame = savedExprMain;
+    }
+    if (mainFrame.currentFields == null) {
+      throw new UnsupportedOperationException("appendcol main side requires a known column list");
+    }
+    List<String> mainCols = new ArrayList<>(mainFrame.currentFields);
+
+    // Walk subquery to its leaf Values placeholder and attach main's source as the subquery's
+    // own source — same shape as visitAppendPipe.
+    UnresolvedPlan subqueryPlan = node.getSubSearch();
+    UnresolvedPlan subTail = subqueryPlan;
+    while (subTail.getChild() != null
+        && !subTail.getChild().isEmpty()
+        && !(subTail.getChild().get(0) instanceof org.opensearch.sql.ast.tree.Values)) {
+      if (subTail.getChild().size() > 1) {
+        throw new RuntimeException("AppendCol doesn't support multiply children subquery.");
+      }
+      subTail = (UnresolvedPlan) subTail.getChild().get(0);
+    }
+    subTail.attach(mainChild);
+
+    Frame subFrame = new Frame();
+    Frame savedExprSub = this.exprFrame;
+    this.exprFrame = subFrame;
+    SqlNode subBody;
+    try {
+      subBody = stripImplicitMetaProjects(subqueryPlan).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExprSub;
+    }
+    if (subFrame.currentFields == null) {
+      throw new UnsupportedOperationException("appendcol subquery requires a known column list");
+    }
+    List<String> subCols = new ArrayList<>(subFrame.currentFields);
+
+    // Wrap each side with ROW_NUMBER OVER () AS _rn_*_.
+    SqlNode mainWithRn = withRowNumber(mainBody, "_rn_main_");
+    SqlNode subWithRn = withRowNumber(subBody, "_rn_sub_");
+    SqlNode aliasedMain =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS, List.of(mainWithRn, new SqlIdentifier("_main_", POS)), POS);
+    SqlNode aliasedSub =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS, List.of(subWithRn, new SqlIdentifier("_sub_", POS)), POS);
+    SqlNode joinCond =
+        new SqlBasicCall(
+            SqlStdOperatorTable.EQUALS,
+            List.of(
+                new SqlIdentifier(java.util.Arrays.asList("_main_", "_rn_main_"), POS),
+                new SqlIdentifier(java.util.Arrays.asList("_sub_", "_rn_sub_"), POS)),
+            POS);
+    org.apache.calcite.sql.SqlJoin join =
+        new org.apache.calcite.sql.SqlJoin(
+            POS,
+            aliasedMain,
+            SqlLiteral.createBoolean(false, POS),
+            JoinType.LEFT.symbol(POS),
+            aliasedSub,
+            org.apache.calcite.sql.JoinConditionType.ON.symbol(POS),
+            joinCond);
+
+    // Build projection using frame-derived column lists.
+    java.util.Set<String> mainSet = new java.util.HashSet<>(mainCols);
+    java.util.Set<String> subSet = new java.util.HashSet<>(subCols);
+    SqlNodeList projection = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    if (node.isOverride()) {
+      SqlNode caseCond = joinCond;
+      for (String c : mainCols) {
+        if (subSet.contains(c)) {
+          SqlNodeList whens = new SqlNodeList(POS);
+          whens.add(caseCond);
+          SqlNodeList thens = new SqlNodeList(POS);
+          thens.add(new SqlIdentifier(java.util.Arrays.asList("_sub_", c), POS));
+          SqlNode caseExpr =
+              new org.apache.calcite.sql.fun.SqlCase(
+                  POS,
+                  null,
+                  whens,
+                  thens,
+                  new SqlIdentifier(java.util.Arrays.asList("_main_", c), POS));
+          projection.add(asAliased(caseExpr, c));
+        } else {
+          projection.add(
+              asAliased(new SqlIdentifier(java.util.Arrays.asList("_main_", c), POS), c));
+        }
+        visible.add(c);
+      }
+      for (String c : subCols) {
+        if (!mainSet.contains(c)) {
+          projection.add(asAliased(new SqlIdentifier(java.util.Arrays.asList("_sub_", c), POS), c));
+          visible.add(c);
+        }
+      }
+    } else {
+      for (String c : mainCols) {
+        projection.add(asAliased(new SqlIdentifier(java.util.Arrays.asList("_main_", c), POS), c));
+        visible.add(c);
+      }
+      for (String c : subCols) {
+        if (!mainSet.contains(c)) {
+          projection.add(asAliased(new SqlIdentifier(java.util.Arrays.asList("_sub_", c), POS), c));
+          visible.add(c);
+        }
+      }
+    }
+    SqlNode wrapped =
+        new SqlSelect(POS, null, projection, join, null, null, null, null, null, null, null, null);
+    frame.currentFields = visible;
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapped;
+  }
+
+  /** Wrap {@code inner} as {@code SELECT *, ROW_NUMBER() OVER () AS <alias> FROM (inner)}. */
+  private SqlNode withRowNumber(SqlNode inner, String alias) {
+    SqlNode rowNum =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(SqlStdOperatorTable.ROW_NUMBER, List.of(), POS),
+                SqlWindow.create(
+                    null,
+                    null,
+                    new SqlNodeList(POS),
+                    new SqlNodeList(POS),
+                    SqlLiteral.createBoolean(false, POS),
+                    null,
+                    null,
+                    null,
+                    POS)),
+            POS);
+    SqlNodeList items = new SqlNodeList(POS);
+    items.add(SqlIdentifier.star(POS));
+    items.add(asAliased(rowNum, alias));
+    return new SqlSelect(POS, null, items, inner, null, null, null, null, null, null, null, null);
   }
 
   @Override

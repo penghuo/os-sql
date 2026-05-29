@@ -2064,8 +2064,47 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof Span sp) {
       return spanExpr(sp);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.In in) {
+      return inExpr(in);
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.Case caseExpr) {
+      return caseExpr(caseExpr);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate {@code <field> IN (v1, v2, ...)} to a {@link SqlStdOperatorTable#IN} call. PPL's type
+   * compatibility check (v2 raises SemanticCheckException for STRING vs NUMERIC mix) needs a
+   * row-type oracle and is deferred — Calcite's validator coerces silently in the meantime.
+   */
+  private SqlNode inExpr(org.opensearch.sql.ast.expression.In in) {
+    SqlNode field = expr(in.getField());
+    SqlNodeList values = new SqlNodeList(POS);
+    for (UnresolvedExpression v : in.getValueList()) {
+      values.add(expr(v));
+    }
+    return new SqlBasicCall(SqlStdOperatorTable.IN, List.of(field, values), POS);
+  }
+
+  /**
+   * Translate a PPL {@code Case} (CASE WHEN cond THEN val ... ELSE elseVal END) to a Calcite {@link
+   * org.apache.calcite.sql.fun.SqlCase}. PPL stores the WHEN/THEN pairs as a list of {@link
+   * org.opensearch.sql.ast.expression.When} nodes plus an optional ELSE expression.
+   */
+  private SqlNode caseExpr(org.opensearch.sql.ast.expression.Case node) {
+    SqlNodeList whens = new SqlNodeList(POS);
+    SqlNodeList thens = new SqlNodeList(POS);
+    for (org.opensearch.sql.ast.expression.When when : node.getWhenClauses()) {
+      whens.add(expr(when.getCondition()));
+      thens.add(expr(when.getResult()));
+    }
+    SqlNode elseExpr =
+        node.getElseClause().isPresent()
+            ? expr(node.getElseClause().get())
+            : SqlLiteral.createNull(POS);
+    return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, elseExpr);
   }
 
   /**
@@ -2120,6 +2159,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         return new SqlBasicCall(SqlStdOperatorTable.CONCAT, args, POS);
       }
       return new SqlBasicCall(op, args, POS);
+    }
+    // PPL `isnull(x)` / `isnotnull(x)` / `like(s, p)` parse as Function calls but Calcite expects
+    // SqlOperator postfix/infix. Map directly. Other operator-shaped functions (regex, ...) come
+    // through PPLBuiltinOperators via the validator-resolved unresolved-function path.
+    String name = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    org.apache.calcite.sql.SqlOperator opOverride =
+        switch (name) {
+          case "isnull", "is_null", "is null" -> SqlStdOperatorTable.IS_NULL;
+          case "isnotnull", "is_not_null", "is not null" -> SqlStdOperatorTable.IS_NOT_NULL;
+          case "like" -> SqlStdOperatorTable.LIKE;
+          case "not_like", "not like" -> SqlStdOperatorTable.NOT_LIKE;
+          default -> null;
+        };
+    if (opOverride != null) {
+      return new SqlBasicCall(opOverride, args, POS);
     }
     return new SqlBasicCall(
         new org.apache.calcite.sql.SqlUnresolvedFunction(
@@ -2208,6 +2262,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       case "<=" -> SqlStdOperatorTable.LESS_THAN_OR_EQUAL;
       case ">" -> SqlStdOperatorTable.GREATER_THAN;
       case ">=" -> SqlStdOperatorTable.GREATER_THAN_OR_EQUAL;
+      case "like" -> SqlStdOperatorTable.LIKE;
+      case "not like", "not_like" -> SqlStdOperatorTable.NOT_LIKE;
+      case "ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
+      case "not ilike", "not_ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.NOT_ILIKE;
+      case "regexp" -> org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_CONTAINS;
       default ->
           throw new UnsupportedOperationException("Comparison operator not supported: " + op);
     };

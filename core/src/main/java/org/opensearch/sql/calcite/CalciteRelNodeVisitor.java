@@ -653,6 +653,25 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
    * @param context CalcitePlanContext
    * @param excludeByForce whether exclude metadata fields by force
    */
+  /**
+   * Drop the synthetic {@code _highlight} column from the current top-of-stack row-type when
+   * highlight was not requested. The column is part of the table catalog (post-C6) so the
+   * SqlValidator can resolve references after the round-trip; it must be removed before
+   * commands that would otherwise treat it as a regular grouping/aggregation column (e.g.
+   * streamstats Aggregate, which fails on MAP-typed group keys).
+   */
+  private static void dropHighlightIfNotRequested(CalcitePlanContext context) {
+    if (context.isHighlightRequested()) {
+      return;
+    }
+    List<String> fields = context.relBuilder.peek().getRowType().getFieldNames();
+    int hlIdx = fields.indexOf(HighlightExpression.HIGHLIGHT_FIELD);
+    if (hlIdx < 0) {
+      return;
+    }
+    context.relBuilder.projectExcept(context.relBuilder.field(hlIdx));
+  }
+
   private static void tryToRemoveMetaFields(CalcitePlanContext context, boolean excludeByForce) {
     if (excludeByForce || !context.isProjectVisited()) {
       List<String> originalFields = context.relBuilder.peek().getRowType().getFieldNames();
@@ -1672,6 +1691,11 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       boolean metricsFirst,
       boolean includeAggFieldsInNullFilter) {
     visitChildren(node, context);
+    // Drop the synthetic _highlight column before grouping. With it left in the row-type, an
+    // outer query like `... | stats sum(x)` would build an Aggregate that includes
+    // _highlight (MAP<VARCHAR, ANY>) as a group key candidate, failing at runtime with
+    // "Assignment conversion not possible from java.util.Map to java.lang.Comparable".
+    dropHighlightIfNotRequested(context);
 
     List<UnresolvedExpression> aggExprList = node.getAggExprList();
     List<UnresolvedExpression> groupExprList = new ArrayList<>();
@@ -2076,6 +2100,9 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   @Override
   public RelNode visitWindow(Window node, CalcitePlanContext context) {
     visitChildren(node, context);
+    // Eventstats: same rationale as visitStreamWindow — drop _highlight before window
+    // aggregation to avoid GROUP BY MAP<VARCHAR, ANY>.
+    dropHighlightIfNotRequested(context);
 
     List<UnresolvedExpression> groupList = node.getGroupList();
     boolean hasGroup = groupList != null && !groupList.isEmpty();
@@ -2132,6 +2159,13 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   @Override
   public RelNode visitStreamWindow(StreamWindow node, CalcitePlanContext context) {
     visitChildren(node, context);
+
+    // _highlight is part of the table catalog row-type as a reserved metadata column. Without
+    // dropping it here, streamstats' inner Aggregate would try to GROUP BY a MAP<VARCHAR, ANY>
+    // column and fail at runtime with "Assignment conversion not possible from
+    // java.util.Map to java.lang.Comparable". Drop it unless highlight was requested — it has
+    // no role in stream window aggregation.
+    dropHighlightIfNotRequested(context);
 
     List<UnresolvedExpression> groupList = node.getGroupList();
     boolean hasGroup = groupList != null && !groupList.isEmpty();

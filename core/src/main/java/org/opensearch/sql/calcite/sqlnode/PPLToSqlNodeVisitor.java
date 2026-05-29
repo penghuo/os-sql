@@ -4655,7 +4655,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           case "log10" -> SqlStdOperatorTable.LOG10;
           case "sqrt" -> SqlStdOperatorTable.SQRT;
           case "round" -> SqlStdOperatorTable.ROUND;
-          case "mod" -> SqlStdOperatorTable.MOD;
+          // PPL MOD: divide-by-zero returns NULL and operand types promote wider than
+          // SqlStdOperatorTable.MOD's signature allows. Bind to the PPL UDF.
+          case "mod" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
           case "pow", "power" -> SqlStdOperatorTable.POWER;
           // PPL named-arithmetic forms parse as regular function calls; route them to the
           // matching binary operator. These differ from the operator forms (`a + b`) which
@@ -4663,8 +4665,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           case "add" -> SqlStdOperatorTable.PLUS;
           case "subtract" -> SqlStdOperatorTable.MINUS;
           case "multiply" -> SqlStdOperatorTable.MULTIPLY;
-          case "divide" -> SqlStdOperatorTable.DIVIDE;
-          case "modulus" -> SqlStdOperatorTable.MOD;
+          case "divide" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE;
+          case "modulus" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
           // Two-arg atan: PPL `atan(y, x)` is mathematically atan2; map to ATAN2.
           case "atan2" -> SqlStdOperatorTable.ATAN2;
           // PPL `signum` / `sign` both return -1/0/1 of a numeric; Calcite's SIGN op handles both.
@@ -4878,8 +4880,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       case "+" -> SqlStdOperatorTable.PLUS;
       case "-" -> SqlStdOperatorTable.MINUS;
       case "*" -> SqlStdOperatorTable.MULTIPLY;
-      case "/" -> SqlStdOperatorTable.DIVIDE;
-      case "%" -> SqlStdOperatorTable.MOD;
+      // PPL semantics for divide-by-zero is to return NULL (and PPL MOD likewise produces wider
+      // type promotion that SqlStdOperatorTable.MOD doesn't match). Bind to PPLBuiltinOperators.
+      case "/" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE;
+      case "%" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
       default -> null;
     };
   }

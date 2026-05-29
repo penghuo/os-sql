@@ -2194,14 +2194,46 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private SqlNode caseExpr(org.opensearch.sql.ast.expression.Case node) {
     SqlNodeList whens = new SqlNodeList(POS);
     SqlNodeList thens = new SqlNodeList(POS);
+    boolean allStringResults = true;
     for (org.opensearch.sql.ast.expression.When when : node.getWhenClauses()) {
       whens.add(expr(when.getCondition()));
       thens.add(expr(when.getResult()));
+      allStringResults &=
+          when.getResult() instanceof Literal lit && lit.getType() == DataType.STRING;
     }
     SqlNode elseExpr =
         node.getElseClause().isPresent()
             ? expr(node.getElseClause().get())
             : SqlLiteral.createNull(POS);
+    if (node.getElseClause().isPresent()) {
+      allStringResults &=
+          node.getElseClause().get() instanceof Literal lit && lit.getType() == DataType.STRING;
+    }
+    // Calcite widens unequal-length CHAR literals to a common CHAR(N), right-padding shorter
+    // values with spaces. PPL keeps strings VARCHAR-typed (no padding). When all THEN/ELSE
+    // values are string literals, cast each to VARCHAR so the CASE result type stays VARCHAR.
+    if (allStringResults && !thens.isEmpty()) {
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+              POS);
+      for (int i = 0; i < thens.size(); i++) {
+        thens.set(
+            i,
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(thens.get(i), varcharSpec),
+                POS));
+      }
+      if (node.getElseClause().isPresent()) {
+        elseExpr =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(elseExpr, varcharSpec),
+                POS);
+      }
+    }
     return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, elseExpr);
   }
 

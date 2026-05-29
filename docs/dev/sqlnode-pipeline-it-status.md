@@ -94,7 +94,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | 29 | CalcitePPLJoinIT | ⚠️ | 37/39 pass after `stripUnusedAsOverJoin` post-processing in `SqlNodePipeline.relToSql`. Calcite's RelToSql wraps the outermost JOIN with a generated alias (`(...) t11`) which the Spark dialect unparses with surrounding parens; the Babel parser's `TableRef3` rule rejects `(JOIN)`. Solution: detect `AS(SqlJoin, alias)` in the SELECT's FROM, walk the SELECT/WHERE for references to that alias, and drop the AS when unused — leaves a bare `SqlJoin` which the unparser writes without surrounding parens. 2 row-count mismatch fails remaining (separate test data issue). |
 | 30 | CalcitePPLLookupIT | ✅ | All pass. |
 | 31 | CalcitePPLInSubqueryIT | ✅ | All pass. |
-| 32 | CalcitePPLExistsSubqueryIT | ✅ | All pass. |
+| 32 | CalcitePPLExistsSubqueryIT | ⚠️ | 17/19 pass. 2 fails (`testSubsearchMaxOut1`, `testExistsSubqueryWithConjunction`) — both produce a correlated EXISTS subquery whose inner plan still carries the catalog-level `_highlight` (MAP<VARCHAR, ANY>) on the outer side. Calcite enumerable codegen generates row comparisons for the correlated reference and fails with "Assignment conversion not possible from java.util.Map to java.lang.Comparable" because MAP isn't Comparable. Tried a `stripHighlightFromSubqueries` pre-pass that projects out `_highlight` immediately above each TableScan inside the subquery; it broke 3 other EXISTS tests with shape changes. Deferred — likely needs a Calcite-side fix to skip MAP columns in correlation row comparison, or a more targeted strip strategy. |
 | 33 | CalcitePPLScalarSubqueryIT | ✅ | All pass. |
 
 ## Phase 6 — Spath / Bin / Eventstats / Trendline (was bypassed for various RelToSql limits)

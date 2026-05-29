@@ -3006,8 +3006,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // to flip). The 2D `over X by Y` pivot case requires schema-aware re-aggregation and is
     // deferred — falls through to the unsupported branch.
     if (node.getRowSplit() != null && node.getColumnSplit() != null) {
-      throw new UnsupportedOperationException(
-          "chart 2D (over X by Y) form not yet supported in PPLToSqlNodeVisitor");
+      return visitChart2D(node, frame, from);
     }
     UnresolvedExpression splitKey =
         node.getRowSplit() != null ? node.getRowSplit() : node.getColumnSplit();
@@ -3057,6 +3056,268 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         .orderBy(List.of(ordered))
         .withFields(visible)
         .wrap(frame);
+  }
+
+  /**
+   * 2D chart pivot: {@code chart agg over X by Y}. Pivots Y values as columns within X groups, with
+   * TOP-N filtering on the per-Y aggregate. Emitted as a five-step nested pipeline (no row-type
+   * oracle needed):
+   *
+   * <ol>
+   *   <li>Inner GROUP BY (X, Y) producing the metric.
+   *   <li>Per-Y total via window SUM partitioned by Y.
+   *   <li>DENSE_RANK over (perYTotal DESC|ASC NULLS LAST, Y NULLS LAST) for top-N selection.
+   *   <li>Optional rank-cap filter when useOther=false.
+   *   <li>CASE-label non-top Y as OTHER (or filter), NULL as nullLabel; outer re-aggregate.
+   * </ol>
+   */
+  private SqlNode visitChart2D(Chart node, Frame frame, SqlNode from) {
+    org.opensearch.sql.ast.expression.Argument.ArgumentMap argMap =
+        org.opensearch.sql.ast.expression.Argument.ArgumentMap.of(node.getArguments());
+    int limit = argMap.get("limit") != null ? (Integer) argMap.get("limit").getValue() : 10;
+    boolean useNull = argMap.get("usenull") == null || (Boolean) argMap.get("usenull").getValue();
+    boolean useOther =
+        argMap.get("useother") == null || (Boolean) argMap.get("useother").getValue();
+    boolean top = argMap.get("top") == null || (Boolean) argMap.get("top").getValue();
+    String otherLabel =
+        argMap.get("otherstr") != null ? argMap.get("otherstr").getValue().toString() : "OTHER";
+    String nullLabel =
+        argMap.get("nullstr") != null ? argMap.get("nullstr").getValue().toString() : "NULL";
+
+    UnresolvedExpression rowKey = node.getRowSplit();
+    UnresolvedExpression colKey = node.getColumnSplit();
+    UnresolvedExpression aggExpr = node.getAggregationFunction();
+    String aggAlias = (aggExpr instanceof Alias al) ? al.getName() : "agg";
+    UnresolvedExpression aggCore = aggExpr instanceof Alias al ? al.getDelegated() : aggExpr;
+    String overName = chartKeyName(rowKey, "_over_");
+    String byName = chartKeyName(colKey, "_by_");
+
+    // Step 1: inner GROUP BY (X, Y) — emit (overName, byName, aggAlias). Cast Y to VARCHAR so
+    // OTHER/NULL substitutes can sit in the same column. Drop NULL aggregate-input rows when the
+    // aggregate has a specific field to null-check (matches v2 includeAggFieldsInNullFilter=true).
+    SqlNode innerRowExpr = expr(stripChartAlias(rowKey));
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    SqlNode innerColExpr =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(expr(stripChartAlias(colKey)), varcharSpec),
+            POS);
+    SqlNodeList innerItems = new SqlNodeList(POS);
+    innerItems.add(asAliased(innerRowExpr, overName));
+    innerItems.add(asAliased(innerColExpr, byName));
+    innerItems.add(asAliased(aggCall(aggCore), aggAlias));
+
+    SqlNode innerWhere = null;
+    if (aggCore instanceof AggregateFunction af
+        && af.getField() != null
+        && !(af.getField() instanceof Literal)
+        && !(af.getField() instanceof AllFields)) {
+      innerWhere =
+          new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(expr(af.getField())), POS);
+    }
+    Frame innerFrame = new Frame();
+    SqlBuilder.SelectBuilder innerB =
+        SqlBuilder.select(innerItems)
+            .from(from)
+            .groupBy(List.of(expr(stripChartAlias(rowKey)), expr(stripChartAlias(colKey))));
+    if (innerWhere != null) {
+      innerB.where(innerWhere);
+    }
+    innerB.withFields(List.of(overName, byName, aggAlias));
+    SqlNode step1 = innerB.wrap(innerFrame);
+
+    // Step 2: extend with per-Y total. Drop X NULLs (always); drop Y NULLs only when !useNull.
+    SqlNode yTotalWindow =
+        SqlWindow.create(
+            null,
+            null,
+            new SqlNodeList(List.of(new SqlIdentifier(byName, POS)), POS),
+            new SqlNodeList(POS),
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode yTotalOver =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(aggAlias, POS)), POS),
+                yTotalWindow),
+            POS);
+    SqlNodeList step2Items = new SqlNodeList(POS);
+    step2Items.add(new SqlIdentifier(overName, POS));
+    step2Items.add(new SqlIdentifier(byName, POS));
+    step2Items.add(new SqlIdentifier(aggAlias, POS));
+    step2Items.add(asAliased(yTotalOver, "__chart_y_total__"));
+    SqlNode step2Where =
+        new SqlBasicCall(
+            SqlStdOperatorTable.IS_NOT_NULL, List.of(new SqlIdentifier(overName, POS)), POS);
+    if (!useNull) {
+      step2Where =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AND,
+              List.of(
+                  step2Where,
+                  new SqlBasicCall(
+                      SqlStdOperatorTable.IS_NOT_NULL,
+                      List.of(new SqlIdentifier(byName, POS)),
+                      POS)),
+              POS);
+    }
+    Frame f2 = new Frame();
+    SqlNode step2 =
+        SqlBuilder.select(step2Items)
+            .from(step1)
+            .where(step2Where)
+            .withFields(List.of(overName, byName, aggAlias, "__chart_y_total__"))
+            .wrap(f2);
+
+    // Step 3: DENSE_RANK over (yTotal DESC|ASC NULLS LAST, byName NULLS LAST). Secondary key
+    // breaks ties so each distinct Y receives a unique rank — required for correct top-N.
+    SqlNode yTotalRef = new SqlIdentifier("__chart_y_total__", POS);
+    SqlNode rankPrimary =
+        top ? new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(yTotalRef), POS) : yTotalRef;
+    rankPrimary = new SqlBasicCall(SqlStdOperatorTable.NULLS_LAST, List.of(rankPrimary), POS);
+    SqlNode rankSecondary =
+        new SqlBasicCall(
+            SqlStdOperatorTable.NULLS_LAST, List.of(new SqlIdentifier(byName, POS)), POS);
+    SqlNodeList rankOrder = new SqlNodeList(List.of(rankPrimary, rankSecondary), POS);
+    SqlNode rankWindow =
+        SqlWindow.create(
+            null,
+            null,
+            new SqlNodeList(POS),
+            rankOrder,
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode rankOver =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.DENSE_RANK, java.util.Collections.emptyList(), POS),
+                rankWindow),
+            POS);
+    SqlNodeList step3Items = new SqlNodeList(POS);
+    step3Items.add(new SqlIdentifier(overName, POS));
+    step3Items.add(new SqlIdentifier(byName, POS));
+    step3Items.add(new SqlIdentifier(aggAlias, POS));
+    step3Items.add(asAliased(rankOver, "__chart_rn__"));
+    Frame f3 = new Frame();
+    SqlNode step3 =
+        SqlBuilder.select(step3Items)
+            .from(step2)
+            .withFields(List.of(overName, byName, aggAlias, "__chart_rn__"))
+            .wrap(f3);
+
+    // Step 4 (optional): drop non-top rows when useOther=false.
+    SqlNode rankFiltered = step3;
+    if (!useOther && limit > 0) {
+      Frame f4 = new Frame();
+      SqlNode rnLE =
+          new SqlBasicCall(
+              SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+              List.of(
+                  new SqlIdentifier("__chart_rn__", POS),
+                  SqlLiteral.createExactNumeric(Integer.toString(limit), POS)),
+              POS);
+      SqlNodeList passThrough = new SqlNodeList(POS);
+      passThrough.add(new SqlIdentifier(overName, POS));
+      passThrough.add(new SqlIdentifier(byName, POS));
+      passThrough.add(new SqlIdentifier(aggAlias, POS));
+      passThrough.add(new SqlIdentifier("__chart_rn__", POS));
+      rankFiltered =
+          SqlBuilder.select(passThrough)
+              .from(step3)
+              .where(rnLE)
+              .withFields(List.of(overName, byName, aggAlias, "__chart_rn__"))
+              .wrap(f4);
+    }
+
+    // Step 5a: relabel — WHEN Y IS NULL THEN <nullLabel|NULL>; WHEN rn<=limit (useOther=true) THEN
+    // Y; ELSE <otherLabel|Y>. Materialize the labeled column before the outer GROUP BY.
+    SqlNode yRef = new SqlIdentifier(byName, POS);
+    SqlNode rnRef = new SqlIdentifier("__chart_rn__", POS);
+    SqlNodeList caseWhens = new SqlNodeList(POS);
+    SqlNodeList caseThens = new SqlNodeList(POS);
+    caseWhens.add(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(yRef), POS));
+    caseThens.add(
+        useNull ? SqlLiteral.createCharString(nullLabel, POS) : SqlLiteral.createNull(POS));
+    if (useOther && limit > 0) {
+      caseWhens.add(
+          new SqlBasicCall(
+              SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+              List.of(rnRef, SqlLiteral.createExactNumeric(Integer.toString(limit), POS)),
+              POS));
+      caseThens.add(yRef);
+    }
+    SqlNode caseElse = useOther && limit > 0 ? SqlLiteral.createCharString(otherLabel, POS) : yRef;
+    SqlNode labeledY =
+        new org.apache.calcite.sql.fun.SqlCase(POS, null, caseWhens, caseThens, caseElse);
+    SqlNodeList step5aItems = new SqlNodeList(POS);
+    step5aItems.add(new SqlIdentifier(overName, POS));
+    step5aItems.add(asAliased(labeledY, byName));
+    step5aItems.add(new SqlIdentifier(aggAlias, POS));
+    Frame f5a = new Frame();
+    SqlNode step5a =
+        SqlBuilder.select(step5aItems)
+            .from(rankFiltered)
+            .withFields(List.of(overName, byName, aggAlias))
+            .wrap(f5a);
+
+    // Step 5b: outer re-aggregate by (overName, byName). MIN/EARLIEST→MIN, MAX/LATEST→MAX,
+    // AVG→AVG, others→SUM (matches v2 buildAggCall mapping).
+    String aggFnName = "sum";
+    if (aggCore instanceof AggregateFunction af) {
+      aggFnName = af.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    } else if (aggCore instanceof org.opensearch.sql.ast.expression.Function fn0) {
+      aggFnName = fn0.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    }
+    org.apache.calcite.sql.SqlOperator outerAgg =
+        switch (aggFnName) {
+          case "min", "earliest" -> SqlStdOperatorTable.MIN;
+          case "max", "latest" -> SqlStdOperatorTable.MAX;
+          case "avg" -> SqlStdOperatorTable.AVG;
+          default -> SqlStdOperatorTable.SUM;
+        };
+    SqlNodeList outerItems = new SqlNodeList(POS);
+    outerItems.add(new SqlIdentifier(overName, POS));
+    outerItems.add(new SqlIdentifier(byName, POS));
+    outerItems.add(
+        asAliased(
+            new SqlBasicCall(outerAgg, List.of(new SqlIdentifier(aggAlias, POS)), POS), aggAlias));
+    SqlNode orderRow =
+        new SqlBasicCall(
+            SqlStdOperatorTable.NULLS_LAST, List.of(new SqlIdentifier(overName, POS)), POS);
+    SqlNode orderCol =
+        new SqlBasicCall(
+            SqlStdOperatorTable.NULLS_LAST, List.of(new SqlIdentifier(byName, POS)), POS);
+    return SqlBuilder.select(outerItems)
+        .from(step5a)
+        .groupBy(List.of(new SqlIdentifier(overName, POS), new SqlIdentifier(byName, POS)))
+        .orderBy(List.of(orderRow, orderCol))
+        .withFields(List.of(overName, byName, aggAlias))
+        .wrap(frame);
+  }
+
+  private static UnresolvedExpression stripChartAlias(UnresolvedExpression e) {
+    return e instanceof Alias a ? a.getDelegated() : e;
+  }
+
+  private static String chartKeyName(UnresolvedExpression e, String fallback) {
+    if (e instanceof Alias a) return a.getName();
+    if (e instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
+    if (e instanceof QualifiedName qn) return qn.toString();
+    return fallback;
   }
 
   @Override

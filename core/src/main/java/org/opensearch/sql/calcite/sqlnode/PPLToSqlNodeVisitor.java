@@ -42,6 +42,7 @@ import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Chart;
 import org.opensearch.sql.ast.tree.Convert;
 import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
@@ -812,6 +813,70 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.joinHints = null;
     frame.lastOrderBy = null;
     return wrapper;
+  }
+
+  @Override
+  public SqlNode visitChart(Chart node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (node.getAggregationFunction() == null) {
+      throw new UnsupportedOperationException("chart requires an aggregation function");
+    }
+    // 1D case: `chart agg by X` or `chart agg over X` — equivalent to GROUP BY X with NULL-key
+    // filtering and an implicit ORDER BY on the split key (so a downstream `reverse` has a sort
+    // to flip). The 2D `over X by Y` pivot case requires schema-aware re-aggregation and is
+    // deferred — falls through to the unsupported branch.
+    if (node.getRowSplit() != null && node.getColumnSplit() != null) {
+      throw new UnsupportedOperationException(
+          "chart 2D (over X by Y) form not yet supported in PPLToSqlNodeVisitor");
+    }
+    UnresolvedExpression splitKey =
+        node.getRowSplit() != null ? node.getRowSplit() : node.getColumnSplit();
+    if (splitKey == null) {
+      throw new UnsupportedOperationException("chart requires a split key (`by` or `over`)");
+    }
+    // Strip the alias around the split key (if any) and translate the inner expression. The
+    // `agg first, group key last` row layout matches v2's chart output.
+    String gkAlias = null;
+    UnresolvedExpression gkCore = splitKey;
+    if (splitKey instanceof Alias a) {
+      gkAlias = a.getName();
+      gkCore = a.getDelegated();
+    } else if (splitKey instanceof QualifiedName qn) {
+      gkAlias = qn.toString();
+    } else if (splitKey instanceof Field f && f.getField() instanceof QualifiedName qn) {
+      gkAlias = qn.toString();
+    }
+    SqlNode keyExpr = expr(gkCore);
+
+    // Build the agg call, capturing alias.
+    UnresolvedExpression aggExpr = node.getAggregationFunction();
+    String aggAlias = aggLabel(aggExpr);
+    UnresolvedExpression aggCore = (aggExpr instanceof Alias a) ? a.getDelegated() : aggExpr;
+    SqlNode aggCallNode = aggCall(aggCore);
+
+    // PPL chart drops rows where the split key is NULL (mirroring v2's nonNullGroupMask).
+    SqlNode nullFilter = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(keyExpr), POS);
+    SqlNodeList items = new SqlNodeList(POS);
+    items.add(asAliased(keyExpr, gkAlias != null ? gkAlias : "_split"));
+    items.add(asAliased(aggCallNode, aggAlias));
+    List<String> visible = new ArrayList<>();
+    visible.add(gkAlias != null ? gkAlias : "_split");
+    visible.add(aggAlias);
+
+    // Order by the split key NULLS_LAST (matches v2's chart output ordering).
+    SqlNode orderRef = gkAlias != null ? new SqlIdentifier(gkAlias, POS) : keyExpr;
+    SqlNode ordered = new SqlBasicCall(SqlStdOperatorTable.NULLS_LAST, List.of(orderRef), POS);
+
+    frame.lastOrderBy = null;
+    frame.joinHints = null;
+
+    return SqlBuilder.select(items)
+        .from(from)
+        .where(nullFilter)
+        .groupBy(List.of(keyExpr))
+        .orderBy(List.of(ordered))
+        .withFields(visible)
+        .wrap(frame);
   }
 
   @Override

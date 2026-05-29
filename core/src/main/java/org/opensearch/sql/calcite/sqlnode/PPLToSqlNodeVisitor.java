@@ -62,6 +62,7 @@ import org.opensearch.sql.ast.tree.Rex;
 import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
+import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.plan.OpenSearchConstants;
 import org.opensearch.sql.calcite.utils.WildcardUtils;
@@ -684,6 +685,52 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitUnion(Union node, Frame frame) {
+    // PPL `| union [<plan1>, <plan2>, ...]` is UNION ALL of N datasets. The new visitor lacks an
+    // oracle so we don't pad mismatched schemas — branches must already align (or the validator
+    // raises a column-mismatch error). For matching-schema unions this is a transparent
+    // emission. Mismatched-schema padding requires schema introspection; defer to a follow-up.
+    if (node.getDatasets() == null || node.getDatasets().size() < 2) {
+      throw new IllegalArgumentException(
+          "Union command requires at least two datasets. Provided: "
+              + (node.getDatasets() == null ? 0 : node.getDatasets().size()));
+    }
+    List<SqlNode> branches = new ArrayList<>();
+    for (UnresolvedPlan ds : node.getDatasets()) {
+      Frame branchFrame = new Frame();
+      Frame savedExpr = this.exprFrame;
+      this.exprFrame = branchFrame;
+      branches.add(stripImplicitMetaProjects(ds).accept(this, branchFrame));
+      this.exprFrame = savedExpr;
+    }
+    SqlNode union = branches.get(0);
+    for (int i = 1; i < branches.size(); i++) {
+      union = new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, branches.get(i)), POS);
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    items.add(SqlIdentifier.star(POS));
+    SqlNode wrapper =
+        new SqlSelect(
+            POS,
+            null,
+            items,
+            union,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            node.getMaxout() != null && node.getMaxout() > 0
+                ? SqlLiteral.createExactNumeric(node.getMaxout().toString(), POS)
+                : null,
+            null);
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapper;
   }
 
   @Override

@@ -1160,10 +1160,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "streamstats reset_before/reset_after not yet supported in PPLToSqlNodeVisitor");
     }
-    if (node.getWindow() > 0) {
-      throw new UnsupportedOperationException(
-          "streamstats window=N not yet supported in PPLToSqlNodeVisitor");
-    }
+    // ROWS frame:
+    //   current=true,  window=N>0 : lower = (N-1) PRECEDING, upper = CURRENT ROW (N rows total)
+    //   current=false, window=N>0 : lower = N     PRECEDING, upper = 1 PRECEDING (N rows excl)
+    //   window=0 (unbounded)      : lower = UNBOUNDED PRECEDING, upper = CURRENT ROW
+    int win = node.getWindow();
+    int lowerOffset = node.isCurrent() ? win - 1 : win;
+    SqlNode frameLower =
+        win > 0
+            ? new SqlBasicCall(
+                SqlWindow.PRECEDING_OPERATOR,
+                List.of(SqlLiteral.createExactNumeric(Integer.toString(lowerOffset), POS)),
+                POS)
+            : SqlWindow.createUnboundedPreceding(POS);
+    SqlNode frameUpper =
+        node.isCurrent()
+            ? SqlWindow.createCurrentRow(POS)
+            : new SqlBasicCall(
+                SqlWindow.PRECEDING_OPERATOR,
+                List.of(SqlLiteral.createExactNumeric("1", POS)),
+                POS);
     SqlNodeList partitionBy = new SqlNodeList(POS);
     List<SqlNode> partitionExprs = new ArrayList<>();
     for (UnresolvedExpression p : node.getGroupList()) {
@@ -1259,7 +1275,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             "Unexpected window function: " + fnLower.toUpperCase(java.util.Locale.ROOT));
       }
       SqlNode aggNode = aggCall(aggInput, /* windowed */ true);
-      // Cumulative ROWS frame: UNBOUNDED PRECEDING to CURRENT ROW.
+      // ROWS frame derived from current/window above (current=true window=0 → cumulative;
+      // current=true window=N → last N rows; current=false window=N → previous N rows).
       SqlNode window =
           SqlWindow.create(
               null,
@@ -1267,8 +1284,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               partitionBy,
               orderBy,
               SqlLiteral.createBoolean(true, POS),
-              SqlWindow.createUnboundedPreceding(POS),
-              SqlWindow.createCurrentRow(POS),
+              frameLower,
+              frameUpper,
               null,
               POS);
       SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);

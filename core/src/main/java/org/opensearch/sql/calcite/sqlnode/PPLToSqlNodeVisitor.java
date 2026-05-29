@@ -402,6 +402,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         aliasesInThisSelect = new LinkedHashSet<>();
       }
       SqlNode rhs = expr(let.getExpression());
+      // Calcite types string literals as CHAR(N) where N is the literal length. When two branches
+      // of a downstream UNION (multisearch / append / chart pivot) bind the same alias to string
+      // literals of different lengths, the union widens the result to CHAR(max) and right-pads
+      // shorter values with spaces. PPL expects VARCHAR semantics, so cast a bare STRING literal
+      // RHS to VARCHAR.
+      if (let.getExpression() instanceof Literal stringLit
+          && stringLit.getType() == DataType.STRING) {
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                POS);
+        rhs =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(rhs, varcharSpec),
+                POS);
+      }
       // PPL `fieldformat alias = "prefix" . expr . "suffix"` parses into a Let with optional
       // concatPrefix/concatSuffix literals. Rewrite to NULL-preserving SQL concat (`||`) — the
       // CONCAT operator preserves NULLs (matches v2's emission shape; CONCAT_FUNCTION coerces

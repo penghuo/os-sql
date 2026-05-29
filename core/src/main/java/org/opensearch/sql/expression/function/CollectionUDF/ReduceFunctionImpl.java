@@ -43,8 +43,24 @@ public class ReduceFunctionImpl extends ImplementorUDF {
   @Override
   public SqlReturnTypeInference getReturnTypeInference() {
     return sqlOperatorBinding -> {
+      // Two callers reach this:
+      //  - SqlValidator.deriveType passes a SqlCallBinding (SqlNode operands; lambda RexNodes
+      //    not yet available)
+      //  - SqlToRelConverter passes a RexCallBinding (RexNode operands available)
+      // For the SqlCallBinding path, we cannot inspect RexLambda; fall back to using the
+      // lambda's own return type which Calcite tracks in the operand RelDataType.
       RelDataTypeFactory typeFactory = sqlOperatorBinding.getTypeFactory();
-      RexCallBinding rexCallBinding = (RexCallBinding) sqlOperatorBinding;
+      if (!(sqlOperatorBinding instanceof RexCallBinding rexCallBinding)) {
+        // SqlCallBinding path (validator). The trailing optional lambda — if present — is the
+        // final accumulator transform; its return type is the call's return type. Otherwise,
+        // the merge lambda's return type is the result. Lambda operand types are
+        // FunctionSqlType; unwrap to the body return type.
+        int lambdaIdx = sqlOperatorBinding.getOperandCount() > 3 ? 3 : 2;
+        RelDataType lambdaType = sqlOperatorBinding.getOperandType(lambdaIdx);
+        return (lambdaType instanceof org.apache.calcite.sql.type.FunctionSqlType fst)
+            ? fst.getReturnType()
+            : lambdaType;
+      }
       List<RexNode> rexNodes = rexCallBinding.operands();
       ArraySqlType listType = (ArraySqlType) rexNodes.get(0).getType();
       RelDataType elementType = listType.getComponentType();
@@ -71,7 +87,7 @@ public class ReduceFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class ReduceImplementor implements NotNullImplementor {

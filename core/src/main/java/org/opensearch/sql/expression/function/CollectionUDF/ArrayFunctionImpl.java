@@ -57,14 +57,19 @@ public class ArrayFunctionImpl extends ImplementorUDF {
         return createArrayType(
             typeFactory, typeFactory.createTypeWithNullability(innerType, true), true);
       } catch (Exception e) {
-        throw new RuntimeException("fail to create array with fixed type: " + e.getMessage());
+        // Calcite's ARRAY rejects mixed-type operands (e.g. ARRAY(1, TRUE) — INTEGER+BOOLEAN
+        // have no leastRestrictive). PPL allows heterogeneous arrays; fall back to ANY element
+        // so the SqlValidator round-trip still types the call.
+        RelDataType anyType = typeFactory.createSqlType(SqlTypeName.ANY);
+        return createArrayType(
+            typeFactory, typeFactory.createTypeWithNullability(anyType, true), true);
       }
     };
   }
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   /**

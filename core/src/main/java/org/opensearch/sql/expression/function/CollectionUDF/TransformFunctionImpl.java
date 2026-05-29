@@ -42,10 +42,22 @@ public class TransformFunctionImpl extends ImplementorUDF {
   @Override
   public SqlReturnTypeInference getReturnTypeInference() {
     return sqlOperatorBinding -> {
+      // Two callers reach this:
+      //  - SqlValidator.deriveType passes a SqlCallBinding (lambda RexNodes not yet available);
+      //    the lambda operand's RelDataType is a FunctionSqlType, so unwrap getReturnType().
+      //  - SqlToRelConverter passes a RexCallBinding; pull the body type via the RexLambda.
       RelDataTypeFactory typeFactory = sqlOperatorBinding.getTypeFactory();
-      RexCallBinding rexCallBinding = (RexCallBinding) sqlOperatorBinding;
-      List<RexNode> operands = rexCallBinding.operands();
-      RelDataType lambdaReturnType = ((RexLambda) operands.get(1)).getExpression().getType();
+      RelDataType lambdaReturnType;
+      if (sqlOperatorBinding instanceof RexCallBinding rexCallBinding) {
+        List<RexNode> operands = rexCallBinding.operands();
+        lambdaReturnType = ((RexLambda) operands.get(1)).getExpression().getType();
+      } else {
+        RelDataType lambdaType = sqlOperatorBinding.getOperandType(1);
+        lambdaReturnType =
+            (lambdaType instanceof org.apache.calcite.sql.type.FunctionSqlType fst)
+                ? fst.getReturnType()
+                : lambdaType;
+      }
       return createArrayType(
           typeFactory, typeFactory.createTypeWithNullability(lambdaReturnType, true), true);
     };
@@ -53,7 +65,7 @@ public class TransformFunctionImpl extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    return null;
+    return UDFOperandMetadata.permissiveVariadic();
   }
 
   public static class TransformImplementor implements NotNullImplementor {

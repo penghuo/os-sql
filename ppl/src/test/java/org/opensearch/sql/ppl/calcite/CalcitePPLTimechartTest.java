@@ -103,7 +103,7 @@ public class CalcitePPLTimechartTest extends CalcitePPLAbstractTest {
     withPPLQuery("source=events | timechart per_second(cpu_usage)")
         .expectSparkSQL(
             "SELECT `@timestamp`, DIVIDE(`per_second(cpu_usage)` * 1.0000E3,"
-                + " TIMESTAMPDIFF('MILLISECOND', `@timestamp`, TIMESTAMPADD('MINUTE', 1,"
+                + " PPL_TIMESTAMPDIFF('MILLISECOND', `@timestamp`, PPL_TIMESTAMPADD('MINUTE', 1,"
                 + " `@timestamp`))) `per_second(cpu_usage)`\n"
                 + "FROM (SELECT SPAN(`@timestamp`, 1, 'm') `@timestamp`, SUM(`cpu_usage`)"
                 + " `per_second(cpu_usage)`\n"
@@ -118,7 +118,7 @@ public class CalcitePPLTimechartTest extends CalcitePPLAbstractTest {
     withPPLQuery("source=events | timechart per_minute(cpu_usage)")
         .expectSparkSQL(
             "SELECT `@timestamp`, DIVIDE(`per_minute(cpu_usage)` * 6.00000E4,"
-                + " TIMESTAMPDIFF('MILLISECOND', `@timestamp`, TIMESTAMPADD('MINUTE', 1,"
+                + " PPL_TIMESTAMPDIFF('MILLISECOND', `@timestamp`, PPL_TIMESTAMPADD('MINUTE', 1,"
                 + " `@timestamp`))) `per_minute(cpu_usage)`\n"
                 + "FROM (SELECT SPAN(`@timestamp`, 1, 'm') `@timestamp`, SUM(`cpu_usage`)"
                 + " `per_minute(cpu_usage)`\n"
@@ -133,7 +133,7 @@ public class CalcitePPLTimechartTest extends CalcitePPLAbstractTest {
     withPPLQuery("source=events | timechart per_hour(cpu_usage)")
         .expectSparkSQL(
             "SELECT `@timestamp`, DIVIDE(`per_hour(cpu_usage)` * 3.6000000E6,"
-                + " TIMESTAMPDIFF('MILLISECOND', `@timestamp`, TIMESTAMPADD('MINUTE', 1,"
+                + " PPL_TIMESTAMPDIFF('MILLISECOND', `@timestamp`, PPL_TIMESTAMPADD('MINUTE', 1,"
                 + " `@timestamp`))) `per_hour(cpu_usage)`\n"
                 + "FROM (SELECT SPAN(`@timestamp`, 1, 'm') `@timestamp`, SUM(`cpu_usage`)"
                 + " `per_hour(cpu_usage)`\n"
@@ -148,7 +148,7 @@ public class CalcitePPLTimechartTest extends CalcitePPLAbstractTest {
     withPPLQuery("source=events | timechart per_day(cpu_usage)")
         .expectSparkSQL(
             "SELECT `@timestamp`, DIVIDE(`per_day(cpu_usage)` * 8.64E7,"
-                + " TIMESTAMPDIFF('MILLISECOND', `@timestamp`, TIMESTAMPADD('MINUTE', 1,"
+                + " PPL_TIMESTAMPDIFF('MILLISECOND', `@timestamp`, PPL_TIMESTAMPADD('MINUTE', 1,"
                 + " `@timestamp`))) `per_day(cpu_usage)`\n"
                 + "FROM (SELECT SPAN(`@timestamp`, 1, 'm') `@timestamp`, SUM(`cpu_usage`)"
                 + " `per_day(cpu_usage)`\n"

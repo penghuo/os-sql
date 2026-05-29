@@ -91,9 +91,9 @@ public class CalcitePPLMathFunctionTest extends CalcitePPLAbstractTest {
   public void testConv() {
     RelNode root = getRelNode("source=EMP | eval CONV = conv(10, 10, 2) | fields CONV");
     String expectedLogical =
-        "LogicalProject(CONV=[CONVERT(10, 10, 2)])\n  LogicalTableScan(table=[[scott, EMP]])\n";
+        "LogicalProject(CONV=[CONV(10, 10, 2)])\n  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
-    String expectedSparkSql = "SELECT CONVERT(10, 10, 2) `CONV`\nFROM `scott`.`EMP`";
+    String expectedSparkSql = "SELECT CONV(10, 10, 2) `CONV`\nFROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
 

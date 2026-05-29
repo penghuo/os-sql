@@ -771,14 +771,14 @@ public class CalcitePPLAggregationTest extends CalcitePPLAbstractTest {
     String expectedLogical =
         "LogicalAggregate(group=[{}], perc50(SAL)=[percentile_approx($0, $1, $2)],"
             + " p95(SAL)=[percentile_approx($0, $3, $2)])\n"
-            + "  LogicalProject(SAL=[$5], $f2=[50.0E0:DOUBLE], $f3=[FLAG(DECIMAL)],"
+            + "  LogicalProject(SAL=[$5], $f2=[50.0E0:DOUBLE], $f3=['DECIMAL'],"
             + " $f4=[95.0E0:DOUBLE])\n"
             + "    LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
-        "SELECT `percentile_approx`(`SAL`, 5.00E1, DECIMAL) `perc50(SAL)`,"
-            + " `percentile_approx`(`SAL`, 9.50E1, DECIMAL) `p95(SAL)`\n"
+        "SELECT `percentile_approx`(`SAL`, 5.00E1, 'DECIMAL') `perc50(SAL)`,"
+            + " `percentile_approx`(`SAL`, 9.50E1, 'DECIMAL') `p95(SAL)`\n"
             + "FROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
@@ -790,14 +790,14 @@ public class CalcitePPLAggregationTest extends CalcitePPLAbstractTest {
     String expectedLogical =
         "LogicalAggregate(group=[{}], perc25.5(SAL)=[percentile_approx($0, $1, $2)],"
             + " p99.9(SAL)=[percentile_approx($0, $3, $2)])\n"
-            + "  LogicalProject(SAL=[$5], $f2=[25.5E0:DOUBLE], $f3=[FLAG(DECIMAL)],"
+            + "  LogicalProject(SAL=[$5], $f2=[25.5E0:DOUBLE], $f3=['DECIMAL'],"
             + " $f4=[99.9E0:DOUBLE])\n"
             + "    LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
-        "SELECT `percentile_approx`(`SAL`, 2.55E1, DECIMAL) `perc25.5(SAL)`,"
-            + " `percentile_approx`(`SAL`, 9.99E1, DECIMAL) `p99.9(SAL)`\n"
+        "SELECT `percentile_approx`(`SAL`, 2.55E1, 'DECIMAL') `perc25.5(SAL)`,"
+            + " `percentile_approx`(`SAL`, 9.99E1, 'DECIMAL') `p99.9(SAL)`\n"
             + "FROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
@@ -810,12 +810,12 @@ public class CalcitePPLAggregationTest extends CalcitePPLAbstractTest {
         "LogicalProject(perc75(SAL)=[$1], DEPTNO=[$0])\n"
             + "  LogicalAggregate(group=[{0}], perc75(SAL)=[percentile_approx($1, $2, $3)])\n"
             + "    LogicalProject(DEPTNO=[$7], SAL=[$5], $f2=[75.0E0:DOUBLE],"
-            + " $f3=[FLAG(DECIMAL)])\n"
+            + " $f3=['DECIMAL'])\n"
             + "      LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
-        "SELECT `percentile_approx`(`SAL`, 7.50E1, DECIMAL) `perc75(SAL)`, `DEPTNO`\n"
+        "SELECT `percentile_approx`(`SAL`, 7.50E1, 'DECIMAL') `perc75(SAL)`, `DEPTNO`\n"
             + "FROM `scott`.`EMP`\n"
             + "GROUP BY `DEPTNO`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
@@ -828,14 +828,14 @@ public class CalcitePPLAggregationTest extends CalcitePPLAbstractTest {
     String expectedLogical =
         "LogicalAggregate(group=[{}], perc0(SAL)=[percentile_approx($0, $1, $2)],"
             + " p100(SAL)=[percentile_approx($0, $3, $2)])\n"
-            + "  LogicalProject(SAL=[$5], $f2=[0.0E0:DOUBLE], $f3=[FLAG(DECIMAL)],"
+            + "  LogicalProject(SAL=[$5], $f2=[0.0E0:DOUBLE], $f3=['DECIMAL'],"
             + " $f4=[100.0E0:DOUBLE])\n"
             + "    LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
-        "SELECT `percentile_approx`(`SAL`, 0E0, DECIMAL) `perc0(SAL)`,"
-            + " `percentile_approx`(`SAL`, 1.000E2, DECIMAL) `p100(SAL)`\n"
+        "SELECT `percentile_approx`(`SAL`, 0E0, 'DECIMAL') `perc0(SAL)`,"
+            + " `percentile_approx`(`SAL`, 1.000E2, 'DECIMAL') `p100(SAL)`\n"
             + "FROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
@@ -858,12 +858,12 @@ public class CalcitePPLAggregationTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
     String expectedLogical =
         "LogicalAggregate(group=[{}], median(SAL)=[percentile_approx($0, $1, $2)])\n"
-            + "  LogicalProject(SAL=[$5], $f1=[50.0:DECIMAL(3, 1)], $f2=[FLAG(DECIMAL)])\n"
+            + "  LogicalProject(SAL=[$5], $f1=[50.0:DECIMAL(3, 1)], $f2=['DECIMAL'])\n"
             + "    LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
     String expectedSparkSql =
-        "SELECT `percentile_approx`(`SAL`, 50.0, DECIMAL) `median(SAL)`\n" + "FROM `scott`.`EMP`";
+        "SELECT `percentile_approx`(`SAL`, 50.0, 'DECIMAL') `median(SAL)`\n" + "FROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
 

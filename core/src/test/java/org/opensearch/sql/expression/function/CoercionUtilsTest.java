@@ -19,7 +19,6 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT;
-import org.opensearch.sql.calcite.utils.PPLOperandTypes;
 
 class CoercionUtilsTest {
 
@@ -105,9 +104,12 @@ class CoercionUtilsTest {
         CoercionUtils.hasString(
             List.of(
                 nullLiteral(type(SqlTypeName.VARCHAR)), nullLiteral(type(SqlTypeName.INTEGER)))));
+    // IP UDT is now VARCHAR-tagged, so it counts as a character. Use BOOLEAN for a
+    // non-character UDT-free comparison.
     assertFalse(
         CoercionUtils.hasString(
-            List.of(nullLiteral(type(SqlTypeName.INTEGER)), nullLiteral(PPLOperandTypes.IP_UDT))));
+            List.of(
+                nullLiteral(type(SqlTypeName.INTEGER)), nullLiteral(type(SqlTypeName.BOOLEAN)))));
   }
 
   private static class StubTypeChecker implements PPLTypeChecker {

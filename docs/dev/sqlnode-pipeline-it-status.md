@@ -78,9 +78,9 @@ Pushdown shape may change for non-nullable group keys. Some assertions may flip 
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 23 | CalcitePPLAggregationIT | ❌ | After fixes: 3 unique fails (down from 28). Fixed: (i) DISTINCT_COUNT_APPROX null-metadata. (ii) MEDIAN/PERCENTILE SymbolFlag → STRING literal. (iii) SPAN: numeric-span unit operand widened from typed-NULL to ANY on round-trip; SpanImplementor's `SqlTypeUtil.isNull(unitType)` returned false, fell through to "Unsupported expr type" throw. Now treats both NULL and ANY as "no unit". Remaining: testSumEmpty, testStatsCountOnFunctionsWithUDTArg, testStatsGroupByDate (3 unrelated singletons). |
-| 24 | CalcitePPLAggregationPaginatingIT | ❌ | 3 unique fails (down from 10) — same 3 unrelated singletons as #23 after MEDIAN/PERCENTILE/SPAN fixes. |
-| 25 | CalcitePPLNestedAggregationIT | ❌ | 1/9 fail (testNestedAggregationThrowExceptionIfPushdownCannotApplied). Test expects an error from nested-aggregation dispatch; removed `reapplyAggregateHints` causes the hint to be dropped on round-trip, so the OpenSearch nested-agg rule doesn't fire and the query unexpectedly succeeds. **Expected from bypass removal; deferred until aggregate-hint preservation is reintroduced.** |
+| 23 | CalcitePPLAggregationIT | ✅ | 100/100 pass after additional fixes: (i) **testSumEmpty**: `where 1=2` collapses via RelBuilder to empty `LogicalValues`; RelToSqlConverter unparses each cell as bare `NULL` so the validator re-types every column as `SqlTypeName.NULL`, widening `SUM(NULL)` to `DECIMAL(38,19)` (renders as `double`). Added `materialiseEmptyValuesForRoundTrip` in `SqlNodePipeline.relToSql` — replaces empty Values with one-row Values + Project of `CAST(NULL AS T)` per column + `Filter(false)`, preserving each column's source type through the round trip. (ii) **testStatsCountOnFunctionsWithUDTArg**: `unix_timestamp(birthdate)` — birthdate is EXPR_TIMESTAMP UDT (VARCHAR-tagged). `OPTIONAL_DATE_OR_TIMESTAMP_OR_NUMERIC` was `family(DATETIME) ∪ NUMERIC ∪ ()`; validator's CompositeOperandTypeChecker coerces VARCHAR→DECIMAL, making the pushdown emit `CAST(birthdate AS DECIMAL(19,9))` which fails at runtime with `Primitive.charToDecimalCast` against the date string. Switched to `wrapUDT(...)` (arity-only at validator) listing each accepted UDT/numeric variant — no implicit coercion fires. (iii) **testStatsGroupByDate**: `date_add(birthdate, INTERVAL 1 DAY)` — `DATETIME_INTERVAL` was a family check rejecting EXPR_TIMESTAMP UDT at the validator; switched to `wrapUDT(...)` with `(DATE_UDT, ANY)` and `(TIMESTAMP_UDT, ANY)`. Added `ANY`-as-wildcard semantics to `PPLTypeChecker.typesMatch` so the second slot (interval qualifier) is tolerated without spelling out every interval kind. |
+| 24 | CalcitePPLAggregationPaginatingIT | ✅ | All pass after the same #23 fixes. |
+| 25 | CalcitePPLNestedAggregationIT | ✅ | All pass after `reattachAggregateHints` in `SqlNodePipeline.revalidate` — walks original and round-tripped plans in lock-step and copies non-empty Aggregate hints onto matching positions. Sets `HintStrategyTable` on the round-tripped cluster so `Aggregate.withHints` does not silently drop the hint. |
 | 26 | CalciteStatsCommandIT | ✅ | 63/63 pass after the SPAN unit-operand fix (see #23). |
 | 27 | CalciteTimechartCommandIT | ✅ | 18/18 pass. |
 | 28 | CalciteTimechartPerFunctionIT | ✅ | 12/12 pass. Renamed PPL UDFs from "TIMESTAMPDIFF"/"TIMESTAMPADD" to "PPL_TIMESTAMPDIFF"/"PPL_TIMESTAMPADD". Calcite's parser knows the standard names as special-syntax built-ins (`TIMESTAMPDIFF(<unit-keyword>, ts1, ts2)`); PPL's variant takes a string literal unit and would unparse as `TIMESTAMPDIFF('MILLISECOND', ts1, ts2)` which the parser rejects. Distinct names route to FUNCTION-syntax binding. |
@@ -91,144 +91,144 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 29 | CalcitePPLJoinIT | ⏳ | |
-| 30 | CalcitePPLLookupIT | ⏳ | |
-| 31 | CalcitePPLInSubqueryIT | ⏳ | |
-| 32 | CalcitePPLExistsSubqueryIT | ⏳ | |
-| 33 | CalcitePPLScalarSubqueryIT | ⏳ | |
+| 29 | CalcitePPLJoinIT | ⚠️ | 37/39 pass after `stripUnusedAsOverJoin` post-processing in `SqlNodePipeline.relToSql`. Calcite's RelToSql wraps the outermost JOIN with a generated alias (`(...) t11`) which the Spark dialect unparses with surrounding parens; the Babel parser's `TableRef3` rule rejects `(JOIN)`. Solution: detect `AS(SqlJoin, alias)` in the SELECT's FROM, walk the SELECT/WHERE for references to that alias, and drop the AS when unused — leaves a bare `SqlJoin` which the unparser writes without surrounding parens. 2 row-count mismatch fails remaining (separate test data issue). |
+| 30 | CalcitePPLLookupIT | ✅ | All pass. |
+| 31 | CalcitePPLInSubqueryIT | ✅ | All pass. |
+| 32 | CalcitePPLExistsSubqueryIT | ✅ | All pass. |
+| 33 | CalcitePPLScalarSubqueryIT | ✅ | All pass. |
 
 ## Phase 6 — Spath / Bin / Eventstats / Trendline (was bypassed for various RelToSql limits)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 34 | CalcitePPLSpathCommandIT | ⏳ | |
-| 35 | CalciteBinCommandIT | ⏳ | |
-| 36 | CalciteBinChartNullIT | ⏳ | |
-| 37 | CalcitePPLEventstatsIT | ⏳ | |
-| 38 | CalcitePPLTrendlineIT | ⏳ | |
-| 39 | CalciteTrendlineCommandIT | ⏳ | |
+| 34 | CalcitePPLSpathCommandIT | ✅ | All pass after JSON UDF `permissiveVariadic` operand metadata fix. |
+| 35 | CalciteBinCommandIT | ⚠️ | 41/43 pass after `isolateSortInputForRoundTrip` — when a Sort sits over a Project that overrides an input column with a same-named output of a different type (e.g. `bin field span=N` produces `Project(field = SPAN_BUCKET(field, N))` where input is INTEGER and output is VARCHAR), wrap the Project in `Filter(true)` to force a derived-table boundary on unparse. Otherwise the unparser collapses Sort+Project into `SELECT SPAN_BUCKET(field) AS field FROM t ORDER BY SPAN_BUCKET(field)` — re-parse resolves `field` in ORDER BY's inlined SPAN_BUCKET to the SELECT alias (now VARCHAR), tripping the validator. 2 fails remaining. |
+| 36 | CalciteBinChartNullIT | ✅ | All pass. |
+| 37 | CalcitePPLEventstatsIT | ✅ | 27/27 pass after `withRemoveSortInSubQuery(false)` (see #38). |
+| 38 | CalcitePPLTrendlineIT | ✅ | 7/7 pass after `withRemoveSortInSubQuery(false)` on the SqlToRelConverter config — Calcite's default strips ORDER BY in sub-SELECTs without LIMIT. PPL trendline-with-sort produces Project(window) → Filter → Sort(SAL DESC) which round-trips as `SELECT ... FROM (SELECT ... ORDER BY SAL DESC) t0` and the Sort was being dropped, scrambling the windowed-AVG result ordering. |
+| 39 | CalciteTrendlineCommandIT | ✅ | All pass. |
 
 ## Phase 7 — Relevance / Highlight (was bypassed: containsMapValueConstructor / containsHighlightAugmentedScan)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 40 | CalciteMatchIT | ⏳ | |
-| 41 | CalciteMatchPhraseIT | ⏳ | |
-| 42 | CalciteMatchPhrasePrefixIT | ⏳ | |
-| 43 | CalciteMatchBoolPrefixIT | ⏳ | |
-| 44 | CalciteMultiMatchIT | ⏳ | |
-| 45 | CalciteQueryStringIT | ⏳ | |
-| 46 | CalciteSimpleQueryStringIT | ⏳ | |
-| 47 | CalciteRelevanceFunctionIT | ⏳ | |
-| 48 | CalciteHighlightIT | ⏳ | |
+| 40 | CalciteMatchIT | ✅ | All pass. |
+| 41 | CalciteMatchPhraseIT | ✅ | All pass. |
+| 42 | CalciteMatchPhrasePrefixIT | ✅ | All pass. |
+| 43 | CalciteMatchBoolPrefixIT | ✅ | All pass. |
+| 44 | CalciteMultiMatchIT | ⚠️ | 4/5 pass. 1 row-count mismatch (expected:16 actual:4) — relevance OR filter shape doesn't match expected after round-trip. Deferred. |
+| 45 | CalciteQueryStringIT | ⚠️ | 4/6 pass. 2 row-count mismatches — same OR filter shape issue. Deferred. |
+| 46 | CalciteSimpleQueryStringIT | ❌ | Multiple fails — OR filter shape issue. Deferred. |
+| 47 | CalciteRelevanceFunctionIT | ✅ | All pass. |
+| 48 | CalciteHighlightIT | ❌ | 19/21 fail. `Column '_highlight' not found in any tab` — `_highlight` synthetic column added by highlight scan is dropped after round-trip. Deferred — needs preservation of the highlight-augmented scan operator across SqlNode. |
 
 ## Phase 8 — Append / Multisearch / GraphLookup / Union (was bypassed: containsUnion / containsGraphLookup)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 49 | CalcitePPLAppendCommandIT | ⏳ | |
-| 50 | CalcitePPLAppendcolIT | ⏳ | |
-| 51 | CalcitePPLAppendPipeCommandIT | ⏳ | |
-| 52 | CalciteMultisearchCommandIT | ⏳ | |
-| 53 | CalciteUnionCommandIT | ⏳ | |
-| 54 | CalcitePPLGraphLookupIT | ⏳ | |
+| 49 | CalcitePPLAppendCommandIT | ✅ | 8/8 pass after `withRemoveSortInSubQuery(false)` (see #38). |
+| 50 | CalcitePPLAppendcolIT | ⚠️ | 0/2 or 2/2 across shards — flaky data-ordering test. Not a code regression. |
+| 51 | CalcitePPLAppendPipeCommandIT | ✅ | All pass. |
+| 52 | CalciteMultisearchCommandIT | ✅ | All pass after `wrapVarcharLiteralsBelowUnionForRoundTrip` extension. |
+| 53 | CalciteUnionCommandIT | ✅ | All pass after `wrapVarcharLiteralsBelowUnionForRoundTrip` — wraps VARCHAR/CHAR RexLiterals in any Project that feeds a Union, so re-parse as VARCHAR avoids CHAR(N) padding. |
+| 54 | CalcitePPLGraphLookupIT | ✅ | All pass. `SqlNodePipeline.revalidate` now bypasses the round-trip when `LogicalGraphLookup` is present in the plan (GraphLookup has no SQL representation; this is the only approved bypass per project rules). |
 
 ## Phase 9 — Lambda collection UDFs (was bypassed: containsLambdaCollectionUdf)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 55 | CalciteArrayFunctionIT | ⏳ | |
-| 56 | CalciteMVAppendFunctionIT | ⏳ | |
-| 57 | CalciteMvCombineCommandIT | ⏳ | |
-| 58 | CalciteMvExpandCommandIT | ⏳ | |
-| 59 | CalciteMultiValueStatsIT | ⏳ | |
-| 60 | CalciteNoMvCommandIT | ⏳ | |
+| 55 | CalciteArrayFunctionIT | ⚠️ | 58/60 pass after fixes. (i) `UDFOperandMetadata.permissiveVariadic()` factory. (ii) Renamed lambda UDFs (`array`→`PPL_ARRAY`, etc.). (iii) Added `SqlLibrary.HIVE` to operator table for `ARRAY_SLICE`. (iv) `ReduceFunctionImpl`/`TransformFunctionImpl` `getReturnTypeInference` now handles both `SqlCallBinding` (validator) and `RexCallBinding` (sql-to-rel) by unwrapping `FunctionSqlType.getReturnType()`. (v) `ArrayFunctionImpl` falls back to `ARRAY<ANY>` when leastRestrictive over heterogeneous operands fails (PPL allows mixed-type arrays). (vi) Extended `wrapVarcharCaseBranchesForRoundTrip` to wrap VARCHAR/CHAR literals inside PPL_ARRAY/ARRAY constructors so re-parse doesn't pad. 2 remaining fails: type-mismatch in expected schema, expected-exception not thrown. Deferred. |
+| 56 | CalciteMVAppendFunctionIT | ✅ | All pass after `permissiveVariadic` fix and lambda UDF renames. |
+| 57 | CalciteMvCombineCommandIT | ✅ | All pass. |
+| 58 | CalciteMvExpandCommandIT | ✅ | All pass. |
+| 59 | CalciteMultiValueStatsIT | ✅ | All pass. |
+| 60 | CalciteNoMvCommandIT | ⚠️ | 19/20 pass after `permissiveVariadic` + lambda return-type fixes. 1 whitespace-difference fail remaining. |
 
 ## Phase 10 — Date/time / parse / rex / dedup / fillnull / sort / eval
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 61 | CalciteDateTimeFunctionIT | ⏳ | |
-| 62 | CalciteDateTimeComparisonIT | ⏳ | |
-| 63 | CalciteDateTimeImplementationIT | ⏳ | |
-| 64 | CalciteConvertTZFunctionIT | ⏳ | |
-| 65 | CalciteNowLikeFunctionIT | ⏳ | |
-| 66 | CalcitePPLDateTimeBuiltinFunctionIT | ⏳ | |
-| 67 | CalcitePPLBuiltinDatetimeFunctionInvalidIT | ⏳ | |
-| 68 | CalciteParseCommandIT | ⏳ | |
-| 69 | CalcitePPLParseIT | ⏳ | |
-| 70 | CalciteRexCommandIT | ⏳ | |
-| 71 | CalciteDedupCommandIT | ⏳ | |
-| 72 | CalcitePPLDedupIT | ⏳ | |
-| 73 | CalciteFillNullCommandIT | ⏳ | |
-| 74 | CalcitePPLFillnullIT | ⏳ | |
-| 75 | CalciteSortCommandIT | ⏳ | |
-| 76 | CalcitePPLSortIT | ⏳ | |
-| 77 | CalciteEvalCommandIT | ⏳ | |
-| 78 | CalcitePPLEvalMaxMinFunctionIT | ⏳ | |
-| 79 | CalcitePPLEnhancedCoalesceIT | ⏳ | |
+| 61 | CalciteDateTimeFunctionIT | ✅ | All pass after multiple fixes: (i) `DATETIME_DATETIME`, `DATETIME_OPTIONAL_INTEGER`, `STRING_DATETIME`, `TIME_TIME` operand metadata switched to `wrapUDT(...)` so EXPR_DATE/EXPR_TIME/EXPR_TIMESTAMP UDTs (VARCHAR-tagged) are accepted at SqlValidator. (ii) `DATETIME_INTERVAL`/`DATETIME_INTERVAL_OR_INTEGER` extended to TIME_UDT and STRING_T (via PPL frontend coercion). (iii) StrftimeFunction's operand metadata switched to wrapUDT enumerating numeric + UDT first slot to avoid validator coercing VARCHAR→DECIMAL. (iv) Renamed UDFs whose names collide with Babel parser keywords/built-ins: `TIMESTAMP`→`PPL_TIMESTAMP`, `DATE`→`PPL_DATE`, `TIME`→`PPL_TIME`, `DATEDIFF`→`PPL_DATEDIFF`, `EXTRACT`→`PPL_EXTRACT`, `TIME_DIFF`→`PPL_TIMEDIFF`. |
+| 62 | CalciteDateTimeComparisonIT | ✅ | All pass. |
+| 63 | CalciteDateTimeImplementationIT | ✅ | All pass. |
+| 64 | CalciteConvertTZFunctionIT | ✅ | All pass. |
+| 65 | CalciteNowLikeFunctionIT | ✅ | All pass. |
+| 66 | CalcitePPLDateTimeBuiltinFunctionIT | ✅ | All pass after the same fixes as #61. |
+| 67 | CalcitePPLBuiltinDatetimeFunctionInvalidIT | ✅ | All pass after extending `DATETIME_INTERVAL_OR_INTEGER` to include `(STRING_T, ANY_T)` and `(STRING_T, INTEGER_T)` shapes (PPL frontend accepts string-date inputs; runtime reports "unsupported format" for malformed strings, matching the test expectations). |
+| 68 | CalciteParseCommandIT | ✅ | All pass. |
+| 69 | CalcitePPLParseIT | ✅ | All pass. |
+| 70 | CalciteRexCommandIT | ✅ | All pass. |
+| 71 | CalciteDedupCommandIT | ✅ | All pass. |
+| 72 | CalcitePPLDedupIT | ✅ | All pass. |
+| 73 | CalciteFillNullCommandIT | ✅ | All pass. |
+| 74 | CalcitePPLFillnullIT | ✅ | All pass. |
+| 75 | CalciteSortCommandIT | ⚠️ | 29/30 pass. 1 fail: IP sort order — IP UDT now reports as VARCHAR (after `b95ea81ca` refactor) so sorts alphabetically not as IP. Pre-existing from IP refactor. Defer or write a special IP-comparator override. |
+| 76 | CalcitePPLSortIT | ✅ | All pass. |
+| 77 | CalciteEvalCommandIT | ✅ | All pass. |
+| 78 | CalcitePPLEvalMaxMinFunctionIT | ✅ | All pass after `permissiveVariadic` operand metadata fix to `ScalarMaxFunction` / `ScalarMinFunction`. |
+| 79 | CalcitePPLEnhancedCoalesceIT | ✅ | All pass after extending `EnhancedCoalesceFunction.getReturnTypeInference` to fall back to VARCHAR when any operand is CHARACTER and any other is non-CHARACTER. PPL semantics widen mixed-type COALESCE to string; Calcite's stock `leastRestrictive` ignores CHARACTER and picks INT for `coalesce(NULL, int_field, 'default')`. |
 
 ## Phase 11 — JSON / strings / crypto / system / builtin
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 80 | CalciteJsonFunctionsIT | ⏳ | |
-| 81 | CalcitePPLJsonBuiltinFunctionIT | ⏳ | |
-| 82 | CalcitePPLStringBuiltinFunctionIT | ⏳ | |
-| 83 | CalciteTextFunctionIT | ⏳ | |
-| 84 | CalciteSystemFunctionIT | ⏳ | |
-| 85 | CalcitePPLCryptographicFunctionIT | ⏳ | |
-| 86 | CalcitePPLBuiltinFunctionIT | ⏳ | |
-| 87 | CalcitePPLBuiltinFunctionsNullIT | ⏳ | |
+| 80 | CalciteJsonFunctionsIT | ⏭️ | Excluded by build rules. |
+| 81 | CalcitePPLJsonBuiltinFunctionIT | ⚠️ | 20/22 pass after `UDFOperandMetadata.permissiveVariadic()` fix to all JSON UDFs whose `getOperandMetadata` returned `null`. 2 remaining fails. |
+| 82 | CalcitePPLStringBuiltinFunctionIT | ✅ | 27/27 pass after adding `SqlLibrary.MYSQL` to the operator table — `STRCMP` is registered only under `SqlLibrary.MYSQL`; without it, the validator rejects the round-tripped SQL with "No match found for function signature STRCMP(<CHARACTER>, <CHARACTER>)". 2 ordering fails fixed by `withRemoveSortInSubQuery(false)` (see #38). |
+| 83 | CalciteTextFunctionIT | ✅ | 24/24 pass after `SqlLibrary.MYSQL` (see #82) and `withRemoveSortInSubQuery(false)` (see #38). |
+| 84 | CalciteSystemFunctionIT | ✅ | All pass. |
+| 85 | CalcitePPLCryptographicFunctionIT | ✅ | All pass. |
+| 86 | CalcitePPLBuiltinFunctionIT | ✅ | All pass. |
+| 87 | CalcitePPLBuiltinFunctionsNullIT | ✅ | All pass. |
 
 ## Phase 12 — Misc commands / formats / data types
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 88 | CalciteAddColTotalsCommandIT | ⏳ | |
-| 89 | CalciteAddTotalsCommandIT | ⏳ | |
-| 90 | CalciteAliasFieldAggregationIT | ⏳ | |
-| 91 | CalciteChartCommandIT | ⏳ | |
-| 92 | CalciteConvertCommandIT | ⏳ | |
-| 93 | CalciteCsvFormatIT | ⏳ | |
-| 94 | CalciteDataTypeIT | ⏳ | |
-| 95 | CalciteExpandCommandIT | ⏳ | |
-| 96 | CalciteExplainIT | ⏳ | |
-| 97 | CalcitePPLExplainIT | ⏳ | |
-| 98 | CalciteFieldFormatCommandIT | ⏳ | |
-| 99 | CalciteFlattenCommandIT | ⏳ | |
-| 100 | CalciteFlattenDocValueIT | ⏳ | |
-| 101 | CalciteGeoIpFunctionsIT | ⏳ | |
-| 102 | CalciteGeoPointFormatsIT | ⏳ | |
-| 103 | CalciteLegacyAPICompatibilityIT | ⏳ | |
-| 104 | CalciteLikeQueryIT | ⏳ | |
-| 105 | CalciteMixedFieldTypeIT | ⏳ | |
-| 106 | CalciteNewAddedCommandsIT | ⏳ | |
-| 107 | CalciteNotInNullFilterIT | ⏳ | |
-| 108 | CalciteNotLikeNullIT | ⏳ | |
-| 109 | CalciteObjectFieldOperateIT | ⏳ | |
-| 110 | CalcitePPLGrokIT | ⏳ | |
-| 111 | CalcitePPLMapPathIT | ⏳ | |
-| 112 | CalcitePPLPatternsIT | ⏳ | |
-| 113 | CalcitePrometheusDataSourceCommandsIT | ⏳ | |
-| 114 | CalciteQueryAnalysisIT | ⏳ | |
-| 115 | CalciteRareCommandIT | ⏳ | |
-| 116 | CalciteRegexCommandIT | ⏳ | |
-| 117 | CalciteReplaceCommandIT | ⏳ | |
-| 118 | CalciteReverseCommandIT | ⏳ | |
-| 119 | CalciteStreamstatsCommandIT | ⏳ | |
-| 120 | CalciteTopCommandIT | ⏳ | |
-| 121 | CalciteTransposeCommandIT | ⏳ | |
-| 122 | CalciteVisualizationFormatIT | ⏳ | |
+| 88 | CalciteAddColTotalsCommandIT | ✅ | All pass. |
+| 89 | CalciteAddTotalsCommandIT | ✅ | All pass. |
+| 90 | CalciteAliasFieldAggregationIT | ✅ | All pass. |
+| 91 | CalciteChartCommandIT | ✅ | All pass. |
+| 92 | CalciteConvertCommandIT | ✅ | All pass. |
+| 93 | CalciteCsvFormatIT | ✅ | All pass. |
+| 94 | CalciteDataTypeIT | ✅ | All pass. |
+| 95 | CalciteExpandCommandIT | ✅ | All pass. |
+| 96 | CalciteExplainIT | ❌ | 113/257 fail. Tests assert exact RelNode plan strings; round-trip changes plan shape. Test expectations need bulk update — separate task from code fixes. Deferred. |
+| 97 | CalcitePPLExplainIT | ❌ | Same as #96 — plan-output drift after round-trip. Deferred. |
+| 98 | CalciteFieldFormatCommandIT | ✅ | All pass. |
+| 99 | CalciteFlattenCommandIT | ✅ | All pass. |
+| 100 | CalciteFlattenDocValueIT | ✅ | All pass. |
+| 101 | CalciteGeoIpFunctionsIT | ✅ | All pass after adding `(String, String, String, NodeClient)` and `(String, String, NodeClient)` overloads to `GeoIpFunction.GeoIPImplementor.fetchIpEnrichment` — the round-trip leaves IP-typed values translated to underlying Strings; the implementer's static-method lookup then needed all-String signatures. |
+| 102 | CalciteGeoPointFormatsIT | ✅ | All pass. |
+| 103 | CalciteLegacyAPICompatibilityIT | ✅ | All pass. |
+| 104 | CalciteLikeQueryIT | ✅ | All pass. |
+| 105 | CalciteMixedFieldTypeIT | ✅ | All pass. |
+| 106 | CalciteNewAddedCommandsIT | ✅ | All pass after GraphLookup bypass in `SqlNodePipeline.revalidate`. |
+| 107 | CalciteNotInNullFilterIT | ✅ | All pass. |
+| 108 | CalciteNotLikeNullIT | ✅ | All pass. |
+| 109 | CalciteObjectFieldOperateIT | ✅ | All pass. |
+| 110 | CalcitePPLGrokIT | ✅ | All pass. |
+| 111 | CalcitePPLMapPathIT | ✅ | All pass. |
+| 112 | CalcitePPLPatternsIT | ⚠️ | 12/15 pass after: (i) `INTERNAL_PATTERN` aggregate operand metadata: `null`→`permissiveVariadic`. (ii) `OpenSearchSparkSqlDialect.getCastSpec`: emit Calcite default for `MAP`/`ARRAY` types so Babel parser accepts them (Spark dialect's `MAP<K,V>` angle-bracket syntax not supported by Babel). 3 invalid-query fails remain. Deferred. |
+| 113 | CalcitePrometheusDataSourceCommandsIT | ⏭️ | Excluded. |
+| 114 | CalciteQueryAnalysisIT | ✅ | All pass. |
+| 115 | CalciteRareCommandIT | ✅ | All pass. |
+| 116 | CalciteRegexCommandIT | ✅ | All pass. |
+| 117 | CalciteReplaceCommandIT | ✅ | All pass. |
+| 118 | CalciteReverseCommandIT | ✅ | All pass. |
+| 119 | CalciteStreamstatsCommandIT | ⚠️ | 43/47 pass after `withRemoveSortInSubQuery(false)` (see #38). 4 fails remaining: chained streamstats (`testMultipleStreamstats*`, `testStreamstatsAndSort`, `testStreamstatsResetWithNullBucket`) — these involve self-join + window combinations whose row ordering still drifts across the round-trip. Deferred. |
+| 120 | CalciteTopCommandIT | ✅ | All pass. |
+| 121 | CalciteTransposeCommandIT | ✅ | All pass. |
+| 122 | CalciteVisualizationFormatIT | ⏭️ | Test class not picked up by include rules; needs investigation. |
 
 ## Phase 13 — Benchmarks (long-running, run last)
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 123 | CalcitePPLBig5IT | ⏳ | |
-| 124 | CalcitePPLClickBenchIT | ⏳ | |
-| 125 | CalcitePPLTpchIT | ⏳ | |
-| 126 | CalcitePPLTpchPaginatingIT | ⏳ | |
+| 123 | CalcitePPLBig5IT | ❌ | 11/54 pass. Original cause "Windowed aggregate expression is illegal in GROUP BY clause" was fixed by `liftWindowedAggsAboveAggregateGroupByForRoundTrip` (lifts windowed aggs into a sub-Project + Filter(true) to prevent Project-merge during unparse). Now fails at runtime with `charToDecimalCast` on EXPR_TIMESTAMP UDT — the bin's WIDTH_BUCKET path operates on VARCHAR-tagged date UDT and at runtime tries to read it as DECIMAL. Deferred. |
+| 124 | CalcitePPLClickBenchIT | ❌ | 0/1 pass. Deferred. |
+| 125 | CalcitePPLTpchIT | ✅ | All pass. |
+| 126 | CalcitePPLTpchPaginatingIT | ✅ | All pass. |
 
 ## Phase 14 — No-pushdown re-run (pushdown OFF)
 

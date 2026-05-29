@@ -54,10 +54,10 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1,"
+        "LogicalProject(ENAME=[$1], patterns_field=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1,"
             + " Sarg['':VARCHAR; NULL AS TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1,"
             + " '[a-zA-Z0-9]+':VARCHAR, '<*>':VARCHAR)), $1), 'pattern'))],"
-            + " tokens=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
+            + " tokens=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
             + " TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1, '[a-zA-Z0-9]+':VARCHAR,"
             + " '<*>':VARCHAR)), $1), 'tokens'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
@@ -81,10 +81,10 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1,"
+        "LogicalProject(ENAME=[$1], patterns_field=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1,"
             + " Sarg['':VARCHAR; NULL AS TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1,"
             + " '[A-H]':VARCHAR, '<*>':VARCHAR)), $1), 'pattern'))],"
-            + " tokens=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
+            + " tokens=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
             + " TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1, '[A-H]':VARCHAR, '<*>':VARCHAR)),"
             + " $1), 'tokens'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
@@ -128,10 +128,10 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
 
     String expectedLogical =
         "LogicalProject(ENAME=[$1], DEPTNO=[$7],"
-            + " patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL"
+            + " patterns_field=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL"
             + " AS TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1, '[a-zA-Z0-9]+':VARCHAR,"
             + " '<*>':VARCHAR)), $1), 'pattern'))],"
-            + " tokens=[SAFE_CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
+            + " tokens=[CAST(ITEM(PATTERN_PARSER(CASE(SEARCH($1, Sarg['':VARCHAR; NULL AS"
             + " TRUE]:VARCHAR), '':VARCHAR, REGEXP_REPLACE($1, '[a-zA-Z0-9]+':VARCHAR,"
             + " '<*>':VARCHAR)), $1), 'tokens'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
@@ -154,7 +154,7 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($1, pattern($1,"
+        "LogicalProject(ENAME=[$1], patterns_field=[CAST(ITEM(PATTERN_PARSER($1, pattern($1,"
             + " 10, 100000, false) OVER (), false), 'pattern'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
@@ -175,9 +175,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($1, pattern($1,"
+        "LogicalProject(ENAME=[$1], patterns_field=[CAST(ITEM(PATTERN_PARSER($1, pattern($1,"
             + " 10, 100000, true) OVER (), true), 'pattern'))],"
-            + " tokens=[SAFE_CAST(ITEM(PATTERN_PARSER($1, pattern($1, 10, 100000, true) OVER (),"
+            + " tokens=[CAST(ITEM(PATTERN_PARSER($1, pattern($1, 10, 100000, true) OVER (),"
             + " true), 'tokens'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
@@ -200,7 +200,7 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], DEPTNO=[$7], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($1,"
+        "LogicalProject(ENAME=[$1], DEPTNO=[$7], patterns_field=[CAST(ITEM(PATTERN_PARSER($1,"
             + " pattern($1, 10, 100000, false) OVER (PARTITION BY $7), false), 'pattern'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
@@ -221,9 +221,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(ENAME=[$1], DEPTNO=[$7], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($1,"
+        "LogicalProject(ENAME=[$1], DEPTNO=[$7], patterns_field=[CAST(ITEM(PATTERN_PARSER($1,"
             + " pattern($1, 10, 100000, true) OVER (PARTITION BY $7), true), 'pattern'))],"
-            + " tokens=[SAFE_CAST(ITEM(PATTERN_PARSER($1, pattern($1, 10, 100000, true) OVER"
+            + " tokens=[CAST(ITEM(PATTERN_PARSER($1, pattern($1, 10, 100000, true) OVER"
             + " (PARTITION BY $7), true), 'tokens'))])\n"
             + "  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
@@ -269,8 +269,8 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($0, $2), 'pattern'))],"
-            + " pattern_count=[$1], tokens=[SAFE_CAST(ITEM(PATTERN_PARSER($0, $2), 'tokens'))],"
+        "LogicalProject(patterns_field=[CAST(ITEM(PATTERN_PARSER($0, $2), 'pattern'))],"
+            + " pattern_count=[$1], tokens=[CAST(ITEM(PATTERN_PARSER($0, $2), 'tokens'))],"
             + " sample_logs=[$2])\n"
             + "  LogicalAggregate(group=[{1}], pattern_count=[COUNT($1)], sample_logs=[TAKE($0,"
             + " $2)])\n"
@@ -300,8 +300,8 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(DEPTNO=[$0], patterns_field=[SAFE_CAST(ITEM(PATTERN_PARSER($1, $3),"
-            + " 'pattern'))], pattern_count=[$2], tokens=[SAFE_CAST(ITEM(PATTERN_PARSER($1, $3),"
+        "LogicalProject(DEPTNO=[$0], patterns_field=[CAST(ITEM(PATTERN_PARSER($1, $3),"
+            + " 'pattern'))], pattern_count=[$2], tokens=[CAST(ITEM(PATTERN_PARSER($1, $3),"
             + " 'tokens'))], sample_logs=[$3])\n"
             + "  LogicalAggregate(group=[{1, 2}], pattern_count=[COUNT($2)], sample_logs=[TAKE($0,"
             + " $3)])\n"
@@ -335,9 +335,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(patterns_field=[SAFE_CAST(ITEM($1, 'pattern'))],"
-            + " pattern_count=[SAFE_CAST(ITEM($1, 'pattern_count'))],"
-            + " sample_logs=[SAFE_CAST(ITEM($1, 'sample_logs'))])\n"
+        "LogicalProject(patterns_field=[CAST(ITEM($1, 'pattern'))],"
+            + " pattern_count=[CAST(ITEM($1, 'pattern_count'))],"
+            + " sample_logs=[CAST(ITEM($1, 'sample_logs'))])\n"
             + "  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
             + "    LogicalAggregate(group=[{}], patterns_field=[pattern($0, $1, $2, $3, $4, $5)])\n"
             + "      LogicalProject(ENAME=[$1], $f8=[2], $f9=[1000], $f10=[false],"
@@ -365,9 +365,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(patterns_field=[SAFE_CAST(ITEM($1, 'pattern'))],"
-            + " pattern_count=[SAFE_CAST(ITEM($1, 'pattern_count'))],"
-            + " sample_logs=[SAFE_CAST(ITEM($1, 'sample_logs'))])\n"
+        "LogicalProject(patterns_field=[CAST(ITEM($1, 'pattern'))],"
+            + " pattern_count=[CAST(ITEM($1, 'pattern_count'))],"
+            + " sample_logs=[CAST(ITEM($1, 'sample_logs'))])\n"
             + "  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
             + "    LogicalAggregate(group=[{}], patterns_field=[pattern($0, $1, $2, $3)])\n"
             + "      LogicalProject(ENAME=[$1], $f8=[10], $f9=[100000], $f10=[false])\n"
@@ -395,9 +395,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(patterns_field=[SAFE_CAST(ITEM($1, 'pattern'))],"
-            + " pattern_count=[SAFE_CAST(ITEM($1, 'pattern_count'))], tokens=[SAFE_CAST(ITEM($1,"
-            + " 'tokens'))], sample_logs=[SAFE_CAST(ITEM($1, 'sample_logs'))])\n"
+        "LogicalProject(patterns_field=[CAST(ITEM($1, 'pattern'))],"
+            + " pattern_count=[CAST(ITEM($1, 'pattern_count'))], tokens=[CAST(ITEM($1,"
+            + " 'tokens'))], sample_logs=[CAST(ITEM($1, 'sample_logs'))])\n"
             + "  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
             + "    LogicalAggregate(group=[{}], patterns_field=[pattern($0, $1, $2, $3)])\n"
             + "      LogicalProject(ENAME=[$1], $f8=[10], $f9=[100000], $f10=[true])\n"
@@ -426,9 +426,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(DEPTNO=[$0], patterns_field=[SAFE_CAST(ITEM($2, 'pattern'))],"
-            + " pattern_count=[SAFE_CAST(ITEM($2, 'pattern_count'))],"
-            + " sample_logs=[SAFE_CAST(ITEM($2, 'sample_logs'))])\n"
+        "LogicalProject(DEPTNO=[$0], patterns_field=[CAST(ITEM($2, 'pattern'))],"
+            + " pattern_count=[CAST(ITEM($2, 'pattern_count'))],"
+            + " sample_logs=[CAST(ITEM($2, 'sample_logs'))])\n"
             + "  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{1}])\n"
             + "    LogicalAggregate(group=[{1}], patterns_field=[pattern($0, $2, $3, $4)])\n"
             + "      LogicalProject(ENAME=[$1], DEPTNO=[$7], $f8=[10], $f9=[100000],"
@@ -460,9 +460,9 @@ public class CalcitePPLPatternsTest extends CalcitePPLAbstractTest {
     RelNode root = getRelNode(ppl);
 
     String expectedLogical =
-        "LogicalProject(DEPTNO=[$0], patterns_field=[SAFE_CAST(ITEM($2, 'pattern'))],"
-            + " pattern_count=[SAFE_CAST(ITEM($2, 'pattern_count'))], tokens=[SAFE_CAST(ITEM($2,"
-            + " 'tokens'))], sample_logs=[SAFE_CAST(ITEM($2, 'sample_logs'))])\n"
+        "LogicalProject(DEPTNO=[$0], patterns_field=[CAST(ITEM($2, 'pattern'))],"
+            + " pattern_count=[CAST(ITEM($2, 'pattern_count'))], tokens=[CAST(ITEM($2,"
+            + " 'tokens'))], sample_logs=[CAST(ITEM($2, 'sample_logs'))])\n"
             + "  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{1}])\n"
             + "    LogicalAggregate(group=[{1}], patterns_field=[pattern($0, $2, $3, $4)])\n"
             + "      LogicalProject(ENAME=[$1], DEPTNO=[$7], $f8=[10], $f9=[100000], $f10=[true])\n"

@@ -20,10 +20,10 @@ public class CalcitePPLDateTimeFunctionTest extends CalcitePPLAbstractTest {
     String ppl = "source=EMP | eval added = DATE(CURRENT_TIMESTAMP()) | fields added";
     RelNode root = getRelNode(ppl);
     String expectedLogical =
-        "LogicalProject(added=[DATE(NOW())])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
+        "LogicalProject(added=[PPL_DATE(NOW())])\n" + "  LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
 
-    String expectedSparkSql = "SELECT DATE(NOW()) `added`\nFROM `scott`.`EMP`";
+    String expectedSparkSql = "SELECT PPL_DATE(NOW()) `added`\nFROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
 

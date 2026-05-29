@@ -51,6 +51,7 @@ import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
+import org.opensearch.sql.ast.tree.Regex;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Rename;
 import org.opensearch.sql.ast.tree.Replace;
@@ -681,6 +682,25 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitRegex(Regex node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `regex field = "pattern"` / `regex field != "pattern"` filters rows where the field
+    // matches (or doesn't match) the regex. Pattern cast to VARCHAR explicitly to match v2's
+    // REGEXP_CONTAINS($0, 'pat':VARCHAR) emission shape.
+    SqlNode field = expr(node.getField());
+    SqlNode pattern = castStringToVarchar(node.getPattern().getValue().toString());
+    SqlNode call =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_CONTAINS,
+            List.of(field, pattern),
+            POS);
+    if (node.isNegated()) {
+      call = new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(call), POS);
+    }
+    return SqlBuilder.select(starList()).from(from).where(call).wrap(frame);
   }
 
   @Override

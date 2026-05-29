@@ -3542,6 +3542,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * synonyms (recorded by {@code visitSubqueryAlias} chain collapse or {@code applyExplicitAlias}
    * displacement) so a downstream {@code | fields tt.col} on a `[Y as tt] right=t2` join still
    * resolves under {@code t2.col} for the validator.
+   *
+   * <p>Each part is constructed with a quoted parser position so the validator's {@code
+   * makeNullaryCall} doesn't shadow it with a niladic system function (e.g. unquoted {@code user} →
+   * {@code CURRENT_USER}, unquoted {@code session_user} → {@code SESSION_USER}). Mirrors the legacy
+   * SqlNode visitor's QPOS treatment of column references.
    */
   private SqlIdentifier toIdentifier(String name) {
     List<String> parts = name.indexOf('.') < 0 ? List.of(name) : Arrays.asList(name.split("\\."));
@@ -3551,9 +3556,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         && exprFrame.aliasSynonyms.containsKey(parts.get(0))) {
       List<String> rewritten = new ArrayList<>(parts);
       rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
-      return new SqlIdentifier(rewritten, POS);
+      return quotedIdentifier(rewritten);
     }
-    return new SqlIdentifier(parts, POS);
+    return quotedIdentifier(parts);
+  }
+
+  private static final SqlParserPos QPOS = SqlParserPos.ZERO.withQuoting(true);
+
+  private static SqlIdentifier quotedIdentifier(List<String> parts) {
+    List<SqlParserPos> positions = new ArrayList<>(parts.size());
+    for (int i = 0; i < parts.size(); i++) {
+      positions.add(QPOS);
+    }
+    return new SqlIdentifier(parts, null, POS, positions);
   }
 
   /**

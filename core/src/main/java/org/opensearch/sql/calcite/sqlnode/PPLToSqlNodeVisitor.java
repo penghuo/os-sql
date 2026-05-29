@@ -425,6 +425,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNodeList items = new SqlNodeList(POS);
     items.add(SqlIdentifier.star(POS));
     Set<String> aliasesInThisSelect = new LinkedHashSet<>();
+    boolean wrappedMidEval = false;
     for (Let let : node.getExpressionList()) {
       String alias = let.getVar().getField().toString();
       // If this let's RHS references an alias introduced earlier in this same eval, the previous
@@ -434,6 +435,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         items = new SqlNodeList(POS);
         items.add(SqlIdentifier.star(POS));
         aliasesInThisSelect = new LinkedHashSet<>();
+        wrappedMidEval = true;
       }
       SqlNode rhs = expr(let.getExpression());
       // Calcite types string literals as CHAR(N) where N is the literal length. When two branches
@@ -498,8 +500,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // a JOIN ...)` which seals join aliases inside the FROM subquery, breaking subsequent pipes
     // that reference `a.col`. The `<child>` SELECT keeps its FROM scope live so `a.col` in our
     // appended `e_i` items resolves.
-    SqlNode peep = appendEvalToChildSelectStar(from, items, visible, frame);
-    if (peep != null) return peep;
+    //
+    // Skip the peephole when the eval forced a mid-eval wrap (because a later let references an
+    // earlier alias). The `from` we just built is the wrapped child; if we append our remaining
+    // items to its select list, we end up with `SELECT *, prev_alias AS x, x AS y FROM ...` —
+    // SQL doesn't let SELECT-list aliases reference each other within the same SELECT.
+    if (!wrappedMidEval) {
+      SqlNode peep = appendEvalToChildSelectStar(from, items, visible, frame);
+      if (peep != null) return peep;
+    }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 

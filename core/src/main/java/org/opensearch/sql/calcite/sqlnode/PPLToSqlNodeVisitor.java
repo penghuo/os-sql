@@ -3110,6 +3110,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               SqlStdOperatorTable.IS_NOT_NULL;
           case "like" -> SqlStdOperatorTable.LIKE;
           case "not_like", "not like" -> SqlStdOperatorTable.NOT_LIKE;
+          case "ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
+          case "not_ilike", "not ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.NOT_ILIKE;
           // Standard SQL conditional functions: COALESCE / NULLIF. PPL's funcExpr unresolved-
           // function path can't always resolve them via case-sensitive validator lookup;
           // dispatch directly.
@@ -3228,6 +3230,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           SqlStdOperatorTable.OR,
           List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
           POS);
+    }
+    // PPL `Like(field, pattern [, caseSensitive])` — wrap with an ESCAPE clause so that PPL
+    // queries can use `\%` / `\_` to match literal `%` / `_`. The 3-arg form picks LIKE vs
+    // ILIKE from the boolean third arg; the 2-arg form is case-sensitive by default.
+    // (ILike(...) flows through the simple opOverride mapping; this branch only handles the
+    // explicit-Like name.)
+    if ("like".equals(name) && (args.size() == 2 || args.size() == 3)) {
+      SqlNode escape = SqlLiteral.createCharString("\\", POS);
+      org.apache.calcite.sql.SqlOperator likeOp = SqlStdOperatorTable.LIKE;
+      if (args.size() == 3
+          && args.get(2) instanceof SqlLiteral lit
+          && Boolean.FALSE.equals(lit.getValue())) {
+        likeOp = org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
+      }
+      return new SqlBasicCall(likeOp, List.of(args.get(0), args.get(1), escape), POS);
     }
     // atan: 1-arg → ATAN, 2-arg → ATAN2 (PPL allows both arities under the same name).
     if ("atan".equals(name)) {

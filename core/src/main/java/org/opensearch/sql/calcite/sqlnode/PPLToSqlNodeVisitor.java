@@ -4992,12 +4992,100 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (args.size() == 3) swapped.add(args.get(2));
       return new SqlBasicCall(org.apache.calcite.sql.fun.SqlLibraryOperators.INSTR, swapped, POS);
     }
+    // PPL `split(str, delim)` returns each character as a separate element when delim is empty.
+    // Calcite's std SPLIT(str, '') returns a single-element array with the whole string. Mirror
+    // PPLFuncImpTable: `CASE WHEN delim='' THEN REGEXP_EXTRACT_ALL(str, '.') ELSE SPLIT(str,
+    // delim)`.
+    if ("split".equals(name) && args.size() == 2) {
+      SqlNode str = args.get(0);
+      SqlNode delim = args.get(1);
+      SqlNode emptyLit = SqlLiteral.createCharString("", POS);
+      SqlNode isEmpty = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(delim, emptyLit), POS);
+      SqlNode anyChar = SqlLiteral.createCharString(".", POS);
+      SqlNode regexExtract =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_EXTRACT_ALL,
+              List.of(str, anyChar),
+              POS);
+      SqlNode split =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SPLIT, List.of(str, delim), POS);
+      SqlNodeList whens = new SqlNodeList(POS);
+      whens.add(isEmpty);
+      SqlNodeList thens = new SqlNodeList(POS);
+      thens.add(regexExtract);
+      return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, split);
+    }
+    // PPL `mvindex(array, index [, end])` — Calcite has no direct 3-arg counterpart. Map the
+    // 2-arg form to ITEM with PPL's 0-based / negative-from-end index normalisation, and the
+    // 3-arg form to ARRAY_SLICE(array, normStart+1, len).
+    if ("mvindex".equals(name) && (args.size() == 2 || args.size() == 3)) {
+      SqlNode arr = args.get(0);
+      SqlNode arrLen =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_LENGTH, List.of(arr), POS);
+      org.apache.calcite.sql.SqlDataTypeSpec intSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.INTEGER, POS),
+              POS);
+      SqlNode startIdx =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(args.get(1), intSpec),
+              POS);
+      SqlNode zero = SqlLiteral.createExactNumeric("0", POS);
+      SqlNode one = SqlLiteral.createExactNumeric("1", POS);
+      if (args.size() == 2) {
+        SqlNode isNeg =
+            new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(startIdx, zero), POS);
+        SqlNode lenPlusIdx =
+            new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, startIdx), POS);
+        SqlNode negCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(lenPlusIdx, one), POS);
+        SqlNode posCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(startIdx, one), POS);
+        SqlNodeList caseWhens = new SqlNodeList(POS);
+        caseWhens.add(isNeg);
+        SqlNodeList caseThens = new SqlNodeList(POS);
+        caseThens.add(negCase);
+        SqlNode norm =
+            new org.apache.calcite.sql.fun.SqlCase(POS, null, caseWhens, caseThens, posCase);
+        return new SqlBasicCall(SqlStdOperatorTable.ITEM, List.of(arr, norm), POS);
+      }
+      SqlNode endIdx =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(args.get(2), intSpec),
+              POS);
+      SqlNode startNeg =
+          new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(startIdx, zero), POS);
+      SqlNode startNegCase =
+          new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, startIdx), POS);
+      SqlNodeList sw = new SqlNodeList(POS);
+      sw.add(startNeg);
+      SqlNodeList st = new SqlNodeList(POS);
+      st.add(startNegCase);
+      SqlNode normStart = new org.apache.calcite.sql.fun.SqlCase(POS, null, sw, st, startIdx);
+      SqlNode endNeg = new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(endIdx, zero), POS);
+      SqlNode endNegCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, endIdx), POS);
+      SqlNodeList ew = new SqlNodeList(POS);
+      ew.add(endNeg);
+      SqlNodeList et = new SqlNodeList(POS);
+      et.add(endNegCase);
+      SqlNode normEnd = new org.apache.calcite.sql.fun.SqlCase(POS, null, ew, et, endIdx);
+      SqlNode diff = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(normEnd, normStart), POS);
+      SqlNode len = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(diff, one), POS);
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_SLICE,
+          List.of(arr, normStart, len),
+          POS);
+    }
     if (opOverride != null) {
       return new SqlBasicCall(opOverride, args, POS);
     }
+    String resolvedName = mapPplFunctionName(name, fn.getFuncName());
     return new SqlBasicCall(
         new org.apache.calcite.sql.SqlUnresolvedFunction(
-            new SqlIdentifier(fn.getFuncName(), POS),
+            new SqlIdentifier(resolvedName, POS),
             null,
             null,
             null,
@@ -5005,6 +5093,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
         args,
         POS);
+  }
+
+  /**
+   * PPL function names whose validator-resolved Calcite operator name differs from the PPL source
+   * token. Mirrors PPLFuncImpTable's name-to-operator registrations: when no entry exists, the
+   * original name is returned unchanged so the validator looks up by PPL-form name.
+   */
+  private static String mapPplFunctionName(String lower, String original) {
+    return switch (lower) {
+      case "mvjoin" -> "ARRAY_JOIN";
+      case "mvcount" -> "ARRAY_LENGTH";
+      case "mvsort" -> "SORT_ARRAY";
+      case "mvdedup" -> "ARRAY_DISTINCT";
+      case "mvcontains" -> "ARRAY_CONTAINS";
+      case "mvslice" -> "ARRAY_SLICE";
+      // mvmap binds to PPLBuiltinOperators.TRANSFORM via PPLFuncImpTable.
+      case "mvmap" -> "transform";
+      case "ifnull" -> "COALESCE";
+      case "json_valid" -> "IS_JSON_VALUE";
+      default -> original;
+    };
   }
 
   /**

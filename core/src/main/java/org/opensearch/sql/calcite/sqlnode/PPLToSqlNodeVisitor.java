@@ -839,19 +839,6 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (sb.getAligntime() != null) {
       throw new UnsupportedOperationException("bin aligntime not yet supported");
     }
-    // Numeric span (e.g. `span=10`) → SPAN_BUCKET(field, n). Time/log span variants need a
-    // row-type oracle and are deferred. Reject anything that isn't a numeric literal so we don't
-    // silently emit broken SQL.
-    if (!(spanExpr instanceof Literal lit)
-        || !(lit.getType() == DataType.INTEGER
-            || lit.getType() == DataType.LONG
-            || lit.getType() == DataType.SHORT
-            || lit.getType() == DataType.DOUBLE
-            || lit.getType() == DataType.FLOAT
-            || lit.getType() == DataType.DECIMAL)) {
-      throw new UnsupportedOperationException(
-          "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
-    }
     UnresolvedExpression rawFieldExpr = sb.getField();
     if (rawFieldExpr instanceof Field f) {
       rawFieldExpr = f.getField();
@@ -860,11 +847,39 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         (rawFieldExpr instanceof QualifiedName qn) ? qn.toString() : rawFieldExpr.toString();
     String alias = sb.getAlias() != null ? sb.getAlias() : fieldName;
     SqlNode fieldRef = expr(sb.getField());
-    SqlNode bucketCall =
-        new SqlBasicCall(
-            org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN_BUCKET,
-            List.of(fieldRef, expr(spanExpr)),
-            POS);
+    SqlNode bucketCall;
+    boolean numericSpan =
+        spanExpr instanceof Literal lit
+            && (lit.getType() == DataType.INTEGER
+                || lit.getType() == DataType.LONG
+                || lit.getType() == DataType.SHORT
+                || lit.getType() == DataType.DOUBLE
+                || lit.getType() == DataType.FLOAT
+                || lit.getType() == DataType.DECIMAL);
+    if (numericSpan) {
+      // `span=10` → SPAN_BUCKET(field, n).
+      bucketCall =
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN_BUCKET,
+              List.of(fieldRef, expr(spanExpr)),
+              POS);
+    } else if (spanExpr instanceof Literal stringLit
+        && stringLit.getType() == DataType.STRING
+        && stringLit.getValue() != null) {
+      // Time span like "1d", "4h", "45minute". Parse into <intValue><unit> and dispatch to
+      // SPAN(field, value, unit). The SPAN UDF detects the field type at runtime.
+      SqlNode timeSpan = tryTimeSpanCall(fieldRef, stringLit.getValue().toString());
+      if (timeSpan == null) {
+        throw new UnsupportedOperationException(
+            "bin span variant "
+                + stringLit.getValue()
+                + " not yet supported in PPLToSqlNodeVisitor");
+      }
+      bucketCall = timeSpan;
+    } else {
+      throw new UnsupportedOperationException(
+          "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
+    }
     // Project: emit non-bin columns in original order, then append the bin column at the end
     // (mirrors v2's emission shape). Without a row-type oracle, walk frame.currentFields.
     if (frame.currentFields == null) {
@@ -1597,6 +1612,69 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     items.add(asAliased(sum, alias));
     visible.add(alias);
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * Parse a time-span literal like {@code "1d"}, {@code "4h"}, {@code "45minute"} into a {@link
+   * SqlBasicCall} on the SPAN UDF. Returns null when the literal isn't a recognised time-span. Unit
+   * aliases match Rounding.DateTimeUnit (the OpenSearch pushdown's runtime resolver):
+   *
+   * <ul>
+   *   <li>ms / millisecond / milliseconds
+   *   <li>s / sec / second / seconds
+   *   <li>m / min / minute / minutes (lowercase \"m\" → minute; uppercase \"M\" → month)
+   *   <li>h / hr / hour / hours
+   *   <li>d / day / days
+   *   <li>w / week / weeks
+   *   <li>mon / month / months / "M"
+   *   <li>q / quarter / quarters
+   *   <li>y / yr / year / years
+   * </ul>
+   */
+  private SqlNode tryTimeSpanCall(SqlNode fieldRef, String spanStr) {
+    spanStr = spanStr.replace("'", "").replace("\"", "").trim();
+    int splitAt = -1;
+    for (int i = 0; i < spanStr.length(); i++) {
+      if (!Character.isDigit(spanStr.charAt(i))) {
+        splitAt = i;
+        break;
+      }
+    }
+    if (splitAt <= 0) return null;
+    int value;
+    try {
+      value = Integer.parseInt(spanStr.substring(0, splitAt));
+    } catch (NumberFormatException ignored) {
+      return null;
+    }
+    String rawUnitOriginal = spanStr.substring(splitAt);
+    String rawUnit = rawUnitOriginal.toLowerCase(java.util.Locale.ROOT);
+    String unit;
+    if ("M".equals(rawUnitOriginal)) {
+      unit = "M";
+    } else {
+      unit =
+          switch (rawUnit) {
+            case "ms", "millisecond", "milliseconds" -> "ms";
+            case "s", "sec", "secs", "second", "seconds" -> "s";
+            case "m", "min", "mins", "minute", "minutes" -> "m";
+            case "h", "hr", "hrs", "hour", "hours" -> "h";
+            case "d", "day", "days" -> "d";
+            case "w", "week", "weeks" -> "w";
+            case "mon", "month", "months" -> "M";
+            case "q", "quarter", "quarters" -> "q";
+            case "y", "yr", "year", "years" -> "y";
+            default -> null;
+          };
+    }
+    if (unit == null) return null;
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
+        List.of(
+            fieldRef,
+            SqlLiteral.createExactNumeric(Integer.toString(value), POS),
+            SqlLiteral.createCharString(unit, POS)),
+        POS);
   }
 
   private static boolean getBoolOption(

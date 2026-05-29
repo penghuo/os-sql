@@ -42,6 +42,7 @@ import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Bin;
 import org.opensearch.sql.ast.tree.Chart;
 import org.opensearch.sql.ast.tree.Convert;
 import org.opensearch.sql.ast.tree.Dedupe;
@@ -63,6 +64,7 @@ import org.opensearch.sql.ast.tree.Reverse;
 import org.opensearch.sql.ast.tree.Rex;
 import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.Sort;
+import org.opensearch.sql.ast.tree.SpanBin;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -800,6 +802,61 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         .from(from)
         .withFields(new ArrayList<>(frame.currentFields))
         .wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitBin(Bin node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (!(node instanceof SpanBin sb)) {
+      throw new UnsupportedOperationException(
+          "bin command subtype " + node.getClass().getSimpleName() + " not yet supported");
+    }
+    UnresolvedExpression spanExpr = sb.getSpan();
+    if (sb.getAligntime() != null) {
+      throw new UnsupportedOperationException("bin aligntime not yet supported");
+    }
+    // Numeric span (e.g. `span=10`) → SPAN_BUCKET(field, n). Time/log span variants need a
+    // row-type oracle and are deferred. Reject anything that isn't a numeric literal so we don't
+    // silently emit broken SQL.
+    if (!(spanExpr instanceof Literal lit)
+        || !(lit.getType() == DataType.INTEGER
+            || lit.getType() == DataType.LONG
+            || lit.getType() == DataType.SHORT
+            || lit.getType() == DataType.DOUBLE
+            || lit.getType() == DataType.FLOAT
+            || lit.getType() == DataType.DECIMAL)) {
+      throw new UnsupportedOperationException(
+          "bin span variant " + spanExpr + " not yet supported in PPLToSqlNodeVisitor");
+    }
+    UnresolvedExpression rawFieldExpr = sb.getField();
+    if (rawFieldExpr instanceof Field f) {
+      rawFieldExpr = f.getField();
+    }
+    String fieldName =
+        (rawFieldExpr instanceof QualifiedName qn) ? qn.toString() : rawFieldExpr.toString();
+    String alias = sb.getAlias() != null ? sb.getAlias() : fieldName;
+    SqlNode fieldRef = expr(sb.getField());
+    SqlNode bucketCall =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN_BUCKET,
+            List.of(fieldRef, expr(spanExpr)),
+            POS);
+    // Project: emit non-bin columns in original order, then append the bin column at the end
+    // (mirrors v2's emission shape). Without a row-type oracle, walk frame.currentFields.
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "bin requires a known column list — call after a `| fields ...` pipe");
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : frame.currentFields) {
+      if (c.equals(alias)) continue;
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    items.add(asAliased(bucketCall, alias));
+    visible.add(alias);
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 
   @Override

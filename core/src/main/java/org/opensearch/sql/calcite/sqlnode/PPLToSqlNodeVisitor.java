@@ -54,6 +54,7 @@ import org.opensearch.sql.ast.tree.RareTopN;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Rename;
 import org.opensearch.sql.ast.tree.Reverse;
+import org.opensearch.sql.ast.tree.Rex;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -678,6 +679,97 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitRex(Rex node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `rex field=<f> "<pattern>" [max_match=N] [offset_field=<o>]` extracts named groups via
+    // REX_EXTRACT (or REX_EXTRACT_MULTI when max_match > 1). SED mode rewrites the source field
+    // and is deferred. Each named group + the optional offset field becomes a new column on the
+    // row, replacing colliding existing columns.
+    if (node.getMode() == Rex.RexMode.SED) {
+      throw new UnsupportedOperationException(
+          "rex SED mode not yet supported in PPLToSqlNodeVisitor");
+    }
+    String patternStr = (String) node.getPattern().getValue();
+    List<String> namedGroups =
+        org.opensearch.sql.expression.parse.RegexCommonUtils.getNamedGroupCandidates(patternStr);
+    if (namedGroups.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Rex pattern must contain at least one named capture group");
+    }
+    SqlNode source = expr(node.getField());
+    SqlNode patternLit = SqlLiteral.createCharString(patternStr, POS);
+
+    java.util.Set<String> newColumns = new java.util.LinkedHashSet<>(namedGroups);
+    node.getOffsetField().ifPresent(newColumns::add);
+    List<String> visible =
+        frame.currentFields == null ? new ArrayList<>() : new ArrayList<>(frame.currentFields);
+    SqlNodeList items = new SqlNodeList(POS);
+    if (frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+    } else {
+      List<String> retained = new ArrayList<>();
+      for (String name : visible) {
+        if (newColumns.contains(name)) continue;
+        items.add(toIdentifier(name));
+        retained.add(name);
+      }
+      visible = retained;
+    }
+    boolean multi = node.getMaxMatch().isPresent() && node.getMaxMatch().get() > 1;
+    for (String group : namedGroups) {
+      SqlNode call;
+      if (multi) {
+        call =
+            new SqlBasicCall(
+                new org.apache.calcite.sql.SqlUnresolvedFunction(
+                    new SqlIdentifier("REX_EXTRACT_MULTI", POS),
+                    null,
+                    null,
+                    null,
+                    null,
+                    org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                List.of(
+                    source,
+                    patternLit,
+                    SqlLiteral.createCharString(group, POS),
+                    SqlLiteral.createExactNumeric(node.getMaxMatch().get().toString(), POS)),
+                POS);
+      } else {
+        call =
+            new SqlBasicCall(
+                new org.apache.calcite.sql.SqlUnresolvedFunction(
+                    new SqlIdentifier("REX_EXTRACT", POS),
+                    null,
+                    null,
+                    null,
+                    null,
+                    org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                List.of(source, patternLit, SqlLiteral.createCharString(group, POS)),
+                POS);
+      }
+      items.add(asAliased(call, group));
+      visible.add(group);
+    }
+    if (node.getOffsetField().isPresent()) {
+      String offset = node.getOffsetField().get();
+      SqlNode offsetCall =
+          new SqlBasicCall(
+              new org.apache.calcite.sql.SqlUnresolvedFunction(
+                  new SqlIdentifier("REX_OFFSET", POS),
+                  null,
+                  null,
+                  null,
+                  null,
+                  org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+              List.of(source, patternLit),
+              POS);
+      items.add(asAliased(offsetCall, offset));
+      visible.add(offset);
+    }
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 
   @Override

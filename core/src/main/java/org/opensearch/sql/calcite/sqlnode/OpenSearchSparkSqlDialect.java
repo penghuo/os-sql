@@ -100,7 +100,15 @@ public class OpenSearchSparkSqlDialect extends SparkSqlDialect {
             .withNullable(type.isNullable());
       }
     }
-    if (name == SqlTypeName.VARCHAR || name == SqlTypeName.CHAR || name == SqlTypeName.REAL) {
+    if (name == SqlTypeName.VARCHAR
+        || name == SqlTypeName.CHAR
+        || name == SqlTypeName.REAL
+        || name == SqlTypeName.MAP
+        || name == SqlTypeName.ARRAY) {
+      // Spark's getCastSpec emits angle-bracket syntax (`MAP<K,V>`, `ARRAY<T>`) which the Babel
+      // parser doesn't accept. Calcite default uses standard SQL `MAP`/`ARRAY` type names that
+      // round-trip cleanly. Note: emitting bare `MAP`/`ARRAY` drops the parameter types — this
+      // is acceptable because validator resolves the cast via the operand's typed expression.
       return org.apache.calcite.sql.dialect.CalciteSqlDialect.DEFAULT.getCastSpec(type);
     }
     return super.getCastSpec(type);

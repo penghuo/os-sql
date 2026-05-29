@@ -2320,17 +2320,25 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitReverse(Reverse node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    // PPL `reverse` flips whatever ordering is currently in effect. With an explicit prior sort,
-    // emit ORDER BY <reversed-keys>. With NO prior sort (e.g. after aggregation, after a bare
-    // source, or when input ordering is data-dependent), reverse becomes a no-op — matches
-    // `testReverseIgnoredWithoutSortOrTimestamp` semantics. The implicit-`__stream_seq__` /
-    // @timestamp fallback used by streamstats is deferred until those visitors land.
+    // PPL `reverse` flips whatever ordering is currently in effect:
+    //   1. Explicit prior sort: emit ORDER BY <reversed-keys>.
+    //   2. No prior sort but @timestamp visible in scope: ORDER BY @timestamp DESC (matches
+    //      v2's reverse semantic for time-series indices like TIME_TEST_DATA).
+    //   3. Otherwise: pass through (e.g. after aggregation, bare source, data-dependent input).
     List<SqlNode> reversed = frame.reversedLastOrderBy();
-    if (reversed == null) {
-      // No-op: pass through unchanged.
-      return from;
+    if (reversed != null) {
+      return SqlBuilder.select(starList()).from(from).orderBy(reversed).wrap(frame);
     }
-    return SqlBuilder.select(starList()).from(from).orderBy(reversed).wrap(frame);
+    if (frame.currentFields != null
+        && frame.currentFields.contains(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP)) {
+      SqlNode tsKey =
+          new SqlBasicCall(
+              SqlStdOperatorTable.DESC,
+              List.of(new SqlIdentifier(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP, POS)),
+              POS);
+      return SqlBuilder.select(starList()).from(from).orderBy(List.of(tsKey)).wrap(frame);
+    }
+    return from;
   }
 
   /** Build SqlNode ORDER BY keys from PPL sort fields. */

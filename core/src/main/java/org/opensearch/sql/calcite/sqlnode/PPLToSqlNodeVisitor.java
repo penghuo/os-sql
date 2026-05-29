@@ -69,6 +69,7 @@ import org.opensearch.sql.ast.tree.Rex;
 import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SpanBin;
+import org.opensearch.sql.ast.tree.StreamWindow;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.Trendline;
 import org.opensearch.sql.ast.tree.Union;
@@ -1139,6 +1140,181 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.joinHints = null;
     frame.lastOrderBy = null;
     return wrapped;
+  }
+
+  @Override
+  public SqlNode visitStreamWindow(StreamWindow node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `streamstats` is the cumulative variant of eventstats: each row gets the running
+    // aggregate of all rows up to and including itself, ordered by an implicit row-sequence.
+    //   <agg> OVER (PARTITION BY <by>? ORDER BY <seq> ROWS UNBOUNDED PRECEDING)
+    //
+    // Defer reset, global=true with by, distinct_count, current=false, window=N (uses
+    // narrower frames). Those need a synthesised __stream_seq__ column or RANGE frames and
+    // are tracked as a follow-up phase.
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "streamstats requires a known column list — call after a `| fields ...` pipe");
+    }
+    if (node.getResetBefore() != null || node.getResetAfter() != null) {
+      throw new UnsupportedOperationException(
+          "streamstats reset_before/reset_after not yet supported in PPLToSqlNodeVisitor");
+    }
+    if (node.getWindow() > 0) {
+      throw new UnsupportedOperationException(
+          "streamstats window=N not yet supported in PPLToSqlNodeVisitor");
+    }
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    List<SqlNode> partitionExprs = new ArrayList<>();
+    for (UnresolvedExpression p : node.getGroupList()) {
+      UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+      SqlNode key = expr(core);
+      partitionBy.add(key);
+      partitionExprs.add(key);
+    }
+    // ORDER BY uses upstream sort keys when present; otherwise synthesise an upstream
+    // __stream_seq__ column (ROW_NUMBER OVER ()) so the cumulative-aggregate window has a
+    // stable order. Calcite forbids OVER clauses inside another window's ORDER BY, so the seq
+    // column has to be materialised in a wrapping SELECT before this window references it.
+    SqlNodeList orderBy = new SqlNodeList(POS);
+    SqlNode wrappedFrom = from;
+    List<String> postSeqFields = frame.currentFields;
+    if (frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
+      for (SqlNode k : frame.lastOrderBy) orderBy.add(k);
+    } else {
+      SqlNode rowNum =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(SqlStdOperatorTable.ROW_NUMBER, List.of(), POS),
+                  SqlWindow.create(
+                      null,
+                      null,
+                      new SqlNodeList(POS),
+                      new SqlNodeList(POS),
+                      SqlLiteral.createBoolean(false, POS),
+                      null,
+                      null,
+                      null,
+                      POS)),
+              POS);
+      SqlNodeList seqSelect = new SqlNodeList(POS);
+      seqSelect.add(SqlIdentifier.star(POS));
+      seqSelect.add(asAliased(rowNum, "__stream_seq__"));
+      wrappedFrom =
+          new SqlSelect(
+              POS, null, seqSelect, from, null, null, null, null, null, null, null, null, null);
+      postSeqFields = new ArrayList<>(frame.currentFields);
+      postSeqFields.add("__stream_seq__");
+      orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+    }
+    SqlNode partitionNotNullCheck = null;
+    if (!node.isBucketNullable() && !partitionExprs.isEmpty()) {
+      for (SqlNode pk : partitionExprs) {
+        SqlNode isNotNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(pk), POS);
+        partitionNotNullCheck =
+            partitionNotNullCheck == null
+                ? isNotNull
+                : new SqlBasicCall(
+                    SqlStdOperatorTable.AND, List.of(partitionNotNullCheck, isNotNull), POS);
+      }
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : frame.currentFields) {
+      // Skip the synthetic __stream_seq__ from the user-visible output (it's only for the OVER
+      // ORDER BY).
+      if ("__stream_seq__".equals(c)) continue;
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    for (UnresolvedExpression item : node.getWindowFunctionList()) {
+      Alias al = (Alias) item;
+      org.opensearch.sql.ast.expression.WindowFunction wf =
+          (org.opensearch.sql.ast.expression.WindowFunction) al.getDelegated();
+      UnresolvedExpression aggInput = wf.getFunction();
+      if (aggInput instanceof org.opensearch.sql.ast.expression.Function f) {
+        UnresolvedExpression argExpr =
+            f.getFuncArgs().isEmpty() ? AllFields.of() : f.getFuncArgs().get(0);
+        java.util.List<UnresolvedExpression> rest =
+            f.getFuncArgs().size() > 1
+                ? f.getFuncArgs().subList(1, f.getFuncArgs().size())
+                : java.util.List.of();
+        aggInput = new AggregateFunction(f.getFuncName(), argExpr, rest);
+      }
+      String fnLower =
+          aggInput instanceof AggregateFunction afn
+              ? afn.getFuncName().toLowerCase(java.util.Locale.ROOT)
+              : "";
+      if (fnLower.equals("dc")
+          || fnLower.equals("distinct_count")
+          || fnLower.equals("distinct_count_approx")) {
+        throw new UnsupportedOperationException(
+            "streamstats distinct_count not yet supported in PPLToSqlNodeVisitor");
+      }
+      if (fnLower.equals("percentile")
+          || fnLower.equals("percentile_approx")
+          || fnLower.equals("median")) {
+        throw new UnsupportedOperationException(
+            "Unexpected window function: " + fnLower.toUpperCase(java.util.Locale.ROOT));
+      }
+      SqlNode aggNode = aggCall(aggInput, /* windowed */ true);
+      // Cumulative ROWS frame: UNBOUNDED PRECEDING to CURRENT ROW.
+      SqlNode window =
+          SqlWindow.create(
+              null,
+              null,
+              partitionBy,
+              orderBy,
+              SqlLiteral.createBoolean(true, POS),
+              SqlWindow.createUnboundedPreceding(POS),
+              SqlWindow.createCurrentRow(POS),
+              null,
+              POS);
+      SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      // Same NULL-guard as visitWindow: AVG/VAR/STDDEV over empty/all-NULL return NULL.
+      if (aggNode instanceof SqlBasicCall bc && bc.getOperandList().size() == 1) {
+        org.apache.calcite.sql.SqlOperator op = bc.getOperator();
+        boolean needsZeroGuard =
+            op == SqlStdOperatorTable.AVG
+                || op == SqlStdOperatorTable.VAR_POP
+                || op == SqlStdOperatorTable.STDDEV_POP;
+        boolean needsOneGuard =
+            op == SqlStdOperatorTable.VAR_SAMP || op == SqlStdOperatorTable.STDDEV_SAMP;
+        if (needsZeroGuard || needsOneGuard) {
+          int minCount = needsOneGuard ? 1 : 0;
+          SqlNode countCall =
+              new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(bc.getOperandList().get(0)), POS);
+          SqlNode countOver =
+              new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCall, window), POS);
+          SqlNode countCondition =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.GREATER_THAN,
+                  List.of(
+                      countOver, SqlLiteral.createExactNumeric(Integer.toString(minCount), POS)),
+                  POS);
+          SqlNodeList whens = new SqlNodeList(POS);
+          whens.add(countCondition);
+          SqlNodeList thens = new SqlNodeList(POS);
+          thens.add(over);
+          over =
+              new org.apache.calcite.sql.fun.SqlCase(
+                  POS, null, whens, thens, SqlLiteral.createNull(POS));
+        }
+      }
+      if (partitionNotNullCheck != null) {
+        SqlNodeList nnWhens = new SqlNodeList(POS);
+        nnWhens.add(partitionNotNullCheck);
+        SqlNodeList nnThens = new SqlNodeList(POS);
+        nnThens.add(over);
+        over =
+            new org.apache.calcite.sql.fun.SqlCase(
+                POS, null, nnWhens, nnThens, SqlLiteral.createNull(POS));
+      }
+      items.add(asAliased(over, al.getName()));
+      visible.add(al.getName());
+    }
+    return SqlBuilder.select(items).from(wrappedFrom).withFields(visible).wrap(frame);
   }
 
   @Override

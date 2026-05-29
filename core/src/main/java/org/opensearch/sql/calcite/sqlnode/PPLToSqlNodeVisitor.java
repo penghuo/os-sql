@@ -1020,6 +1020,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         && (v.getValues() == null || v.getValues().isEmpty());
   }
 
+  /** Lowercase function name from a WindowFunction's inner expression (Aggregate or Function). */
+  private static String wfFuncNameLower(UnresolvedExpression fn) {
+    if (fn instanceof AggregateFunction af) {
+      return af.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    }
+    if (fn instanceof org.opensearch.sql.ast.expression.Function f) {
+      return f.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    }
+    return "";
+  }
+
+  /** First positional arg (the field) from a WindowFunction's inner expression. */
+  private static UnresolvedExpression wfFirstArg(UnresolvedExpression fn) {
+    if (fn instanceof AggregateFunction af) {
+      return af.getField();
+    }
+    if (fn instanceof org.opensearch.sql.ast.expression.Function f && !f.getFuncArgs().isEmpty()) {
+      return f.getFuncArgs().get(0);
+    }
+    return null;
+  }
+
   private SqlNode padToUnifiedSchema(SqlNode body, List<String> present, List<String> unified) {
     Set<String> presentSet = new java.util.LinkedHashSet<>(present);
     SqlNodeList items = new SqlNodeList(POS);
@@ -1424,6 +1446,91 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                     SqlStdOperatorTable.AND, List.of(partitionNotNullCheck, isNotNull), POS);
       }
     }
+
+    // Streamstats dc(x) prep — Calcite forbids COUNT(DISTINCT) OVER and the partition-wide
+    // dense_rank trick is wrong for cumulative semantics. Emit `is_first_<i> = CASE WHEN x IS
+    // NULL THEN 0 WHEN ROW_NUMBER() OVER (PARTITION BY [g, ] x ORDER BY seq) = 1 THEN 1 ELSE 0
+    // END` as a wrapping SELECT, then in the agg loop swap dc(x) for SUM(is_first_<i>) OVER
+    // (... ROWS UNBOUNDED PRECEDING). Splitting into two SELECTs avoids the "Aggregate
+    // expressions cannot be nested" error from putting ROW_NUMBER OVER inside SUM OVER.
+    java.util.Map<Integer, String> dcIsFirstColForFnIdx = new java.util.HashMap<>();
+    List<UnresolvedExpression> wfns = node.getWindowFunctionList();
+    if (!orderBy.getList().isEmpty()) {
+      SqlNodeList dcWrapList = null;
+      for (int i = 0; i < wfns.size(); i++) {
+        Alias al = (Alias) wfns.get(i);
+        org.opensearch.sql.ast.expression.WindowFunction wf =
+            (org.opensearch.sql.ast.expression.WindowFunction) al.getDelegated();
+        String fnLowerI = wfFuncNameLower(wf.getFunction());
+        if (!"dc".equals(fnLowerI)
+            && !"distinct_count".equals(fnLowerI)
+            && !"distinct_count_approx".equals(fnLowerI)) {
+          continue;
+        }
+        UnresolvedExpression argExpr = wfFirstArg(wf.getFunction());
+        if (argExpr == null || argExpr instanceof AllFields) continue;
+        SqlNodeList rnPart = new SqlNodeList(POS);
+        for (SqlNode p : partitionBy.getList()) rnPart.add(p);
+        rnPart.add(expr(argExpr));
+        SqlNode rnWindow =
+            SqlWindow.create(
+                null,
+                null,
+                rnPart,
+                orderBy,
+                SqlLiteral.createBoolean(false, POS),
+                null,
+                null,
+                null,
+                POS);
+        SqlNode rn =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OVER,
+                List.of(new SqlBasicCall(SqlStdOperatorTable.ROW_NUMBER, List.of(), POS), rnWindow),
+                POS);
+        SqlNode isNullArg =
+            new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(expr(argExpr)), POS);
+        SqlNode rnEqOne =
+            new SqlBasicCall(
+                SqlStdOperatorTable.EQUALS,
+                List.of(rn, SqlLiteral.createExactNumeric("1", POS)),
+                POS);
+        SqlNodeList isFirstWhens = new SqlNodeList(POS);
+        isFirstWhens.add(isNullArg);
+        isFirstWhens.add(rnEqOne);
+        SqlNodeList isFirstThens = new SqlNodeList(POS);
+        isFirstThens.add(SqlLiteral.createExactNumeric("0", POS));
+        isFirstThens.add(SqlLiteral.createExactNumeric("1", POS));
+        SqlNode isFirst =
+            new org.apache.calcite.sql.fun.SqlCase(
+                POS, null, isFirstWhens, isFirstThens, SqlLiteral.createExactNumeric("0", POS));
+        String colName = "_dc_is_first_" + i + "_";
+        if (dcWrapList == null) {
+          dcWrapList = new SqlNodeList(POS);
+          dcWrapList.add(SqlIdentifier.star(POS));
+        }
+        dcWrapList.add(asAliased(isFirst, colName));
+        dcIsFirstColForFnIdx.put(i, colName);
+      }
+      if (dcWrapList != null) {
+        wrappedFrom =
+            new SqlSelect(
+                POS,
+                null,
+                dcWrapList,
+                wrappedFrom,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null);
+      }
+    }
+
     SqlNodeList items = new SqlNodeList(POS);
     List<String> visible = new ArrayList<>();
     // Pass through every column from postSeqFields (which includes the just-synthesised or
@@ -1434,7 +1541,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       items.add(toIdentifier(c));
       visible.add(c);
     }
-    for (UnresolvedExpression item : node.getWindowFunctionList()) {
+    for (int i = 0; i < wfns.size(); i++) {
+      UnresolvedExpression item = wfns.get(i);
       Alias al = (Alias) item;
       org.opensearch.sql.ast.expression.WindowFunction wf =
           (org.opensearch.sql.ast.expression.WindowFunction) al.getDelegated();
@@ -1452,32 +1560,49 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           aggInput instanceof AggregateFunction afn
               ? afn.getFuncName().toLowerCase(java.util.Locale.ROOT)
               : "";
-      if (fnLower.equals("dc")
-          || fnLower.equals("distinct_count")
-          || fnLower.equals("distinct_count_approx")) {
-        throw new UnsupportedOperationException(
-            "streamstats distinct_count not yet supported in PPLToSqlNodeVisitor");
-      }
       if (fnLower.equals("percentile")
           || fnLower.equals("percentile_approx")
           || fnLower.equals("median")) {
         throw new UnsupportedOperationException(
             "Unexpected window function: " + fnLower.toUpperCase(java.util.Locale.ROOT));
       }
-      SqlNode aggNode = aggCall(aggInput, /* windowed */ true);
+      SqlNode aggNode;
+      if (dcIsFirstColForFnIdx.containsKey(i)) {
+        // dc(x) → SUM(is_first_<i>) OVER (PARTITION BY [g] ORDER BY seq ROWS UNBOUNDED
+        // PRECEDING). Always cumulative regardless of streamstats `window=N` setting —
+        // distinct count is running over the full preceding stream by PPL semantics.
+        aggNode =
+            new SqlBasicCall(
+                SqlStdOperatorTable.SUM,
+                List.of(new SqlIdentifier(dcIsFirstColForFnIdx.get(i), POS)),
+                POS);
+      } else if (fnLower.equals("dc")
+          || fnLower.equals("distinct_count")
+          || fnLower.equals("distinct_count_approx")) {
+        // dc with no ORDER BY — fall back to the legacy error.
+        throw new UnsupportedOperationException(
+            "streamstats distinct_count requires a stable order (no upstream sort and no"
+                + " synthesised __stream_seq__)");
+      } else {
+        aggNode = aggCall(aggInput, /* windowed */ true);
+      }
       // ROWS frame derived from current/window above (current=true window=0 → cumulative;
       // current=true window=N → last N rows; current=false window=N → previous N rows).
       // useRange=true switches to RANGE frame on __stream_seq__ — bounds reflect global
       // row distance (for global=true with by-partition).
+      // dc(x) emulation: SUM(is_first_<i>) is always cumulative regardless of window=N.
+      boolean cumulativeForDc = dcIsFirstColForFnIdx.containsKey(i);
+      SqlNode dcLower = SqlWindow.createUnboundedPreceding(POS);
+      SqlNode dcUpper = SqlWindow.createCurrentRow(POS);
       SqlNode window =
           SqlWindow.create(
               null,
               null,
               partitionBy,
               orderBy,
-              SqlLiteral.createBoolean(!useRange, POS),
-              frameLower,
-              frameUpper,
+              SqlLiteral.createBoolean(cumulativeForDc || !useRange, POS),
+              cumulativeForDc ? dcLower : frameLower,
+              cumulativeForDc ? dcUpper : frameUpper,
               null,
               POS);
       SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);

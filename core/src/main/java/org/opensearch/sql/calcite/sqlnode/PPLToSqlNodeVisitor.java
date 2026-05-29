@@ -378,7 +378,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         visible.add(alias);
       }
     }
+    // Peephole: when child is a SELECT * (no GROUP BY / HAVING), append our extra eval items to
+    // its select list and reuse it. Avoids nesting `SELECT *, e1 AS a1 FROM (SELECT * FROM <X> AS
+    // a JOIN ...)` which seals join aliases inside the FROM subquery, breaking subsequent pipes
+    // that reference `a.col`. The `<child>` SELECT keeps its FROM scope live so `a.col` in our
+    // appended `e_i` items resolves.
+    SqlNode peep = appendEvalToChildSelectStar(from, items, visible, frame);
+    if (peep != null) return peep;
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * If {@code from} is a {@code SELECT *[, ...prior eval items] FROM <inner> [WHERE ...]} (no GROUP
+   * BY / HAVING / ORDER BY / FETCH / OFFSET, and the first select-list item is {@code *}), append
+   * our extra eval items ({@code [e_i AS a_i, ...]}) to its select list in place and return the
+   * rewritten node. Returns null when the shape doesn't match — caller falls back to normal
+   * wrapping. The {@code *} as first item keeps the prior pipe's columns visible; chained evals
+   * just keep appending.
+   */
+  private static SqlNode appendEvalToChildSelectStar(
+      SqlNode from, SqlNodeList newList, List<String> visible, Frame frame) {
+    if (!(from instanceof SqlSelect select)) return null;
+    SqlNodeList existing = select.getSelectList();
+    if (existing == null || existing.size() < 1) return null;
+    SqlNode first = existing.get(0);
+    if (!(first instanceof SqlIdentifier id) || !id.isStar()) return null;
+    if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
+    if (select.getHaving() != null) return null;
+    if (select.getOrderList() != null && !select.getOrderList().getList().isEmpty()) return null;
+    if (select.getFetch() != null || select.getOffset() != null) return null;
+    // newList starts with `*` then our eval items. Skip its leading `*` (already in `existing`)
+    // and append the rest.
+    for (int i = 1; i < newList.size(); i++) {
+      existing.add(newList.get(i));
+    }
+    frame.currentFields = visible;
+    frame.joinHints = null;
+    return select;
   }
 
   @Override

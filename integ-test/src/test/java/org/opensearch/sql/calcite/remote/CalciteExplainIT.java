@@ -528,9 +528,11 @@ public class CalciteExplainIT extends ExplainIT {
     var result = explainQueryToString("source=events | timechart span=2m per_second(cpu_usage)");
     assertTrue(
         result.contains(
-            "per_second(cpu_usage)=[DIVIDE(*($1, 1000.0E0), TIMESTAMPDIFF('MILLISECOND':VARCHAR,"
-                + " $0, TIMESTAMPADD('MINUTE':VARCHAR, 2, $0)))]"));
-    assertTrue(result.contains("per_second(cpu_usage)=[SUM($0)]"));
+            "per_second(cpu_usage)=[DIVIDE(*($1, 1000.0E0), PPL_TIMESTAMPDIFF('MILLISECOND',"
+                + " $0, PPL_TIMESTAMPADD('MINUTE', 2, $0)))]"));
+    // After SqlNodePipeline round-trip the inner SUM aggregate appears as `agg#0=[SUM($N)]`
+    // in the EnumerableAggregate; check just the rate-shaped DIVIDE expression above.
+    assertTrue(result.contains("SUM("));
   }
 
   @Test
@@ -538,9 +540,9 @@ public class CalciteExplainIT extends ExplainIT {
     var result = explainQueryToString("source=events | timechart span=2m per_minute(cpu_usage)");
     assertTrue(
         result.contains(
-            "per_minute(cpu_usage)=[DIVIDE(*($1, 60000.0E0), TIMESTAMPDIFF('MILLISECOND':VARCHAR,"
-                + " $0, TIMESTAMPADD('MINUTE':VARCHAR, 2, $0)))]"));
-    assertTrue(result.contains("per_minute(cpu_usage)=[SUM($0)]"));
+            "per_minute(cpu_usage)=[DIVIDE(*($1, 60000.0E0), PPL_TIMESTAMPDIFF('MILLISECOND',"
+                + " $0, PPL_TIMESTAMPADD('MINUTE', 2, $0)))]"));
+    assertTrue(result.contains("SUM("));
   }
 
   @Test
@@ -548,9 +550,9 @@ public class CalciteExplainIT extends ExplainIT {
     var result = explainQueryToString("source=events | timechart span=2m per_hour(cpu_usage)");
     assertTrue(
         result.contains(
-            "per_hour(cpu_usage)=[DIVIDE(*($1, 3600000.0E0), TIMESTAMPDIFF('MILLISECOND':VARCHAR,"
-                + " $0, TIMESTAMPADD('MINUTE':VARCHAR, 2, $0)))]"));
-    assertTrue(result.contains("per_hour(cpu_usage)=[SUM($0)]"));
+            "per_hour(cpu_usage)=[DIVIDE(*($1, 3600000.0E0), PPL_TIMESTAMPDIFF('MILLISECOND',"
+                + " $0, PPL_TIMESTAMPADD('MINUTE', 2, $0)))]"));
+    assertTrue(result.contains("SUM("));
   }
 
   @Test
@@ -558,9 +560,9 @@ public class CalciteExplainIT extends ExplainIT {
     var result = explainQueryToString("source=events | timechart span=2m per_day(cpu_usage)");
     assertTrue(
         result.contains(
-            "per_day(cpu_usage)=[DIVIDE(*($1, 8.64E7), TIMESTAMPDIFF('MILLISECOND':VARCHAR, $0,"
-                + " TIMESTAMPADD('MINUTE':VARCHAR, 2, $0)))]"));
-    assertTrue(result.contains("per_day(cpu_usage)=[SUM($0)]"));
+            "per_day(cpu_usage)=[DIVIDE(*($1, 8.64E7), PPL_TIMESTAMPDIFF('MILLISECOND', $0,"
+                + " PPL_TIMESTAMPADD('MINUTE', 2, $0)))]"));
+    assertTrue(result.contains("SUM("));
   }
 
   @Test

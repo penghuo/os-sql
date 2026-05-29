@@ -7,5 +7,5 @@ calcite:
     EnumerableLimit(fetch=[10000])
       EnumerableCalc(expr#0..12=[{inputs}], expr#13=[null:BIGINT], expr#14=[CASE($t11, $t12, $t13)], proj#0..10=[{exprs}], count()=[$t14])
         EnumerableWindow(window#0=[window(partition {7} aggs [COUNT()])])
-          EnumerableCalc(expr#0..16=[{inputs}], expr#17=[IS NOT NULL($t7)], proj#0..10=[{exprs}], $11=[$t17])
+          EnumerableCalc(expr#0..17=[{inputs}], expr#18=[IS NOT NULL($t7)], proj#0..10=[{exprs}], $11=[$t18])
             CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])

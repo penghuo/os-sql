@@ -7,5 +7,5 @@ calcite:
   physical: |
     EnumerableLimit(fetch=[10000])
       EnumerableAggregate(group=[{}], take=[TAKE($0, $1)])
-        EnumerableCalc(expr#0..16=[{inputs}], expr#17=[2], firstname=[$t1], $f1=[$t17])
+        EnumerableCalc(expr#0..17=[{inputs}], expr#18=[2], firstname=[$t1], $f1=[$t18])
           CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])

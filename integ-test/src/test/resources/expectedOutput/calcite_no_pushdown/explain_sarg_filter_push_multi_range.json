@@ -1,6 +1,6 @@
 {
   "calcite": {
-    "logical": "LogicalSystemLimit(fetch=[10000], type=[QUERY_SIZE_LIMIT])\n  LogicalProject(age=[$8])\n    LogicalFilter(condition=[SEARCH($8, Sarg[0, [1..10], (20..30)])])\n      CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])\n",
-    "physical": "EnumerableLimit(fetch=[10000])\n  EnumerableCalc(expr#0..16=[{inputs}], expr#17=[Sarg[0, [1..10], (20..30)]], expr#18=[SEARCH($t8, $t17)], age=[$t8], $condition=[$t18])\n    CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])\n"
+    "logical": "LogicalSystemLimit(fetch=[10000], type=[QUERY_SIZE_LIMIT])\n  LogicalProject(age=[$8])\n    LogicalFilter(condition=[OR(=($8, 0), AND(>=($8, 1), <=($8, 10)), AND(>($8, 20), <($8, 30)))])\n      CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])\n",
+    "physical": "EnumerableLimit(fetch=[10000])\n  EnumerableCalc(expr#0..17=[{inputs}], expr#18=[Sarg[0L:BIGINT, [1L:BIGINT..10L:BIGINT], (20L:BIGINT..30L:BIGINT)]:BIGINT], expr#19=[SEARCH($t8, $t18)], age=[$t8], $condition=[$t19])\n    CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])\n"
   }
 }

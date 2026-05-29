@@ -6,5 +6,5 @@ calcite:
           CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_deep_nested]])
   physical: |
     EnumerableLimit(fetch=[10000])
-      EnumerableCalc(expr#0..15=[{inputs}], expr#16=[CHAR_LENGTH($t3)], expr#17=[29], expr#18=[>($t16, $t17)], projects.name=[$t3], proj_name_len=[$t16], $condition=[$t18])
+      EnumerableCalc(expr#0..16=[{inputs}], expr#17=[CHAR_LENGTH($t3)], expr#18=[29], expr#19=[>($t17, $t18)], projects.name=[$t3], proj_name_len=[$t17], $condition=[$t19])
         CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_deep_nested]])

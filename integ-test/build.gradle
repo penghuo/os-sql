@@ -540,6 +540,12 @@ integTest {
     systemProperty 'tests.security.manager', 'false'
     systemProperty('project.root', project.projectDir.absolutePath)
 
+    // Propagate regen flag for ExplainIT-style golden-file regeneration via
+    // -Dregen.expected=true. See ExpectedPlanRegen.
+    if (System.getProperty("regen.expected") != null) {
+        systemProperty 'regen.expected', System.getProperty("regen.expected")
+    }
+
     systemProperty "https", System.getProperty("https")
     systemProperty "user", System.getProperty("user")
     systemProperty "password", System.getProperty("password")

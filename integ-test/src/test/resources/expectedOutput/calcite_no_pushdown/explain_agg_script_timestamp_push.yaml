@@ -12,5 +12,5 @@ calcite:
         EnumerableLimit(fetch=[3])
           EnumerableSort(sort0=[$0], dir0=[ASC-nulls-first])
             EnumerableAggregate(group=[{0}], count()=[COUNT()])
-              EnumerableCalc(expr#0..18=[{inputs}], expr#19=[UNIX_TIMESTAMP($t3)], t=[$t19])
+              EnumerableCalc(expr#0..19=[{inputs}], expr#20=[UNIX_TIMESTAMP($t3)], t=[$t20])
                 CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_bank]])

@@ -9,5 +9,5 @@ calcite:
     EnumerableLimit(fetch=[10000])
       EnumerableCalc(expr#0..1=[{inputs}], count()=[$t1], age_range=[$t0])
         EnumerableAggregate(group=[{0}], count()=[COUNT()])
-          EnumerableCalc(expr#0..18=[{inputs}], expr#19=[30], expr#20=[<($t10, $t19)], expr#21=[100], expr#22=[CASE($t20, $t19, $t21)], age_range=[$t22])
+          EnumerableCalc(expr#0..19=[{inputs}], expr#20=[30], expr#21=[<($t10, $t20)], expr#22=[100], expr#23=[CASE($t21, $t20, $t22)], age_range=[$t23])
             CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_bank]])

@@ -1,11 +1,11 @@
 calcite:
   logical: |
     LogicalSystemLimit(fetch=[10000], type=[QUERY_SIZE_LIMIT])
-      LogicalProject(state=[$7], city=[$5], age=[$8], location=[COALESCE(ARRAY_JOIN(ARRAY_COMPACT(array($7, $5)), '
-    '), '':VARCHAR)])
+      LogicalProject(state=[$7], city=[$5], age=[$8], location=[COALESCE(ARRAY_JOIN(ARRAY_COMPACT(PPL_ARRAY($7, $5)), '
+    '), '')])
         CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])
   physical: |
     EnumerableLimit(fetch=[10000])
-      EnumerableCalc(expr#0..16=[{inputs}], expr#17=[array($t7, $t5)], expr#18=[ARRAY_COMPACT($t17)], expr#19=['
-    '], expr#20=[ARRAY_JOIN($t18, $t19)], expr#21=['':VARCHAR], expr#22=[COALESCE($t20, $t21)], state=[$t7], city=[$t5], age=[$t8], location=[$t22])
+      EnumerableCalc(expr#0..17=[{inputs}], expr#18=[PPL_ARRAY($t7, $t5)], expr#19=[ARRAY_COMPACT($t18)], expr#20=['
+    '], expr#21=[ARRAY_JOIN($t19, $t20)], expr#22=[''], expr#23=[COALESCE($t21, $t22)], state=[$t7], city=[$t5], age=[$t8], location=[$t23])
         CalciteEnumerableIndexScan(table=[[OpenSearch, opensearch-sql_test_index_account]])

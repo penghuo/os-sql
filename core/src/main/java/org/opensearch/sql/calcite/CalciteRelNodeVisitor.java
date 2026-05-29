@@ -317,6 +317,10 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   @Override
   public RelNode visitAppendPipe(AppendPipe node, CalcitePlanContext context) {
     visitChildren(node, context);
+    // AppendPipe builds a Union of the main pipeline and the sub-pipeline. _highlight (MAP<
+    // VARCHAR, ANY>) on either side cannot be unparsed by RelToSqlConverter as `CAST(NULL AS T)`,
+    // so the round-trip fails. Drop _highlight from both sides before the Union.
+    dropHighlightIfNotRequested(context);
     UnresolvedPlan subqueryPlan = node.getSubQuery();
     UnresolvedPlan childNode = subqueryPlan;
     while (childNode.getChild() != null
@@ -330,6 +334,8 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     childNode.attach(node.getChild().getFirst());
 
     subqueryPlan.accept(this, context);
+    // Drop _highlight from the sub-pipeline before merging with the main side.
+    dropHighlightIfNotRequested(context);
 
     RelNode subPipelineNode = context.relBuilder.build();
     RelNode mainNode = context.relBuilder.build();
@@ -3254,6 +3260,9 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   @Override
   public RelNode visitAddColTotals(AddColTotals node, CalcitePlanContext context) {
     visitChildren(node, context);
+    // Drop _highlight before building the Union/Project shape — the synthetic column has
+    // type MAP<VARCHAR, ANY> which RelToSqlConverter cannot unparse as `CAST(NULL AS T)`.
+    dropHighlightIfNotRequested(context);
 
     // Parse options from the AddTotals node
     Map<String, Literal> options = node.getOptions();
@@ -3518,6 +3527,8 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   public RelNode visitAddTotals(AddTotals node, CalcitePlanContext context) {
     // 1. Process child plan first
     visitChildren(node, context);
+    // See visitAddColTotals: drop _highlight before Union/Project so the round-trip can unparse.
+    dropHighlightIfNotRequested(context);
 
     // Parse options from the AddTotals node
     Map<String, Literal> options = node.getOptions();

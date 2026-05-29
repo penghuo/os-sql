@@ -439,6 +439,8 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
    */
   protected static String loadFromFile(String filename) {
     try {
+      // Stash for the regen helper — see ExpectedPlanRegen.
+      org.opensearch.sql.util.ExpectedPlanRegen.setLastResourcePath(filename);
       URI uri = Resources.getResource(filename).toURI();
       return new String(Files.readAllBytes(Paths.get(uri)));
     } catch (Exception e) {
@@ -457,6 +459,11 @@ public abstract class PPLIntegTestCase extends SQLIntegTestCase {
     } else {
       prefix = "expectedOutput/ppl/";
     }
-    return loadFromFile(prefix + fileName);
+    String resourcePath = prefix + fileName;
+    // Stash the resource path on a thread-local so MatcherUtils can write the actual back when
+    // -Dregen.expected=true is set. This lets ExplainIT-style tests bulk-update their expected
+    // golden files after a controlled plan-shape change without touching every call site.
+    org.opensearch.sql.util.ExpectedPlanRegen.setLastResourcePath(resourcePath);
+    return loadFromFile(resourcePath);
   }
 }

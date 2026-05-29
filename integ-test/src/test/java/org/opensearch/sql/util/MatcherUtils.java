@@ -427,6 +427,9 @@ public class MatcherUtils {
    * @param actual actual JSON string.
    */
   public static void assertJsonEquals(String expected, String actual) {
+    if (ExpectedPlanRegen.isEnabled() && ExpectedPlanRegen.writeToSourceTree(actual)) {
+      return;
+    }
     assertEquals(
         JsonParser.parseString(eliminatePid(expected)),
         JsonParser.parseString(eliminatePid(actual)));
@@ -438,6 +441,9 @@ public class MatcherUtils {
    */
   @Deprecated
   public static void assertJsonEqualsIgnoreId(String expected, String actual) {
+    if (ExpectedPlanRegen.isEnabled() && ExpectedPlanRegen.writeToSourceTree(actual)) {
+      return;
+    }
     assertJsonEquals(cleanUpId(expected), cleanUpId(actual));
   }
 
@@ -466,6 +472,9 @@ public class MatcherUtils {
 
   /** Compare two YAML strings are equals with ignoring the RelNode id in the Calcite plan. */
   public static void assertYamlEqualsIgnoreId(String expectedYaml, String actualYaml) {
+    if (ExpectedPlanRegen.isEnabled() && ExpectedPlanRegen.writeToSourceTree(actualYaml)) {
+      return;
+    }
     assertYamlEquals(cleanUpYaml(expectedYaml), cleanUpYaml(actualYaml));
   }
 
@@ -481,6 +490,9 @@ public class MatcherUtils {
    */
   public static void assertYamlEqualsIgnoreId(
       String expectedYaml1, String expectedYaml2, String actualYaml) {
+    if (ExpectedPlanRegen.isEnabled() && ExpectedPlanRegen.writeToSourceTree(actualYaml)) {
+      return;
+    }
     try {
       assertYamlEquals(cleanUpYaml(expectedYaml1), cleanUpYaml(actualYaml));
     } catch (AssertionError e) {

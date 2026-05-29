@@ -8,8 +8,7 @@ calcite:
               LogicalProject
                 LogicalFilter
                   LogicalProject
-                    LogicalProject
-                      LogicalAggregate
-                        LogicalProject
-                          LogicalFilter
-                            CalciteLogicalIndexScan
+                    LogicalAggregate
+                      LogicalProject
+                        LogicalFilter
+                          CalciteLogicalIndexScan

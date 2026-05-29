@@ -751,6 +751,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 ? notNull
                 : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(where, notNull), POS);
       }
+    } else if (node.getSpan() != null && isTimeSpanGroupKey(node.getSpan())) {
+      // Time-unit Span always filters NULL bucket regardless of bucket_nullable. PPL semantics:
+      // a NULL-keyed time bucket from rows where the span field is NULL is hidden in the output.
+      // Mirrors v2's visitAggregation behaviour. Filter on the FIELD (not the wrapped SPAN call)
+      // so the OpenSearch pushdown emits a term-not-exists query rather than a script.
+      UnresolvedExpression spanCore =
+          (node.getSpan() instanceof Alias al) ? al.getDelegated() : node.getSpan();
+      if (spanCore instanceof Span sp) {
+        where =
+            new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(expr(sp.getField())), POS);
+      }
     }
 
     SqlBuilder.SelectBuilder b =
@@ -5544,6 +5555,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * True if any operand of a {@code +} expression is statically a string — used to pick CONCAT over
    * PLUS when PPL's {@code +} acts as string concatenation.
    */
+  /**
+   * True when {@code e} is a {@link Span} (or aliased Span) over a time-unit. PPL semantics: a
+   * stats with a time-span group key always filters NULL buckets regardless of bucket_nullable.
+   */
+  private static boolean isTimeSpanGroupKey(UnresolvedExpression e) {
+    UnresolvedExpression core = e instanceof Alias al ? al.getDelegated() : e;
+    return core instanceof Span sp
+        && org.opensearch.sql.ast.expression.SpanUnit.isTimeUnit(sp.getUnit());
+  }
+
   /**
    * True when {@code e} is the PPL parse shape for a bare `null` token: a {@link QualifiedName} (or
    * {@link Field} wrapping one) whose stringified name is "null" case-insensitively. PPL has no

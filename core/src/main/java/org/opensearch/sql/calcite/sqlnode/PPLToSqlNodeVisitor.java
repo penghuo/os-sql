@@ -4871,6 +4871,64 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
       }
     }
+    // PPL `replace(str, pattern, replacement)` is a regex replace (PCRE-style); SQL's standard
+    // REPLACE does literal substring replace only. Dispatch to REGEXP_REPLACE_3 and convert PPL's
+    // \1 \2 backrefs to Java's $1 $2. Validate the pattern at translation time so syntax errors
+    // surface as 400 Bad Request (IllegalArgumentException), not 500 from runtime
+    // PatternSyntaxException.
+    if ("replace".equals(name) && args.size() == 3) {
+      if (args.get(1) instanceof SqlLiteral patLit
+          && patLit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
+        String pattern = ((org.apache.calcite.util.NlsString) patLit.getValue()).getValue();
+        try {
+          java.util.regex.Pattern.compile(pattern);
+        } catch (java.util.regex.PatternSyntaxException pse) {
+          throw new IllegalArgumentException(
+              String.format("Invalid regex pattern '%s': %s", pattern, pse.getDescription()), pse);
+        }
+      }
+      SqlNode replacement = args.get(2);
+      if (replacement instanceof SqlLiteral lit
+          && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
+        String s = ((org.apache.calcite.util.NlsString) lit.getValue()).getValue();
+        StringBuilder converted = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+          char c = s.charAt(i);
+          if (c == '\\' && i + 1 < s.length() && Character.isDigit(s.charAt(i + 1))) {
+            converted.append('$');
+          } else if (c == '$') {
+            converted.append("\\$");
+          } else {
+            converted.append(c);
+          }
+        }
+        replacement = SqlLiteral.createCharString(converted.toString(), POS);
+      }
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
+          List.of(args.get(0), args.get(1), replacement),
+          POS);
+    }
+    // PPL `trim(str)` -> TRIM(BOTH ' ' FROM str). Calcite's TRIM is keyword-syntax that doesn't
+    // bind via SqlBasicCall function-call form; emulate via REGEXP_REPLACE.
+    if ("trim".equals(name) && args.size() == 1) {
+      return new SqlBasicCall(
+          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
+          List.of(
+              args.get(0),
+              SqlLiteral.createCharString("^\\s+|\\s+$", POS),
+              SqlLiteral.createCharString("", POS)),
+          POS);
+    }
+    // PPL `locate(sub, str [, start])` -> INSTR(str, sub [, start]). PPL's argument order has the
+    // substring first; INSTR (Oracle-library) takes the full string first. Swap operands.
+    if ("locate".equals(name) && (args.size() == 2 || args.size() == 3)) {
+      List<SqlNode> swapped = new ArrayList<>();
+      swapped.add(args.get(1));
+      swapped.add(args.get(0));
+      if (args.size() == 3) swapped.add(args.get(2));
+      return new SqlBasicCall(org.apache.calcite.sql.fun.SqlLibraryOperators.INSTR, swapped, POS);
+    }
     if (opOverride != null) {
       return new SqlBasicCall(opOverride, args, POS);
     }

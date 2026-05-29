@@ -1126,21 +1126,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // PPL pads missing columns with NULL on each side so heterogeneous schemas can union. Use
     // each side's frame.currentFields as the column-set oracle (visitProject / visitAggregation
     // / visitFields keep this list authoritative).
+    //
+    // Apply v2's EmptySourcePropagateVisitor BEFORE walking. Empty-source subsearches like
+    // `append [ ]` or `append [ | where ... | append [ ] ]` collapse to (or contain) Values([])
+    // that the visitor would otherwise fail to handle. The propagator's visitAppend always
+    // returns a new Append even when both sides became EMPTY; collapse that here too.
+    UnresolvedPlan prunedSubSearch =
+        node.getSubSearch().accept(new org.opensearch.sql.ast.EmptySourcePropagateVisitor(), null);
+    if (isEmptyValues(prunedSubSearch) || isFullyEmptyAppend(prunedSubSearch)) {
+      // Empty subsearch is a no-op for append: return main unchanged.
+      SqlNode mainBody = node.getChild().get(0).accept(this, frame);
+      return mainBody;
+    }
     SqlNode mainBody = node.getChild().get(0).accept(this, frame);
     if (frame.currentFields == null) {
       throw new UnsupportedOperationException(
           "append main side requires a known column list — call after a pipe that sets it");
     }
     List<String> mainCols = new ArrayList<>(frame.currentFields);
-
-    // Apply v2's EmptySourcePropagateVisitor so `append [ ]` and `append [ | stats ... ]`
-    // (empty-source subsearch) collapse to a Values([]) we can recognise and skip.
-    UnresolvedPlan prunedSubSearch =
-        node.getSubSearch().accept(new org.opensearch.sql.ast.EmptySourcePropagateVisitor(), null);
-    if (isEmptyValues(prunedSubSearch)) {
-      // Empty subsearch is a no-op for append: return main unchanged.
-      return mainBody;
-    }
 
     Frame subFrame = new Frame();
     Frame savedExpr = this.exprFrame;
@@ -1192,6 +1195,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private static boolean isEmptyValues(UnresolvedPlan plan) {
     return plan instanceof org.opensearch.sql.ast.tree.Values v
         && (v.getValues() == null || v.getValues().isEmpty());
+  }
+
+  /**
+   * True when {@code plan} is an Append whose both sides resolved (after propagation) to empty —
+   * EmptySourcePropagateVisitor's visitAppend always rebuilds an Append even when both children
+   * became empty, so we collapse it ourselves.
+   */
+  private static boolean isFullyEmptyAppend(UnresolvedPlan plan) {
+    if (!(plan instanceof Append app)) return false;
+    UnresolvedPlan sub = app.getSubSearch();
+    UnresolvedPlan child = app.getChild().isEmpty() ? null : (UnresolvedPlan) app.getChild().get(0);
+    boolean subEmpty = sub != null && (isEmptyValues(sub) || isFullyEmptyAppend(sub));
+    boolean childEmpty = child != null && (isEmptyValues(child) || isFullyEmptyAppend(child));
+    return subEmpty && childEmpty;
   }
 
   /** Lowercase function name from a WindowFunction's inner expression (Aggregate or Function). */

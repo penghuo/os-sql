@@ -190,13 +190,14 @@ class OpenSearchIndexTest {
     assertThat(
         fieldTypes,
         allOf(
-            aMapWithSize(6),
+            aMapWithSize(7),
             hasEntry("_id", ExprCoreType.STRING),
             hasEntry("_index", ExprCoreType.STRING),
             hasEntry("_routing", ExprCoreType.STRING),
             hasEntry("_sort", ExprCoreType.LONG),
             hasEntry("_score", ExprCoreType.FLOAT),
-            hasEntry("_maxscore", ExprCoreType.FLOAT)));
+            hasEntry("_maxscore", ExprCoreType.FLOAT),
+            hasEntry("_highlight", ExprCoreType.STRUCT)));
   }
 
   @Test

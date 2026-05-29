@@ -235,11 +235,13 @@ public class OpenSearchResponse implements Iterable<ExprValue> {
             }
           } else if (metaDataField.equals(METADATA_FIELD_SORT)) {
             builder.put(METADATA_FIELD_SORT, new ExprLongValue(hit.getSeqNo()));
-          } else { // if (metaDataField.equals(METADATA_FIELD_ROUTING)){
+          } else if (metaDataField.equals(METADATA_FIELD_ROUTING)) {
             builder.put(
                 METADATA_FIELD_ROUTING,
                 new ExprStringValue(hit.getShard() == null ? null : hit.getShard().toString()));
           }
+          // _highlight is populated separately via addHighlightsToBuilder; other reserved
+          // metadata fields not listed above are intentionally skipped here.
         });
   }
 

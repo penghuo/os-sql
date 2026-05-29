@@ -20,6 +20,14 @@ public interface OpenSearchConstants {
 
   String METADATA_FIELD_ROUTING = "_routing";
 
+  /**
+   * Synthetic per-row column populated by the highlight pushdown (when the user issues a {@code
+   * highlight} clause). Always present in the table row-type so the SqlValidator can resolve
+   * references after the SqlNodePipeline round-trip; the visitor projects it only when highlight
+   * was actually requested, and {@code tryToRemoveMetaFields} strips it otherwise.
+   */
+  String METADATA_FIELD_HIGHLIGHT = "_highlight";
+
   String IMPLICIT_FIELD_TIMESTAMP = "@timestamp";
 
   java.util.Map<String, ExprType> METADATAFIELD_TYPE_MAP =
@@ -30,5 +38,6 @@ public interface OpenSearchConstants {
           METADATA_FIELD_SCORE, ExprCoreType.FLOAT,
           METADATA_FIELD_MAXSCORE, ExprCoreType.FLOAT,
           METADATA_FIELD_SORT, ExprCoreType.LONG,
-          METADATA_FIELD_ROUTING, ExprCoreType.STRING);
+          METADATA_FIELD_ROUTING, ExprCoreType.STRING,
+          METADATA_FIELD_HIGHLIGHT, ExprCoreType.STRUCT);
 }

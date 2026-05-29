@@ -251,13 +251,15 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     context.relBuilder.scan(node.getTableQualifiedName().getParts());
     RelNode scan = context.relBuilder.peek();
 
-    // Eagerly push down highlight config to the scan (highlight is a scan hint, not an operator)
+    // Eagerly push down highlight config to the scan (highlight is a scan hint, not an operator).
+    // Do NOT clear the config — the SqlNodePipeline round-trip rebuilds the scan via
+    // OpenSearchIndex.toRel (so the CalciteLogicalIndexScan is fresh with an empty
+    // PushDownContext); QueryService re-applies the highlight pushdown post-revalidate.
     if (context.getHighlightConfig() != null && scan instanceof HighlightPushDown) {
       RelNode newScan = ((HighlightPushDown) scan).pushDownHighlight(context.getHighlightConfig());
       context.relBuilder.build(); // pop old scan
       context.relBuilder.push(newScan);
       scan = newScan;
-      context.setHighlightConfig(null); // consumed
     }
 
     if (scan instanceof AliasFieldsWrappable) {
@@ -466,10 +468,15 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     List<RexNode> expandedFields =
         expandProjectFields(node.getProjectList(), currentFields, context);
 
-    // Include _highlight in projections when the highlight column is present in the schema
-    int hlIndex = currentFields.indexOf(HighlightExpression.HIGHLIGHT_FIELD);
-    if (hlIndex >= 0) {
-      expandedFields.add(context.relBuilder.field(hlIndex));
+    // _highlight is now always present in the catalog row-type as a reserved metadata column
+    // (post-C6: pre-registered in OpenSearchIndex.METADATAFIELD_TYPE_MAP so the validator can
+    // resolve it after the SqlNodePipeline round-trip). Only project it when the user actually
+    // requested highlighting; tryToRemoveMetaFields strips the column otherwise.
+    if (context.isHighlightRequested()) {
+      int hlIndex = currentFields.indexOf(HighlightExpression.HIGHLIGHT_FIELD);
+      if (hlIndex >= 0) {
+        expandedFields.add(context.relBuilder.field(hlIndex));
+      }
     }
 
     if (node.isExcluded()) {
@@ -649,9 +656,15 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
   private static void tryToRemoveMetaFields(CalcitePlanContext context, boolean excludeByForce) {
     if (excludeByForce || !context.isProjectVisited()) {
       List<String> originalFields = context.relBuilder.peek().getRowType().getFieldNames();
+      // _highlight is a reserved metadata column but must remain in the output when the user
+      // issued a highlight clause (post-C6: the column is now always in the catalog row-type;
+      // strip it only for non-highlight queries).
+      boolean keepHighlight = context.isHighlightRequested();
       List<RexNode> metaFieldsRef =
           originalFields.stream()
               .filter(OpenSearchConstants.METADATAFIELD_TYPE_MAP::containsKey)
+              .filter(
+                  f -> !(keepHighlight && HighlightExpression.HIGHLIGHT_FIELD.equals(f)))
               .map(metaField -> (RexNode) context.relBuilder.field(metaField))
               .toList();
       // Remove metadata fields if there is and ensure there are other fields.

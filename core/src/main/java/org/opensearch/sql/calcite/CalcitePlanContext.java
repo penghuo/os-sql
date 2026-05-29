@@ -47,6 +47,15 @@ public class CalcitePlanContext {
       ThreadLocal.withInitial(() -> true);
 
   @Getter @Setter private HighlightConfig highlightConfig;
+
+  /**
+   * Sticky flag set when a {@code highlight} clause was issued. Persists across the {@link
+   * #setHighlightConfig} clear that {@code visitRelation} performs after consuming the config, so
+   * downstream {@code visitProject} can decide whether to project the synthetic {@code _highlight}
+   * column (always present in the catalog row-type post-C6 fix).
+   */
+  @Getter @Setter private boolean highlightRequested = false;
+
   @Getter @Setter private boolean isResolvingJoinCondition = false;
   @Getter @Setter private boolean isResolvingSubquery = false;
   @Getter @Setter private boolean inCoalesceFunction = false;
@@ -99,6 +108,7 @@ public class CalcitePlanContext {
     this.rexBuilder = parent.rexBuilder; // Share the same rexBuilder
     this.functionProperties = parent.functionProperties;
     this.highlightConfig = parent.highlightConfig;
+    this.highlightRequested = parent.highlightRequested;
     this.rexLambdaRefMap = new HashMap<>(); // New map for lambda variables
     this.capturedVariables = new ArrayList<>(); // New list for captured variables
     this.inLambdaContext = true; // Mark that we're inside a lambda

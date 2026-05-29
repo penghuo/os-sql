@@ -602,12 +602,34 @@ public final class SqlNodePipeline {
             java.util.List<org.apache.calcite.rex.RexNode> projects =
                 new java.util.ArrayList<>(rowType.getFieldCount());
             java.util.List<String> names = new java.util.ArrayList<>(rowType.getFieldCount());
+            // Skip columns whose type contains ANY (e.g. MAP<VARCHAR, ANY> for the synthetic
+            // _highlight column) — SqlTypeUtil.convertTypeToSpec rejects ANY and the entire
+            // CAST list fails to unparse. The empty Values has no rows so dropping the
+            // column from the materialised representation is harmless; downstream operators
+            // referencing those columns are filtered by Filter(false) anyway.
+            org.apache.calcite.rel.type.RelDataTypeFactory.Builder narrowSchema =
+                values.getCluster().getTypeFactory().builder();
             for (int i = 0; i < rowType.getFieldCount(); i++) {
               org.apache.calcite.rel.type.RelDataTypeField f = rowType.getFieldList().get(i);
+              if (containsAnyType(f.getType())) {
+                continue;
+              }
               org.apache.calcite.rex.RexNode nullLit = rexBuilder.makeNullLiteral(f.getType());
               projects.add(rexBuilder.makeAbstractCast(f.getType(), nullLit));
               names.add(f.getName());
+              narrowSchema.add(f.getName(), f.getType());
             }
+            // Rebuild the one-row Values with the narrowed schema (mirrors the project list).
+            com.google.common.collect.ImmutableList.Builder<org.apache.calcite.rex.RexLiteral>
+                narrowRowBuilder = com.google.common.collect.ImmutableList.builder();
+            for (org.apache.calcite.rel.type.RelDataTypeField f : narrowSchema.build().getFieldList()) {
+              narrowRowBuilder.add(rexBuilder.makeNullLiteral(f.getType()));
+            }
+            oneRow =
+                org.apache.calcite.rel.logical.LogicalValues.create(
+                    values.getCluster(),
+                    narrowSchema.build(),
+                    com.google.common.collect.ImmutableList.of(narrowRowBuilder.build()));
             RelNode projected =
                 org.apache.calcite.rel.logical.LogicalProject.create(
                     oneRow, java.util.Collections.emptyList(), projects, names, java.util.Set.of());
@@ -615,6 +637,28 @@ public final class SqlNodePipeline {
                 projected, rexBuilder.makeLiteral(false));
           }
         });
+  }
+
+  /**
+   * Recursively check whether the given type or any of its component types is {@link
+   * org.apache.calcite.sql.type.SqlTypeName#ANY}. Used to skip {@code CAST(NULL AS T)} on column
+   * types that {@code SqlTypeUtil.convertTypeToSpec} cannot serialise (e.g. {@code MAP<VARCHAR,
+   * ANY>} for the synthetic {@code _highlight} column).
+   */
+  private static boolean containsAnyType(org.apache.calcite.rel.type.RelDataType t) {
+    if (t.getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.ANY) {
+      return true;
+    }
+    if (t.getComponentType() != null && containsAnyType(t.getComponentType())) {
+      return true;
+    }
+    if (t.getKeyType() != null && containsAnyType(t.getKeyType())) {
+      return true;
+    }
+    if (t.getValueType() != null && containsAnyType(t.getValueType())) {
+      return true;
+    }
+    return false;
   }
 
   /**

@@ -151,6 +151,7 @@ public class QueryService {
                           buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
 
                   context.setHighlightConfig(highlightConfig);
+                  context.setHighlightRequested(highlightConfig != null);
 
                   // Wrap analyze with ANALYZING stage tracking
                   RelNode relNode =
@@ -203,6 +204,7 @@ public class QueryService {
                       CalcitePlanContext.create(
                           buildFrameworkConfig(), SysLimit.fromSettings(settings), queryType);
                   context.setHighlightConfig(highlightConfig);
+                  context.setHighlightRequested(highlightConfig != null);
                   context.run(
                       () -> {
                         RelNode relNode = revalidateThroughSqlNode(analyze(plan, context), context);
@@ -399,7 +401,45 @@ public class QueryService {
    * @param context Calcite context
    */
   private RelNode revalidateThroughSqlNode(RelNode relNode, CalcitePlanContext context) {
-    return SqlNodePipeline.revalidate(relNode, context);
+    RelNode roundTripped = SqlNodePipeline.revalidate(relNode, context);
+    return reapplyHighlightPushDown(roundTripped, context);
+  }
+
+  /**
+   * The {@link SqlNodePipeline} round-trip rebuilds every {@code TableScan} via {@link
+   * org.apache.calcite.plan.RelOptTable#toRel(org.apache.calcite.plan.RelOptTable.ToRelContext)},
+   * producing a fresh {@code CalciteLogicalIndexScan} whose {@code PushDownContext} is empty.
+   * Highlight is the only scan-level pushdown configured pre-revalidate (other pushdowns are
+   * driven by HepProgram rules that fire after this point). Re-apply it here using the still-
+   * populated {@code highlightConfig} on the context so the highlight clause survives the
+   * round-trip and reaches the OpenSearch request builder.
+   */
+  private static RelNode reapplyHighlightPushDown(RelNode root, CalcitePlanContext context) {
+    org.opensearch.sql.ast.tree.HighlightConfig hl = context.getHighlightConfig();
+    if (hl == null) {
+      return root;
+    }
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (visited instanceof org.opensearch.sql.calcite.plan.HighlightPushDown hp
+                && !hasHighlightPushdown(visited)) {
+              return hp.pushDownHighlight(hl);
+            }
+            return visited;
+          }
+        });
+  }
+
+  private static boolean hasHighlightPushdown(RelNode node) {
+    // Best-effort: re-applying is idempotent at the AbstractCalciteIndexScan level (the request
+    // builder rebuilds the highlight section every time), but avoid stacking duplicate
+    // PushDownType.HIGHLIGHT entries by checking via reflection-free toString contains. The
+    // safer check would expose getPushDownContext on the HighlightPushDown interface, but
+    // that's a wider API change.
+    return node.toString().contains("HIGHLIGHT");
   }
 
   private static RelNode convertToCalcitePlan(RelNode osPlan, CalcitePlanContext context) {

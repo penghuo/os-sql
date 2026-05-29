@@ -36,7 +36,6 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
-import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -86,12 +85,11 @@ public class CalciteLogicalIndexScan extends AbstractCalciteIndexScan implements
   }
 
   public RelNode pushDownHighlight(HighlightConfig highlightConfig) {
-    RelDataTypeFactory.Builder schemaBuilder = getCluster().getTypeFactory().builder();
-    schemaBuilder.addAll(getRowType().getFieldList());
-    schemaBuilder.add(
-        HighlightExpression.HIGHLIGHT_FIELD,
-        getCluster().getTypeFactory().createSqlType(SqlTypeName.ANY));
-    CalciteLogicalIndexScan newScan = copyWithNewSchema(schemaBuilder.build());
+    // _highlight is registered as a reserved metadata column on the table catalog (see
+    // OpenSearchIndex.METADATAFIELD_TYPE_MAP), so the SqlValidator can resolve it after the
+    // SqlNodePipeline round-trip without a per-scan row-type mutation. Just record the
+    // pushdown action so the OpenSearch request includes the highlight clause at runtime.
+    CalciteLogicalIndexScan newScan = copy();
     newScan
         .getPushDownContext()
         .add(

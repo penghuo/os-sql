@@ -62,6 +62,13 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
 
   public static final String METADATA_FIELD_ROUTING = "_routing";
 
+  /**
+   * Synthetic column populated when the user issues a {@code highlight} clause. Pre-registered in
+   * the table catalog so the SqlValidator can resolve the column after the SqlNodePipeline
+   * round-trip; the visitor only projects it when highlight was actually requested.
+   */
+  public static final String METADATA_FIELD_HIGHLIGHT = "_highlight";
+
   public static final java.util.Map<String, ExprType> METADATAFIELD_TYPE_MAP =
       new LinkedHashMap<>() {
         {
@@ -71,6 +78,7 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
           put(METADATA_FIELD_MAXSCORE, ExprCoreType.FLOAT);
           put(METADATA_FIELD_SORT, ExprCoreType.LONG);
           put(METADATA_FIELD_ROUTING, ExprCoreType.STRING);
+          put(METADATA_FIELD_HIGHLIGHT, ExprCoreType.STRUCT);
         }
       };
 

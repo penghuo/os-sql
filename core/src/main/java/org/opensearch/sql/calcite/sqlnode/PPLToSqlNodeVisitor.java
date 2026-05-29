@@ -1030,7 +1030,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         throw new UnsupportedOperationException(
             "Unexpected window function: " + fnLower.toUpperCase(java.util.Locale.ROOT));
       }
-      SqlNode aggNode = aggCall(aggInput);
+      SqlNode aggNode = aggCall(aggInput, /* windowed */ true);
       SqlNode window =
           SqlWindow.create(
               null,
@@ -1862,6 +1862,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * distinct_count}). count() with {@link AllFields} arg becomes {@code COUNT(*)}.
    */
   private SqlNode aggCall(UnresolvedExpression e) {
+    return aggCall(e, false);
+  }
+
+  /**
+   * Build a Calcite aggregate call. When {@code windowed} is true, the call will be used inside an
+   * OVER clause: PPL's nullable AVG/VAR/STDDEV variants have no window-context enumerable
+   * implementation, so fall back to the standard SQL operators (and pair with a CASE-WHEN-COUNT
+   * guard at the call site for the empty-group → NULL semantics).
+   */
+  private SqlNode aggCall(UnresolvedExpression e, boolean windowed) {
     if (!(e instanceof AggregateFunction af)) {
       throw new UnsupportedOperationException(
           "stats aggregator must be an AggregateFunction, got: " + e.getClass().getSimpleName());
@@ -1900,15 +1910,36 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         switch (fnLower) {
           case "count" -> SqlStdOperatorTable.COUNT;
           case "sum" -> SqlStdOperatorTable.SUM;
-          case "avg" -> SqlStdOperatorTable.AVG;
+          // PPL stats AVG over an empty/all-NULL group should return NULL — Calcite's standard
+          // AVG return type is NOT NULL and trips a "Cannot convert null to double" runtime error
+          // when the group is empty. PPLBuiltinOperators.AVG_NULLABLE is a nullable wrapper that
+          // returns NULL in that case. In window context, the nullable variant has no enumerable
+          // implementor, so we use standard AVG and pair with a CASE-WHEN-COUNT guard at the
+          // visitWindow call site.
+          case "avg" ->
+              windowed
+                  ? SqlStdOperatorTable.AVG
+                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.AVG_NULLABLE;
           case "min" -> SqlStdOperatorTable.MIN;
           case "max" -> SqlStdOperatorTable.MAX;
           // PPL `stddev` is sample-stddev (Bessel's correction), `stddev_pop` is population
-          // form. Mirror Calcite's SqlStdOperatorTable directly. `var_samp`/`var_pop` likewise.
-          case "stddev", "stddev_samp" -> SqlStdOperatorTable.STDDEV_SAMP;
-          case "stddev_pop" -> SqlStdOperatorTable.STDDEV_POP;
-          case "variance", "var_samp" -> SqlStdOperatorTable.VAR_SAMP;
-          case "var_pop" -> SqlStdOperatorTable.VAR_POP;
+          // form. Same nullable-vs-windowed dispatch as AVG.
+          case "stddev", "stddev_samp" ->
+              windowed
+                  ? SqlStdOperatorTable.STDDEV_SAMP
+                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.STDDEV_SAMP_NULLABLE;
+          case "stddev_pop" ->
+              windowed
+                  ? SqlStdOperatorTable.STDDEV_POP
+                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.STDDEV_POP_NULLABLE;
+          case "variance", "var_samp" ->
+              windowed
+                  ? SqlStdOperatorTable.VAR_SAMP
+                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.VAR_SAMP_NULLABLE;
+          case "var_pop" ->
+              windowed
+                  ? SqlStdOperatorTable.VAR_POP
+                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.VAR_POP_NULLABLE;
           // percentile/percentile_approx/median dispatch to the OpenSearch T-Digest UDAF.
           // median(x) is shorthand for percentile_approx(x, 50).
           case "percentile", "percentile_approx", "median" ->

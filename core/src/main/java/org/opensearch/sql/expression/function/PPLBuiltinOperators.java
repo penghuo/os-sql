@@ -186,7 +186,12 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator BINARY = new BinaryFunction().toUDF("BINARY");
 
   // Datetime function
-  public static final SqlOperator TIMESTAMP = new TimestampFunction().toUDF("TIMESTAMP");
+  // Renamed from "TIMESTAMP" / "DATE" because those are reserved keywords in the Babel parser
+  // (the round-trip parser): `TIMESTAMP('1997-01-01 00:00:00')` parses as the SQL TIMESTAMP type
+  // constructor, not a function call. Renaming to PPL_-prefixed function names routes the call
+  // to FUNCTION-syntax binding so the unparser emits `PPL_TIMESTAMP(...)` which the Babel parser
+  // accepts.
+  public static final SqlOperator TIMESTAMP = new TimestampFunction().toUDF("PPL_TIMESTAMP");
   public static final SqlOperator DATE =
       adaptExprMethodToUDF(
               DateTimeFunctions.class,
@@ -194,7 +199,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               PPLReturnTypes.DATE_FORCE_NULLABLE,
               NullPolicy.ARG0,
               PPLOperandTypes.DATE_OR_TIMESTAMP_OR_STRING)
-          .toUDF("DATE");
+          .toUDF("PPL_DATE");
   public static final SqlOperator YEARWEEK = new YearweekFunction().toUDF("YEARWEEK");
   public static final SqlOperator WEEKDAY = new WeekdayFunction().toUDF("WEEKDAY");
   public static final SqlOperator UNIX_TIMESTAMP =
@@ -221,7 +226,10 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator SUBDATE = new AddSubDateFunction(false).toUDF("SUBDATE");
   public static final SqlOperator DATE_ADD = new DateAddSubFunction(true).toUDF("DATE_ADD");
   public static final SqlOperator DATE_SUB = new DateAddSubFunction(false).toUDF("DATE_SUB");
-  public static final SqlOperator EXTRACT = new ExtractFunction().toUDF("EXTRACT");
+  // PPL_EXTRACT — EXTRACT is a Calcite/Babel special-syntax built-in (EXTRACT(unit FROM expr)).
+  // PPL's EXTRACT takes the unit as a string literal: EXTRACT('YEAR', ts). Distinct name so the
+  // parser binds to the PPL FUNCTION-syntax UDF rather than the SQL built-in.
+  public static final SqlOperator EXTRACT = new ExtractFunction().toUDF("PPL_EXTRACT");
   public static final SqlOperator YEAR = new DatePartFunction(TimeUnit.YEAR).toUDF("YEAR");
   public static final SqlOperator QUARTER = new DatePartFunction(TimeUnit.QUARTER).toUDF("QUARTER");
   public static final SqlOperator MONTH = new DatePartFunction(TimeUnit.MONTH).toUDF("MONTH");
@@ -262,6 +270,9 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               NullPolicy.ANY,
               PPLOperandTypes.TIMESTAMP_OR_STRING_STRING_STRING)
           .toUDF("CONVERT_TZ");
+  // PPL_DATEDIFF (NOT "DATEDIFF") because Calcite's Babel parser knows DATEDIFF as a
+  // special-syntax built-in (DATEDIFF(<unit-keyword>, ts1, ts2)). Use a distinct name so the
+  // parser binds to the PPL UDF via FUNCTION syntax rather than the built-in.
   public static final SqlOperator DATEDIFF =
       adaptExprMethodWithPropertiesToUDF(
               DateTimeFunctions.class,
@@ -269,7 +280,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               ReturnTypes.BIGINT_FORCE_NULLABLE,
               NullPolicy.ANY,
               PPLOperandTypes.DATETIME_DATETIME)
-          .toUDF("DATEDIFF");
+          .toUDF("PPL_DATEDIFF");
   // PPL_TIMESTAMPDIFF (NOT "TIMESTAMPDIFF") because Calcite's parser knows TIMESTAMPDIFF as a
   // special-syntax built-in: TIMESTAMPDIFF(<unit-keyword>, ts1, ts2) where the unit MUST be a
   // bare identifier. PPL's TIMESTAMPDIFF UDF takes the unit as a string literal and would
@@ -338,6 +349,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
           .toUDF("STR_TO_DATE");
   public static final SqlOperator SYSDATE = new SysdateFunction().toUDF("SYSDATE");
   public static final SqlOperator SEC_TO_TIME = new SecToTimeFunction().toUDF("SEC_TO_TIME");
+  // Renamed to PPL_TIME — see PPL_TIMESTAMP above for rationale (TIME is a reserved keyword).
   public static final SqlOperator TIME =
       adaptExprMethodToUDF(
               DateTimeFunctions.class,
@@ -345,7 +357,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               PPLReturnTypes.TIME_FORCE_NULLABLE,
               NullPolicy.ARG0,
               PPLOperandTypes.DATETIME_OR_STRING)
-          .toUDF("TIME");
+          .toUDF("PPL_TIME");
 
   // IP cast function
   public static final SqlOperator IP =
@@ -358,6 +370,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               NullPolicy.ARG0,
               PPLOperandTypes.TIME_OR_TIMESTAMP_OR_STRING)
           .toUDF("TIME_TO_SEC");
+  // Renamed PPL_TIMEDIFF — Babel has TimeDiffFunctionCall special-syntax built-in for TIME_DIFF.
   public static final SqlOperator TIMEDIFF =
       UserDefinedFunctionUtils.adaptExprMethodToUDF(
               DateTimeFunctions.class,
@@ -365,11 +378,12 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
               PPLReturnTypes.TIME_FORCE_NULLABLE,
               NullPolicy.ANY,
               PPLOperandTypes.TIME_TIME)
-          .toUDF("TIME_DIFF");
+          .toUDF("PPL_TIMEDIFF");
   // Renamed to PPL_TIMESTAMPADD: same reason as PPL_TIMESTAMPDIFF — Calcite's parser knows
   // TIMESTAMPADD as a special-syntax built-in TIMESTAMPADD(<unit-keyword>, n, ts), incompatible
   // with PPL's quoted-string unit form. Use a distinct name to avoid the parser binding.
-  public static final SqlOperator TIMESTAMPADD = new TimestampAddFunction().toUDF("PPL_TIMESTAMPADD");
+  public static final SqlOperator TIMESTAMPADD =
+      new TimestampAddFunction().toUDF("PPL_TIMESTAMPADD");
   public static final SqlOperator TO_DAYS =
       adaptExprMethodToUDF(
               DateTimeFunctions.class,
@@ -411,17 +425,21 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator PATTERN_PARSER =
       new PatternParserFunctionImpl().toUDF("PATTERN_PARSER");
 
-  public static final SqlOperator FORALL = new ForallFunctionImpl().toUDF("forall");
-  public static final SqlOperator EXISTS = new ExistsFunctionImpl().toUDF("exists");
-  public static final SqlOperator ARRAY = new ArrayFunctionImpl().toUDF("array");
-  public static final SqlOperator MAP_APPEND = new MapAppendFunctionImpl().toUDF("map_append");
+  // Lambda collection UDFs renamed with PPL_ prefix because their unprefixed names collide with
+  // Babel parser keywords/built-ins (EXISTS is the subquery keyword; ARRAY/FILTER/TRANSFORM are
+  // SQL standard functions with special-syntax binding). Using PPL_-prefixed names routes the
+  // call to FUNCTION-syntax lookup, allowing the SqlNodePipeline round-trip to succeed.
+  public static final SqlOperator FORALL = new ForallFunctionImpl().toUDF("PPL_FORALL");
+  public static final SqlOperator EXISTS = new ExistsFunctionImpl().toUDF("PPL_EXISTS");
+  public static final SqlOperator ARRAY = new ArrayFunctionImpl().toUDF("PPL_ARRAY");
+  public static final SqlOperator MAP_APPEND = new MapAppendFunctionImpl().toUDF("MAP_APPEND");
   public static final SqlOperator MAP_REMOVE = new MapRemoveFunctionImpl().toUDF("MAP_REMOVE");
-  public static final SqlOperator MVAPPEND = new MVAppendFunctionImpl().toUDF("mvappend");
-  public static final SqlOperator MVZIP = new MVZipFunctionImpl().toUDF("mvzip");
-  public static final SqlOperator MVFIND = new MVFindFunctionImpl().toUDF("mvfind");
-  public static final SqlOperator FILTER = new FilterFunctionImpl().toUDF("filter");
-  public static final SqlOperator TRANSFORM = new TransformFunctionImpl().toUDF("transform");
-  public static final SqlOperator REDUCE = new ReduceFunctionImpl().toUDF("reduce");
+  public static final SqlOperator MVAPPEND = new MVAppendFunctionImpl().toUDF("MVAPPEND");
+  public static final SqlOperator MVZIP = new MVZipFunctionImpl().toUDF("MVZIP");
+  public static final SqlOperator MVFIND = new MVFindFunctionImpl().toUDF("MVFIND");
+  public static final SqlOperator FILTER = new FilterFunctionImpl().toUDF("PPL_FILTER");
+  public static final SqlOperator TRANSFORM = new TransformFunctionImpl().toUDF("PPL_TRANSFORM");
+  public static final SqlOperator REDUCE = new ReduceFunctionImpl().toUDF("PPL_REDUCE");
 
   private static final RelevanceQueryFunction RELEVANCE_QUERY_FUNCTION_INSTANCE =
       new RelevanceQueryFunction();
@@ -507,7 +525,7 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
           LogPatternAggFunction.class,
           "pattern",
           ReturnTypes.explicit(UserDefinedFunctionUtils.nullablePatternAggList),
-          null);
+          UDFOperandMetadata.permissiveVariadic());
   public static final SqlAggFunction LIST =
       createUserDefinedAggFunction(
           ListAggFunction.class, "LIST", PPLReturnTypes.STRING_ARRAY, PPLOperandTypes.ANY_SCALAR);

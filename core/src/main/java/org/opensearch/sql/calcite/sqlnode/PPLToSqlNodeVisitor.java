@@ -42,6 +42,7 @@ import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Append;
 import org.opensearch.sql.ast.tree.Bin;
 import org.opensearch.sql.ast.tree.Chart;
 import org.opensearch.sql.ast.tree.Convert;
@@ -859,6 +860,76 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     items.add(asAliased(bucketCall, alias));
     visible.add(alias);
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitAppend(Append node, Frame frame) {
+    // PPL `<main> | append [<subsearch>]` is UNION ALL of the main pipeline with the subsearch.
+    // PPL pads missing columns with NULL on each side so heterogeneous schemas can union. Use
+    // each side's frame.currentFields as the column-set oracle (visitProject / visitAggregation
+    // / visitFields keep this list authoritative).
+    SqlNode mainBody = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "append main side requires a known column list — call after a pipe that sets it");
+    }
+    List<String> mainCols = new ArrayList<>(frame.currentFields);
+
+    Frame subFrame = new Frame();
+    Frame savedExpr = this.exprFrame;
+    this.exprFrame = subFrame;
+    SqlNode sub;
+    try {
+      sub = stripImplicitMetaProjects(node.getSubSearch()).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExpr;
+    }
+    if (subFrame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "append subsearch requires a known column list — call after a pipe that sets it");
+    }
+    List<String> subCols = new ArrayList<>(subFrame.currentFields);
+
+    // Unified column order: main's order first, then sub's columns absent on main (preserving
+    // sub's order). Mirrors v2 emission shape so explain plans line up.
+    List<String> unified = new ArrayList<>(mainCols);
+    for (String c : subCols) {
+      if (!unified.contains(c)) {
+        unified.add(c);
+      }
+    }
+    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified);
+    SqlNode subPadded = padToUnifiedSchema(sub, subCols, unified);
+    SqlNode unioned =
+        new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(mainPadded, subPadded), POS);
+    SqlNodeList wrapItems = new SqlNodeList(POS);
+    wrapItems.add(SqlIdentifier.star(POS));
+    SqlNode wrapped =
+        new SqlSelect(
+            POS, null, wrapItems, unioned, null, null, null, null, null, null, null, null);
+    frame.currentFields = unified;
+    frame.joinHints = null;
+    frame.lastOrderBy = null;
+    return wrapped;
+  }
+
+  /**
+   * Wrap {@code body} with a SELECT that lists every column in {@code unified}, taking each from
+   * {@code body}'s {@code present} columns when available and emitting {@code NULL AS <col>} for
+   * columns absent from this side. Pads heterogeneous-schema unions so PPL's NULL-pad semantics is
+   * preserved.
+   */
+  private SqlNode padToUnifiedSchema(SqlNode body, List<String> present, List<String> unified) {
+    Set<String> presentSet = new java.util.LinkedHashSet<>(present);
+    SqlNodeList items = new SqlNodeList(POS);
+    for (String c : unified) {
+      if (presentSet.contains(c)) {
+        items.add(toIdentifier(c));
+      } else {
+        items.add(asAliased(SqlLiteral.createNull(POS), c));
+      }
+    }
+    return new SqlSelect(POS, null, items, body, null, null, null, null, null, null, null, null);
   }
 
   @Override

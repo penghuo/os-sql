@@ -109,6 +109,31 @@ public class GeoIpFunction extends ImplementorUDF {
       return fetchIpEnrichment(dataSource, ipAddress.toString(), options, nodeClient);
     }
 
+    /**
+     * 4-arg overload for the (String, String, String, NodeClient) shape that arises after the
+     * SqlValidator round-trip: the validator coerces the IP operand via the IP() UDF, but the
+     * runtime translator may resolve the IP-typed value to its underlying String representation,
+     * leaving the implementer's static-method lookup looking for a (String, String, String,
+     * NodeClient) signature. Without this overload, {@code Types.lookupMethod} fails with "while
+     * resolving method 'fetchIpEnrichment'".
+     */
+    public static Map<String, ?> fetchIpEnrichment(
+        String dataSource, String ipAddress, String commaSeparatedOptions, NodeClient nodeClient) {
+      String unquotedOptions = StringUtils.unquoteText(commaSeparatedOptions);
+      final Set<String> options =
+          Arrays.stream(unquotedOptions.split(",")).map(String::trim).collect(Collectors.toSet());
+      return fetchIpEnrichment(dataSource, ipAddress, options, nodeClient);
+    }
+
+    /**
+     * 3-arg overload for the (String, String, NodeClient) shape (no options). Same rationale as the
+     * 4-arg String overload above — covers the round-trip path where IP becomes String.
+     */
+    public static Map<String, ?> fetchIpEnrichment(
+        String dataSource, String ipAddress, NodeClient nodeClient) {
+      return fetchIpEnrichment(dataSource, ipAddress, Collections.emptySet(), nodeClient);
+    }
+
     private static Map<String, ?> fetchIpEnrichment(
         String dataSource, String ipAddress, Set<String> options, NodeClient nodeClient) {
       IpEnrichmentActionClient ipClient = new IpEnrichmentActionClient(nodeClient);

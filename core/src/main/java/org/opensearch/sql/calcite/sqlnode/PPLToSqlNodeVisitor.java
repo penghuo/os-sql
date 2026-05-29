@@ -2297,11 +2297,47 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     org.apache.calcite.sql.SqlOperator opOverride =
         switch (name) {
           case "isnull", "is_null", "is null" -> SqlStdOperatorTable.IS_NULL;
-          case "isnotnull", "is_not_null", "is not null" -> SqlStdOperatorTable.IS_NOT_NULL;
+          case "isnotnull", "is_not_null", "is not null", "ispresent" ->
+              SqlStdOperatorTable.IS_NOT_NULL;
           case "like" -> SqlStdOperatorTable.LIKE;
           case "not_like", "not like" -> SqlStdOperatorTable.NOT_LIKE;
+          // Standard SQL conditional functions: COALESCE / NULLIF. PPL's funcExpr unresolved-
+          // function path can't always resolve them via case-sensitive validator lookup;
+          // dispatch directly.
+          case "coalesce" -> SqlStdOperatorTable.COALESCE;
+          case "nullif" -> SqlStdOperatorTable.NULLIF;
           default -> null;
         };
+    // PPL `isempty(x)` — NULL or empty string. PPL `isblank(x)` — NULL or whitespace-only.
+    // Both desugar to OR-chains because Calcite's IS_EMPTY postfix operator at the validator
+    // level only accepts collection types. Mirrors the legacy SqlNode visitor's permissive
+    // implementations (without the post-RelNode shuttle that would rewrite to v2's
+    // IS_EMPTY(TRIM(...)) shape — those rewrites only matter for explain-plan parity).
+    if (("isempty".equals(name) || "isblank".equals(name)) && args.size() == 1) {
+      SqlNode a = args.get(0);
+      SqlNode toCheck = a;
+      if ("isblank".equals(name)) {
+        // For isblank, strip whitespace before length check.
+        toCheck =
+            new SqlBasicCall(
+                SqlStdOperatorTable.REPLACE,
+                List.of(
+                    a, SqlLiteral.createCharString(" ", POS), SqlLiteral.createCharString("", POS)),
+                POS);
+      }
+      SqlNode lenZero =
+          new SqlBasicCall(
+              SqlStdOperatorTable.EQUALS,
+              List.of(
+                  new SqlBasicCall(
+                      org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH, List.of(toCheck), POS),
+                  SqlLiteral.createExactNumeric("0", POS)),
+              POS);
+      return new SqlBasicCall(
+          SqlStdOperatorTable.OR,
+          List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
+          POS);
+    }
     if (opOverride != null) {
       return new SqlBasicCall(opOverride, args, POS);
     }

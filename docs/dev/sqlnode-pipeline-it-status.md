@@ -142,7 +142,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | 57 | CalciteMvCombineCommandIT | ✅ | All pass. |
 | 58 | CalciteMvExpandCommandIT | ✅ | All pass. |
 | 59 | CalciteMultiValueStatsIT | ✅ | All pass. |
-| 60 | CalciteNoMvCommandIT | ⚠️ | 19/20 pass after `permissiveVariadic` + lambda return-type fixes. 1 whitespace-difference fail remaining. |
+| 60 | CalciteNoMvCommandIT | ✅ | 20/20 pass after short-circuiting `visitNoMv` when the target field is missing — emit `eval field = ""` directly instead of routing through `coalesce(mvjoin(array_compact(NULL), '\n'), '')`. The default rewrite would propagate Void.class through to `RexImpTable.ARRAY_JOIN → SqlFunctions.arrayToString(Void, String)` which has no overload, and Calcite codegen failed with `AssertionError`. |
 
 ## Phase 10 — Date/time / parse / rex / dedup / fillnull / sort / eval
 

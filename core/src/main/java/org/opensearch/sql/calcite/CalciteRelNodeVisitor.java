@@ -4050,6 +4050,16 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
    * <p>The explicit cast to Eval is safe because {@link NoMv#rewriteAsEval()} always returns a
    * newly constructed Eval instance and never returns null or other types.
    *
+   * <p>Missing-field short-circuit: if the target field is absent from the input row-type, the
+   * default rewrite would funnel a NULL-typed literal through {@code
+   * coalesce(mvjoin(array_compact(NULL), '\n'), '')}. Calcite's enumerable codegen for {@code
+   * ARRAY_JOIN} then resolves to {@code SqlFunctions.arrayToString(Void, String)} via {@code
+   * Types.lookupMethod} — which fails with {@code AssertionError} because no such overload exists
+   * (only {@code arrayToString(List, String)}). Detect the missing field here, where the input
+   * row-type is available, and emit an {@code Eval} that simply assigns an empty string. The
+   * user-visible result is identical (an empty-string column for a missing field) without
+   * exercising the array codegen path.
+   *
    * @param node the NoMv node to visit
    * @param context the Calcite plan context containing schema and optimization information
    * @return the RelNode resulting from visiting the rewritten Eval node
@@ -4057,7 +4067,37 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
    */
   @Override
   public RelNode visitNoMv(NoMv node, CalcitePlanContext context) {
-    return visitEval((Eval) node.rewriteAsEval(), context);
+    visitChildren(node, context);
+    String fieldName = node.getField().getField().toString();
+    List<String> currentFields = context.relBuilder.peek().getRowType().getFieldNames();
+    if (!currentFields.contains(fieldName)) {
+      // Missing field — emit `eval field = ""` directly. The default rewrite would go through
+      // coalesce(mvjoin(array_compact(NULL), '\n'), '') and trip the ARRAY_JOIN(Void, String)
+      // codegen lookup at runtime.
+      org.opensearch.sql.ast.expression.Let emptyLet =
+          new org.opensearch.sql.ast.expression.Let(
+              node.getField(),
+              new org.opensearch.sql.ast.expression.Literal(
+                  "", org.opensearch.sql.ast.expression.DataType.STRING));
+      RexNode rex = rexVisitor.analyze(emptyLet, context);
+      String alias =
+          ((RexLiteral) ((RexCall) rex).getOperands().get(1)).getValueAs(String.class);
+      projectPlusOverriding(List.of(rex), List.of(alias), context);
+      return context.relBuilder.peek();
+    }
+    // Field present — rewrite to coalesce(mvjoin(array_compact(<field>), '\n'), '') which is
+    // a no-op on a single-value field and joins array elements on a multi-value field.
+    Eval rewritten = (Eval) node.rewriteAsEval();
+    rewritten
+        .getExpressionList()
+        .forEach(
+            expr -> {
+              RexNode eval = rexVisitor.analyze(expr, context);
+              String alias =
+                  ((RexLiteral) ((RexCall) eval).getOperands().get(1)).getValueAs(String.class);
+              projectPlusOverriding(List.of(eval), List.of(alias), context);
+            });
+    return context.relBuilder.peek();
   }
 
   /**

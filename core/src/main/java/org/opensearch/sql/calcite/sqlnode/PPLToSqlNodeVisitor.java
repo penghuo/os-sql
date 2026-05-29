@@ -261,19 +261,30 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     //      The validator resolves the parts itself — alias-qualified column vs STRUCT-field
     //      access is its job, not ours.
     //
-    //   2. Disambiguate header labels for duplicate suffixes. Calcite labels a multi-part ref
-    //      `t1.name` as just `name`; if the user wrote `| fields t1.name, t2.name`, both
-    //      identifiers would label as `name` and Calcite auto-uniquifies the dup as `name0`.
-    //      PPL's convention: the first occurrence keeps the bare suffix; subsequent occurrences
-    //      keep their original dotted label. Wrap second+ dotted occurrences as `t2.name AS
-    //      "t2.name"` (quoted so the dot survives in the resulting row-type field name).
+    //   2. Disambiguate header labels for dotted refs over a join scope. Calcite labels a
+    //      multi-part ref `t1.name` as just `name`; that's fine when the leaf is unique. Quote
+    //      with `<dotted> AS "<dotted>"` (preserving the dot in the row-type field name) when:
+    //        a. the leaf was already projected by an earlier item (avoid Calcite's `name0` dedup),
+    //        b. the dotted prefix matches the RIGHT join alias AND the leaf appears on BOTH sides
+    //           (PPL's bind-bare-to-LEFT means `b.col` would otherwise render identically to a
+    //           left-side bare ref).
+    //      Mirrors the legacy visitor's `joinScope`-aware projection rule.
     SqlNodeList selectList = new SqlNodeList(POS);
-    Set<String> seenSuffixes = new LinkedHashSet<>();
+    Set<String> seenLeaves = new LinkedHashSet<>();
+    JoinHints hints = frame.joinHints;
     for (String name : selected) {
       SqlIdentifier ref = qualifyIfAmbiguous(name, frame);
-      String suffix = name.substring(name.lastIndexOf('.') + 1);
-      boolean firstSuffix = seenSuffixes.add(suffix);
-      if (name.indexOf('.') >= 0 && !firstSuffix) {
+      String leaf = name.substring(name.lastIndexOf('.') + 1);
+      boolean dotted = name.indexOf('.') >= 0;
+      String prefix = dotted ? name.substring(0, name.indexOf('.')) : null;
+      boolean leafSeen = seenLeaves.contains(leaf);
+      boolean rightAliasOverlap =
+          dotted
+              && hints != null
+              && hints.rightAlias() != null
+              && hints.rightAlias().equals(prefix)
+              && hints.ambiguousColumns().contains(leaf);
+      if (dotted && (leafSeen || rightAliasOverlap)) {
         SqlIdentifier alias =
             new SqlIdentifier(
                 java.util.Collections.singletonList(name),
@@ -284,6 +295,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       } else {
         selectList.add(ref);
       }
+      seenLeaves.add(leaf);
     }
 
     // Peephole: if the child is a SELECT * with no projection of its own (visitSort/visitFilter/

@@ -535,26 +535,84 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitRename(Rename node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    // PPL `rename old1 as new1, old2 as new2` produces a new SELECT list with each renamed
-    // column as `<old> AS <new>` and all other columns passed through. Build the list explicitly
-    // so the row type's field names reflect the renames; downstream pipes see the new names.
-    java.util.Map<String, String> renames = new java.util.LinkedHashMap<>();
-    for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
-      String oldName = ((Field) m.getOrigin()).getField().toString();
-      String newName = ((Field) m.getTarget()).getField().toString();
-      renames.put(oldName, newName);
-    }
+    // PPL `rename old1 as new1, old2 as new2` rewrites named columns and passes the rest through.
+    // PPL also supports chained renames within a single command (`A as B, B as C` collapses to
+    // A→C) and wildcard patterns (`*ame as *AME` captures the wildcard substring and substitutes
+    // it into the replacement). When a rename target collides with an existing column, the
+    // existing column is dropped.
     List<String> incoming = frame.currentFields == null ? List.of() : frame.currentFields;
-    List<String> newVisible = new ArrayList<>(incoming.size());
-    SqlNodeList items = new SqlNodeList(POS);
-    for (String name : incoming) {
-      String mapped = renames.get(name);
-      if (mapped != null) {
-        items.add(asAliased(toIdentifier(name), mapped));
-        newVisible.add(mapped);
+    List<String> cols =
+        incoming.stream()
+            .filter(c -> !OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c))
+            .toList();
+    java.util.Map<String, String> currentName = new java.util.LinkedHashMap<>();
+    for (String c : cols) currentName.put(c, c);
+    for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+      String origin = ((Field) m.getOrigin()).getField().toString();
+      String target = ((Field) m.getTarget()).getField().toString();
+      boolean wildcard = origin.contains("*") || target.contains("*");
+      if (wildcard) {
+        long originStars = origin.chars().filter(c -> c == '*').count();
+        long targetStars = target.chars().filter(c -> c == '*').count();
+        if (originStars != targetStars) {
+          throw new IllegalArgumentException(
+              "Source and target patterns have different wildcard counts: "
+                  + origin
+                  + " has "
+                  + originStars
+                  + ", "
+                  + target
+                  + " has "
+                  + targetStars);
+        }
+        java.util.regex.Pattern re =
+            java.util.regex.Pattern.compile("^" + origin.replace("*", "(.*)") + "$");
+        for (java.util.Map.Entry<String, String> e : currentName.entrySet()) {
+          java.util.regex.Matcher m2 = re.matcher(e.getValue());
+          if (m2.matches()) {
+            StringBuilder out = new StringBuilder();
+            int captureIdx = 1;
+            for (int i = 0; i < target.length(); i++) {
+              char ch = target.charAt(i);
+              if (ch == '*' && captureIdx <= m2.groupCount()) {
+                out.append(m2.group(captureIdx++));
+              } else {
+                out.append(ch);
+              }
+            }
+            e.setValue(out.toString());
+          }
+        }
       } else {
-        items.add(toIdentifier(name));
-        newVisible.add(name);
+        for (java.util.Map.Entry<String, String> e : currentName.entrySet()) {
+          if (origin.equals(e.getValue())) {
+            e.setValue(target);
+            break;
+          }
+        }
+      }
+    }
+    java.util.Set<String> renamedTargets = new java.util.HashSet<>();
+    for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+      String origin = ((Field) m.getOrigin()).getField().toString();
+      String target = ((Field) m.getTarget()).getField().toString();
+      if (!target.contains("*") && !origin.equals(target)) {
+        renamedTargets.add(target);
+      }
+    }
+    List<String> newVisible = new ArrayList<>(cols.size());
+    SqlNodeList items = new SqlNodeList(POS);
+    for (String c : cols) {
+      String t = currentName.get(c);
+      if (!t.equals(c)) {
+        items.add(asAliased(toIdentifier(c), t));
+        newVisible.add(t);
+      } else if (renamedTargets.contains(c)) {
+        // Original column dropped because another rename targets this name.
+        continue;
+      } else {
+        items.add(toIdentifier(c));
+        newVisible.add(c);
       }
     }
     return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);

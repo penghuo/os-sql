@@ -42,12 +42,14 @@ import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
+import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
+import org.opensearch.sql.ast.tree.RareTopN;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Rename;
 import org.opensearch.sql.ast.tree.Reverse;
@@ -526,6 +528,262 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    */
   private static boolean isJoinUpstream(Frame frame) {
     return frame.joinHints != null;
+  }
+
+  @Override
+  public SqlNode visitRareTopN(RareTopN node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `rare F by G [usenull=false] [showcount=true]`:
+    //   1. Aggregate: `SELECT G, F, COUNT(*) AS count FROM <child> [WHERE G IS NOT NULL AND F IS
+    //      NOT NULL] GROUP BY G, F`.
+    //   2. Per-G partition cap: ROW_NUMBER() OVER (PARTITION BY G ORDER BY count [ASC for rare,
+    //      DESC for top]) <= N.
+    //   3. Final projection: `[G..., F..., count?]` with the helper column dropped, and the count
+    //      column also dropped when showcount=false.
+    org.opensearch.sql.ast.expression.Argument.ArgumentMap argMap =
+        org.opensearch.sql.ast.expression.Argument.ArgumentMap.of(node.getArguments());
+    String countFieldName = (String) argMap.get(RareTopN.Option.countField.name()).getValue();
+    boolean showCount = (Boolean) argMap.get(RareTopN.Option.showCount.name()).getValue();
+    boolean useNull = (Boolean) argMap.get(RareTopN.Option.useNull.name()).getValue();
+    boolean isTop = node.getCommandType() == RareTopN.CommandType.TOP;
+
+    // Step 1 — collect group keys (G followed by F in PPL row order) and the IS NOT NULL filter
+    // when useNull=false.
+    List<SqlNode> groupKeys = new ArrayList<>();
+    List<SqlNode> partitionKeys = new ArrayList<>();
+    List<String> groupNames = new ArrayList<>();
+    List<String> fieldNames = new ArrayList<>();
+    for (UnresolvedExpression g : node.getGroupExprList()) {
+      groupKeys.add(expr(g));
+      partitionKeys.add(expr(g));
+      groupNames.add(rareGroupName(g));
+    }
+    for (Field f : node.getFields()) {
+      groupKeys.add(expr(f.getField()));
+      fieldNames.add(f.getField().toString());
+    }
+
+    SqlNode aggFrom = from;
+    if (!useNull && !groupKeys.isEmpty()) {
+      // Wrap with a WHERE that drops NULL-keyed rows. SELECT * FROM <child> WHERE g IS NOT NULL
+      // AND f IS NOT NULL ...
+      SqlNode acc = null;
+      for (SqlNode k : groupKeys) {
+        SqlNode notNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(k), POS);
+        acc =
+            (acc == null)
+                ? notNull
+                : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(acc, notNull), POS);
+      }
+      SqlNodeList items = new SqlNodeList(POS);
+      items.add(SqlIdentifier.star(POS));
+      aggFrom =
+          new SqlSelect(POS, null, items, from, acc, null, null, null, null, null, null, null);
+    }
+
+    // Step 2 — aggregate: SELECT <group-keys>, COUNT(*) AS count FROM <aggFrom> GROUP BY ...
+    SqlNodeList aggItems = new SqlNodeList(POS);
+    for (int i = 0; i < node.getGroupExprList().size(); i++) {
+      aggItems.add(asAliased(groupKeys.get(i), groupNames.get(i)));
+    }
+    int fieldOffset = node.getGroupExprList().size();
+    for (int i = 0; i < node.getFields().size(); i++) {
+      aggItems.add(asAliased(groupKeys.get(fieldOffset + i), fieldNames.get(i)));
+    }
+    SqlNode countCall =
+        new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(SqlIdentifier.star(POS)), POS);
+    aggItems.add(asAliased(countCall, countFieldName));
+    SqlNodeList groupByList = new SqlNodeList(POS);
+    for (SqlNode k : groupKeys) {
+      groupByList.add(k);
+    }
+    SqlNode aggSelect =
+        new SqlSelect(
+            POS, null, aggItems, aggFrom, null, groupByList, null, null, null, null, null, null);
+
+    // Step 3 — ROW_NUMBER() over (PARTITION BY <G> ORDER BY count [DESC for TOP, ASC for rare])
+    // and filter <= N. Partition keys reference the count-aliased columns (so dotted refs become
+    // flat names after the wrap).
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    for (int i = 0; i < node.getGroupExprList().size(); i++) {
+      partitionBy.add(new SqlIdentifier(groupNames.get(i), POS));
+    }
+    SqlNodeList rnOrderBy = new SqlNodeList(POS);
+    SqlNode countRef = new SqlIdentifier(countFieldName, POS);
+    rnOrderBy.add(
+        isTop ? new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(countRef), POS) : countRef);
+    SqlNode rowNumWindow =
+        SqlWindow.create(
+            null,
+            null,
+            partitionBy,
+            rnOrderBy,
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode rowNum =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                rowNumWindow),
+            POS);
+    SqlNodeList wrappedItems = new SqlNodeList(POS);
+    wrappedItems.add(SqlIdentifier.star(POS));
+    wrappedItems.add(asAliased(rowNum, "__rn_rare__"));
+    SqlNode windowSelect =
+        new SqlSelect(
+            POS, null, wrappedItems, aggSelect, null, null, null, null, null, null, null, null);
+
+    SqlNode rnCheck =
+        new SqlBasicCall(
+            SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+            List.of(
+                new SqlIdentifier("__rn_rare__", POS),
+                SqlLiteral.createExactNumeric(node.getNoOfResults().toString(), POS)),
+            POS);
+
+    // Step 4 — final projection: [G..., F..., (count if showCount)] dropping the helper column.
+    SqlNodeList finalItems = new SqlNodeList(POS);
+    List<String> finalNames = new ArrayList<>();
+    for (String gn : groupNames) {
+      finalItems.add(new SqlIdentifier(gn, POS));
+      finalNames.add(gn);
+    }
+    for (String fn : fieldNames) {
+      finalItems.add(new SqlIdentifier(fn, POS));
+      finalNames.add(fn);
+    }
+    if (showCount) {
+      finalItems.add(countRef);
+      finalNames.add(countFieldName);
+    }
+    frame.currentFields = finalNames;
+    frame.lastOrderBy = null;
+    frame.joinHints = null;
+    return new SqlSelect(
+        POS, null, finalItems, windowSelect, rnCheck, null, null, null, null, null, null, null);
+  }
+
+  /**
+   * Extract a user-facing column label from a {@code rare ... by G} grouping expression. PPL
+   * accepts both {@link QualifiedName} (bare column refs) and {@link Field} wrappers; both render
+   * to a column name like {@code gender} or {@code addr.city}, not the AST's {@code toString()}.
+   */
+  private static String rareGroupName(UnresolvedExpression g) {
+    if (g instanceof QualifiedName qn) return qn.toString();
+    if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
+    return g.toString();
+  }
+
+  @Override
+  public SqlNode visitDedupe(Dedupe node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `dedup [N] F1, F2, ... [keepempty=true]` keeps at most N rows per <F1,F2,...> partition.
+    // Default N=1. SQL form via ROW_NUMBER:
+    //   SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY F1, F2 ORDER BY <upstream>) AS
+    //   __rn FROM <child>) WHERE __rn <= N
+    // With keepempty=true, NULL groups bypass the cap (each NULL row stays); with the default
+    // keepempty=false, also drop rows where any dedup field IS NULL.
+    // Consecutive dedup falls back to v2 (testConsecutiveDedup wraps in withFallbackEnabled).
+    int allowedDup = 1;
+    boolean keepEmpty = false;
+    boolean consecutive = false;
+    for (Argument arg : node.getOptions()) {
+      switch (arg.getArgName()) {
+        case "number" -> allowedDup = (Integer) arg.getValue().getValue();
+        case "keepempty" -> keepEmpty = (Boolean) arg.getValue().getValue();
+        case "consecutive" -> consecutive = (Boolean) arg.getValue().getValue();
+        default -> {}
+      }
+    }
+    if (allowedDup <= 0) {
+      throw new IllegalArgumentException("Number of duplicate events must be greater than 0");
+    }
+    if (consecutive) {
+      throw new UnsupportedOperationException(
+          "consecutive=true dedup is not yet supported in PPLToSqlNodeVisitor");
+    }
+    List<SqlNode> partitionFields = new ArrayList<>();
+    for (Field f : node.getFields()) {
+      partitionFields.add(expr(f.getField()));
+    }
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    for (SqlNode pf : partitionFields) {
+      partitionBy.add(pf);
+    }
+    SqlNodeList windowOrderBy = new SqlNodeList(POS);
+    if (frame.lastOrderBy != null) {
+      for (SqlNode k : frame.lastOrderBy) {
+        windowOrderBy.add(k);
+      }
+    }
+    SqlNode rowNumWindow =
+        SqlWindow.create(
+            null,
+            null,
+            partitionBy,
+            windowOrderBy,
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode rowNum =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                rowNumWindow),
+            POS);
+    SqlNodeList innerSelects = new SqlNodeList(POS);
+    innerSelects.add(SqlIdentifier.star(POS));
+    innerSelects.add(asAliased(rowNum, "__rn_dedup__"));
+    SqlNode innerSelect =
+        new SqlSelect(
+            POS, null, innerSelects, from, null, null, null, null, null, null, null, null);
+    SqlNode boundCheck =
+        new SqlBasicCall(
+            SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+            List.of(
+                new SqlIdentifier("__rn_dedup__", POS),
+                SqlLiteral.createExactNumeric(Integer.toString(allowedDup), POS)),
+            POS);
+    SqlNode whereCond;
+    if (keepEmpty) {
+      // (F1 IS NULL) OR (F2 IS NULL) OR ... OR (__rn_dedup__ <= N)
+      SqlNode acc = boundCheck;
+      for (SqlNode pf : partitionFields) {
+        acc =
+            new SqlBasicCall(
+                SqlStdOperatorTable.OR,
+                List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(pf), POS), acc),
+                POS);
+      }
+      whereCond = acc;
+    } else {
+      // (F1 IS NOT NULL) AND ... AND (__rn_dedup__ <= N)
+      SqlNode acc = boundCheck;
+      for (SqlNode pf : partitionFields) {
+        acc =
+            new SqlBasicCall(
+                SqlStdOperatorTable.AND,
+                List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(pf), POS), acc),
+                POS);
+      }
+      whereCond = acc;
+    }
+    SqlNodeList outerSelects = new SqlNodeList(POS);
+    outerSelects.add(SqlIdentifier.star(POS));
+    // Wrap returns SELECT * FROM (<inner>) WHERE <cond>. Downstream `| fields` projects away the
+    // helper `__rn_dedup__` column. Without an explicit projection the helper leaks into the
+    // user-facing row type — matches legacy behaviour for the `oracle == null` path.
+    return new SqlSelect(
+        POS, null, outerSelects, innerSelect, whereCond, null, null, null, null, null, null, null);
   }
 
   /**

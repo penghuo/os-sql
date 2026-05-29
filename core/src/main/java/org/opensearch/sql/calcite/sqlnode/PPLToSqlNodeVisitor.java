@@ -48,6 +48,7 @@ import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
 import org.opensearch.sql.ast.tree.Relation;
@@ -677,6 +678,70 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (g instanceof QualifiedName qn) return qn.toString();
     if (g instanceof Field f && f.getField() instanceof QualifiedName qn) return qn.toString();
     return g.toString();
+  }
+
+  @Override
+  public SqlNode visitParse(Parse node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    // PPL `parse <field> '<pattern>' [...]` extracts named groups from the regex match. Each
+    // named group becomes an extra column on the row. The group name may collide with the source
+    // field (e.g. `parse email '.+@(?<email>.+)'` overrides email); handle that by stripping the
+    // colliding name from the visible field list before appending.
+    org.opensearch.sql.ast.expression.ParseMethod method = node.getParseMethod();
+    if (method == org.opensearch.sql.ast.expression.ParseMethod.PATTERNS) {
+      throw new UnsupportedOperationException(
+          "patterns parse method not yet supported in PPLToSqlNodeVisitor");
+    }
+    String patternValue = (String) node.getPattern().getValue();
+    List<String> groups =
+        org.opensearch.sql.utils.ParseUtils.getNamedGroupCandidates(
+            method, patternValue, node.getArguments());
+    if (groups.isEmpty()) {
+      return from;
+    }
+    SqlNode source = expr(node.getSourceField());
+    SqlNode patternLit = SqlLiteral.createCharString(patternValue, POS);
+    SqlNode methodLit = SqlLiteral.createCharString(method.getName(), POS);
+
+    // Build the new SELECT list: first emit existing columns (or `*` if currentFields is null),
+    // dropping any names that collide with a parse group, then append `PARSE(...)['group'] AS
+    // <group>` for each group. Result: parse extends the row, replacing colliding columns.
+    java.util.Set<String> groupSet = new java.util.LinkedHashSet<>(groups);
+    List<String> visible =
+        frame.currentFields == null ? new ArrayList<>() : new ArrayList<>(frame.currentFields);
+    SqlNodeList items = new SqlNodeList(POS);
+    if (frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+    } else {
+      List<String> retained = new ArrayList<>();
+      for (String name : visible) {
+        if (groupSet.contains(name)) continue;
+        items.add(toIdentifier(name));
+        retained.add(name);
+      }
+      visible = retained;
+    }
+    for (String group : groups) {
+      SqlNode parseCall =
+          new SqlBasicCall(
+              new org.apache.calcite.sql.SqlUnresolvedFunction(
+                  new SqlIdentifier("PARSE", POS),
+                  null,
+                  null,
+                  null,
+                  null,
+                  org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+              List.of(source, patternLit, methodLit),
+              POS);
+      SqlNode itemCall =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(parseCall, SqlLiteral.createCharString(group, POS)),
+              POS);
+      items.add(asAliased(itemCall, group));
+      visible.add(group);
+    }
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 
   @Override

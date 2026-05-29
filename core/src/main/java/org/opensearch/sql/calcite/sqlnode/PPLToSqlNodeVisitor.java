@@ -4257,8 +4257,78 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
       return relevanceFieldListExpr(rfl);
     }
+    if (e instanceof org.opensearch.sql.ast.expression.subquery.InSubquery is) {
+      return inSubqueryExpr(is);
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.subquery.ExistsSubquery es) {
+      return existsSubqueryExpr(es);
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.subquery.ScalarSubquery ss) {
+      return scalarSubqueryExpr(ss);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * {@code EXISTS (<subquery>)} — outer-scope columns referenced from the subquery resolve via
+   * Calcite's correlated-subquery binding.
+   */
+  private SqlNode existsSubqueryExpr(org.opensearch.sql.ast.expression.subquery.ExistsSubquery es) {
+    Frame subFrame = new Frame();
+    Frame savedExpr = this.exprFrame;
+    this.exprFrame = subFrame;
+    SqlNode subQuery;
+    try {
+      subQuery = stripImplicitMetaProjects(es.getQuery()).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExpr;
+    }
+    return new SqlBasicCall(SqlStdOperatorTable.EXISTS, List.of(subQuery), POS);
+  }
+
+  /**
+   * Scalar subquery: emit the subquery's SqlSelect — Calcite treats it as a scalar expression when
+   * used in a comparable context (e.g. {@code col = (subquery)}).
+   */
+  private SqlNode scalarSubqueryExpr(org.opensearch.sql.ast.expression.subquery.ScalarSubquery ss) {
+    Frame subFrame = new Frame();
+    Frame savedExpr = this.exprFrame;
+    this.exprFrame = subFrame;
+    try {
+      return stripImplicitMetaProjects(ss.getQuery()).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExpr;
+    }
+  }
+
+  /**
+   * PPL {@code where col in [<subquery>]} — emit {@code col IN (subSqlNode)}. The subquery is
+   * walked in a fresh Frame so its own scope doesn't leak into the outer expression's frame.
+   * Multi-column IN wraps the LHS as a {@code ROW(...)} so Calcite's IN operator binds against a
+   * row-typed subquery output.
+   */
+  private SqlNode inSubqueryExpr(org.opensearch.sql.ast.expression.subquery.InSubquery is) {
+    Frame subFrame = new Frame();
+    Frame savedExpr = this.exprFrame;
+    this.exprFrame = subFrame;
+    SqlNode subQuery;
+    try {
+      subQuery = stripImplicitMetaProjects(is.getQuery()).accept(this, subFrame);
+    } finally {
+      this.exprFrame = savedExpr;
+    }
+    SqlNode left;
+    if (is.getValue().size() == 1) {
+      left = expr(is.getValue().get(0));
+    } else {
+      List<SqlNode> rowOperands = new ArrayList<>(is.getValue().size());
+      for (UnresolvedExpression v : is.getValue()) {
+        rowOperands.add(expr(v));
+      }
+      left = new SqlBasicCall(SqlStdOperatorTable.ROW, rowOperands, POS);
+    }
+    return new SqlBasicCall(SqlStdOperatorTable.IN, List.of(left, subQuery), POS);
   }
 
   /**

@@ -166,8 +166,75 @@ public final class SqlNodePipeline {
     RelNode roundTripped = sqlToRel(sql, context);
     roundTripped = stripIdentityProjects(roundTripped);
     roundTripped = unpadRelevanceMapKeys(roundTripped);
+    roundTripped = retypeItemForArrayCast(roundTripped);
     roundTripped = reattachCorrelateJoinTypes(original, roundTripped);
     return reattachAggregateHints(original, roundTripped);
+  }
+
+  /**
+   * Pattern aggregations return {@code ARRAY<MAP<VARCHAR, ANY>>}. The visitor's flatten step
+   * extracts named values from each MAP via {@code CAST(ITEM(map, 'sample_logs') AS VARCHAR
+   * ARRAY)}. Pre-round-trip the visitor uses a typed RexInputRef view so {@code ITEM} returns
+   * {@code ARRAY<VARCHAR>} directly. After the round-trip the typed view is gone — {@code
+   * map}'s declared value type is {@code ANY} so {@code ITEM(map, key)} returns {@code ANY},
+   * and {@code CAST(ANY AS ARRAY<...>)} hits Calcite's {@code RexToLixTranslator} assertion
+   * because {@code source.getComponentType()} returns null.
+   *
+   * <p>Walk the round-tripped tree, find {@code CAST(ITEM(mapExpr, key) AS ARRAY<X>)} where the
+   * ITEM source is a MAP whose value type is ANY, and replace the inner mapExpr with a typed
+   * view (a {@link org.apache.calcite.rex.RexInputRef} or {@link
+   * org.apache.calcite.rex.RexFieldAccess} re-typed as {@code MAP<key, ARRAY<X>>}). The ITEM
+   * call then returns {@code ARRAY<X>} and the CAST becomes a no-op identity.
+   */
+  private static RelNode retypeItemForArrayCast(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rb0 = root.getCluster().getRexBuilder();
+    org.apache.calcite.rex.RexShuttle shuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexCall visited =
+                (org.apache.calcite.rex.RexCall) super.visitCall(call);
+            if (visited.getKind() != org.apache.calcite.sql.SqlKind.CAST) return visited;
+            org.apache.calcite.rel.type.RelDataType target = visited.getType();
+            if (target.getSqlTypeName() != org.apache.calcite.sql.type.SqlTypeName.ARRAY) {
+              return visited;
+            }
+            org.apache.calcite.rex.RexNode inner = visited.getOperands().get(0);
+            if (!(inner instanceof org.apache.calcite.rex.RexCall itemCall)
+                || itemCall.getKind() != org.apache.calcite.sql.SqlKind.ITEM) {
+              return visited;
+            }
+            org.apache.calcite.rex.RexNode mapOperand = itemCall.getOperands().get(0);
+            org.apache.calcite.rex.RexNode keyOperand = itemCall.getOperands().get(1);
+            org.apache.calcite.rel.type.RelDataType mapType = mapOperand.getType();
+            if (mapType.getSqlTypeName() != org.apache.calcite.sql.type.SqlTypeName.MAP) {
+              return visited;
+            }
+            org.apache.calcite.rel.type.RelDataType valType = mapType.getValueType();
+            if (valType == null
+                || valType.getSqlTypeName() != org.apache.calcite.sql.type.SqlTypeName.ANY) {
+              return visited;
+            }
+            // Build a re-typed map operand: same RexInputRef/FieldAccess but with
+            // value type = target (ARRAY<X>). ITEM result type then becomes ARRAY<X>.
+            org.apache.calcite.rex.RexBuilder rb = rb0;
+            org.apache.calcite.rel.type.RelDataType newMapType =
+                rb.getTypeFactory().createMapType(mapType.getKeyType(), target);
+            // Use an explicit CAST so the validator agrees on the type. Then ITEM(map, key) on the
+            // CAST value returns ARRAY<X> directly.
+            org.apache.calcite.rex.RexNode retypedMap = rb.makeAbstractCast(newMapType, mapOperand);
+            org.apache.calcite.rex.RexNode newItem =
+                rb.makeCall(target, itemCall.getOperator(), java.util.List.of(retypedMap, keyOperand));
+            return newItem;
+          }
+        };
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            return super.visit(node).accept(shuttle);
+          }
+        });
   }
 
   /**

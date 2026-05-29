@@ -36,6 +36,8 @@ import org.opensearch.sql.ast.expression.Literal;
 import org.opensearch.sql.ast.expression.Not;
 import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
+import org.opensearch.sql.ast.expression.Span;
+import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
 import org.opensearch.sql.ast.tree.Aggregation;
 import org.opensearch.sql.ast.tree.Eval;
@@ -323,9 +325,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitAggregation(Aggregation node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    // SELECT list = group keys (aliased) + aggregate calls (aliased). FROM = child. GROUP BY =
-    // group key expressions (without aliases). The visible field list for the next pipe is the
-    // ordered list of agg-output names (PPL convention: aggregates first, then group keys).
+    // SELECT list = aggregates (aliased) + group keys (aliased). FROM = child. GROUP BY = group
+    // key expressions (without aliases). The visible field list for the next pipe is the ordered
+    // list of agg-output names (PPL convention: aggregates first, span (if any), then by-fields).
     SqlNodeList items = new SqlNodeList(POS);
     List<SqlNode> groupKeys = new ArrayList<>();
     List<String> visible = new ArrayList<>();
@@ -336,6 +338,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       SqlNode call = aggCall(core);
       items.add(asAliased(call, alias));
       visible.add(alias);
+    }
+    // span is a separate field on Aggregation (not in groupExprList). Emit it first in the group
+    // list to match PPL's `<aggs> by span(...), <by_fields>` row layout.
+    if (node.getSpan() != null) {
+      UnresolvedExpression spanExpr = node.getSpan();
+      String spanAlias = (spanExpr instanceof Alias a) ? a.getName() : spanAutoLabel(spanExpr);
+      UnresolvedExpression spanCore = (spanExpr instanceof Alias a) ? a.getDelegated() : spanExpr;
+      SqlNode keyExpr = expr(spanCore);
+      groupKeys.add(keyExpr);
+      items.add(asAliased(keyExpr, spanAlias));
+      visible.add(spanAlias);
     }
     for (UnresolvedExpression groupExpr : node.getGroupExprList()) {
       String alias = aggLabel(groupExpr);
@@ -348,6 +361,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Aggregations destroy row-level collation; clear the lastOrderBy hint.
     frame.lastOrderBy = null;
     return SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * Auto-generate the column label for a {@link Span} when the user didn't supply an explicit
+   * alias. Mirrors v2's display name: {@code span(<field>,<value>[,<unit>])}.
+   */
+  private static String spanAutoLabel(UnresolvedExpression e) {
+    if (!(e instanceof Span sp)) return e.toString();
+    StringBuilder sb = new StringBuilder("span(");
+    sb.append(sp.getField()).append(",").append(sp.getValue());
+    if (sp.getUnit() != null && sp.getUnit() != SpanUnit.NONE && sp.getUnit() != SpanUnit.UNKNOWN) {
+      sb.append(",").append(sp.getUnit().getName());
+    }
+    sb.append(")");
+    return sb.toString();
   }
 
   /**
@@ -813,8 +841,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
       return funcExpr(fn);
     }
+    if (e instanceof Span sp) {
+      return spanExpr(sp);
+    }
     throw new UnsupportedOperationException(
         "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  }
+
+  /**
+   * Translate {@link Span} (PPL {@code span(field, value [, unit])}) to a call on the SPAN
+   * built-in. {@code SpanFunction} dispatches numeric vs time bucket via the unit operand: a NULL
+   * cast to NULL type for the numeric branch, a string literal for time units.
+   */
+  private SqlNode spanExpr(Span sp) {
+    SqlNode field = expr(sp.getField());
+    SqlNode value = expr(sp.getValue());
+    SpanUnit unit = sp.getUnit();
+    SqlNode unitNode;
+    if (unit == SpanUnit.NONE || unit == SpanUnit.UNKNOWN) {
+      // SqlLiteral.createNull() types as ANY by default; SpanFunction's dispatcher relies on
+      // SqlTypeUtil.isNull. Cast to NULL to land on the numeric-bucket branch.
+      org.apache.calcite.sql.SqlDataTypeSpec nullSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.NULL, POS),
+              POS);
+      unitNode =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(SqlLiteral.createNull(POS), nullSpec),
+              POS);
+    } else {
+      unitNode = SqlLiteral.createCharString(unit.getName(), POS);
+    }
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
+        List.of(field, value, unitNode),
+        POS);
   }
 
   /**

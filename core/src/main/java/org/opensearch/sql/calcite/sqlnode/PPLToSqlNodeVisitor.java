@@ -4748,9 +4748,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * org.apache.calcite.sql.SqlUnresolvedFunction} so the validator's name lookup resolves them.
    */
   private SqlNode funcExpr(org.opensearch.sql.ast.expression.Function fn) {
+    // PPL parses the bare token `null` as a Field("null") (no typed null literal in PPL grammar).
+    // Inside coalesce/ifnull, the v2 path's QualifiedNameResolver replaces such operands with a
+    // typed NULL. Mirror that here at SqlNode time — without it, `coalesce(null, 42)` fails the
+    // validator with "Field [null] not found". (Missing-field replacement requires an oracle and
+    // is left for the row-type-aware path.)
+    String fnLower = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    boolean isCoalesce = "coalesce".equals(fnLower) || "ifnull".equals(fnLower);
     List<SqlNode> args = new ArrayList<>(fn.getFuncArgs().size());
     for (UnresolvedExpression a : fn.getFuncArgs()) {
-      args.add(expr(a));
+      if (isCoalesce && isNullLiteralRef(a)) {
+        args.add(SqlLiteral.createNull(POS));
+      } else {
+        args.add(expr(a));
+      }
     }
     org.apache.calcite.sql.SqlOperator op = arithmeticOperator(fn.getFuncName());
     if (op != null) {
@@ -5267,6 +5278,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * True if any operand of a {@code +} expression is statically a string — used to pick CONCAT over
    * PLUS when PPL's {@code +} acts as string concatenation.
    */
+  /**
+   * True when {@code e} is the PPL parse shape for a bare `null` token: a {@link QualifiedName} (or
+   * {@link Field} wrapping one) whose stringified name is "null" case-insensitively. PPL has no
+   * typed null literal in the grammar, so any place that wants to accept the keyword `null` must
+   * intercept this AST shape.
+   */
+  private static boolean isNullLiteralRef(UnresolvedExpression e) {
+    QualifiedName qn = null;
+    if (e instanceof QualifiedName q) qn = q;
+    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+    return qn != null && "null".equalsIgnoreCase(qn.toString());
+  }
+
   private static boolean hasStringOperand(List<UnresolvedExpression> args) {
     for (UnresolvedExpression a : args) {
       if (isStringExpr(a)) return true;

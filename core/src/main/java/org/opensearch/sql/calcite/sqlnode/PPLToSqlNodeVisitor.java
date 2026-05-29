@@ -872,15 +872,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "eventstats requires a known column list — call after a `| fields ...` pipe");
     }
-    if (!node.isBucketNullable()) {
-      // bucket_nullable=false requires CASE-WHEN-IS-NOT-NULL wrapping per-agg; deferred.
-      throw new UnsupportedOperationException(
-          "eventstats bucket_nullable=false not yet supported in PPLToSqlNodeVisitor");
-    }
     SqlNodeList partitionBy = new SqlNodeList(POS);
+    List<SqlNode> partitionExprs = new ArrayList<>();
     for (UnresolvedExpression p : node.getGroupList()) {
       UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
-      partitionBy.add(expr(core));
+      SqlNode key = expr(core);
+      partitionBy.add(key);
+      partitionExprs.add(key);
+    }
+    // PPL `eventstats bucket_nullable=false ... by X, Y` excludes rows where any partition key
+    // is NULL from the aggregate output. Wrap each agg with `CASE WHEN <pk1> IS NOT NULL [AND
+    // ...] THEN <agg> ELSE NULL END`. Without partitions, bucket_nullable has no effect.
+    SqlNode partitionNotNullCheck = null;
+    if (!node.isBucketNullable() && !partitionExprs.isEmpty()) {
+      for (SqlNode pk : partitionExprs) {
+        SqlNode isNotNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(pk), POS);
+        partitionNotNullCheck =
+            partitionNotNullCheck == null
+                ? isNotNull
+                : new SqlBasicCall(
+                    SqlStdOperatorTable.AND, List.of(partitionNotNullCheck, isNotNull), POS);
+      }
     }
     SqlNodeList items = new SqlNodeList(POS);
     List<String> visible = new ArrayList<>();
@@ -971,6 +983,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               new org.apache.calcite.sql.fun.SqlCase(
                   POS, null, whens, thens, SqlLiteral.createNull(POS));
         }
+      }
+      if (partitionNotNullCheck != null) {
+        SqlNodeList nnWhens = new SqlNodeList(POS);
+        nnWhens.add(partitionNotNullCheck);
+        SqlNodeList nnThens = new SqlNodeList(POS);
+        nnThens.add(over);
+        over =
+            new org.apache.calcite.sql.fun.SqlCase(
+                POS, null, nnWhens, nnThens, SqlLiteral.createNull(POS));
       }
       items.add(asAliased(over, al.getName()));
       visible.add(al.getName());

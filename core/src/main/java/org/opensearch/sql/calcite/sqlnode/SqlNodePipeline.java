@@ -6,7 +6,6 @@
 package org.opensearch.sql.calcite.sqlnode;
 
 import java.util.Collections;
-import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.calcite.avatica.util.Quoting;
@@ -22,7 +21,6 @@ import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.rel2sql.SqlImplementor;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
@@ -31,7 +29,6 @@ import org.apache.calcite.sql.util.ChainedSqlOperatorTable;
 import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
-import org.apache.calcite.sql2rel.StandardConvertletTable;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
@@ -100,10 +97,14 @@ public final class SqlNodePipeline {
     //   - PostgreSQL: ILIKE / NOT ILIKE (PPL `where x like* '...'` or case-insensitive
     //     comparisons lower to ILIKE; the dialect unparses as ILIKE which only resolves under
     //     the PostgreSQL library).
+    //   - MySQL: STRCMP (PPL `strcmp(a, b)` lowers to SqlLibraryOperators.STRCMP which is only
+    //     visible under SqlLibrary.MYSQL).
     SqlOperatorTable lib =
         org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(
             org.apache.calcite.sql.fun.SqlLibrary.BIG_QUERY,
             org.apache.calcite.sql.fun.SqlLibrary.SPARK,
+            org.apache.calcite.sql.fun.SqlLibrary.HIVE,
+            org.apache.calcite.sql.fun.SqlLibrary.MYSQL,
             org.apache.calcite.sql.fun.SqlLibrary.POSTGRESQL);
     return new ChainedSqlOperatorTable(
         extension == null
@@ -146,19 +147,474 @@ public final class SqlNodePipeline {
   /**
    * Round-trip {@code original} through SQL and Calcite's validator. Every plan is sent through
    * {@link RelToSqlConverter} → parser → {@link SqlValidator} → {@link SqlToRelConverter}.
+   *
+   * <p>Aggregate hints (e.g. {@code AGG_ARGS}) are dropped by the round-trip — RelToSql drops them
+   * because there is no SQL representation, and SqlValidator builds fresh Aggregate nodes with
+   * empty hints. Re-attach them by walking original and round-tripped plans in lock-step and
+   * copying hints onto matching Aggregate positions.
+   *
+   * <p>GraphLookup is the only command that bypasses the round-trip. Its RelNode form ({@code
+   * LogicalGraphLookup}) has no SQL representation and {@code RelToSqlConverter} fails with "Error
+   * while converting RelNode to SqlNode". Per the project rule, GraphLookup is the single approved
+   * bypass; all other commands and functions must go through the validator.
    */
   public static RelNode revalidate(RelNode original, CalcitePlanContext context) {
+    if (containsGraphLookup(original)) {
+      return original;
+    }
     String sql = relToSql(original);
-    return sqlToRel(sql, context);
+    RelNode roundTripped = sqlToRel(sql, context);
+    return reattachAggregateHints(original, roundTripped);
+  }
+
+  private static boolean containsGraphLookup(RelNode root) {
+    boolean[] found = {false};
+    root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            if (node instanceof org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup) {
+              found[0] = true;
+              return node;
+            }
+            return super.visit(node);
+          }
+        });
+    return found[0];
+  }
+
+  /**
+   * Walk {@code original} and {@code roundTripped} in pre-order and copy any non-empty Aggregate
+   * hints from positions in {@code original} to corresponding positions in {@code roundTripped}.
+   * Matches by node-class identity (Aggregate vs Aggregate) and traversal index. If shapes diverge
+   * mid-walk, stop re-attaching to avoid cross-contamination.
+   */
+  private static RelNode reattachAggregateHints(RelNode original, RelNode roundTripped) {
+    java.util.List<org.apache.calcite.rel.hint.RelHint> origHints = collectAggregateHints(original);
+    if (origHints.isEmpty() || origHints.stream().allMatch(h -> h == null)) return roundTripped;
+    // Ensure the cluster has a HintStrategyTable that registers AGG_ARGS — Aggregate.withHints
+    // otherwise drops unknown hints silently.
+    if (roundTripped.getCluster().getHintStrategies()
+        == org.apache.calcite.rel.hint.HintStrategyTable.EMPTY) {
+      roundTripped
+          .getCluster()
+          .setHintStrategies(org.opensearch.sql.calcite.utils.PPLHintUtils.getHintStrategyTable());
+    }
+    int[] idx = {0};
+    return roundTripped.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (visited instanceof org.apache.calcite.rel.core.Aggregate agg
+                && idx[0] < origHints.size()) {
+              org.apache.calcite.rel.hint.RelHint hint = origHints.get(idx[0]++);
+              if (hint != null && agg.getHints().isEmpty()) {
+                return agg.withHints(java.util.List.of(hint));
+              }
+            }
+            return visited;
+          }
+        });
+  }
+
+  private static java.util.List<org.apache.calcite.rel.hint.RelHint> collectAggregateHints(
+      RelNode node) {
+    java.util.List<org.apache.calcite.rel.hint.RelHint> hints = new java.util.ArrayList<>();
+    node.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode n) {
+            if (n instanceof org.apache.calcite.rel.core.Aggregate agg) {
+              hints.add(agg.getHints().isEmpty() ? null : agg.getHints().get(0));
+            }
+            return super.visit(n);
+          }
+        });
+    return hints;
   }
 
   static String relToSql(RelNode rel) {
     RelNode prepared = wrapFloatLiteralsForRoundTrip(rel);
     prepared = wrapVarcharCaseBranchesForRoundTrip(prepared);
+    prepared = wrapVarcharLiteralsBelowUnionForRoundTrip(prepared);
+    prepared = materialiseEmptyValuesForRoundTrip(prepared);
+    prepared = liftWindowedAggsAboveAggregateGroupByForRoundTrip(prepared);
+    prepared = isolateSortInputForRoundTrip(prepared);
     RelToSqlConverter converter = new RelToSqlConverter(OpenSearchSparkSqlDialect.DEFAULT);
     SqlImplementor.Result result = converter.visitRoot(prepared);
     SqlNode sqlNode = result.asStatement();
+    sqlNode = stripUnusedAsOverJoin(sqlNode);
     return sqlNode.toSqlString(OpenSearchSparkSqlDialect.DEFAULT).getSql();
+  }
+
+  /**
+   * If a Project below an Aggregate computes a windowed aggregate (e.g. {@code MAX(x) OVER ()}) and
+   * that windowed expression appears as part of an Aggregate group-by key, the SqlNodePipeline
+   * round-trip rejects with "Windowed aggregate expression is illegal in GROUP BY clause" — the
+   * unparser inlines the windowed expression in the GROUP BY clause and Calcite's strict validator
+   * forbids that.
+   *
+   * <p>Pre-process the plan: when an Aggregate sits directly on a Project containing windowed
+   * aggregates, materialise those windowed-agg expressions in an extra sub-Project below, so the
+   * outer Project (and any subsequent Aggregate group-by) references the windowed result via a
+   * column reference instead of inlining the windowed expression.
+   */
+  private static RelNode liftWindowedAggsAboveAggregateGroupByForRoundTrip(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            // Lift any Project that contains windowed aggregates inline. Without lifting, the
+            // unparser inlines the windowed expression into SELECT (and any Aggregate group-by
+            // or Sort key referencing it) and the SqlValidator rejects "Windowed aggregate
+            // expression is illegal in GROUP BY clause", or the round-trip generates nested
+            // aggregates (WIDTH_BUCKET-of-WIDTH_BUCKET) when the bin'd column is referenced by
+            // a downstream Sort.
+            if (visited instanceof org.apache.calcite.rel.core.Project project
+                && project.getProjects().stream().anyMatch(SqlNodePipeline::containsWindowedAgg)) {
+              return liftProjectWindowedAggs(project, rexBuilder);
+            }
+            return visited;
+          }
+        });
+  }
+
+  private static boolean containsWindowedAgg(org.apache.calcite.rex.RexNode expr) {
+    boolean[] found = {false};
+    expr.accept(
+        new org.apache.calcite.rex.RexVisitorImpl<Void>(true) {
+          @Override
+          public Void visitOver(org.apache.calcite.rex.RexOver over) {
+            found[0] = true;
+            return null;
+          }
+        });
+    return found[0];
+  }
+
+  private static RelNode liftProjectWindowedAggs(
+      org.apache.calcite.rel.core.Project outerProject,
+      org.apache.calcite.rex.RexBuilder rexBuilder) {
+    RelNode origInput = outerProject.getInput();
+    java.util.List<org.apache.calcite.rex.RexNode> origInputProjects = new java.util.ArrayList<>();
+    java.util.List<String> origInputNames = new java.util.ArrayList<>();
+    java.util.List<String> origNames = origInput.getRowType().getFieldNames();
+    for (int i = 0; i < origInput.getRowType().getFieldCount(); i++) {
+      origInputProjects.add(rexBuilder.makeInputRef(origInput, i));
+      origInputNames.add(origNames.get(i));
+    }
+    // For each windowed-agg sub-expression in the outer Project, add it to the sub-Project and
+    // remember its new column index.
+    java.util.Map<String, Integer> windowedToCol = new java.util.HashMap<>();
+    java.util.List<org.apache.calcite.rex.RexOver> uniqueOvers = new java.util.ArrayList<>();
+    for (org.apache.calcite.rex.RexNode expr : outerProject.getProjects()) {
+      collectWindowedAggs(expr, uniqueOvers);
+    }
+    if (uniqueOvers.isEmpty()) {
+      return outerProject;
+    }
+    int aliasCounter = 0;
+    for (org.apache.calcite.rex.RexOver over : uniqueOvers) {
+      String key = over.toString();
+      if (windowedToCol.containsKey(key)) continue;
+      windowedToCol.put(key, origInputProjects.size());
+      origInputProjects.add(over);
+      origInputNames.add("__win_" + (aliasCounter++));
+    }
+    RelNode newInput =
+        org.apache.calcite.rel.logical.LogicalProject.create(
+            origInput,
+            java.util.Collections.emptyList(),
+            origInputProjects,
+            origInputNames,
+            java.util.Set.of());
+    // Force a derived-table boundary so RelToSqlConverter cannot merge this Project into the
+    // outer Project. Without this, Calcite inlines the windowed-agg references back into the
+    // outer Project's SQL output, which the SqlValidator round-trip rejects in the GROUP BY.
+    newInput =
+        org.apache.calcite.rel.logical.LogicalFilter.create(newInput, rexBuilder.makeLiteral(true));
+    // Rewrite the outer Project's expressions so windowed-agg subexpressions become column refs.
+    java.util.List<org.apache.calcite.rex.RexNode> newOuterExprs = new java.util.ArrayList<>();
+    for (org.apache.calcite.rex.RexNode expr : outerProject.getProjects()) {
+      newOuterExprs.add(rewriteWindowedAggsAsColumnRefs(expr, windowedToCol, newInput, rexBuilder));
+    }
+    return outerProject.copy(
+        outerProject.getTraitSet(), newInput, newOuterExprs, outerProject.getRowType());
+  }
+
+  private static void collectWindowedAggs(
+      org.apache.calcite.rex.RexNode expr, java.util.List<org.apache.calcite.rex.RexOver> out) {
+    expr.accept(
+        new org.apache.calcite.rex.RexVisitorImpl<Void>(true) {
+          @Override
+          public Void visitOver(org.apache.calcite.rex.RexOver over) {
+            // Only collect "leaf" windowed aggs — the ones whose direct sub-expressions are not
+            // themselves windowed. (Nested OVERs are illegal anyway.) Use exact-string dedup.
+            for (org.apache.calcite.rex.RexOver existing : out) {
+              if (existing.toString().equals(over.toString())) return null;
+            }
+            out.add(over);
+            return null;
+          }
+        });
+  }
+
+  private static org.apache.calcite.rex.RexNode rewriteWindowedAggsAsColumnRefs(
+      org.apache.calcite.rex.RexNode expr,
+      java.util.Map<String, Integer> windowedToCol,
+      RelNode newInput,
+      org.apache.calcite.rex.RexBuilder rexBuilder) {
+    return expr.accept(
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitOver(org.apache.calcite.rex.RexOver over) {
+            Integer colIdx = windowedToCol.get(over.toString());
+            if (colIdx == null) return over;
+            return rexBuilder.makeInputRef(newInput, colIdx);
+          }
+        });
+  }
+
+  /**
+   * Wrap VARCHAR/CHAR {@link org.apache.calcite.rex.RexLiteral} expressions in any {@link
+   * org.apache.calcite.rel.core.Project} that feeds a {@link org.apache.calcite.rel.core.Union}.
+   * After RelToSql unparses the UNION's input projections, bare quoted strings re-parse as {@code
+   * CHAR(N)}. The UNION's leastRestrictive type then widens to {@code CHAR(max-of-branch-lengths)}
+   * and SQL CHAR semantics pad shorter values with trailing spaces — so {@code "Illinois"} appears
+   * as {@code "Illinois "}. Wrapping each VARCHAR/CHAR literal in {@code CAST(... AS VARCHAR)}
+   * forces the parser to type them as VARCHAR, keeping the UNION result VARCHAR.
+   */
+  private static RelNode wrapVarcharLiteralsBelowUnionForRoundTrip(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (!(visited instanceof org.apache.calcite.rel.core.Union)) {
+              return visited;
+            }
+            java.util.List<RelNode> wrappedInputs =
+                new java.util.ArrayList<>(visited.getInputs().size());
+            boolean changed = false;
+            for (RelNode input : visited.getInputs()) {
+              RelNode wrapped = wrapVarcharLiteralsInProject(input, rexBuilder);
+              wrappedInputs.add(wrapped);
+              if (wrapped != input) changed = true;
+            }
+            if (!changed) return visited;
+            return visited.copy(visited.getTraitSet(), wrappedInputs);
+          }
+        });
+  }
+
+  private static RelNode wrapVarcharLiteralsInProject(
+      RelNode input, org.apache.calcite.rex.RexBuilder rexBuilder) {
+    if (!(input instanceof org.apache.calcite.rel.core.Project project)) {
+      return input;
+    }
+    java.util.List<org.apache.calcite.rex.RexNode> projects = project.getProjects();
+    java.util.List<org.apache.calcite.rex.RexNode> rewritten =
+        new java.util.ArrayList<>(projects.size());
+    boolean changed = false;
+    for (org.apache.calcite.rex.RexNode expr : projects) {
+      if (isVarcharLiteral(expr)) {
+        rewritten.add(rexBuilder.makeAbstractCast(expr.getType(), expr));
+        changed = true;
+      } else {
+        rewritten.add(expr);
+      }
+    }
+    if (!changed) return input;
+    return project.copy(project.getTraitSet(), project.getInput(), rewritten, project.getRowType());
+  }
+
+  /**
+   * When a {@link org.apache.calcite.rel.core.Sort} is fed by a {@link
+   * org.apache.calcite.rel.core.Project} that overrides an input column with a same-named output of
+   * a different type (e.g. PPL {@code bin field span=N} produces {@code Project(field =
+   * SPAN_BUCKET(field, N))} where input {@code field} is INTEGER and output is VARCHAR), the
+   * unparser collapses Sort+Project into {@code SELECT SPAN_BUCKET(field) AS field FROM t ORDER BY
+   * SPAN_BUCKET(field)}. After re-parse, ORDER BY's {@code field} reference resolves to the SELECT
+   * alias (now VARCHAR), and the inlined SPAN_BUCKET on a VARCHAR alias trips the validator with
+   * "Cannot apply 'SPAN_BUCKET' to arguments of type SPAN_BUCKET(<VARCHAR>)".
+   *
+   * <p>Force a derived-table boundary by inserting a {@code Filter(true)} between Sort and the
+   * type-overriding Project: {@code Sort(...) → Filter(true) → Project(...)} unparses as {@code
+   * SELECT * FROM (SELECT SPAN_BUCKET(...) AS field FROM t WHERE TRUE) ORDER BY field}. The ORDER
+   * BY now references the outer alias (VARCHAR), which is OK because we sort by alias directly
+   * rather than inlining the SPAN_BUCKET expression.
+   */
+  private static RelNode isolateSortInputForRoundTrip(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (!(visited instanceof org.apache.calcite.rel.core.Sort sort)) {
+              return visited;
+            }
+            RelNode sortInput = sort.getInput();
+            if (!(sortInput instanceof org.apache.calcite.rel.core.Project project)) {
+              return visited;
+            }
+            if (!projectOverridesColumnType(project)) {
+              return visited;
+            }
+            // Wrap project in Filter(true) to force a sub-SELECT boundary on unparse.
+            RelNode wrappedProject =
+                org.apache.calcite.rel.logical.LogicalFilter.create(
+                    project, rexBuilder.makeLiteral(true));
+            return sort.copy(sort.getTraitSet(), java.util.List.of(wrappedProject));
+          }
+        });
+  }
+
+  private static boolean projectOverridesColumnType(org.apache.calcite.rel.core.Project project) {
+    org.apache.calcite.rel.type.RelDataType inputType = project.getInput().getRowType();
+    org.apache.calcite.rel.type.RelDataType outputType = project.getRowType();
+    java.util.Map<String, org.apache.calcite.sql.type.SqlTypeName> inputByName =
+        new java.util.HashMap<>();
+    for (org.apache.calcite.rel.type.RelDataTypeField f : inputType.getFieldList()) {
+      inputByName.put(f.getName(), f.getType().getSqlTypeName());
+    }
+    for (org.apache.calcite.rel.type.RelDataTypeField outF : outputType.getFieldList()) {
+      org.apache.calcite.sql.type.SqlTypeName inSql = inputByName.get(outF.getName());
+      if (inSql != null && inSql != outF.getType().getSqlTypeName()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Strip {@code AS(SqlJoin, alias)} wrappers from the FROM clause when the {@code alias} is not
+   * referenced anywhere in the enclosing SELECT.
+   *
+   * <p>Calcite's {@link RelToSqlConverter} wraps the outermost FROM-position join with a generated
+   * alias (e.g. {@code (... ) t11}). The Spark dialect's unparse adds parens around the JOIN
+   * because of operator precedence — the resulting {@code FROM ((SELECT ...) t6 CROSS JOIN ...)
+   * t11} is rejected by the Babel parser ({@code TableRef3}: "Join expression encountered in
+   * illegal context"). When {@code t11} is unused (the SELECT/WHERE references inner aliases like
+   * {@code t6.state} only), dropping the AS leaves the bare {@code SqlJoin} which the unparser
+   * writes without surrounding parens.
+   *
+   * <p>If the alias is referenced (e.g. {@code SELECT t11.col FROM ...}), the AS is preserved — the
+   * round-trip still fails for that shape, but it's a smaller surface than blanket stripping.
+   */
+  private static SqlNode stripUnusedAsOverJoin(SqlNode root) {
+    if (!(root instanceof org.apache.calcite.sql.SqlSelect select)) {
+      return root;
+    }
+    SqlNode from = select.getFrom();
+    if (from == null) {
+      return root;
+    }
+    SqlNode stripped = stripUnusedAsOverJoinInFrom(from, select);
+    if (stripped != from) {
+      select.setFrom(stripped);
+    }
+    return root;
+  }
+
+  private static SqlNode stripUnusedAsOverJoinInFrom(
+      SqlNode from, org.apache.calcite.sql.SqlSelect outer) {
+    if (from instanceof org.apache.calcite.sql.SqlBasicCall basic
+        && basic.getOperator() == org.apache.calcite.sql.fun.SqlStdOperatorTable.AS
+        && basic.getOperandList().size() == 2
+        && basic.getOperandList().get(0) instanceof org.apache.calcite.sql.SqlJoin innerJoin
+        && basic.getOperandList().get(1) instanceof org.apache.calcite.sql.SqlIdentifier alias) {
+      String aliasName = alias.getSimple();
+      if (!aliasReferenced(outer, aliasName, basic)) {
+        return innerJoin;
+      }
+    }
+    return from;
+  }
+
+  private static boolean aliasReferenced(SqlNode root, String aliasName, SqlNode skip) {
+    final boolean[] found = {false};
+    org.apache.calcite.sql.util.SqlBasicVisitor<Void> visitor =
+        new org.apache.calcite.sql.util.SqlBasicVisitor<>() {
+          @Override
+          public Void visit(org.apache.calcite.sql.SqlIdentifier id) {
+            if (id.names.size() >= 2 && aliasName.equalsIgnoreCase(id.names.get(0))) {
+              found[0] = true;
+            }
+            return null;
+          }
+
+          @Override
+          public Void visit(org.apache.calcite.sql.SqlCall call) {
+            if (call == skip || found[0]) {
+              return null;
+            }
+            return super.visit(call);
+          }
+        };
+    root.accept(visitor);
+    return found[0];
+  }
+
+  /**
+   * Replace every empty {@link org.apache.calcite.rel.logical.LogicalValues} node (the shape that
+   * {@code RelBuilder.filter(falseLiteral)} collapses to) with a one-row {@code LogicalValues}
+   * carrying typed {@code CAST(NULL AS T)} literals plus a {@code Filter(false)}. Without this,
+   * {@link RelToSqlConverter#visit(org.apache.calcite.rel.core.Values)} unparses each cell as the
+   * bare keyword {@code NULL} — re-parsing then types every column as {@code SqlTypeName.NULL},
+   * which collapses {@code SUM(BIGINT)} into {@code SUM(NULL)}. The validator's least-restrictive
+   * coercion widens that to {@code DECIMAL(38, 19)} and the column reaches the response formatter
+   * as {@code double} where the user asked for {@code bigint}. Materialising typed casts preserves
+   * each column's source type through the round trip.
+   */
+  private static RelNode materialiseEmptyValuesForRoundTrip(RelNode root) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            RelNode visited = super.visit(node);
+            if (!(visited instanceof org.apache.calcite.rel.core.Values values)) {
+              return visited;
+            }
+            if (!values.getTuples().isEmpty()) {
+              return visited;
+            }
+            org.apache.calcite.rel.type.RelDataType rowType = values.getRowType();
+            com.google.common.collect.ImmutableList.Builder<
+                    com.google.common.collect.ImmutableList<org.apache.calcite.rex.RexLiteral>>
+                tupleBuilder = com.google.common.collect.ImmutableList.builder();
+            com.google.common.collect.ImmutableList.Builder<org.apache.calcite.rex.RexLiteral>
+                rowBuilder = com.google.common.collect.ImmutableList.builder();
+            for (org.apache.calcite.rel.type.RelDataTypeField f : rowType.getFieldList()) {
+              rowBuilder.add(rexBuilder.makeNullLiteral(f.getType()));
+            }
+            tupleBuilder.add(rowBuilder.build());
+            RelNode oneRow =
+                org.apache.calcite.rel.logical.LogicalValues.create(
+                    values.getCluster(), rowType, tupleBuilder.build());
+            // Wrap each column with CAST(NULL AS T) so the unparser emits typed casts rather than
+            // bare NULL literals; only typed casts survive parser → validator with their type.
+            java.util.List<org.apache.calcite.rex.RexNode> projects =
+                new java.util.ArrayList<>(rowType.getFieldCount());
+            java.util.List<String> names = new java.util.ArrayList<>(rowType.getFieldCount());
+            for (int i = 0; i < rowType.getFieldCount(); i++) {
+              org.apache.calcite.rel.type.RelDataTypeField f = rowType.getFieldList().get(i);
+              org.apache.calcite.rex.RexNode nullLit = rexBuilder.makeNullLiteral(f.getType());
+              projects.add(rexBuilder.makeAbstractCast(f.getType(), nullLit));
+              names.add(f.getName());
+            }
+            RelNode projected =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    oneRow, java.util.Collections.emptyList(), projects, names, java.util.Set.of());
+            return org.apache.calcite.rel.logical.LogicalFilter.create(
+                projected, rexBuilder.makeLiteral(false));
+          }
+        });
   }
 
   /**
@@ -169,15 +625,14 @@ public final class SqlNodePipeline {
    * Babel parser re-types bare quoted strings as {@code CHAR(N)}. When such literals appear as
    * branches of a {@code CASE}, Calcite's least-restrictive type computation widens the result to
    * {@code CHAR(max-of-branch-lengths)}, and SQL CHAR semantics pad shorter values with trailing
-   * spaces — so {@code case(..., 'adult', ...)} returns {@code "adult   "} instead of
-   * {@code "adult"}. Wrapping the branches in {@code CAST(... AS VARCHAR)} forces the parser to
-   * type them as VARCHAR; the CASE result type stays VARCHAR and the values keep their actual
-   * length.
+   * spaces — so {@code case(..., 'adult', ...)} returns {@code "adult "} instead of {@code
+   * "adult"}. Wrapping the branches in {@code CAST(... AS VARCHAR)} forces the parser to type them
+   * as VARCHAR; the CASE result type stays VARCHAR and the values keep their actual length.
    *
    * <p>The wrapping is scoped to CASE branches because broader wrapping (every VARCHAR literal)
    * defeats OpenSearch pushdown analyzers that pattern-match on {@code RexInputRef = RexLiteral}
-   * pairs. Comparisons like {@code name = 'Jake'} keep their bare literal RHS and continue to
-   * push down.
+   * pairs. Comparisons like {@code name = 'Jake'} keep their bare literal RHS and continue to push
+   * down.
    */
   private static RelNode wrapVarcharCaseBranchesForRoundTrip(RelNode root) {
     org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
@@ -189,34 +644,16 @@ public final class SqlNodePipeline {
             if (!(visited instanceof org.apache.calcite.rex.RexCall outer)) {
               return visited;
             }
-            if (outer.getOperator() != SqlStdOperatorTable.CASE) {
-              return outer;
+            if (outer.getOperator() == SqlStdOperatorTable.CASE) {
+              return wrapCaseBranches(outer, rexBuilder);
             }
-            // CASE operand layout: [whenA, thenA, whenB, thenB, ..., elseExpr]
-            // Wrap odd-index branches (the THENs) and the trailing ELSE.
-            java.util.List<org.apache.calcite.rex.RexNode> ops = outer.getOperands();
-            java.util.List<org.apache.calcite.rex.RexNode> rewritten =
-                new java.util.ArrayList<>(ops.size());
-            boolean changed = false;
-            for (int i = 0; i < ops.size(); i++) {
-              org.apache.calcite.rex.RexNode op = ops.get(i);
-              boolean isBranch = (i % 2 == 1) || (i == ops.size() - 1 && i % 2 == 0);
-              if (isBranch
-                  && op instanceof org.apache.calcite.rex.RexLiteral
-                  && (op.getType().getSqlTypeName()
-                          == org.apache.calcite.sql.type.SqlTypeName.VARCHAR
-                      || op.getType().getSqlTypeName()
-                          == org.apache.calcite.sql.type.SqlTypeName.CHAR)) {
-                rewritten.add(rexBuilder.makeAbstractCast(op.getType(), op));
-                changed = true;
-              } else {
-                rewritten.add(op);
-              }
+            // PPL_ARRAY/array constructor — leastRestrictive over CHAR(N) operands widens to
+            // CHAR(max) padded; wrap each VARCHAR/CHAR operand to keep VARCHAR semantics.
+            if ("PPL_ARRAY".equals(outer.getOperator().getName())
+                || "ARRAY".equals(outer.getOperator().getName())) {
+              return wrapAllVarcharOperands(outer, rexBuilder);
             }
-            if (!changed) {
-              return outer;
-            }
-            return rexBuilder.makeCall(outer.getType(), outer.getOperator(), rewritten);
+            return outer;
           }
         };
     return root.accept(
@@ -229,6 +666,56 @@ public final class SqlNodePipeline {
         });
   }
 
+  private static org.apache.calcite.rex.RexNode wrapCaseBranches(
+      org.apache.calcite.rex.RexCall outer, org.apache.calcite.rex.RexBuilder rexBuilder) {
+    // CASE operand layout: [whenA, thenA, whenB, thenB, ..., elseExpr]
+    // Wrap odd-index branches (the THENs) and the trailing ELSE.
+    java.util.List<org.apache.calcite.rex.RexNode> ops = outer.getOperands();
+    java.util.List<org.apache.calcite.rex.RexNode> rewritten =
+        new java.util.ArrayList<>(ops.size());
+    boolean changed = false;
+    for (int i = 0; i < ops.size(); i++) {
+      org.apache.calcite.rex.RexNode op = ops.get(i);
+      boolean isBranch = (i % 2 == 1) || (i == ops.size() - 1 && i % 2 == 0);
+      if (isBranch && isVarcharLiteral(op)) {
+        rewritten.add(rexBuilder.makeAbstractCast(op.getType(), op));
+        changed = true;
+      } else {
+        rewritten.add(op);
+      }
+    }
+    if (!changed) {
+      return outer;
+    }
+    return rexBuilder.makeCall(outer.getType(), outer.getOperator(), rewritten);
+  }
+
+  private static org.apache.calcite.rex.RexNode wrapAllVarcharOperands(
+      org.apache.calcite.rex.RexCall outer, org.apache.calcite.rex.RexBuilder rexBuilder) {
+    java.util.List<org.apache.calcite.rex.RexNode> ops = outer.getOperands();
+    java.util.List<org.apache.calcite.rex.RexNode> rewritten =
+        new java.util.ArrayList<>(ops.size());
+    boolean changed = false;
+    for (org.apache.calcite.rex.RexNode op : ops) {
+      if (isVarcharLiteral(op)) {
+        rewritten.add(rexBuilder.makeAbstractCast(op.getType(), op));
+        changed = true;
+      } else {
+        rewritten.add(op);
+      }
+    }
+    if (!changed) {
+      return outer;
+    }
+    return rexBuilder.makeCall(outer.getType(), outer.getOperator(), rewritten);
+  }
+
+  private static boolean isVarcharLiteral(org.apache.calcite.rex.RexNode op) {
+    return op instanceof org.apache.calcite.rex.RexLiteral
+        && (op.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.VARCHAR
+            || op.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR);
+  }
+
   /**
    * Wrap every {@code FLOAT}/{@code REAL} (single-precision) {@link
    * org.apache.calcite.rex.RexLiteral} in an explicit {@code CAST(... AS REAL)}.
@@ -237,13 +724,13 @@ public final class SqlNodePipeline {
    * FLOAT/REAL RexLiteral as the same bare numeric form as a DOUBLE one (e.g. {@code 6E-2}).
    * Calcite's parser then types every exponent-bearing numeric literal as DOUBLE, so the
    * round-tripped plan reports a DOUBLE column where the visitor produced FLOAT — contradicting
-   * PPL's rule that {@code FLOAT - FLOAT} stays FLOAT. The CAST forces the unparser to emit
-   * {@code CAST(6E-2 AS REAL)}, whose target type the parser reads explicitly. Both
-   * {@link org.apache.calcite.sql.type.SqlTypeName#FLOAT} and
-   * {@link org.apache.calcite.sql.type.SqlTypeName#REAL} are wrapped because Calcite's
-   * {@code RexBuilder.makeCast} for {@code DECIMAL → REAL} folds the literal to a REAL-typed
-   * RexLiteral, not a FLOAT-typed one. {@code makeAbstractCast} preserves the CAST as a Rex node
-   * (a plain {@code makeCast} would constant-fold it back into a literal).
+   * PPL's rule that {@code FLOAT - FLOAT} stays FLOAT. The CAST forces the unparser to emit {@code
+   * CAST(6E-2 AS REAL)}, whose target type the parser reads explicitly. Both {@link
+   * org.apache.calcite.sql.type.SqlTypeName#FLOAT} and {@link
+   * org.apache.calcite.sql.type.SqlTypeName#REAL} are wrapped because Calcite's {@code
+   * RexBuilder.makeCast} for {@code DECIMAL → REAL} folds the literal to a REAL-typed RexLiteral,
+   * not a FLOAT-typed one. {@code makeAbstractCast} preserves the CAST as a Rex node (a plain
+   * {@code makeCast} would constant-fold it back into a literal).
    */
   private static RelNode wrapFloatLiteralsForRoundTrip(RelNode root) {
     org.apache.calcite.rex.RexBuilder rexBuilder = root.getCluster().getRexBuilder();
@@ -324,6 +811,11 @@ public final class SqlNodePipeline {
       throw new org.opensearch.sql.exception.ExpressionEvaluationException(e.getMessage(), e);
     }
 
+    // withRemoveSortInSubQuery(false): Calcite's default removes ORDER BY clauses inside derived
+    // tables (sub-SELECTs without LIMIT) because they are technically redundant in standard SQL.
+    // PPL plans rely on inner Sort+Project shapes to feed an outer windowed-aggregate (e.g.
+    // `trendline sort - SAL sma(2, SAL)` produces Project(window) → Filter → Sort(SAL DESC)).
+    // Stripping the inner Sort breaks ordering-dependent windows; preserve the Sort.
     SqlToRelConverter sqlToRel =
         new SqlToRelConverter(
             (rowType, queryString, schemaPath, viewPath) -> null,
@@ -331,7 +823,9 @@ public final class SqlNodePipeline {
             catalogReader,
             context.relBuilder.getCluster(),
             new PplConvertletTable(),
-            SqlToRelConverter.config().withTrimUnusedFields(false));
+            SqlToRelConverter.config()
+                .withTrimUnusedFields(false)
+                .withRemoveSortInSubQuery(false));
 
     RelRoot root = sqlToRel.convertQuery(validated, false, true);
     return root.project();

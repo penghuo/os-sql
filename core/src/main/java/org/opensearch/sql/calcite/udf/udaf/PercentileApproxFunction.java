@@ -40,8 +40,7 @@ public class PercentileApproxFunction
     }
     percentile = ((Number) values[1]).intValue() / 100.0;
     Object trailing = values[values.length - 1];
-    returnTypeName =
-        (trailing instanceof String) ? (String) trailing : trailing.toString();
+    returnTypeName = (trailing instanceof String) ? (String) trailing : trailing.toString();
     if (values.length > 3) {
       compression = ((Number) values[values.length - 2]).doubleValue();
     }

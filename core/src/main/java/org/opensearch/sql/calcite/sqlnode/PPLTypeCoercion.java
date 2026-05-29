@@ -138,8 +138,8 @@ public class PPLTypeCoercion extends TypeCoercionImpl {
   /**
    * Wrap the operand with the PPL UDF that produces the target UDT (TIMESTAMP/DATE/TIME/IP). This
    * preserves UDT identity through SqlToRelConverter — using {@code CAST(... AS spec)} would lose
-   * it because {@link SqlTypeUtil#convertTypeToSpec} maps the UDT's inner BasicSqlType (VARCHAR
-   * for date-like UDTs), and the resulting SqlNode says {@code AS VARCHAR}, not {@code AS
+   * it because {@link SqlTypeUtil#convertTypeToSpec} maps the UDT's inner BasicSqlType (VARCHAR for
+   * date-like UDTs), and the resulting SqlNode says {@code AS VARCHAR}, not {@code AS
    * EXPR_TIMESTAMP}. The UDFs declare the right return type and the Spark dialect quotes their
    * names so they round-trip cleanly.
    */
@@ -166,14 +166,11 @@ public class PPLTypeCoercion extends TypeCoercionImpl {
   }
 
   /**
-   * Wrap operand at index {@code idx} with the given PPL UDF. Same as {@link
-   * #forceCastOperand} but for non-datetime UDTs (e.g. IP) where we already know the UDF.
+   * Wrap operand at index {@code idx} with the given PPL UDF. Same as {@link #forceCastOperand} but
+   * for non-datetime UDTs (e.g. IP) where we already know the UDF.
    */
   private void forceCastOperandWithUdf(
-      SqlCallBinding binding,
-      int idx,
-      RelDataType target,
-      org.apache.calcite.sql.SqlOperator udf) {
+      SqlCallBinding binding, int idx, RelDataType target, org.apache.calcite.sql.SqlOperator udf) {
     org.apache.calcite.sql.SqlNode operand = binding.getCall().operand(idx);
     org.apache.calcite.sql.SqlNode wrapped =
         udf.createCall(org.apache.calcite.sql.parser.SqlParserPos.ZERO, operand);

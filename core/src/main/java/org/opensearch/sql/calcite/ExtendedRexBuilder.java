@@ -153,10 +153,14 @@ public class ExtendedRexBuilder extends RexBuilder {
     // → true/false; cast(numeric AS BOOLEAN) → numeric != 0. Wire up these cases as RexNode-shape
     // rewrites here so the caller's intent reads through.
     if (exp instanceof RexLiteral && sqlType == org.apache.calcite.sql.type.SqlTypeName.BOOLEAN) {
-      RexLiteral one = (RexLiteral) makeLiteral("1", typeFactory.createSqlType(
-          org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
-      RexLiteral zero = (RexLiteral) makeLiteral("0", typeFactory.createSqlType(
-          org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
+      RexLiteral one =
+          (RexLiteral)
+              makeLiteral(
+                  "1", typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
+      RexLiteral zero =
+          (RexLiteral)
+              makeLiteral(
+                  "0", typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.CHAR, 1));
       if (exp.equals(one)) {
         return makeLiteral(true, type);
       }

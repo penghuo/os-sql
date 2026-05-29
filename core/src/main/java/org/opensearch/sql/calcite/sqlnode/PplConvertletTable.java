@@ -10,9 +10,9 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql2rel.SqlRexContext;
 import org.apache.calcite.sql2rel.SqlRexConvertlet;
 import org.apache.calcite.sql2rel.SqlRexConvertletTable;
-import org.apache.calcite.sql2rel.SqlRexContext;
 import org.apache.calcite.sql2rel.StandardConvertletTable;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
@@ -20,14 +20,14 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * PPL-flavoured wrapper around {@link StandardConvertletTable}. The stock convertlet, when
  * converting a binary comparison (e.g. {@code SMALLINT_field <> 0}), follows {@code
  * ComparableOperandTypeChecker.Consistency.LEAST_RESTRICTIVE} and inserts a {@code CAST(field AS
- * INTEGER)} so both operands share the least-restrictive common type. The runtime can compare
- * mixed numerics directly, so the CAST is semantically a no-op but it changes the RelNode shape
- * — pushdown plan snapshots that match against the un-CAST plan from the visitor break.
+ * INTEGER)} so both operands share the least-restrictive common type. The runtime can compare mixed
+ * numerics directly, so the CAST is semantically a no-op but it changes the RelNode shape —
+ * pushdown plan snapshots that match against the un-CAST plan from the visitor break.
  *
  * <p>Strip the redundant CAST after {@code StandardConvertletTable} runs: if a binary comparison
- * call has a CAST operand whose source type is also numeric and not narrower than the cast
- * target's natural family, drop the CAST and re-build the call with the original operand. This
- * preserves the visitor's RelNode shape end-to-end.
+ * call has a CAST operand whose source type is also numeric and not narrower than the cast target's
+ * natural family, drop the CAST and re-build the call with the original operand. This preserves the
+ * visitor's RelNode shape end-to-end.
  */
 final class PplConvertletTable implements SqlRexConvertletTable {
 
@@ -69,8 +69,8 @@ final class PplConvertletTable implements SqlRexConvertletTable {
   }
 
   /**
-   * Operators whose operands the {@link StandardConvertletTable} wraps with redundant numeric
-   * CASTs via {@code Consistency.LEAST_RESTRICTIVE}: binary comparisons (=, <>, <, <=, >, >=) and
+   * Operators whose operands the {@link StandardConvertletTable} wraps with redundant numeric CASTs
+   * via {@code Consistency.LEAST_RESTRICTIVE}: binary comparisons (=, <>, <, <=, >, >=) and
    * arithmetic (+, -, *, /). Stripping the CAST keeps the RelNode shape close to the visitor's
    * output, which is critical for pushdown serialization size (the bin command's nested arithmetic
    * grows from ~20KB to 683KB+ when each operand is wrapped) and for snapshot tests.
@@ -95,16 +95,16 @@ final class PplConvertletTable implements SqlRexConvertletTable {
 
   /**
    * If {@code expr} is a {@code CAST(x AS T)} where both {@code x.getType()} and {@code T} are
-   * exact numeric integer types (TINYINT/SMALLINT/INTEGER/BIGINT) of the same family, return
-   * {@code x}. Otherwise return {@code expr} unchanged.
+   * exact numeric integer types (TINYINT/SMALLINT/INTEGER/BIGINT) of the same family, return {@code
+   * x}. Otherwise return {@code expr} unchanged.
    *
-   * <p>The runtime compares same-family integers directly, so the cast adds no semantic value
-   * for comparison and integer arithmetic. We deliberately do <em>not</em> strip casts that cross
+   * <p>The runtime compares same-family integers directly, so the cast adds no semantic value for
+   * comparison and integer arithmetic. We deliberately do <em>not</em> strip casts that cross
    * exact↔approximate boundaries (BIGINT → DOUBLE, INTEGER → DECIMAL) because those casts change
    * the result of subsequent arithmetic — most importantly division: {@code BIGINT/BIGINT} is
-   * integer division (truncating), {@code BIGINT/DOUBLE} is floating-point division. PPL window
-   * AVG is desugared to {@code SUM(x) / CAST(COUNT(x) AS DOUBLE)} and depends on the DOUBLE cast
-   * to preserve the fractional part.
+   * integer division (truncating), {@code BIGINT/DOUBLE} is floating-point division. PPL window AVG
+   * is desugared to {@code SUM(x) / CAST(COUNT(x) AS DOUBLE)} and depends on the DOUBLE cast to
+   * preserve the fractional part.
    */
   private static RexNode unwrapNumericCast(RexNode expr) {
     if (!(expr instanceof RexCall)) {

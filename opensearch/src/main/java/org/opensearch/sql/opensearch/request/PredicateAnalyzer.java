@@ -554,15 +554,15 @@ public class PredicateAnalyzer {
     }
 
     /**
-     * Accept either {@link SqlStdOperatorTable#MAP_VALUE_CONSTRUCTOR} (the visitor's direct
-     * output, SPECIAL syntax) or {@link
-     * org.apache.calcite.sql.fun.SqlLibraryOperators#MAP} (Spark's variadic {@code map(k, v, ...)}
-     * function). The two carry the same semantics — a key/value pair list — but are different
-     * {@link SqlOperator} instances. After a {@code SqlNodePipeline.revalidate} round-trip the
-     * Spark dialect unparses {@code MAP_VALUE_CONSTRUCTOR} as bare {@code MAP(k, v)}, the parser
-     * re-parses it as a FUNCTION-syntax call, and the validator binds it to {@code
-     * SqlLibraryOperators.MAP}. Pattern-matching on a single operator identity would miss the
-     * round-tripped form and break relevance pushdown.
+     * Accept either {@link SqlStdOperatorTable#MAP_VALUE_CONSTRUCTOR} (the visitor's direct output,
+     * SPECIAL syntax) or {@link org.apache.calcite.sql.fun.SqlLibraryOperators#MAP} (Spark's
+     * variadic {@code map(k, v, ...)} function). The two carry the same semantics — a key/value
+     * pair list — but are different {@link SqlOperator} instances. After a {@code
+     * SqlNodePipeline.revalidate} round-trip the Spark dialect unparses {@code
+     * MAP_VALUE_CONSTRUCTOR} as bare {@code MAP(k, v)}, the parser re-parses it as a
+     * FUNCTION-syntax call, and the validator binds it to {@code SqlLibraryOperators.MAP}.
+     * Pattern-matching on a single operator identity would miss the round-tripped form and break
+     * relevance pushdown.
      */
     private static RexCall expectMapCall(RexNode node, String funcName) {
       if (node instanceof RexCall call

@@ -180,7 +180,8 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
     BigDecimal raw = new BigDecimal(value.toString());
     BigDecimal scaled = raw.multiply(intervalQualifier.getStartUnit().multiplier);
     if (intervalQualifier.getStartUnit() == TimeUnit.QUARTER) {
-      intervalQualifier = new SqlIntervalQualifier(TimeUnit.MONTH, TimeUnit.MONTH, SqlParserPos.ZERO);
+      intervalQualifier =
+          new SqlIntervalQualifier(TimeUnit.MONTH, TimeUnit.MONTH, SqlParserPos.ZERO);
     }
     return context.rexBuilder.makeIntervalLiteral(scaled, intervalQualifier);
   }
@@ -235,7 +236,8 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
           valueList.stream().map(value -> context.rexBuilder.makeCast(commonType, value)).toList();
       return context.rexBuilder.makeIn(field, newValueList);
     } else {
-      List<String> typeNames = dataTypes.stream().map(CalciteRexNodeVisitor::renderTypeName).toList();
+      List<String> typeNames =
+          dataTypes.stream().map(CalciteRexNodeVisitor::renderTypeName).toList();
       throw new SemanticCheckException(
           StringUtils.format(
               "In expression types are incompatible: fields type %s, values type %s",
@@ -596,13 +598,7 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                       ? Collections.emptyList()
                       : arguments.subList(1, arguments.size());
               return PlanUtils.makeOver(
-                  context,
-                  functionName,
-                  field,
-                  args,
-                  partitions,
-                  List.of(),
-                  node.getWindowFrame());
+                  context, functionName, field, args, partitions, List.of(), node.getWindowFrame());
             })
         .orElseThrow(
             () ->

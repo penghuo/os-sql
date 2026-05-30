@@ -2930,9 +2930,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                     SqlStdOperatorTable.AND, List.of(partitionNotNullCheck, isNotNull), POS);
       }
     }
+    // Filter metadata fields out of the projection — visitWindow's outer SELECT projects the
+    // currentFields followed by the window-aggregated columns; including metadata here produces
+    // an extra LogicalProject layer when the planner-level stripMetadataFields shuttle later
+    // trims the row type. Mirrors the visitDedupe pattern (commit e36c34d48a).
     SqlNodeList items = new SqlNodeList(POS);
     List<String> visible = new ArrayList<>();
     for (String c : frame.currentFields) {
+      if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
       items.add(toIdentifier(c));
       visible.add(c);
     }

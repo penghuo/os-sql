@@ -576,9 +576,92 @@ public class QueryService {
      * For the redundant sort, we rely on Calcite optimizer to eliminate
      */
     RelCollation collation = calcitePlan.getTraitSet().getCollation();
+    // PPL preserves sort through pipes (e.g. `... | sort F | head N | fields cols` should expose
+    // the collation at the top-level LogicalSystemLimit). Calcite's automatic trait propagation
+    // doesn't carry an inner Sort's collation through a Project layer, so propagate it manually
+    // by descending through passthrough Projects below the LSL to find an inner Sort and remap
+    // its collation field indices through the Project's outputs. Mirrors v2's emission shape
+    // where the top-level Sort/SystemLimit directly carries the user's ORDER BY.
+    if (collation == null || collation == RelCollations.EMPTY) {
+      RelCollation propagated = derivePropagatedCollation(osPlan);
+      if (propagated != null && !propagated.getFieldCollations().isEmpty()) {
+        calcitePlan =
+            LogicalSystemLimit.create(
+                SystemLimitType.QUERY_SIZE_LIMIT,
+                attachCollationTrait(osPlan, propagated),
+                context.relBuilder.literal(context.sysLimit.querySizeLimit()));
+        collation = propagated;
+      }
+    }
     if (!(calcitePlan instanceof Sort) && collation != RelCollations.EMPTY) {
       calcitePlan = LogicalSort.create(calcitePlan, collation, null, null);
     }
     return calcitePlan;
+  }
+
+  /**
+   * Walk down through passthrough {@link org.apache.calcite.rel.logical.LogicalProject} layers to
+   * find an inner {@link org.apache.calcite.rel.core.Sort} carrying a collation, then remap the
+   * collation's field indices forward through each Project's RexInputRef outputs. Returns null when
+   * no propagation is possible (no inner Sort, or some Project isn't passthrough so we can't safely
+   * remap indices).
+   */
+  private static RelCollation derivePropagatedCollation(RelNode rel) {
+    java.util.List<int[]> projectMaps = new java.util.ArrayList<>();
+    RelNode cur = rel;
+    while (cur instanceof org.apache.calcite.rel.logical.LogicalProject proj) {
+      java.util.List<org.apache.calcite.rex.RexNode> exprs = proj.getProjects();
+      int[] map = new int[exprs.size()];
+      for (int i = 0; i < exprs.size(); i++) {
+        if (!(exprs.get(i) instanceof org.apache.calcite.rex.RexInputRef ref)) {
+          return null;
+        }
+        map[i] = ref.getIndex();
+      }
+      projectMaps.add(map);
+      cur = proj.getInput();
+    }
+    if (!(cur instanceof org.apache.calcite.rel.core.Sort sort)) {
+      return null;
+    }
+    if (sort.getCollation().getFieldCollations().isEmpty()) {
+      return null;
+    }
+    // Build inverse map for each project: input-position -> output-position. Apply inverses in
+    // reverse order (innermost project first, outermost last) so collation indices that
+    // referenced the Sort's input row type get translated to the topmost Project's output row
+    // type.
+    java.util.List<org.apache.calcite.rel.RelFieldCollation> fcs =
+        new java.util.ArrayList<>(sort.getCollation().getFieldCollations());
+    for (int p = projectMaps.size() - 1; p >= 0; p--) {
+      int[] map = projectMaps.get(p);
+      java.util.List<org.apache.calcite.rel.RelFieldCollation> remapped =
+          new java.util.ArrayList<>();
+      for (org.apache.calcite.rel.RelFieldCollation fc : fcs) {
+        int srcIdx = fc.getFieldIndex();
+        int outIdx = -1;
+        for (int j = 0; j < map.length; j++) {
+          if (map[j] == srcIdx) {
+            outIdx = j;
+            break;
+          }
+        }
+        if (outIdx < 0) return null; // Sort key isn't in the projection — can't propagate.
+        remapped.add(fc.withFieldIndex(outIdx));
+      }
+      fcs = remapped;
+    }
+    return org.apache.calcite.rel.RelCollations.of(fcs);
+  }
+
+  /**
+   * Re-create a passthrough {@link org.apache.calcite.rel.logical.LogicalProject} with an updated
+   * collation trait so its parent ({@link org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit})
+   * sees the propagated collation. Returns the input unchanged when not a Project.
+   */
+  private static RelNode attachCollationTrait(RelNode rel, RelCollation collation) {
+    if (!(rel instanceof org.apache.calcite.rel.logical.LogicalProject proj)) return rel;
+    org.apache.calcite.plan.RelTraitSet newTraits = proj.getTraitSet().replace(collation);
+    return proj.copy(newTraits, proj.getInputs());
   }
 }

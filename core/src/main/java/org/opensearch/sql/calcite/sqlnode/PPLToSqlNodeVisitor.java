@@ -5725,6 +5725,42 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           POS);
     }
     org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(targetType);
+    // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
+    //   - numeric literal: `value != 0` (1→true, 0→false, 2→true).
+    //   - string literal: '1'→true, '0'→false, anything else→NULL (Spark/Postgres semantics).
+    // Without an oracle we can only handle literals; non-literal sources fall through to
+    // SAFE_CAST which would return NULL for these cross-family casts.
+    if (tn == org.apache.calcite.sql.type.SqlTypeName.BOOLEAN
+        && c.getExpression() instanceof Literal lit) {
+      switch (lit.getType()) {
+        case SHORT, INTEGER, LONG, FLOAT, DOUBLE, DECIMAL:
+          return new SqlBasicCall(
+              SqlStdOperatorTable.NOT_EQUALS,
+              List.of(value, SqlLiteral.createExactNumeric("0", POS)),
+              POS);
+        case STRING:
+          {
+            SqlNodeList whens = new SqlNodeList(POS);
+            whens.add(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.EQUALS,
+                    List.of(value, SqlLiteral.createCharString("1", POS)),
+                    POS));
+            whens.add(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.EQUALS,
+                    List.of(value, SqlLiteral.createCharString("0", POS)),
+                    POS));
+            SqlNodeList thens = new SqlNodeList(POS);
+            thens.add(SqlLiteral.createBoolean(true, POS));
+            thens.add(SqlLiteral.createBoolean(false, POS));
+            return new org.apache.calcite.sql.fun.SqlCase(
+                POS, null, whens, thens, SqlLiteral.createNull(POS));
+          }
+        default:
+          // BOOLEAN literal → BOOLEAN: identity, fall through.
+      }
+    }
     org.apache.calcite.sql.SqlDataTypeSpec spec =
         new org.apache.calcite.sql.SqlDataTypeSpec(
             new org.apache.calcite.sql.SqlBasicTypeNameSpec(tn, POS), POS);

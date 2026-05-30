@@ -231,9 +231,10 @@ public class CalciteReverseCommandIT extends PPLIntegTestCase {
 
   @Test
   public void testStreamstatsWithReverse() throws IOException {
-    // Test that reverse is ignored when used directly after streamstats
-    // streamstats maintains order via __stream_seq__, but this field is projected out
-    // and doesn't create a detectable collation, so reverse is ignored (no-op)
+    // Reverse after streamstats reverses on the streamstats's tail-Sort($stream_seq).
+    // streamstats keeps __stream_seq__ in the row-type so chained streamstats can share it
+    // (final tryToRemoveMetaFields strips it from output); the surviving Sort($stream_seq ASC)
+    // gives `reverse` a collation to flip, so it iterates rows in reverse streamstats order.
     JSONObject result =
         executeQuery(
             String.format(
@@ -249,18 +250,17 @@ public class CalciteReverseCommandIT extends PPLIntegTestCase {
         schema("age", "int"),
         schema("cnt", "bigint"),
         schema("avg", "double"));
-    // Reverse is ignored, so data remains in original streamstats order
     verifyDataRowsInOrder(
         result,
-        rows("Jake", "USA", "California", 4, 2023, 70, 1, 70),
-        rows("Hello", "USA", "New York", 4, 2023, 30, 2, 50),
+        rows("Jane", "Canada", "Quebec", 4, 2023, 20, 4, 36.25),
         rows("John", "Canada", "Ontario", 4, 2023, 25, 3, 41.666666666666664),
-        rows("Jane", "Canada", "Quebec", 4, 2023, 20, 4, 36.25));
+        rows("Hello", "USA", "New York", 4, 2023, 30, 2, 50),
+        rows("Jake", "USA", "California", 4, 2023, 70, 1, 70));
   }
 
   @Test
   public void testStreamstatsWindowWithReverse() throws IOException {
-    // Test that reverse is ignored after streamstats with window
+    // Reverse after streamstats window=2 reverses on the streamstats's tail-Sort.
     JSONObject result =
         executeQuery(
             String.format(
@@ -275,14 +275,13 @@ public class CalciteReverseCommandIT extends PPLIntegTestCase {
         schema("year", "int"),
         schema("age", "int"),
         schema("avg", "double"));
-    // Reverse is ignored, data remains in original order
-    // Window=2 means average of current and previous row (sliding window of size 2)
+    // Window=2 means average of current and previous row (sliding window of size 2).
     verifyDataRowsInOrder(
         result,
-        rows("Jake", "USA", "California", 4, 2023, 70, 70),
-        rows("Hello", "USA", "New York", 4, 2023, 30, 50),
+        rows("Jane", "Canada", "Quebec", 4, 2023, 20, 22.5),
         rows("John", "Canada", "Ontario", 4, 2023, 25, 27.5),
-        rows("Jane", "Canada", "Quebec", 4, 2023, 20, 22.5));
+        rows("Hello", "USA", "New York", 4, 2023, 30, 50),
+        rows("Jake", "USA", "California", 4, 2023, 70, 70));
   }
 
   @Test

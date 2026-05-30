@@ -3154,6 +3154,14 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     for (UnresolvedPlan dataset : node.getDatasets()) {
       UnresolvedPlan prunedDataset = dataset.accept(new EmptySourcePropagateVisitor(), null);
       prunedDataset.accept(this, context);
+      // Drop the catalog-level `_highlight` MAP<VARCHAR, ANY> column from each Union branch
+      // unless the user explicitly asked for highlighting. The SchemaUnifier below pads missing
+      // columns with NULL literals typed as the unified column type; for `_highlight` that means
+      // CAST(NULL AS MAP<VARCHAR, ANY>) on the branch missing the column. RelToSql's
+      // castNullType then calls SqlTypeUtil.convertTypeToSpec on the inner ANY value type and
+      // throws — the round-trip cannot represent ANY in cast specs. Dropping the column before
+      // the unifier sidesteps the issue without losing user-visible data.
+      dropHighlightIfNotRequested(context);
       inputNodes.add(context.relBuilder.build());
     }
 

@@ -234,7 +234,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 
 | # | Class | Pushdown OFF | Notes |
 |---|---|---|---|
-| 127 | CalciteNoPushdownIT | ⏳ | Re-runs the suite registered in `@SuiteClasses` with `plugins.calcite.pushdown.enabled=false`. |
+| 127 | CalciteNoPushdownIT | ✅ | All 93 classes pass with `plugins.calcite.pushdown.enabled=false` after Track Q23: (a) `OpenSearchSparkSqlDialect.getCastSpec` now handles `SqlTypeName.ANY` (returns `OTHER` spec) so `RelToSqlConverter.castNullType` no longer throws when a Union branch contributes `CAST(NULL AS MAP<VARCHAR, ANY>)` for the `_highlight` column; (b) `visitUnion` now drops `_highlight` from each Union branch via `dropHighlightIfNotRequested` before SchemaUnifier pads missing columns — sidesteps the ANY-in-MAP round-trip entirely when highlight wasn't requested; (c) `CalciteReverseCommandIT.testStreamstatsWithReverse` and `testStreamstatsWindowWithReverse` updated to reflect Track O21's chained-streamstats fix — `__stream_seq__` now persists in the row-type, so `reverse` after streamstats correctly inverts on the streamstats's tail-Sort instead of being a no-op. |
 
 ## Phase 15 — Cross-cluster (env-dependent, may not be runnable locally)
 

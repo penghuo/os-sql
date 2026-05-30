@@ -8,6 +8,7 @@ package org.opensearch.sql.calcite.sqlnode;
 import com.google.common.collect.ImmutableMap;
 import java.util.Map;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.sql.SqlBasicTypeNameSpec;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlDataTypeSpec;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -110,6 +111,18 @@ public class OpenSearchSparkSqlDialect extends SparkSqlDialect {
       // round-trip cleanly. Note: emitting bare `MAP`/`ARRAY` drops the parameter types — this
       // is acceptable because validator resolves the cast via the operand's typed expression.
       return org.apache.calcite.sql.dialect.CalciteSqlDialect.DEFAULT.getCastSpec(type);
+    }
+    if (name == SqlTypeName.ANY) {
+      // SqlTypeUtil.convertTypeToSpec (which RelToSqlConverter.castNullType invokes via
+      // SqlDialect.getCastSpec) rejects SqlTypeName.ANY outright. ANY appears in column types
+      // when a Union merges two indices with conflicting field types (Calcite's leastRestrictive
+      // collapses the column to ANY) and one branch contributes a NULL literal that
+      // RelToSqlConverter wraps in CAST(NULL AS T). Emit a permissive type spec the Babel parser
+      // accepts; the validator's schema for the union projection will re-anchor the column type.
+      return new SqlDataTypeSpec(
+              new SqlBasicTypeNameSpec(SqlTypeName.OTHER, -1, -1, null, SqlParserPos.ZERO),
+              SqlParserPos.ZERO)
+          .withNullable(type.isNullable());
     }
     return super.getCastSpec(type);
   }

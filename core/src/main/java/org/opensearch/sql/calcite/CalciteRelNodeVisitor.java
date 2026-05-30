@@ -2833,11 +2833,52 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     return context.relBuilder.peek();
   }
 
+  /**
+   * Walk down from {@code node} through input chains to find the first {@link
+   * org.apache.calcite.rel.core.Sort} (or {@code LogicalSort}) node and return its collation
+   * field collations as {@link RexInputRef} order keys. Returns an empty list if no Sort is
+   * found in the linear input chain. Used by appendcol to pass the preceding `sort` command's
+   * key fields as the ORDER BY of the ROW_NUMBER window function — without this, ROW_NUMBER's
+   * row order is undefined and the FULL JOIN between main and subsearch ROW_NUMBERs misaligns
+   * across shards/runs.
+   */
+  private static List<RexNode> collationToOrderKeys(RelNode node, CalcitePlanContext context) {
+    RelNode cur = node;
+    int depth = 0;
+    while (cur != null && depth < 10) {
+      if (cur instanceof org.apache.calcite.rel.core.Sort sort) {
+        org.apache.calcite.rel.RelCollation collation = sort.getCollation();
+        if (collation == null || collation.getFieldCollations().isEmpty()) {
+          return List.of();
+        }
+        List<RexNode> keys = new ArrayList<>(collation.getFieldCollations().size());
+        for (org.apache.calcite.rel.RelFieldCollation fc : collation.getFieldCollations()) {
+          // Reference field by index relative to `node`'s row-type. The Sort below `node`
+          // shares the same row-type as `node`, so RexInputRef indices are preserved.
+          keys.add(
+              context.rexBuilder.makeInputRef(
+                  node.getRowType().getFieldList().get(fc.getFieldIndex()).getType(),
+                  fc.getFieldIndex()));
+        }
+        return keys;
+      }
+      if (cur.getInputs().size() != 1) break;
+      cur = cur.getInput(0);
+      depth++;
+    }
+    return List.of();
+  }
+
   @Override
   public RelNode visitAppendCol(AppendCol node, CalcitePlanContext context) {
     // 1. resolve main plan
     visitChildren(node, context);
-    // 2. add row_number() column to main
+    // 2. add row_number() column to main using the input's collation as ORDER BY so the
+    // numbering is deterministic. Without ORDER BY keys, ROW_NUMBER's row order is undefined
+    // — different shards may assign different numbers to the same row, breaking the FULL JOIN
+    // alignment between main and subsearch ROW_NUMBER columns. The preceding `sort` command
+    // sets the collation; extract it here.
+    List<RexNode> mainOrderKeys = collationToOrderKeys(context.relBuilder.peek(), context);
     RexNode mainRowNumber =
         PlanUtils.makeOver(
             context,
@@ -2845,7 +2886,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
             null,
             List.of(),
             List.of(),
-            List.of(),
+            mainOrderKeys,
             WindowFrame.toCurrentRow());
     context.relBuilder.projectPlus(
         context.relBuilder.alias(mainRowNumber, ROW_NUMBER_COLUMN_FOR_MAIN));
@@ -2855,7 +2896,8 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     transformPlanToAttachChild(node.getSubSearch(), relation);
     // 4. resolve subsearch plan
     node.getSubSearch().accept(this, context);
-    // 5. add row_number() column to subsearch
+    // 5. add row_number() column to subsearch with the subsearch's collation as ORDER BY.
+    List<RexNode> subOrderKeys = collationToOrderKeys(context.relBuilder.peek(), context);
     RexNode subsearchRowNumber =
         PlanUtils.makeOver(
             context,
@@ -2863,7 +2905,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
             null,
             List.of(),
             List.of(),
-            List.of(),
+            subOrderKeys,
             WindowFrame.toCurrentRow());
     context.relBuilder.projectPlus(
         context.relBuilder.alias(subsearchRowNumber, ROW_NUMBER_COLUMN_FOR_SUBSEARCH));

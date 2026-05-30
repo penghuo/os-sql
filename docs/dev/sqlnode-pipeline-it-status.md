@@ -127,7 +127,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
 | 49 | CalcitePPLAppendCommandIT | ✅ | 8/8 pass after `withRemoveSortInSubQuery(false)` (see #38). |
-| 50 | CalcitePPLAppendcolIT | ⚠️ | 0/2 or 2/2 across shards — flaky data-ordering test. Not a code regression. |
+| 50 | CalcitePPLAppendcolIT | ✅ | 2/2 deterministic on both shards after Track N20: `visitAppendCol` now passes the preceding `sort` command's collation as ORDER BY for the `ROW_NUMBER` window function on both main and subsearch sides. Without ORDER BY keys, ROW_NUMBER's row order is undefined per SQL spec — different shards/runs assigned different numbers to the same row, breaking the FULL JOIN alignment between main and subsearch ROW_NUMBER columns. The new `collationToOrderKeys` helper walks down the input plan looking for a `Sort` node and converts its field collations to RexInputRef keys. |
 | 51 | CalcitePPLAppendPipeCommandIT | ✅ | All pass. |
 | 52 | CalciteMultisearchCommandIT | ✅ | All pass after `wrapVarcharLiteralsBelowUnionForRoundTrip` extension. |
 | 53 | CalciteUnionCommandIT | ✅ | All pass after `wrapVarcharLiteralsBelowUnionForRoundTrip` — wraps VARCHAR/CHAR RexLiterals in any Project that feeds a Union, so re-parse as VARCHAR avoids CHAR(N) padding. |

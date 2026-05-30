@@ -132,6 +132,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<SqlNode> lastOrderBy;
 
     /**
+     * Eval-alias → statically-known {@link DataType} map. Populated by {@code visitEval} when a
+     * let's RHS has a derivable static type ({@code Cast(... AS DOUBLE)}, {@code Literal(STRING)},
+     * {@code Function("date", ...)}, etc.). Consumed by {@code castExpr} to dispatch {@code
+     * NUMBER_TO_STRING} / IP_TO_STRING / etc. for column refs whose type can be resolved without a
+     * validator probe. Cleared on aggregation / pipe boundaries that wipe collation.
+     */
+    java.util.Map<String, DataType> evalAliasTypes = new java.util.LinkedHashMap<>();
+
+    /**
      * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
      * NULLS_LAST). Returns {@code null} if no prior sort exists. Used by {@code visitReverse}.
      */
@@ -520,6 +529,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       aliasesInThisSelect.add(alias);
       if (existingNames.add(alias)) {
         visible.add(alias);
+      }
+      // Track this alias's static type when derivable, so downstream castExpr / Compare can
+      // dispatch type-specific helpers (NUMBER_TO_STRING, IP_TO_STRING, etc.) for column refs
+      // whose type would otherwise be unknown without a validator probe.
+      DataType staticType = staticTypeOf(let.getExpression(), frame);
+      if (staticType != null) {
+        frame.evalAliasTypes.put(alias, staticType);
+      } else {
+        // Rebound alias with unknown type — drop the prior tracking.
+        frame.evalAliasTypes.remove(alias);
       }
     }
     // Peephole: when child is a SELECT * (no GROUP BY / HAVING), append our extra eval items to
@@ -6782,26 +6801,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           POS);
     }
     org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(targetType);
-    // STRING target with floating-point/decimal literal source: Calcite SAFE_CAST stringifies
-    // 0.99 → ".99" and 0.0 → "0E0", but PPL expects "0.99" / "0.0" (Java toString semantics).
-    // Dispatch to NUMBER_TO_STRING UDF. Without an oracle we only catch literals; non-literal
-    // numeric sources fall through to SAFE_CAST.
-    if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR
-        && c.getExpression() instanceof Literal numLit) {
-      switch (numLit.getType()) {
-        case FLOAT, DOUBLE, DECIMAL:
-          return new SqlBasicCall(
-              new org.apache.calcite.sql.SqlUnresolvedFunction(
-                  new SqlIdentifier("NUMBER_TO_STRING", POS),
-                  null,
-                  null,
-                  null,
-                  null,
-                  org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-              List.of(value),
-              POS);
-        default:
-          // fall through to SAFE_CAST
+    // STRING target with floating-point/decimal source: Calcite SAFE_CAST stringifies 0.99 → ".99"
+    // and 0.0 → "0E0", but PPL expects "0.99" / "0.0" (Java toString semantics). Dispatch to
+    // NUMBER_TO_STRING UDF when the source type is statically derivable: a literal of
+    // FLOAT/DOUBLE/DECIMAL, an inner CAST AS those types, or a column ref to an eval alias whose
+    // type was tracked at eval time.
+    if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR) {
+      DataType srcType = staticTypeOf(c.getExpression(), exprFrame);
+      if (srcType == DataType.FLOAT || srcType == DataType.DOUBLE || srcType == DataType.DECIMAL) {
+        return new SqlBasicCall(
+            new org.apache.calcite.sql.SqlUnresolvedFunction(
+                new SqlIdentifier("NUMBER_TO_STRING", POS),
+                null,
+                null,
+                null,
+                null,
+                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+            List.of(value),
+            POS);
       }
     }
     // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
@@ -6978,6 +6995,48 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return hasStringOperand(fn.getFuncArgs());
     }
     return false;
+  }
+
+  /**
+   * Best-effort static type derivation for an eval RHS. Returns the {@link DataType} when the
+   * expression is a literal, a CAST, an arithmetic chain over already-typed column refs, or a
+   * column ref whose alias type is known via {@link Frame#evalAliasTypes}. Returns null when the
+   * type can't be determined statically (e.g. column ref to a scan-level field). Used to track eval
+   * aliases for downstream cast/comparison decisions.
+   */
+  private static DataType staticTypeOf(UnresolvedExpression e, Frame frame) {
+    if (e == null) return null;
+    if (e instanceof Literal lit) return lit.getType();
+    if (e instanceof Cast c) return c.getDataType();
+    if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
+      String name =
+          fn.getFuncName() == null ? "" : fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+      switch (name) {
+        case "date":
+          return DataType.DATE;
+        case "time":
+          return DataType.TIME;
+        case "timestamp":
+          return DataType.TIMESTAMP;
+        default:
+          // unknown function; can't derive
+          return null;
+      }
+    }
+    if (e instanceof QualifiedName qn
+        && qn.getParts().size() == 1
+        && frame != null
+        && frame.evalAliasTypes.containsKey(qn.toString())) {
+      return frame.evalAliasTypes.get(qn.toString());
+    }
+    if (e instanceof Field f && f.getField() instanceof QualifiedName qn) {
+      if (qn.getParts().size() == 1
+          && frame != null
+          && frame.evalAliasTypes.containsKey(qn.toString())) {
+        return frame.evalAliasTypes.get(qn.toString());
+      }
+    }
+    return null;
   }
 
   /**

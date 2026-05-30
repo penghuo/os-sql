@@ -590,6 +590,17 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
             .map(arg -> analyze(arg, context))
             .map(this::extractRexNodeFromAlias)
             .toList();
+    // Honour the WindowFunction's sortList. PPL's eventstats/streamstats AST attaches the
+    // running-aggregate ORDER BY here (e.g. streamstats sets __stream_seq__ as the sort key
+    // so per-partition running aggregates are deterministic across the SqlNodePipeline
+    // round-trip — without ORDER BY, ANSI SQL leaves the row order within a window
+    // partition undefined and the validator may evaluate in scan order, breaking the
+    // chained-streamstats running count.
+    List<RexNode> orderKeys =
+        node.getSortList().stream()
+            .map(p -> analyze(p.getRight(), context))
+            .map(this::extractRexNodeFromAlias)
+            .toList();
     return BuiltinFunctionName.ofWindowFunction(windowFunction.getFuncName())
         .map(
             functionName -> {
@@ -599,7 +610,7 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                       ? Collections.emptyList()
                       : arguments.subList(1, arguments.size());
               return PlanUtils.makeOver(
-                  context, functionName, field, args, partitions, List.of(), node.getWindowFrame());
+                  context, functionName, field, args, partitions, orderKeys, node.getWindowFrame());
             })
         .orElseThrow(
             () ->

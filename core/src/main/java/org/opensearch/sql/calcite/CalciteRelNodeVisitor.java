@@ -11,6 +11,7 @@ import static org.opensearch.sql.ast.tree.Join.JoinType.ANTI;
 import static org.opensearch.sql.ast.tree.Join.JoinType.SEMI;
 import static org.opensearch.sql.ast.tree.Sort.NullOrder.NULL_FIRST;
 import static org.opensearch.sql.ast.tree.Sort.NullOrder.NULL_LAST;
+import static org.opensearch.sql.ast.tree.Sort.SortOption.DEFAULT_ASC;
 import static org.opensearch.sql.ast.tree.Sort.SortOption.DEFAULT_DESC;
 import static org.opensearch.sql.ast.tree.Sort.SortOrder.ASC;
 import static org.opensearch.sql.ast.tree.Sort.SortOrder.DESC;
@@ -698,7 +699,10 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       boolean keepHighlight = context.isHighlightRequested();
       List<RexNode> metaFieldsRef =
           originalFields.stream()
-              .filter(OpenSearchConstants.METADATAFIELD_TYPE_MAP::containsKey)
+              .filter(
+                  f ->
+                      OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(f)
+                          || ROW_NUMBER_COLUMN_FOR_STREAMSTATS.equals(f))
               .filter(f -> !(keepHighlight && HighlightExpression.HIGHLIGHT_FIELD.equals(f)))
               .map(metaField -> (RexNode) context.relBuilder.field(metaField))
               .toList();
@@ -2216,26 +2220,33 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
 
     // CASE: global=true + window>0 + has group
     if (node.isGlobal() && hasWindow && hasGroup) {
-      // 1. Add global sequence column for sliding window
-      RexNode streamSeq =
-          context
-              .relBuilder
-              .aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
-              .over()
-              .rowsTo(RexWindowBounds.CURRENT_ROW)
-              .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
-      context.relBuilder.projectPlus(streamSeq);
+      // 1. Add global sequence column for sliding window. Reuse the upstream
+      // streamstats's __stream_seq__ if it survived through filter/eval — same chained
+      // streamstats safety as the simpler-streamstats branches below.
+      boolean streamSeqAlreadyPresent =
+          context.relBuilder.peek().getRowType().getFieldNames().stream()
+              .anyMatch(ROW_NUMBER_COLUMN_FOR_STREAMSTATS::equals);
+      if (!streamSeqAlreadyPresent) {
+        List<RexNode> seqOrderKeys = collationToOrderKeys(context.relBuilder.peek(), context);
+        org.apache.calcite.tools.RelBuilder.AggCall rnCall =
+            context.relBuilder.aggregateCall(SqlStdOperatorTable.ROW_NUMBER);
+        RexNode streamSeq =
+            (seqOrderKeys.isEmpty()
+                    ? rnCall.over()
+                    : rnCall.over().orderBy(seqOrderKeys))
+                .rowsTo(RexWindowBounds.CURRENT_ROW)
+                .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
+        context.relBuilder.projectPlus(streamSeq);
+      }
       RelNode left = context.relBuilder.build();
 
       // 2. Use self-join approach to avoid nested correlates (which cause NPE
-      //    in Calcite's RelDecorrelator when chaining multiple streamstats)
+      //    in Calcite's RelDecorrelator when chaining multiple streamstats).
+      //    Pass an empty cleanup list — keep __stream_seq__ in the output so a downstream
+      //    chained streamstats can reuse it as ORDER BY. tryToRemoveMetaFields strips
+      //    __stream_seq__ from the user-visible final output.
       return buildStreamWindowSelfJoinPlan(
-          context,
-          left,
-          node,
-          groupList,
-          ROW_NUMBER_COLUMN_FOR_STREAMSTATS,
-          new String[] {ROW_NUMBER_COLUMN_FOR_STREAMSTATS});
+          context, left, node, groupList, ROW_NUMBER_COLUMN_FOR_STREAMSTATS, new String[] {});
     }
 
     // For both with-group and no-group paths, add a __stream_seq__ column and the surrounding
@@ -2247,15 +2258,28 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     List<RexNode> overExpressions;
 
     if (hasGroup) {
-      // only build sequence when there is by condition
-      RexNode streamSeq =
-          context
-              .relBuilder
-              .aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
-              .over()
-              .rowsTo(RexWindowBounds.CURRENT_ROW)
-              .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
-      context.relBuilder.projectPlus(streamSeq);
+      // Only build sequence when there is a by condition. For chained streamstats, the
+      // prior streamstats's __stream_seq__ may already be in the row-type (when it survived
+      // through filter/eval). If so, reuse it directly — adding a new ROW_NUMBER OVER ()
+      // here would produce a non-deterministic order with no ORDER BY to anchor it.
+      // Otherwise, add a new __stream_seq__ ROW_NUMBER and pull upstream sort keys (if any)
+      // into the ROW_NUMBER's ORDER BY for determinism.
+      boolean streamSeqAlreadyPresent =
+          context.relBuilder.peek().getRowType().getFieldNames().stream()
+              .anyMatch(ROW_NUMBER_COLUMN_FOR_STREAMSTATS::equals);
+      if (!streamSeqAlreadyPresent) {
+        List<RexNode> seqOrderKeys = collationToOrderKeys(context.relBuilder.peek(), context);
+        org.apache.calcite.tools.RelBuilder.AggCall rnCall =
+            context.relBuilder.aggregateCall(SqlStdOperatorTable.ROW_NUMBER);
+        RexNode streamSeq =
+            (seqOrderKeys.isEmpty()
+                    ? rnCall.over()
+                    : rnCall.over().orderBy(seqOrderKeys))
+                .rowsTo(RexWindowBounds.CURRENT_ROW)
+                .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
+        context.relBuilder.projectPlus(streamSeq);
+      }
+      attachStreamSeqAsOrderBy(node.getWindowFunctionList());
       overExpressions =
           node.getWindowFunctionList().stream().map(w -> rexVisitor.analyze(w, context)).toList();
 
@@ -2278,9 +2302,11 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
         context.relBuilder.projectPlus(overExpressions);
       }
 
-      // resort when there is by condition
+      // resort when there is by condition. Keep __stream_seq__ in the output row-type so
+      // a subsequent (chained) streamstats can use it as the ORDER BY of its window
+      // aggregates. The final root-level projection (tryToRemoveMetaFields) strips it from
+      // the user-visible output along with the other reserved metadata columns.
       context.relBuilder.sort(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
-      context.relBuilder.projectExcept(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
     } else {
       // Add __stream_seq__ then sort by it so the unparsed SQL preserves the upstream input
       // ordering across the SqlNodePipeline round-trip. Without this, the window aggregate
@@ -2288,23 +2314,57 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       // SQL evaluates window aggregates in unspecified order without ORDER BY in OVER. The
       // surrounding Sort($N) survives via `withRemoveSortInSubQuery(false)` and feeds the
       // window evaluation.
-      RexNode streamSeq =
-          context
-              .relBuilder
-              .aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
-              .over()
-              .rowsTo(RexWindowBounds.CURRENT_ROW)
-              .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
-      context.relBuilder.projectPlus(streamSeq);
+      // Same chained-streamstats safety as the with-group branch: reuse the prior
+      // streamstats's __stream_seq__ if it survived through the input chain, or add a new
+      // ROW_NUMBER with upstream sort keys as ORDER BY for determinism.
+      boolean streamSeqAlreadyPresent =
+          context.relBuilder.peek().getRowType().getFieldNames().stream()
+              .anyMatch(ROW_NUMBER_COLUMN_FOR_STREAMSTATS::equals);
+      if (!streamSeqAlreadyPresent) {
+        List<RexNode> seqOrderKeys = collationToOrderKeys(context.relBuilder.peek(), context);
+        org.apache.calcite.tools.RelBuilder.AggCall rnCall =
+            context.relBuilder.aggregateCall(SqlStdOperatorTable.ROW_NUMBER);
+        RexNode streamSeq =
+            (seqOrderKeys.isEmpty()
+                    ? rnCall.over()
+                    : rnCall.over().orderBy(seqOrderKeys))
+                .rowsTo(RexWindowBounds.CURRENT_ROW)
+                .as(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
+        context.relBuilder.projectPlus(streamSeq);
+      }
       // Now compute window expressions on the seq-decorated input.
+      attachStreamSeqAsOrderBy(node.getWindowFunctionList());
       List<RexNode> reanalysed =
           node.getWindowFunctionList().stream().map(w -> rexVisitor.analyze(w, context)).toList();
       context.relBuilder.projectPlus(reanalysed);
+      // Keep __stream_seq__ in the output row-type for chained streamstats — see the
+      // matching with-group branch above for the rationale. The final root-level
+      // projection (tryToRemoveMetaFields) strips it from the user-visible output.
       context.relBuilder.sort(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
-      context.relBuilder.projectExcept(context.relBuilder.field(ROW_NUMBER_COLUMN_FOR_STREAMSTATS));
     }
 
     return context.relBuilder.peek();
+  }
+
+  /**
+   * Mutate each {@link WindowFunction} in {@code aliases} so its {@code sortList} is
+   * {@code [(__stream_seq__ ASC)]}. Must be called AFTER {@code __stream_seq__} has been
+   * projected so the column is resolvable, and BEFORE {@code rexVisitor.analyze} runs on the
+   * window function list. Without this, the analyzer's {@code makeOver} produces an OVER
+   * clause with no ORDER BY — running aggregates (count/sum/avg with UNBOUNDED PRECEDING TO
+   * CURRENT ROW) then evaluate in unspecified row order across the SqlNodePipeline
+   * round-trip. Chained streamstats break because the outer running aggregate cannot tell
+   * which row is "earlier" within its partition.
+   */
+  private static void attachStreamSeqAsOrderBy(List<UnresolvedExpression> aliases) {
+    QualifiedName seqRef = QualifiedName.of(ROW_NUMBER_COLUMN_FOR_STREAMSTATS);
+    for (UnresolvedExpression e : aliases) {
+      UnresolvedExpression inner =
+          (e instanceof Alias a) ? a.getDelegated() : e;
+      if (inner instanceof WindowFunction wf && wf.getSortList().isEmpty()) {
+        wf.setSortList(List.of(Pair.of(DEFAULT_ASC, seqRef)));
+      }
+    }
   }
 
   private List<RexNode> wrapWindowFunctionsWithGroupNotNull(
@@ -2852,13 +2912,35 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
           return List.of();
         }
         List<RexNode> keys = new ArrayList<>(collation.getFieldCollations().size());
+        // Map Sort key indices to columns in `node`'s row-type by NAME, not by raw index.
+        // A Project (e.g. projectExcept that drops a column) between the Sort and `node`
+        // shifts column positions, so the Sort's index N may correspond to a different
+        // column at position N in `node`. Looking up by name is the only way to keep the
+        // ORDER BY key resolved to the same logical column across these layers.
+        List<org.apache.calcite.rel.type.RelDataTypeField> sortFields =
+            sort.getRowType().getFieldList();
+        List<org.apache.calcite.rel.type.RelDataTypeField> nodeFields =
+            node.getRowType().getFieldList();
         for (org.apache.calcite.rel.RelFieldCollation fc : collation.getFieldCollations()) {
-          // Reference field by index relative to `node`'s row-type. The Sort below `node`
-          // shares the same row-type as `node`, so RexInputRef indices are preserved.
-          keys.add(
-              context.rexBuilder.makeInputRef(
-                  node.getRowType().getFieldList().get(fc.getFieldIndex()).getType(),
-                  fc.getFieldIndex()));
+          int sortIdx = fc.getFieldIndex();
+          if (sortIdx < 0 || sortIdx >= sortFields.size()) {
+            return List.of();
+          }
+          String name = sortFields.get(sortIdx).getName();
+          int nodeIdx = -1;
+          for (int i = 0; i < nodeFields.size(); i++) {
+            if (nodeFields.get(i).getName().equals(name)) {
+              nodeIdx = i;
+              break;
+            }
+          }
+          if (nodeIdx < 0) {
+            // Sort key column is not visible at `node`'s level (e.g. projectExcept
+            // dropped it). Fall back to no ORDER BY rather than producing a stale
+            // index ref.
+            return List.of();
+          }
+          keys.add(context.rexBuilder.makeInputRef(nodeFields.get(nodeIdx).getType(), nodeIdx));
         }
         return keys;
       }

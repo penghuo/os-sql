@@ -1731,13 +1731,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               POS);
     } else if (node instanceof org.opensearch.sql.ast.tree.MinSpanBin msb) {
       // MINSPAN_BUCKET(field, min_span, data_range=max-min, max_value=max).
+      // v2 emits min_span as DOUBLE literal (e.g. 5.0E0:DOUBLE); wrap in CAST AS DOUBLE.
       SqlNode minVal = minOver(fieldRef);
       SqlNode maxVal = maxOver(fieldRef);
       SqlNode dataRange = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(maxVal, minVal), POS);
+      org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+              POS);
+      SqlNode minSpanCast =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlStdOperatorTable.CAST,
+              List.of(expr(msb.getMinspan()), doubleSpec),
+              POS);
       bucketCall =
           new SqlBasicCall(
               org.opensearch.sql.expression.function.PPLBuiltinOperators.MINSPAN_BUCKET,
-              List.of(fieldRef, expr(msb.getMinspan()), dataRange, maxVal),
+              List.of(fieldRef, minSpanCast, dataRange, maxVal),
               POS);
     } else if (node instanceof org.opensearch.sql.ast.tree.RangeBin rb) {
       // RANGE_BUCKET(field, MIN OVER, MAX OVER, start, end).

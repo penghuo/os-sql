@@ -5792,7 +5792,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     boolean isCoalesce = "coalesce".equals(fnLower) || "ifnull".equals(fnLower);
     List<SqlNode> args = new ArrayList<>(fn.getFuncArgs().size());
     for (UnresolvedExpression a : fn.getFuncArgs()) {
-      if (isCoalesce && isNullLiteralRef(a)) {
+      if (isCoalesce && (isNullLiteralRef(a) || isUnknownFieldRef(a))) {
         args.add(SqlLiteral.createNull(POS));
       } else {
         args.add(expr(a));
@@ -6464,6 +6464,23 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof QualifiedName q) qn = q;
     else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
     return qn != null && "null".equalsIgnoreCase(qn.toString());
+  }
+
+  /**
+   * True when {@code e} is a single-part QualifiedName/Field whose name is NOT in the current
+   * scope's visible field list. Used inside coalesce/ifnull to mirror v2's
+   * QualifiedNameResolver.replaceWithNullLiteralInCoalesce: missing fields collapse to typed NULL
+   * rather than failing validation. Multi-part (dotted) names need a row-type oracle to verify
+   * struct paths and are left alone.
+   */
+  private boolean isUnknownFieldRef(UnresolvedExpression e) {
+    if (exprFrame == null || exprFrame.currentFields == null) return false;
+    QualifiedName qn = null;
+    if (e instanceof QualifiedName q) qn = q;
+    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+    if (qn == null) return false;
+    if (qn.getParts().size() != 1) return false;
+    return !exprFrame.currentFields.contains(qn.toString());
   }
 
   /**

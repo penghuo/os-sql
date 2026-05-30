@@ -1141,6 +1141,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "fillnull requires a known column list — call after a `| fields ...` pipe");
     }
+    // Type-compatibility pre-check (per field). PPL fillnull requires the replacement value's
+    // type to match the field's type, otherwise the runtime cast surfaces as a confusing error
+    // ("For input string ..."). When the row-type oracle is wired (Frame.columnPrimitiveType
+    // populated), validate up front and emit PPL's documented error message.
+    java.util.Set<String> targetFields = new java.util.LinkedHashSet<>();
+    boolean implicitAllFields = forAll != null && perField.isEmpty();
+    if (implicitAllFields) {
+      targetFields.addAll(frame.currentFields);
+    } else {
+      targetFields.addAll(perField.keySet());
+    }
+    for (String c : targetFields) {
+      UnresolvedExpression repl = perField.getOrDefault(c, forAll);
+      if (repl == null) continue;
+      DataType replType = staticTypeOf(repl, frame);
+      DataType fieldType = frame.columnPrimitiveType.get(c);
+      if (fieldType == null && frame.evalAliasTypes.containsKey(c)) {
+        fieldType = frame.evalAliasTypes.get(c);
+      }
+      if (replType != null && fieldType != null && !pplTypesCompatible(replType, fieldType)) {
+        throw new IllegalArgumentException(
+            String.format(
+                "fillnull failed: replacement value type %s is not compatible with field '%s' "
+                    + "(type: %s). The replacement value type must match the field type.",
+                pplTypeToSqlNameForError(replType), c, pplTypeToSqlNameForError(fieldType)));
+      }
+    }
+
     SqlNodeList items = new SqlNodeList(POS);
     for (String c : frame.currentFields) {
       SqlNode fieldRef = toIdentifier(c);
@@ -1161,6 +1189,49 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         .from(from)
         .withFields(new ArrayList<>(frame.currentFields))
         .wrap(frame);
+  }
+
+  /**
+   * True when {@code a} and {@code b} are PPL-fillnull-compatible (numeric family or both string).
+   */
+  private static boolean pplTypesCompatible(DataType a, DataType b) {
+    if (a == b) return true;
+    boolean aNum = isNumericPplType(a);
+    boolean bNum = isNumericPplType(b);
+    if (aNum && bNum) return true;
+    return false;
+  }
+
+  /** Map PPL DataType to the SQL type name used in fillnull error messages. */
+  private static String pplTypeToSqlNameForError(DataType t) {
+    switch (t) {
+      case BOOLEAN:
+        return "BOOLEAN";
+      case SHORT:
+        return "SMALLINT";
+      case INTEGER:
+        return "INTEGER";
+      case LONG:
+        return "BIGINT";
+      case FLOAT:
+        return "FLOAT";
+      case DOUBLE:
+        return "DOUBLE";
+      case DECIMAL:
+        return "DECIMAL";
+      case STRING:
+        return "VARCHAR";
+      case DATE:
+        return "DATE";
+      case TIME:
+        return "TIME";
+      case TIMESTAMP:
+        return "TIMESTAMP";
+      case IP:
+        return "IP";
+      default:
+        return t.name();
+    }
   }
 
   @Override

@@ -6423,12 +6423,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             (v instanceof java.math.BigDecimal b) ? b : new java.math.BigDecimal(v.toString());
         yield SqlLiteral.createExactNumeric(bd.toPlainString(), POS);
       }
-      case FLOAT, DOUBLE -> {
+      case DOUBLE -> {
         String s = v.toString();
         if (!s.contains("e") && !s.contains("E")) {
           s = s + "E0";
         }
         yield SqlLiteral.createApproxNumeric(s, POS);
+      }
+      // Calcite's createApproxNumeric returns DOUBLE; CAST down to FLOAT so the validator preserves
+      // PPL's `0.06f` typing instead of widening to DOUBLE during arithmetic.
+      case FLOAT -> {
+        String s = v.toString();
+        if (!s.contains("e") && !s.contains("E")) {
+          s = s + "E0";
+        }
+        SqlNode approx = SqlLiteral.createApproxNumeric(s, POS);
+        org.apache.calcite.sql.SqlDataTypeSpec floatSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.FLOAT, POS),
+                POS);
+        yield new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(approx, floatSpec), POS);
       }
       case STRING -> SqlLiteral.createCharString(v.toString(), POS);
       default ->

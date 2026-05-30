@@ -1134,7 +1134,7 @@ public class PPLFuncImpTable {
       registerOperator(JSON_ARRAY_LENGTH, PPLBuiltinOperators.JSON_ARRAY_LENGTH);
       registerOperator(JSON_EXTRACT, PPLBuiltinOperators.JSON_EXTRACT);
       registerOperator(JSON_KEYS, PPLBuiltinOperators.JSON_KEYS);
-      registerOperator(JSON_VALID, SqlStdOperatorTable.IS_JSON_VALUE);
+      registerOperator(JSON_VALID, PPLBuiltinOperators.JSON_VALID);
       registerOperator(JSON_SET, PPLBuiltinOperators.JSON_SET);
       registerOperator(JSON_DELETE, PPLBuiltinOperators.JSON_DELETE);
       registerOperator(JSON_APPEND, PPLBuiltinOperators.JSON_APPEND);

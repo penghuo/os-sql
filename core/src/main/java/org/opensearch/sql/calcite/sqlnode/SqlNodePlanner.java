@@ -581,6 +581,11 @@ public final class SqlNodePlanner {
     // CalciteExplainIT and CalcitePPLBig5IT). Only swaps when the Project is a pure passthrough
     // (RexInputRef-only, no computed expressions) so the sort keys can be straightforwardly
     // re-indexed from projected-positions to input-positions.
+    // PPL `... | sort F | head N` produces two adjacent LogicalSort rels: an inner
+    // sort-only (collation, no fetch) and an outer fetch-only (no collation). v2's RelBuilder
+    // path fuses them into a single Sort(collation, fetch=N). Match that shape so cosmetic plan
+    // diffs in Big5IT/ClickBench don't fire on the Sort+Fetch double-Sort pattern.
+    rel = fuseAdjacentSorts(rel);
     rel = swapSortAndPassthroughProject(rel);
     // Re-run trim AFTER swap so adjacent passthrough Projects produced by the swap (e.g. a
     // user-fields Project sitting on top of an eval-extended Project that exposed a sort key)
@@ -772,6 +777,42 @@ public final class SqlNodePlanner {
    * (FETCH-only), in which case no remapping is needed because Sort references no columns from its
    * child.
    */
+  /**
+   * Fuse {@code LogicalSort(fetch=N) <- LogicalSort(collation=...)} into a single {@code
+   * LogicalSort(collation=..., fetch=N)}. PPL `... | sort F | head N` produces two adjacent
+   * LogicalSort rels because the SqlNode pipeline emits Sort and Fetch as distinct operations; v2's
+   * RelBuilder fuses them. Match v2's emission shape.
+   *
+   * <p>Conditions: the OUTER sort must have FETCH but no collation, and the INNER sort must have
+   * collation but no FETCH/OFFSET. The OFFSET on the outer carries through, and the fused Sort gets
+   * the inner's collation + outer's FETCH/OFFSET.
+   */
+  private RelNode fuseAdjacentSorts(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalSort outer)) {
+              return visited;
+            }
+            // Outer must be FETCH-only (and possibly OFFSET): no collation keys.
+            if (!outer.getCollation().getFieldCollations().isEmpty()) return visited;
+            if (outer.fetch == null) return visited;
+            if (!(outer.getInput() instanceof org.apache.calcite.rel.logical.LogicalSort inner)) {
+              return visited;
+            }
+            // Inner must have collation keys and no FETCH/OFFSET (otherwise fusing would
+            // override the inner's row-cap, changing semantics).
+            if (inner.getCollation().getFieldCollations().isEmpty()) return visited;
+            if (inner.fetch != null || inner.offset != null) return visited;
+            return org.apache.calcite.rel.logical.LogicalSort.create(
+                inner.getInput(), inner.getCollation(), outer.offset, outer.fetch);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
   private RelNode swapSortAndPassthroughProject(RelNode rel) {
     org.apache.calcite.rel.RelShuttle shuttle =
         new org.apache.calcite.rel.RelHomogeneousShuttle() {

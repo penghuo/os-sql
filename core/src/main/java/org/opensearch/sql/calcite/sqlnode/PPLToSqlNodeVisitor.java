@@ -8004,11 +8004,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           fn.getFuncName() == null ? "" : fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
       switch (name) {
         case "date":
+        case "current_date":
+        case "curdate":
           return DataType.DATE;
         case "time":
+        case "current_time":
+        case "curtime":
           return DataType.TIME;
         case "timestamp":
+        case "now":
+        case "current_timestamp":
+        case "localtime":
+        case "localtimestamp":
           return DataType.TIMESTAMP;
+        case "ip":
+          return DataType.IP;
         default:
           // unknown function; can't derive
           return null;

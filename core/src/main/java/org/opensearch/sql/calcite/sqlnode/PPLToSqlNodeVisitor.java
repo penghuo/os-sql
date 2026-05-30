@@ -73,6 +73,7 @@ import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.ast.tree.SpanBin;
 import org.opensearch.sql.ast.tree.StreamWindow;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
+import org.opensearch.sql.ast.tree.Transpose;
 import org.opensearch.sql.ast.tree.Trendline;
 import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
@@ -4001,6 +4002,113 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     return new SqlSelect(
         POS, null, outerSelects, step3, boundCheck, null, null, null, null, null, null, null);
+  }
+
+  /**
+   * PPL `transpose [N] [columnName]` pivots N data rows into N columns. The input row order becomes
+   * the new "row 1..N" columns, and the input column names become the new pivot key column.
+   * Two-stage emission:
+   *
+   * <ol>
+   *   <li>UNION ALL of (column_name_lit AS column, col_value AS _value_, ROW_NUMBER() OVER () AS
+   *       _rn_) for each visible input column.
+   *   <li>GROUP BY column with MAX(_value_) FILTER (WHERE _rn_ = N) AS "row N" for N=1..maxRows.
+   * </ol>
+   *
+   * Without a row-type oracle we use {@code frame.currentFields} as the column list. Mirrors v2
+   * legacy SqlNode visitor's {@code visitTranspose}.
+   */
+  @Override
+  public SqlNode visitTranspose(Transpose node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null || frame.currentFields.isEmpty()) {
+      throw new UnsupportedOperationException(
+          "transpose requires a known column list — call after a `| fields ...` pipe");
+    }
+    List<String> cols =
+        frame.currentFields.stream()
+            .filter(c -> !OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c))
+            .toList();
+    int maxRows = node.getMaxRows();
+    String columnAlias = node.getColumnName() != null ? node.getColumnName() : "column";
+
+    // Step 1: UNION ALL of per-column branches.
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    SqlNode unioned = null;
+    for (String c : cols) {
+      SqlNodeList sl = new SqlNodeList(POS);
+      // CAST the literal to VARCHAR — UNION ALL of CHAR literals would CHAR-pad to the
+      // longest branch's width, leaving trailing spaces in shorter column names.
+      SqlNode colNameLit =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(SqlLiteral.createCharString(c, POS), varcharSpec),
+              POS);
+      sl.add(asAliased(colNameLit, columnAlias));
+      sl.add(
+          asAliased(
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                  List.of(toIdentifier(c), varcharSpec),
+                  POS),
+              "_value_"));
+      SqlNode rnOver =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(
+                      SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                  SqlWindow.create(
+                      null,
+                      null,
+                      new SqlNodeList(POS),
+                      new SqlNodeList(POS),
+                      SqlLiteral.createBoolean(false, POS),
+                      null,
+                      null,
+                      null,
+                      POS)),
+              POS);
+      sl.add(asAliased(rnOver, "_rn_"));
+      SqlNode branch =
+          new SqlSelect(POS, null, sl, from, null, null, null, null, null, null, null, null);
+      unioned =
+          (unioned == null)
+              ? branch
+              : new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(unioned, branch), POS);
+    }
+
+    // Step 2: GROUP BY column, MAX(_value_) FILTER (WHERE _rn_=N) AS "row N".
+    SqlNodeList outerItems = new SqlNodeList(POS);
+    outerItems.add(new SqlIdentifier(columnAlias, POS));
+    List<String> visible = new ArrayList<>();
+    visible.add(columnAlias);
+    for (int n = 1; n <= maxRows; n++) {
+      SqlNode filterCond =
+          new SqlBasicCall(
+              SqlStdOperatorTable.EQUALS,
+              List.of(
+                  new SqlIdentifier("_rn_", POS),
+                  SqlLiteral.createExactNumeric(Integer.toString(n), POS)),
+              POS);
+      SqlNode maxCall =
+          new SqlBasicCall(
+              SqlStdOperatorTable.MAX, List.of(new SqlIdentifier("_value_", POS)), POS);
+      SqlNode filtered =
+          new SqlBasicCall(SqlStdOperatorTable.FILTER, List.of(maxCall, filterCond), POS);
+      String rowAlias = "row " + n;
+      outerItems.add(asAliased(filtered, rowAlias));
+      visible.add(rowAlias);
+    }
+    return SqlBuilder.select(outerItems)
+        .from(unioned)
+        .groupBy(List.of(new SqlIdentifier(columnAlias, POS)))
+        .withFields(visible)
+        .wrap(frame);
   }
 
   /**

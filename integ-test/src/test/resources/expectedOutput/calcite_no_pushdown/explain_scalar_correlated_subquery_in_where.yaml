@@ -8,7 +8,8 @@ calcite:
         LogicalFilter(condition=[=($cor1.id, $1)])
           CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_work_information]])
     }))], variablesSet=[[$cor1]])
-          CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_worker]])
+          LogicalProject(name=[$0], country=[$1], id=[$2], occupation=[$3], salary=[$4], _id=[$5], _index=[$6], _score=[$7], _maxscore=[$8], _sort=[$9], _routing=[$10])
+            CalciteLogicalIndexScan(table=[[OpenSearch, opensearch-sql_test_index_worker]])
   physical: |
     EnumerableLimit(fetch=[10000])
       EnumerableCalc(expr#0..1=[{inputs}], id=[$t1], name=[$t0])

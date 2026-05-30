@@ -523,7 +523,9 @@ public final class SqlNodePipeline {
     prepared = materialiseEmptyValuesForRoundTrip(prepared);
     prepared = liftWindowedAggsAboveAggregateGroupByForRoundTrip(prepared);
     prepared = isolateSortInputForRoundTrip(prepared);
-    RelToSqlConverter converter = new RelToSqlConverter(OpenSearchSparkSqlDialect.DEFAULT);
+    RelToSqlConverter converter =
+        new org.apache.calcite.rel.rel2sql.OpenSearchRelToSqlConverter(
+            OpenSearchSparkSqlDialect.DEFAULT);
     SqlImplementor.Result result = converter.visitRoot(prepared);
     SqlNode sqlNode = result.asStatement();
     sqlNode = stripUnusedAsOverJoin(sqlNode);

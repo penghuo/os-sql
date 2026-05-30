@@ -1042,6 +1042,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (existing == null || existing.size() < 1) return null;
     SqlNode first = existing.get(0);
     if (!(first instanceof SqlIdentifier id) || !id.isStar()) return null;
+    // newList must also lead with `*`. When visitEval rebinds an existing column it produces an
+    // explicit list (no `*`); merging that into the child's `*` would emit both the original
+    // column (via `*`) and the rebind, leaving the column ambiguous downstream (e.g.
+    // `eval balance = 100 | fields balance` after `fields *` raises "Column 'balance' is
+    // ambiguous"). Bail out so the caller falls back to wrapping.
+    if (newList.size() < 1) return null;
+    SqlNode newFirst = newList.get(0);
+    if (!(newFirst instanceof SqlIdentifier ns) || !ns.isStar()) return null;
     if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
     if (select.getHaving() != null) return null;
     if (select.getOrderList() != null && !select.getOrderList().getList().isEmpty()) return null;

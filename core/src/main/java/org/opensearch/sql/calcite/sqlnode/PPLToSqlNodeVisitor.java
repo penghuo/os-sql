@@ -8079,33 +8079,47 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           default -> null;
         };
     // PPL `isempty(x)` — NULL or empty string. PPL `isblank(x)` — NULL or whitespace-only.
-    // Both desugar to OR-chains because Calcite's IS_EMPTY postfix operator at the validator
-    // level only accepts collection types. Mirrors the legacy SqlNode visitor's permissive
-    // implementations (without the post-RelNode shuttle that would rewrite to v2's
-    // IS_EMPTY(TRIM(...)) shape — those rewrites only matter for explain-plan parity).
+    // Both desugar to `arg IS NULL OR IS_EMPTY(<adjusted>)`. Calcite's standard IS_EMPTY postfix
+    // operator rejects strings at validation time (collection-only), so route through
+    // PERMISSIVE_IS_EMPTY (a function-shape SqlOperator that accepts any operand). A post-
+    // conversion shuttle (`rewritePermissiveIsEmpty` / `rewriteIsBlankToTrimEmpty` in
+    // SqlNodePlanner) rewrites the RexCall back to the standard IS_EMPTY postfix operator and
+    // wraps `isblank` arg in TRIM, matching v2's `IS EMPTY(arg)` / `IS_EMPTY(TRIM(...))` shape
+    // in the explain output.
     if (("isempty".equals(name) || "isblank".equals(name)) && args.size() == 1) {
       SqlNode a = args.get(0);
       SqlNode toCheck = a;
       if ("isblank".equals(name)) {
-        // For isblank, strip whitespace before length check.
+        // For isblank, strip whitespace before length check. The post-conversion
+        // rewriteIsBlankToTrimEmpty shuttle detects this LENGTH(REPLACE(..., ' ', '')) shape
+        // and rewrites it to v2's `IS_EMPTY(TRIM(BOTH ' ', arg))`.
         toCheck =
             new SqlBasicCall(
                 SqlStdOperatorTable.REPLACE,
                 List.of(
                     a, SqlLiteral.createCharString(" ", POS), SqlLiteral.createCharString("", POS)),
                 POS);
+        SqlNode lenZero =
+            new SqlBasicCall(
+                SqlStdOperatorTable.EQUALS,
+                List.of(
+                    new SqlBasicCall(
+                        org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH,
+                        List.of(toCheck),
+                        POS),
+                    SqlLiteral.createExactNumeric("0", POS)),
+                POS);
+        return new SqlBasicCall(
+            SqlStdOperatorTable.OR,
+            List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
+            POS);
       }
-      SqlNode lenZero =
-          new SqlBasicCall(
-              SqlStdOperatorTable.EQUALS,
-              List.of(
-                  new SqlBasicCall(
-                      org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH, List.of(toCheck), POS),
-                  SqlLiteral.createExactNumeric("0", POS)),
-              POS);
+      // isempty: use PERMISSIVE_IS_EMPTY so the explain plan shows `IS EMPTY(arg)` (matches v2).
       return new SqlBasicCall(
           SqlStdOperatorTable.OR,
-          List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
+          List.of(
+              new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS),
+              new SqlBasicCall(PplToSqlNode.PERMISSIVE_IS_EMPTY, List.of(toCheck), POS)),
           POS);
     }
     // PPL `Like(field, pattern [, caseSensitive])` — wrap with an ESCAPE clause so that PPL

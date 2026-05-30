@@ -8132,6 +8132,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           POS);
     }
     if (opOverride != null) {
+      // LIKE/ILIKE/NOT_LIKE/NOT_ILIKE 2-arg keyword form: append the literal `\` escape arg so
+      // OpenSearch pushdown's wildcard query handles `\%`/`\_` literally. Mirrors v2's emission
+      // shape: `ILIKE($field, '%pat%', '\')`. The 3-arg `Like(field, pat, caseSensitive)` form
+      // (handled earlier via the explicit `like` branch) already supplies an escape; this guard
+      // only fires on the bare 2-arg keyword form going through opOverride.
+      if (args.size() == 2
+          && (opOverride == SqlStdOperatorTable.LIKE
+              || opOverride == SqlStdOperatorTable.NOT_LIKE
+              || opOverride == org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE
+              || opOverride == org.apache.calcite.sql.fun.SqlLibraryOperators.NOT_ILIKE)) {
+        java.util.List<SqlNode> withEscape = new ArrayList<>(3);
+        withEscape.add(args.get(0));
+        withEscape.add(args.get(1));
+        withEscape.add(SqlLiteral.createCharString("\\", POS));
+        return new SqlBasicCall(opOverride, withEscape, POS);
+      }
       return new SqlBasicCall(opOverride, args, POS);
     }
     String resolvedName = mapPplFunctionName(name, fn.getFuncName());

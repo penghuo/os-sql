@@ -6946,15 +6946,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       // per-column UDT map populated in visitRelation.
       String lFieldUdt = qualifiedNameUdt(c.getLeft());
       String rFieldUdt = qualifiedNameUdt(c.getRight());
+      // VARCHAR-cast the string literal before wrapping in the UDT UDF so the explain plan
+      // shows `TIMESTAMP('...':VARCHAR)` matching v2's RexBuilder emission. Without the cast
+      // Calcite emits CHAR(N) which renders without the type suffix and breaks plan-shape
+      // tests.
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+              POS);
       if (lFieldUdt != null && isStringLiteral(c.getRight())) {
         org.apache.calcite.sql.SqlOperator op = udtConstructorOpForRoot(lFieldUdt);
         if (op != null) {
-          r = new SqlBasicCall(op, List.of(r), POS);
+          SqlNode rArg =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                  List.of(r, varcharSpec),
+                  POS);
+          r = new SqlBasicCall(op, List.of(rArg), POS);
         }
       } else if (rFieldUdt != null && isStringLiteral(c.getLeft())) {
         org.apache.calcite.sql.SqlOperator op = udtConstructorOpForRoot(rFieldUdt);
         if (op != null) {
-          l = new SqlBasicCall(op, List.of(l), POS);
+          SqlNode lArg =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                  List.of(l, varcharSpec),
+                  POS);
+          l = new SqlBasicCall(op, List.of(lArg), POS);
         }
       }
       return new SqlBasicCall(comparisonOperator(c.getOperator()), List.of(l, r), POS);

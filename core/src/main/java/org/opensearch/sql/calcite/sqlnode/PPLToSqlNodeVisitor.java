@@ -1445,6 +1445,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
+   * True when {@code a} and {@code b} are PPL-BETWEEN-compatible (same family — both numeric, both
+   * string, both date/time, or identical type). Used by the BETWEEN expression validator to throw
+   * PPL's documented "BETWEEN expression types are incompatible" message.
+   */
+  private static boolean pplBetweenBoundsCompatible(DataType a, DataType b) {
+    if (a == b) return true;
+    if (isNumericPplType(a) && isNumericPplType(b)) return true;
+    return false;
+  }
+
+  /**
    * True when {@code a} and {@code b} are PPL-fillnull-compatible (numeric family or both string).
    * Used by visitFillNull to validate replacement-vs-field compatibility.
    */
@@ -6619,6 +6630,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return inSubqueryExpr(is);
     }
     if (e instanceof org.opensearch.sql.ast.expression.Between b) {
+      // PPL rejects BETWEEN with incompatible bound types statically (mirrors v2's
+      // SemanticCheckException). Detect when lower/upper are both literals AND one is STRING and
+      // the other is numeric — those don't widen cleanly. Throws PPL's documented message.
+      DataType lowerType = b.getLowerBound() instanceof Literal l ? l.getType() : null;
+      DataType upperType = b.getUpperBound() instanceof Literal u ? u.getType() : null;
+      if (lowerType != null
+          && upperType != null
+          && !pplBetweenBoundsCompatible(lowerType, upperType)) {
+        throw new IllegalArgumentException(
+            "BETWEEN expression types are incompatible: lower bound is "
+                + pplTypeToSqlNameForError(lowerType)
+                + ", upper bound is "
+                + pplTypeToSqlNameForError(upperType));
+      }
       return new SqlBasicCall(
           SqlStdOperatorTable.BETWEEN,
           List.of(expr(b.getValue()), expr(b.getLowerBound()), expr(b.getUpperBound())),

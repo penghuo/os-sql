@@ -5808,6 +5808,78 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       return new SqlBasicCall(op, args, POS);
     }
+    // PPL JSON manipulation UDFs that need explicit operator dispatch — Calcite's validator
+    // can't resolve the lowercase PPL names to PPLBuiltinOperators by signature alone.
+    if ("json_valid".equals(fnLower) && args.size() == 1) {
+      return new SqlBasicCall(SqlStdOperatorTable.IS_JSON_VALUE, args, POS);
+    }
+    if ("json_keys".equals(fnLower) && args.size() == 1) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_KEYS, args, POS);
+    }
+    if ("json_extract".equals(fnLower)) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_EXTRACT, args, POS);
+    }
+    if ("json_array_length".equals(fnLower) && args.size() == 1) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_ARRAY_LENGTH, args, POS);
+    }
+    if ("json_set".equals(fnLower)) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_SET, args, POS);
+    }
+    if ("json_append".equals(fnLower)) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_APPEND, args, POS);
+    }
+    if ("json_extend".equals(fnLower)) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_EXTEND, args, POS);
+    }
+    if ("json_delete".equals(fnLower)) {
+      return new SqlBasicCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_DELETE, args, POS);
+    }
+    // PPL `json_object('k', v, ...)` / `json_array(v, ...)`: Calcite's JSON_OBJECT/JSON_ARRAY
+    // require a leading null-behavior flag (NULL ON NULL). Nested json_object/json_array values
+    // are stringified to match v2's `{"outer":"{\"inner\":...}"}` shape — wrap them in CAST AS
+    // VARCHAR so the inner constructor's output stays as a string column instead of being merged
+    // into the outer JSON tree.
+    if ("json_object".equals(fnLower) || "json_array".equals(fnLower)) {
+      List<SqlNode> jsonArgs = new ArrayList<>();
+      jsonArgs.add(
+          SqlLiteral.createSymbol(
+              org.apache.calcite.sql.SqlJsonConstructorNullClause.NULL_ON_NULL, POS));
+      List<UnresolvedExpression> userArgs = fn.getFuncArgs();
+      boolean isObject = "json_object".equals(fnLower);
+      for (int i = 0; i < args.size(); i++) {
+        SqlNode a = args.get(i);
+        boolean isValuePos = !isObject || (i % 2) == 1;
+        boolean nestedJsonCtor =
+            i < userArgs.size()
+                && userArgs.get(i) instanceof org.opensearch.sql.ast.expression.Function nfn
+                && (nfn.getFuncName().equalsIgnoreCase("json_object")
+                    || nfn.getFuncName().equalsIgnoreCase("json_array"));
+        if (isValuePos && nestedJsonCtor) {
+          a =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.CAST,
+                  List.of(
+                      a,
+                      new org.apache.calcite.sql.SqlDataTypeSpec(
+                          new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                          POS)),
+                  POS);
+        }
+        jsonArgs.add(a);
+      }
+      return new SqlBasicCall(
+          isObject ? SqlStdOperatorTable.JSON_OBJECT : SqlStdOperatorTable.JSON_ARRAY,
+          jsonArgs,
+          POS);
+    }
     // PPL `isnull(x)` / `isnotnull(x)` / `like(s, p)` parse as Function calls but Calcite expects
     // SqlOperator postfix/infix. Map directly. Other operator-shaped functions (regex, ...) come
     // through PPLBuiltinOperators via the validator-resolved unresolved-function path.

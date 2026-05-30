@@ -2019,6 +2019,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return null;
   }
 
+  /**
+   * Map a comparison operator string (=/!=/&gt;/&gt;=/&lt;/&lt;=) to its IP-aware PPL comparator.
+   * Mirrors v2's PPLFuncImpTable.registerOperator(GREATER, GREATER_IP, GT) dispatch.
+   */
+  private static org.apache.calcite.sql.SqlOperator ipComparisonOperator(String op) {
+    return switch (op) {
+      case "=" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.EQUALS_IP;
+      case "!=", "<>" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.NOT_EQUALS_IP;
+      case ">" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.GREATER_IP;
+      case ">=" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.GTE_IP;
+      case "<" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LESS_IP;
+      case "<=" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LTE_IP;
+      default -> null;
+    };
+  }
+
   /** Map a UDT root name (timestamp/date/time/ip) to the corresponding PPL constructor UDF. */
   private static org.apache.calcite.sql.SqlOperator udtConstructorOpForRoot(String root) {
     switch (root) {
@@ -7103,6 +7119,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                   List.of(l, varcharSpec),
                   POS);
           l = new SqlBasicCall(op, List.of(lArg), POS);
+        }
+      }
+      // EXPR_IP-aware comparator dispatch: when either side is an EXPR_IP field, use
+      // PPLBuiltinOperators IP comparators (GREATER_IP/LESS_IP/etc.) instead of standard
+      // operators. Mirrors v2's PPLFuncImpTable.registerOperator(GREATER, GREATER_IP, GT) which
+      // selects the IP variant when an operand has UDT IP type. Standard comparators run at
+      // runtime over EXPR_IP but produce a different explain-plan shape and may pushdown via a
+      // generic range query that doesn't preserve IP-aware ordering.
+      if ("ip".equals(lFieldUdt) || "ip".equals(rFieldUdt)) {
+        org.apache.calcite.sql.SqlOperator ipOp =
+            ipComparisonOperator(
+                c.getOperator() == null ? "" : c.getOperator().toLowerCase(java.util.Locale.ROOT));
+        if (ipOp != null) {
+          return new SqlBasicCall(ipOp, List.of(l, r), POS);
         }
       }
       return new SqlBasicCall(comparisonOperator(c.getOperator()), List.of(l, r), POS);

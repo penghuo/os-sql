@@ -54,6 +54,7 @@ import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
 import org.opensearch.sql.ast.tree.FillNull;
 import org.opensearch.sql.ast.tree.Filter;
+import org.opensearch.sql.ast.tree.Flatten;
 import org.opensearch.sql.ast.tree.GraphLookup;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
@@ -4162,6 +4163,57 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // currentFields oracle, scalar input would throw at execution). Defer scalar-rejection error
     // reporting until a row-type oracle is wired in.
     return node.rewriteAsEval().accept(this, frame);
+  }
+
+  @Override
+  public SqlNode visitFlatten(Flatten node, Frame frame) {
+    // PPL `flatten <field>` lifts struct sub-fields into top-level columns. OpenSearch flattens
+    // nested fields at scan time as `<field>.<sub>` columns, so the sub-fields are already
+    // present in the scan schema — we re-project them under their leaf names (or user-supplied
+    // aliases). Build an explicit projection so the leaf names are exposed as flat columns and
+    // the dotted-name flattened-leaf duplicates are dropped (mirrors v2's tryToRemoveNestedFields).
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "flatten requires a known column list — call after a `| fields ...` pipe");
+    }
+    String fieldName = node.getField().getField().toString();
+    List<String> allCols =
+        frame.currentFields.stream()
+            .filter(c -> !OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c))
+            .toList();
+    List<String> subCols = allCols.stream().filter(c -> c.startsWith(fieldName + ".")).toList();
+    List<String> aliases =
+        node.getAliases() != null
+            ? node.getAliases()
+            : subCols.stream().map(c -> c.substring(fieldName.length() + 1)).toList();
+    if (node.getAliases() != null && node.getAliases().size() != subCols.size()) {
+      throw new IllegalArgumentException(
+          String.format(
+              "The number of aliases has to match the number of flattened fields. Expected %d"
+                  + " (%s), got %d (%s)",
+              subCols.size(),
+              String.join(", ", subCols),
+              node.getAliases().size(),
+              String.join(", ", node.getAliases())));
+    }
+    // Project: input cols (drop dotted-name children of struct parents in scope) + aliased subs.
+    java.util.Set<String> all = new java.util.LinkedHashSet<>(allCols);
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : allCols) {
+      int lastDot = c.lastIndexOf('.');
+      if (lastDot >= 0 && all.contains(c.substring(0, lastDot))) {
+        continue;
+      }
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    for (int i = 0; i < subCols.size(); i++) {
+      items.add(asAliased(toIdentifier(subCols.get(i)), aliases.get(i)));
+      visible.add(aliases.get(i));
+    }
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
   }
 
   @Override

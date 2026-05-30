@@ -5740,6 +5740,38 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     } else {
       arg = expr(argExpr);
     }
+    // Numeric aggs over a MAP-path (ITEM dispatch yields ANY-typed, not numeric): wrap with
+    // CAST(... AS DOUBLE) so SUM/AVG/MIN/MAX/STDDEV/VAR get a numeric input. Without the cast,
+    // Calcite's converter raises "type mismatch: DECIMAL(38,19) vs VARCHAR" because the
+    // aggregate's expected input type doesn't match ITEM's ANY type. Skip for COUNT, count is
+    // just row-count regardless of arg type.
+    boolean isNumericAgg =
+        fnLower.equals("sum")
+            || fnLower.equals("avg")
+            || fnLower.equals("min")
+            || fnLower.equals("max")
+            || fnLower.equals("stddev")
+            || fnLower.equals("stddev_samp")
+            || fnLower.equals("stddev_pop")
+            || fnLower.equals("var_samp")
+            || fnLower.equals("var_pop")
+            || fnLower.equals("median")
+            || fnLower.equals("percentile")
+            || fnLower.equals("percentile_approx");
+    if (isNumericAgg
+        && arg instanceof SqlBasicCall sbc
+        && sbc.getOperator() == SqlStdOperatorTable.ITEM) {
+      org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+              POS);
+      arg =
+          new SqlBasicCall(
+              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+              List.of(arg, doubleSpec),
+              POS);
+    }
     org.apache.calcite.sql.SqlLiteral quantifier =
         distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
     // percentile/percentile_approx (extra <percent> arg, with median defaulting to 50),

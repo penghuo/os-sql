@@ -5611,12 +5611,52 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                     SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
                 rowNumWindow),
             POS);
+    // Build the partition-field IS NOT NULL / IS NULL pre-filter (no helper col yet). v2 emits
+    // this as a separate inner Filter rel BEFORE the window is added so the EnumerableWindow
+    // operates on already-filtered rows. Putting it in a single AND with the bound check (as we
+    // did before) collapses the two Filter rels into one — cosmetic plan-shape diff against v2.
+    SqlNode partitionPred = null;
+    if (keepEmpty) {
+      // OR: F1 IS NULL OR F2 IS NULL OR ... — keepEmpty=true means rows with ANY null partition
+      // key bypass the dedup window altogether. Without a separate inner filter this is hard to
+      // express, so we fall back to the old single-Filter shape. (keepEmpty=true is rare.)
+    } else {
+      // AND: F1 IS NOT NULL AND F2 IS NOT NULL AND ... — applied as a separate inner Filter.
+      for (SqlNode pf : partitionFields) {
+        SqlNode notNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(pf), POS);
+        partitionPred =
+            (partitionPred == null)
+                ? notNull
+                : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(partitionPred, notNull), POS);
+      }
+    }
+    SqlNode preFiltered = from;
+    if (partitionPred != null) {
+      // Wrap as `SELECT * FROM <from> WHERE <partitionPred>`.
+      SqlNodeList passthroughStar = new SqlNodeList(POS);
+      passthroughStar.add(SqlIdentifier.star(POS));
+      preFiltered =
+          new SqlSelect(
+              POS,
+              null,
+              passthroughStar,
+              from,
+              partitionPred,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null);
+    }
+    // Inner SELECT adds the ROW_NUMBER window column.
     SqlNodeList innerSelects = new SqlNodeList(POS);
     innerSelects.add(SqlIdentifier.star(POS));
     innerSelects.add(asAliased(rowNum, "_row_number_dedup_"));
     SqlNode innerSelect =
         new SqlSelect(
-            POS, null, innerSelects, from, null, null, null, null, null, null, null, null);
+            POS, null, innerSelects, preFiltered, null, null, null, null, null, null, null, null);
     SqlNode boundCheck =
         new SqlBasicCall(
             SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
@@ -5624,33 +5664,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 new SqlIdentifier("_row_number_dedup_", POS),
                 SqlLiteral.createExactNumeric(Integer.toString(allowedDup), POS)),
             POS);
-    SqlNode whereCond;
+    SqlNode whereCond = boundCheck;
     if (keepEmpty) {
-      // (F1 IS NULL) OR (F2 IS NULL) OR ... OR (_row_number_dedup_ <= N)
-      SqlNode acc = boundCheck;
+      // keepEmpty=true: still need to OR-in the IS-NULL conditions since we didn't pre-filter.
+      // Result: (F1 IS NULL) OR ... OR (_row_number_dedup_ <= N)
       for (SqlNode pf : partitionFields) {
-        acc =
+        whereCond =
             new SqlBasicCall(
                 SqlStdOperatorTable.OR,
-                List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(pf), POS), acc),
+                List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(pf), POS), whereCond),
                 POS);
       }
-      whereCond = acc;
-    } else {
-      // (F1 IS NOT NULL) AND ... AND (_row_number_dedup_ <= N)
-      SqlNode acc = boundCheck;
-      for (SqlNode pf : partitionFields) {
-        acc =
-            new SqlBasicCall(
-                SqlStdOperatorTable.AND,
-                List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(pf), POS), acc),
-                POS);
-      }
-      whereCond = acc;
     }
-    // Outer SELECT projects only the user-visible columns so the helper `_row_number_dedup_` column
-    // doesn't leak into the row type (PPL's implicit final `| fields *` should not surface it).
-    // Falls back to SELECT * when we don't know the visible fields (no row-type oracle).
+    // Outer SELECT projects only the user-visible columns so the helper `_row_number_dedup_`
+    // column doesn't leak into the row type (PPL's implicit final `| fields *` should not
+    // surface it). Falls back to SELECT * when we don't know the visible fields.
     SqlNodeList outerSelects = new SqlNodeList(POS);
     List<String> visible = frame.currentFields;
     if (visible != null && !visible.isEmpty()) {

@@ -4316,14 +4316,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     List<String> visible = frame.currentFields == null ? List.of() : frame.currentFields;
     java.util.Set<String> visibleSet = new java.util.LinkedHashSet<>(visible);
+    // Recognise MAP-path targets (e.g. `replace ... IN doc.user.name` over a MAP-typed `doc`):
+    // these aren't in visible/currentFields but the prefix is in frame.mapColumns. Handle them as
+    // appended `ITEM(<map>, '<path>')` columns. Validate any non-map-path target is in visible.
+    java.util.Set<String> mapPathTargets = new java.util.LinkedHashSet<>();
     for (String t : targets) {
-      if (!visibleSet.contains(t)) {
+      int dot = t.indexOf('.');
+      if (dot > 0 && frame.mapColumns.contains(t.substring(0, dot))) {
+        mapPathTargets.add(t);
+      } else if (!visibleSet.contains(t)) {
         throw new IllegalArgumentException(
             "field [" + t + "] not found; input fields are: " + visible);
       }
     }
     SqlNodeList items = new SqlNodeList(POS);
-    List<String> newVisible = new ArrayList<>(visible.size());
+    List<String> newVisible = new ArrayList<>(visible.size() + mapPathTargets.size());
     for (String c : visible) {
       SqlNode fieldRef = toIdentifier(c);
       if (targets.contains(c)) {
@@ -4332,6 +4339,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         items.add(fieldRef);
       }
       newVisible.add(c);
+    }
+    for (String t : mapPathTargets) {
+      int dot = t.indexOf('.');
+      SqlNode fieldRef =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(
+                  new SqlIdentifier(t.substring(0, dot), POS),
+                  SqlLiteral.createCharString(t.substring(dot + 1), POS)),
+              POS);
+      items.add(asAliased(buildReplaceChain(fieldRef, node), t));
+      newVisible.add(t);
+      // Register the materialised flat-dotted column as a dotted-eval-alias so downstream
+      // visitProject emits a quoted single-part identifier (rather than re-running ITEM
+      // dispatch and bypassing our REPLACE substitution).
+      frame.dottedEvalAliases.add(t);
     }
     return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
   }

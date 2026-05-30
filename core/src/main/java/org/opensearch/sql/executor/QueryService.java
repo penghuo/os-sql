@@ -238,11 +238,48 @@ public class QueryService {
         // This happens if Calcite fell back to V2 due to some issue, and then V2 also failed.
         // Prefer the Calcite error.
         // https://github.com/opensearch-project/sql/issues/5060
-        propagateCalciteError(calciteFailure.get(), listener);
+        // EXCEPTION: when the v2 failure is a DataSourceClientException (e.g.
+        // DatasourceDisabledException, DataSourceNotFoundException) the v2 error carries the
+        // specific user-facing reason that the test contract expects ("Datasource X is
+        // disabled.", reason "Invalid Query"); the Calcite error is just the generic
+        // CalciteUnsupportedException("Datasource X is unsupported in Calcite"). Prefer the
+        // v2 error in that case so the disabled/missing-DS contract matches the v2 path.
+        if (isDataSourceClientError(e) && isCalciteUnsupportedError(calciteFailure.get())) {
+          listener.onFailure(e);
+        } else {
+          propagateCalciteError(calciteFailure.get(), listener);
+        }
       } else {
         listener.onFailure(e);
       }
     }
+  }
+
+  /**
+   * True if the (possibly nested) cause is a {@code
+   * org.opensearch.sql.datasources.exceptions.DataSourceClientException}. The class lives in the
+   * `datasources` module which `core` doesn't depend on, so match by class name.
+   */
+  private static boolean isDataSourceClientError(Throwable t) {
+    while (t != null) {
+      if ("org.opensearch.sql.datasources.exceptions.DataSourceClientException"
+              .equals(t.getClass().getName())
+          || isAssignableByName(
+              t.getClass(), "org.opensearch.sql.datasources.exceptions.DataSourceClientException")) {
+        return true;
+      }
+      t = t.getCause();
+    }
+    return false;
+  }
+
+  private static boolean isAssignableByName(Class<?> cls, String parent) {
+    Class<?> c = cls.getSuperclass();
+    while (c != null && c != Object.class) {
+      if (parent.equals(c.getName())) return true;
+      c = c.getSuperclass();
+    }
+    return false;
   }
 
   /**

@@ -594,7 +594,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         && node.getProjectList().size() == 1
         && node.getProjectList().getFirst() instanceof AllFields
         && (from instanceof SqlSelect || from instanceof org.apache.calcite.sql.SqlOrderBy)) {
-      return from;
+      // Short-circuit applies only when the visible field list has no dotted-leaf-with-parent
+      // duplicates — otherwise we need to wrap with an explicit projection so {@link
+      // #resolveSelectedFields}'s tryToRemoveNestedFields-style filter prunes the leaf.
+      if (frame.currentFields == null || !hasDottedLeafWithVisibleParent(frame.currentFields)) {
+        return from;
+      }
     }
 
     List<String> selected = resolveSelectedFields(node, frame.currentFields);
@@ -6414,6 +6419,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
+   * True when {@code fields} contains a dotted-name field whose parent (substring before the last
+   * dot) is also in {@code fields}. Mirrors v2's tryToRemoveNestedFields trigger condition.
+   */
+  private static boolean hasDottedLeafWithVisibleParent(List<String> fields) {
+    java.util.Set<String> set = new java.util.HashSet<>(fields);
+    for (String c : fields) {
+      int lastDot = c.lastIndexOf('.');
+      if (lastDot >= 0 && set.contains(c.substring(0, lastDot))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Resolve the explicit SELECT-list field names this Project should emit, given the Project AST
    * and the field list visible at this pipe.
    *
@@ -6441,7 +6461,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
     if (node.getProjectList().size() == 1
         && node.getProjectList().getFirst() instanceof AllFields) {
-      return nonMeta;
+      // Mirror v2's tryToRemoveNestedFields: when a dotted-name field's parent is itself a
+      // visible column, drop the dotted leaf. Otherwise an `eval `agent.name` = 'test'` after
+      // `fields agent` would expose both `agent` (struct) and `agent.name` (string), inflating
+      // the implicit `fields *` output beyond PPL's documented behaviour.
+      java.util.Set<String> nonMetaSet = new java.util.LinkedHashSet<>(nonMeta);
+      List<String> filtered = new ArrayList<>();
+      for (String c : nonMeta) {
+        int lastDot = c.lastIndexOf('.');
+        if (lastDot >= 0 && nonMetaSet.contains(c.substring(0, lastDot))) {
+          continue;
+        }
+        filtered.add(c);
+      }
+      return filtered;
     }
 
     List<String> requested = new ArrayList<>();

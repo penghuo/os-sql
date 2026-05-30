@@ -581,12 +581,14 @@ public final class SqlNodePlanner {
     // CalciteExplainIT and CalcitePPLBig5IT). Only swaps when the Project is a pure passthrough
     // (RexInputRef-only, no computed expressions) so the sort keys can be straightforwardly
     // re-indexed from projected-positions to input-positions.
-    // PPL `... | sort F | head N` produces two adjacent LogicalSort rels: an inner
-    // sort-only (collation, no fetch) and an outer fetch-only (no collation). v2's RelBuilder
-    // path fuses them into a single Sort(collation, fetch=N). Match that shape so cosmetic plan
-    // diffs in Big5IT/ClickBench don't fire on the Sort+Fetch double-Sort pattern.
-    rel = fuseAdjacentSorts(rel);
     rel = swapSortAndPassthroughProject(rel);
+    // PPL `... | sort F | head N` produces two adjacent LogicalSort rels (or after the swap
+    // above, separated only by a passthrough Project that swap moved on top): an inner
+    // sort-only (collation, no fetch) and an outer fetch-only (no collation). v2's RelBuilder
+    // path fuses them into a single Sort(collation, fetch=N). Run AFTER swap so the swap can
+    // collapse `Sort(fetch) -> Project -> Sort(collation)` to `Project -> Sort(fetch) ->
+    // Sort(collation)` which is the directly-adjacent shape my fuse handles.
+    rel = fuseAdjacentSorts(rel);
     // Re-run trim AFTER swap so adjacent passthrough Projects produced by the swap (e.g. a
     // user-fields Project sitting on top of an eval-extended Project that exposed a sort key)
     // get collapsed into a single composed Project.
@@ -793,24 +795,35 @@ public final class SqlNodePlanner {
           @Override
           public RelNode visit(RelNode other) {
             RelNode visited = super.visit(other);
-            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalSort outer)) {
-              return visited;
-            }
-            // Outer must be FETCH-only (and possibly OFFSET): no collation keys.
-            if (!outer.getCollation().getFieldCollations().isEmpty()) return visited;
-            if (outer.fetch == null) return visited;
-            if (!(outer.getInput() instanceof org.apache.calcite.rel.logical.LogicalSort inner)) {
-              return visited;
-            }
-            // Inner must have collation keys and no FETCH/OFFSET (otherwise fusing would
-            // override the inner's row-cap, changing semantics).
-            if (inner.getCollation().getFieldCollations().isEmpty()) return visited;
-            if (inner.fetch != null || inner.offset != null) return visited;
-            return org.apache.calcite.rel.logical.LogicalSort.create(
-                inner.getInput(), inner.getCollation(), outer.offset, outer.fetch);
+            return tryFuseAdjacentSorts(visited);
+          }
+
+          @Override
+          public RelNode visit(org.apache.calcite.rel.logical.LogicalSort sort) {
+            // RelShuttleImpl's visit(LogicalSort) doesn't route through visit(RelNode), so we
+            // need an explicit override. Process children, then attempt the fuse.
+            RelNode visited = super.visit(sort);
+            return tryFuseAdjacentSorts(visited);
           }
         };
     return rel.accept(shuttle);
+  }
+
+  /** Fuse `LogicalSort(fetch=N) <- LogicalSort(collation=...)` into a single Sort if possible. */
+  private static RelNode tryFuseAdjacentSorts(RelNode visited) {
+    if (!(visited instanceof org.apache.calcite.rel.logical.LogicalSort outer)) {
+      return visited;
+    }
+    if (!outer.getCollation().getFieldCollations().isEmpty()) return visited;
+    if (outer.fetch == null) return visited;
+    org.apache.calcite.rel.RelNode inputRel = outer.getInput();
+    if (!(inputRel instanceof org.apache.calcite.rel.logical.LogicalSort inner)) {
+      return visited;
+    }
+    if (inner.getCollation().getFieldCollations().isEmpty()) return visited;
+    if (inner.fetch != null || inner.offset != null) return visited;
+    return org.apache.calcite.rel.logical.LogicalSort.create(
+        inner.getInput(), inner.getCollation(), outer.offset, outer.fetch);
   }
 
   private RelNode swapSortAndPassthroughProject(RelNode rel) {

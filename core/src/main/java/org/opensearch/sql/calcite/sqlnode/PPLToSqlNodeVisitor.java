@@ -803,11 +803,29 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (rebound.isEmpty() || frame.currentFields == null) {
       items.add(SqlIdentifier.star(POS));
     } else {
-      for (String c : frame.currentFields) {
-        if (!rebound.contains(c)) {
-          items.add(toIdentifier(c));
+      // When eval rebinds a dotted flattened-nested-leaf (e.g. `eval `a.b.c` = ...` where `a.b.c`
+      // was already a flat catalog column), also drop ALL ancestor structs (`a`, `a.b`) from
+      // the explicit list. PPL semantics (mirrors v2's tryToRemoveNestedFields):  a rebound
+      // leaf's override would otherwise be shadowed by the lingering struct parent that still
+      // contains the pre-override value. Keep sibling leaves visible (they're still flat
+      // columns, not under the rebound parent path).
+      java.util.Set<String> ancestorDrop = new java.util.HashSet<>();
+      for (String r : rebound) {
+        if (r.indexOf('.') < 0) continue;
+        // Add every prefix `a`, `a.b`, ..., `a.b.c.d` (excluding the leaf itself, which is the
+        // rebound name).
+        int idx = r.indexOf('.');
+        while (idx >= 0) {
+          ancestorDrop.add(r.substring(0, idx));
+          idx = r.indexOf('.', idx + 1);
         }
       }
+      for (String c : frame.currentFields) {
+        if (rebound.contains(c) || ancestorDrop.contains(c)) continue;
+        items.add(toIdentifier(c));
+      }
+      // Also remove ancestor structs from `visible` so downstream pipes don't see them.
+      visible.removeAll(ancestorDrop);
     }
     Set<String> aliasesInThisSelect = new LinkedHashSet<>();
     boolean wrappedMidEval = false;

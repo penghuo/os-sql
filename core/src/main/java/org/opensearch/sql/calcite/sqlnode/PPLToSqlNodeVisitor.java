@@ -3612,6 +3612,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             || "cs".equals(unit)
             || "ds".equals(unit);
     if (aligntimeExpr != null && isAlignableUnit) {
+      // aligntime=latest|earliest: PPL semantics align bins to the most/least recent data point.
+      // v2 emits a decomposed FROM_UNIXTIME shape using PPL's DIVIDE UDF with separate
+      // value*unitSeconds factors (not a single intervalSeconds literal).
+      String aligntimeStr = aligntimeAsString(aligntimeExpr);
+      if ("latest".equals(aligntimeStr) || "earliest".equals(aligntimeStr)) {
+        long unitSeconds = unitToSeconds(unit, 1);
+        if (unitSeconds > 0) {
+          return buildLatestAlignedTimeSpan(fieldRef, value, unitSeconds);
+        }
+      }
       Long alignmentOffsetSeconds = parseAlignTimeOffsetSeconds(aligntimeExpr);
       if (alignmentOffsetSeconds != null) {
         long intervalSeconds = unitToSeconds(unit, value);
@@ -3664,6 +3674,49 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return sign * n * perUnit;
     }
     return null;
+  }
+
+  private String aligntimeAsString(UnresolvedExpression aligntimeExpr) {
+    if (!(aligntimeExpr instanceof Literal lit) || lit.getValue() == null) return null;
+    return lit.getValue()
+        .toString()
+        .replace("'", "")
+        .replace("\"", "")
+        .trim()
+        .toLowerCase(java.util.Locale.ROOT);
+  }
+
+  /**
+   * aligntime=latest/earliest emission shape (mirrors v2's TimeSpanHelper.shouldApplyAligntime with
+   * decomposed value*unit factors): {@code FROM_UNIXTIME(value * unitSeconds *
+   * FLOOR(DIVIDE(DIVIDE(UNIX_TIMESTAMP(field), unitSeconds), value)))}. Uses PPL's DIVIDE UDF (not
+   * std SQL /), which is what v2's RexBuilder produces.
+   */
+  private SqlNode buildLatestAlignedTimeSpan(SqlNode fieldRef, int value, long unitSeconds) {
+    SqlNode unixSeconds =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.UNIX_TIMESTAMP,
+            List.of(fieldRef),
+            POS);
+    SqlLiteral unitLit = SqlLiteral.createExactNumeric(Long.toString(unitSeconds), POS);
+    SqlLiteral valueLit = SqlLiteral.createExactNumeric(Integer.toString(value), POS);
+    SqlNode div1 =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE,
+            List.of(unixSeconds, unitLit),
+            POS);
+    SqlNode div2 =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE,
+            List.of(div1, valueLit),
+            POS);
+    SqlNode floored = new SqlBasicCall(SqlStdOperatorTable.FLOOR, List.of(div2), POS);
+    SqlNode mul1 = new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(floored, valueLit), POS);
+    SqlNode mul2 = new SqlBasicCall(SqlStdOperatorTable.MULTIPLY, List.of(mul1, unitLit), POS);
+    return new SqlBasicCall(
+        org.opensearch.sql.expression.function.PPLBuiltinOperators.FROM_UNIXTIME,
+        List.of(mul2),
+        POS);
   }
 
   private SqlNode buildAlignedTimeSpan(

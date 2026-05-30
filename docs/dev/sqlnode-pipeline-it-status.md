@@ -48,8 +48,8 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | 7 | CalciteWhereCommandIT | ✅ | 82/82 pass after adding SqlLibrary.POSTGRESQL (for ILIKE). |
 | 8 | CalciteSearchCommandIT | ✅ | 104/104 pass. |
 | 9 | CalciteDescribeCommandIT | ✅ | 6/6 pass. |
-| 10 | CalciteShowDataSourcesCommandIT | ⏭️ | Excluded by build exclude rules (datasource IT). |
-| 11 | CalciteInformationSchemaCommandIT | ⏭️ | Excluded by build exclude rules. |
+| 10 | CalciteShowDataSourcesCommandIT | ✅ | 2/2 pass after Track V28 — class-level `@Ignore` (issue #3465) and `build.gradle` exclude both removed; the class now runs and the v2 parent's `Relation` visitor throws `CalciteUnsupportedException("SHOW DATASOURCES is unsupported in Calcite")` which falls back to the v2 engine path. The test asserts on the v2 fallback's response which works correctly. |
+| 11 | CalciteInformationSchemaCommandIT | ✅ | 3/3 pass after Track V28 — class-level `@Ignore` (issue #3455) and `build.gradle` exclude both removed; the v2 parent's `Relation` visitor throws `CalciteUnsupportedException("information_schema is unsupported in Calcite")` which falls back to v2 cleanly. |
 | 12 | CalciteSettingsIT | ✅ | 4/4 pass. |
 | 13 | CalciteResourceMonitorIT | ✅ | All pass after Track R24: `OpenSearchExecutionEngine.execute(RelNode, ...)` now mirrors `ResourceMonitorPlan.open()` — calls `osProtector.getResourceMonitor().getStatus()` before invoking `OpenSearchRelRunners.run`, and throws `IllegalStateException("Insufficient resources to start query: ...")` when the configured `plugins.ppl.query.memory_limit` is exceeded. Without this, the Calcite engine bypassed the limit because the JDBC `PreparedStatement.executeQuery()` path didn't go through `executionProtector.protect()`. Plus `GCedMemoryUsage.usage()` now falls back to `RuntimeMemoryUsage` when no old-gen GC has fired (sentinel -1) — required for a meaningful coordinator-side memory comparison before the first GC notification arrives. |
 | 14 | CalciteErrorReportStageIT | ✅ | 7/7 pass. |
@@ -172,7 +172,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 80 | CalciteJsonFunctionsIT | ⏭️ | Excluded by build rules. |
+| 80 | CalciteJsonFunctionsIT | ⏭️ | Track V28 attempted to enable: 4/5 fail. Calcite's JSON path treats empty string as invalid JSON (test_not_json_valid sees "json empty string" as not-valid; v2 considers it valid) and the count assertions are off-by-one. These are real feature differences requiring upstream JSON-function work tracked under issue #3436; the round-trip pipeline itself passes the SQL through unchanged. Re-`@Ignore`'d for now. |
 | 81 | CalcitePPLJsonBuiltinFunctionIT | ✅ | 22/22 pass after `permissiveVariadic` operand metadata + IT expectation update for nested `json_object`/`json_array` round-trip. SqlNodePipeline activates SqlValidator's SQL:2016 implicit `FORMAT JSON` wrap on JSON-returning operands, so nested values embed as real sub-objects instead of being Jackson-escaped into strings. Matches Spark/Snowflake semantics. |
 | 82 | CalcitePPLStringBuiltinFunctionIT | ✅ | 27/27 pass after adding `SqlLibrary.MYSQL` to the operator table — `STRCMP` is registered only under `SqlLibrary.MYSQL`; without it, the validator rejects the round-tripped SQL with "No match found for function signature STRCMP(<CHARACTER>, <CHARACTER>)". 2 ordering fails fixed by `withRemoveSortInSubQuery(false)` (see #38). |
 | 83 | CalciteTextFunctionIT | ✅ | 24/24 pass after `SqlLibrary.MYSQL` (see #82) and `withRemoveSortInSubQuery(false)` (see #38). |
@@ -210,7 +210,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 | 110 | CalcitePPLGrokIT | ✅ | All pass. |
 | 111 | CalcitePPLMapPathIT | ✅ | All pass. |
 | 112 | CalcitePPLPatternsIT | ✅ | 15/15 pass after Track C7: `SqlNodePipeline.retypeItemForArrayCast` post-pass detects `CAST(ITEM(map_with_any, key) AS ARRAY<X>)` patterns where the round-trip lost the visitor's typed-MAP view (so source.getComponentType() is null and `RexToLixTranslator.getConvertExpression` line 371 asserts). Wraps the `map_with_any` operand with an explicit `CAST(map AS MAP<K, ARRAY<X>>)` so ITEM returns `ARRAY<X>` directly and CAST becomes an identity. Plus earlier fixes: (i) `INTERNAL_PATTERN` operand metadata `permissiveVariadic`; (ii) `OpenSearchSparkSqlDialect.getCastSpec` emits Calcite default for MAP/ARRAY (Spark dialect's `MAP<K,V>` angle-brackets not supported by Babel). |
-| 113 | CalcitePrometheusDataSourceCommandsIT | ⏭️ | Excluded. |
+| 113 | CalcitePrometheusDataSourceCommandsIT | ⏭️ | Track V28 attempted to enable: 10/11 pass. `testQueryOnDisabledDataSource` expects `"Invalid Query"` but Calcite throws `CalciteUnsupportedException("Datasource X is unsupported in Calcite")` from `visitRelation`. The error message contract differs from v2; resolving requires aligning the disabled-DS error path (issue #3455). Re-`@Ignore`'d for now; the other 10 tests pass. |
 | 114 | CalciteQueryAnalysisIT | ✅ | All pass. |
 | 115 | CalciteRareCommandIT | ✅ | All pass. |
 | 116 | CalciteRegexCommandIT | ✅ | All pass. |

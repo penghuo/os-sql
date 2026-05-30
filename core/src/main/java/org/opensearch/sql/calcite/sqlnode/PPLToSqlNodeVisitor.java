@@ -172,6 +172,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Set<String> mapColumns = new java.util.LinkedHashSet<>();
 
     /**
+     * Eval aliases whose name contains a literal dot (e.g. {@code spath input=doc} produces {@code
+     * doc.user.name} as an alias). When a downstream expression references these by their dotted
+     * name, emit a quoted single-part identifier so the validator looks up the literal column
+     * instead of treating dot parts as schema/table/column.
+     */
+    java.util.Set<String> dottedEvalAliases = new java.util.LinkedHashSet<>();
+
+    /**
      * Active SubqueryAlias name set by {@link #visitSubqueryAlias} from {@code source = X as i}.
      * Used by visitors that wrap state (visitFilter / visitSort / visitEval / visitAggregation /
      * etc.) to re-attach the alias around the wrapped subquery so a downstream {@code | sort i.col}
@@ -462,6 +470,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         case "map_concat":
         case "map_filter":
         case "map_zip":
+        case "json_extract_all":
           return true;
         default:
           return false;
@@ -611,6 +620,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       String leaf = name.substring(name.lastIndexOf('.') + 1);
       boolean dotted = name.indexOf('.') >= 0;
       String prefix = dotted ? name.substring(0, name.indexOf('.')) : null;
+      // Spath/eval-dotted-alias: when the full dotted name is a known eval alias (e.g.
+      // `doc.user.name` from spath rewriteAsEval), emit a quoted single-part identifier so the
+      // validator looks up the literal alias.
+      if (dotted && frame.dottedEvalAliases.contains(name)) {
+        selectList.add(quotedIdentifier(java.util.Collections.singletonList(name)));
+        seenLeaves.add(leaf);
+        continue;
+      }
       // ITEM dispatch when the dotted prefix is a MAP-typed column (catalog "object" mapping or
       // an eval alias bound to a MAP-producing function like geoip). Validator multi-part
       // identifier resolution would otherwise fail with "Table 'X' not found". Always alias the
@@ -867,6 +884,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       } else if (rebound.contains(alias)) {
         // Rebound to a non-MAP RHS — drop any prior MAP tracking for this name.
         frame.mapColumns.remove(alias);
+      }
+      // Track eval aliases whose name contains a literal dot (e.g. spath rewriteAsEval emits
+      // `eval doc.user.name = json_extract(doc, '$.user.name')`). When a downstream expression
+      // references the alias by its dotted name, the validator's multi-part identifier
+      // resolution would interpret it as <table>.<col> — emit a quoted single-part identifier
+      // instead so the validator looks up the literal column.
+      if (alias.indexOf('.') >= 0) {
+        frame.dottedEvalAliases.add(alias);
       }
     }
     // Peephole: when child is a SELECT * (no GROUP BY / HAVING), append our extra eval items to
@@ -6442,6 +6467,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         List<String> rewritten = new ArrayList<>(parts);
         rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
         return new SqlIdentifier(rewritten, POS);
+      }
+      // Spath/eval-with-dotted-alias case: {@code eval doc.user.name = json_extract(doc, ...)}
+      // produces an alias whose own name contains dots. A downstream `doc.user.name` reference
+      // must resolve to the literal column, not a multi-part identifier path.
+      if (parts.size() >= 2
+          && exprFrame != null
+          && exprFrame.dottedEvalAliases.contains(qn.toString())) {
+        return quotedIdentifier(java.util.Collections.singletonList(qn.toString()));
       }
       // OpenSearch "object" mappings become MAP<VARCHAR, ANY> in Calcite. A dotted reference
       // {@code object_value.first} drills via {@code ITEM(object_value, 'first')} —

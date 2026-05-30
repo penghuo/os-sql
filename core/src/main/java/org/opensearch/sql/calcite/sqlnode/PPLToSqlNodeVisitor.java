@@ -319,6 +319,74 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
   }
 
+  /**
+   * Static result-type for an aggregate function call. Returns {@code null} when the agg's input
+   * type is unknown statically. Mirrors PPL's documented agg semantics: count/distinct_count return
+   * LONG; sum/min/max/first/last/earliest/latest/take preserve input type;
+   * avg/percentile/median/var_pop/var_samp/stddev_pop/stddev_samp return DOUBLE; list/values return
+   * ARRAY input which is not statically derivable.
+   */
+  private static DataType staticAggResultType(
+      UnresolvedExpression aggExpr,
+      java.util.Map<String, DataType> preAggCols,
+      java.util.Map<String, DataType> preAggEvals) {
+    if (!(aggExpr instanceof AggregateFunction af)) {
+      // Non-AggregateFunction (eval-style scalar exposed as agg): no static type.
+      return null;
+    }
+    String fn = af.getFuncName() == null ? "" : af.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    switch (fn) {
+      case "count":
+      case "distinct_count":
+      case "distinct_count_approx":
+      case "dc":
+        return DataType.LONG;
+      case "avg":
+      case "var_pop":
+      case "var_samp":
+      case "stddev_pop":
+      case "stddev_samp":
+      case "percentile":
+      case "percentile_approx":
+      case "median":
+        return DataType.DOUBLE;
+      case "sum":
+      case "min":
+      case "max":
+      case "first":
+      case "last":
+      case "earliest":
+      case "latest":
+      case "take":
+        return staticTypeOfFromMaps(af.getField(), preAggCols, preAggEvals);
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Like {@link #staticTypeOf} but reads from explicit column- and eval-alias maps (passed by
+   * caller) rather than {@link Frame#columnPrimitiveType} / {@link Frame#evalAliasTypes}. Used by
+   * {@link #staticAggResultType} when the caller needs a snapshot before the frame is mutated.
+   */
+  private static DataType staticTypeOfFromMaps(
+      UnresolvedExpression e,
+      java.util.Map<String, DataType> cols,
+      java.util.Map<String, DataType> evals) {
+    if (e == null) return null;
+    if (e instanceof Literal lit) return lit.getType();
+    if (e instanceof Cast c) return c.getDataType();
+    QualifiedName qn = null;
+    if (e instanceof QualifiedName q) qn = q;
+    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+    if (qn != null && qn.getParts().size() == 1) {
+      String name = qn.toString();
+      if (evals != null && evals.containsKey(name)) return evals.get(name);
+      if (cols != null && cols.containsKey(name)) return cols.get(name);
+    }
+    return null;
+  }
+
   /** True when {@code dt} is a PPL numeric type (SHORT/INTEGER/LONG/FLOAT/DOUBLE/DECIMAL). */
   private static boolean isNumericPplType(DataType dt) {
     if (dt == null) return false;
@@ -866,12 +934,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<String> visible = new ArrayList<>();
     String spanAlias = null;
 
+    // Snapshot per-column type info BEFORE the aggregation clears the frame's column maps —
+    // visitAggregation reuses the same Frame, but agg outputs can be statically typed from the
+    // input column's type (sum/min/max preserve numeric input type; count returns LONG; avg
+    // returns DOUBLE). We mirror this into the post-aggregation frame's evalAliasTypes so a
+    // downstream Append/Multisearch/AppendPipe can compare per-side column types.
+    java.util.Map<String, DataType> preAggColumnTypes =
+        new java.util.LinkedHashMap<>(frame.columnPrimitiveType);
+    java.util.Map<String, DataType> preAggEvalAliases =
+        new java.util.LinkedHashMap<>(frame.evalAliasTypes);
+    java.util.Map<String, DataType> postAggTypes = new java.util.LinkedHashMap<>();
+
     for (UnresolvedExpression aggExpr : node.getAggExprList()) {
       String alias = aggLabel(aggExpr);
       UnresolvedExpression core = (aggExpr instanceof Alias a) ? a.getDelegated() : aggExpr;
       SqlNode call = aggCall(core);
       items.add(asAliased(call, alias));
       visible.add(alias);
+      DataType aggResultType = staticAggResultType(core, preAggColumnTypes, preAggEvalAliases);
+      if (aggResultType != null) {
+        postAggTypes.put(alias, aggResultType);
+      }
     }
     // span is a separate field on Aggregation (not in groupExprList). Emit it first in the group
     // list to match PPL's `<aggs> by span(...), <by_fields>` row layout.
@@ -893,9 +976,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       nonSpanGroupExprs.add(keyExpr);
       items.add(asAliased(keyExpr, alias));
       visible.add(alias);
+      // Group keys preserve the input column's type. Snapshot for the post-agg frame.
+      DataType groupType = staticTypeOfFromMaps(core, preAggColumnTypes, preAggEvalAliases);
+      if (groupType != null) {
+        postAggTypes.put(alias, groupType);
+      }
     }
     // Aggregations destroy row-level collation; clear the lastOrderBy hint.
     frame.lastOrderBy = null;
+    // Post-aggregation: replace per-column types with the agg-output types. Group keys retain
+    // input type; aggs (sum/min/max/count/...) get their statically-derived result type. Non-
+    // resolved aggs leave the entry absent (downstream Append will skip type-checking those).
+    frame.columnPrimitiveType.clear();
+    frame.evalAliasTypes.clear();
+    frame.evalAliasTypes.putAll(postAggTypes);
 
     // PPL `stats bucket_nullable=false ... by X, Y` excludes rows where any group key is NULL.
     // Default true keeps NULL buckets. The argExprList carries the option literal.
@@ -1193,6 +1287,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   /**
    * True when {@code a} and {@code b} are PPL-fillnull-compatible (numeric family or both string).
+   * Used by visitFillNull to validate replacement-vs-field compatibility.
    */
   private static boolean pplTypesCompatible(DataType a, DataType b) {
     if (a == b) return true;
@@ -1200,6 +1295,50 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     boolean bNum = isNumericPplType(b);
     if (aNum && bNum) return true;
     return false;
+  }
+
+  /**
+   * Strict per-column type identity: PPL append/multisearch/appendpipe rejects cross-numeric
+   * mismatches (BIGINT vs INTEGER) and not just cross-family mismatches. Mirrors v2's documented
+   * "Unable to process column 'C' due to incompatible types" check.
+   */
+  private static boolean pplExactTypesCompatible(DataType a, DataType b) {
+    return a == b;
+  }
+
+  /**
+   * Detect type conflicts on shared columns across two UNION-ALL sides. PPL throws a documented
+   * error when a column appears on both sides with statically-different types that don't widen
+   * cleanly (e.g. one side BIGINT and the other DOUBLE after a `cast as double` eval).
+   *
+   * <p>Throws {@link IllegalArgumentException} with PPL's documented message format:
+   *
+   * <pre>Unable to process column 'C' due to incompatible types: [A, B]</pre>
+   */
+  private static void detectAppendTypeConflict(
+      List<String> mainCols, List<String> subCols, Frame mainFrame, Frame subFrame) {
+    java.util.Set<String> shared = new java.util.LinkedHashSet<>(mainCols);
+    shared.retainAll(subCols);
+    for (String c : shared) {
+      DataType mainType = lookupColumnType(c, mainFrame);
+      DataType subType = lookupColumnType(c, subFrame);
+      if (mainType != null && subType != null && !pplExactTypesCompatible(mainType, subType)) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Unable to process column '%s' due to incompatible types: [%s, %s]",
+                c, pplTypeToSqlNameForError(mainType), pplTypeToSqlNameForError(subType)));
+      }
+    }
+  }
+
+  /**
+   * Look up a column's static type from a Frame's columnPrimitiveType (catalog-derived) or
+   * evalAliasTypes (eval/agg-derived). Returns {@code null} when the column isn't tracked.
+   */
+  private static DataType lookupColumnType(String name, Frame frame) {
+    if (frame.evalAliasTypes.containsKey(name)) return frame.evalAliasTypes.get(name);
+    if (frame.columnPrimitiveType.containsKey(name)) return frame.columnPrimitiveType.get(name);
+    return null;
   }
 
   /** Map PPL DataType to the SQL type name used in fillnull error messages. */
@@ -1397,6 +1536,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         unified.add(c);
       }
     }
+    // Type-conflict pre-check: when a column appears on BOTH sides with different statically-known
+    // types (and they aren't in the same numeric family), throw PPL's documented error message.
+    detectAppendTypeConflict(mainCols, subCols, frame, subFrame);
     SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified, subFrame.columnUdt);
     SqlNode subPadded = padToUnifiedSchema(sub, subCols, unified, frame.columnUdt);
     SqlNode unioned =
@@ -1626,6 +1768,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         unified.add(c);
       }
     }
+    detectAppendTypeConflict(mainCols, subCols, mainFrame, subFrame);
     SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified, subFrame.columnUdt);
     SqlNode subPadded = padToUnifiedSchema(subBody, subCols, unified, mainFrame.columnUdt);
     SqlNode unioned =
@@ -1809,6 +1952,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<SqlNode> branchNodes = new ArrayList<>();
     List<List<String>> branchCols = new ArrayList<>();
     List<java.util.Map<String, String>> branchUdt = new ArrayList<>();
+    List<Frame> branchFrames = new ArrayList<>();
     List<String> unified = new ArrayList<>();
     for (UnresolvedPlan sub : node.getSubsearches()) {
       // Apply EmptySourcePropagateVisitor — drop branches that collapse to Values([]).
@@ -1831,10 +1975,18 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       branchCols.add(new ArrayList<>(subFrame.currentFields));
       branchUdt.add(new java.util.LinkedHashMap<>(subFrame.columnUdt));
+      branchFrames.add(subFrame);
       for (String c : subFrame.currentFields) {
         if (!unified.contains(c)) {
           unified.add(c);
         }
+      }
+    }
+    // Type-conflict check across pairs of branches that share a column.
+    for (int i = 0; i < branchFrames.size(); i++) {
+      for (int j = i + 1; j < branchFrames.size(); j++) {
+        detectAppendTypeConflict(
+            branchCols.get(i), branchCols.get(j), branchFrames.get(i), branchFrames.get(j));
       }
     }
     if (branchNodes.isEmpty()) {

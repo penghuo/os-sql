@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.ppl;
 
+import static org.junit.Assert.assertEquals;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_BANK;
 import static org.opensearch.sql.plugin.rest.RestPPLQueryAction.QUERY_API_ENDPOINT;
@@ -12,7 +13,7 @@ import static org.opensearch.sql.plugin.rest.RestPPLQueryAction.QUERY_API_ENDPOI
 import java.io.IOException;
 import java.util.Locale;
 import org.junit.Assert;
-import org.junit.jupiter.api.Test;
+import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 
@@ -24,10 +25,11 @@ public class VisualizationFormatIT extends PPLIntegTestCase {
   }
 
   @Test
-  void format() throws IOException {
+  public void format() throws IOException {
     String result =
         executeVizQuery(
-            String.format(Locale.ROOT, "source=%s | fields firstname, age", TEST_INDEX_BANK), true);
+            String.format(Locale.ROOT, "source=%s | fields firstname, age", TEST_INDEX_BANK), true)
+            .trim();
     assertEquals(
         "{\n"
             + "  \"data\": {\n"
@@ -72,7 +74,7 @@ public class VisualizationFormatIT extends PPLIntegTestCase {
     Request request =
         buildRequest(
             query,
-            QUERY_API_ENDPOINT + String.format(Locale.ROOT, "?format=csv&pretty=%b", pretty));
+            QUERY_API_ENDPOINT + String.format(Locale.ROOT, "?format=viz&pretty=%b", pretty));
     Response response = client().performRequest(request);
     Assert.assertEquals(200, response.getStatusLine().getStatusCode());
     return getResponseBody(response, true);

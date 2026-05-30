@@ -163,6 +163,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> columnPrimitiveType = new java.util.LinkedHashMap<>();
 
     /**
+     * Top-level catalog columns whose Calcite type is MAP&lt;VARCHAR, ANY&gt;. PPL converts
+     * OpenSearch "object" mappings to MAP. When a dotted identifier like {@code object_value.first}
+     * starts at one of these columns, emit {@code ITEM(object_value, 'first')} so the validator
+     * drills into the map instead of interpreting the leading part as a table name. Skipped for
+     * ARRAY-typed (nested) columns since ITEM rejects string keys for arrays.
+     */
+    java.util.Set<String> mapColumns = new java.util.LinkedHashSet<>();
+
+    /**
      * Active SubqueryAlias name set by {@link #visitSubqueryAlias} from {@code source = X as i}.
      * Used by visitors that wrap state (visitFilter / visitSort / visitEval / visitAggregation /
      * etc.) to re-attach the alias around the wrapped subquery so a downstream {@code | sort i.col}
@@ -324,6 +333,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         if (prim != null) {
           frame.columnPrimitiveType.put(field.getName(), prim);
         }
+      }
+      if (field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.MAP) {
+        frame.mapColumns.add(field.getName());
       }
     }
   }
@@ -6375,6 +6387,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         List<String> rewritten = new ArrayList<>(parts);
         rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
         return new SqlIdentifier(rewritten, POS);
+      }
+      // OpenSearch "object" mappings become MAP<VARCHAR, ANY> in Calcite. A dotted reference
+      // {@code object_value.first} drills via {@code ITEM(object_value, 'first')} —
+      // multi-part identifier resolution would otherwise fail with "Table 'object_value' not
+      // found". Joins all trailing parts with '.' for OpenSearch's literal-dotted keys.
+      if (parts.size() >= 2 && exprFrame != null && exprFrame.mapColumns.contains(parts.get(0))) {
+        String subkey = String.join(".", parts.subList(1, parts.size()));
+        return new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(new SqlIdentifier(parts.get(0), POS), SqlLiteral.createCharString(subkey, POS)),
+            POS);
       }
       return new SqlIdentifier(parts, POS);
     }

@@ -4379,7 +4379,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.currentFields = null;
     frame.joinHints = null;
     frame.lastOrderBy = null;
-    return tableExpr;
+    // Wrap the bare COLLECTION_TABLE in `SELECT * FROM (...)` so the validator sees a top-level
+    // SELECT shape and the planner can derive the row type for downstream pipes/RelFieldTrimmer.
+    SqlNodeList star = new SqlNodeList(POS);
+    star.add(SqlIdentifier.star(POS));
+    return SqlBuilder.select(star).from(tableExpr).wrap(frame);
   }
 
   /**

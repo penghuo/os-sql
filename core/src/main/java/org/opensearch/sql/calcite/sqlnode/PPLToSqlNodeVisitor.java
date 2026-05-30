@@ -6582,6 +6582,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           && exprFrame.dottedEvalAliases.contains(qn.toString())) {
         return quotedIdentifier(java.util.Collections.singletonList(qn.toString()));
       }
+      // OpenSearch flattens deeply-nested object/nested mappings into top-level dotted-name
+      // catalog columns (e.g. `address.city`, `projects.name`). When the full dotted name is a
+      // visible flat column AND the leading part isn't a known join-arg alias, emit it as a
+      // quoted single-part identifier so the validator looks it up literally instead of trying
+      // multi-part resolution (which fails with "Table 'X' not found"). Mirror toIdentifier's
+      // same-named rewrite for the WHERE/expression path.
+      if (parts.size() >= 2
+          && exprFrame != null
+          && !exprFrame.liveJoinAliases.contains(parts.get(0))
+          && exprFrame.aliasSynonyms.isEmpty()
+          && exprFrame.currentFields != null
+          && exprFrame.currentFields.contains(qn.toString())) {
+        return quotedIdentifier(java.util.Collections.singletonList(qn.toString()));
+      }
       // OpenSearch "object" mappings become MAP<VARCHAR, ANY> in Calcite. A dotted reference
       // {@code object_value.first} drills via {@code ITEM(object_value, 'first')} —
       // multi-part identifier resolution would otherwise fail with "Table 'object_value' not

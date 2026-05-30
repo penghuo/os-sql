@@ -539,7 +539,14 @@ public class MatcherUtils {
             .replaceAll("pitId=[^,]+,", "pitId=*,")
             .replaceAll(" needClean=true,", "")
             .replaceAll(" searchDone=false,", "")
-            .replaceAll("id = \\d+", "id = *"));
+            .replaceAll("id = \\d+", "id = *")
+            // Calcite names synthetic Project columns `$fN` where N is the position of the
+            // first synthetic field in the SOURCE row-type before projection trimming —
+            // so the same plan can produce `$f1` or `$f90` depending on whether the trim
+            // happens before or after Calcite assigns names. The expressions inside the
+            // brackets are the meaningful identity; collapse the `$fN` label to `$f*` so
+            // both forms compare equal.
+            .replaceAll("\\$f\\d+=", "\\$f*="));
   }
 
   /**

@@ -58,6 +58,7 @@ import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Multisearch;
+import org.opensearch.sql.ast.tree.NoMv;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Patterns;
 import org.opensearch.sql.ast.tree.Project;
@@ -4132,6 +4133,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     outerItems.add(toIdentifier("sample_logs"));
     outerVisible.add("sample_logs");
     return SqlBuilder.select(outerItems).from(aggSelect).withFields(outerVisible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitNoMv(NoMv node, Frame frame) {
+    // PPL `nomv <field>` rewrites to `eval <field> = coalesce(mvjoin(array_compact(<field>), '\n'),
+    // '')`. The rewrite is independent of the source field's actual type — when the field is
+    // missing or scalar, downstream eval handles it (missing-field-replacement via the
+    // currentFields oracle, scalar input would throw at execution). Defer scalar-rejection error
+    // reporting until a row-type oracle is wired in.
+    return node.rewriteAsEval().accept(this, frame);
   }
 
   @Override

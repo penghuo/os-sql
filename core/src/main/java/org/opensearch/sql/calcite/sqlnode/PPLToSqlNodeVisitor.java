@@ -1251,12 +1251,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         where =
             new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(expr(sp.getField())), POS);
       }
-    } else if (where == null && groupKeys.isEmpty() && !node.getAggExprList().isEmpty()) {
-      // doc_count optimization: when there's no GROUP BY and every agg is count(field) or
-      // dc(field) with the same single field arg (no count(*) and no mixed fields), add
-      // IS NOT NULL(field) so OpenSearch pushdown emits an `exists` query (uses doc_count
-      // instead of value_count). Mirrors v2's CalciteRelNodeVisitor.java:1462-1483
-      // (aggregateWithTrimming doc_count optimization).
+    }
+    // doc_count optimization: when there's no GROUP BY and every agg is count(field) or
+    // dc(field) with the same single field arg (no count(*) and no mixed fields), add
+    // IS NOT NULL(field) so OpenSearch pushdown emits an `exists` query (uses doc_count
+    // instead of value_count). Mirrors v2's CalciteRelNodeVisitor.java:1462-1483
+    // (aggregateWithTrimming doc_count optimization). Run regardless of the bucket_nullable
+    // branch above — when groupKeys is empty, the bucket_nullable branch produces no filter
+    // and falls through here.
+    if (where == null && groupKeys.isEmpty() && !node.getAggExprList().isEmpty()) {
       java.util.Set<String> distinctFields = new java.util.LinkedHashSet<>();
       boolean allEligible = true;
       for (UnresolvedExpression a : node.getAggExprList()) {

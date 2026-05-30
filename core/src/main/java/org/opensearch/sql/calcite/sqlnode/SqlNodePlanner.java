@@ -564,6 +564,13 @@ public final class SqlNodePlanner {
     // a typed-null literal directly (`null:EXPR_TIMESTAMP VARCHAR`); rewrite our wrapper RexCall
     // back to a typed null literal of the same RexCall's return type.
     rel = rewriteUdtWrappedNullsToTypedNulls(rel);
+    // Rename auto-named `$fN` columns in pre-aggregate Project (input of LogicalAggregate) when
+    // the column expression is a SPAN call. v2 names this column with the user-visible alias
+    // `span(field,unit)`; SqlValidator only sees the SPAN call without an explicit alias in the
+    // GROUP BY context and assigns `$fN`. Mirror v2's emission shape so the explain plan and the
+    // OpenSearch composite-aggregation source name match v2 (Big5 composite_date_histogram_*
+    // tests compare these names).
+    rel = renameSpanProjectColumn(rel);
     // Collapse `Project(span_alias=$N) <- Filter(F on $M) <- Project(passthrough[*] + SPAN AS
     // span_alias)`
     // when the outer Project ONLY references the trailing SPAN column. This pattern comes from
@@ -804,6 +811,88 @@ public final class SqlNodePlanner {
             // need an explicit override. Process children, then attempt the fuse.
             RelNode visited = super.visit(sort);
             return tryFuseAdjacentSorts(visited);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Rename auto-named `$fN` columns in the pre-aggregate Project (the input of a LogicalAggregate)
+   * to v2's user-visible `span(field,unit)` alias when the column expression is a SPAN call.
+   * SqlValidator assigns `$fN` to unnamed Project entries in GROUP BY context; v2's RelBuilder
+   * names them via the alias. Walk through Project layers above the immediate input of the
+   * Aggregate to handle the case where visitAggregation's pre-wrap inserts an additional
+   * passthrough Project.
+   */
+  private RelNode renameSpanProjectColumn(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
+              return visited;
+            }
+            java.util.List<org.apache.calcite.rex.RexNode> projects = proj.getProjects();
+            java.util.List<String> names = proj.getRowType().getFieldNames();
+            java.util.List<String> newNames = new java.util.ArrayList<>(names);
+            boolean changed = false;
+            for (int i = 0; i < projects.size(); i++) {
+              org.apache.calcite.rex.RexNode rx = projects.get(i);
+              if (!(rx instanceof org.apache.calcite.rex.RexCall call)) continue;
+              if (!"SPAN".equals(call.getOperator().getName())) continue;
+              if (call.getOperands().size() < 2) continue;
+              String currentName = names.get(i);
+              if (!currentName.startsWith("$f")) continue;
+              org.apache.calcite.rex.RexNode fieldOp = call.getOperands().get(0);
+              String fieldName = null;
+              if (fieldOp instanceof org.apache.calcite.rex.RexInputRef ref) {
+                int idx = ref.getIndex();
+                java.util.List<org.apache.calcite.rel.type.RelDataTypeField> inFields =
+                    proj.getInput().getRowType().getFieldList();
+                if (idx >= 0 && idx < inFields.size()) {
+                  fieldName = inFields.get(idx).getName();
+                }
+              }
+              if (fieldName == null) continue;
+              org.apache.calcite.rex.RexNode valueOp = call.getOperands().get(1);
+              String valueStr;
+              if (valueOp instanceof org.apache.calcite.rex.RexLiteral vlit
+                  && vlit.getValue() != null) {
+                valueStr = vlit.getValue().toString();
+                if (valueStr.endsWith(".0")) {
+                  valueStr = valueStr.substring(0, valueStr.length() - 2);
+                }
+              } else {
+                continue;
+              }
+              String unitStr = "";
+              if (call.getOperands().size() >= 3) {
+                org.apache.calcite.rex.RexNode unitOp = call.getOperands().get(2);
+                if (unitOp instanceof org.apache.calcite.rex.RexLiteral ulit
+                    && ulit.getValueAs(String.class) != null) {
+                  unitStr = ulit.getValueAs(String.class);
+                }
+              }
+              String quotedField = fieldName.startsWith("@") ? "`" + fieldName + "`" : fieldName;
+              String alias = "span(" + quotedField + "," + valueStr + unitStr + ")";
+              if (!alias.equals(currentName)) {
+                newNames.set(i, alias);
+                changed = true;
+              }
+            }
+            if (!changed) return visited;
+            org.apache.calcite.rel.logical.LogicalProject newProj =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    proj.getInput(),
+                    proj.getHints(),
+                    proj.getProjects(),
+                    newNames,
+                    proj.getVariablesSet());
+            return agg.copy(agg.getTraitSet(), java.util.List.of(newProj));
           }
         };
     return rel.accept(shuttle);

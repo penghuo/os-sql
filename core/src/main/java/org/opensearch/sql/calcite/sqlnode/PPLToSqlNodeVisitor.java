@@ -320,6 +320,44 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
+   * Detect the nested-aggregation pattern: an agg over a dotted leaf whose first part is itself a
+   * group key. e.g. {@code stats min(address.area) by address}. Throws PPL's documented runtime
+   * error at translation time so the user sees the documented message instead of a confusing "Table
+   * not found" from the SQL validator.
+   */
+  private static void detectNestedAggregationPattern(Aggregation node) {
+    java.util.Set<String> groupKeyNames = new java.util.LinkedHashSet<>();
+    for (UnresolvedExpression g : node.getGroupExprList()) {
+      UnresolvedExpression core = (g instanceof Alias a) ? a.getDelegated() : g;
+      QualifiedName qn = null;
+      if (core instanceof QualifiedName q) qn = q;
+      else if (core instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+      if (qn != null && qn.getParts().size() == 1) {
+        groupKeyNames.add(qn.toString());
+      }
+    }
+    if (groupKeyNames.isEmpty()) return;
+    for (UnresolvedExpression aggExpr : node.getAggExprList()) {
+      UnresolvedExpression core = (aggExpr instanceof Alias a) ? a.getDelegated() : aggExpr;
+      if (!(core instanceof AggregateFunction af)) continue;
+      UnresolvedExpression argField = af.getField();
+      QualifiedName argQn = null;
+      if (argField instanceof QualifiedName q) argQn = q;
+      else if (argField instanceof Field f && f.getField() instanceof QualifiedName q) argQn = q;
+      if (argQn != null && argQn.getParts().size() >= 2) {
+        if (groupKeyNames.contains(argQn.getParts().get(0))) {
+          throw new IllegalArgumentException(
+              "Cannot execute nested aggregation: aggregating on '"
+                  + argQn
+                  + "' where '"
+                  + argQn.getParts().get(0)
+                  + "' is also a group key");
+        }
+      }
+    }
+  }
+
+  /**
    * Static result-type for an aggregate function call. Returns {@code null} when the agg's input
    * type is unknown statically. Mirrors PPL's documented agg semantics: count/distinct_count return
    * LONG; sum/min/max/first/last/earliest/latest/take preserve input type;
@@ -922,6 +960,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   @Override
   public SqlNode visitAggregation(Aggregation node, Frame frame) {
+    // Pre-pass: detect nested-aggregation pattern. PPL `stats min(<group>.<leaf>) by <group>` runs
+    // an aggregate over a dotted-leaf whose parent is itself a group key — Calcite rejects this
+    // shape because the dotted name resolves through STRUCT path and the validator can't reach
+    // the leaf. Mirror v2's CalciteEnumerableNestedAggregate runtime error so users see the
+    // documented message instead of "Table 'X' not found".
+    detectNestedAggregationPattern(node);
     SqlNode from = node.getChild().get(0).accept(this, frame);
     // Detect upstream join AFTER walking the child — only then has visitJoin's joinHints been
     // populated on the frame. (Before recursion the frame still reflects the calling pipe.)

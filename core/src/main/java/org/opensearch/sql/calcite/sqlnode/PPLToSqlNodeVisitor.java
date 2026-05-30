@@ -1480,6 +1480,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
 
     SqlNodeList items = new SqlNodeList(POS);
+    List<String> newVisible = new ArrayList<>(frame.currentFields);
     for (String c : frame.currentFields) {
       SqlNode fieldRef = toIdentifier(c);
       UnresolvedExpression repl = perField.get(c);
@@ -1495,10 +1496,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         items.add(fieldRef);
       }
     }
-    return SqlBuilder.select(items)
-        .from(from)
-        .withFields(new ArrayList<>(frame.currentFields))
-        .wrap(frame);
+    // PPL `fillnull using <map>.<path> = <repl>` over a MAP-typed prefix (e.g. spath
+    // auto-extract): emit `COALESCE(ITEM(<map>, '<path>'), <repl>) AS <dotted-path>` and
+    // register as a flat-dotted column. Mirrors visitReplace's MAP-path handling.
+    for (java.util.Map.Entry<String, UnresolvedExpression> e : perField.entrySet()) {
+      String c = e.getKey();
+      if (frame.currentFields.contains(c)) continue;
+      int dot = c.indexOf('.');
+      if (dot <= 0 || !frame.mapColumns.contains(c.substring(0, dot))) continue;
+      SqlNode item =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(
+                  new SqlIdentifier(c.substring(0, dot), POS),
+                  SqlLiteral.createCharString(c.substring(dot + 1), POS)),
+              POS);
+      SqlNode coalesce =
+          new SqlBasicCall(SqlStdOperatorTable.COALESCE, List.of(item, expr(e.getValue())), POS);
+      items.add(asAliased(coalesce, c));
+      newVisible.add(c);
+      frame.dottedEvalAliases.add(c);
+    }
+    return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
   }
 
   /**

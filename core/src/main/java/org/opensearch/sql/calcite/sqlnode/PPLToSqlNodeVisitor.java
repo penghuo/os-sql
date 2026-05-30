@@ -3744,8 +3744,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new IllegalArgumentException("Number of duplicate events must be greater than 0");
     }
     if (consecutive) {
-      throw new UnsupportedOperationException(
-          "consecutive=true dedup is not yet supported in PPLToSqlNodeVisitor");
+      return visitDedupeConsecutive(node, frame, from, allowedDup, keepEmpty);
     }
     List<SqlNode> partitionFields = new ArrayList<>();
     for (Field f : node.getFields()) {
@@ -3831,6 +3830,177 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     return new SqlSelect(
         POS, null, outerSelects, innerSelect, whereCond, null, null, null, null, null, null, null);
+  }
+
+  /**
+   * `dedup consecutive=true` keeps a row if it differs from the previous row in any of the dedup
+   * fields. For {@code allowedDup} N, keeps up to N consecutive rows of the same key. With
+   * keepEmpty=false, NULL fields are dropped.
+   *
+   * <p>Strategy (3 wraps):
+   *
+   * <ol>
+   *   <li>Add ROW_NUMBER() OVER () AS _consec_rn_ and LAG(field) OVER () AS _consec_lag_<i>_ for
+   *       each dedup field.
+   *   <li>Compute "is run start" = (_consec_rn_=1 OR any field IS DISTINCT FROM its lag), then
+   *       cumulative SUM(run-start) → _consec_run_id_.
+   *   <li>Per-run ROW_NUMBER() OVER (PARTITION BY _consec_run_id_ ORDER BY _consec_rn_) → keep rows
+   *       with position ≤ allowedDup.
+   * </ol>
+   */
+  private SqlNode visitDedupeConsecutive(
+      Dedupe node, Frame frame, SqlNode from, int allowedDup, boolean keepEmpty) {
+    List<SqlNode> fieldNodes = new ArrayList<>(node.getFields().size());
+    for (Field f : node.getFields()) {
+      fieldNodes.add(expr(f.getField()));
+    }
+    SqlNodeList emptyPart = new SqlNodeList(POS);
+    SqlNodeList emptyOrder = new SqlNodeList(POS);
+
+    // Step 1: SELECT *, ROW_NUMBER() OVER () AS _consec_rn_, LAG(F0) OVER () AS _consec_lag_0_, ...
+    // FROM (from). When keepEmpty=false, prepend WHERE F_i IS NOT NULL conjuncts.
+    SqlNodeList step1Items = new SqlNodeList(POS);
+    step1Items.add(SqlIdentifier.star(POS));
+    SqlNode rnOver =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                SqlWindow.create(
+                    null,
+                    null,
+                    emptyPart,
+                    emptyOrder,
+                    SqlLiteral.createBoolean(false, POS),
+                    null,
+                    null,
+                    null,
+                    POS)),
+            POS);
+    step1Items.add(asAliased(rnOver, "_consec_rn_"));
+    for (int i = 0; i < fieldNodes.size(); i++) {
+      SqlNode lagOver =
+          new SqlBasicCall(
+              SqlStdOperatorTable.OVER,
+              List.of(
+                  new SqlBasicCall(SqlStdOperatorTable.LAG, List.of(fieldNodes.get(i)), POS),
+                  SqlWindow.create(
+                      null,
+                      null,
+                      emptyPart,
+                      emptyOrder,
+                      SqlLiteral.createBoolean(false, POS),
+                      null,
+                      null,
+                      null,
+                      POS)),
+              POS);
+      step1Items.add(asAliased(lagOver, "_consec_lag_" + i));
+    }
+    SqlNode step1Where = null;
+    if (!keepEmpty) {
+      for (SqlNode field : fieldNodes) {
+        SqlNode notNull = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(field), POS);
+        step1Where =
+            (step1Where == null)
+                ? notNull
+                : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(step1Where, notNull), POS);
+      }
+    }
+    SqlNode step1 =
+        new SqlSelect(
+            POS, null, step1Items, from, step1Where, null, null, null, null, null, null, null);
+
+    // Step 2: SELECT *, SUM(runFlag) OVER (ORDER BY _consec_rn_) AS _consec_run_id_ FROM (step1).
+    // runFlag = CASE WHEN _consec_rn_=1 OR any (F_i IS DISTINCT FROM _consec_lag_i_) THEN 1 ELSE 0
+    SqlNode firstRow =
+        new SqlBasicCall(
+            SqlStdOperatorTable.EQUALS,
+            List.of(new SqlIdentifier("_consec_rn_", POS), SqlLiteral.createExactNumeric("1", POS)),
+            POS);
+    SqlNode isRunStart = firstRow;
+    for (int i = 0; i < fieldNodes.size(); i++) {
+      SqlNode field = fieldNodes.get(i);
+      SqlNode lag = new SqlIdentifier("_consec_lag_" + i, POS);
+      SqlNode distinct =
+          new SqlBasicCall(SqlStdOperatorTable.IS_DISTINCT_FROM, List.of(field, lag), POS);
+      isRunStart = new SqlBasicCall(SqlStdOperatorTable.OR, List.of(isRunStart, distinct), POS);
+    }
+    SqlNodeList runFlagWhens = new SqlNodeList(POS);
+    runFlagWhens.add(isRunStart);
+    SqlNodeList runFlagThens = new SqlNodeList(POS);
+    runFlagThens.add(SqlLiteral.createExactNumeric("1", POS));
+    SqlNode runFlag =
+        new org.apache.calcite.sql.fun.SqlCase(
+            POS, null, runFlagWhens, runFlagThens, SqlLiteral.createExactNumeric("0", POS));
+    SqlNode runIdOver =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(runFlag), POS),
+                SqlWindow.create(
+                    null,
+                    null,
+                    emptyPart,
+                    new SqlNodeList(List.of(new SqlIdentifier("_consec_rn_", POS)), POS),
+                    SqlLiteral.createBoolean(true, POS),
+                    SqlWindow.createUnboundedPreceding(POS),
+                    SqlWindow.createCurrentRow(POS),
+                    null,
+                    POS)),
+            POS);
+    SqlNodeList step2Items = new SqlNodeList(POS);
+    step2Items.add(SqlIdentifier.star(POS));
+    step2Items.add(asAliased(runIdOver, "_consec_run_id_"));
+    SqlNode step2 =
+        new SqlSelect(POS, null, step2Items, step1, null, null, null, null, null, null, null, null);
+
+    // Step 3: SELECT *, ROW_NUMBER() OVER (PARTITION BY _consec_run_id_ ORDER BY _consec_rn_) AS
+    // _consec_pos_ FROM (step2). Then outer wrap filters _consec_pos_ <= allowedDup and projects
+    // user-visible columns only (drop helper cols).
+    SqlNode posOver =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                SqlWindow.create(
+                    null,
+                    null,
+                    new SqlNodeList(List.of(new SqlIdentifier("_consec_run_id_", POS)), POS),
+                    new SqlNodeList(List.of(new SqlIdentifier("_consec_rn_", POS)), POS),
+                    SqlLiteral.createBoolean(false, POS),
+                    null,
+                    null,
+                    null,
+                    POS)),
+            POS);
+    SqlNodeList step3Items = new SqlNodeList(POS);
+    step3Items.add(SqlIdentifier.star(POS));
+    step3Items.add(asAliased(posOver, "_consec_pos_"));
+    SqlNode step3 =
+        new SqlSelect(POS, null, step3Items, step2, null, null, null, null, null, null, null, null);
+
+    // Outer: filter _consec_pos_ <= N, project user-visible columns only.
+    SqlNode boundCheck =
+        new SqlBasicCall(
+            SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+            List.of(
+                new SqlIdentifier("_consec_pos_", POS),
+                SqlLiteral.createExactNumeric(Integer.toString(allowedDup), POS)),
+            POS);
+    SqlNodeList outerSelects = new SqlNodeList(POS);
+    List<String> visible = frame.currentFields;
+    if (visible != null && !visible.isEmpty()) {
+      for (String c : visible) {
+        outerSelects.add(toIdentifier(c));
+      }
+    } else {
+      outerSelects.add(SqlIdentifier.star(POS));
+    }
+    return new SqlSelect(
+        POS, null, outerSelects, step3, boundCheck, null, null, null, null, null, null, null);
   }
 
   /**

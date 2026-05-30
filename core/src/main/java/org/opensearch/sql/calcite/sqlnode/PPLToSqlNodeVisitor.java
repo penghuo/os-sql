@@ -6728,6 +6728,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             List.of(new SqlIdentifier(parts.get(0), POS), SqlLiteral.createCharString(subkey, POS)),
             POS);
       }
+      // Join-arg-aliased MAP-path: {@code l.doc.user.name} where {@code l} is a join-arg alias
+      // and {@code doc} is a MAP-typed column on l's side. Emit {@code ITEM(l.doc, 'user.name')}
+      // so the validator looks up {@code l.doc} as a column path and applies ITEM to drill the
+      // MAP value. Without this, multi-part resolution interprets {@code l.doc.user} as
+      // {@code <table>.<col>.<sub-col>} and fails.
+      if (parts.size() >= 3
+          && exprFrame != null
+          && exprFrame.liveJoinAliases.contains(parts.get(0))
+          && exprFrame.mapColumns.contains(parts.get(1))) {
+        String subkey = String.join(".", parts.subList(2, parts.size()));
+        SqlIdentifier mapRef = new SqlIdentifier(parts.subList(0, 2), POS);
+        return new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(mapRef, SqlLiteral.createCharString(subkey, POS)),
+            POS);
+      }
       return new SqlIdentifier(parts, POS);
     }
     if (e instanceof Field f) {

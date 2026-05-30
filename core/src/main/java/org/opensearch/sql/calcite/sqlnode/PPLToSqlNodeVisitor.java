@@ -5010,6 +5010,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     //     already-walked child (avoids double-walking) so frame mutations happen exactly once.
     String fieldName = node.getField().getField().toString();
     SqlNode child = node.getChild().get(0).accept(this, frame);
+    // PPL `nomv <scalar_field>` is a type error — the field is statically not an array. Throw
+    // IllegalArgumentException at translation time so the user sees a 400 response with the
+    // documented type-mismatch message instead of a 500 from a runtime cast failure. Detection:
+    // field is in scope AND has a known non-array primitive type via columnPrimitiveType (or
+    // evalAliasTypes). UDT fields (TIMESTAMP/DATE/TIME/IP) are also non-array → reject.
+    if (frame.currentFields != null
+        && frame.currentFields.contains(fieldName)
+        && (frame.columnPrimitiveType.containsKey(fieldName)
+            || frame.evalAliasTypes.containsKey(fieldName)
+            || frame.columnUdt.containsKey(fieldName))) {
+      throw new IllegalArgumentException(
+          "nomv requires an ARRAY-typed field; got scalar field '"
+              + fieldName
+              + "' (cannot apply MVJOIN to non-array type)");
+    }
     if (frame.currentFields == null || !frame.currentFields.contains(fieldName)) {
       SqlNodeList items = new SqlNodeList(POS);
       if (frame.currentFields != null) {

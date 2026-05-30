@@ -809,16 +809,49 @@ public final class SqlNodePipeline {
             if (!(sortInput instanceof org.apache.calcite.rel.core.Project project)) {
               return visited;
             }
-            if (!projectOverridesColumnType(project)) {
+            if (!projectOverridesColumnType(project) && !projectShadowsInputName(project)) {
               return visited;
             }
-            // Wrap project in Filter(true) to force a sub-SELECT boundary on unparse.
+            // Wrap project in Filter(true) to force a sub-SELECT boundary on unparse. This
+            // applies when the project either overrides the input column's type (e.g. bin
+            // outputs a VARCHAR over a TIMESTAMP input column) OR shadows an input column name
+            // with a non-input-ref expression (e.g. bin's DATE_FORMAT(...) AS @timestamp). The
+            // latter case prevents Calcite's RelToSqlConverter from merging Project+Sort into
+            // a single SELECT and inlining the bin expression in ORDER BY, which would cause
+            // alias-shadowing during re-parse: an inner @timestamp reference inside the
+            // inlined ORDER BY expression would resolve to the SELECT alias (the formatted
+            // string output) instead of the FROM column, blowing up at runtime.
             RelNode wrappedProject =
                 org.apache.calcite.rel.logical.LogicalFilter.create(
                     project, rexBuilder.makeLiteral(true));
             return sort.copy(sort.getTraitSet(), java.util.List.of(wrappedProject));
           }
         });
+  }
+
+  /**
+   * True if any project expression has the same output name as an input column AND is not a
+   * trivial {@link org.apache.calcite.rex.RexInputRef} for that column. This catches the bin
+   * pattern where {@code DATE_FORMAT(...) AS @timestamp} shadows the input {@code @timestamp}
+   * column.
+   */
+  private static boolean projectShadowsInputName(org.apache.calcite.rel.core.Project project) {
+    java.util.List<String> inputNames = project.getInput().getRowType().getFieldNames();
+    java.util.Set<String> inputSet = new java.util.HashSet<>(inputNames);
+    java.util.List<String> outputNames = project.getRowType().getFieldNames();
+    java.util.List<org.apache.calcite.rex.RexNode> exprs = project.getProjects();
+    for (int i = 0; i < outputNames.size(); i++) {
+      String outName = outputNames.get(i);
+      org.apache.calcite.rex.RexNode expr = exprs.get(i);
+      if (!inputSet.contains(outName)) continue;
+      if (expr instanceof org.apache.calcite.rex.RexInputRef ref
+          && ref.getIndex() < inputNames.size()
+          && inputNames.get(ref.getIndex()).equals(outName)) {
+        continue; // identity reference — not shadowing
+      }
+      return true;
+    }
+    return false;
   }
 
   private static boolean projectOverridesColumnType(org.apache.calcite.rel.core.Project project) {

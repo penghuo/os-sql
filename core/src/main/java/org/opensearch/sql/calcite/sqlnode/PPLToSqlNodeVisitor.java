@@ -350,6 +350,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       return p;
     }
+    // Union has N children (datasets); the generic unary descent below is wrong for Union
+    // because Union.attach(child) prepends to datasets, turning a 1-dataset Union into a
+    // 2-dataset Union and silently swallowing the "Union requires at least two datasets"
+    // validation. Skip Union entirely — datasets are stripped per-branch in visitUnion.
+    if (plan instanceof Union) {
+      return plan;
+    }
     // Generic unary descent: any other plan with a single child (Aggregation, Sort, Filter,
     // Eval, Rename, Limit, Reverse, Head, ...) re-attaches its rewritten child. Required because
     // AstBuilder injects `Project(AllFieldsExcludeMeta, ...)` markers around join sides and

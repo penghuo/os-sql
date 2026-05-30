@@ -531,14 +531,160 @@ public class MatcherUtils {
   }
 
   private static String cleanUpYaml(String s) {
-    return s.replaceAll("\"utcTimestamp\":\\d+", "\"utcTimestamp\": 0")
-        .replaceAll("rel#\\d+", "rel#")
-        .replaceAll("RelSubset#\\d+", "RelSubset#")
-        .replaceAll("LogicalProject#\\d+", "LogicalProject#")
-        .replaceAll("pitId=[^,]+,", "pitId=*,")
-        .replaceAll(" needClean=true,", "")
-        .replaceAll(" searchDone=false,", "")
-        .replaceAll("id = \\d+", "id = *");
+    return sortScriptFieldsByKey(
+        s.replaceAll("\"utcTimestamp\":\\d+", "\"utcTimestamp\": 0")
+            .replaceAll("rel#\\d+", "rel#")
+            .replaceAll("RelSubset#\\d+", "RelSubset#")
+            .replaceAll("LogicalProject#\\d+", "LogicalProject#")
+            .replaceAll("pitId=[^,]+,", "pitId=*,")
+            .replaceAll(" needClean=true,", "")
+            .replaceAll(" searchDone=false,", "")
+            .replaceAll("id = \\d+", "id = *"));
+  }
+
+  /**
+   * Normalize {@code "script_fields":{...}} JSON sub-objects so their top-level keys appear in
+   * alphabetical order. The OpenSearch {@code TopHitsAggregationBuilder} stores scriptFields in a
+   * {@link java.util.HashSet}, so its serialized iteration order is unspecified — explain-plan
+   * tests would otherwise be flaky run-to-run. This rewrites every occurrence in place so two
+   * runs produce a comparable string.
+   */
+  private static String sortScriptFieldsByKey(String s) {
+    String marker = "\"script_fields\":{";
+    StringBuilder out = new StringBuilder(s.length());
+    int i = 0;
+    while (i < s.length()) {
+      int idx = s.indexOf(marker, i);
+      if (idx < 0) {
+        out.append(s, i, s.length());
+        break;
+      }
+      out.append(s, i, idx).append(marker);
+      int contentStart = idx + marker.length();
+      int objEnd = matchingBraceEnd(s, contentStart - 1); // points at '{'
+      if (objEnd < 0) {
+        // Unbalanced — give up and emit verbatim from this point.
+        out.append(s, contentStart, s.length());
+        break;
+      }
+      String body = s.substring(contentStart, objEnd);
+      String sorted = sortJsonObjectBodyByKey(body);
+      out.append(sorted).append('}');
+      i = objEnd + 1;
+    }
+    return out.toString();
+  }
+
+  /** Given the contents (without surrounding braces) of a JSON object, return them sorted by key. */
+  private static String sortJsonObjectBodyByKey(String body) {
+    java.util.List<String[]> entries = splitTopLevelEntries(body);
+    if (entries.isEmpty()) {
+      return body;
+    }
+    entries.sort(java.util.Comparator.comparing(e -> e[0]));
+    StringBuilder sb = new StringBuilder(body.length());
+    for (int j = 0; j < entries.size(); j++) {
+      if (j > 0) sb.append(',');
+      sb.append('"').append(entries.get(j)[0]).append("\":").append(entries.get(j)[1]);
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Split a JSON-object body (no enclosing braces) into [key, valueText] pairs at top level,
+   * respecting nested braces, brackets, and quoted strings (with backslash escapes).
+   */
+  private static java.util.List<String[]> splitTopLevelEntries(String body) {
+    java.util.List<String[]> entries = new java.util.ArrayList<>();
+    int n = body.length();
+    int i = 0;
+    while (i < n) {
+      while (i < n && Character.isWhitespace(body.charAt(i))) i++;
+      if (i >= n) break;
+      if (body.charAt(i) != '"') return java.util.Collections.emptyList();
+      int keyStart = i + 1;
+      int keyEnd = findStringEnd(body, i);
+      if (keyEnd < 0) return java.util.Collections.emptyList();
+      String key = body.substring(keyStart, keyEnd);
+      i = keyEnd + 1;
+      while (i < n && Character.isWhitespace(body.charAt(i))) i++;
+      if (i >= n || body.charAt(i) != ':') return java.util.Collections.emptyList();
+      i++;
+      while (i < n && Character.isWhitespace(body.charAt(i))) i++;
+      int valStart = i;
+      int valEnd = findValueEnd(body, valStart);
+      if (valEnd < 0) return java.util.Collections.emptyList();
+      entries.add(new String[] {key, body.substring(valStart, valEnd)});
+      i = valEnd;
+      while (i < n && Character.isWhitespace(body.charAt(i))) i++;
+      if (i < n && body.charAt(i) == ',') i++;
+    }
+    return entries;
+  }
+
+  private static int findStringEnd(String s, int openQuoteIdx) {
+    int n = s.length();
+    int i = openQuoteIdx + 1;
+    while (i < n) {
+      char c = s.charAt(i);
+      if (c == '\\') {
+        i += 2;
+        continue;
+      }
+      if (c == '"') return i;
+      i++;
+    }
+    return -1;
+  }
+
+  /** Returns the index AFTER the JSON value starting at {@code start}. -1 on error. */
+  private static int findValueEnd(String s, int start) {
+    int n = s.length();
+    if (start >= n) return -1;
+    char c = s.charAt(start);
+    if (c == '"') {
+      int e = findStringEnd(s, start);
+      return e < 0 ? -1 : e + 1;
+    }
+    if (c == '{' || c == '[') {
+      int e = matchingBraceEnd(s, start);
+      return e < 0 ? -1 : e + 1;
+    }
+    int i = start;
+    while (i < n) {
+      char ch = s.charAt(i);
+      if (ch == ',' || ch == '}' || ch == ']') return i;
+      i++;
+    }
+    return n;
+  }
+
+  /**
+   * Given that {@code s.charAt(open)} is '{' or '[', return the index of its matching brace.
+   * Quoted strings (with backslash escapes) are skipped. Returns -1 if unbalanced.
+   */
+  private static int matchingBraceEnd(String s, int open) {
+    char openCh = s.charAt(open);
+    char closeCh = openCh == '{' ? '}' : ']';
+    int depth = 0;
+    int n = s.length();
+    int i = open;
+    while (i < n) {
+      char c = s.charAt(i);
+      if (c == '"') {
+        int e = findStringEnd(s, i);
+        if (e < 0) return -1;
+        i = e + 1;
+        continue;
+      }
+      if (c == openCh) depth++;
+      else if (c == closeCh) {
+        depth--;
+        if (depth == 0) return i;
+      }
+      i++;
+    }
+    return -1;
   }
 
   private static String jsonToYaml(String json) {

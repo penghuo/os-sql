@@ -3095,12 +3095,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   @Override
   public SqlNode visitUnion(Union node, Frame frame) {
-    // PPL `| union [<plan1>, <plan2>, ...]` is UNION ALL of N datasets. The new visitor lacks an
-    // oracle so we don't pad mismatched schemas — branches must already align (or the validator
-    // raises a column-mismatch error). For matching-schema unions this is a transparent
-    // emission. Mismatched-schema padding requires schema introspection; defer to a follow-up.
+    // PPL `| union [<plan1>, <plan2>, ...]` is UNION ALL of N datasets. Use
+    // NonFallbackCalciteException so the validation error surfaces to the user as a 400
+    // response instead of silently falling back to the V2 engine (which would mask the bad
+    // input by trying to translate it differently).
     if (node.getDatasets() == null || node.getDatasets().size() < 2) {
-      throw new IllegalArgumentException(
+      throw new org.opensearch.sql.exception.NonFallbackCalciteException(
           "Union command requires at least two datasets. Provided: "
               + (node.getDatasets() == null ? 0 : node.getDatasets().size()));
     }

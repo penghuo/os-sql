@@ -165,7 +165,7 @@ public class QueryService {
                 () -> executionEngine.execute(calcitePlan, context, listener),
                 "while running the query");
           } catch (Throwable t) {
-            if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {
+            if (isCalciteFallbackAllowed(t) && !isNonFallback(t)) {
               log.warn("Fallback to V2 query engine since got exception", t);
               executeWithLegacy(plan, queryType, listener, Optional.of(t));
             } else {
@@ -198,7 +198,7 @@ public class QueryService {
                 },
                 settings);
           } catch (Throwable t) {
-            if (isCalciteFallbackAllowed(t)) {
+            if (isCalciteFallbackAllowed(t) && !isNonFallback(t)) {
               log.warn("Fallback to V2 query engine since got exception", t);
               explainWithLegacy(plan, queryType, listener, mode, Optional.of(t));
             } else {
@@ -487,6 +487,21 @@ public class QueryService {
       case null -> false;
       case CalciteUnsupportedException calciteUnsupportedException -> true;
       case ErrorReport errorReport when t.getCause() instanceof CalciteUnsupportedException -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * True when {@code t} (or its immediate cause, after StageErrorHandler wrapping) is a
+   * NonFallbackCalciteException. Used to suppress V2 fallback for translation errors that should
+   * surface to the user as documented PPL validation errors instead of being silently masked by the
+   * V2 path.
+   */
+  private boolean isNonFallback(@Nullable Throwable t) {
+    return switch (t) {
+      case null -> false;
+      case NonFallbackCalciteException nf -> true;
+      case ErrorReport errorReport when t.getCause() instanceof NonFallbackCalciteException -> true;
       default -> false;
     };
   }

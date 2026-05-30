@@ -5665,6 +5665,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof Compare c) {
       SqlNode l = expr(c.getLeft());
       SqlNode r = expr(c.getRight());
+      // Cross-type DATE/TIME/TIMESTAMP comparison: align both sides to TIMESTAMP so the runtime
+      // doesn't compare opaque UDT VARCHARs and produce wrong booleans. Mirrors v2's
+      // CoercionUtils.widenArguments. Detect statically when both operands are AST Cast nodes
+      // (or Function calls with names date/time/timestamp) that yield UDT datetime types.
+      String lDtName = staticDateTimeUdtName(c.getLeft());
+      String rDtName = staticDateTimeUdtName(c.getRight());
+      if (lDtName != null && rDtName != null && !lDtName.equals(rDtName)) {
+        if (!"timestamp".equals(lDtName)) {
+          l =
+              new SqlBasicCall(
+                  org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
+                  List.of(l),
+                  POS);
+        }
+        if (!"timestamp".equals(rDtName)) {
+          r =
+              new SqlBasicCall(
+                  org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
+                  List.of(r),
+                  POS);
+        }
+      }
       return new SqlBasicCall(comparisonOperator(c.getOperator()), List.of(l, r), POS);
     }
     if (e instanceof And a) {
@@ -6830,6 +6852,32 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return hasStringOperand(fn.getFuncArgs());
     }
     return false;
+  }
+
+  /**
+   * Best-effort static check: when {@code e} is statically a DATE/TIME/TIMESTAMP UDT, return its
+   * lowercase name; otherwise null. True for {@code Cast(... AS DATE/TIME/TIMESTAMP)} and for
+   * {@code Function("date"/"time"/"timestamp", ...)} calls. Used by Compare to coerce cross-type
+   * datetime operands to TIMESTAMP. Without an oracle we can't infer types from column refs.
+   */
+  private static String staticDateTimeUdtName(UnresolvedExpression e) {
+    if (e instanceof Cast c) {
+      return switch (c.getDataType()) {
+        case DATE -> "date";
+        case TIME -> "time";
+        case TIMESTAMP -> "timestamp";
+        default -> null;
+      };
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
+      String name =
+          fn.getFuncName() == null ? "" : fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+      return switch (name) {
+        case "date", "time", "timestamp" -> name;
+        default -> null;
+      };
+    }
+    return null;
   }
 
   private static org.apache.calcite.sql.SqlOperator comparisonOperator(String op) {

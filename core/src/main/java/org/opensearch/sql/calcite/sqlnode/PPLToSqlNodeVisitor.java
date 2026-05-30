@@ -3059,16 +3059,65 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               + (node.getDatasets() == null ? 0 : node.getDatasets().size()));
     }
     List<SqlNode> branches = new ArrayList<>();
+    List<List<String>> branchCols = new ArrayList<>();
+    List<java.util.Map<String, String>> branchUdt = new ArrayList<>();
+    List<Frame> branchFrames = new ArrayList<>();
+    List<String> unified = new ArrayList<>();
     for (UnresolvedPlan ds : node.getDatasets()) {
       Frame branchFrame = new Frame();
       Frame savedExpr = this.exprFrame;
       this.exprFrame = branchFrame;
-      branches.add(stripImplicitMetaProjects(ds).accept(this, branchFrame));
+      SqlNode branch = stripImplicitMetaProjects(ds).accept(this, branchFrame);
       this.exprFrame = savedExpr;
+      // PPL `| union <table1>, <table2>` resolves each side via visitRelation, which returns a
+      // bare SqlIdentifier. Calcite's UNION ALL operand expects a SELECT/VALUES/SET_OP — passing
+      // a bare identifier raises "Was not expecting value 'IDENTIFIER' for enumeration
+      // 'org.apache.calcite.sql.SqlKind' in this context". Wrap as `SELECT * FROM <branch>`.
+      if (branch instanceof SqlIdentifier) {
+        SqlNodeList wrapStar = new SqlNodeList(POS);
+        wrapStar.add(SqlIdentifier.star(POS));
+        branch =
+            new SqlSelect(
+                POS, null, wrapStar, branch, null, null, null, null, null, null, null, null);
+      }
+      branches.add(branch);
+      List<String> bcols =
+          branchFrame.currentFields == null
+              ? new ArrayList<>()
+              : new ArrayList<>(branchFrame.currentFields);
+      branchCols.add(bcols);
+      branchUdt.add(new java.util.LinkedHashMap<>(branchFrame.columnUdt));
+      branchFrames.add(branchFrame);
+      for (String c : bcols) {
+        if (!unified.contains(c)) unified.add(c);
+      }
     }
-    SqlNode union = branches.get(0);
+    // PPL union does NOT raise on numeric/string type-conflicts (unlike append/multisearch). The
+    // unified row type is computed by Calcite's UNION ALL leastRestrictive, which widens numeric
+    // and string types automatically. Skip the detectAppendTypeConflict call here.
+    // Merged-of-all-other-branches UDT map so absent columns get typed pads whenever any other
+    // branch has that column as a UDT.
+    java.util.Map<String, String> allUdt = new java.util.LinkedHashMap<>();
+    for (java.util.Map<String, String> bm : branchUdt) {
+      for (java.util.Map.Entry<String, String> e : bm.entrySet()) {
+        allUdt.putIfAbsent(e.getKey(), e.getValue());
+      }
+    }
+    // Pad each branch to the unified column list so UNION ALL row-type derivation succeeds.
+    // Branches whose currentFields are unknown (bare table relations without a row-type oracle
+    // entry) skip padding — the validator will still raise a column-count error if schemas
+    // don't align, but explicit-fields branches (the common PPL union shape) work.
+    SqlNode firstPadded =
+        branchCols.get(0).isEmpty()
+            ? branches.get(0)
+            : padToUnifiedSchema(branches.get(0), branchCols.get(0), unified, allUdt);
+    SqlNode union = firstPadded;
     for (int i = 1; i < branches.size(); i++) {
-      union = new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, branches.get(i)), POS);
+      SqlNode padded =
+          branchCols.get(i).isEmpty()
+              ? branches.get(i)
+              : padToUnifiedSchema(branches.get(i), branchCols.get(i), unified, allUdt);
+      union = new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, padded), POS);
     }
     SqlNodeList items = new SqlNodeList(POS);
     items.add(SqlIdentifier.star(POS));
@@ -3090,6 +3139,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             null);
     frame.joinHints = null;
     frame.lastOrderBy = null;
+    if (!unified.isEmpty()) {
+      frame.currentFields = unified;
+      frame.columnUdt.putAll(allUdt);
+    }
     return wrapper;
   }
 

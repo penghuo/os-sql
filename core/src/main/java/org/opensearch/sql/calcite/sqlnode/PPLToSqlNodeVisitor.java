@@ -1462,7 +1462,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
     SqlNodeList wrappedItems = new SqlNodeList(POS);
     wrappedItems.add(SqlIdentifier.star(POS));
-    wrappedItems.add(asAliased(rowNum, "__rn_rare__"));
+    wrappedItems.add(asAliased(rowNum, "_row_number_rare_top_"));
     SqlNode windowSelect =
         new SqlSelect(
             POS, null, wrappedItems, aggSelect, null, null, null, null, null, null, null, null);
@@ -1471,7 +1471,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         new SqlBasicCall(
             SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
             List.of(
-                new SqlIdentifier("__rn_rare__", POS),
+                new SqlIdentifier("_row_number_rare_top_", POS),
                 SqlLiteral.createExactNumeric(node.getNoOfResults().toString(), POS)),
             POS);
 

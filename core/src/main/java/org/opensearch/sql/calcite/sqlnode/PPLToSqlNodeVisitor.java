@@ -59,6 +59,7 @@ import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Multisearch;
 import org.opensearch.sql.ast.tree.Parse;
+import org.opensearch.sql.ast.tree.Patterns;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.RareTopN;
 import org.opensearch.sql.ast.tree.Regex;
@@ -3718,6 +3719,419 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       visible.add(group);
     }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitPatterns(Patterns node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    org.opensearch.sql.ast.expression.PatternMethod method = node.getPatternMethod();
+    org.opensearch.sql.ast.expression.PatternMode mode = node.getPatternMode();
+    String aliasField = "patterns_field";
+    boolean showNumbered =
+        node.getShowNumberedToken() instanceof Literal lit && Boolean.TRUE.equals(lit.getValue());
+
+    if (method != org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN
+        && method != org.opensearch.sql.ast.expression.PatternMethod.BRAIN) {
+      throw new UnsupportedOperationException("Unknown patterns method: " + method);
+    }
+
+    if (method == org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN) {
+      return visitPatternsSimple(node, frame, from, aliasField, mode, showNumbered);
+    }
+    return visitPatternsBrain(node, frame, from, aliasField, mode, showNumbered);
+  }
+
+  /**
+   * SIMPLE_PATTERN: REGEXP_REPLACE(source, pattern, '<*>') wrapped in a CASE for empty/NULL input.
+   * The {@code show_numbered_token=true} variant additionally calls {@code PATTERN_PARSER} to
+   * replace wildcards with {@code <token1>}/{@code <token2>}/... and exposes the captured tokens
+   * map.
+   */
+  private SqlNode visitPatternsSimple(
+      Patterns node,
+      Frame frame,
+      SqlNode from,
+      String aliasField,
+      org.opensearch.sql.ast.expression.PatternMode mode,
+      boolean showNumbered) {
+    Literal patternLit =
+        node.getArguments() != null
+            ? node.getArguments().get(org.opensearch.sql.common.patterns.PatternUtils.PATTERN)
+            : null;
+    String regex = patternLit != null ? patternLit.getValue().toString() : "";
+    if (regex.isEmpty()) {
+      regex = "[a-zA-Z0-9]+";
+    }
+    SqlNode source = expr(node.getSourceField());
+    SqlNode replaced =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
+            List.of(
+                source,
+                SqlLiteral.createCharString(regex, POS),
+                SqlLiteral.createCharString("<*>", POS)),
+            POS);
+    SqlNodeList whens = new SqlNodeList(POS);
+    whens.add(
+        new SqlBasicCall(
+            SqlStdOperatorTable.OR,
+            List.of(
+                new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(source), POS),
+                new SqlBasicCall(
+                    SqlStdOperatorTable.EQUALS,
+                    List.of(source, SqlLiteral.createCharString("", POS)),
+                    POS)),
+            POS));
+    SqlNodeList thens = new SqlNodeList(POS);
+    thens.add(SqlLiteral.createCharString("", POS));
+    SqlNode patternsExpr =
+        new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, replaced);
+
+    if (mode == org.opensearch.sql.ast.expression.PatternMode.AGGREGATION) {
+      return emitPatternsAggregation(
+          node,
+          frame,
+          from,
+          aliasField,
+          patternsExpr, /* method */
+          org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN,
+          showNumbered);
+    }
+
+    // LABEL mode: extend the row with patterns_field; if show_numbered_token=true, also expose
+    // the token-numbered pattern (overriding patterns_field) and the tokens map. The latter
+    // requires patterns_field to be a real column, so it lives in a wrapped subquery.
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible =
+        frame.currentFields == null ? new ArrayList<>() : new ArrayList<>(frame.currentFields);
+    if (frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+    } else {
+      List<String> retained = new ArrayList<>();
+      for (String name : visible) {
+        if (name.equals(aliasField)) continue;
+        items.add(toIdentifier(name));
+        retained.add(name);
+      }
+      visible = retained;
+    }
+    items.add(asAliased(patternsExpr, aliasField));
+    visible.add(aliasField);
+    SqlNode wrapped = SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+    if (!showNumbered) {
+      return wrapped;
+    }
+    return wrapWithPatternParser(wrapped, frame, node, aliasField);
+  }
+
+  /**
+   * BRAIN: aggregate via INTERNAL_PATTERN window function, then SAFE_CAST(ITEM(PATTERN_PARSER(...),
+   * 'pattern') AS VARCHAR). For LABEL mode, the window aggregate runs over PARTITION BY (no ORDER
+   * BY) and the call inlines into PATTERN_PARSER. AGGREGATION mode expands the array-of-MAP via
+   * UNNEST and is deferred (legacy path uses {@code Uncollect}, requires CROSS JOIN UNNEST that
+   * needs a row-type oracle to spell the inner MAP keys).
+   */
+  private SqlNode visitPatternsBrain(
+      Patterns node,
+      Frame frame,
+      SqlNode from,
+      String aliasField,
+      org.opensearch.sql.ast.expression.PatternMode mode,
+      boolean showNumbered) {
+    if (mode == org.opensearch.sql.ast.expression.PatternMode.AGGREGATION) {
+      throw new UnsupportedOperationException(
+          "patterns method=BRAIN mode=AGGREGATION not yet supported in PPLToSqlNodeVisitor");
+    }
+    SqlNode source = expr(node.getSourceField());
+    SqlNode maxSampleCount =
+        node.getPatternMaxSampleCount() != null
+            ? expr(node.getPatternMaxSampleCount())
+            : SqlLiteral.createExactNumeric("10", POS);
+    SqlNode bufferLimit =
+        node.getPatternBufferLimit() != null
+            ? expr(node.getPatternBufferLimit())
+            : SqlLiteral.createExactNumeric("100000", POS);
+    SqlNode showNumberedNode =
+        node.getShowNumberedToken() != null
+            ? expr(node.getShowNumberedToken())
+            : SqlLiteral.createBoolean(false, POS);
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    if (node.getPartitionByList() != null) {
+      for (UnresolvedExpression p : node.getPartitionByList()) {
+        UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+        partitionBy.add(expr(core));
+      }
+    }
+    SqlNode patternWindow =
+        SqlWindow.create(
+            null,
+            null,
+            partitionBy,
+            new SqlNodeList(POS),
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    List<SqlNode> patternArgs = new ArrayList<>();
+    patternArgs.add(source);
+    patternArgs.add(maxSampleCount);
+    patternArgs.add(bufferLimit);
+    patternArgs.add(showNumberedNode);
+    if (node.getArguments() != null) {
+      List<String> brainKeys =
+          node.getArguments().keySet().stream()
+              .filter(
+                  org.opensearch.sql.common.patterns.PatternUtils.VALID_BRAIN_PARAMETERS::contains)
+              .sorted()
+              .toList();
+      for (String k : brainKeys) {
+        patternArgs.add(literalToSqlNode(node.getArguments().get(k)));
+      }
+    }
+    SqlNode patternAgg =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.INTERNAL_PATTERN,
+            patternArgs,
+            POS);
+    SqlNode patternOver =
+        new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(patternAgg, patternWindow), POS);
+    SqlNode parserCall =
+        new SqlBasicCall(
+            new org.apache.calcite.sql.SqlUnresolvedFunction(
+                new SqlIdentifier("PATTERN_PARSER", POS),
+                null,
+                null,
+                null,
+                null,
+                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+            List.of(expr(node.getSourceField()), patternOver, showNumberedNode),
+            POS);
+    SqlNode itemPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parserCall, SqlLiteral.createCharString("pattern", POS)),
+            POS);
+    SqlNode safeCastPattern =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(
+                itemPattern,
+                new org.apache.calcite.sql.SqlDataTypeSpec(
+                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                        org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                    POS)),
+            POS);
+
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible =
+        frame.currentFields == null ? new ArrayList<>() : new ArrayList<>(frame.currentFields);
+    if (frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+    } else {
+      List<String> retained = new ArrayList<>();
+      for (String name : visible) {
+        if (name.equals(aliasField) || name.equals("tokens")) continue;
+        items.add(toIdentifier(name));
+        retained.add(name);
+      }
+      visible = retained;
+    }
+    items.add(asAliased(safeCastPattern, aliasField));
+    visible.add(aliasField);
+    if (showNumbered) {
+      SqlNode itemTokens =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(parserCall, SqlLiteral.createCharString("tokens", POS)),
+              POS);
+      items.add(asAliased(itemTokens, "tokens"));
+      visible.add("tokens");
+    }
+    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * Wrap the given SqlNode (which exposes {@code patterns_field}) in a SELECT that overrides {@code
+   * patterns_field} with the {@code <tokenN>}-numbered pattern and adds {@code tokens}. Mirrors
+   * v2's flattenParsedPattern. The wrap turns the prior eval-alias into a real column referenceable
+   * by PATTERN_PARSER.
+   */
+  private SqlNode wrapWithPatternParser(
+      SqlNode inner, Frame frame, Patterns node, String aliasField) {
+    SqlNode patternsFieldRef = new SqlIdentifier(aliasField, POS);
+    SqlNode sourceFieldRef = expr(node.getSourceField());
+    SqlNode parserCall =
+        new SqlBasicCall(
+            new org.apache.calcite.sql.SqlUnresolvedFunction(
+                new SqlIdentifier("PATTERN_PARSER", POS),
+                null,
+                null,
+                null,
+                null,
+                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+            List.of(patternsFieldRef, sourceFieldRef),
+            POS);
+    SqlNode itemPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parserCall, SqlLiteral.createCharString("pattern", POS)),
+            POS);
+    SqlNode safeCastPattern =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(
+                itemPattern,
+                new org.apache.calcite.sql.SqlDataTypeSpec(
+                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                        org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                    POS)),
+            POS);
+    SqlNode itemTokens =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parserCall, SqlLiteral.createCharString("tokens", POS)),
+            POS);
+
+    List<String> innerFields = frame.currentFields == null ? List.of() : frame.currentFields;
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : innerFields) {
+      if (c.equals(aliasField) || c.equals("tokens")) continue;
+      items.add(toIdentifier(c));
+      visible.add(c);
+    }
+    items.add(asAliased(safeCastPattern, aliasField));
+    visible.add(aliasField);
+    items.add(asAliased(itemTokens, "tokens"));
+    visible.add("tokens");
+    return SqlBuilder.select(items).from(inner).withFields(visible).wrap(frame);
+  }
+
+  /**
+   * AGGREGATION mode for SIMPLE_PATTERN: GROUP BY (partitionBy ..., patterns_field) with
+   * pattern_count = COUNT(*), sample_logs = TAKE(source, max_sample_count). show_numbered_token
+   * additionally re-runs PATTERN_PARSER post-grouping to expose the numbered pattern + tokens map.
+   */
+  private SqlNode emitPatternsAggregation(
+      Patterns node,
+      Frame frame,
+      SqlNode from,
+      String aliasField,
+      SqlNode patternsExpr,
+      org.opensearch.sql.ast.expression.PatternMethod method,
+      boolean showNumbered) {
+    if (method != org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN) {
+      throw new UnsupportedOperationException(
+          "patterns method=BRAIN mode=AGGREGATION not yet supported in PPLToSqlNodeVisitor");
+    }
+    List<SqlNode> selects = new ArrayList<>();
+    List<SqlNode> groupKeys = new ArrayList<>();
+    List<String> visible = new ArrayList<>();
+    if (node.getPartitionByList() != null) {
+      for (UnresolvedExpression p : node.getPartitionByList()) {
+        UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+        SqlNode key = expr(core);
+        groupKeys.add(key);
+        String name =
+            (p instanceof Alias a)
+                ? a.getName()
+                : (core instanceof QualifiedName qn ? qn.toString() : null);
+        if (name != null) {
+          selects.add(asAliased(key, name));
+          visible.add(name);
+        } else {
+          selects.add(key);
+        }
+      }
+    }
+    groupKeys.add(patternsExpr);
+    selects.add(asAliased(patternsExpr, aliasField));
+    visible.add(aliasField);
+    SqlNode countCall =
+        new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(SqlIdentifier.star(POS)), POS);
+    selects.add(asAliased(countCall, "pattern_count"));
+    visible.add("pattern_count");
+    SqlNode maxSampleCount =
+        node.getPatternMaxSampleCount() != null
+            ? expr(node.getPatternMaxSampleCount())
+            : SqlLiteral.createExactNumeric("10", POS);
+    SqlNode takeCall =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE,
+            List.of(expr(node.getSourceField()), maxSampleCount),
+            POS);
+    selects.add(asAliased(takeCall, "sample_logs"));
+    visible.add("sample_logs");
+
+    SqlNodeList items = new SqlNodeList(POS);
+    for (SqlNode n : selects) {
+      items.add(n);
+    }
+    SqlNode aggSelect =
+        SqlBuilder.select(items).from(from).groupBy(groupKeys).withFields(visible).wrap(frame);
+    if (!showNumbered) {
+      return aggSelect;
+    }
+    // Re-run PATTERN_PARSER post-grouping. v2 emits the projection in order:
+    // [partitionBy ..., patterns_field, pattern_count, tokens, sample_logs].
+    SqlNode patternsFieldRef = new SqlIdentifier(aliasField, POS);
+    SqlNode sampleLogsRef = new SqlIdentifier("sample_logs", POS);
+    SqlNode parserCall =
+        new SqlBasicCall(
+            new org.apache.calcite.sql.SqlUnresolvedFunction(
+                new SqlIdentifier("PATTERN_PARSER", POS),
+                null,
+                null,
+                null,
+                null,
+                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+            List.of(patternsFieldRef, sampleLogsRef),
+            POS);
+    SqlNode itemPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parserCall, SqlLiteral.createCharString("pattern", POS)),
+            POS);
+    SqlNode castPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CAST,
+            List.of(
+                itemPattern,
+                new org.apache.calcite.sql.SqlDataTypeSpec(
+                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                        org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                    POS)),
+            POS);
+    SqlNode itemTokens =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(parserCall, SqlLiteral.createCharString("tokens", POS)),
+            POS);
+    SqlNodeList outerItems = new SqlNodeList(POS);
+    List<String> outerVisible = new ArrayList<>();
+    if (node.getPartitionByList() != null) {
+      for (UnresolvedExpression p : node.getPartitionByList()) {
+        UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+        String name =
+            (p instanceof Alias a)
+                ? a.getName()
+                : (core instanceof QualifiedName qn ? qn.toString() : null);
+        if (name != null) {
+          outerItems.add(toIdentifier(name));
+          outerVisible.add(name);
+        }
+      }
+    }
+    outerItems.add(asAliased(castPattern, aliasField));
+    outerVisible.add(aliasField);
+    outerItems.add(toIdentifier("pattern_count"));
+    outerVisible.add("pattern_count");
+    outerItems.add(asAliased(itemTokens, "tokens"));
+    outerVisible.add("tokens");
+    outerItems.add(toIdentifier("sample_logs"));
+    outerVisible.add("sample_logs");
+    return SqlBuilder.select(outerItems).from(aggSelect).withFields(outerVisible).wrap(frame);
   }
 
   @Override

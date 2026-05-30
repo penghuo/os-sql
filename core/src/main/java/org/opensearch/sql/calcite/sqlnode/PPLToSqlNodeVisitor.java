@@ -5255,12 +5255,18 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       groupKeys.add(ref);
       newVisible.add(c);
     }
+    // ARRAY_AGG(field) FILTER (WHERE field IS NOT NULL) — drop NULLs so collected array doesn't
+    // contain null entries. Mirrors v2's emission shape (legacy commit aa7a3f54ea).
     SqlNode arrayAgg =
         new SqlBasicCall(
             org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_AGG,
             List.of(toIdentifier(fieldName)),
             POS);
-    items.add(asAliased(arrayAgg, fieldName));
+    SqlNode notNullFilter =
+        new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(toIdentifier(fieldName)), POS);
+    SqlNode filteredArrayAgg =
+        new SqlBasicCall(SqlStdOperatorTable.FILTER, List.of(arrayAgg, notNullFilter), POS);
+    items.add(asAliased(filteredArrayAgg, fieldName));
     newVisible.add(fieldName);
     return SqlBuilder.select(items)
         .from(child)

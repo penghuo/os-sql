@@ -319,6 +319,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
   }
 
+  /** True when {@code dt} is a PPL numeric type (SHORT/INTEGER/LONG/FLOAT/DOUBLE/DECIMAL). */
+  private static boolean isNumericPplType(DataType dt) {
+    if (dt == null) return false;
+    switch (dt) {
+      case SHORT:
+      case INTEGER:
+      case LONG:
+      case FLOAT:
+      case DOUBLE:
+      case DECIMAL:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   /**
    * Map a Calcite {@link org.apache.calcite.rel.type.RelDataType} to a PPL {@link DataType} for
    * primitive columns. Returns {@code null} for non-primitive types (UDT, MAP, ARRAY, etc.).
@@ -2705,10 +2721,25 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlSelect mainProjected =
         new SqlSelect(POS, null, mainProj, from, null, null, null, null, null, null, null, null);
 
-    // Summary row: SELECT SUM(c) AS c (or NULL/label) FROM (mainProjected).
+    // Summary row: SELECT SUM(c) AS c (or NULL/label) FROM (mainProjected). When the user did
+    // NOT provide an explicit field list, restrict SUM to statically-known numeric columns —
+    // including a non-numeric column would surface a runtime NumberFormatException ("For input
+    // string: '880 Holmes Lane'"). Falls back to summing every column when the row-type oracle
+    // doesn't have type info (Frame.columnPrimitiveType empty).
     SqlNodeList summaryProj = new SqlNodeList(POS);
     for (String c : frame.currentFields) {
-      boolean shouldAgg = !explicitFields || aggFieldNames.contains(c);
+      boolean shouldAgg;
+      if (explicitFields) {
+        shouldAgg = aggFieldNames.contains(c);
+      } else {
+        DataType dt = frame.columnPrimitiveType.get(c);
+        if (dt == null && frame.evalAliasTypes.containsKey(c)) {
+          dt = frame.evalAliasTypes.get(c);
+        }
+        // dt == null → unknown type, default to summing (legacy behaviour). dt non-null and
+        // non-numeric → skip; the column shows as NULL in the summary row.
+        shouldAgg = dt == null || isNumericPplType(dt);
+      }
       if (shouldAgg) {
         SqlNode sum =
             new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(c, POS)), POS);
@@ -2786,7 +2817,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       List<Field> fields = node.getFieldList();
       List<String> sumNames;
       if (fields == null || fields.isEmpty()) {
-        sumNames = new ArrayList<>(frame.currentFields);
+        // Implicit field list: sum every visible column. PPL's runtime would NumberFormatException
+        // on a non-numeric value mid-row, so filter to statically-known numeric columns when the
+        // row-type oracle is wired (Frame.columnPrimitiveType is populated by visitRelation). When
+        // no oracle info is available (no rowTypeOracle, or all columns are eval/agg outputs with
+        // unknown static type), fall back to the legacy "sum everything" behaviour.
+        sumNames = new ArrayList<>();
+        for (String c : frame.currentFields) {
+          DataType dt = frame.columnPrimitiveType.get(c);
+          if (dt == null && frame.evalAliasTypes.containsKey(c)) {
+            dt = frame.evalAliasTypes.get(c);
+          }
+          if (dt == null || isNumericPplType(dt)) {
+            sumNames.add(c);
+          }
+        }
+        if (sumNames.isEmpty()) {
+          // No statically-numeric columns. Sum everything (legacy behaviour) so a runtime cast
+          // fires the same exception the user expects.
+          sumNames = new ArrayList<>(frame.currentFields);
+        }
       } else {
         sumNames = new ArrayList<>();
         for (Field f : fields) {
@@ -2848,7 +2898,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
       SqlNodeList summaryProj = new SqlNodeList(POS);
       for (String c : frame.currentFields) {
-        boolean shouldAgg = !explicitFields || aggFieldNames.contains(c);
+        boolean shouldAgg;
+        if (explicitFields) {
+          shouldAgg = aggFieldNames.contains(c);
+        } else {
+          DataType dt = frame.columnPrimitiveType.get(c);
+          if (dt == null && frame.evalAliasTypes.containsKey(c)) {
+            dt = frame.evalAliasTypes.get(c);
+          }
+          shouldAgg = dt == null || isNumericPplType(dt);
+        }
         if (shouldAgg) {
           SqlNode sum =
               new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(c, POS)), POS);

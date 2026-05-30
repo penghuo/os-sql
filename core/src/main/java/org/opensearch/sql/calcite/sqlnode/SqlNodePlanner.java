@@ -923,9 +923,7 @@ public final class SqlNodePlanner {
             RelNode visited = super.visit(other);
             if (visited instanceof org.apache.calcite.rel.logical.LogicalSort sort
                 && sort.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject proj
-                && (isPassthroughProject(proj)
-                    || (sort.getCollation().getFieldCollations().isEmpty()
-                        && isAugmentingProject(proj)))
+                && isPassthroughProject(proj)
                 // Swap when Sort has collation keys, OR when Sort has FETCH but the Project's
                 // input chain has a Filter (PPL `where ... | head N` case where v2 emits
                 // `Project(15) <- Sort(fetch=N) <- Filter`). The bare-FETCH-no-Filter case

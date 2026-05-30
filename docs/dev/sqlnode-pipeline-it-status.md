@@ -240,7 +240,7 @@ Most likely failure mode: `RelToSqlConverter` emits JOIN syntax that the Babel p
 
 | # | Class | Pushdown ON | Notes |
 |---|---|---|---|
-| 128 | CalciteCrossClusterSearchIT | ⏳ | Likely needs multi-cluster fixture; mark `⏭️` if env can't run it. |
+| 128 | CalciteCrossClusterSearchIT | ✅ | All 37 pass via `:integ-test:integTestWithSecurity` (the suite runs cross-cluster tests with the security plugin and a `remoteCluster` fixture) after Track S25: (a) `SqlValidator.Config` now uses `SqlConformanceEnum.STRICT_2003` so GROUP BY/ORDER BY references resolve to FROM-clause columns, not SELECT aliases. RelToSql can emit SELECT lists where `bin age` outputs a VARCHAR aliased AS `age` while the FROM clause still has the BIGINT `age` from the scan; the default conformance preferred the alias, surfacing as "Cannot apply 'DIVIDE' to arguments of type 'DIVIDE(<VARCHAR>, <DOUBLE>)'" during round-trip validation. (b) `visitTranspose` now passes upstream Sort collation as ORDER BY of the ROW_NUMBER it adds, with `collationToOrderKeys` extended to honor DESCENDING direction (wraps via `RelBuilder.desc()`) — previously `transpose` after `sort firstname desc` shuffled `_row_number_transpose_` because the unparsed SQL placed ROW_NUMBER OVER () before the inner ORDER BY, then the outer FILTER (WHERE _row_number_=N) picked wrong rows. (c) Two chart explain YAMLs (`chart_with_integer_span`, `chart_with_timestamp_span`) refreshed for the leaner plan shape STRICT_2003 produces (drops a redundant intermediate Project that was inlining a SPAN expression for an alias-resolved ORDER BY). |
 
 ---
 

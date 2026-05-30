@@ -952,10 +952,15 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     RexBuilder rx = context.rexBuilder;
     RelDataType varchar = rx.getTypeFactory().createSqlType(SqlTypeName.VARCHAR);
 
-    // Step 1: ROW_NUMBER
+    // Step 1: ROW_NUMBER. Pass the upstream Sort's collation as ORDER BY so the row-number
+    // assignment is deterministic across the SqlNodePipeline round-trip — without ORDER BY,
+    // ANSI SQL leaves OVER() row order unspecified, the validator may evaluate ROW_NUMBER
+    // in scan order and the subsequent FILTER (WHERE _row_number = N) picks wrong rows.
+    List<RexNode> tposeOrderKeys = collationToOrderKeys(b.peek(), context);
+    org.apache.calcite.tools.RelBuilder.AggCall tposeRn =
+        b.aggregateCall(SqlStdOperatorTable.ROW_NUMBER);
     b.projectPlus(
-        b.aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
-            .over()
+        (tposeOrderKeys.isEmpty() ? tposeRn.over() : tposeRn.over().orderBy(tposeOrderKeys))
             .rowsTo(RexWindowBounds.CURRENT_ROW)
             .as(PlanUtils.ROW_NUMBER_COLUMN_FOR_TRANSPOSE));
 
@@ -2940,7 +2945,18 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
             // index ref.
             return List.of();
           }
-          keys.add(context.rexBuilder.makeInputRef(nodeFields.get(nodeIdx).getType(), nodeIdx));
+          RexNode ref =
+              context.rexBuilder.makeInputRef(nodeFields.get(nodeIdx).getType(), nodeIdx);
+          // Preserve sort direction. RelBuilder.desc() wraps the key so the OVER's ORDER BY
+          // emits DESC; without this, every direction collapses to ASC and ROW_NUMBER values
+          // on a DESC-sorted upstream get reversed (e.g. transpose-after-sort-DESC picks the
+          // wrong rows for `row 1`/`row 2`/`row 3`).
+          if (fc.direction == org.apache.calcite.rel.RelFieldCollation.Direction.DESCENDING
+              || fc.direction
+                  == org.apache.calcite.rel.RelFieldCollation.Direction.STRICTLY_DESCENDING) {
+            ref = context.relBuilder.desc(ref);
+          }
+          keys.add(ref);
         }
         return keys;
       }

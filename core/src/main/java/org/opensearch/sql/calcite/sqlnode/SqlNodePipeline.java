@@ -162,8 +162,13 @@ public final class SqlNodePipeline {
     if (containsGraphLookup(original)) {
       return original;
     }
+    String origStr = org.apache.calcite.plan.RelOptUtil.toString(original);
+    boolean trace = origStr.contains("transpose") || origStr.contains("TRANSPOSE");
+    if (trace) System.out.println("[TR2-ORIG] " + origStr.replace("\n", "<NL>"));
     String sql = relToSql(original);
+    if (trace) System.out.println("[TR2-SQL] " + sql.replace("\n", " | "));
     RelNode roundTripped = sqlToRel(sql, context);
+    if (trace) System.out.println("[TR2-RT] " + org.apache.calcite.plan.RelOptUtil.toString(roundTripped).replace("\n", "<NL>"));
     roundTripped = stripIdentityProjects(roundTripped);
     roundTripped = unpadRelevanceMapKeys(roundTripped);
     roundTripped = retypeItemForArrayCast(roundTripped);
@@ -1306,7 +1311,16 @@ public final class SqlNodePipeline {
             SqlValidator.Config.DEFAULT
                 .withTypeCoercionFactory(PPLTypeCoercion.FACTORY)
                 .withDefaultNullCollation(NullCollation.LOW)
-                .withIdentifierExpansion(true));
+                .withIdentifierExpansion(true)
+                // STRICT_2003: GROUP BY/ORDER BY refer to FROM-clause columns, not SELECT aliases.
+                // RelToSql may emit SELECT lists where the same name appears as both an output
+                // alias (e.g. `bin age`'s VARCHAR result aliased AS `age`) and an input column
+                // (the unmodified BIGINT `age` from the FROM clause). The default conformance
+                // resolves bare GROUP BY/ORDER BY references to the SELECT alias, which flips
+                // the type and breaks downstream validation (DIVIDE(VARCHAR, DOUBLE)). Strict
+                // 2003 forces FROM-side resolution which matches the original RelNode plan.
+                .withSqlConformance(
+                    org.apache.calcite.sql.validate.SqlConformanceEnum.STRICT_2003));
 
     SqlParser.Config parserConfig =
         fc.getParserConfig()

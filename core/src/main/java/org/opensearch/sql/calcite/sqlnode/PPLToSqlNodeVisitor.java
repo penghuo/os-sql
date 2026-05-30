@@ -7698,6 +7698,20 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (op == SqlStdOperatorTable.PLUS && hasStringOperand(fn.getFuncArgs())) {
         return new SqlBasicCall(SqlStdOperatorTable.CONCAT, args, POS);
       }
+      // `<datetime> + <INTERVAL>` and `<datetime> - <INTERVAL>` dispatch to the PPL DATE_ADD /
+      // DATE_SUB UDFs (mirroring v2's RexBuilder which routes `+(timestamp, INTERVAL)` through
+      // these UDFs). Standard PLUS/MINUS over INTERVAL gets rewritten by Calcite's converter to
+      // ADDDATE/SUBTRACT_DATE which encode the interval value as ms (8.64E7 for 1d) rather than
+      // the original (1, 'd'). Detection: 2 args, second is an Interval AST node.
+      if ((op == SqlStdOperatorTable.PLUS || op == SqlStdOperatorTable.MINUS)
+          && fn.getFuncArgs().size() == 2
+          && fn.getFuncArgs().get(1) instanceof org.opensearch.sql.ast.expression.Interval) {
+        org.apache.calcite.sql.SqlOperator dateOp =
+            op == SqlStdOperatorTable.PLUS
+                ? org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_ADD
+                : org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_SUB;
+        return new SqlBasicCall(dateOp, args, POS);
+      }
       return new SqlBasicCall(op, args, POS);
     }
     // PPL `typeof(expr)` returns the PPL legacy type name as a literal string. v2 computes this
@@ -7862,10 +7876,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMPDIFF;
           case "last_day" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST_DAY;
           case "extract" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.EXTRACT;
-          case "adddate", "date_add" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDDATE;
-          case "subdate", "date_sub" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBDATE;
+          // PPL `date_add(timestamp, INTERVAL N unit)` and `adddate(...)` accept (date, interval)
+          // with day-time interval as ms. v2 dispatches `date_add` to DATE_ADD UDF (preserving the
+          // original (N, unit) arity in the explain plan); `adddate` keeps ADDDATE.
+          case "date_add" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_ADD;
+          case "adddate" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDDATE;
+          case "date_sub" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_SUB;
+          case "subdate" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBDATE;
           case "addtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDTIME;
           case "subtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBTIME;
           case "datediff" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATEDIFF;

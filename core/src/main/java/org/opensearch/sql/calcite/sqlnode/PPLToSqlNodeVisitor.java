@@ -1101,6 +1101,32 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         newVisible.add(c);
       }
     }
+    // PPL `rename <map>.<path> as <alias>` — when the source is a MAP-typed column's sub-path
+    // (e.g. `rename doc.user.name as username` over a MAP-typed `doc` produced by spath
+    // auto-extract), emit `ITEM(doc, 'user.name') AS username` and add `username` to the visible
+    // set. The map sub-path isn't in {@code frame.currentFields} so the rename loop above wouldn't
+    // catch it; this post-pass handles MAP-path renames specifically.
+    for (org.opensearch.sql.ast.expression.Map m : node.getRenameList()) {
+      String origin = ((Field) m.getOrigin()).getField().toString();
+      String target = ((Field) m.getTarget()).getField().toString();
+      if (origin.contains("*") || target.contains("*")) continue;
+      int dot = origin.indexOf('.');
+      if (dot < 0) continue;
+      String prefix = origin.substring(0, dot);
+      if (!frame.mapColumns.contains(prefix)) continue;
+      // Avoid double-add if the loop above already covered this column (unlikely since the
+      // dotted MAP path isn't in cols, but be defensive).
+      if (newVisible.contains(target)) continue;
+      SqlNode item =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(
+                  new SqlIdentifier(prefix, POS),
+                  SqlLiteral.createCharString(origin.substring(dot + 1), POS)),
+              POS);
+      items.add(asAliased(item, target));
+      newVisible.add(target);
+    }
     return SqlBuilder.select(items).from(from).withFields(newVisible).wrap(frame);
   }
 

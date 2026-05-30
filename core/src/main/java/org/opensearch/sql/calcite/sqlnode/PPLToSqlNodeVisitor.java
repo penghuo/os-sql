@@ -5613,7 +5613,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
     SqlNodeList innerSelects = new SqlNodeList(POS);
     innerSelects.add(SqlIdentifier.star(POS));
-    innerSelects.add(asAliased(rowNum, "__rn_dedup__"));
+    innerSelects.add(asAliased(rowNum, "_row_number_dedup_"));
     SqlNode innerSelect =
         new SqlSelect(
             POS, null, innerSelects, from, null, null, null, null, null, null, null, null);
@@ -5621,12 +5621,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         new SqlBasicCall(
             SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
             List.of(
-                new SqlIdentifier("__rn_dedup__", POS),
+                new SqlIdentifier("_row_number_dedup_", POS),
                 SqlLiteral.createExactNumeric(Integer.toString(allowedDup), POS)),
             POS);
     SqlNode whereCond;
     if (keepEmpty) {
-      // (F1 IS NULL) OR (F2 IS NULL) OR ... OR (__rn_dedup__ <= N)
+      // (F1 IS NULL) OR (F2 IS NULL) OR ... OR (_row_number_dedup_ <= N)
       SqlNode acc = boundCheck;
       for (SqlNode pf : partitionFields) {
         acc =
@@ -5637,7 +5637,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       whereCond = acc;
     } else {
-      // (F1 IS NOT NULL) AND ... AND (__rn_dedup__ <= N)
+      // (F1 IS NOT NULL) AND ... AND (_row_number_dedup_ <= N)
       SqlNode acc = boundCheck;
       for (SqlNode pf : partitionFields) {
         acc =
@@ -5648,7 +5648,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       whereCond = acc;
     }
-    // Outer SELECT projects only the user-visible columns so the helper `__rn_dedup__` column
+    // Outer SELECT projects only the user-visible columns so the helper `_row_number_dedup_` column
     // doesn't leak into the row type (PPL's implicit final `| fields *` should not surface it).
     // Falls back to SELECT * when we don't know the visible fields (no row-type oracle).
     SqlNodeList outerSelects = new SqlNodeList(POS);

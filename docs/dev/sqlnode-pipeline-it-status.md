@@ -51,7 +51,7 @@ Goal: prove the round-trip works at all on plans that touch none of the removed 
 | 10 | CalciteShowDataSourcesCommandIT | ⏭️ | Excluded by build exclude rules (datasource IT). |
 | 11 | CalciteInformationSchemaCommandIT | ⏭️ | Excluded by build exclude rules. |
 | 12 | CalciteSettingsIT | ✅ | 4/4 pass. |
-| 13 | CalciteResourceMonitorIT | ❌ | 1/2 fail (`queryExceedResourceLimitShouldFail`). Test sets memory_limit=1% and expects 500 "Insufficient resources"; query succeeds. Runtime-engine concern, not round-trip. **Deferred.** |
+| 13 | CalciteResourceMonitorIT | ✅ | All pass after Track R24: `OpenSearchExecutionEngine.execute(RelNode, ...)` now mirrors `ResourceMonitorPlan.open()` — calls `osProtector.getResourceMonitor().getStatus()` before invoking `OpenSearchRelRunners.run`, and throws `IllegalStateException("Insufficient resources to start query: ...")` when the configured `plugins.ppl.query.memory_limit` is exceeded. Without this, the Calcite engine bypassed the limit because the JDBC `PreparedStatement.executeQuery()` path didn't go through `executionProtector.protect()`. Plus `GCedMemoryUsage.usage()` now falls back to `RuntimeMemoryUsage` when no old-gen GC has fired (sentinel -1) — required for a meaningful coordinator-side memory comparison before the first GC notification arrives. |
 | 14 | CalciteErrorReportStageIT | ✅ | 7/7 pass. |
 
 ## Phase 2 — IP comparisons (expected REGRESSION: rewriteIpComparisons removed)

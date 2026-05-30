@@ -48,7 +48,15 @@ public class GCedMemoryUsage implements MemoryUsage {
 
   @Override
   public long usage() {
-    return usage.get();
+    long current = usage.get();
+    if (current >= 0) {
+      return current;
+    }
+    // No old-gen GC has fired yet, so the cached usage is still the sentinel (-1). Fall back
+    // to RuntimeMemoryUsage so the resource-monitor check on the Calcite engine has a sensible
+    // value to compare against the configured limit (otherwise the limit is silently ignored
+    // until the first GC notification arrives, breaking ResourceMonitorIT under Calcite).
+    return RuntimeMemoryUsage.getInstance().usage();
   }
 
   @Override

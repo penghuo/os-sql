@@ -214,6 +214,33 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
+          // Mirror ResourceMonitorPlan.open(): refuse to start a query when the configured
+          // memory limit (plugins.ppl.query.memory_limit) is already exceeded. The v2 engine
+          // installs this check via OpenSearchExecutionProtector wrapping the PhysicalPlan,
+          // but the Calcite path runs through the JDBC PreparedStatement without that
+          // wrapper, so the limit was previously ignored.
+          if (executionProtector
+              instanceof
+              org.opensearch.sql.opensearch.executor.protector.OpenSearchExecutionProtector
+              osProtector) {
+            org.opensearch.sql.monitor.ResourceMonitor monitor = osProtector.getResourceMonitor();
+            if (monitor != null) {
+              org.opensearch.sql.monitor.ResourceStatus status = monitor.getStatus();
+              if (!status.isHealthy()) {
+                throw new IllegalStateException(
+                    String.format(
+                        "Insufficient resources to start query: %s. "
+                            + "To increase the limit, adjust the '%s' setting (default: %s).",
+                        status.getFormattedDescription(),
+                        org.opensearch.sql.common.setting.Settings.Key.QUERY_MEMORY_LIMIT
+                            .getKeyValue(),
+                        org.opensearch.sql.opensearch.setting.OpenSearchSettings
+                            .QUERY_MEMORY_LIMIT_SETTING.getDefault(
+                                org.opensearch.common.settings.Settings.EMPTY)
+                            .toString()));
+              }
+            }
+          }
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
             ProfileMetric metric = QueryProfiling.current().getOrCreateMetric(MetricName.EXECUTE);
             long execTime = System.nanoTime();

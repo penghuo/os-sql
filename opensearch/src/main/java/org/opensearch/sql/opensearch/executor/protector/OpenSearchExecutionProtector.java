@@ -37,6 +37,17 @@ public class OpenSearchExecutionProtector extends ExecutionProtector {
   /** OpenSearch resource monitor. */
   private final ResourceMonitor resourceMonitor;
 
+  /**
+   * Exposes the underlying resource monitor so non-PhysicalPlan execution paths (e.g. the
+   * Calcite engine, which executes via {@code OpenSearchRelRunners.run}) can perform the same
+   * pre-execution resource check that {@link ResourceMonitorPlan#open()} does for the v2
+   * engine. Without this, queries on the Calcite path bypass the {@code
+   * plugins.ppl.query.memory_limit} setting entirely.
+   */
+  public ResourceMonitor getResourceMonitor() {
+    return resourceMonitor;
+  }
+
   public PhysicalPlan protect(PhysicalPlan physicalPlan) {
     return physicalPlan.accept(this, null);
   }

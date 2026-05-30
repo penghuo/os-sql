@@ -5755,6 +5755,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     } finally {
       this.exprFrame = savedExpr;
     }
+    // Calcite's EXISTS expects a subquery (SELECT/AS), not a bare relation identifier. When the
+    // subsearch body is `source = X` (no other pipes), the visitor returns a SqlIdentifier; wrap
+    // it in `SELECT * FROM (...)` so the validator parses EXISTS correctly.
+    if (subQuery instanceof SqlIdentifier
+        || (subQuery instanceof SqlBasicCall sbc && sbc.getOperator() == SqlStdOperatorTable.AS)) {
+      SqlNodeList star = new SqlNodeList(POS);
+      star.add(SqlIdentifier.star(POS));
+      subQuery = SqlBuilder.select(star).from(subQuery).wrap(subFrame);
+    }
     return new SqlBasicCall(SqlStdOperatorTable.EXISTS, List.of(subQuery), POS);
   }
 

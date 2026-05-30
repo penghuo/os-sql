@@ -6265,6 +6265,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       return new SqlBasicCall(op, args, POS);
     }
+    // PPL `typeof(expr)` returns the PPL legacy type name as a literal string. v2 computes this
+    // in PPLFuncImpTable at build time using a validator probe. Without an oracle, derive
+    // statically: literals carry their type, casts/typed-functions (`date()`, `now()`) likewise.
+    // Column refs whose type isn't trackable via {@link Frame#evalAliasTypes} fall through to an
+    // unresolved TYPEOF call (which the validator rejects — same outcome as before).
+    if ("typeof".equals(fnLower) && fn.getFuncArgs().size() == 1) {
+      String legacyName = pplLegacyTypeName(fn.getFuncArgs().get(0), exprFrame);
+      if (legacyName != null) {
+        return SqlLiteral.createCharString(legacyName, POS);
+      }
+    }
     // PPL JSON manipulation UDFs that need explicit operator dispatch — Calcite's validator
     // can't resolve the lowercase PPL names to PPLBuiltinOperators by signature alone.
     if ("json_valid".equals(fnLower) && args.size() == 1) {
@@ -6995,6 +7006,35 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return hasStringOperand(fn.getFuncArgs());
     }
     return false;
+  }
+
+  /**
+   * Resolve PPL's user-facing type name for {@code typeof()}. Returns null when the source type
+   * can't be derived statically; the caller falls back to a TYPEOF() emission that the validator
+   * will handle (or reject with the same error as before).
+   */
+  private static String pplLegacyTypeName(UnresolvedExpression e, Frame frame) {
+    if (e instanceof org.opensearch.sql.ast.expression.Interval) {
+      return "INTERVAL";
+    }
+    DataType dt = staticTypeOf(e, frame);
+    if (dt == null) return null;
+    return switch (dt) {
+      case SHORT -> "SMALLINT";
+      case INTEGER -> "INT";
+      case LONG -> "BIGINT";
+      case FLOAT -> "FLOAT";
+      case DOUBLE -> "DOUBLE";
+      case DECIMAL -> "DOUBLE";
+      case BOOLEAN -> "BOOLEAN";
+      case STRING -> "STRING";
+      case DATE -> "DATE";
+      case TIME -> "TIME";
+      case TIMESTAMP -> "TIMESTAMP";
+      case INTERVAL -> "INTERVAL";
+      case IP -> "IP";
+      default -> null;
+    };
   }
 
   /**

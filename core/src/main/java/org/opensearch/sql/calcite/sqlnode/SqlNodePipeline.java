@@ -193,36 +193,54 @@ public final class SqlNodePipeline {
           @Override
           public org.apache.calcite.rex.RexNode visitSubQuery(
               org.apache.calcite.rex.RexSubQuery subQuery) {
-            // Recurse into nested subqueries first so inner-most EXISTS get their strip too.
+            // Recurse into nested subqueries first so inner-most subqueries get their strip too.
             org.apache.calcite.rex.RexSubQuery walked =
                 (org.apache.calcite.rex.RexSubQuery) super.visitSubQuery(subQuery);
-            if (walked.getKind() != org.apache.calcite.sql.SqlKind.EXISTS) {
-              return walked;
-            }
             RelNode inner = walked.rel;
-            int hlIdx = -1;
-            java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
-                inner.getRowType().getFieldList();
-            for (int i = 0; i < fields.size(); i++) {
-              if ("_highlight".equals(fields.get(i).getName())) {
-                hlIdx = i;
-                break;
+            // Try a deep scan strip: when the inner subquery has a Linear chain
+            // (Project/Filter/Sort) over a TableScan with _highlight at the last position
+            // AND no operator in the chain references the _highlight position, drop it at
+            // the scan. This prevents Calcite's EnumerableSort/Window codegen from generating
+            // `(Comparable) row.fieldX` for the MAP column inside intermediate operators.
+            // Applies to all subquery kinds (EXISTS, IN, SCALAR) — the strip is safe
+            // whenever no upstream operator references the _highlight position.
+            RelNode deeplyStripped = tryDeepStripHighlightInSimpleChain(inner);
+            if (deeplyStripped != inner) {
+              inner = deeplyStripped;
+            }
+
+            // Top-of-plan strip applies ONLY for EXISTS — those don't materialise inner cols
+            // into the outer result so dropping the top column is semantically transparent.
+            // IN/Scalar subqueries reference specific value columns, so column reordering at
+            // the top would break match semantics. The scan-level strip above is safe for all
+            // kinds because it only changes the scan's row-type, not the projected output.
+            if (walked.getKind() == org.apache.calcite.sql.SqlKind.EXISTS) {
+              int hlIdx = -1;
+              java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+                  inner.getRowType().getFieldList();
+              for (int i = 0; i < fields.size(); i++) {
+                if ("_highlight".equals(fields.get(i).getName())) {
+                  hlIdx = i;
+                  break;
+                }
+              }
+              if (hlIdx >= 0) {
+                org.apache.calcite.rex.RexBuilder rb = inner.getCluster().getRexBuilder();
+                java.util.List<org.apache.calcite.rex.RexNode> projects =
+                    new java.util.ArrayList<>(fields.size() - 1);
+                java.util.List<String> names = new java.util.ArrayList<>(fields.size() - 1);
+                for (int i = 0; i < fields.size(); i++) {
+                  if (i == hlIdx) continue;
+                  projects.add(rb.makeInputRef(inner, i));
+                  names.add(fields.get(i).getName());
+                }
+                inner =
+                    org.apache.calcite.rel.logical.LogicalProject.create(
+                        inner, java.util.Collections.emptyList(), projects, names);
               }
             }
-            if (hlIdx < 0) return walked;
-            org.apache.calcite.rex.RexBuilder rb = inner.getCluster().getRexBuilder();
-            java.util.List<org.apache.calcite.rex.RexNode> projects =
-                new java.util.ArrayList<>(fields.size() - 1);
-            java.util.List<String> names = new java.util.ArrayList<>(fields.size() - 1);
-            for (int i = 0; i < fields.size(); i++) {
-              if (i == hlIdx) continue;
-              projects.add(rb.makeInputRef(inner, i));
-              names.add(fields.get(i).getName());
-            }
-            RelNode wrapped =
-                org.apache.calcite.rel.logical.LogicalProject.create(
-                    inner, java.util.Collections.emptyList(), projects, names);
-            return walked.clone(wrapped);
+            if (inner == walked.rel) return walked;
+            return walked.clone(inner);
           }
         };
     return root.accept(
@@ -232,6 +250,82 @@ public final class SqlNodePipeline {
             return super.visit(node).accept(shuttle);
           }
         });
+  }
+
+  /**
+   * If the plan is a SIMPLE LINEAR chain (only Project/Filter/Sort nodes, exactly one input
+   * each) terminating in a TableScan whose row-type ends with {@code _highlight}, AND no
+   * operator in the chain references the {@code _highlight} column index, wrap the scan with
+   * a {@code LogicalProject} that drops {@code _highlight} and re-clone every operator above
+   * with the new input. Otherwise return the plan unchanged.
+   *
+   * <p>Returns the original plan unchanged on any failure mode (Join, Aggregate, Correlate,
+   * UNNEST, RexInputRef referencing the dropped index, etc.). This makes the operation a
+   * conservative best-effort optimization.
+   */
+  private static RelNode tryDeepStripHighlightInSimpleChain(RelNode root) {
+    java.util.List<RelNode> chain = new java.util.ArrayList<>();
+    RelNode cur = root;
+    while (cur != null
+        && (cur instanceof org.apache.calcite.rel.core.Project
+            || cur instanceof org.apache.calcite.rel.core.Filter
+            || cur instanceof org.apache.calcite.rel.core.Sort)
+        && cur.getInputs().size() == 1) {
+      chain.add(cur);
+      cur = cur.getInput(0);
+    }
+    if (!(cur instanceof org.apache.calcite.rel.core.TableScan scan)) return root;
+    java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+        scan.getRowType().getFieldList();
+    if (fields.isEmpty()) return root;
+    int last = fields.size() - 1;
+    if (!"_highlight".equals(fields.get(last).getName())) return root;
+    // Check no operator in the chain references the _highlight position.
+    for (RelNode op : chain) {
+      if (operatorReferencesIndex(op, last)) return root;
+    }
+    // Wrap scan with a Project that drops _highlight.
+    org.apache.calcite.rex.RexBuilder rb = scan.getCluster().getRexBuilder();
+    java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>(last);
+    java.util.List<String> names = new java.util.ArrayList<>(last);
+    for (int i = 0; i < last; i++) {
+      projects.add(rb.makeInputRef(scan, i));
+      names.add(fields.get(i).getName());
+    }
+    RelNode current =
+        org.apache.calcite.rel.logical.LogicalProject.create(
+            scan, java.util.Collections.emptyList(), projects, names);
+    // Re-clone the chain bottom-up.
+    for (int i = chain.size() - 1; i >= 0; i--) {
+      RelNode op = chain.get(i);
+      current = op.copy(op.getTraitSet(), java.util.List.of(current));
+    }
+    return current;
+  }
+
+  private static boolean operatorReferencesIndex(RelNode node, int idx) {
+    boolean[] found = {false};
+    org.apache.calcite.rex.RexVisitorImpl<Void> visitor =
+        new org.apache.calcite.rex.RexVisitorImpl<>(true) {
+          @Override
+          public Void visitInputRef(org.apache.calcite.rex.RexInputRef ref) {
+            if (ref.getIndex() == idx) found[0] = true;
+            return null;
+          }
+        };
+    if (node instanceof org.apache.calcite.rel.core.Filter f) {
+      f.getCondition().accept(visitor);
+    } else if (node instanceof org.apache.calcite.rel.core.Project p) {
+      for (org.apache.calcite.rex.RexNode e : p.getProjects()) e.accept(visitor);
+    } else if (node instanceof org.apache.calcite.rel.core.Sort s) {
+      for (org.apache.calcite.rel.RelFieldCollation fc :
+          s.getCollation().getFieldCollations()) {
+        if (fc.getFieldIndex() == idx) return true;
+      }
+      if (s.fetch != null) s.fetch.accept(visitor);
+      if (s.offset != null) s.offset.accept(visitor);
+    }
+    return found[0];
   }
 
   /**

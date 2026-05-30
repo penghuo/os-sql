@@ -881,11 +881,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 new org.apache.calcite.sql.SqlBasicTypeNameSpec(
                     org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
                 POS);
-        rhs =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(rhs, varcharSpec),
-                POS);
+        // Use SqlStdOperatorTable.CAST (not SAFE_CAST) so the validator simplifies the typed
+        // literal to a bare `'literal':VARCHAR` annotation matching v2's RexBuilder.makeLiteral
+        // emission. SAFE_CAST leaves a `CAST(...)` wrapper visible in the explain plan.
+        rhs = new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(rhs, varcharSpec), POS);
       }
       // PPL `fieldformat alias = "prefix" . expr . "suffix"` parses into a Let with optional
       // concatPrefix/concatSuffix literals. Rewrite to NULL-preserving SQL concat (`||`) — the

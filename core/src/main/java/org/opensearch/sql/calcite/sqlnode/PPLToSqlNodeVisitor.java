@@ -6531,6 +6531,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     } finally {
       this.exprFrame = savedExpr;
     }
+    // Column-count check: LHS arity must match subquery's output arity. Mirrors PPL's documented
+    // SemanticCheckException ("The number of columns in the left hand side of an IN subquery does
+    // not match the number of columns in the output of subquery"). Without this, Calcite raises a
+    // confusing "Values passed to IN operator must have compatible types" instead.
+    int lhsCount = is.getValue().size();
+    int rhsCount = subFrame.currentFields == null ? -1 : subFrame.currentFields.size();
+    if (rhsCount > 0 && lhsCount != rhsCount) {
+      throw new IllegalArgumentException(
+          "The number of columns in the left hand side of an IN subquery does not match the "
+              + "number of columns in the output of subquery");
+    }
     SqlNode left;
     if (is.getValue().size() == 1) {
       left = expr(is.getValue().get(0));

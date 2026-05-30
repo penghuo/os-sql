@@ -6269,6 +6269,25 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (fnLower.equals("median") && args.size() == 1) {
         args.add(SqlLiteral.createExactNumeric("50", POS));
       }
+      // v2's PERCENTILE_APPROX dispatcher appends a SYMBOL flag holding the field's SqlTypeName
+      // (rexBuilder.makeFlag(field.getType().getSqlTypeName())) so the runtime impl can return
+      // the correct numeric type. Mirror that here for percentile/median/percentile_approx;
+      // probe the field's primitive type via Frame.columnPrimitiveType / evalAliasTypes (no
+      // validator probe needed) and emit a SqlSymbolLiteral. Other aggregates in this dispatch
+      // (first/last/take/values) keep their original arity. Mirrors legacy commit 26d6ff2081.
+      if (fnLower.equals("percentile")
+          || fnLower.equals("percentile_approx")
+          || fnLower.equals("median")) {
+        DataType fieldDt = staticTypeOf(argExpr, exprFrame);
+        if (fieldDt != null) {
+          try {
+            org.apache.calcite.sql.type.SqlTypeName sqlType = pplTypeToSqlType(fieldDt);
+            args.add(SqlLiteral.createSymbol(sqlType, POS));
+          } catch (UnsupportedOperationException ignored) {
+            // Field's PPL DataType doesn't map to a SqlTypeName — skip flag.
+          }
+        }
+      }
       return new SqlBasicCall(op, args, POS, quantifier);
     }
     return new SqlBasicCall(op, List.of(arg), POS, quantifier);

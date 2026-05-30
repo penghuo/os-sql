@@ -4226,11 +4226,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (lastDot >= 0 && all.contains(c.substring(0, lastDot))) {
         continue;
       }
-      items.add(toIdentifier(c));
+      // OpenSearch flattens nested fields under their dotted name (`message.author` is a single
+      // column, not a struct path). Emit as a quoted single-part identifier so the validator
+      // looks it up literally in the catalog row type instead of treating `message` as a table.
+      items.add(c.indexOf('.') < 0 ? toIdentifier(c) : quotedIdentifier(List.of(c)));
       visible.add(c);
     }
     for (int i = 0; i < subCols.size(); i++) {
-      items.add(asAliased(toIdentifier(subCols.get(i)), aliases.get(i)));
+      items.add(asAliased(quotedIdentifier(List.of(subCols.get(i))), aliases.get(i)));
       visible.add(aliases.get(i));
     }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);

@@ -180,6 +180,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Set<String> dottedEvalAliases = new java.util.LinkedHashSet<>();
 
     /**
+     * Names of join-arg aliases ({@code left=a, right=b}) live in this pipeline's history. Used by
+     * {@link #toIdentifier} to gate the dotted-flat-column rewrite — when the leading part is a
+     * known join alias, keep the multi-part identifier so {@code a.name} resolves through alias
+     * scope. Carries across pipe wraps.
+     */
+    java.util.Set<String> liveJoinAliases = new java.util.LinkedHashSet<>();
+
+    /**
      * Active SubqueryAlias name set by {@link #visitSubqueryAlias} from {@code source = X as i}.
      * Used by visitors that wrap state (visitFilter / visitSort / visitEval / visitAggregation /
      * etc.) to re-attach the alias around the wrapped subquery so a downstream {@code | sort i.col}
@@ -6056,6 +6064,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // The join consumes any inherited subquery alias — clear it so downstream pipes don't
     // wrap the join in `AS <stale-alias>`.
     frame.subqueryAliasName = null;
+    // Track join-arg aliases on the frame so toIdentifier knows not to rewrite dotted refs
+    // like `a.col` as quoted-single-part (which would break alias-qualified resolution).
+    if (leftAlias != null) frame.liveJoinAliases.add(leftAlias);
+    if (rightAlias != null) frame.liveJoinAliases.add(rightAlias);
 
     // SEMI/ANTI joins aren't supported in Calcite's SqlNode dialect (raises "Dialect does not
     // support feature"). Rewrite as `<left> WHERE [NOT] EXISTS (SELECT * FROM <right> WHERE
@@ -8156,6 +8168,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       List<String> rewritten = new ArrayList<>(parts);
       rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
       return quotedIdentifier(rewritten);
+    }
+    // OpenSearch flattens deeply-nested object mappings into top-level dotted-name fields (e.g.
+    // {@code resource.attributes.telemetry.sdk.version}). When the full dotted name appears as a
+    // visible flat column AND the leading part isn't a known alias prefix, emit it as a quoted
+    // single-part identifier so the validator looks it up literally. Without this, multi-part
+    // identifier resolution would interpret the leading part as a table and fail with
+    // "Table 'X' not found". Skip when in join scope where alias-qualified refs ({@code a.col})
+    // are also valid.
+    if (parts.size() >= 2
+        && exprFrame != null
+        && !exprFrame.liveJoinAliases.contains(parts.get(0))
+        && exprFrame.aliasSynonyms.isEmpty()
+        && exprFrame.currentFields != null
+        && exprFrame.currentFields.contains(name)) {
+      return quotedIdentifier(java.util.Collections.singletonList(name));
+    }
+    if (parts.size() >= 2 && exprFrame != null && exprFrame.dottedEvalAliases.contains(name)) {
+      return quotedIdentifier(java.util.Collections.singletonList(name));
     }
     return quotedIdentifier(parts);
   }

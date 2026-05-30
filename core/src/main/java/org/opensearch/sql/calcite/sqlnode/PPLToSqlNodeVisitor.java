@@ -5764,6 +5764,31 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // validator with "Field [null] not found". (Missing-field replacement requires an oracle and
     // is left for the row-type-aware path.)
     String fnLower = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+    // mvmap/transform: when the lambda body references names from the OUTER scope (e.g.
+    // `mvmap(arr, arr * multiplier)`), the SqlLambda validator only sees the lambda params and
+    // rejects the outer ref. Mirror v2's captured-variable rewrite — collect outer refs from the
+    // lambda body, append them to the lambda's parameter list, and pass them as additional outer
+    // arguments. TransformFunctionImpl.eval routes outer values into args[2..] of the lambda.
+    if (("mvmap".equals(fnLower) || "transform".equals(fnLower))
+        && fn.getFuncArgs().size() >= 2
+        && fn.getFuncArgs().get(1) instanceof org.opensearch.sql.ast.expression.LambdaFunction lf) {
+      java.util.Set<String> declared = new java.util.LinkedHashSet<>();
+      for (QualifiedName qn : lf.getFuncArgs()) declared.add(qn.toString());
+      java.util.LinkedHashMap<String, QualifiedName> captured = new java.util.LinkedHashMap<>();
+      collectCapturedRefs(lf.getFunction(), declared, captured);
+      if (!captured.isEmpty()) {
+        java.util.List<QualifiedName> newLambdaArgs = new ArrayList<>(lf.getFuncArgs());
+        newLambdaArgs.addAll(captured.values());
+        org.opensearch.sql.ast.expression.LambdaFunction extendedLambda =
+            new org.opensearch.sql.ast.expression.LambdaFunction(lf.getFunction(), newLambdaArgs);
+        java.util.List<UnresolvedExpression> newOuterArgs = new ArrayList<>();
+        newOuterArgs.add(fn.getFuncArgs().get(0));
+        newOuterArgs.add(extendedLambda);
+        for (QualifiedName qn : captured.values()) newOuterArgs.add(qn);
+        return funcExpr(
+            new org.opensearch.sql.ast.expression.Function(fn.getFuncName(), newOuterArgs));
+      }
+    }
     boolean isCoalesce = "coalesce".equals(fnLower) || "ifnull".equals(fnLower);
     List<SqlNode> args = new ArrayList<>(fn.getFuncArgs().size());
     for (UnresolvedExpression a : fn.getFuncArgs()) {
@@ -6367,6 +6392,44 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (e instanceof QualifiedName q) qn = q;
     else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
     return qn != null && "null".equalsIgnoreCase(qn.toString());
+  }
+
+  /**
+   * Walk a lambda body and collect QualifiedName references whose first part is NOT in {@code
+   * declared} (the lambda's own parameter set). These are outer-scope captures. Single-part bare
+   * names like {@code multiplier} are added under their own key; nested lambdas extend the shadow
+   * set.
+   */
+  private static void collectCapturedRefs(
+      UnresolvedExpression e,
+      java.util.Set<String> declared,
+      java.util.LinkedHashMap<String, QualifiedName> out) {
+    if (e == null) return;
+    if (e instanceof QualifiedName qn) {
+      String head = qn.getParts().isEmpty() ? qn.toString() : qn.getParts().get(0);
+      if (!declared.contains(head) && !out.containsKey(head)) {
+        out.put(head, qn);
+      }
+      return;
+    }
+    if (e instanceof Field fld && fld.getField() instanceof QualifiedName qn) {
+      String head = qn.getParts().isEmpty() ? qn.toString() : qn.getParts().get(0);
+      if (!declared.contains(head) && !out.containsKey(head)) {
+        out.put(head, qn);
+      }
+      return;
+    }
+    if (e instanceof org.opensearch.sql.ast.expression.LambdaFunction nestedLf) {
+      java.util.Set<String> nested = new java.util.LinkedHashSet<>(declared);
+      for (QualifiedName p : nestedLf.getFuncArgs()) nested.add(p.toString());
+      collectCapturedRefs(nestedLf.getFunction(), nested, out);
+      return;
+    }
+    for (org.opensearch.sql.ast.Node child : e.getChild()) {
+      if (child instanceof UnresolvedExpression cu) {
+        collectCapturedRefs(cu, declared, out);
+      }
+    }
   }
 
   private static boolean hasStringOperand(List<UnresolvedExpression> args) {

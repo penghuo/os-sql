@@ -5725,6 +5725,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           POS);
     }
     org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(targetType);
+    // STRING target with floating-point/decimal literal source: Calcite SAFE_CAST stringifies
+    // 0.99 → ".99" and 0.0 → "0E0", but PPL expects "0.99" / "0.0" (Java toString semantics).
+    // Dispatch to NUMBER_TO_STRING UDF. Without an oracle we only catch literals; non-literal
+    // numeric sources fall through to SAFE_CAST.
+    if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR
+        && c.getExpression() instanceof Literal numLit) {
+      switch (numLit.getType()) {
+        case FLOAT, DOUBLE, DECIMAL:
+          return new SqlBasicCall(
+              new org.apache.calcite.sql.SqlUnresolvedFunction(
+                  new SqlIdentifier("NUMBER_TO_STRING", POS),
+                  null,
+                  null,
+                  null,
+                  null,
+                  org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+              List.of(value),
+              POS);
+        default:
+          // fall through to SAFE_CAST
+      }
+    }
     // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
     //   - numeric literal: `value != 0` (1→true, 0→false, 2→true).
     //   - string literal: '1'→true, '0'→false, anything else→NULL (Spark/Postgres semantics).

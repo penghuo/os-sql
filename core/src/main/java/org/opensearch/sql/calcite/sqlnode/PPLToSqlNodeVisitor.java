@@ -52,6 +52,7 @@ import org.opensearch.sql.ast.tree.Chart;
 import org.opensearch.sql.ast.tree.Convert;
 import org.opensearch.sql.ast.tree.Dedupe;
 import org.opensearch.sql.ast.tree.Eval;
+import org.opensearch.sql.ast.tree.Expand;
 import org.opensearch.sql.ast.tree.FillNull;
 import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Flatten;
@@ -4214,6 +4215,62 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       visible.add(aliases.get(i));
     }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitExpand(Expand node, Frame frame) {
+    // PPL `expand <field> [as <alias>]` unnests an array column: each input row becomes one row
+    // per array element, with the element exposed as a struct under the alias (or the original
+    // field name when no alias). Emit the LATERAL CROSS JOIN UNNEST shape.
+    SqlNode input = node.getChild().get(0).accept(this, frame);
+    UnresolvedExpression fieldExpr = node.getField().getField();
+    if (!(fieldExpr instanceof QualifiedName fqn)) {
+      throw new UnsupportedOperationException(
+          "expand requires a simple column reference, got: " + fieldExpr.getClass());
+    }
+    String fieldName = fqn.toString();
+    String alias = node.getAlias() != null ? node.getAlias() : fieldName;
+    String inputAlias = "expand_input";
+    String unnestAlias = "expand_t";
+    SqlNode aliasedInput = SqlBuilder.aliasAs(input, inputAlias);
+    SqlNode unnestArg = new SqlIdentifier(java.util.Arrays.asList(inputAlias, fieldName), POS);
+    SqlNode unnest = new SqlBasicCall(SqlStdOperatorTable.UNNEST, List.of(unnestArg), POS);
+    SqlNode aliasedUnnest =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS,
+            List.of(unnest, new SqlIdentifier(unnestAlias, POS), new SqlIdentifier(alias, POS)),
+            POS);
+    SqlNode join =
+        new org.apache.calcite.sql.SqlJoin(
+            POS,
+            aliasedInput,
+            SqlLiteral.createBoolean(false, POS),
+            JoinType.COMMA.symbol(POS),
+            aliasedUnnest,
+            org.apache.calcite.sql.JoinConditionType.NONE.symbol(POS),
+            null);
+    // Build explicit projection: input cols (drop the array source and dotted descendants whose
+    // parent struct is in scope, mirroring v2's tryToRemoveNestedFields) + the unnested element
+    // surfaced as `alias`.
+    List<String> inputCols = frame.currentFields == null ? List.of() : frame.currentFields;
+    java.util.Set<String> inputColSet = new java.util.LinkedHashSet<>(inputCols);
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    String dottedPrefix = fieldName + ".";
+    for (String c : inputCols) {
+      if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
+      // Drop the array source column — the unnested element replaces it (whether under the same
+      // name or the user-supplied alias). Mirrors v2's projection rule at PplToSqlNode#1762.
+      if (c.equals(fieldName)) continue;
+      if (c.startsWith(dottedPrefix)) continue;
+      int lastDot = c.lastIndexOf('.');
+      if (lastDot != -1 && inputColSet.contains(c.substring(0, lastDot))) continue;
+      items.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
+      visible.add(c);
+    }
+    items.add(new SqlIdentifier(java.util.Arrays.asList(unnestAlias, alias), POS));
+    visible.add(alias);
+    return SqlBuilder.select(items).from(join).withFields(visible).wrap(frame);
   }
 
   @Override

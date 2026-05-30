@@ -5186,10 +5186,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode aliasedLookup = SqlBuilder.aliasAs(lookupProject, lookupAlias);
 
     // Build join condition. mappingAliasMap stores lookup-table column -> source column.
+    // When the source column is a dotted MAP-path (e.g. `doc.user.name` over a MAP-typed `doc`
+    // produced by spath auto-extract), emit `ITEM(lookup_input.doc, 'user.name')` so the
+    // validator can drill the MAP value instead of failing with "Field [doc.user.name] not
+    // found" via multi-part identifier resolution.
     SqlNode condition = null;
     for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
       SqlNode lookupCol = new SqlIdentifier(java.util.Arrays.asList(lookupAlias, e.getKey()), POS);
-      SqlNode sourceCol = new SqlIdentifier(java.util.Arrays.asList(inputAlias, e.getValue()), POS);
+      String src = e.getValue();
+      SqlNode sourceCol;
+      int dot = src.indexOf('.');
+      if (dot > 0 && frame.mapColumns.contains(src.substring(0, dot))) {
+        SqlIdentifier mapRef =
+            new SqlIdentifier(java.util.Arrays.asList(inputAlias, src.substring(0, dot)), POS);
+        sourceCol =
+            new SqlBasicCall(
+                SqlStdOperatorTable.ITEM,
+                List.of(mapRef, SqlLiteral.createCharString(src.substring(dot + 1), POS)),
+                POS);
+      } else {
+        sourceCol = new SqlIdentifier(java.util.Arrays.asList(inputAlias, src), POS);
+      }
       SqlNode eq = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(sourceCol, lookupCol), POS);
       condition =
           condition == null

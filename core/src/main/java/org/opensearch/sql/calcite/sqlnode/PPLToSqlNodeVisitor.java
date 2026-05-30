@@ -2456,10 +2456,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // __stream_seq__ column (from a prior streamstats) when in scope, else synthesise one.
     // Calcite forbids OVER clauses inside another window's ORDER BY, so a freshly synthesised
     // seq has to be materialised in a wrapping SELECT before this window references it.
+    //
+    // When ALL stream-window aggs are earliest/latest (ARG_MIN/ARG_MAX), they carry their own
+    // ordering via the second arg (the time field). v2 emits `OVER (ROWS UNBOUNDED PRECEDING)`
+    // without an ORDER BY clause; mirror that by skipping the seq synthesis. Mirrors legacy
+    // commit d4b48e1ba1.
+    boolean allArgMinMax = true;
+    if (node.getWindowFunctionList() == null || node.getWindowFunctionList().isEmpty()) {
+      allArgMinMax = false;
+    } else {
+      for (UnresolvedExpression ae : node.getWindowFunctionList()) {
+        UnresolvedExpression core = (ae instanceof Alias a) ? a.getDelegated() : ae;
+        if (core instanceof org.opensearch.sql.ast.expression.WindowFunction wf) {
+          core = wf.getFunction();
+        }
+        String fname = null;
+        if (core instanceof org.opensearch.sql.ast.expression.AggregateFunction af) {
+          fname = af.getFuncName();
+        } else if (core instanceof org.opensearch.sql.ast.expression.Function fn) {
+          fname = fn.getFuncName();
+        }
+        if (fname == null) {
+          allArgMinMax = false;
+          break;
+        }
+        fname = fname.toLowerCase(java.util.Locale.ROOT);
+        if (!fname.equals("earliest") && !fname.equals("latest")) {
+          allArgMinMax = false;
+          break;
+        }
+      }
+    }
     SqlNodeList orderBy = new SqlNodeList(POS);
     SqlNode wrappedFrom = from;
     List<String> postSeqFields = frame.currentFields;
-    if (frame.currentFields.contains("__stream_seq__")) {
+    if (allArgMinMax && !hasReset && !useRange) {
+      // No ORDER BY synthesis; ARG_MIN/ARG_MAX's 2nd arg is the time field providing ordering.
+    } else if (frame.currentFields.contains("__stream_seq__")) {
       // Upstream streamstats already provides the seq — reuse it for stable ordering. Don't
       // re-synthesise.
       orderBy.add(new SqlIdentifier("__stream_seq__", POS));

@@ -160,6 +160,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<SqlNode> lastOrderBy;
 
     /**
+     * True when the most-recent emitted order-by came from {@link #visitReverse}'s implicit
+     * {@code @timestamp DESC} fallback (case 2: no prior sort but @timestamp visible). PPL
+     * semantics: a downstream user-explicit {@code | sort F} OVERRIDES this implicit reverse sort
+     * (the user is asking for a different ordering, not stacking). When set, {@code visitSort}
+     * should drop the inner reverse-implicit sort.
+     */
+    boolean reverseImplicitOrderBy;
+
+    /**
      * Eval-alias → statically-known {@link DataType} map. Populated by {@code visitEval} when a
      * let's RHS has a derivable static type ({@code Cast(... AS DOUBLE)}, {@code Literal(STRING)},
      * {@code Function("date", ...)}, etc.). Consumed by {@code castExpr} to dispatch {@code
@@ -6358,6 +6367,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         node.getCount() != null && node.getCount() != 0
             ? SqlLiteral.createExactNumeric(node.getCount().toString(), POS)
             : null;
+    // Drop a reverse-implicit `@timestamp DESC` order-by when a user-explicit sort follows.
+    // PPL semantics: `| reverse | sort F` should produce just `sort F` (the user override).
+    // Detect via the frame flag set by visitReverse case 2; unwrap an outer SqlOrderBy to
+    // expose the underlying SqlSelect for the new sort to operate on directly.
+    if (frame.reverseImplicitOrderBy
+        && from instanceof org.apache.calcite.sql.SqlOrderBy ob
+        && ob.fetch == null
+        && ob.offset == null
+        && ob.query instanceof SqlSelect inner) {
+      from = inner;
+      frame.reverseImplicitOrderBy = false;
+      frame.lastOrderBy = null;
+    }
     // Peephole: when child is a SELECT * already (e.g. SEMI/ANTI's `SELECT * FROM <X AS a> WHERE
     // EXISTS(...)`), wrap with SqlOrderBy directly instead of building a new SELECT around it.
     // The new SELECT would seal the alias `a` inside its FROM subquery, breaking `ORDER BY a.col`.
@@ -6435,6 +6457,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // testStreamstatsWindowWithReverse codify this.
     List<SqlNode> reversed = frame.reversedLastOrderBy();
     if (reversed != null) {
+      // When the prior sort produced an outer SqlOrderBy (no fetch/offset), unwrap it so the
+      // reversed order-by replaces it directly instead of stacking. PPL semantics: reverse
+      // FLIPS the prior ordering — it doesn't add a new layer on top. v2's RelBuilder produces
+      // a single Sort with the flipped collation.
+      if (from instanceof org.apache.calcite.sql.SqlOrderBy ob
+          && ob.fetch == null
+          && ob.offset == null
+          && ob.query instanceof SqlSelect inner) {
+        from = inner;
+      }
       return SqlBuilder.select(starList()).from(from).orderBy(reversed).wrap(frame);
     }
     if (frame.currentFields != null
@@ -6444,7 +6476,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               SqlStdOperatorTable.DESC,
               List.of(new SqlIdentifier(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP, POS)),
               POS);
-      return SqlBuilder.select(starList()).from(from).orderBy(List.of(tsKey)).wrap(frame);
+      SqlNode result = SqlBuilder.select(starList()).from(from).orderBy(List.of(tsKey)).wrap(frame);
+      // Mark the emitted order-by as reverse-implicit so a downstream user-explicit `| sort F`
+      // can drop this fallback ordering (PPL semantics: user sort overrides reverse).
+      frame.reverseImplicitOrderBy = true;
+      return result;
     }
     return from;
   }

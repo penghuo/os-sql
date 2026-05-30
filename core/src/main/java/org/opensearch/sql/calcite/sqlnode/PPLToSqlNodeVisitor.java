@@ -5933,17 +5933,29 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 POS);
       }
     }
-    // Outer SELECT projects only the user-visible columns so the helper `_row_number_dedup_`
-    // column doesn't leak into the row type (PPL's implicit final `| fields *` should not
-    // surface it). Falls back to SELECT * when we don't know the visible fields.
+    // Outer SELECT projects only the user-visible columns (excluding metadata fields and the
+    // `_row_number_dedup_` helper) so neither leaks into downstream pipes. Filtering out the
+    // OpenSearch metadata fields here also obviates the planner-level stripMetadataFields
+    // shuttle's outer Project — which would otherwise produce an extra LogicalProject layer
+    // between dedup and the implicit final `| fields *`. Mirrors v2 PplToSqlNode#visitDedupe
+    // (which projects inputCols filtered by !METADATAFIELD_TYPE_MAP). Updates frame.currentFields
+    // so subsequent pipes see the trimmed list.
     SqlNodeList outerSelects = new SqlNodeList(POS);
     List<String> visible = frame.currentFields;
+    List<String> userCols = null;
     if (visible != null && !visible.isEmpty()) {
+      userCols = new ArrayList<>();
       for (String c : visible) {
+        if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
         outerSelects.add(toIdentifier(c));
+        userCols.add(c);
       }
-    } else {
+    }
+    if (outerSelects.size() == 0) {
       outerSelects.add(SqlIdentifier.star(POS));
+    } else {
+      // Update frame so downstream pipes see the trimmed column list.
+      frame.currentFields = userCols;
     }
     return new SqlSelect(
         POS, null, outerSelects, innerSelect, whereCond, null, null, null, null, null, null, null);

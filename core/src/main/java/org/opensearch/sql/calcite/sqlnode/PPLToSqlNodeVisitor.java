@@ -891,31 +891,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       // CONCAT operator preserves NULLs (matches v2's emission shape; CONCAT_FUNCTION coerces
       // NULL → empty string).
       if (let.getConcatPrefix() != null || let.getConcatSuffix() != null) {
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpecForFieldformat =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                POS);
         SqlNode strRhs = rhs;
         // Cast non-string rhs to VARCHAR so `||` produces a string column, not a coerced numeric.
         strRhs =
             new SqlBasicCall(
                 org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(
-                    strRhs,
-                    new org.apache.calcite.sql.SqlDataTypeSpec(
-                        new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                            org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                        POS)),
+                List.of(strRhs, varcharSpecForFieldformat),
                 POS);
         if (let.getConcatPrefix() != null) {
-          strRhs =
+          // VARCHAR-cast prefix literal so emission shows `'$':VARCHAR` matching v2.
+          SqlNode prefixNode =
               new SqlBasicCall(
-                  SqlStdOperatorTable.CONCAT,
-                  List.of(literalToSqlNode(let.getConcatPrefix()), strRhs),
+                  SqlStdOperatorTable.CAST,
+                  List.of(literalToSqlNode(let.getConcatPrefix()), varcharSpecForFieldformat),
                   POS);
+          strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(prefixNode, strRhs), POS);
         }
         if (let.getConcatSuffix() != null) {
-          strRhs =
+          SqlNode suffixNode =
               new SqlBasicCall(
-                  SqlStdOperatorTable.CONCAT,
-                  List.of(strRhs, literalToSqlNode(let.getConcatSuffix())),
+                  SqlStdOperatorTable.CAST,
+                  List.of(literalToSqlNode(let.getConcatSuffix()), varcharSpecForFieldformat),
                   POS);
+          strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(strRhs, suffixNode), POS);
         }
         rhs = strRhs;
       }

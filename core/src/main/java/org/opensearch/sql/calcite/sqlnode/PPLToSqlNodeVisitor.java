@@ -3455,6 +3455,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       boolean shouldAgg;
       if (explicitFields) {
         shouldAgg = aggFieldNames.contains(c);
+      } else if (frame.columnUdt.containsKey(c)) {
+        // Skip UDT columns (DATE/TIME/TIMESTAMP/IP/BINARY) — SUM(date_string) raises a
+        // NumberFormatException at runtime.
+        shouldAgg = false;
       } else {
         DataType dt = frame.columnPrimitiveType.get(c);
         if (dt == null && frame.evalAliasTypes.containsKey(c)) {
@@ -3470,6 +3474,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         summaryProj.add(asAliased(sum, c));
       } else if (labelField != null && c.equals(labelField)) {
         summaryProj.add(asAliased(SqlLiteral.createCharString(label, POS), c));
+      } else if (frame.columnUdt.containsKey(c)) {
+        // UDT column — emit `<UDT>(CAST(NULL AS VARCHAR))` so UNION-ALL leastRestrictive type
+        // computation preserves EXPR_TIMESTAMP/DATE/TIME/IP through the summary side. Bare NULL
+        // would collapse the UDT to NULL/BIGINT, breaking the UNION row-type derivation.
+        String udt = frame.columnUdt.get(c);
+        org.apache.calcite.sql.SqlOperator udtOp = udtConstructorOpForRoot(udt);
+        if (udtOp != null) {
+          org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+              new org.apache.calcite.sql.SqlDataTypeSpec(
+                  new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                      org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                  POS);
+          SqlNode castNull =
+              new SqlBasicCall(
+                  SqlStdOperatorTable.CAST, List.of(SqlLiteral.createNull(POS), varcharSpec), POS);
+          SqlNode udtNull = new SqlBasicCall(udtOp, List.of(castNull), POS);
+          summaryProj.add(asAliased(udtNull, c));
+        } else {
+          summaryProj.add(asAliased(SqlLiteral.createNull(POS), c));
+        }
       } else {
         summaryProj.add(asAliased(SqlLiteral.createNull(POS), c));
       }
@@ -3539,6 +3563,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         // unknown static type), fall back to the legacy "sum everything" behaviour.
         sumNames = new ArrayList<>();
         for (String c : frame.currentFields) {
+          // Skip UDT columns (DATE/TIME/TIMESTAMP/IP/BINARY) — SUM(date_string) raises a
+          // NumberFormatException at runtime. Only include statically-numeric or unknown.
+          if (frame.columnUdt.containsKey(c)) continue;
           DataType dt = frame.columnPrimitiveType.get(c);
           if (dt == null && frame.evalAliasTypes.containsKey(c)) {
             dt = frame.evalAliasTypes.get(c);

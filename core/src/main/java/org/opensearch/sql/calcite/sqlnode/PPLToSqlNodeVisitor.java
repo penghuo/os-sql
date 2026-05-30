@@ -446,6 +446,30 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return null;
   }
 
+  /**
+   * True when {@code e} is a function call that produces a MAP-typed value at runtime. PPL's {@code
+   * geoip}/{@code map_*} functions return a MAP&lt;VARCHAR, ANY&gt;. Used by visitEval to track the
+   * eval alias on {@link Frame#mapColumns} so a downstream dotted ref like {@code info.city} routes
+   * through the ITEM dispatch instead of the multi-part identifier path.
+   */
+  private static boolean isMapProducingExpr(UnresolvedExpression e) {
+    if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
+      String name =
+          fn.getFuncName() == null ? "" : fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
+      switch (name) {
+        case "geoip":
+        case "map":
+        case "map_concat":
+        case "map_filter":
+        case "map_zip":
+          return true;
+        default:
+          return false;
+      }
+    }
+    return false;
+  }
+
   /** True when {@code dt} is a PPL numeric type (SHORT/INTEGER/LONG/FLOAT/DOUBLE/DECIMAL). */
   private static boolean isNumericPplType(DataType dt) {
     if (dt == null) return false;
@@ -584,10 +608,32 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     Set<String> seenLeaves = new LinkedHashSet<>();
     JoinHints hints = frame.joinHints;
     for (String name : selected) {
-      SqlIdentifier ref = qualifyIfAmbiguous(name, frame);
       String leaf = name.substring(name.lastIndexOf('.') + 1);
       boolean dotted = name.indexOf('.') >= 0;
       String prefix = dotted ? name.substring(0, name.indexOf('.')) : null;
+      // ITEM dispatch when the dotted prefix is a MAP-typed column (catalog "object" mapping or
+      // an eval alias bound to a MAP-producing function like geoip). Validator multi-part
+      // identifier resolution would otherwise fail with "Table 'X' not found". Always alias the
+      // ITEM call back to the original dotted name so {@code | fields a.b} keeps {@code a.b} as
+      // the output column header.
+      if (dotted && frame.mapColumns.contains(prefix)) {
+        String subkey = name.substring(name.indexOf('.') + 1);
+        SqlNode item =
+            new SqlBasicCall(
+                SqlStdOperatorTable.ITEM,
+                List.of(new SqlIdentifier(prefix, POS), SqlLiteral.createCharString(subkey, POS)),
+                POS);
+        SqlIdentifier alias =
+            new SqlIdentifier(
+                java.util.Collections.singletonList(name),
+                null,
+                POS,
+                List.of(SqlParserPos.ZERO.withQuoting(true)));
+        selectList.add(new SqlBasicCall(SqlStdOperatorTable.AS, List.of(item, alias), POS));
+        seenLeaves.add(leaf);
+        continue;
+      }
+      SqlIdentifier ref = qualifyIfAmbiguous(name, frame);
       boolean leafSeen = seenLeaves.contains(leaf);
       boolean rightAliasOverlap =
           dotted
@@ -812,6 +858,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       } else {
         // Rebound alias with unknown type — drop the prior tracking.
         frame.evalAliasTypes.remove(alias);
+      }
+      // Track MAP-producing eval aliases (e.g. {@code eval info = geoip(...)}). Downstream
+      // dotted refs `info.city` get ITEM dispatch in expr(QualifiedName), same path as catalog
+      // MAP columns. Detection: known MAP-returning function calls.
+      if (isMapProducingExpr(let.getExpression())) {
+        frame.mapColumns.add(alias);
+      } else if (rebound.contains(alias)) {
+        // Rebound to a non-MAP RHS — drop any prior MAP tracking for this name.
+        frame.mapColumns.remove(alias);
       }
     }
     // Peephole: when child is a SELECT * (no GROUP BY / HAVING), append our extra eval items to

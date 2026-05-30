@@ -1935,7 +1935,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       items.add(asAliased(over, al.getName()));
       visible.add(al.getName());
     }
-    return SqlBuilder.select(items).from(wrappedFrom).withFields(visible).wrap(frame);
+    SqlNode result = SqlBuilder.select(items).from(wrappedFrom).withFields(visible).wrap(frame);
+    // Streamstats with `by` partitioning: a downstream `reverse` should flip the per-partition
+    // streaming order (testStreamstatsByWithReverse). __stream_seq__ is included in postSeqFields
+    // and propagated through `visible`, so it's resolvable in the outer scope. Set it as the
+    // active sort on the frame after wrap so visitReverse can flip via DESC. The post-RelNode
+    // `stripSyntheticSeqColumns` shuttle drops it from the user-facing output. Without `by`,
+    // reverse stays a no-op per visitReverse's comment.
+    if (hasGroup && postSeqFields.contains("__stream_seq__")) {
+      // Wrap with NULLS_LAST so reverseSortKeys flips it (the helper only flips NULLS_*-wrapped
+      // keys; bare identifiers pass through unchanged).
+      SqlNode seqKey =
+          new SqlBasicCall(
+              SqlStdOperatorTable.NULLS_LAST,
+              List.of(new SqlIdentifier("__stream_seq__", POS)),
+              POS);
+      frame.lastOrderBy = List.of(seqKey);
+    }
+    return result;
   }
 
   @Override

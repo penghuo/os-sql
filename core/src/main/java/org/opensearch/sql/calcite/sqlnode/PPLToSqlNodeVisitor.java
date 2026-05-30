@@ -163,6 +163,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> columnPrimitiveType = new java.util.LinkedHashMap<>();
 
     /**
+     * Active SubqueryAlias name set by {@link #visitSubqueryAlias} from {@code source = X as i}.
+     * Used by visitors that wrap state (visitFilter / visitSort / visitEval / visitAggregation /
+     * etc.) to re-attach the alias around the wrapped subquery so a downstream {@code | sort i.col}
+     * still resolves the alias. Cleared by {@link #visitJoin} once the alias is consumed via
+     * applyExplicitAlias.
+     */
+    String subqueryAliasName;
+
+    /**
      * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
      * NULLS_LAST). Returns {@code null} if no prior sort exists. Used by {@code visitReverse}.
      */
@@ -507,8 +516,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode inner = child.accept(this, frame);
     // PPL allows `source = X as i` and `[ source = X ] as i`; both produce a SubqueryAlias around
     // either a bare Relation or a sub-pipeline. Calcite needs the alias attached as a SqlNode
-    // AS-call so qualified refs `i.col` resolve.
+    // AS-call so qualified refs `i.col` resolve. Track the alias on the frame so downstream
+    // pipes (visitFilter / visitSort / visitEval / visitAggregation) re-attach it after each
+    // wrap — without re-attachment the alias dies inside the FROM subquery.
+    frame.subqueryAliasName = node.getAlias();
     return SqlBuilder.aliasAs(inner, node.getAlias());
+  }
+
+  /**
+   * Re-wrap the result of a pipe-wrap with the active SubqueryAlias when one is set on the frame.
+   * Visitors that wrap state into {@code SELECT * FROM (...)} call this so the alias survives the
+   * wrap. No-op when no alias is active.
+   */
+  private SqlNode reattachSubqueryAlias(SqlNode wrapped, Frame frame) {
+    if (frame.subqueryAliasName == null) return wrapped;
+    return SqlBuilder.aliasAs(wrapped, frame.subqueryAliasName);
   }
 
   @Override
@@ -633,7 +655,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   public SqlNode visitFilter(Filter node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlNode where = expr(node.getCondition());
-    return SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+    SqlNode wrapped = SqlBuilder.select(starList()).from(from).where(where).wrap(frame);
+    return reattachSubqueryAlias(wrapped, frame);
   }
 
   @Override
@@ -5711,7 +5734,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (fetch != null) {
       b.fetch(fetch);
     }
-    return b.wrap(frame);
+    return reattachSubqueryAlias(b.wrap(frame), frame);
   }
 
   @Override
@@ -5729,7 +5752,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (offset != null) {
       b.offset(offset);
     }
-    return b.wrap(frame);
+    return reattachSubqueryAlias(b.wrap(frame), frame);
   }
 
   /**
@@ -5890,6 +5913,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Record the displaced inner alias as a synonym so a downstream `| fields tt.col` resolves.
     leftSide = applyExplicitAlias(leftSide, leftAlias, frame);
     rightSide = applyExplicitAlias(rightSide, rightAlias, frame);
+    // The join consumes any inherited subquery alias — clear it so downstream pipes don't
+    // wrap the join in `AS <stale-alias>`.
+    frame.subqueryAliasName = null;
 
     // SEMI/ANTI joins aren't supported in Calcite's SqlNode dialect (raises "Dialect does not
     // support feature"). Rewrite as `<left> WHERE [NOT] EXISTS (SELECT * FROM <right> WHERE

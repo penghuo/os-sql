@@ -4787,13 +4787,28 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       regex = "[a-zA-Z0-9]+";
     }
     SqlNode source = expr(node.getSourceField());
+    // VARCHAR-cast pattern and replacement literals so emission shows `'[a-zA-Z0-9]+':VARCHAR`
+    // matching v2's RexBuilder.makeLiteral default. Bare CHAR literals would render without the
+    // type annotation in the explain plan.
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpecForPattern =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    SqlNode regexLit =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CAST,
+            List.of(SqlLiteral.createCharString(regex, POS), varcharSpecForPattern),
+            POS);
+    SqlNode placeholderLit =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CAST,
+            List.of(SqlLiteral.createCharString("<*>", POS), varcharSpecForPattern),
+            POS);
     SqlNode replaced =
         new SqlBasicCall(
             org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
-            List.of(
-                source,
-                SqlLiteral.createCharString(regex, POS),
-                SqlLiteral.createCharString("<*>", POS)),
+            List.of(source, regexLit, placeholderLit),
             POS);
     SqlNodeList whens = new SqlNodeList(POS);
     whens.add(

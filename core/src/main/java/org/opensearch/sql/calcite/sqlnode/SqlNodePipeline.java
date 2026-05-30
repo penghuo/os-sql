@@ -167,8 +167,71 @@ public final class SqlNodePipeline {
     roundTripped = stripIdentityProjects(roundTripped);
     roundTripped = unpadRelevanceMapKeys(roundTripped);
     roundTripped = retypeItemForArrayCast(roundTripped);
+    roundTripped = stripHighlightFromExistsTop(roundTripped, context);
     roundTripped = reattachCorrelateJoinTypes(original, roundTripped);
     return reattachAggregateHints(original, roundTripped);
+  }
+
+  /**
+   * Track K17 (post-pass): when the round-trip's optimizer drops the EXISTS subquery's outer
+   * Project (because EXISTS only checks row existence, not columns), the top-of-plan inside the
+   * RexSubQuery may expose {@code _highlight} (MAP&lt;VARCHAR, ANY&gt;) directly. Calcite's
+   * enumerable codegen then materialises rows including the MAP and trips on
+   * "Assignment conversion not possible from java.util.Map to java.lang.Comparable".
+   *
+   * <p>Wrap the inner plan of every EXISTS {@link org.apache.calcite.rex.RexSubQuery} with a
+   * {@link org.apache.calcite.rel.logical.LogicalProject} that drops {@code _highlight}. EXISTS
+   * doesn't materialise any column from the inner row into the outer result, so dropping the
+   * column is semantically transparent. Skipped when highlight was requested — that flag means
+   * the column must remain available for the response formatter.
+   */
+  private static RelNode stripHighlightFromExistsTop(
+      RelNode root, CalcitePlanContext context) {
+    if (context.isHighlightRequested()) return root;
+    org.apache.calcite.rex.RexShuttle shuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitSubQuery(
+              org.apache.calcite.rex.RexSubQuery subQuery) {
+            // Recurse into nested subqueries first so inner-most EXISTS get their strip too.
+            org.apache.calcite.rex.RexSubQuery walked =
+                (org.apache.calcite.rex.RexSubQuery) super.visitSubQuery(subQuery);
+            if (walked.getKind() != org.apache.calcite.sql.SqlKind.EXISTS) {
+              return walked;
+            }
+            RelNode inner = walked.rel;
+            int hlIdx = -1;
+            java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+                inner.getRowType().getFieldList();
+            for (int i = 0; i < fields.size(); i++) {
+              if ("_highlight".equals(fields.get(i).getName())) {
+                hlIdx = i;
+                break;
+              }
+            }
+            if (hlIdx < 0) return walked;
+            org.apache.calcite.rex.RexBuilder rb = inner.getCluster().getRexBuilder();
+            java.util.List<org.apache.calcite.rex.RexNode> projects =
+                new java.util.ArrayList<>(fields.size() - 1);
+            java.util.List<String> names = new java.util.ArrayList<>(fields.size() - 1);
+            for (int i = 0; i < fields.size(); i++) {
+              if (i == hlIdx) continue;
+              projects.add(rb.makeInputRef(inner, i));
+              names.add(fields.get(i).getName());
+            }
+            RelNode wrapped =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    inner, java.util.Collections.emptyList(), projects, names);
+            return walked.clone(wrapped);
+          }
+        };
+    return root.accept(
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode node) {
+            return super.visit(node).accept(shuttle);
+          }
+        });
   }
 
   /**

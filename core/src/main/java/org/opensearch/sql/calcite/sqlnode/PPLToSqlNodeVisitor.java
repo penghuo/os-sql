@@ -2766,7 +2766,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // upstream __stream_seq__) so a downstream streamstats can reuse the same row ordering.
     // SqlNodePlanner.stripSyntheticSeqColumns drops __stream_seq__ from the user-facing
     // top-level row type after RelNode conversion.
+    //
+    // Filter metadata fields out — including them produces an extra LogicalProject layer when
+    // the planner-level stripMetadataFields shuttle later trims the row type. Mirrors the
+    // visitDedupe / visitWindow pattern.
     for (String c : postSeqFields) {
+      if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
       items.add(toIdentifier(c));
       visible.add(c);
     }

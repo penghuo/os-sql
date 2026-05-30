@@ -57,6 +57,7 @@ import org.opensearch.sql.ast.tree.Filter;
 import org.opensearch.sql.ast.tree.Head;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
+import org.opensearch.sql.ast.tree.Lookup;
 import org.opensearch.sql.ast.tree.Multisearch;
 import org.opensearch.sql.ast.tree.NoMv;
 import org.opensearch.sql.ast.tree.Parse;
@@ -4143,6 +4144,125 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // currentFields oracle, scalar input would throw at execution). Defer scalar-rejection error
     // reporting until a row-type oracle is wired in.
     return node.rewriteAsEval().accept(this, frame);
+  }
+
+  @Override
+  public SqlNode visitLookup(Lookup node, Frame frame) {
+    // PPL `LOOKUP <table> <map_field>[ AS <src_field>]... [{REPLACE|APPEND} <out_field>[ AS
+    // <new_name>]...]` is a LEFT JOIN against the lookup table on the mapping pairs, projecting
+    // selected output columns into the input row. Empty OUTPUT defaults to "all lookup-side
+    // columns minus the mapping keys".
+    SqlNode input = node.getChild().get(0).accept(this, frame);
+    UnresolvedPlan lookupRel = node.getLookupRelation();
+    if (!(lookupRel instanceof Relation rel)) {
+      throw new UnsupportedOperationException("LOOKUP requires a bare relation");
+    }
+    List<String> lookupTableParts = rel.getTableQualifiedName().getParts();
+    List<String> lookupCols = lookupTableFields(lookupTableParts);
+    List<String> inputCols = frame.currentFields == null ? List.of() : frame.currentFields;
+    java.util.Set<String> userCols = new java.util.LinkedHashSet<>();
+    for (String c : inputCols) {
+      if (!OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) {
+        userCols.add(c);
+      }
+    }
+
+    java.util.Map<String, String> mapping = node.getMappingAliasMap();
+    java.util.LinkedHashMap<String, String> output =
+        new java.util.LinkedHashMap<>(node.getOutputAliasMap());
+    if (output.isEmpty()) {
+      // Default: all lookup-side columns except the mapping keys (and metadata fields).
+      for (String c : lookupCols) {
+        if (!mapping.containsKey(c) && !OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) {
+          output.put(c, c);
+        }
+      }
+    }
+
+    // Lookup-side SELECT projecting the union of (output-source cols, mapping keys), deduped.
+    SqlNodeList lookupSelectList = new SqlNodeList(POS);
+    java.util.Set<String> emittedLookupCols = new java.util.LinkedHashSet<>();
+    for (String src : output.keySet()) {
+      if (emittedLookupCols.add(src)) {
+        lookupSelectList.add(toIdentifier(src));
+      }
+    }
+    for (String key : mapping.keySet()) {
+      if (emittedLookupCols.add(key)) {
+        lookupSelectList.add(toIdentifier(key));
+      }
+    }
+    SqlNode lookupRelation = SqlBuilder.relation(lookupTableParts, lookupCols, new Frame());
+    SqlSelect lookupProject =
+        new SqlSelect(
+            POS,
+            SqlNodeList.EMPTY,
+            lookupSelectList,
+            lookupRelation,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+
+    String inputAlias = "lookup_input";
+    String lookupAlias = "lookup_t";
+    SqlNode aliasedInput = SqlBuilder.aliasAs(input, inputAlias);
+    SqlNode aliasedLookup = SqlBuilder.aliasAs(lookupProject, lookupAlias);
+
+    // Build join condition. mappingAliasMap stores lookup-table column -> source column.
+    SqlNode condition = null;
+    for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
+      SqlNode lookupCol = new SqlIdentifier(java.util.Arrays.asList(lookupAlias, e.getKey()), POS);
+      SqlNode sourceCol = new SqlIdentifier(java.util.Arrays.asList(inputAlias, e.getValue()), POS);
+      SqlNode eq = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(sourceCol, lookupCol), POS);
+      condition =
+          condition == null
+              ? eq
+              : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(condition, eq), POS);
+    }
+    SqlNode join =
+        new org.apache.calcite.sql.SqlJoin(
+            POS,
+            aliasedInput,
+            SqlLiteral.createBoolean(false, POS),
+            JoinType.LEFT.symbol(POS),
+            aliasedLookup,
+            org.apache.calcite.sql.JoinConditionType.ON.symbol(POS),
+            condition);
+
+    // Build final projection: input columns minus collisions, then lookup outputs.
+    java.util.Set<String> targetAliases = new java.util.LinkedHashSet<>(output.values());
+    boolean isAppend = node.getOutputStrategy() == Lookup.OutputStrategy.APPEND;
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    for (String c : userCols) {
+      if (targetAliases.contains(c)) continue;
+      items.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
+      visible.add(c);
+    }
+    for (java.util.Map.Entry<String, String> e : output.entrySet()) {
+      String src = e.getKey();
+      String tgt = e.getValue();
+      if (userCols.contains(tgt) && isAppend) {
+        SqlNode coalesced =
+            new SqlBasicCall(
+                SqlStdOperatorTable.COALESCE,
+                List.of(
+                    new SqlIdentifier(java.util.Arrays.asList(inputAlias, tgt), POS),
+                    new SqlIdentifier(java.util.Arrays.asList(lookupAlias, src), POS)),
+                POS);
+        items.add(asAliased(coalesced, tgt));
+      } else {
+        SqlNode lookupCol = new SqlIdentifier(java.util.Arrays.asList(lookupAlias, src), POS);
+        items.add(src.equals(tgt) ? lookupCol : asAliased(lookupCol, tgt));
+      }
+      visible.add(tgt);
+    }
+    return SqlBuilder.select(items).from(join).withFields(visible).wrap(frame);
   }
 
   @Override

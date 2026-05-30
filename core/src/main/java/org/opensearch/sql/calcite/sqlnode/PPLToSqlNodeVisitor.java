@@ -3294,6 +3294,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // (matches PPL behaviour: addcoltotals on non-numeric throws).
     boolean explicitFields = !aggFieldNames.isEmpty();
     boolean appendLabelField = labelField != null && !frame.currentFields.contains(labelField);
+    // VARCHAR(N) width = max(label.length, labelField.length). Mirrors v2's emission so the
+    // UNION-ALL leastRestrictive type computation produces a single VARCHAR(N).
+    int labelVarcharWidth = Math.max(label.length(), labelField == null ? 0 : labelField.length());
 
     // Wrap the main pipeline as a subquery so we can UNION ALL it with the summary row.
     SqlNodeList mainProj = new SqlNodeList(POS);
@@ -3301,19 +3304,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       mainProj.add(toIdentifier(c));
     }
     if (appendLabelField) {
-      // Pad the data side with an empty-VARCHAR placeholder so the UNION's row-type derivation
-      // resolves to VARCHAR (not BIGINT-from-NULL). Match label length so the union doesn't
-      // widen to a longer CHAR(N).
+      // Emit `CAST(NULL AS VARCHAR(N))` so the UNION's row-type derivation resolves to VARCHAR(N),
+      // matching v2's typed-null emission shape.
       org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
           new org.apache.calcite.sql.SqlDataTypeSpec(
               new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, labelVarcharWidth, POS),
               POS);
       SqlNode pad =
           new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(SqlLiteral.createCharString(" ".repeat(label.length()), POS), varcharSpec),
-              POS);
+              SqlStdOperatorTable.CAST, List.of(SqlLiteral.createNull(POS), varcharSpec), POS);
       mainProj.add(asAliased(pad, labelField));
     }
     SqlSelect mainProjected =
@@ -3349,17 +3349,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
     if (appendLabelField) {
-      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
-              POS);
-      SqlNode lab =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(SqlLiteral.createCharString(label, POS), varcharSpec),
-              POS);
-      summaryProj.add(asAliased(lab, labelField));
+      // Bare char literal — UNION-ALL leastRestrictive widens it to match the main-side typed-null.
+      summaryProj.add(asAliased(SqlLiteral.createCharString(label, POS), labelField));
     }
     SqlNode aggFrom =
         new SqlBasicCall(
@@ -3473,6 +3464,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
       boolean explicitFields = !aggFieldNames.isEmpty();
       boolean appendLabelField = labelField != null && !frame.currentFields.contains(labelField);
+      // VARCHAR(N) width = max(label.length, labelField.length). Mirrors v2's emission so the
+      // UNION-ALL leastRestrictive type computation produces a single VARCHAR(N) for both sides.
+      int labelVarcharWidth =
+          Math.max(label.length(), labelField == null ? 0 : labelField.length());
 
       SqlNodeList mainProj = new SqlNodeList(POS);
       for (String c : frame.currentFields) {
@@ -3482,13 +3477,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
             new org.apache.calcite.sql.SqlDataTypeSpec(
                 new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, labelVarcharWidth, POS),
                 POS);
+        // Emit `CAST(NULL AS VARCHAR(N))` for the main side so UNION coerces to typed null.
         SqlNode pad =
             new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(SqlLiteral.createCharString(" ".repeat(label.length()), POS), varcharSpec),
-                POS);
+                SqlStdOperatorTable.CAST, List.of(SqlLiteral.createNull(POS), varcharSpec), POS);
         mainProj.add(asAliased(pad, labelField));
       }
       SqlSelect mainProjected =
@@ -3517,17 +3511,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         }
       }
       if (appendLabelField) {
-        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-            new org.apache.calcite.sql.SqlDataTypeSpec(
-                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, label.length(), POS),
-                POS);
-        SqlNode lab =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(SqlLiteral.createCharString(label, POS), varcharSpec),
-                POS);
-        summaryProj.add(asAliased(lab, labelField));
+        // Bare char literal — validator's UNION-ALL leastRestrictive widens to VARCHAR(N)
+        // matching the main-side typed-null pad.
+        summaryProj.add(asAliased(SqlLiteral.createCharString(label, POS), labelField));
       }
       SqlNode aggFrom =
           new SqlBasicCall(

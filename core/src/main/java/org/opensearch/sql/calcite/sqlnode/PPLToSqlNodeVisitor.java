@@ -1467,8 +1467,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         unified.add(c);
       }
     }
-    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified);
-    SqlNode subPadded = padToUnifiedSchema(subBody, subCols, unified);
+    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified, subFrame.columnUdt);
+    SqlNode subPadded = padToUnifiedSchema(subBody, subCols, unified, mainFrame.columnUdt);
     SqlNode unioned =
         new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(mainPadded, subPadded), POS);
     SqlNodeList wrapItems = new SqlNodeList(POS);
@@ -1479,6 +1479,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.currentFields = unified;
     frame.joinHints = null;
     frame.lastOrderBy = null;
+    // Merge per-side columnUdt into outer frame so downstream pipes preserve UDT info.
+    frame.columnUdt.putAll(mainFrame.columnUdt);
+    for (java.util.Map.Entry<String, String> e : subFrame.columnUdt.entrySet()) {
+      frame.columnUdt.putIfAbsent(e.getKey(), e.getValue());
+    }
     return wrapped;
   }
 
@@ -1644,6 +1649,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     List<SqlNode> branchNodes = new ArrayList<>();
     List<List<String>> branchCols = new ArrayList<>();
+    List<java.util.Map<String, String>> branchUdt = new ArrayList<>();
     List<String> unified = new ArrayList<>();
     for (UnresolvedPlan sub : node.getSubsearches()) {
       // Apply EmptySourcePropagateVisitor — drop branches that collapse to Values([]).
@@ -1665,6 +1671,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             "multisearch subsearch requires a known column list");
       }
       branchCols.add(new ArrayList<>(subFrame.currentFields));
+      branchUdt.add(new java.util.LinkedHashMap<>(subFrame.columnUdt));
       for (String c : subFrame.currentFields) {
         if (!unified.contains(c)) {
           unified.add(c);
@@ -1674,9 +1681,17 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (branchNodes.isEmpty()) {
       throw new IllegalArgumentException("Multisearch requires at least one non-empty subsearch");
     }
-    SqlNode union = padToUnifiedSchema(branchNodes.get(0), branchCols.get(0), unified);
+    // Merged-of-all-other-branches UDT map per branch — so a branch missing column X gets a
+    // typed pad whenever any OTHER branch has X with a UDT type.
+    java.util.Map<String, String> allUdt = new java.util.LinkedHashMap<>();
+    for (java.util.Map<String, String> bm : branchUdt) {
+      for (java.util.Map.Entry<String, String> e : bm.entrySet()) {
+        allUdt.putIfAbsent(e.getKey(), e.getValue());
+      }
+    }
+    SqlNode union = padToUnifiedSchema(branchNodes.get(0), branchCols.get(0), unified, allUdt);
     for (int i = 1; i < branchNodes.size(); i++) {
-      SqlNode padded = padToUnifiedSchema(branchNodes.get(i), branchCols.get(i), unified);
+      SqlNode padded = padToUnifiedSchema(branchNodes.get(i), branchCols.get(i), unified, allUdt);
       union = new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(union, padded), POS);
     }
     SqlNodeList wrapItems = new SqlNodeList(POS);
@@ -1697,6 +1712,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.currentFields = unified;
     frame.joinHints = null;
     frame.lastOrderBy = null;
+    // Propagate per-branch UDT info onto the outer frame so downstream pipes preserve UDT.
+    frame.columnUdt.putAll(allUdt);
     return wrapped;
   }
 

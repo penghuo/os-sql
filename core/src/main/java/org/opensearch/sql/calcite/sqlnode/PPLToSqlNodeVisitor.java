@@ -5001,11 +5001,57 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitNoMv(NoMv node, Frame frame) {
     // PPL `nomv <field>` rewrites to `eval <field> = coalesce(mvjoin(array_compact(<field>), '\n'),
-    // '')`. The rewrite is independent of the source field's actual type — when the field is
-    // missing or scalar, downstream eval handles it (missing-field-replacement via the
-    // currentFields oracle, scalar input would throw at execution). Defer scalar-rejection error
-    // reporting until a row-type oracle is wired in.
-    return node.rewriteAsEval().accept(this, frame);
+    // '')`. Pre-walk the child so frame.currentFields reflects the upstream column list, then
+    // distinguish three cases:
+    //   - Field missing from currentFields: emit `SELECT *, '' AS <field>` so the column shows
+    //     as empty string rather than failing validation. Mirrors PPL's runtime behaviour where
+    //     nomv on a missing field returns "" instead of throwing.
+    //   - Field present: build the standard rewriteAsEval emission directly using the
+    //     already-walked child (avoids double-walking) so frame mutations happen exactly once.
+    String fieldName = node.getField().getField().toString();
+    SqlNode child = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null || !frame.currentFields.contains(fieldName)) {
+      SqlNodeList items = new SqlNodeList(POS);
+      if (frame.currentFields != null) {
+        for (String c : frame.currentFields) {
+          items.add(toIdentifier(c));
+        }
+      } else {
+        items.add(SqlIdentifier.star(POS));
+      }
+      items.add(asAliased(SqlLiteral.createCharString("", POS), fieldName));
+      List<String> newVisible =
+          new ArrayList<>(frame.currentFields == null ? List.of() : frame.currentFields);
+      if (!newVisible.contains(fieldName)) newVisible.add(fieldName);
+      return SqlBuilder.select(items).from(child).withFields(newVisible).wrap(frame);
+    }
+    // Field is in scope — build the rewrite-as-eval emission directly to avoid re-walking the
+    // already-visited child. Mirrors `node.rewriteAsEval().accept(this, frame)`.
+    SqlNodeList items = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      if (c.equals(fieldName)) continue;
+      items.add(toIdentifier(c));
+    }
+    SqlNode arrayCompact =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_COMPACT,
+            List.of(toIdentifier(fieldName)),
+            POS);
+    SqlNode mvjoin =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_JOIN,
+            List.of(arrayCompact, SqlLiteral.createCharString("\n", POS)),
+            POS);
+    SqlNode coalesce =
+        new SqlBasicCall(
+            SqlStdOperatorTable.COALESCE,
+            List.of(mvjoin, SqlLiteral.createCharString("", POS)),
+            POS);
+    items.add(asAliased(coalesce, fieldName));
+    return SqlBuilder.select(items)
+        .from(child)
+        .withFields(new ArrayList<>(frame.currentFields))
+        .wrap(frame);
   }
 
   @Override

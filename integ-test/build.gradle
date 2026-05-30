@@ -609,7 +609,6 @@ integTest {
     // to keep these classes off the test runner's input set. Net behaviour for CI: still
     // skipped, just at the build layer instead of inside JUnit. Remove once Gradle ships a fix
     // (not fixed as of 9.5.0). OrderIT is already excluded above.
-    exclude 'org/opensearch/sql/calcite/remote/CalciteJsonFunctionsIT.class'
     exclude 'org/opensearch/sql/legacy/AggregationIT.class'
     exclude 'org/opensearch/sql/legacy/DateFormatIT.class'
     exclude 'org/opensearch/sql/legacy/DateFunctionsIT.class'

@@ -728,6 +728,18 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
   @Override
   public RexNode visitCast(Cast node, CalcitePlanContext context) {
     RexNode expr = analyze(node.getExpression(), context);
+    // `cast(x AS json)` is type-collapsed to STRING in Cast.getDataType (see
+    // ast/expression/Cast.java line 87) since Calcite has no first-class JSON type. Route
+    // through PPL's `json()` UDF so the output mirrors v2's `castJson` contract (parse +
+    // re-serialize via Jackson→Gson canonical form, NULL on invalid/empty input) instead of
+    // an identity-cast that returns the raw input string.
+    String convertedTypeName =
+        node.getConvertedType() == null ? null : node.getConvertedType().toString();
+    if (convertedTypeName != null
+        && "json".equalsIgnoreCase(convertedTypeName)) {
+      return context.rexBuilder.makeCall(
+          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON, expr);
+    }
     RelDataType nullableType =
         switch (node.getDataType()) {
           case TYPE_ERROR ->

@@ -200,6 +200,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> columnPrimitiveType = new java.util.LinkedHashMap<>();
 
     /**
+     * Per-column PPL legacy type name for catalog columns that need a sub-type distinction beyond
+     * what {@link DataType} captures (e.g. TINYINT/BYTE vs SMALLINT/SHORT both map to {@link
+     * DataType#SHORT}, but PPL's {@code typeof()} differentiates). Populated by {@link
+     * #visitRelation} from the catalog Calcite SqlTypeName. Consumed by {@code pplLegacyTypeName}
+     * for {@code typeof(<column>)} dispatch.
+     */
+    java.util.Map<String, String> columnLegacyTypeName = new java.util.LinkedHashMap<>();
+
+    /**
      * Top-level catalog columns whose Calcite type is MAP&lt;VARCHAR, ANY&gt;. PPL converts
      * OpenSearch "object" mappings to MAP. When a dotted identifier like {@code object_value.first}
      * starts at one of these columns, emit {@code ITEM(object_value, 'first')} so the validator
@@ -385,6 +394,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         DataType prim = primitiveDataTypeOf(field.getType());
         if (prim != null) {
           frame.columnPrimitiveType.put(field.getName(), prim);
+        }
+        // Track legacy type name for typeof() — TINYINT / SMALLINT / INT / BIGINT differ.
+        org.apache.calcite.sql.type.SqlTypeName stn = field.getType().getSqlTypeName();
+        String legacy =
+            switch (stn) {
+              case TINYINT -> "TINYINT";
+              case SMALLINT -> "SMALLINT";
+              case INTEGER -> "INT";
+              case BIGINT -> "BIGINT";
+              case FLOAT, REAL -> "FLOAT";
+              case DOUBLE -> "DOUBLE";
+              case DECIMAL -> "DOUBLE";
+              case BOOLEAN -> "BOOLEAN";
+              case VARCHAR, CHAR -> "STRING";
+              case BINARY, VARBINARY -> "BINARY";
+              case MAP -> "STRUCT";
+              case GEOMETRY -> "GEO_POINT";
+              default -> null;
+            };
+        if (legacy != null) {
+          frame.columnLegacyTypeName.put(field.getName(), legacy);
+        } else {
+          // Fall back to OpenSearchDataType.legacyTypeName when SqlTypeName doesn't carry it
+          // (e.g., GEO_POINT, NESTED stored as ARRAY/ANY/etc).
+          String full = field.getType().getFullTypeString().toUpperCase(java.util.Locale.ROOT);
+          if (full.contains("GEO_POINT") || full.contains("GEOPOINT")) {
+            frame.columnLegacyTypeName.put(field.getName(), "GEO_POINT");
+          }
         }
       }
       if (field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.MAP) {
@@ -583,7 +620,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (name.contains("date")) return "date";
     if (name.contains("time")) return "time";
     if (name.contains("ip")) return "ip";
+    if (name.contains("binary")) return "binary";
     String full = type.getFullTypeString().toLowerCase(java.util.Locale.ROOT);
+    if (full.contains("expr_binary")) return "binary";
     if (full.contains("expr_timestamp")) return "timestamp";
     if (full.contains("expr_date")) return "date";
     if (full.contains("expr_time")) return "time";
@@ -8627,6 +8666,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private static String pplLegacyTypeName(UnresolvedExpression e, Frame frame) {
     if (e instanceof org.opensearch.sql.ast.expression.Interval) {
       return "INTERVAL";
+    }
+    // For column refs, prefer the catalog legacy type name (distinguishes TINYINT from SMALLINT,
+    // INT from BIGINT, etc.) over the coarser DataType-based mapping.
+    if (frame != null) {
+      QualifiedName qn = null;
+      if (e instanceof QualifiedName q) qn = q;
+      else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+      if (qn != null && qn.getParts().size() == 1) {
+        String name = qn.toString();
+        String legacy = frame.columnLegacyTypeName.get(name);
+        if (legacy != null) return legacy;
+        // UDT columns (DATE/TIME/TIMESTAMP/IP) — typeof() returns the UDT name in uppercase.
+        String udt = frame.columnUdt.get(name);
+        if (udt != null) return udt.toUpperCase(java.util.Locale.ROOT);
+      }
     }
     DataType dt = staticTypeOf(e, frame);
     if (dt == null) return null;

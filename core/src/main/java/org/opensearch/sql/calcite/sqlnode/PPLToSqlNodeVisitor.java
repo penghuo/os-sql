@@ -7721,6 +7721,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Calcite widens unequal-length CHAR literals to a common CHAR(N), right-padding shorter
     // values with spaces. PPL keeps strings VARCHAR-typed (no padding). When all THEN/ELSE
     // values are string literals, cast each to VARCHAR so the CASE result type stays VARCHAR.
+    // Use SqlStdOperatorTable.CAST (not SAFE_CAST) so the validator simplifies each typed literal
+    // to a bare `'literal':VARCHAR` annotation, matching v2's RexBuilder.makeLiteral emission.
+    // SAFE_CAST would leave an OUTER `CAST(CASE(...)):VARCHAR` wrapper around the entire CASE
+    // when the CASE result type derivation widens to a common type — the explain plan would
+    // show the redundant outer CAST that v2's path doesn't emit.
     if (allStringResults && !thens.isEmpty()) {
       org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
           new org.apache.calcite.sql.SqlDataTypeSpec(
@@ -7729,18 +7734,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               POS);
       for (int i = 0; i < thens.size(); i++) {
         thens.set(
-            i,
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(thens.get(i), varcharSpec),
-                POS));
+            i, new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(thens.get(i), varcharSpec), POS));
       }
       if (node.getElseClause().isPresent()) {
-        elseExpr =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(elseExpr, varcharSpec),
-                POS);
+        elseExpr = new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(elseExpr, varcharSpec), POS);
       }
     }
     return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, elseExpr);

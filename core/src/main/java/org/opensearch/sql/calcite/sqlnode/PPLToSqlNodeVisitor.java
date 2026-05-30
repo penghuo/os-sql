@@ -62,6 +62,7 @@ import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Lookup;
 import org.opensearch.sql.ast.tree.Multisearch;
+import org.opensearch.sql.ast.tree.MvCombine;
 import org.opensearch.sql.ast.tree.NoMv;
 import org.opensearch.sql.ast.tree.Parse;
 import org.opensearch.sql.ast.tree.Patterns;
@@ -5066,6 +5067,46 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return SqlBuilder.select(items)
         .from(child)
         .withFields(new ArrayList<>(frame.currentFields))
+        .wrap(frame);
+  }
+
+  @Override
+  public SqlNode visitMvCombine(MvCombine node, Frame frame) {
+    // PPL `mvcombine <field>` collapses rows with identical other-column values into a single
+    // row whose <field> becomes an array of the combined values. Emit:
+    //   SELECT <other_cols>, ARRAY_AGG(<field>) AS <field>
+    //   FROM <child>
+    //   GROUP BY <other_cols>
+    String fieldName = node.getField().getField().toString();
+    SqlNode child = node.getChild().get(0).accept(this, frame);
+    if (frame.currentFields == null) {
+      throw new UnsupportedOperationException(
+          "mvcombine requires a known column list — call after a `| fields ...` pipe");
+    }
+    if (!frame.currentFields.contains(fieldName)) {
+      throw new IllegalArgumentException("Field [" + fieldName + "] not found.");
+    }
+    SqlNodeList items = new SqlNodeList(POS);
+    List<SqlNode> groupKeys = new ArrayList<>();
+    List<String> newVisible = new ArrayList<>(frame.currentFields.size());
+    for (String c : frame.currentFields) {
+      if (c.equals(fieldName)) continue;
+      SqlIdentifier ref = toIdentifier(c);
+      items.add(ref);
+      groupKeys.add(ref);
+      newVisible.add(c);
+    }
+    SqlNode arrayAgg =
+        new SqlBasicCall(
+            org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_AGG,
+            List.of(toIdentifier(fieldName)),
+            POS);
+    items.add(asAliased(arrayAgg, fieldName));
+    newVisible.add(fieldName);
+    return SqlBuilder.select(items)
+        .from(child)
+        .groupBy(groupKeys)
+        .withFields(newVisible)
         .wrap(frame);
   }
 

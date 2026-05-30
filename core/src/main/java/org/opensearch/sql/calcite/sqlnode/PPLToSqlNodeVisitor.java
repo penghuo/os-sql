@@ -1396,6 +1396,33 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return new SqlSelect(POS, null, items, body, null, null, null, null, null, null, null, null);
   }
 
+  /**
+   * Return the lowercase UDT root name ({@code timestamp/date/time/ip}) when {@code e} is a
+   * QualifiedName/Field whose target column is in {@link Frame#columnUdt}, or {@code null}
+   * otherwise.
+   */
+  private String qualifiedNameUdt(UnresolvedExpression e) {
+    if (exprFrame == null || exprFrame.columnUdt.isEmpty()) return null;
+    QualifiedName qn = null;
+    if (e instanceof QualifiedName q) qn = q;
+    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
+    if (qn == null) return null;
+    String name = qn.toString();
+    String udt = exprFrame.columnUdt.get(name);
+    if (udt != null) return udt;
+    // Tolerate alias-qualified refs like `<alias>.host` — strip the leading alias and try again.
+    int dot = name.indexOf('.');
+    if (dot > 0) {
+      return exprFrame.columnUdt.get(name.substring(dot + 1));
+    }
+    return null;
+  }
+
+  /** True when {@code e} is a STRING-typed PPL Literal AST node. */
+  private static boolean isStringLiteral(UnresolvedExpression e) {
+    return e instanceof Literal lit && lit.getType() == DataType.STRING;
+  }
+
   /** Map a UDT root name (timestamp/date/time/ip) to the corresponding PPL constructor UDF. */
   private static org.apache.calcite.sql.SqlOperator udtConstructorOpForRoot(String root) {
     switch (root) {
@@ -5980,6 +6007,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                   org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
                   List.of(r),
                   POS);
+        }
+      }
+      // PPL-UDT comparison with a string literal: wrap the literal in the matching UDF so
+      // Calcite's operand checker accepts the comparison. e.g. `where host = '1.2.3.4'` with
+      // host:EXPR_IP becomes `host = IP('1.2.3.4')`. Without this, validator rejects with
+      // "Cannot apply '=' to arguments of type '<EXPR_IP> = <CHAR(7)>'". Detected via the
+      // per-column UDT map populated in visitRelation.
+      String lFieldUdt = qualifiedNameUdt(c.getLeft());
+      String rFieldUdt = qualifiedNameUdt(c.getRight());
+      if (lFieldUdt != null && isStringLiteral(c.getRight())) {
+        org.apache.calcite.sql.SqlOperator op = udtConstructorOpForRoot(lFieldUdt);
+        if (op != null) {
+          r = new SqlBasicCall(op, List.of(r), POS);
+        }
+      } else if (rFieldUdt != null && isStringLiteral(c.getLeft())) {
+        org.apache.calcite.sql.SqlOperator op = udtConstructorOpForRoot(rFieldUdt);
+        if (op != null) {
+          l = new SqlBasicCall(op, List.of(l), POS);
         }
       }
       return new SqlBasicCall(comparisonOperator(c.getOperator()), List.of(l, r), POS);

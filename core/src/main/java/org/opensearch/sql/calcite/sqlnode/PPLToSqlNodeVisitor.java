@@ -2001,6 +2001,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return e instanceof Literal lit && lit.getType() == DataType.STRING;
   }
 
+  /**
+   * Extract a boolean value from a Literal that's either typed BOOLEAN or a STRING containing
+   * "TRUE"/"FALSE" (case-insensitive). Returns null otherwise. PPL allows both forms when comparing
+   * against a boolean field (e.g. {@code where male = 'TRUE'} and {@code where male = TRUE}).
+   */
+  private static Boolean extractBoolLiteral(UnresolvedExpression e) {
+    if (!(e instanceof Literal lit)) return null;
+    if (lit.getType() == DataType.BOOLEAN) {
+      return (Boolean) lit.getValue();
+    }
+    if (lit.getType() == DataType.STRING) {
+      String s = String.valueOf(lit.getValue());
+      if ("TRUE".equalsIgnoreCase(s)) return Boolean.TRUE;
+      if ("FALSE".equalsIgnoreCase(s)) return Boolean.FALSE;
+    }
+    return null;
+  }
+
   /** Map a UDT root name (timestamp/date/time/ip) to the corresponding PPL constructor UDF. */
   private static org.apache.calcite.sql.SqlOperator udtConstructorOpForRoot(String root) {
     switch (root) {
@@ -7007,6 +7025,39 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       return expr(f.getField());
     }
     if (e instanceof Compare c) {
+      String cOp =
+          c.getOperator() == null ? "" : c.getOperator().toLowerCase(java.util.Locale.ROOT);
+      // Boolean simplification: `<bool_field> = TRUE` → `<bool_field>`, `<bool_field> = FALSE` →
+      // `NOT(<bool_field>)`, `<bool_field> != TRUE` → `IS NOT TRUE(<bool_field>)`,
+      // `<bool_field> != FALSE` → `IS NOT FALSE(<bool_field>)`. Mirrors v2's emission shape so
+      // OpenSearch pushdown emits a single `term` query against the boolean. Detect the boolean
+      // side via Frame.columnPrimitiveType / Frame.evalAliasTypes (no validator probe required).
+      if (cOp.equals("=") || cOp.equals("!=") || cOp.equals("<>")) {
+        Boolean rightBool = extractBoolLiteral(c.getRight());
+        Boolean leftBool = extractBoolLiteral(c.getLeft());
+        UnresolvedExpression fieldAst = null;
+        Boolean boolValue = null;
+        if (rightBool != null) {
+          fieldAst = c.getLeft();
+          boolValue = rightBool;
+        } else if (leftBool != null) {
+          fieldAst = c.getRight();
+          boolValue = leftBool;
+        }
+        if (boolValue != null && staticTypeOf(fieldAst, exprFrame) == DataType.BOOLEAN) {
+          SqlNode fieldSide = expr(fieldAst);
+          boolean isEq = cOp.equals("=");
+          if (isEq) {
+            return boolValue
+                ? fieldSide
+                : new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(fieldSide), POS);
+          } else {
+            org.apache.calcite.sql.SqlOperator postfix =
+                boolValue ? SqlStdOperatorTable.IS_NOT_TRUE : SqlStdOperatorTable.IS_NOT_FALSE;
+            return new SqlBasicCall(postfix, List.of(fieldSide), POS);
+          }
+        }
+      }
       SqlNode l = expr(c.getLeft());
       SqlNode r = expr(c.getRight());
       // Cross-type DATE/TIME/TIMESTAMP comparison: align both sides to TIMESTAMP so the runtime
@@ -7079,6 +7130,29 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           SqlStdOperatorTable.OR, List.of(expr(o.getLeft()), expr(o.getRight())), POS);
     }
     if (e instanceof Not n) {
+      // Intercept `NOT(<bool_field> = <bool_lit>)` and flip the operator so the same boolean
+      // simplification path produces the matching IS NOT TRUE / IS NOT FALSE shape. v2's
+      // RexBuilder produces this shape directly; SqlValidator-default emission would leave a
+      // bare NOT(field) which doesn't match v2's plan-shape on pushdown.
+      UnresolvedExpression inner = n.getExpression();
+      if (inner instanceof Compare innerCmp) {
+        String iop =
+            innerCmp.getOperator() == null
+                ? ""
+                : innerCmp.getOperator().toLowerCase(java.util.Locale.ROOT);
+        if (iop.equals("=") || iop.equals("!=") || iop.equals("<>")) {
+          Boolean rb = extractBoolLiteral(innerCmp.getRight());
+          Boolean lb = extractBoolLiteral(innerCmp.getLeft());
+          UnresolvedExpression fieldAst = null;
+          if (rb != null) fieldAst = innerCmp.getLeft();
+          else if (lb != null) fieldAst = innerCmp.getRight();
+          if (fieldAst != null && staticTypeOf(fieldAst, exprFrame) == DataType.BOOLEAN) {
+            String flipped = iop.equals("=") ? "!=" : "=";
+            Compare flippedCmp = new Compare(flipped, innerCmp.getLeft(), innerCmp.getRight());
+            return expr(flippedCmp);
+          }
+        }
+      }
       return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
     }
     if (e instanceof Cast c) {

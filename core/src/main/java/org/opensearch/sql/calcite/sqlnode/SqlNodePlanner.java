@@ -77,6 +77,25 @@ public final class SqlNodePlanner {
   }
 
   /**
+   * Resolve a table qualified name to its full row type via a direct catalog lookup. Used by
+   * visitors that need column types (e.g. UDT detection for UNION-pad emission), not just names.
+   */
+  public java.util.function.Function<
+          java.util.List<String>, org.apache.calcite.rel.type.RelDataType>
+      tableRowType() {
+    return parts ->
+        runWithPrepare(
+            (cluster, catalogReader) -> {
+              org.apache.calcite.prepare.Prepare.PreparingTable table =
+                  catalogReader.getTable(parts);
+              if (table == null) {
+                throw new IllegalStateException("Table not found in catalog: " + parts);
+              }
+              return table.getRowType();
+            });
+  }
+
+  /**
    * Build a row-type oracle suitable for {@link PplToSqlNode}'s schema-introspection-backed
    * commands. Validates a probe SqlNode in the same prepare context and returns its row type.
    */

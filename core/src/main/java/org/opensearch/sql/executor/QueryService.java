@@ -309,7 +309,8 @@ public class QueryService {
       if (jsl != null) joinSubsearchLimit = jsl;
     }
     org.apache.calcite.sql.SqlNode sqlNode =
-        new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(planner.tableFields())
+        new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(
+                planner.tableFields(), planner.tableRowType())
             .translate(plan);
     RelNode rel = planner.plan(sqlNode);
     // PPL setting plugins.ppl.join.subsearch_maxout caps the right side of every JOIN to N rows

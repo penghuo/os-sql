@@ -141,6 +141,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> evalAliasTypes = new java.util.LinkedHashMap<>();
 
     /**
+     * Per-column UDT name when the underlying catalog column has a PPL user-defined type ({@code
+     * EXPR_TIMESTAMP}, {@code EXPR_DATE}, {@code EXPR_TIME}, {@code EXPR_IP}). Populated by {@link
+     * #visitRelation} from the catalog row type and propagated through pipes that preserve column
+     * identity (eval, fields, sort, head, ...). Consumed by {@link #visitAppend} / {@link
+     * #visitMultisearch} / {@link #visitUnion} so absent UDT columns get a typed-NULL pad ({@code
+     * TIMESTAMP(CAST(NULL AS VARCHAR))} for {@code EXPR_TIMESTAMP}, etc.) instead of a raw {@code
+     * NULL} that collapses the UDT into VARCHAR through least-restrictive type computation. Maps
+     * column name → lowercase UDT root ({@code timestamp}, {@code date}, {@code time}, {@code ip}).
+     * Empty when no UDT columns are visible.
+     */
+    java.util.Map<String, String> columnUdt = new java.util.LinkedHashMap<>();
+
+    /**
      * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
      * NULLS_LAST). Returns {@code null} if no prior sort exists. Used by {@code visitReverse}.
      */
@@ -156,6 +169,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private final Function<List<String>, List<String>> tableFields;
 
   /**
+   * Resolves a table qualified name to its full {@link org.apache.calcite.rel.type.RelDataType}.
+   * Optional — {@code null} when the visitor was constructed without a row-type oracle (legacy
+   * single-arg ctor for tests). Visitors that need column types (e.g. UDT detection in {@link
+   * #visitAppend}) fall through to type-agnostic emission when this is {@code null}.
+   */
+  private final Function<List<String>, org.apache.calcite.rel.type.RelDataType> tableRowType;
+
+  /**
    * The Frame currently in scope at expression-translation time. Set by {@link #translate} and
    * swapped by {@link #visitJoin} during the right walk so {@link #expr} and {@link #toIdentifier}
    * can apply alias synonyms recorded by upstream {@code visitSubqueryAlias} chain collapse or
@@ -166,7 +187,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private Frame exprFrame;
 
   public PPLToSqlNodeVisitor(Function<List<String>, List<String>> tableFields) {
+    this(tableFields, null);
+  }
+
+  public PPLToSqlNodeVisitor(
+      Function<List<String>, List<String>> tableFields,
+      Function<List<String>, org.apache.calcite.rel.type.RelDataType> tableRowType) {
     this.tableFields = tableFields;
+    this.tableRowType = tableRowType;
   }
 
   /** Public entry point. */
@@ -251,7 +279,50 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   @Override
   public SqlNode visitRelation(Relation node, Frame frame) {
     List<String> parts = node.getTableQualifiedName().getParts();
+    populateColumnUdt(parts, frame);
     return SqlBuilder.relation(parts, lookupTableFields(parts), frame);
+  }
+
+  /**
+   * Populate {@link Frame#columnUdt} from the catalog row type for the table at {@code parts}. Each
+   * column whose type is a PPL UDT ({@code EXPR_TIMESTAMP/DATE/TIME/IP}) gets recorded with its
+   * lowercase UDT root so downstream UNION-pad sites can preserve the UDT.
+   */
+  private void populateColumnUdt(List<String> parts, Frame frame) {
+    if (tableRowType == null) return;
+    org.apache.calcite.rel.type.RelDataType rowType;
+    try {
+      rowType = tableRowType.apply(parts);
+    } catch (Exception ignore) {
+      return;
+    }
+    if (rowType == null || !rowType.isStruct()) return;
+    for (org.apache.calcite.rel.type.RelDataTypeField field : rowType.getFieldList()) {
+      String udt = udtRootName(field.getType());
+      if (udt != null) {
+        frame.columnUdt.put(field.getName(), udt);
+      }
+    }
+  }
+
+  /**
+   * Return the lowercase UDT root name ({@code timestamp/date/time/ip}) when {@code type} is a PPL
+   * user-defined type, or {@code null} otherwise. Detects via class hierarchy and toString
+   * inspection so we don't need a hard dependency on the UDT class name.
+   */
+  private static String udtRootName(org.apache.calcite.rel.type.RelDataType type) {
+    if (type == null) return null;
+    String name = type.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
+    if (name.contains("timestamp")) return "timestamp";
+    if (name.contains("date")) return "date";
+    if (name.contains("time")) return "time";
+    if (name.contains("ip")) return "ip";
+    String full = type.getFullTypeString().toLowerCase(java.util.Locale.ROOT);
+    if (full.contains("expr_timestamp")) return "timestamp";
+    if (full.contains("expr_date")) return "date";
+    if (full.contains("expr_time")) return "time";
+    if (full.contains("expr_ip")) return "ip";
+    return null;
   }
 
   @Override
@@ -1194,8 +1265,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         unified.add(c);
       }
     }
-    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified);
-    SqlNode subPadded = padToUnifiedSchema(sub, subCols, unified);
+    SqlNode mainPadded = padToUnifiedSchema(mainBody, mainCols, unified, subFrame.columnUdt);
+    SqlNode subPadded = padToUnifiedSchema(sub, subCols, unified, frame.columnUdt);
     SqlNode unioned =
         new SqlBasicCall(SqlStdOperatorTable.UNION_ALL, List.of(mainPadded, subPadded), POS);
     SqlNodeList wrapItems = new SqlNodeList(POS);
@@ -1206,6 +1277,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     frame.currentFields = unified;
     frame.joinHints = null;
     frame.lastOrderBy = null;
+    // Merge sub's UDT info into main's so downstream pipes pick up UDT columns from either side.
+    for (java.util.Map.Entry<String, String> e : subFrame.columnUdt.entrySet()) {
+      frame.columnUdt.putIfAbsent(e.getKey(), e.getValue());
+    }
     return wrapped;
   }
 
@@ -1270,16 +1345,71 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   private SqlNode padToUnifiedSchema(SqlNode body, List<String> present, List<String> unified) {
+    return padToUnifiedSchema(body, present, unified, java.util.Map.of());
+  }
+
+  /**
+   * Pad {@code body} to {@code unified}'s columns. For each column absent from {@code present},
+   * emit {@code NULL AS <col>} unless the column is in {@code referenceUdt} (the OTHER side's
+   * column-to-UDT map). When a UDT is known, wrap the NULL in the corresponding PPL UDF ({@code
+   * TIMESTAMP}, {@code DATE}, {@code TIME}, {@code IP}) so the UDT survives the UNION ALL through
+   * least-restrictive type computation.
+   */
+  private SqlNode padToUnifiedSchema(
+      SqlNode body,
+      List<String> present,
+      List<String> unified,
+      java.util.Map<String, String> referenceUdt) {
     Set<String> presentSet = new java.util.LinkedHashSet<>(present);
     SqlNodeList items = new SqlNodeList(POS);
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
     for (String c : unified) {
       if (presentSet.contains(c)) {
         items.add(toIdentifier(c));
       } else {
-        items.add(asAliased(SqlLiteral.createNull(POS), c));
+        String udt = referenceUdt.get(c);
+        SqlNode nullPad;
+        if (udt != null) {
+          // CAST(NULL AS VARCHAR) keeps the UDF operand checker happy (PPL UDTs require CHARACTER
+          // input); the wrapping UDF returns the UDT and propagates NULL via NullPolicy.ANY.
+          SqlNode castNull =
+              new SqlBasicCall(
+                  org.apache.calcite.sql.fun.SqlStdOperatorTable.CAST,
+                  List.of(SqlLiteral.createNull(POS), varcharSpec),
+                  POS);
+          org.apache.calcite.sql.SqlOperator op = udtConstructorOpForRoot(udt);
+          if (op != null) {
+            nullPad = new SqlBasicCall(op, List.of(castNull), POS);
+          } else {
+            nullPad = SqlLiteral.createNull(POS);
+          }
+        } else {
+          nullPad = SqlLiteral.createNull(POS);
+        }
+        items.add(asAliased(nullPad, c));
       }
     }
     return new SqlSelect(POS, null, items, body, null, null, null, null, null, null, null, null);
+  }
+
+  /** Map a UDT root name (timestamp/date/time/ip) to the corresponding PPL constructor UDF. */
+  private static org.apache.calcite.sql.SqlOperator udtConstructorOpForRoot(String root) {
+    switch (root) {
+      case "timestamp":
+        return org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP;
+      case "date":
+        return org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE;
+      case "time":
+        return org.opensearch.sql.expression.function.PPLBuiltinOperators.TIME;
+      case "ip":
+        return org.opensearch.sql.expression.function.PPLBuiltinOperators.IP;
+      default:
+        return null;
+    }
   }
 
   @Override

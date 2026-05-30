@@ -154,6 +154,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, String> columnUdt = new java.util.LinkedHashMap<>();
 
     /**
+     * Per-column primitive {@link DataType} for catalog columns whose Calcite type maps cleanly to
+     * a PPL primitive (BOOLEAN, INTEGER, LONG, DOUBLE, etc.). Populated by {@link #visitRelation}
+     * from the catalog row type. Used by {@link #castExpr} to detect source-type conditions (e.g.
+     * BOOLEAN→INT cast needs CASE-WHEN expansion since Calcite SAFE_CAST rejects it). Does NOT
+     * cover the UDT types ({@link #columnUdt} handles those).
+     */
+    java.util.Map<String, DataType> columnPrimitiveType = new java.util.LinkedHashMap<>();
+
+    /**
      * Return the most-recent sort keys with each direction flipped (ASC ↔ DESC, NULLS_FIRST ↔
      * NULLS_LAST). Returns {@code null} if no prior sort exists. Used by {@code visitReverse}.
      */
@@ -301,7 +310,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       String udt = udtRootName(field.getType());
       if (udt != null) {
         frame.columnUdt.put(field.getName(), udt);
+      } else {
+        DataType prim = primitiveDataTypeOf(field.getType());
+        if (prim != null) {
+          frame.columnPrimitiveType.put(field.getName(), prim);
+        }
       }
+    }
+  }
+
+  /**
+   * Map a Calcite {@link org.apache.calcite.rel.type.RelDataType} to a PPL {@link DataType} for
+   * primitive columns. Returns {@code null} for non-primitive types (UDT, MAP, ARRAY, etc.).
+   */
+  private static DataType primitiveDataTypeOf(org.apache.calcite.rel.type.RelDataType type) {
+    if (type == null) return null;
+    switch (type.getSqlTypeName()) {
+      case BOOLEAN:
+        return DataType.BOOLEAN;
+      case TINYINT:
+      case SMALLINT:
+        return DataType.SHORT;
+      case INTEGER:
+        return DataType.INTEGER;
+      case BIGINT:
+        return DataType.LONG;
+      case FLOAT:
+      case REAL:
+        return DataType.FLOAT;
+      case DOUBLE:
+        return DataType.DOUBLE;
+      case DECIMAL:
+        return DataType.DECIMAL;
+      case VARCHAR:
+      case CHAR:
+        return DataType.STRING;
+      default:
+        return null;
     }
   }
 
@@ -7043,6 +7088,40 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
       }
     }
+    // BOOLEAN source → numeric/string target: Calcite SAFE_CAST rejects BOOLEAN→INTEGER with
+    // "Cast function cannot convert value of type BOOLEAN to type INTEGER". PPL semantics:
+    //   - BOOLEAN → INT/LONG/SHORT: TRUE→1, FALSE→0 via CASE.
+    //   - BOOLEAN → STRING: TRUE→'TRUE', FALSE→'FALSE' via UPPER + SAFE_CAST.
+    // Detect via the per-column primitive type map (populated from the catalog row type).
+    DataType srcStaticType = staticTypeOf(c.getExpression(), exprFrame);
+    if (srcStaticType == DataType.BOOLEAN) {
+      if (tn == org.apache.calcite.sql.type.SqlTypeName.INTEGER
+          || tn == org.apache.calcite.sql.type.SqlTypeName.BIGINT
+          || tn == org.apache.calcite.sql.type.SqlTypeName.SMALLINT
+          || tn == org.apache.calcite.sql.type.SqlTypeName.TINYINT) {
+        SqlNodeList whens = new SqlNodeList(POS);
+        whens.add(value);
+        SqlNodeList thens = new SqlNodeList(POS);
+        thens.add(SqlLiteral.createExactNumeric("1", POS));
+        return new org.apache.calcite.sql.fun.SqlCase(
+            POS, null, whens, thens, SqlLiteral.createExactNumeric("0", POS));
+      }
+      if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR) {
+        // PPL emits 'TRUE' / 'FALSE' (uppercase) for BOOLEAN→STRING. Calcite's SAFE_CAST
+        // produces 'true' / 'false'; wrap in UPPER to match.
+        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                POS);
+        SqlNode cast =
+            new SqlBasicCall(
+                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+                List.of(value, varcharSpec),
+                POS);
+        return new SqlBasicCall(SqlStdOperatorTable.UPPER, List.of(cast), POS);
+      }
+    }
     // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
     //   - numeric literal: `value != 0` (1→true, 0→false, 2→true).
     //   - string literal: '1'→true, '0'→false, anything else→NULL (Spark/Postgres semantics).
@@ -7274,17 +7353,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           return null;
       }
     }
-    if (e instanceof QualifiedName qn
-        && qn.getParts().size() == 1
-        && frame != null
-        && frame.evalAliasTypes.containsKey(qn.toString())) {
-      return frame.evalAliasTypes.get(qn.toString());
+    if (e instanceof QualifiedName qn && qn.getParts().size() == 1 && frame != null) {
+      String name = qn.toString();
+      if (frame.evalAliasTypes.containsKey(name)) {
+        return frame.evalAliasTypes.get(name);
+      }
+      if (frame.columnPrimitiveType.containsKey(name)) {
+        return frame.columnPrimitiveType.get(name);
+      }
     }
     if (e instanceof Field f && f.getField() instanceof QualifiedName qn) {
-      if (qn.getParts().size() == 1
-          && frame != null
-          && frame.evalAliasTypes.containsKey(qn.toString())) {
-        return frame.evalAliasTypes.get(qn.toString());
+      if (qn.getParts().size() == 1 && frame != null) {
+        String name = qn.toString();
+        if (frame.evalAliasTypes.containsKey(name)) {
+          return frame.evalAliasTypes.get(name);
+        }
+        if (frame.columnPrimitiveType.containsKey(name)) {
+          return frame.columnPrimitiveType.get(name);
+        }
       }
     }
     return null;

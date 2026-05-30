@@ -1251,6 +1251,49 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         where =
             new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(expr(sp.getField())), POS);
       }
+    } else if (where == null && groupKeys.isEmpty() && !node.getAggExprList().isEmpty()) {
+      // doc_count optimization: when there's no GROUP BY and every agg is count(field) or
+      // dc(field) with the same single field arg (no count(*) and no mixed fields), add
+      // IS NOT NULL(field) so OpenSearch pushdown emits an `exists` query (uses doc_count
+      // instead of value_count). Mirrors v2's CalciteRelNodeVisitor.java:1462-1483
+      // (aggregateWithTrimming doc_count optimization).
+      java.util.Set<String> distinctFields = new java.util.LinkedHashSet<>();
+      boolean allEligible = true;
+      for (UnresolvedExpression a : node.getAggExprList()) {
+        UnresolvedExpression core = a instanceof Alias al ? al.getDelegated() : a;
+        String name = null;
+        UnresolvedExpression argExpr = null;
+        if (core instanceof AggregateFunction af) {
+          name = af.getFuncName().toLowerCase(java.util.Locale.ROOT);
+          argExpr = af.getField();
+        } else if (core instanceof org.opensearch.sql.ast.expression.Function f) {
+          name = f.getFuncName().toLowerCase(java.util.Locale.ROOT);
+          argExpr = f.getFuncArgs().isEmpty() ? null : f.getFuncArgs().get(0);
+        }
+        boolean isCountish =
+            "count".equals(name)
+                || "distinct_count".equals(name)
+                || "dc".equals(name)
+                || "distinct_count_approx".equals(name);
+        if (!isCountish || argExpr == null || argExpr instanceof AllFields) {
+          allEligible = false;
+          break;
+        }
+        QualifiedName qn = null;
+        if (argExpr instanceof Field f && f.getField() instanceof QualifiedName qq) qn = qq;
+        else if (argExpr instanceof QualifiedName qq) qn = qq;
+        if (qn == null) {
+          allEligible = false;
+          break;
+        }
+        distinctFields.add(qn.toString());
+      }
+      if (allEligible && distinctFields.size() == 1) {
+        String fieldName = distinctFields.iterator().next();
+        where =
+            new SqlBasicCall(
+                SqlStdOperatorTable.IS_NOT_NULL, List.of(toIdentifier(fieldName)), POS);
+      }
     }
 
     SqlBuilder.SelectBuilder b =

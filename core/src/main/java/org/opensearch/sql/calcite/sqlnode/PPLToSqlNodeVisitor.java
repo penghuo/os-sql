@@ -7026,6 +7026,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             List.of(value),
             POS);
       }
+      // EXPR_IP → STRING: SAFE_CAST returns the opaque UDT VARCHAR repr; PPL expects the
+      // canonical IP-string form. Dispatch to IP_TO_STRING UDF when the source column has
+      // UDT type "ip" in {@link Frame#columnUdt} (populated from the catalog row type).
+      String fieldUdt = qualifiedNameUdt(c.getExpression());
+      if ("ip".equals(fieldUdt)) {
+        return new SqlBasicCall(
+            new org.apache.calcite.sql.SqlUnresolvedFunction(
+                new SqlIdentifier("IP_TO_STRING", POS),
+                null,
+                null,
+                null,
+                null,
+                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
+            List.of(value),
+            POS);
+      }
     }
     // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
     //   - numeric literal: `value != 0` (1→true, 0→false, 2→true).

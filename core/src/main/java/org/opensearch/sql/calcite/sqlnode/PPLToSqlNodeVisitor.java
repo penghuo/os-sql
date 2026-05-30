@@ -103,6 +103,33 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   private static final SqlParserPos POS = SqlParserPos.ZERO;
 
+  /**
+   * Function names whose string-literal args MUST stay as CHAR (no VARCHAR cast). Pushdown for
+   * regex/LIKE/replace/fillnull/transpose patterns relies on detecting CHAR-typed literals to route
+   * through specific scripted-pattern paths; casting to VARCHAR breaks that detection. Most other
+   * UDFs are fine with VARCHAR-cast literals (v2's RexBuilder default).
+   */
+  private static final java.util.Set<String> FUNC_NAMES_KEEP_CHAR_LITERAL =
+      java.util.Set.of(
+          "like",
+          "ilike",
+          "not_like",
+          "not_ilike",
+          "rlike",
+          "regexp",
+          "regexp_match",
+          "regexp_replace",
+          "regexp_extract",
+          "regexp_extract_all",
+          "regex",
+          "replace",
+          "fillnull",
+          "transpose",
+          "array",
+          "mvappend",
+          "mvjoin",
+          "array_join");
+
   /** Per-translation state: the visible field list and any active join-disambiguation hints. */
   static final class Frame {
     List<String> currentFields;
@@ -7604,6 +7631,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         args.add(SqlLiteral.createNull(POS));
       } else {
         args.add(expr(a));
+      }
+    }
+    // Cast bare string-literal args to VARCHAR — v2's RexBuilder defaults to VARCHAR for char
+    // literals, so explain plans show `'...':VARCHAR`. Skip for functions whose pushdown
+    // semantics rely on CHAR-typed pattern matching (regex/like/replace/fillnull/transpose/
+    // array literals). Mirrors legacy commit 7e09dba5e4.
+    if (!FUNC_NAMES_KEEP_CHAR_LITERAL.contains(fnLower)) {
+      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+          new org.apache.calcite.sql.SqlDataTypeSpec(
+              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+              POS);
+      for (int i = 0; i < args.size(); i++) {
+        UnresolvedExpression a = fn.getFuncArgs().get(i);
+        if (a instanceof Literal lit
+            && lit.getType() == DataType.STRING
+            && lit.getValue() != null) {
+          args.set(
+              i,
+              new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(args.get(i), varcharSpec), POS));
+        }
       }
     }
     org.apache.calcite.sql.SqlOperator op = arithmeticOperator(fn.getFuncName());

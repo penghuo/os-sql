@@ -7654,6 +7654,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         }
       }
     }
+    // v2 wraps a bare string literal first-arg in TIMESTAMP() for date-part extraction
+    // functions (week/weekofyear/yearweek). The PPL UDF accepts STRING but emits explain plans
+    // showing the explicit TIMESTAMP wrap. Mirror that emission so explain output matches.
+    // Mirrors legacy commit 987d3fd453.
+    if (!args.isEmpty()
+        && fn.getFuncArgs().get(0) instanceof Literal lit0
+        && lit0.getType() == DataType.STRING
+        && (fnLower.equals("week")
+            || fnLower.equals("weekofyear")
+            || fnLower.equals("week_of_year")
+            || fnLower.equals("yearweek"))) {
+      args.set(
+          0,
+          new SqlBasicCall(
+              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
+              List.of(args.get(0)),
+              POS));
+    }
     org.apache.calcite.sql.SqlOperator op = arithmeticOperator(fn.getFuncName());
     if (op != null) {
       // PPL overloads `+` as both numeric addition and string concatenation. When any operand is

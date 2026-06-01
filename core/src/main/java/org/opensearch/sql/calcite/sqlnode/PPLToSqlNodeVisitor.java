@@ -4973,6 +4973,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // LABEL mode: extend the row with patterns_field; if show_numbered_token=true, also expose
     // the token-numbered pattern (overriding patterns_field) and the tokens map. The latter
     // requires patterns_field to be a real column, so it lives in a wrapped subquery.
+    // Filter metadata fields out — including them produces an extra LogicalProject layer when
+    // the planner-level stripMetadataFields shuttle later trims the row type. Mirrors
+    // visitDedupe / visitWindow / visitStreamWindow.
     SqlNodeList items = new SqlNodeList(POS);
     List<String> visible =
         frame.currentFields == null ? new ArrayList<>() : new ArrayList<>(frame.currentFields);
@@ -4982,6 +4985,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       List<String> retained = new ArrayList<>();
       for (String name : visible) {
         if (name.equals(aliasField)) continue;
+        if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(name)) continue;
         items.add(toIdentifier(name));
         retained.add(name);
       }

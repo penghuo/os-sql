@@ -1907,7 +1907,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "append main side requires a known column list — call after a pipe that sets it");
     }
-    List<String> mainCols = new ArrayList<>(frame.currentFields);
+    // Strip metadata fields from each side's column list (same pattern as visitMultisearch /
+    // visitUnion). v2 emits per-side user-only Projects; padding with metadata in our schema
+    // produces extra-wide Project layers.
+    List<String> mainCols = new ArrayList<>(stripMeta(frame.currentFields));
 
     Frame subFrame = new Frame();
     Frame savedExpr = this.exprFrame;
@@ -1922,7 +1925,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "append subsearch requires a known column list — call after a pipe that sets it");
     }
-    List<String> subCols = new ArrayList<>(subFrame.currentFields);
+    List<String> subCols = new ArrayList<>(stripMeta(subFrame.currentFields));
 
     // Unified column order: main's order first, then sub's columns absent on main (preserving
     // sub's order). Mirrors v2 emission shape so explain plans line up.
@@ -2403,10 +2406,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         throw new UnsupportedOperationException(
             "multisearch subsearch requires a known column list");
       }
-      branchCols.add(new ArrayList<>(subFrame.currentFields));
+      // Strip metadata fields from each branch's column list before padding. v2's RelBuilder
+      // emits per-branch user-only Projects above the Filter; including metadata in our branch
+      // schema produces an extra-wide Project layer (testExplainMultisearchBasic).
+      List<String> userOnlyCols = stripMeta(subFrame.currentFields);
+      branchCols.add(new ArrayList<>(userOnlyCols));
       branchUdt.add(new java.util.LinkedHashMap<>(subFrame.columnUdt));
       branchFrames.add(subFrame);
-      for (String c : subFrame.currentFields) {
+      for (String c : userOnlyCols) {
         if (!unified.contains(c)) {
           unified.add(c);
         }
@@ -3353,10 +3360,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 POS, null, wrapStar, branch, null, null, null, null, null, null, null, null);
       }
       branches.add(branch);
+      // Strip metadata fields from each branch's column list before padding (same pattern as
+      // visitMultisearch). v2 emits per-branch user-only Projects; padding with metadata in our
+      // schema produces extra-wide Project layers (testExplainUnion).
       List<String> bcols =
           branchFrame.currentFields == null
               ? new ArrayList<>()
-              : new ArrayList<>(branchFrame.currentFields);
+              : new ArrayList<>(stripMeta(branchFrame.currentFields));
       branchCols.add(bcols);
       branchUdt.add(new java.util.LinkedHashMap<>(branchFrame.columnUdt));
       branchFrames.add(branchFrame);

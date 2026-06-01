@@ -724,6 +724,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         seenLeaves.add(leaf);
         continue;
       }
+      // Flat-dotted catalog column: OpenSearch flattens deeply-nested object mappings into
+      // top-level dotted-name fields (e.g. `machine.os1`). When the FULL dotted name appears as
+      // a visible flat column in `currentFields`, prefer this over ITEM dispatch — the field has
+      // a typed RelDataTypeField in the rel rowType (string, bigint, etc), but ITEM(map, key)
+      // returns ANY-typed and loses the type. Emit a quoted single-part identifier so the
+      // validator resolves it to the typed column directly. Mirror toIdentifier's existing logic
+      // (commit 203bcfede3) for the visitProject SELECT-list emission path.
+      if (dotted
+          && frame.currentFields != null
+          && frame.currentFields.contains(name)
+          && !frame.liveJoinAliases.contains(prefix)
+          && frame.aliasSynonyms.isEmpty()) {
+        selectList.add(quotedIdentifier(java.util.Collections.singletonList(name)));
+        seenLeaves.add(leaf);
+        continue;
+      }
       // ITEM dispatch when the dotted prefix is a MAP-typed column (catalog "object" mapping or
       // an eval alias bound to a MAP-producing function like geoip). Validator multi-part
       // identifier resolution would otherwise fail with "Table 'X' not found". Always alias the

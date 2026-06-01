@@ -693,7 +693,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       }
     }
 
-    List<String> selected = resolveSelectedFields(node, frame.currentFields);
+    List<String> selected = resolveSelectedFields(node, frame.currentFields, frame.joinHints);
 
     // Build the SELECT list. Two responsibilities here:
     //
@@ -7120,7 +7120,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    *       {@code requested}.
    * </ul>
    */
-  private List<String> resolveSelectedFields(Project node, List<String> incomingFields) {
+  private List<String> resolveSelectedFields(
+      Project node, List<String> incomingFields, JoinHints joinHints) {
     if (incomingFields == null) {
       // Post-join with explicit ON: the join layer didn't produce a deduped field list because
       // the user is expected to project explicitly. Tolerate by treating "all visible" as empty
@@ -7134,13 +7135,36 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
     if (node.getProjectList().size() == 1
         && node.getProjectList().getFirst() instanceof AllFields) {
+      // Over an explicit-ON join the visible field list is `[bare..., l.bare..., r.bare...]`
+      // (see {@link #unionFieldsWithAliasPrefixes}). The bare names are kept for downstream
+      // pipes that write `| where state = '...'` (resolved via PPL's bind-bare-to-LEFT through
+      // {@link Frame#joinHints}); but the implicit final `| fields *` emitted by
+      // AstStatementBuilder must not double-up those columns. Drop bare names whose
+      // alias-qualified counterpart is also visible; keep alias-qualified entries so each
+      // side's columns appear exactly once.
+      List<String> source = nonMeta;
+      if (!node.isExcluded() && joinHints != null) {
+        Set<String> aliasQualifiedLeaves = new LinkedHashSet<>();
+        for (String c : nonMeta) {
+          int dot = c.indexOf('.');
+          if (dot >= 0) aliasQualifiedLeaves.add(c.substring(dot + 1));
+        }
+        if (!aliasQualifiedLeaves.isEmpty()) {
+          List<String> dedup = new ArrayList<>();
+          for (String c : nonMeta) {
+            if (c.indexOf('.') < 0 && aliasQualifiedLeaves.contains(c)) continue;
+            dedup.add(c);
+          }
+          source = dedup;
+        }
+      }
       // Mirror v2's tryToRemoveNestedFields: when a dotted-name field's parent is itself a
       // visible column, drop the dotted leaf. Otherwise an `eval `agent.name` = 'test'` after
       // `fields agent` would expose both `agent` (struct) and `agent.name` (string), inflating
       // the implicit `fields *` output beyond PPL's documented behaviour.
-      java.util.Set<String> nonMetaSet = new java.util.LinkedHashSet<>(nonMeta);
+      java.util.Set<String> nonMetaSet = new java.util.LinkedHashSet<>(source);
       List<String> filtered = new ArrayList<>();
-      for (String c : nonMeta) {
+      for (String c : source) {
         int lastDot = c.lastIndexOf('.');
         if (lastDot >= 0 && nonMetaSet.contains(c.substring(0, lastDot))) {
           continue;

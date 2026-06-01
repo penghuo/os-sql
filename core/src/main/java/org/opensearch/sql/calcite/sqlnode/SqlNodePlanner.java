@@ -571,6 +571,12 @@ public final class SqlNodePlanner {
     // OpenSearch composite-aggregation source name match v2 (Big5 composite_date_histogram_*
     // tests compare these names).
     rel = renameSpanProjectColumn(rel);
+    // When an outer LogicalProject references the same Aggregate output position via multiple
+    // aliases (PPL `stats count(), count() as c1 by gender` — both `count()` and `c1` point at
+    // the same COUNT call), pick the canonical-looking name (`<funcName>()` form) for the
+    // Aggregate's output. SqlValidator picks the LAST alias by default; v2's RelBuilder picks
+    // the canonical name.
+    rel = preferCanonicalAggCallName(rel);
     // Bump pre-aggregate Project field names from `$fN` to `$f<N+1>` when the parent Aggregate
     // has no group-by AND a single agg-call (count-no-group with eval-arg pattern). v2's
     // RelBuilder reserves position 0 for the agg result; SqlValidator names projection cols from
@@ -891,6 +897,108 @@ public final class SqlNodePlanner {
           }
         };
     return rel.accept(shuttle);
+  }
+
+  /**
+   * When a parent {@link org.apache.calcite.rel.logical.LogicalProject} references the same {@link
+   * org.apache.calcite.rel.logical.LogicalAggregate} output position via multiple aliases with
+   * different names, prefer the canonical-looking name (e.g. {@code count()}) for the Aggregate's
+   * output. SqlValidator picks the LAST alias by default; v2's RelBuilder picks the canonical
+   * (auto-generated) name even when an explicit user alias is provided.
+   *
+   * <p>Example: PPL {@code stats count(), count() as c1 by gender} — both projections reference the
+   * same COUNT call. v2 emits {@code Aggregate(group=[{0}], count()=[COUNT()])}; we emit {@code
+   * Aggregate(group=[{0}], c1=[COUNT()])}. After this shuttle the Aggregate output's name matches
+   * v2.
+   */
+  private RelNode preferCanonicalAggCallName(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
+              return visited;
+            }
+            if (!(proj.getInput() instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            int groupCount = agg.getGroupSet().cardinality();
+            java.util.Map<Integer, java.util.LinkedHashSet<String>> namesByAggIdx =
+                new java.util.HashMap<>();
+            java.util.List<org.apache.calcite.rex.RexNode> projExprs = proj.getProjects();
+            java.util.List<String> projNames = proj.getRowType().getFieldNames();
+            for (int i = 0; i < projExprs.size(); i++) {
+              org.apache.calcite.rex.RexNode e = projExprs.get(i);
+              if (!(e instanceof org.apache.calcite.rex.RexInputRef ref)) continue;
+              int aggOutIdx = ref.getIndex() - groupCount;
+              if (aggOutIdx < 0 || aggOutIdx >= agg.getAggCallList().size()) continue;
+              namesByAggIdx
+                  .computeIfAbsent(aggOutIdx, k -> new java.util.LinkedHashSet<>())
+                  .add(projNames.get(i));
+            }
+            java.util.List<org.apache.calcite.rel.type.RelDataTypeField> aggFields =
+                agg.getRowType().getFieldList();
+            java.util.List<String> newNames = new java.util.ArrayList<>();
+            for (org.apache.calcite.rel.type.RelDataTypeField field : aggFields) {
+              newNames.add(field.getName());
+            }
+            boolean changed = false;
+            for (java.util.Map.Entry<Integer, java.util.LinkedHashSet<String>> entry :
+                namesByAggIdx.entrySet()) {
+              int aggOutIdx = entry.getKey();
+              java.util.LinkedHashSet<String> names = entry.getValue();
+              if (names.size() < 2) continue;
+              org.apache.calcite.rel.core.AggregateCall call = agg.getAggCallList().get(aggOutIdx);
+              String canonical = canonicalAggName(call);
+              String preferred;
+              if (canonical != null && names.contains(canonical)) {
+                preferred = canonical;
+              } else {
+                preferred = names.iterator().next();
+              }
+              int rowTypeIdx = groupCount + aggOutIdx;
+              if (rowTypeIdx < 0 || rowTypeIdx >= newNames.size()) continue;
+              if (preferred.equals(newNames.get(rowTypeIdx))) continue;
+              newNames.set(rowTypeIdx, preferred);
+              changed = true;
+            }
+            if (!changed) return visited;
+            java.util.List<org.apache.calcite.rel.core.AggregateCall> newAggCalls =
+                new java.util.ArrayList<>();
+            for (int i = 0; i < agg.getAggCallList().size(); i++) {
+              org.apache.calcite.rel.core.AggregateCall call = agg.getAggCallList().get(i);
+              String desired = newNames.get(groupCount + i);
+              if (desired.equals(call.getName())) {
+                newAggCalls.add(call);
+              } else {
+                newAggCalls.add(call.rename(desired));
+              }
+            }
+            org.apache.calcite.rel.logical.LogicalAggregate newAgg =
+                org.apache.calcite.rel.logical.LogicalAggregate.create(
+                    agg.getInput(),
+                    agg.getHints(),
+                    agg.getGroupSet(),
+                    agg.getGroupSets(),
+                    newAggCalls);
+            return proj.copy(proj.getTraitSet(), java.util.List.of(newAgg));
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Construct the canonical name for an aggregate call, mirroring v2's auto-generated alias.
+   * Examples: {@code COUNT()} -> {@code count()}. Returns null when the call has args (multi-arg
+   * naming is more involved; v2's RelBuilder keeps the user alias in those cases).
+   */
+  private static String canonicalAggName(org.apache.calcite.rel.core.AggregateCall call) {
+    String fnName = call.getAggregation().getName().toLowerCase(java.util.Locale.ROOT);
+    if (call.getArgList().isEmpty()) {
+      return fnName + "()";
+    }
+    return null;
   }
 
   /**

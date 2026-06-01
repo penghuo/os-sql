@@ -822,13 +822,24 @@ public final class SqlNodePlanner {
   }
 
   /**
-   * Bump pre-aggregate Project's `$fN` auto-names by 1. v2's RelBuilder names singleton projections
-   * after the parent Aggregate's leading column position (which is 0 for the COUNT itself), so `...
-   * | stats count() | eval x = case(...)` produces `LogicalProject($f1=CASE(...))` — `$f1` even
-   * though it's at position 0 in the pre-aggregate Project. SqlValidator names by position and
-   * emits `$f0`. Limited to: parent is LogicalAggregate with NO group-by AND single agg-call
-   * (COUNT-family pattern); pre-aggregate Project has exactly 1 column whose name starts with `$f`.
-   * Renames the lone `$fN` to `$f<N+1>`.
+   * Rename pre-aggregate Project's `$fN` auto-names to match v2's RelBuilder naming convention. v2
+   * reserves position counters for the parent Aggregate's group-by + agg-call outputs first, then
+   * names computed pre-aggregate Project columns starting from `$f<group_count+agg_count>`.
+   * SqlValidator names by Project position (`$f<col_index>`).
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   *   <li>{@code stats count() | eval x = case(...)} — 0 group + 1 agg → first computed col gets
+   *       `$f1` (was `$f0`).
+   *   <li>{@code stats sum(a), sum(b+1) by g} — 1 group + 2 aggs → first computed gets `$f3`.
+   *   <li>{@code stats take(firstname, 2)} — 0 group + 1 agg, Project=[firstname, 2] → computed col
+   *       at position 1 named `$f1` (matches; bumpBy=1 + autoCounter=0).
+   * </ul>
+   *
+   * <p>For each computed (non-passthrough) Project col whose current name is `$fN` where N matches
+   * its position in the Project's field list, rename to `$f<autoCounter + bumpBy>` where
+   * autoCounter increments per computed col and bumpBy = group_count + agg_count.
    */
   private RelNode bumpPreAggregateAutoNames(RelNode rel) {
     org.apache.calcite.rel.RelShuttle shuttle =
@@ -839,28 +850,42 @@ public final class SqlNodePlanner {
             if (!(visited instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
               return visited;
             }
-            if (!agg.getGroupSet().isEmpty()) return visited;
-            if (agg.getAggCallList().size() != 1) return visited;
             if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
               return visited;
             }
+            java.util.List<org.apache.calcite.rex.RexNode> projects = proj.getProjects();
             java.util.List<String> names = proj.getRowType().getFieldNames();
-            if (names.size() != 1) return visited;
-            String currentName = names.get(0);
-            if (!currentName.startsWith("$f")) return visited;
-            int n;
-            try {
-              n = Integer.parseInt(currentName.substring(2));
-            } catch (NumberFormatException e) {
-              return visited;
+            int bumpBy = agg.getGroupSet().cardinality() + agg.getAggCallList().size();
+            if (bumpBy == 0) return visited;
+            java.util.List<String> newNames = new java.util.ArrayList<>(names);
+            boolean changed = false;
+            int autoCounter = 0;
+            for (int i = 0; i < projects.size(); i++) {
+              org.apache.calcite.rex.RexNode rx = projects.get(i);
+              if (rx instanceof org.apache.calcite.rex.RexInputRef) continue;
+              String currentName = names.get(i);
+              if (!currentName.startsWith("$f")) continue;
+              int n;
+              try {
+                n = Integer.parseInt(currentName.substring(2));
+              } catch (NumberFormatException e) {
+                continue;
+              }
+              if (n != i) continue;
+              String newName = "$f" + (autoCounter + bumpBy);
+              if (!newName.equals(currentName)) {
+                newNames.set(i, newName);
+                changed = true;
+              }
+              autoCounter++;
             }
-            String newName = "$f" + (n + 1);
+            if (!changed) return visited;
             org.apache.calcite.rel.logical.LogicalProject newProj =
                 org.apache.calcite.rel.logical.LogicalProject.create(
                     proj.getInput(),
                     proj.getHints(),
                     proj.getProjects(),
-                    java.util.List.of(newName),
+                    newNames,
                     proj.getVariablesSet());
             return agg.copy(agg.getTraitSet(), java.util.List.of(newProj));
           }

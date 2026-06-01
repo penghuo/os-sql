@@ -571,6 +571,11 @@ public final class SqlNodePlanner {
     // OpenSearch composite-aggregation source name match v2 (Big5 composite_date_histogram_*
     // tests compare these names).
     rel = renameSpanProjectColumn(rel);
+    // Bump pre-aggregate Project field names from `$fN` to `$f<N+1>` when the parent Aggregate
+    // has no group-by AND a single agg-call (count-no-group with eval-arg pattern). v2's
+    // RelBuilder reserves position 0 for the agg result; SqlValidator names projection cols from
+    // position 0. Limit to the single-arg case to avoid regressing multi-arg agg shapes.
+    rel = bumpPreAggregateAutoNames(rel);
     // Collapse `Project(span_alias=$N) <- Filter(F on $M) <- Project(passthrough[*] + SPAN AS
     // span_alias)`
     // when the outer Project ONLY references the trailing SPAN column. This pattern comes from
@@ -811,6 +816,53 @@ public final class SqlNodePlanner {
             // need an explicit override. Process children, then attempt the fuse.
             RelNode visited = super.visit(sort);
             return tryFuseAdjacentSorts(visited);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Bump pre-aggregate Project's `$fN` auto-names by 1. v2's RelBuilder names singleton projections
+   * after the parent Aggregate's leading column position (which is 0 for the COUNT itself), so `...
+   * | stats count() | eval x = case(...)` produces `LogicalProject($f1=CASE(...))` — `$f1` even
+   * though it's at position 0 in the pre-aggregate Project. SqlValidator names by position and
+   * emits `$f0`. Limited to: parent is LogicalAggregate with NO group-by AND single agg-call
+   * (COUNT-family pattern); pre-aggregate Project has exactly 1 column whose name starts with `$f`.
+   * Renames the lone `$fN` to `$f<N+1>`.
+   */
+  private RelNode bumpPreAggregateAutoNames(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            if (!agg.getGroupSet().isEmpty()) return visited;
+            if (agg.getAggCallList().size() != 1) return visited;
+            if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
+              return visited;
+            }
+            java.util.List<String> names = proj.getRowType().getFieldNames();
+            if (names.size() != 1) return visited;
+            String currentName = names.get(0);
+            if (!currentName.startsWith("$f")) return visited;
+            int n;
+            try {
+              n = Integer.parseInt(currentName.substring(2));
+            } catch (NumberFormatException e) {
+              return visited;
+            }
+            String newName = "$f" + (n + 1);
+            org.apache.calcite.rel.logical.LogicalProject newProj =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    proj.getInput(),
+                    proj.getHints(),
+                    proj.getProjects(),
+                    java.util.List.of(newName),
+                    proj.getVariablesSet());
+            return agg.copy(agg.getTraitSet(), java.util.List.of(newProj));
           }
         };
     return rel.accept(shuttle);

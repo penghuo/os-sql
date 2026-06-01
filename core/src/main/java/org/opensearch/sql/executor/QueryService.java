@@ -341,6 +341,11 @@ public class QueryService {
    * Drop OpenSearch metadata fields ({@code _id}, {@code _index}, {@code _score}, ...) from the
    * top-level row type. PPL hides these from user-facing output; only explicit references (e.g.
    * {@code | fields _id, name}) keep them.
+   *
+   * <p>When the rel is already a {@link org.apache.calcite.rel.logical.LogicalProject}, compose the
+   * metadata-strip directly into that Project (drop the metadata-named columns) instead of wrapping
+   * in a new outer Project. This avoids producing an extra plan-shape layer that v2's RelBuilder
+   * doesn't emit (testExplainEvalMax et al.).
    */
   private static RelNode stripMetadataFields(RelNode rel) {
     java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
@@ -353,6 +358,26 @@ public class QueryService {
                         .containsKey(f.getName()));
     if (!anyMeta) {
       return rel;
+    }
+    if (rel instanceof org.apache.calcite.rel.logical.LogicalProject lp) {
+      java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>();
+      java.util.List<String> names = new java.util.ArrayList<>();
+      java.util.List<org.apache.calcite.rex.RexNode> existing = lp.getProjects();
+      java.util.List<String> existingNames = lp.getRowType().getFieldNames();
+      for (int i = 0; i < existing.size(); i++) {
+        String name = existingNames.get(i);
+        if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(
+            name)) {
+          continue;
+        }
+        projects.add(existing.get(i));
+        names.add(name);
+      }
+      if (projects.isEmpty()) {
+        return rel;
+      }
+      return org.apache.calcite.rel.logical.LogicalProject.create(
+          lp.getInput(), lp.getHints(), projects, names, lp.getVariablesSet());
     }
     org.apache.calcite.rex.RexBuilder rb = rel.getCluster().getRexBuilder();
     java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>();

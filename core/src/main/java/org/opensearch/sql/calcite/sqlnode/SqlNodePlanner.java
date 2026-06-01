@@ -2197,7 +2197,7 @@ public final class SqlNodePlanner {
           || "_rn_main_".equals(n)
           || "_rn_sub_".equals(n)
           || "_dummy_".equals(n)
-          || "__join_max_rn__".equals(n)
+          || "_row_number_dedup_".equals(n)
           || "__mvexpand_rn__".equals(n)) {
         anyHidden = true;
         continue;

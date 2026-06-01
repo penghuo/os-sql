@@ -7007,7 +7007,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
     SqlNodeList innerSelects = new SqlNodeList(POS);
     innerSelects.add(SqlIdentifier.star(POS));
-    innerSelects.add(asAliased(rowNum, "__join_max_rn__"));
+    innerSelects.add(asAliased(rowNum, "_row_number_dedup_"));
     SqlNode innerSelect =
         new SqlSelect(
             POS, null, innerSelects, rightSide, null, null, null, null, null, null, null, null);
@@ -7022,7 +7022,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         new SqlBasicCall(
             SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
             List.of(
-                new SqlIdentifier("__join_max_rn__", POS),
+                new SqlIdentifier("_row_number_dedup_", POS),
                 SqlLiteral.createExactNumeric(Integer.toString(maxArg), POS)),
             POS);
     return new SqlSelect(

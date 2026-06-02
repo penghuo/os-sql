@@ -5650,6 +5650,84 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   @Override
+  public SqlNode visitMvExpand(org.opensearch.sql.ast.tree.MvExpand node, Frame frame) {
+    // PPL `mvexpand <field>` unnests an array column in place: the same column name continues
+    // to exist post-mvexpand but holds an element rather than the array. v2's RelBuilder emits:
+    //   LogicalProject(<other_user_cols>, <field>=$<unnested_pos>)
+    //     LogicalCorrelate($cor0, INNER)
+    //       LogicalProject(<all_input_cols>)
+    //       Uncollect
+    //         LogicalProject(<field>=$cor0.<field>)
+    //           LogicalValues(tuples=[[{ 0 }]])
+    //
+    // We mirror this with `SELECT <pruned_user_cols>, t.<field> AS <field>
+    // FROM <input> AS s, UNNEST(s.<field>) AS t(<field>)`. Calcite's SqlToRelConverter turns
+    // implicit-LATERAL CROSS JOIN with UNNEST referencing the left side into LogicalCorrelate
+    // + Uncollect.
+    SqlNode input = node.getChild().get(0).accept(this, frame);
+    UnresolvedExpression fieldExpr = node.getField().getField();
+    if (!(fieldExpr instanceof QualifiedName fqn)) {
+      throw new UnsupportedOperationException(
+          "mvexpand requires a simple column reference, got: " + fieldExpr.getClass());
+    }
+    String fieldName = fqn.toString();
+    // PPL mvexpand on a scalar (non-array) field is a no-op (passes input through unchanged).
+    // Without a row-type oracle we can't introspect the field type at SqlNode construction
+    // time, so use the Frame's eval-alias / column-primitive type maps as a best-effort check.
+    // If the field is recorded as a non-array scalar (INTEGER, STRING, etc.), skip the
+    // UNNEST emission entirely. Mirrors v2's CalciteRelNodeVisitor.visitMvExpand semantics.
+    // The DataType enum tracks only scalar types (INTEGER/STRING/BOOLEAN/...). If `fieldName`
+    // appears in the Frame's primitive/eval-alias type maps, it's a known scalar — mvexpand is
+    // a no-op. The OpenSearch flat-dotted scan columns (skills_int, skills_not_array) populate
+    // columnPrimitiveType during visitRelation; eval-emitted scalars populate evalAliasTypes.
+    if (frame.columnPrimitiveType.containsKey(fieldName)
+        || frame.evalAliasTypes.containsKey(fieldName)) {
+      return input;
+    }
+    String inputAlias = "mvexpand_input";
+    String unnestAlias = "mvexpand_t";
+    SqlNode aliasedInput = SqlBuilder.aliasAs(input, inputAlias);
+    SqlNode unnestArg = new SqlIdentifier(java.util.Arrays.asList(inputAlias, fieldName), POS);
+    SqlNode unnest = new SqlBasicCall(SqlStdOperatorTable.UNNEST, List.of(unnestArg), POS);
+    SqlNode aliasedUnnest =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS,
+            List.of(unnest, new SqlIdentifier(unnestAlias, POS), new SqlIdentifier(fieldName, POS)),
+            POS);
+    SqlNode join =
+        new org.apache.calcite.sql.SqlJoin(
+            POS,
+            aliasedInput,
+            SqlLiteral.createBoolean(false, POS),
+            JoinType.COMMA.symbol(POS),
+            aliasedUnnest,
+            org.apache.calcite.sql.JoinConditionType.NONE.symbol(POS),
+            null);
+    // Output projection mirrors v2: keep input cols (drop dotted descendants of <field> since
+    // the unnested element replaces the parent struct, and drop metadata fields), then surface
+    // the unnested element under the same name as the original array column.
+    List<String> inputCols = frame.currentFields == null ? List.of() : frame.currentFields;
+    java.util.Set<String> inputColSet = new java.util.LinkedHashSet<>(inputCols);
+    SqlNodeList items = new SqlNodeList(POS);
+    List<String> visible = new ArrayList<>();
+    String dottedPrefix = fieldName + ".";
+    for (String c : inputCols) {
+      if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
+      if (c.equals(fieldName)) continue;
+      if (c.startsWith(dottedPrefix)) continue;
+      int lastDot = c.lastIndexOf('.');
+      if (lastDot != -1 && inputColSet.contains(c.substring(0, lastDot))) continue;
+      items.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, c), POS));
+      visible.add(c);
+    }
+    items.add(
+        asAliased(
+            new SqlIdentifier(java.util.Arrays.asList(unnestAlias, fieldName), POS), fieldName));
+    visible.add(fieldName);
+    return SqlBuilder.select(items).from(join).withFields(visible).wrap(frame);
+  }
+
+  @Override
   public SqlNode visitExpand(Expand node, Frame frame) {
     // PPL `expand <field> [as <alias>]` unnests an array column: each input row becomes one row
     // per array element, with the element exposed as a struct under the alias (or the original

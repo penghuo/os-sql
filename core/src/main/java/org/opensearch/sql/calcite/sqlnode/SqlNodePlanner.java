@@ -587,6 +587,11 @@ public final class SqlNodePlanner {
     // (e.g. `stats count() by info.city`) carry the user-visible name through the pre-Aggregate
     // Project (matches v2's RelBuilder explicit field-naming).
     rel = namePreAggregateGroupKeyFromOuterProject(rel);
+    // Trendline (and similar) emits `CASE(WHEN guard, THEN agg, ELSE null)` where Calcite's CASE
+    // type-coercion bumps the ELSE-null literal to the THEN branch's type (e.g. DOUBLE).
+    // v2's RelBuilder constructs the null literal with NULL type explicitly, so explain output
+    // shows `null:NULL`. Rewrite typed-null ELSE literals back to NULL type.
+    rel = rewriteTrendlineCaseElseNullType(rel);
     // Collapse `Project(span_alias=$N) <- Filter(F on $M) <- Project(passthrough[*] + SPAN AS
     // span_alias)`
     // when the outer Project ONLY references the trailing SPAN column. This pattern comes from
@@ -980,6 +985,59 @@ public final class SqlNodePlanner {
                     newNames,
                     proj.getVariablesSet());
             return agg.copy(agg.getTraitSet(), java.util.List.of(newProj));
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Rewrite typed-null literals appearing as the ELSE branch of trendline-pattern CASE expressions
+   * to NULL-typed literals, so explain output reads {@code null:NULL} instead of {@code
+   * null:DOUBLE}. v2's RelBuilder for trendline constructs the null with NULL type; Calcite's CASE
+   * type-coercion bumps an UNKNOWN-typed null to the THEN branch's type at validation.
+   *
+   * <p>Conservative — only rewrites when the THEN branch is a {@code DIVIDE(SUM, ...)} expression
+   * (the trendline SMA shape). Other CASE patterns (eventstats null-bucket guard, etc.) preserve
+   * their THEN-derived null type per v2 emission shape.
+   */
+  private RelNode rewriteTrendlineCaseElseNullType(RelNode rel) {
+    org.apache.calcite.rex.RexShuttle rex =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexCall visited =
+                (org.apache.calcite.rex.RexCall) super.visitCall(call);
+            if (visited.getKind() != org.apache.calcite.sql.SqlKind.CASE) return visited;
+            java.util.List<org.apache.calcite.rex.RexNode> ops = visited.getOperands();
+            // Trendline pattern: CASE(WHEN, THEN, ELSE) — exactly 3 operands.
+            if (ops.size() != 3) return visited;
+            // THEN branch must be a DIVIDE expression (the trendline SMA shape
+            // SUM/CAST(COUNT) or WMA shape Σ.../divisor). Eventstats null-bucket guard has
+            // a single agg OVER (no DIVIDE), so it's preserved.
+            if (!(ops.get(1) instanceof org.apache.calcite.rex.RexCall thenCall)) return visited;
+            if (thenCall.getOperator() != org.apache.calcite.sql.fun.SqlStdOperatorTable.DIVIDE)
+              return visited;
+            org.apache.calcite.rex.RexNode last = ops.get(2);
+            if (!(last instanceof org.apache.calcite.rex.RexLiteral lit)) return visited;
+            if (lit.getValue() != null) return visited;
+            org.apache.calcite.sql.type.SqlTypeName tn = lit.getType().getSqlTypeName();
+            if (tn == org.apache.calcite.sql.type.SqlTypeName.NULL) return visited;
+            org.apache.calcite.rex.RexBuilder rb = rel.getCluster().getRexBuilder();
+            org.apache.calcite.rel.type.RelDataType nullType =
+                rb.getTypeFactory().createSqlType(org.apache.calcite.sql.type.SqlTypeName.NULL);
+            org.apache.calcite.rex.RexNode newNull = rb.makeNullLiteral(nullType);
+            java.util.List<org.apache.calcite.rex.RexNode> newOps = new java.util.ArrayList<>(ops);
+            newOps.set(ops.size() - 1, newNull);
+            return (org.apache.calcite.rex.RexCall)
+                rb.makeCall(visited.getType(), visited.getOperator(), newOps);
+          }
+        };
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            return visited.accept(rex);
           }
         };
     return rel.accept(shuttle);

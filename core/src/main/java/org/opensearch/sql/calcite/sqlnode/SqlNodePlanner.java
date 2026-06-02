@@ -587,6 +587,12 @@ public final class SqlNodePlanner {
     // (e.g. `stats count() by info.city`) carry the user-visible name through the pre-Aggregate
     // Project (matches v2's RelBuilder explicit field-naming).
     rel = namePreAggregateGroupKeyFromOuterProject(rel);
+    // Chart/timechart 1D: visitChart emits `(group-key, agg-call)` SELECT list which becomes
+    // `Aggregate(group={0}, SUM($1)) ← Project(group_key, agg_arg)`. v2's RelBuilder emits
+    // agg-args BEFORE group keys: `Aggregate(group={1}, SUM($0)) ← Project(agg_arg, group_key)`.
+    // Swap the pre-Project columns and update Aggregate's groupSet+agg references. Aggregate
+    // output positions are unchanged (group keys first per groupSet order in output row type).
+    rel = swapChartPreAggregateColumnOrder(rel);
     // Trendline (and similar) emits `CASE(WHEN guard, THEN agg, ELSE null)` where Calcite's CASE
     // type-coercion bumps the ELSE-null literal to the THEN branch's type (e.g. DOUBLE).
     // v2's RelBuilder constructs the null literal with NULL type explicitly, so explain output
@@ -988,6 +994,71 @@ public final class SqlNodePlanner {
           }
         };
     return rel.accept(shuttle);
+  }
+
+  /**
+   * Chart/timechart 1D: swap a 2-column pre-Aggregate Project so the agg-input column comes BEFORE
+   * the group key — matching v2's RelBuilder convention. Update the Aggregate's groupSet and agg
+   * call argument references accordingly. Aggregate's output row type is unchanged (group keys
+   * first per groupSet order, then agg-call outputs), so consumers above the Aggregate continue to
+   * reference outputs at the same positions.
+   *
+   * <p>Conservative — only rewrites when:
+   *
+   * <ul>
+   *   <li>Pre-Project has exactly 2 columns
+   *   <li>Aggregate has exactly 1 group key and 1 agg call with 1 arg
+   *   <li>Group key is at pre-Project position 0 and agg arg is at pre-Project position 1
+   * </ul>
+   */
+  private RelNode swapChartPreAggregateColumnOrder(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle aggSwap =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject pre)) {
+              return visited;
+            }
+            if (pre.getProjects().size() != 2) return visited;
+            if (agg.getGroupSet().cardinality() != 1) return visited;
+            if (agg.getAggCallList().size() != 1) return visited;
+            int groupCol = agg.getGroupSet().nth(0);
+            org.apache.calcite.rel.core.AggregateCall ac = agg.getAggCallList().get(0);
+            if (ac.getArgList().size() != 1) return visited;
+            int aggCol = ac.getArgList().get(0);
+            if (!(groupCol == 0 && aggCol == 1)) return visited;
+            // Limit to chart-style aggregations: pre-Project's group key is a non-trivial RexCall
+            // (e.g. SPAN), not a plain RexInputRef. Plain stats aggregations like
+            // `stats count(balance) by gender` have RexInputRef group keys and v2 expects
+            // (group, agg) ordering for those — don't swap.
+            org.apache.calcite.rex.RexNode groupExpr = pre.getProjects().get(groupCol);
+            if (!(groupExpr instanceof org.apache.calcite.rex.RexCall)) return visited;
+            java.util.List<org.apache.calcite.rex.RexNode> newProjects =
+                java.util.List.of(pre.getProjects().get(1), pre.getProjects().get(0));
+            java.util.List<String> newNames =
+                java.util.List.of(
+                    pre.getRowType().getFieldNames().get(1),
+                    pre.getRowType().getFieldNames().get(0));
+            org.apache.calcite.rel.logical.LogicalProject newPre =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    pre.getInput(), pre.getHints(), newProjects, newNames, pre.getVariablesSet());
+            org.apache.calcite.util.ImmutableBitSet newGroup =
+                org.apache.calcite.util.ImmutableBitSet.of(1);
+            org.apache.calcite.rel.core.AggregateCall newAc =
+                ac.copy(java.util.List.of(0), ac.filterArg, ac.collation);
+            return agg.copy(
+                agg.getTraitSet(),
+                newPre,
+                newGroup,
+                java.util.List.of(newGroup),
+                java.util.List.of(newAc));
+          }
+        };
+    return rel.accept(aggSwap);
   }
 
   /**

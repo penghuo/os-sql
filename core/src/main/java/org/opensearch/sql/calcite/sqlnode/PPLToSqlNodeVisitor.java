@@ -3308,8 +3308,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       SqlNode windowedAgg;
       switch (c.getComputationType()) {
         case SMA -> {
-          SqlNode agg = new SqlBasicCall(SqlStdOperatorTable.AVG, List.of(fieldRef), POS);
-          windowedAgg = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(agg, window), POS);
+          // Emit SUM(x)/CAST(COUNT(x) AS DOUBLE) directly to bypass Calcite's
+          // AvgVarianceConvertlet (matches v2's SUM/CAST(COUNT) shape — see visitWindow).
+          SqlNode sumCall = new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(fieldRef), POS);
+          SqlNode sumOver =
+              new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(sumCall, window), POS);
+          SqlNode countCallArg =
+              new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(fieldRef), POS);
+          SqlNode countArgOver =
+              new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCallArg, window), POS);
+          org.apache.calcite.sql.SqlDataTypeSpec doubleSpecAvg =
+              new org.apache.calcite.sql.SqlDataTypeSpec(
+                  new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                      org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+                  POS);
+          SqlNode countAsDouble =
+              new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(countArgOver, doubleSpecAvg), POS);
+          windowedAgg =
+              new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(sumOver, countAsDouble), POS);
         }
         case WMA -> {
           // WMA = Σ(i * NTH_VALUE(field, i)) / (N*(N+1)/2). Cast the divisor to DOUBLE so the

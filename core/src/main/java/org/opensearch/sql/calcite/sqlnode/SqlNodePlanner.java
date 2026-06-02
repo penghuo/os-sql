@@ -1031,12 +1031,13 @@ public final class SqlNodePlanner {
             if (ac.getArgList().size() != 1) return visited;
             int aggCol = ac.getArgList().get(0);
             if (!(groupCol == 0 && aggCol == 1)) return visited;
-            // Limit to chart-style aggregations: pre-Project's group key is a non-trivial RexCall
-            // (e.g. SPAN), not a plain RexInputRef. Plain stats aggregations like
-            // `stats count(balance) by gender` have RexInputRef group keys and v2 expects
-            // (group, agg) ordering for those — don't swap.
+            // Limit to chart-style aggregations: pre-Project's group key is a SPAN function call
+            // (`chart agg by <field> span=N`). Plain stats group keys (RexInputRef like `gender`)
+            // and stats-with-CASE-group-keys use (group, agg) ordering per v2's RelBuilder.
             org.apache.calcite.rex.RexNode groupExpr = pre.getProjects().get(groupCol);
-            if (!(groupExpr instanceof org.apache.calcite.rex.RexCall)) return visited;
+            if (!(groupExpr instanceof org.apache.calcite.rex.RexCall gc)) return visited;
+            String opName = gc.getOperator().getName();
+            if (!"SPAN".equals(opName) && !"SPAN_BUCKET".equals(opName)) return visited;
             java.util.List<org.apache.calcite.rex.RexNode> newProjects =
                 java.util.List.of(pre.getProjects().get(1), pre.getProjects().get(0));
             java.util.List<String> newNames =

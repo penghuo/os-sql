@@ -4244,7 +4244,30 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode aggCallNode = aggCall(aggCore);
 
     // PPL chart drops rows where the split key is NULL (mirroring v2's nonNullGroupMask).
-    SqlNode nullFilter = new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(keyExpr), POS);
+    // For SPAN-typed group keys, IS NOT NULL targets the underlying field (SPAN(NULL)=NULL, so
+    // checking the field is equivalent and OpenSearch pushdown-friendly: emits term-not-exists
+    // query rather than a wrapped script). Mirrors v2's emission shape.
+    SqlNode keyNullCheckTarget = keyExpr;
+    if (gkCore instanceof Span sp) {
+      keyNullCheckTarget = expr(sp.getField());
+    }
+    SqlNode nullFilter =
+        new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(keyNullCheckTarget), POS);
+    // Also add IS NOT NULL on the agg arg when it's a single QualifiedName field — mirrors v2's
+    // aggregateWithTrimming behavior so OpenSearch composite source emits an `exists` filter,
+    // unlocking pushdown via doc_count.
+    UnresolvedExpression aggArg = aggArgIfSingleField(aggCore);
+    if (aggArg instanceof QualifiedName qn) {
+      // Only add when the agg arg is a different field from the group key.
+      String aggArgName = qn.toString();
+      String groupKeyName = (gkCore instanceof QualifiedName g) ? g.toString() : null;
+      if (groupKeyName == null || !aggArgName.equals(groupKeyName)) {
+        SqlNode aggArgNotNull =
+            new SqlBasicCall(SqlStdOperatorTable.IS_NOT_NULL, List.of(expr(aggArg)), POS);
+        nullFilter =
+            new SqlBasicCall(SqlStdOperatorTable.AND, List.of(nullFilter, aggArgNotNull), POS);
+      }
+    }
     SqlNodeList items = new SqlNodeList(POS);
     items.add(asAliased(keyExpr, gkAlias != null ? gkAlias : "_split"));
     items.add(asAliased(aggCallNode, aggAlias));
@@ -6499,6 +6522,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private static String aggLabel(UnresolvedExpression e) {
     if (e instanceof Alias a) return a.getName();
     return e.toString();
+  }
+
+  /**
+   * Return the agg argument as an UnresolvedExpression when the agg is a single-field
+   * AggregateFunction (count(field), sum(field), avg(field), etc.). Returns {@code null} for
+   * count(*), multi-arg aggs, or non-AggregateFunction expressions.
+   */
+  private static UnresolvedExpression aggArgIfSingleField(UnresolvedExpression e) {
+    UnresolvedExpression core = e instanceof Alias a ? a.getDelegated() : e;
+    if (!(core instanceof AggregateFunction af)) return null;
+    UnresolvedExpression field = af.getField();
+    if (field instanceof org.opensearch.sql.ast.expression.AllFields) return null;
+    if (field instanceof Field f) return f.getField();
+    if (field instanceof QualifiedName) return field;
+    return null;
   }
 
   /** Build {@code <expr> AS "<alias>"} with the alias quoted (preserves dots in the label). */

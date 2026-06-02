@@ -2862,14 +2862,37 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               cumulativeForDc ? dcUpper : frameUpper,
               null,
               POS);
-      SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
-      // Same NULL-guard as visitWindow: AVG/VAR/STDDEV over empty/all-NULL return NULL.
+      // For windowed AVG: emit SUM(x)/CAST(COUNT(x) AS DOUBLE) directly to bypass Calcite's
+      // AvgVarianceConvertlet (matches v2's emission shape — see visitWindow for rationale).
+      boolean isWindowedAvg =
+          aggNode instanceof SqlBasicCall avgBc
+              && avgBc.getOperator() == SqlStdOperatorTable.AVG
+              && avgBc.getOperandList().size() == 1;
+      SqlNode over;
+      if (isWindowedAvg) {
+        SqlNode arg = ((SqlBasicCall) aggNode).getOperandList().get(0);
+        SqlNode sumCall = new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(arg), POS);
+        SqlNode sumOver = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(sumCall, window), POS);
+        SqlNode countCall = new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(arg), POS);
+        SqlNode countOver =
+            new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCall, window), POS);
+        org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+                POS);
+        SqlNode countAsDouble =
+            new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(countOver, doubleSpec), POS);
+        over = new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(sumOver, countAsDouble), POS);
+      } else {
+        over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      }
+      // Same NULL-guard as visitWindow: VAR/STDDEV over empty/all-NULL return NULL. AVG handled
+      // via SUM/CAST(COUNT) shape above (NULL division returns NULL via PPL DIVIDE semantics).
       if (aggNode instanceof SqlBasicCall bc && bc.getOperandList().size() == 1) {
         org.apache.calcite.sql.SqlOperator op = bc.getOperator();
         boolean needsZeroGuard =
-            op == SqlStdOperatorTable.AVG
-                || op == SqlStdOperatorTable.VAR_POP
-                || op == SqlStdOperatorTable.STDDEV_POP;
+            op == SqlStdOperatorTable.VAR_POP || op == SqlStdOperatorTable.STDDEV_POP;
         boolean needsOneGuard =
             op == SqlStdOperatorTable.VAR_SAMP || op == SqlStdOperatorTable.STDDEV_SAMP;
         if (needsZeroGuard || needsOneGuard) {
@@ -3111,17 +3134,43 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               null,
               null,
               POS);
-      SqlNode over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      // For windowed AVG: emit SUM(x)/CAST(COUNT(x) AS DOUBLE) directly instead of relying on
+      // Calcite's AvgVarianceConvertlet to expand AVG. The convertlet emits a redundant
+      // `CASE(>(COUNT, 0), CAST(SUM):DOUBLE, null) / COUNT` shape; v2 emits the simpler
+      // `SUM/CAST(COUNT)` form. Outer NULL-guard from partitionNotNullCheck (when present)
+      // already covers the all-NULL/empty-partition case at the partition level.
+      boolean isWindowedAvg =
+          aggNode instanceof SqlBasicCall avgBc
+              && avgBc.getOperator() == SqlStdOperatorTable.AVG
+              && avgBc.getOperandList().size() == 1;
+      SqlNode over;
+      if (isWindowedAvg) {
+        SqlNode arg = ((SqlBasicCall) aggNode).getOperandList().get(0);
+        SqlNode sumCall = new SqlBasicCall(SqlStdOperatorTable.SUM, List.of(arg), POS);
+        SqlNode sumOver = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(sumCall, window), POS);
+        SqlNode countCall = new SqlBasicCall(SqlStdOperatorTable.COUNT, List.of(arg), POS);
+        SqlNode countOver =
+            new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(countCall, window), POS);
+        org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
+            new org.apache.calcite.sql.SqlDataTypeSpec(
+                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                    org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
+                POS);
+        SqlNode countAsDouble =
+            new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(countOver, doubleSpec), POS);
+        over = new SqlBasicCall(SqlStdOperatorTable.DIVIDE, List.of(sumOver, countAsDouble), POS);
+      } else {
+        over = new SqlBasicCall(SqlStdOperatorTable.OVER, List.of(aggNode, window), POS);
+      }
       // Calcite's standard AVG over a partition with all-NULL values returns 0 (the SUM/COUNT
       // convertlet yields 0/0 in the enumerable runtime). PPL semantics: NULL when no non-NULL
-      // rows contributed. Wrap AVG with `CASE WHEN COUNT(field) > 0 THEN <avg> ELSE NULL END`.
-      // VAR_SAMP/STDDEV_SAMP need n>1 for Bessel's correction; VAR_POP/STDDEV_POP need n>0.
+      // rows contributed. For VAR_SAMP/STDDEV_SAMP need n>1 (Bessel's correction); for
+      // VAR_POP/STDDEV_POP need n>0. AVG is handled via the SUM/CAST(COUNT) shape above which
+      // returns NULL naturally for divide-by-zero (PPL DIVIDE semantics).
       if (aggNode instanceof SqlBasicCall bc && bc.getOperandList().size() == 1) {
         org.apache.calcite.sql.SqlOperator op = bc.getOperator();
         boolean needsZeroGuard =
-            op == SqlStdOperatorTable.AVG
-                || op == SqlStdOperatorTable.VAR_POP
-                || op == SqlStdOperatorTable.STDDEV_POP;
+            op == SqlStdOperatorTable.VAR_POP || op == SqlStdOperatorTable.STDDEV_POP;
         boolean needsOneGuard =
             op == SqlStdOperatorTable.VAR_SAMP || op == SqlStdOperatorTable.STDDEV_SAMP;
         if (needsZeroGuard || needsOneGuard) {

@@ -5166,10 +5166,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       String aliasField,
       org.opensearch.sql.ast.expression.PatternMode mode,
       boolean showNumbered) {
-    if (mode == org.opensearch.sql.ast.expression.PatternMode.AGGREGATION) {
-      throw new UnsupportedOperationException(
-          "patterns method=BRAIN mode=AGGREGATION not yet supported in PPLToSqlNodeVisitor");
-    }
+    // For AGGREGATION mode: emit the BRAIN-LABEL projection first (PATTERN_PARSER OVER ...),
+    // then wrap with GROUP BY (partitionBy + patterns_field). Mirrors v2's
+    // CalciteRelNodeVisitor flow for BRAIN AGG. show_numbered_token is propagated through to
+    // the LABEL pass; the post-AGG re-run via PATTERN_PARSER is wired in
+    // emitPatternsAggregation when needed.
+    boolean aggMode = mode == org.opensearch.sql.ast.expression.PatternMode.AGGREGATION;
+    // BRAIN's PATTERN_PARSER produces the `<tokenN>`-numbered placeholders directly in the
+    // LABEL phase, so propagate showNumbered through. The post-AGG re-run (used by
+    // SIMPLE_PATTERN AGG show_numbered=true) is unnecessary for BRAIN.
+    boolean labelShowNumbered = showNumbered;
     SqlNode source = expr(node.getSourceField());
     SqlNode maxSampleCount =
         node.getPatternMaxSampleCount() != null
@@ -5267,7 +5273,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     items.add(asAliased(safeCastPattern, aliasField));
     visible.add(aliasField);
-    if (showNumbered) {
+    if (labelShowNumbered) {
       SqlNode itemTokens =
           new SqlBasicCall(
               SqlStdOperatorTable.ITEM,
@@ -5276,7 +5282,25 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       items.add(asAliased(itemTokens, "tokens"));
       visible.add("tokens");
     }
-    return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+    SqlNode labelSelect = SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+    if (!aggMode) {
+      return labelSelect;
+    }
+    // AGGREGATION mode: GROUP BY (partitionBy ..., patterns_field) post-LABEL. Reuse the
+    // SIMPLE_PATTERN aggregator with a passthrough patternsExpr (the LABEL-emitted aliasField
+    // column is already the patterns_field). Pass the actual user method (BRAIN) so the
+    // showNumbered post-AGG re-run uses BRAIN's tokens format.
+    // For BRAIN AGG, the LABEL phase already produced numbered tokens — skip post-AGG re-run
+    // by passing showNumbered=false. For SIMPLE_PATTERN AGG, the post-AGG re-run is what
+    // produces numbered tokens; that path stays in visitPatternsSimple.
+    return emitPatternsAggregation(
+        node,
+        frame,
+        labelSelect,
+        aliasField,
+        new SqlIdentifier(aliasField, POS),
+        org.opensearch.sql.ast.expression.PatternMethod.BRAIN,
+        /* showNumbered */ false);
   }
 
   /**
@@ -5349,10 +5373,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       SqlNode patternsExpr,
       org.opensearch.sql.ast.expression.PatternMethod method,
       boolean showNumbered) {
-    if (method != org.opensearch.sql.ast.expression.PatternMethod.SIMPLE_PATTERN) {
-      throw new UnsupportedOperationException(
-          "patterns method=BRAIN mode=AGGREGATION not yet supported in PPLToSqlNodeVisitor");
-    }
+    // Both SIMPLE_PATTERN and BRAIN flow through this aggregator. The patternsExpr passed in is
+    // the patterns_field source — for SIMPLE_PATTERN it's the CASE/REGEXP_REPLACE expression
+    // built upstream; for BRAIN it's a column reference to the LABEL-emitted aliasField.
     List<SqlNode> selects = new ArrayList<>();
     List<SqlNode> groupKeys = new ArrayList<>();
     List<String> visible = new ArrayList<>();

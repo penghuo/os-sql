@@ -629,6 +629,11 @@ public final class SqlNodePlanner {
     // keeps `30` (INTEGER). Strip the redundant widening from comparison/Sarg-bound literals so
     // explain output matches v2.
     rel = demoteIntegerLiterals(rel);
+    // Rewrite `CASE(>(COUNT(x) OVER W, 0), SUM(x) OVER W, null:T)` → `SUM(x) OVER W`. Calcite's
+    // StandardConvertletTable.SUM expands a nullable-input SUM with this CASE wrapper at
+    // SqlToRel conversion time; v2's RelBuilder direct path doesn't expand. The wrapper is
+    // semantically redundant (SUM is already nullable), so we strip it to match v2's emission.
+    rel = unwrapWindowedSumNullGuard(rel);
     // Rewrite CASE(IS NOT NULL($x), CAST($x):T, replacement) back to COALESCE($x, replacement).
     // StandardConvertletTable expands COALESCE to CASE during SqlNode→Rel conversion. v2's
     // RexBuilder.makeCall(COALESCE) skips this expansion, so explain output shows COALESCE
@@ -1523,6 +1528,91 @@ public final class SqlNodePlanner {
               }
             }
             return visited;
+          }
+        };
+    org.apache.calcite.rel.RelShuttle relShuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            return visited.accept(rexShuttle);
+          }
+        };
+    return rel.accept(relShuttle);
+  }
+
+  /**
+   * Rewrite {@code CASE(>(COUNT(x) OVER W, 0), SUM(x) OVER W, null:T)} back to plain {@code SUM(x)
+   * OVER W}. StandardConvertletTable.SUM expands a nullable-input SUM with this CASE wrapper at
+   * SqlToRel conversion time; v2's RelBuilder.aggregateCall path doesn't expand. The wrapper is
+   * semantically redundant (SUM is nullable, returns NULL on empty/all-NULL).
+   *
+   * <p>The pattern matches when:
+   *
+   * <ul>
+   *   <li>Outer call is CASE with 3 operands.
+   *   <li>Operand 0 is {@code >(COUNT($expr) OVER W, 0)} (any COUNT input expr is fine).
+   *   <li>Operand 1 is {@code SUM($expr) OVER W'} where W' has the same partition/orderby/frame as
+   *       W (same OVER clause).
+   *   <li>Operand 2 is a typed NULL literal.
+   * </ul>
+   */
+  private RelNode unwrapWindowedSumNullGuard(RelNode rel) {
+    org.apache.calcite.rex.RexShuttle rexShuttle =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexCall visited =
+                (org.apache.calcite.rex.RexCall) super.visitCall(call);
+            if (visited.getKind() != org.apache.calcite.sql.SqlKind.CASE
+                || visited.getOperands().size() != 3) {
+              return visited;
+            }
+            org.apache.calcite.rex.RexNode whenOp = visited.getOperands().get(0);
+            org.apache.calcite.rex.RexNode thenOp = visited.getOperands().get(1);
+            org.apache.calcite.rex.RexNode elseOp = visited.getOperands().get(2);
+            // ELSE must be a NULL literal.
+            if (!(elseOp instanceof org.apache.calcite.rex.RexLiteral elseLit)
+                || !elseLit.isNull()) {
+              return visited;
+            }
+            // WHEN must be `>(COUNT(...) OVER ..., 0)`.
+            if (!(whenOp instanceof org.apache.calcite.rex.RexCall whenCall)
+                || whenCall.getKind() != org.apache.calcite.sql.SqlKind.GREATER_THAN
+                || whenCall.getOperands().size() != 2) {
+              return visited;
+            }
+            org.apache.calcite.rex.RexNode whenLhs = whenCall.getOperands().get(0);
+            org.apache.calcite.rex.RexNode whenRhs = whenCall.getOperands().get(1);
+            if (!(whenRhs instanceof org.apache.calcite.rex.RexLiteral rhsLit)
+                || rhsLit.isNull()
+                || !(rhsLit.getValueAs(java.math.BigDecimal.class) != null
+                    && rhsLit.getValueAs(java.math.BigDecimal.class).signum() == 0)) {
+              return visited;
+            }
+            if (!(whenLhs instanceof org.apache.calcite.rex.RexOver whenOver)
+                || whenOver.getAggOperator()
+                    != org.apache.calcite.sql.fun.SqlStdOperatorTable.COUNT) {
+              return visited;
+            }
+            // THEN must be `SUM(...) OVER ...`.
+            if (!(thenOp instanceof org.apache.calcite.rex.RexOver thenOver)
+                || thenOver.getAggOperator()
+                    != org.apache.calcite.sql.fun.SqlStdOperatorTable.SUM) {
+              return visited;
+            }
+            // Window must match (same partition, order, frame).
+            if (!whenOver.getWindow().equals(thenOver.getWindow())) {
+              return visited;
+            }
+            // The COUNT and SUM arg must reference the same expression.
+            if (whenOver.getOperands().size() != 1 || thenOver.getOperands().size() != 1) {
+              return visited;
+            }
+            if (!whenOver.getOperands().get(0).equals(thenOver.getOperands().get(0))) {
+              return visited;
+            }
+            return thenOp;
           }
         };
     org.apache.calcite.rel.RelShuttle relShuttle =

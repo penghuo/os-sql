@@ -5572,11 +5572,27 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         new SqlBasicCall(SqlStdOperatorTable.FILTER, List.of(arrayAgg, notNullFilter), POS);
     items.add(asAliased(filteredArrayAgg, fieldName));
     newVisible.add(fieldName);
-    return SqlBuilder.select(items)
-        .from(child)
-        .groupBy(groupKeys)
-        .withFields(newVisible)
-        .wrap(frame);
+    SqlNode aggSelect =
+        SqlBuilder.select(items).from(child).groupBy(groupKeys).withFields(newVisible).wrap(frame);
+    // Wrap with an outer `SELECT * FROM (<aggregate>)` so the planner emits the
+    // top-level identity Project that v2's RelBuilder produces. Otherwise SqlToRelConverter
+    // collapses the aggregate to a single LogicalAggregate without a passthrough Project.
+    SqlNode outer =
+        new SqlSelect(
+            POS,
+            null,
+            new SqlNodeList(List.of(SqlIdentifier.star(POS)), POS),
+            aggSelect,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+    frame.currentFields = newVisible;
+    return outer;
   }
 
   @Override

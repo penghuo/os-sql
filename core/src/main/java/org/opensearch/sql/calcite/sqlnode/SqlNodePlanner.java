@@ -607,6 +607,14 @@ public final class SqlNodePlanner {
     // v2's RelBuilder constructs the null literal with NULL type explicitly, so explain output
     // shows `null:NULL`. Rewrite typed-null ELSE literals back to NULL type.
     rel = rewriteTrendlineCaseElseNullType(rel);
+    // visitBin CountBin emits WIDTH_BUCKET(field, bins, dataRange=MAX-MIN, max). The TIMESTAMP
+    // operand-type signature requires dataRange:CHARACTER (because TIMESTAMP-TIMESTAMP returns
+    // INTERVAL-as-string semantically). SqlValidator's type coercion wraps the SqlNode-emitted
+    // `MAX(@ts) OVER () - MIN(@ts) OVER ()` in `CAST(MINUS(CAST(MAX):DECIMAL, CAST(MIN):DECIMAL)):
+    // VARCHAR`. v2's RelBuilder constructs the RexCall directly so its dataRange stays as plain
+    // MINUS(MAX, MIN). Strip the outer CAST-VARCHAR + inner CAST-DECIMAL wrappers from
+    // WIDTH_BUCKET's third argument when the inner shape matches MINUS(RexOver, RexOver).
+    rel = stripWidthBucketDataRangeCasts(rel);
     // Collapse `Project(span_alias=$N) <- Filter(F on $M) <- Project(passthrough[*] + SPAN AS
     // span_alias)`
     // when the outer Project ONLY references the trailing SPAN column. This pattern comes from
@@ -1254,6 +1262,82 @@ public final class SqlNodePlanner {
             newOps.set(ops.size() - 1, newNull);
             return (org.apache.calcite.rex.RexCall)
                 rb.makeCall(visited.getType(), visited.getOperator(), newOps);
+          }
+        };
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            return visited.accept(rex);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Strip type-coercion CAST wrappers around the {@code dataRange} (3rd) argument of a {@code
+   * WIDTH_BUCKET} call. The visitor emits {@code WIDTH_BUCKET(field, bins, MAX(field) OVER -
+   * MIN(field) OVER, MAX(field) OVER)}; SqlValidator's CHARACTER-family operand check on the
+   * TIMESTAMP signature wraps the MAX-MIN MINUS in {@code CAST(MINUS(CAST(MAX):DECIMAL, CAST
+   * (MIN):DECIMAL)):VARCHAR}. v2's RelBuilder constructs the RexCall directly, leaving the
+   * dataRange as plain {@code MINUS(MAX OVER, MIN OVER)}. Conservative: only fires when the inner
+   * shape is exactly {@code CAST(MINUS(CAST(RexOver):DECIMAL, CAST(RexOver):DECIMAL)): VARCHAR}.
+   */
+  private RelNode stripWidthBucketDataRangeCasts(RelNode rel) {
+    org.apache.calcite.rex.RexShuttle rex =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitCall(org.apache.calcite.rex.RexCall call) {
+            org.apache.calcite.rex.RexCall visited =
+                (org.apache.calcite.rex.RexCall) super.visitCall(call);
+            String opName = visited.getOperator().getName();
+            if (!"WIDTH_BUCKET".equals(opName)) return visited;
+            if (visited.getOperands().size() != 4) return visited;
+            org.apache.calcite.rex.RexNode dataRange = visited.getOperands().get(2);
+            org.apache.calcite.rex.RexNode stripped = stripDataRangeCasts(dataRange);
+            if (stripped == dataRange) return visited;
+            java.util.List<org.apache.calcite.rex.RexNode> newOps =
+                new java.util.ArrayList<>(visited.getOperands());
+            newOps.set(2, stripped);
+            return (org.apache.calcite.rex.RexCall)
+                rel.getCluster()
+                    .getRexBuilder()
+                    .makeCall(visited.getType(), visited.getOperator(), newOps);
+          }
+
+          private org.apache.calcite.rex.RexNode stripDataRangeCasts(
+              org.apache.calcite.rex.RexNode dr) {
+            // Match: CAST(MINUS(CAST(RexOver):DECIMAL, CAST(RexOver):DECIMAL)):VARCHAR
+            if (!(dr instanceof org.apache.calcite.rex.RexCall outerCast)) return dr;
+            if (outerCast.getOperator() != org.apache.calcite.sql.fun.SqlStdOperatorTable.CAST)
+              return dr;
+            if (outerCast.getType().getSqlTypeName()
+                != org.apache.calcite.sql.type.SqlTypeName.VARCHAR) return dr;
+            if (!(outerCast.getOperands().get(0) instanceof org.apache.calcite.rex.RexCall minus))
+              return dr;
+            if (minus.getOperator() != org.apache.calcite.sql.fun.SqlStdOperatorTable.MINUS)
+              return dr;
+            if (minus.getOperands().size() != 2) return dr;
+            org.apache.calcite.rex.RexNode lhs =
+                unwrapDecimalCastOnRexOver(minus.getOperands().get(0));
+            org.apache.calcite.rex.RexNode rhs =
+                unwrapDecimalCastOnRexOver(minus.getOperands().get(1));
+            if (lhs == null || rhs == null) return dr;
+            return rel.getCluster()
+                .getRexBuilder()
+                .makeCall(org.apache.calcite.sql.fun.SqlStdOperatorTable.MINUS, lhs, rhs);
+          }
+
+          private org.apache.calcite.rex.RexNode unwrapDecimalCastOnRexOver(
+              org.apache.calcite.rex.RexNode n) {
+            if (!(n instanceof org.apache.calcite.rex.RexCall innerCast)) return null;
+            if (innerCast.getOperator() != org.apache.calcite.sql.fun.SqlStdOperatorTable.CAST)
+              return null;
+            if (innerCast.getType().getSqlTypeName()
+                != org.apache.calcite.sql.type.SqlTypeName.DECIMAL) return null;
+            org.apache.calcite.rex.RexNode inner = innerCast.getOperands().get(0);
+            return (inner instanceof org.apache.calcite.rex.RexOver) ? inner : null;
           }
         };
     org.apache.calcite.rel.RelShuttle shuttle =

@@ -607,6 +607,14 @@ public final class SqlNodePlanner {
     // collapse `Sort(fetch) -> Project -> Sort(collation)` to `Project -> Sort(fetch) ->
     // Sort(collation)` which is the directly-adjacent shape my fuse handles.
     rel = fuseAdjacentSorts(rel);
+    // Lift a passthrough Project from below an inner FETCH-only Sort to between two nested
+    // Sorts. Pattern: `Sort(outer) -> Sort(inner FETCH-only) -> Project(passthrough) -> X`
+    // becomes `Sort(outer) -> Project -> Sort(inner FETCH-only) -> X`. This is the URL-fetch-size
+    // (outer) + user `head N | fields col` (inner) emission shape — v2's RelBuilder produces the
+    // Project BETWEEN the two Sorts; ours produces the Project below both. swapSortAndPassthrough
+    // alone doesn't handle this because `Sort -> Project -> Scan` doesn't satisfy its swap
+    // conditions (project is single-col passthrough with no Filter/Sort below).
+    rel = liftProjectBetweenNestedSorts(rel);
     // Re-run trim AFTER swap so adjacent passthrough Projects produced by the swap (e.g. a
     // user-fields Project sitting on top of an eval-extended Project that exposed a sort key)
     // get collapsed into a single composed Project.
@@ -822,6 +830,74 @@ public final class SqlNodePlanner {
             // need an explicit override. Process children, then attempt the fuse.
             RelNode visited = super.visit(sort);
             return tryFuseAdjacentSorts(visited);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Lift a passthrough Project from below a FETCH-only inner Sort to between two nested Sorts.
+   *
+   * <p>Pattern: {@code Sort(outer) -> Sort(inner FETCH-only, no collation) -> Project(passthrough)
+   * -> X} becomes {@code Sort(outer) -> Project -> Sort(inner FETCH-only) -> X}.
+   *
+   * <p>This is the URL-fetch-size + user `head N | fields col` emission shape — v2's RelBuilder
+   * produces the Project BETWEEN the two Sorts; ours produces the Project below both because
+   * swapSortAndPassthroughProject's swap conditions don't match `Sort -> Project -> Scan` when the
+   * Project is single-col passthrough with no Filter/Sort below.
+   *
+   * <p>Outer Sort's collation field indices are re-mapped through Project's index mapping when the
+   * outer Sort has collation keys.
+   */
+  private RelNode liftProjectBetweenNestedSorts(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            return tryLift(visited);
+          }
+
+          @Override
+          public RelNode visit(org.apache.calcite.rel.logical.LogicalSort sort) {
+            RelNode visited = super.visit(sort);
+            return tryLift(visited);
+          }
+
+          private RelNode tryLift(RelNode visited) {
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalSort outerSort)) {
+              return visited;
+            }
+            if (!(outerSort.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalSort innerSort)) {
+              return visited;
+            }
+            if (innerSort.fetch == null) return visited;
+            if (!innerSort.getCollation().getFieldCollations().isEmpty()) return visited;
+            if (!(innerSort.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
+              return visited;
+            }
+            if (!isPassthroughProject(proj)) return visited;
+            // Inner Sort moves below Project: its collation is empty (FETCH-only), so no remap
+            // needed. Inner Sort's input becomes Project's input (the Scan or whatever).
+            org.apache.calcite.rel.logical.LogicalSort newInner =
+                org.apache.calcite.rel.logical.LogicalSort.create(
+                    proj.getInput(), innerSort.getCollation(), innerSort.offset, innerSort.fetch);
+            // Project sits over the new inner Sort. Its row type is unchanged (same projected
+            // exprs over the same input row type).
+            org.apache.calcite.rel.logical.LogicalProject newProj =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    newInner,
+                    proj.getHints(),
+                    proj.getProjects(),
+                    proj.getRowType().getFieldNames(),
+                    proj.getVariablesSet());
+            // Outer Sort sits over the new Project. Its collation indices reference Project's
+            // output positions — unchanged before and after the lift since Project's output row
+            // type is the same.
+            return org.apache.calcite.rel.logical.LogicalSort.create(
+                newProj, outerSort.getCollation(), outerSort.offset, outerSort.fetch);
           }
         };
     return rel.accept(shuttle);

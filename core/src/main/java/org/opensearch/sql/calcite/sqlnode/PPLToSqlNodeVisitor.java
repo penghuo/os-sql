@@ -2536,8 +2536,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     //
     // When ALL stream-window aggs are earliest/latest (ARG_MIN/ARG_MAX), they carry their own
     // ordering via the second arg (the time field). v2 emits `OVER (ROWS UNBOUNDED PRECEDING)`
-    // without an ORDER BY clause; mirror that by skipping the seq synthesis. Mirrors legacy
-    // commit d4b48e1ba1.
+    // without an ORDER BY clause; mirror that by skipping the OVER ORDER BY but still synthesising
+    // __stream_seq__ for outer Sort. Mirrors legacy commit d4b48e1ba1.
     boolean allArgMinMax = true;
     if (node.getWindowFunctionList() == null || node.getWindowFunctionList().isEmpty()) {
       allArgMinMax = false;
@@ -2567,12 +2567,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNodeList orderBy = new SqlNodeList(POS);
     SqlNode wrappedFrom = from;
     List<String> postSeqFields = frame.currentFields;
-    if (allArgMinMax && !hasReset && !useRange) {
-      // No ORDER BY synthesis; ARG_MIN/ARG_MAX's 2nd arg is the time field providing ordering.
-    } else if (frame.currentFields.contains("__stream_seq__")) {
+    if (frame.currentFields.contains("__stream_seq__")) {
       // Upstream streamstats already provides the seq — reuse it for stable ordering. Don't
       // re-synthesise.
-      orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+      if (!allArgMinMax || hasReset || useRange) {
+        orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+      }
     } else if (!useRange && frame.lastOrderBy != null && !frame.lastOrderBy.isEmpty()) {
       // useRange needs a numeric seq column for RANGE bounds. Skip the lastOrderBy path so the
       // synth branch below materialises __stream_seq__.
@@ -2602,7 +2602,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               POS, null, seqSelect, from, null, null, null, null, null, null, null, null, null);
       postSeqFields = new ArrayList<>(frame.currentFields);
       postSeqFields.add("__stream_seq__");
-      orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+      // For allArgMinMax (earliest/latest), the OVER itself doesn't need ORDER BY because
+      // ARG_MIN/ARG_MAX carry their own ordering via the time-field arg. The synthesised
+      // __stream_seq__ still flows through to a downstream Sort for stable result ordering.
+      if (!allArgMinMax || hasReset || useRange) {
+        orderBy.add(new SqlIdentifier("__stream_seq__", POS));
+      }
     }
     // Reset support: each row's reset flag bumps a __seg_id__; cumulative aggregate restarts
     // when segment id changes. Compute __seg_id__ in a wrapping SELECT and prepend it to the

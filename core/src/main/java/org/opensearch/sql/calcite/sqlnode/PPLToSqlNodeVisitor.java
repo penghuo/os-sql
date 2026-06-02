@@ -2567,7 +2567,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNodeList orderBy = new SqlNodeList(POS);
     SqlNode wrappedFrom = from;
     List<String> postSeqFields = frame.currentFields;
-    if (frame.currentFields.contains("__stream_seq__")) {
+    // For allArgMinMax with no partitioning (`by`), v2 emits a bare OVER (ROWS UNBOUNDED
+    // PRECEDING) without seq synthesis — ARG_MIN/ARG_MAX over the whole stream collapses to a
+    // global earliest/latest, no need for stable ordering. Skip synthesis in that case.
+    boolean skipSeqSynthForArgMinMax = allArgMinMax && !hasGroup && !hasReset && !useRange;
+    if (skipSeqSynthForArgMinMax) {
+      // No ORDER BY, no seq — leave both unset so the OVER below has no ORDER BY clause.
+    } else if (frame.currentFields.contains("__stream_seq__")) {
       // Upstream streamstats already provides the seq — reuse it for stable ordering. Don't
       // re-synthesise.
       if (!allArgMinMax || hasReset || useRange) {
@@ -2795,11 +2801,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // SqlNodePlanner.stripSyntheticSeqColumns drops __stream_seq__ from the user-facing
     // top-level row type after RelNode conversion.
     //
-    // Filter metadata fields out — including them produces an extra LogicalProject layer when
-    // the planner-level stripMetadataFields shuttle later trims the row type. Mirrors the
-    // visitDedupe / visitWindow pattern.
+    // Keep metadata fields here — v2's streamstats Project preserves metadata, and the
+    // planner-level stripMetadataFields composes the strip into the final outer Project so
+    // there's no extra layer.
     for (String c : postSeqFields) {
-      if (OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) continue;
       items.add(toIdentifier(c));
       visible.add(c);
     }
@@ -2933,7 +2938,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       items.add(asAliased(over, al.getName()));
       visible.add(al.getName());
     }
-    SqlNode result = SqlBuilder.select(items).from(wrappedFrom).withFields(visible).wrap(frame);
+    SqlBuilder.SelectBuilder rb = SqlBuilder.select(items).from(wrappedFrom).withFields(visible);
+    // For allArgMinMax (earliest/latest only), we skipped the OVER's ORDER BY since
+    // ARG_MIN/ARG_MAX carry their own ordering. The synthesized __stream_seq__ still needs to
+    // sort the result for stable streaming order — emit an outer ORDER BY __stream_seq__ here
+    // so v2's `LogicalSort(__stream_seq__) <- LogicalProject(window+seq) <- ...` shape is
+    // reproduced. Skip when seq isn't in scope (no synthesis happened).
+    if (allArgMinMax && !hasReset && !useRange && visible.contains("__stream_seq__")) {
+      rb.orderBy(List.of(new SqlIdentifier("__stream_seq__", POS)));
+    }
+    SqlNode result = rb.wrap(frame);
     // Streamstats with `by` partitioning: a downstream `reverse` should flip the per-partition
     // streaming order (testStreamstatsByWithReverse). __stream_seq__ is included in postSeqFields
     // and propagated through `visible`, so it's resolvable in the outer scope. Set it as the

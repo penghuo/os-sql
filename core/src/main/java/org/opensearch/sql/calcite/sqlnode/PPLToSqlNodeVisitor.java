@@ -3239,11 +3239,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
               : new SqlBasicCall(SqlStdOperatorTable.AND, List.of(whereCond, notNull), POS);
     }
 
-    // Sort embedded in the OVER clause's ORDER BY. PPL `trendline sort <fld> sma(...)` puts the
-    // ordering inside the window; an outer ORDER BY on the same key is also retained so the
-    // result preserves the requested sort.
+    // PPL `trendline sort <fld> sma(...)` puts the ordering BEFORE the window: the outer SELECT
+    // sorts the input, then the OVER clause computes over the already-sorted stream. v2's
+    // RelBuilder emits this layout (LogicalSort below the trendline Project, OVER without ORDER
+    // BY). Calcite's Window operator preserves input collation, so omitting ORDER BY in OVER is
+    // semantically equivalent.
     SqlNodeList windowOrderBy = new SqlNodeList(POS);
-    List<SqlNode> outerOrderBy = null;
+    SqlNode sortKeyForFromClause = null;
     if (node.getSortByField().isPresent()) {
       Field sortField = node.getSortByField().get();
       Sort.SortOption opt = analyzeSortOption(sortField.getFieldArgs());
@@ -3251,18 +3253,38 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (opt.getSortOrder() == Sort.SortOrder.DESC) {
         key = new SqlBasicCall(SqlStdOperatorTable.DESC, List.of(key), POS);
       }
-      windowOrderBy.add(key);
-      outerOrderBy = List.of(key);
+      sortKeyForFromClause = key;
     }
 
     // Wrap the child with the NULL pre-filter so the trendline columns and pre-existing columns
-    // come from the same SELECT scope.
+    // come from the same SELECT scope. When a sort key is present, layer it BELOW the filter as
+    // a separate SELECT-with-ORDER-BY so the resulting plan is `Filter <- Sort <- ... <- from`,
+    // matching v2's emission shape (the trendline window then sees an already-sorted, filtered
+    // stream).
+    SqlNode preFiltered = from;
+    if (sortKeyForFromClause != null) {
+      SqlNodeList sortByList = new SqlNodeList(List.of(sortKeyForFromClause), POS);
+      preFiltered =
+          new SqlSelect(
+              POS,
+              null,
+              new SqlNodeList(List.of(SqlIdentifier.star(POS)), POS),
+              from,
+              null,
+              null,
+              null,
+              null,
+              sortByList,
+              null,
+              null,
+              null);
+    }
     SqlNode filtered =
         new SqlSelect(
             POS,
             null,
             new SqlNodeList(List.of(SqlIdentifier.star(POS)), POS),
-            from,
+            preFiltered,
             whereCond,
             null,
             null,
@@ -3401,9 +3423,6 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
 
     SqlBuilder.SelectBuilder b = SqlBuilder.select(items).from(filtered).withFields(visible);
-    if (outerOrderBy != null) {
-      b.orderBy(outerOrderBy);
-    }
     return b.wrap(frame);
   }
 

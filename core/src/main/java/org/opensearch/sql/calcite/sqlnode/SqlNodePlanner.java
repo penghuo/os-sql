@@ -773,11 +773,14 @@ public final class SqlNodePlanner {
   private static boolean allCoveredByIsNotNullFilter(
       RelNode rel, java.util.Set<Integer> requiredIndices) {
     java.util.Set<Integer> coveredIndices = new java.util.HashSet<>();
+    java.util.Set<Integer> autoCoveredIndices = new java.util.HashSet<>();
     int safety = 8;
     while (rel != null && safety-- > 0) {
       if (rel instanceof org.apache.calcite.rel.logical.LogicalFilter filter) {
         collectIsNotNullRefs(filter.getCondition(), coveredIndices);
-        if (coveredIndices.containsAll(requiredIndices)) {
+        java.util.Set<Integer> totalCovered = new java.util.HashSet<>(coveredIndices);
+        totalCovered.addAll(autoCoveredIndices);
+        if (totalCovered.containsAll(requiredIndices)) {
           return true;
         }
         rel = filter.getInput();
@@ -789,6 +792,25 @@ public final class SqlNodePlanner {
         // indices. Allow SPAN(field, ...) projection too — the underlying field's IS NOT NULL
         // covers the SPAN's null check (SPAN of NULL is NULL).
         rel = proj.getInput();
+      } else if (rel instanceof org.apache.calcite.rel.logical.LogicalProject proj) {
+        // Wide Project with computed expressions: collect indices whose projection is
+        // statically non-nullable (CASE-with-else, COALESCE, literal, etc.) — those positions
+        // can never produce NULL so the bucket-non-null guarantee holds without an explicit
+        // IS NOT NULL filter. Stop descending after this layer; only one wide-Project hop is
+        // expected.
+        java.util.List<org.apache.calcite.rex.RexNode> projects = proj.getProjects();
+        for (int reqIdx : requiredIndices) {
+          if (reqIdx < 0 || reqIdx >= projects.size()) continue;
+          if (!projects.get(reqIdx).getType().isNullable()) {
+            autoCoveredIndices.add(reqIdx);
+          }
+        }
+        java.util.Set<Integer> totalCovered = new java.util.HashSet<>(coveredIndices);
+        totalCovered.addAll(autoCoveredIndices);
+        if (totalCovered.containsAll(requiredIndices)) {
+          return true;
+        }
+        return false;
       } else {
         return false;
       }

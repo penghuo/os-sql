@@ -4337,6 +4337,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       gkAlias = qn.toString();
     } else if (splitKey instanceof Field f && f.getField() instanceof QualifiedName qn) {
       gkAlias = qn.toString();
+    } else if (splitKey instanceof Span sp && sp.getField() instanceof QualifiedName fqn) {
+      // `chart agg by <field> span=<N>` — use the underlying field name as the alias. Calcite
+      // auto-suffixes with `0` (e.g. `age0`) when the alias collides with an input column,
+      // matching v2's RelBuilder emission shape.
+      gkAlias = fqn.toString();
     }
     SqlNode keyExpr = expr(gkCore);
 

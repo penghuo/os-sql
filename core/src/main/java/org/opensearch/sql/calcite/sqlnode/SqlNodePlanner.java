@@ -1156,16 +1156,37 @@ public final class SqlNodePlanner {
               int preIdx = groupKeys.get(aggOutputIdx);
               if (preIdx >= preNames.size()) continue;
               String preName = preNames.get(preIdx);
-              if (!preName.startsWith("$f")) continue;
-              try {
-                Integer.parseInt(preName.substring(2));
-              } catch (NumberFormatException e) {
-                continue;
+              boolean isAutoName = false;
+              if (preName.startsWith("$f")) {
+                try {
+                  Integer.parseInt(preName.substring(2));
+                  isAutoName = true;
+                } catch (NumberFormatException e) {
+                  // not auto
+                }
               }
+              // Also treat function-call display names (e.g. `span(age,10)`) as auto-derived
+              // so they can be replaced by the outer Project's user-visible alias. v2's
+              // RelBuilder names group-key Projects by the user alias (e.g. `age`, which
+              // collides with input col `age` and gets Calcite-renamed to `age0`).
+              if (!isAutoName && preName.indexOf('(') >= 0) {
+                isAutoName = true;
+              }
+              if (!isAutoName) continue;
               String outerName = outerNames.get(i);
               if (outerName.startsWith("$f")) continue;
-              if (!outerName.equals(preName)) {
-                newPreNames.set(preIdx, outerName);
+              // When the propagated name collides with an input column name (e.g.
+              // `chart agg by age span=N` → outer alias `age` collides with input field `age`),
+              // suffix with `0` to match Calcite's standard auto-disambiguation. v2's RelBuilder
+              // does this; we replicate at the post-conversion rename.
+              String resolvedName = outerName;
+              java.util.Set<String> inputNames =
+                  new java.util.HashSet<>(pre.getInput().getRowType().getFieldNames());
+              if (inputNames.contains(resolvedName)) {
+                resolvedName = resolvedName + "0";
+              }
+              if (!resolvedName.equals(preName)) {
+                newPreNames.set(preIdx, resolvedName);
                 changed = true;
               }
             }

@@ -593,6 +593,15 @@ public final class SqlNodePlanner {
     // Swap the pre-Project columns and update Aggregate's groupSet+agg references. Aggregate
     // output positions are unchanged (group keys first per groupSet order in output row type).
     rel = swapChartPreAggregateColumnOrder(rel);
+    // Multi-group-key chart variant: 3-column pre-Project with 2 group keys (one SPAN, one
+    // non-SPAN expression like CASE) and 1 agg call. v2's RelBuilder emits non-span groups
+    // first, then agg args, then SPAN (e.g. `stats avg(value) by value_range, span(@ts,1h)`
+    // → pre-Project(value_range, value, span), groupSet={0,2}, AVG($1)). Calcite's
+    // SqlToRelConverter pulls span+groups+agg-args in encounter order from the SELECT list
+    // (visitor emits aggs, span, non-span groups) — so pre-Project comes out as (span,
+    // non-span, agg-arg). This shuttle reorders, rewrites groupSet/aggCall refs, AND
+    // rewrites parent Project's RexInputRefs to compensate for the post-agg output flip.
+    rel = swapMultiKeyChartPreAggregateColumnOrder(rel);
     // Trendline (and similar) emits `CASE(WHEN guard, THEN agg, ELSE null)` where Calcite's CASE
     // type-coercion bumps the ELSE-null literal to the THEN branch's type (e.g. DOUBLE).
     // v2's RelBuilder constructs the null literal with NULL type explicitly, so explain output
@@ -1057,6 +1066,149 @@ public final class SqlNodePlanner {
                 newGroup,
                 java.util.List.of(newGroup),
                 java.util.List.of(newAc));
+          }
+        };
+    return rel.accept(aggSwap);
+  }
+
+  /**
+   * Multi-group-key chart variant of {@link #swapChartPreAggregateColumnOrder}. Targets the shape
+   *
+   * <pre>
+   *   Project(... refs into Aggregate output)
+   *     Aggregate(group={0,1}, AVG($2))
+   *       Project(span_expr=SPAN(...), non_span_expr=$N, agg_arg=$M)
+   * </pre>
+   *
+   * Reorders the pre-Project to {@code (non_span, agg_arg, span)}, updates the Aggregate's groupSet
+   * to {@code {0, 2}} and the AggregateCall's args to {@code [1]}. Because the Aggregate output row
+   * is (group keys in groupSet order, then aggs), the post-Aggregate row order flips from {@code
+   * (span, non_span, avg)} to {@code (non_span, span, avg)} — so the parent Project's {@code
+   * RexInputRef}s are remapped accordingly. Conservative: only fires when there are exactly 2 group
+   * keys, exactly 1 single-arg agg call, and exactly one of the two group keys is a
+   * SPAN/SPAN_BUCKET RexCall.
+   */
+  private RelNode swapMultiKeyChartPreAggregateColumnOrder(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle aggSwap =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalProject parent)) {
+              return visited;
+            }
+            if (!(parent.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject pre)) {
+              return visited;
+            }
+            if (pre.getProjects().size() != 3) return visited;
+            if (agg.getGroupSet().cardinality() != 2) return visited;
+            if (agg.getAggCallList().size() != 1) return visited;
+            org.apache.calcite.rel.core.AggregateCall ac = agg.getAggCallList().get(0);
+            if (ac.getArgList().size() != 1) return visited;
+            int g0 = agg.getGroupSet().nth(0);
+            int g1 = agg.getGroupSet().nth(1);
+            int aggCol = ac.getArgList().get(0);
+            if (!(g0 == 0 && g1 == 1 && aggCol == 2)) return visited;
+            // Identify which group key is the SPAN.
+            org.apache.calcite.rex.RexNode p0 = pre.getProjects().get(0);
+            org.apache.calcite.rex.RexNode p1 = pre.getProjects().get(1);
+            int spanIdx = -1;
+            int nonSpanIdx = -1;
+            if (p0 instanceof org.apache.calcite.rex.RexCall c0
+                && ("SPAN".equals(c0.getOperator().getName())
+                    || "SPAN_BUCKET".equals(c0.getOperator().getName()))) {
+              spanIdx = 0;
+              nonSpanIdx = 1;
+            } else if (p1 instanceof org.apache.calcite.rex.RexCall c1
+                && ("SPAN".equals(c1.getOperator().getName())
+                    || "SPAN_BUCKET".equals(c1.getOperator().getName()))) {
+              spanIdx = 1;
+              nonSpanIdx = 0;
+            } else {
+              return visited;
+            }
+            // The other group key must NOT also be a SPAN — single-span pattern only.
+            org.apache.calcite.rex.RexNode otherGroup = pre.getProjects().get(nonSpanIdx);
+            if (otherGroup instanceof org.apache.calcite.rex.RexCall ogc
+                && ("SPAN".equals(ogc.getOperator().getName())
+                    || "SPAN_BUCKET".equals(ogc.getOperator().getName()))) {
+              return visited;
+            }
+            // Reorder pre-Project columns: non_span (was @nonSpanIdx), agg_arg (was @2),
+            // span (was @spanIdx).
+            java.util.List<org.apache.calcite.rex.RexNode> newProjects =
+                java.util.List.of(
+                    pre.getProjects().get(nonSpanIdx),
+                    pre.getProjects().get(2),
+                    pre.getProjects().get(spanIdx));
+            java.util.List<String> newNames =
+                java.util.List.of(
+                    pre.getRowType().getFieldNames().get(nonSpanIdx),
+                    pre.getRowType().getFieldNames().get(2),
+                    pre.getRowType().getFieldNames().get(spanIdx));
+            org.apache.calcite.rel.logical.LogicalProject newPre =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    pre.getInput(), pre.getHints(), newProjects, newNames, pre.getVariablesSet());
+            // Aggregate: group keys at positions 0 and 2, agg arg at 1.
+            org.apache.calcite.util.ImmutableBitSet newGroup =
+                org.apache.calcite.util.ImmutableBitSet.of(0, 2);
+            org.apache.calcite.rel.core.AggregateCall newAc =
+                ac.copy(java.util.List.of(1), ac.filterArg, ac.collation);
+            org.apache.calcite.rel.logical.LogicalAggregate newAgg =
+                (org.apache.calcite.rel.logical.LogicalAggregate)
+                    agg.copy(
+                        agg.getTraitSet(),
+                        newPre,
+                        newGroup,
+                        java.util.List.of(newGroup),
+                        java.util.List.of(newAc));
+            // Post-aggregate output row order:
+            //   before: (groupKey@0=span, groupKey@1=non_span, agg) → indices 0=span, 1=non_span,
+            // 2=agg
+            //   after:  (groupKey@0=non_span, groupKey@2=span, agg) → indices 0=non_span, 1=span,
+            // 2=agg
+            // Build remap: oldIdx → newIdx.
+            //   nonSpanIdx == 1 (older second group): old position in agg output was 1 → new 0
+            //   spanIdx == 0 (older first group): old position in agg output was 0 → new 1
+            // (Or vice versa depending on which idx had span.)
+            // In our pre-swap: agg output[0] = pre[g0]=p0, agg output[1] = pre[g1]=p1.
+            // So before: agg-out[spanIdx]=span, agg-out[nonSpanIdx]=non_span.
+            // After: agg-out[0]=non_span, agg-out[1]=span.
+            // Remap: spanIdx → 1, nonSpanIdx → 0, 2 → 2.
+            int[] remap = new int[3];
+            remap[spanIdx] = 1;
+            remap[nonSpanIdx] = 0;
+            remap[2] = 2;
+            org.apache.calcite.rel.type.RelDataType newAggType = newAgg.getRowType();
+            org.apache.calcite.rex.RexShuttle remapShuttle =
+                new org.apache.calcite.rex.RexShuttle() {
+                  @Override
+                  public org.apache.calcite.rex.RexNode visitInputRef(
+                      org.apache.calcite.rex.RexInputRef ref) {
+                    int idx = ref.getIndex();
+                    if (idx >= 0 && idx < remap.length) {
+                      int newIdx = remap[idx];
+                      return new org.apache.calcite.rex.RexInputRef(
+                          newIdx, newAggType.getFieldList().get(newIdx).getType());
+                    }
+                    return ref;
+                  }
+                };
+            java.util.List<org.apache.calcite.rex.RexNode> newParentProjects =
+                new java.util.ArrayList<>();
+            for (org.apache.calcite.rex.RexNode pe : parent.getProjects()) {
+              newParentProjects.add(pe.accept(remapShuttle));
+            }
+            return org.apache.calcite.rel.logical.LogicalProject.create(
+                newAgg,
+                parent.getHints(),
+                newParentProjects,
+                parent.getRowType().getFieldNames(),
+                parent.getVariablesSet());
           }
         };
     return rel.accept(aggSwap);

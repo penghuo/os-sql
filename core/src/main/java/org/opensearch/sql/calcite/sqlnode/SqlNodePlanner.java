@@ -582,6 +582,11 @@ public final class SqlNodePlanner {
     // RelBuilder reserves position 0 for the agg result; SqlValidator names projection cols from
     // position 0. Limit to the single-arg case to avoid regressing multi-arg agg shapes.
     rel = bumpPreAggregateAutoNames(rel);
+    // For `Project(name=$N, ...) <- Aggregate(group={K}) <- Project($fM=...)`, propagate the
+    // outer Project's column name down to the pre-Aggregate Project so dotted/aliased group keys
+    // (e.g. `stats count() by info.city`) carry the user-visible name through the pre-Aggregate
+    // Project (matches v2's RelBuilder explicit field-naming).
+    rel = namePreAggregateGroupKeyFromOuterProject(rel);
     // Collapse `Project(span_alias=$N) <- Filter(F on $M) <- Project(passthrough[*] + SPAN AS
     // span_alias)`
     // when the outer Project ONLY references the trailing SPAN column. This pattern comes from
@@ -975,6 +980,77 @@ public final class SqlNodePlanner {
                     newNames,
                     proj.getVariablesSet());
             return agg.copy(agg.getTraitSet(), java.util.List.of(newProj));
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Propagate names from a parent {@code Project} down to a pre-Aggregate {@code Project} so that
+   * dotted or aliased GROUP BY keys (e.g. {@code stats count() by info.city}) appear with the
+   * user-visible name on the pre-Aggregate Project — matching v2's RelBuilder explicit
+   * field-naming.
+   *
+   * <p>Pattern: {@code Project(... col=$<aggGroupPos> ...) <- Aggregate(group={k0,k1,...}) <-
+   * Project(... $fM=expr ...)}. For each outer-Project column whose RexNode is a single RexInputRef
+   * pointing to an Aggregate group-key position {@code i}, look up the corresponding input column
+   * index {@code k = groupSet.nth(i)} and, if the pre-Project's name at index {@code k} is
+   * auto-generated ({@code $fN}), replace it with the outer name.
+   */
+  private RelNode namePreAggregateGroupKeyFromOuterProject(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalProject outer)) {
+              return visited;
+            }
+            if (!(outer.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalAggregate agg)) {
+              return visited;
+            }
+            if (!(agg.getInput() instanceof org.apache.calcite.rel.logical.LogicalProject pre)) {
+              return visited;
+            }
+            if (agg.getGroupSet().isEmpty()) return visited;
+            java.util.List<Integer> groupKeys = agg.getGroupSet().asList();
+            java.util.List<String> preNames = pre.getRowType().getFieldNames();
+            java.util.List<String> outerNames = outer.getRowType().getFieldNames();
+            java.util.List<String> newPreNames = new java.util.ArrayList<>(preNames);
+            boolean changed = false;
+            for (int i = 0; i < outer.getProjects().size(); i++) {
+              org.apache.calcite.rex.RexNode rx = outer.getProjects().get(i);
+              if (!(rx instanceof org.apache.calcite.rex.RexInputRef ref)) continue;
+              int aggOutputIdx = ref.getIndex();
+              if (aggOutputIdx >= groupKeys.size()) continue;
+              int preIdx = groupKeys.get(aggOutputIdx);
+              if (preIdx >= preNames.size()) continue;
+              String preName = preNames.get(preIdx);
+              if (!preName.startsWith("$f")) continue;
+              try {
+                Integer.parseInt(preName.substring(2));
+              } catch (NumberFormatException e) {
+                continue;
+              }
+              String outerName = outerNames.get(i);
+              if (outerName.startsWith("$f")) continue;
+              if (!outerName.equals(preName)) {
+                newPreNames.set(preIdx, outerName);
+                changed = true;
+              }
+            }
+            if (!changed) return visited;
+            org.apache.calcite.rel.logical.LogicalProject newPre =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    pre.getInput(),
+                    pre.getHints(),
+                    pre.getProjects(),
+                    newPreNames,
+                    pre.getVariablesSet());
+            return outer.copy(
+                outer.getTraitSet(),
+                java.util.List.of(agg.copy(agg.getTraitSet(), java.util.List.of(newPre))));
           }
         };
     return rel.accept(shuttle);

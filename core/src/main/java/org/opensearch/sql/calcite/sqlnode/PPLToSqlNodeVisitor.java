@@ -4522,11 +4522,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                     SqlStdOperatorTable.SUM, List.of(new SqlIdentifier(aggAlias, POS)), POS),
                 yTotalWindow),
             POS);
+    // Wrap the SUM-OVER in COALESCE(SUM-OVER, NULL) to force the column type NULLABLE.
+    // Calcite's RelDataTypeFactory marks SUM-OVER NOT NULL when the partition is guaranteed
+    // non-empty (PARTITION BY a key that's also a GROUP BY key one level down). Step3's rank
+    // OVER references this column in its ORDER BY collation; ProjectToWindowRule.onMatch
+    // (RexProgramBuilder.RegisterInputShuttle) asserts the RexInputRef's type matches the
+    // input row type — fails with "<type> vs <type> NOT NULL" because the validator-derived
+    // RexInputRef captures NULLABLE while the input row says NOT NULL. COALESCE forces the
+    // column type to NULLABLE consistently. Behaviorally a no-op: COALESCE(x, NULL) ≡ x.
+    SqlNode yTotalNullable =
+        new SqlBasicCall(
+            SqlStdOperatorTable.COALESCE, List.of(yTotalOver, SqlLiteral.createNull(POS)), POS);
     SqlNodeList step2Items = new SqlNodeList(POS);
     step2Items.add(new SqlIdentifier(overName, POS));
     step2Items.add(new SqlIdentifier(byName, POS));
     step2Items.add(new SqlIdentifier(aggAlias, POS));
-    step2Items.add(asAliased(yTotalOver, "__chart_y_total__"));
+    step2Items.add(asAliased(yTotalNullable, "__chart_y_total__"));
     SqlNode step2Where =
         new SqlBasicCall(
             SqlStdOperatorTable.IS_NOT_NULL, List.of(new SqlIdentifier(overName, POS)), POS);

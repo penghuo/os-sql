@@ -479,7 +479,7 @@ public final class SqlNodePlanner {
             StandardConvertletTable.INSTANCE,
             SqlToRelConverter.config()
                 .withTrimUnusedFields(false)
-                .withExpand(false)
+                .withExpand(true)
                 .withRemoveSortInSubQuery(false));
 
     RelRoot root;

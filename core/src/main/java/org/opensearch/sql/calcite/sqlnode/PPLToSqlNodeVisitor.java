@@ -848,15 +848,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // produces `SELECT a.name FROM (SELECT * FROM <join> ORDER BY a.age)` where the outer SELECT
     // can no longer see `a` from the inner FROM. Rewriting the inner select list keeps the join
     // aliases live in the same SELECT scope.
+    List<String> postFields = stripAliasPrefix(selected, frame);
     SqlNode rewritten = projectIntoChildSelectStar(from, selectList);
     if (rewritten != null) {
-      frame.currentFields = stripAliasPrefix(selected);
+      frame.currentFields = postFields;
       return rewritten;
     }
-    return SqlBuilder.select(selectList)
-        .from(from)
-        .withFields(stripAliasPrefix(selected))
-        .wrap(frame);
+    return SqlBuilder.select(selectList).from(from).withFields(postFields).wrap(frame);
   }
 
   /**
@@ -5861,7 +5859,68 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (frame.arrayRootedFields.contains(fieldName)) {
       frame.mapColumns.add(fieldName);
     }
+    // PPL `mvexpand <field> limit=N` caps the number of expanded rows PER source document. Apply
+    // a per-input-row ROW_NUMBER() PARTITION BY <input_keys> filter to <= N. Without per-row
+    // partitioning a global LIMIT would only keep N rows total across all source docs.
+    if (node.getLimit() != null && node.getLimit() > 0) {
+      result = applyMvExpandLimit(result, frame, node.getLimit());
+    }
     return result;
+  }
+
+  /**
+   * Wrap the mvexpand emission with a per-source-row LIMIT: assign ROW_NUMBER() OVER (PARTITION BY
+   * <all-non-expanded-cols>) and filter rows where the rank is &le; N. Mirrors PPL's documented
+   * {@code mvexpand <field> limit=N} semantics — caps expansion per source document.
+   */
+  private SqlNode applyMvExpandLimit(SqlNode mvexpandSelect, Frame frame, int limit) {
+    // Partition by all visible cols EXCEPT the unnested field — those are stable per source row.
+    String unnested = frame.currentFields.get(frame.currentFields.size() - 1);
+    SqlNodeList partitionBy = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      if (c.equals(unnested)) continue;
+      partitionBy.add(toIdentifier(c));
+    }
+    SqlNode rowNumWindow =
+        SqlWindow.create(
+            null,
+            null,
+            partitionBy,
+            new SqlNodeList(POS),
+            SqlLiteral.createBoolean(false, POS),
+            null,
+            null,
+            null,
+            POS);
+    SqlNode rowNum =
+        new SqlBasicCall(
+            SqlStdOperatorTable.OVER,
+            List.of(
+                new SqlBasicCall(
+                    SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
+                rowNumWindow),
+            POS);
+    String rnAlias = "_mvexpand_rn_";
+    SqlNodeList innerItems = new SqlNodeList(POS);
+    innerItems.add(SqlIdentifier.star(POS));
+    innerItems.add(asAliased(rowNum, rnAlias));
+    SqlNode innerSelect =
+        new SqlSelect(
+            POS, null, innerItems, mvexpandSelect, null, null, null, null, null, null, null, null);
+    SqlNode rnLE =
+        new SqlBasicCall(
+            SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+            List.of(
+                new SqlIdentifier(rnAlias, POS),
+                SqlLiteral.createExactNumeric(Integer.toString(limit), POS)),
+            POS);
+    // Outer SELECT with explicit field list (to drop the helper rn column from output).
+    SqlNodeList outerItems = new SqlNodeList(POS);
+    for (String c : frame.currentFields) {
+      outerItems.add(toIdentifier(c));
+    }
+    return new SqlSelect(
+        POS, null, outerItems, innerSelect, rnLE, null, null, null, null, null, null, null);
   }
 
   @Override
@@ -9610,11 +9669,31 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * with a dot keep only the suffix.
    */
   private static List<String> stripAliasPrefix(List<String> names) {
+    return stripAliasPrefix(names, null);
+  }
+
+  /**
+   * Strip the alias prefix from each dotted name (e.g. {@code t1.col} → {@code col}). Reserved for
+   * join-side projection where multiple sides expose the same leaf name. Skip stripping when the
+   * prefix is a known {@link Frame#mapColumns} entry — those refer to MAP-typed columns (e.g.
+   * OpenSearch nested-object scans, post-mvexpand element columns) where the dotted name IS the
+   * literal flat-column name and stripping would lose the column.
+   */
+  private static List<String> stripAliasPrefix(List<String> names, Frame frame) {
     List<String> out = new ArrayList<>(names.size());
     Set<String> seen = new LinkedHashSet<>();
     for (String n : names) {
       int dot = n.indexOf('.');
-      String stripped = dot < 0 ? n : n.substring(dot + 1);
+      String stripped;
+      if (dot < 0) {
+        stripped = n;
+      } else if (frame != null && frame.mapColumns.contains(n.substring(0, dot))) {
+        // Flat-dotted ref over a MAP column — keep the full name so downstream pipes can resolve
+        // it.
+        stripped = n;
+      } else {
+        stripped = n.substring(dot + 1);
+      }
       if (seen.add(stripped)) out.add(stripped);
     }
     return out;

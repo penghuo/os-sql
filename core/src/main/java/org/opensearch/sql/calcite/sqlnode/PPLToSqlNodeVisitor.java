@@ -5852,7 +5852,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         asAliased(
             new SqlIdentifier(java.util.Arrays.asList(unnestAlias, fieldName), POS), fieldName));
     visible.add(fieldName);
-    return SqlBuilder.select(items).from(join).withFields(visible).wrap(frame);
+    SqlNode result = SqlBuilder.select(items).from(join).withFields(visible).wrap(frame);
+    // Register the unnested column on Frame.mapColumns so downstream dotted refs like
+    // `skills.name` route through ITEM(skills, 'name') instead of multi-part identifier
+    // resolution. OpenSearch arrays of nested-object documents become ARRAY of MAP at the catalog
+    // level; UNNEST yields a MAP element. Without this, the validator would interpret
+    // `skills.name` as `<table=skills>.<col=name>` and fail with "Table 'skills' not found".
+    if (frame.arrayRootedFields.contains(fieldName)) {
+      frame.mapColumns.add(fieldName);
+    }
+    return result;
   }
 
   @Override

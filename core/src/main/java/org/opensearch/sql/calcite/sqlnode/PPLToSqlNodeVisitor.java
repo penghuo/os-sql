@@ -6995,7 +6995,32 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // cap is invisible to the outer scope. The cluster-wide subsearch_maxout cap is applied
     // post-RelNode (in QueryService) instead — wrapping a bare relation here would hide the table
     // identifier from the JOIN's outer scope.
-    rightSide = applyMaxPerPartition(node, rightSide);
+    SqlNode rightSidePostMax = applyMaxPerPartition(node, rightSide, rightFrame);
+    boolean rightWasMaxWrapped = rightSidePostMax != rightSide;
+    rightSide = rightSidePostMax;
+    // Strip metadata fields from the LEFT side so the join's output schema matches v2's
+    // emission (no `_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing` columns leaking
+    // into the join's row type). Conservative — only fires when the right side has been
+    // max-wrapped (max=N option present), and the left is a bare Relation. Wider application
+    // breaks tests like testMultipleJoinsWithoutTableAliases that rely on the inner relation's
+    // table identifier remaining visible in outer scope.
+    if (rightWasMaxWrapped
+        && frame.currentFields != null
+        && !frame.currentFields.isEmpty()
+        && node.getChildren().get(0) instanceof Relation) {
+      List<String> leftNonMeta = new ArrayList<>();
+      for (String c : frame.currentFields) {
+        if (!OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) leftNonMeta.add(c);
+      }
+      if (!leftNonMeta.isEmpty() && leftNonMeta.size() < frame.currentFields.size()) {
+        SqlNodeList stripList = new SqlNodeList(POS);
+        for (String c : leftNonMeta) stripList.add(new SqlIdentifier(c, POS));
+        leftSide =
+            new SqlSelect(
+                POS, null, stripList, leftSide, null, null, null, null, null, null, null, null);
+        frame.currentFields = leftNonMeta;
+      }
+    }
 
     // PPL allows referencing a side via either an explicit `left=l right=r` arg, or — when the
     // side is a SubqueryAlias — by the alias name. The visitor for SubqueryAlias already wrapped
@@ -7243,7 +7268,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * <right>) WHERE __rn <= N}. Partition cols come from the {@code join F1 F2 ...} field list, or
    * from the right-side equi-join columns when the user wrote {@code on l.X = r.Y}.
    */
-  private SqlNode applyMaxPerPartition(Join node, SqlNode rightSide) {
+  private SqlNode applyMaxPerPartition(Join node, SqlNode rightSide, Frame rightFrame) {
     Integer maxArg = null;
     if (node.getArgumentMap() != null && node.getArgumentMap().get("max") != null) {
       Object v = node.getArgumentMap().get("max").getValue();
@@ -7261,6 +7286,22 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           extractRightEquiJoinCols(node.getJoinCondition().get(), node.getRightAlias().get());
     }
     if (partitionCols == null || partitionCols.isEmpty()) return rightSide;
+    // Compute the non-metadata column list for the right side. v2's RelBuilder emits explicit
+    // strip-meta Projects below the row_number Project AND above the WHERE filter so the
+    // join's output schema and the OpenSearch pushdown PROJECT clause match the user-visible
+    // fields. Without these strip-Projects the post-conversion plan keeps metadata cols inside
+    // the join's right input, breaking testJoinWithCriteriaAndMaxOption / testJoinWithFieldList
+    // / etc. shape comparisons.
+    List<String> nonMetaCols = null;
+    if (rightFrame.currentFields != null && !rightFrame.currentFields.isEmpty()) {
+      nonMetaCols = new ArrayList<>();
+      for (String c : rightFrame.currentFields) {
+        if (!OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) {
+          nonMetaCols.add(c);
+        }
+      }
+      if (nonMetaCols.isEmpty()) nonMetaCols = null;
+    }
     SqlNodeList partitionBy = new SqlNodeList(POS);
     for (String col : partitionCols) {
       partitionBy.add(new SqlIdentifier(col, POS));
@@ -7284,19 +7325,56 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                     SqlStdOperatorTable.ROW_NUMBER, java.util.Collections.emptyList(), POS),
                 rowNumWindow),
             POS);
+    // Bottom: separate the strip-meta Project from the IS NOT NULL filter so Calcite preserves
+    // both layers (mirrors v2's dedup-style emission). Combining them in one SELECT
+    // (`SELECT non-meta FROM r WHERE IS NOT NULL(col)`) lets Calcite trim/swap and lose the
+    // Project. Use TWO nested SELECTS: inner = strip-meta Project, outer = WHERE filter.
+    SqlNode bottom = rightSide;
+    if (nonMetaCols != null) {
+      SqlNodeList stripList = new SqlNodeList(POS);
+      for (String c : nonMetaCols) stripList.add(new SqlIdentifier(c, POS));
+      SqlNode stripSelect =
+          new SqlSelect(
+              POS, null, stripList, rightSide, null, null, null, null, null, null, null, null);
+      SqlNode stripAliased =
+          new SqlBasicCall(
+              SqlStdOperatorTable.AS,
+              List.of(stripSelect, new SqlIdentifier("__max_strip__", POS)),
+              POS);
+      SqlNodeList allStar = new SqlNodeList(POS);
+      allStar.add(SqlIdentifier.star(POS));
+      // IS NOT NULL on the first partition col. v2 emits a single IS NOT NULL guard.
+      SqlNode notNull =
+          new SqlBasicCall(
+              SqlStdOperatorTable.IS_NOT_NULL,
+              List.of(new SqlIdentifier(partitionCols.get(0), POS)),
+              POS);
+      bottom =
+          new SqlSelect(
+              POS, null, allStar, stripAliased, notNull, null, null, null, null, null, null, null);
+    }
+    // Middle: SELECT *, ROW_NUMBER() OVER (PARTITION BY <pcol>) AS _row_number_dedup_ FROM
+    // <bottom>.
     SqlNodeList innerSelects = new SqlNodeList(POS);
     innerSelects.add(SqlIdentifier.star(POS));
     innerSelects.add(asAliased(rowNum, "_row_number_dedup_"));
     SqlNode innerSelect =
         new SqlSelect(
-            POS, null, innerSelects, rightSide, null, null, null, null, null, null, null, null);
+            POS, null, innerSelects, bottom, null, null, null, null, null, null, null, null);
     SqlNode innerAliased =
         new SqlBasicCall(
             SqlStdOperatorTable.AS,
             List.of(innerSelect, new SqlIdentifier("__max_inner__", POS)),
             POS);
+    // Top: outer SELECT keeping only non-meta cols (v2's emission — strip _row_number_dedup_
+    // and any leaked metadata before the JOIN sees the right side). Falls back to SELECT * when
+    // we don't know the non-meta col list.
     SqlNodeList outerSelects = new SqlNodeList(POS);
-    outerSelects.add(SqlIdentifier.star(POS));
+    if (nonMetaCols != null) {
+      for (String c : nonMetaCols) outerSelects.add(new SqlIdentifier(c, POS));
+    } else {
+      outerSelects.add(SqlIdentifier.star(POS));
+    }
     SqlNode outerWhere =
         new SqlBasicCall(
             SqlStdOperatorTable.LESS_THAN_OR_EQUAL,

@@ -7031,13 +7031,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     rightSide = rightSidePostMax;
     // Strip metadata fields from the LEFT side so the join's output schema matches v2's
     // emission (no `_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing` columns leaking
-    // into the join's row type). Two safe cases:
+    // into the join's row type). Three safe cases:
     //   1. max=N is set (rightWasMaxWrapped) — the right side is already wrapped with
     //      strip-meta, so wrapping the left side too aligns the output schema.
     //   2. No ON-clause (joinCondition.isEmpty()) — the user wrote `| join F1 F2 ... <table>`
     //      with a join field list, so no `<table>.<col>` references are possible. Hiding the
     //      table identifier from outer scope is safe.
-    // Both cases additionally require the LEFT child to be a bare Relation (or
+    //   3. Both explicit `left=l right=r` aliases are given — the ON-clause refers to the
+    //      explicit aliases (l.col, r.col), NOT to the table identifiers. Wrapping with
+    //      strip-meta SELECT below the alias re-application preserves alias resolution.
+    // All cases additionally require the LEFT child to be a bare Relation (or
     // SubqueryAlias-wrapped Relation). Multi-join chains like testMultipleJoinsWithoutTable
     // Aliases have a Join AST as left child and stay untouched.
     UnresolvedPlan leftChild = node.getChildren().get(0);
@@ -7047,7 +7050,9 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 && !sa.getChild().isEmpty()
                 && sa.getChild().get(0) instanceof Relation);
     boolean noOnClause = node.getJoinCondition().isEmpty();
-    boolean canStripBothSides = noOnClause && leftIsBareRelationOrAlias;
+    boolean bothExplicitAliases =
+        node.getLeftAlias().isPresent() && node.getRightAlias().isPresent();
+    boolean canStripBothSides = (noOnClause || bothExplicitAliases) && leftIsBareRelationOrAlias;
     if ((rightWasMaxWrapped || canStripBothSides)
         && frame.currentFields != null
         && !frame.currentFields.isEmpty()

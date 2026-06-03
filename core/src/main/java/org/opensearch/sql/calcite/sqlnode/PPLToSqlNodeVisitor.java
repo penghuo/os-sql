@@ -7113,6 +7113,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // Record the displaced inner alias as a synonym so a downstream `| fields tt.col` resolves.
     leftSide = applyExplicitAlias(leftSide, leftAlias, frame);
     rightSide = applyExplicitAlias(rightSide, rightAlias, frame);
+    // When a side is a bare Relation (or AS-wrapped relation) with no explicit `left=`/
+    // `right=` arg, derive an effective alias from the table name FOR DOWNSTREAM JOIN HINT
+    // PURPOSES ONLY (do not call applyExplicitAlias — the bare Relation already exposes the
+    // table name as a queryable alias). This lets PPL's bind-bare-to-LEFT logic in
+    // `qualifyIfAmbiguous` qualify ambiguous bare refs in the post-join Project. Without this,
+    // `source=bank | join on f=g dog` over common cols (e.g. `age`) trips Calcite's validator
+    // with "Column 'age' is ambiguous". Skip derivation when both sides resolve to the SAME
+    // table name (self-join) — using the same identifier on both sides would duplicate the
+    // FROM-clause relation name and tests like testJoinWithFieldListSelfJoin would fail with
+    // "Duplicate relation name". v2's RelBuilder uses synthesized aliases like __l/__r in
+    // those cases.
+    String derivedLeft = leftAlias == null ? bareRelationAlias(node.getChildren().get(0)) : null;
+    String derivedRight = rightAlias == null ? bareRelationAlias(node.getRight()) : null;
+    boolean selfJoin = derivedLeft != null && derivedLeft.equals(derivedRight);
+    if (!selfJoin) {
+      if (derivedLeft != null) leftAlias = derivedLeft;
+      if (derivedRight != null) rightAlias = derivedRight;
+    }
     // The join consumes any inherited subquery alias — clear it so downstream pipes don't
     // wrap the join in `AS <stale-alias>`.
     frame.subqueryAliasName = null;
@@ -9428,6 +9446,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   private static String rightAliasOrDefault(String explicitAlias) {
     return explicitAlias != null ? explicitAlias : "__r";
+  }
+
+  /**
+   * Return the bare-relation table name (last part) when {@code child} is a Relation, or the inner
+   * Relation's table name when wrapped in a SubqueryAlias holding a bare Relation. Returns {@code
+   * null} otherwise (e.g. multi-join chains, subsearches).
+   */
+  private static String bareRelationAlias(UnresolvedPlan child) {
+    Relation rel = null;
+    if (child instanceof Relation r) {
+      rel = r;
+    } else if (child instanceof SubqueryAlias sa
+        && !sa.getChild().isEmpty()
+        && sa.getChild().get(0) instanceof Relation r) {
+      rel = r;
+    }
+    if (rel == null) return null;
+    List<String> parts = rel.getTableQualifiedName().getParts();
+    if (parts == null || parts.isEmpty()) return null;
+    return parts.get(parts.size() - 1);
   }
 
   /** Drop OpenSearch metadata fields from a column list. */

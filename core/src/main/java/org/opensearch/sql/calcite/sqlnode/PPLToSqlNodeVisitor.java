@@ -809,11 +809,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    */
   private static SqlNode projectIntoChildSelectStar(SqlNode from, SqlNodeList newList) {
     SqlSelect select = null;
+    boolean fromIsOrderBy = false;
     if (from instanceof SqlSelect s) {
       select = s;
     } else if (from instanceof org.apache.calcite.sql.SqlOrderBy ob
         && ob.query instanceof SqlSelect s) {
       select = s;
+      fromIsOrderBy = true;
     }
     if (select == null) return null;
     SqlNodeList items = select.getSelectList();
@@ -822,8 +824,37 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (!(lone instanceof SqlIdentifier id) || !id.isStar()) return null;
     if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
     if (select.getHaving() != null) return null;
+    // When the SELECT is wrapped in SqlOrderBy AND its inner FROM is itself a SqlSelect with
+    // computed (non-passthrough) projections (i.e. an eval-like wide Project), folding the
+    // narrow user-projection into the SqlOrderBy's SELECT * loses the wide-Project layer:
+    // Calcite trims unused eval cols, leaving only the user-requested cols. v2's emission
+    // keeps the wide eval Project under the Sort. Skip the peephole here so the visitor falls
+    // through to wrapping a fresh outer SELECT, preserving the wide Project. Mirrors v2's
+    // emission shape for `... | eval ... | sort ... | fields ...` patterns
+    // (e.g. testIssue5114SortExprHeadExplain).
+    if (fromIsOrderBy
+        && select.getFrom() instanceof SqlSelect inner
+        && hasComputedProjection(inner.getSelectList())) {
+      return null;
+    }
     select.setSelectList(newList);
     return from;
+  }
+
+  /** True when the select list contains a non-passthrough projection (e.g. eval expression). */
+  private static boolean hasComputedProjection(SqlNodeList items) {
+    if (items == null) return false;
+    for (SqlNode item : items) {
+      // Bare * or bare identifier → passthrough.
+      if (item instanceof SqlIdentifier) continue;
+      // `expr AS name` → check if expr is an identifier (passthrough rename) or computed.
+      if (item instanceof SqlBasicCall call && call.getOperator() == SqlStdOperatorTable.AS) {
+        if (call.getOperandList().size() >= 1
+            && call.getOperandList().get(0) instanceof SqlIdentifier) continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   @Override

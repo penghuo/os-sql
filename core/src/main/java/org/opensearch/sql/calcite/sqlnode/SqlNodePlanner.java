@@ -648,6 +648,14 @@ public final class SqlNodePlanner {
     // alone doesn't handle this because `Sort -> Project -> Scan` doesn't satisfy its swap
     // conditions (project is single-col passthrough with no Filter/Sort below).
     rel = liftProjectBetweenNestedSorts(rel);
+    // PPL `stats ... | head N | head M from K` emits an outer Sort (offset=K, fetch=M), a
+    // user-fields Project (count, state), an inner Sort (fetch=N), and an Aggregate. v2's
+    // RelBuilder emits both Sorts ABOVE the user-fields Project: `Sort(outer) → Sort(inner) →
+    // Project → Aggregate`. Ours emits `Sort(outer) → Project → Sort(inner) → Aggregate`.
+    // Lower the Project below the inner Sort. Inner Sort has no collation (FETCH-only), so its
+    // re-parenting is collation-safe; outer Sort's collation indices are remapped through the
+    // Project (when collation is non-empty).
+    rel = lowerProjectAboveSortBelowSort(rel);
     // Re-run trim AFTER swap so adjacent passthrough Projects produced by the swap (e.g. a
     // user-fields Project sitting on top of an eval-extended Project that exposed a sort key)
     // get collapsed into a single composed Project.
@@ -958,6 +966,108 @@ public final class SqlNodePlanner {
             // type is the same.
             return org.apache.calcite.rel.logical.LogicalSort.create(
                 newProj, outerSort.getCollation(), outerSort.offset, outerSort.fetch);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Lower a passthrough {@link org.apache.calcite.rel.logical.LogicalProject} sitting between two
+   * nested {@link org.apache.calcite.rel.logical.LogicalSort}s when the inner Sort has only a FETCH
+   * (no collation). Targets the shape
+   *
+   * <pre>
+   *   Sort(outer)
+   *     Project(passthrough, possibly reorder)
+   *       Sort(inner FETCH-only)
+   *         X
+   * </pre>
+   *
+   * and lowers Project below the inner Sort:
+   *
+   * <pre>
+   *   Sort(outer, collation remapped through Project)
+   *     Sort(inner FETCH-only)
+   *       Project(passthrough, possibly reorder)
+   *         X
+   * </pre>
+   *
+   * Outer Sort's collation indices reference Project's OUTPUT positions; after lowering, they
+   * reference Project's INPUT row (= inner Sort's input row), so collation indices are remapped via
+   * the Project's RexInputRef projection list. When outer Sort has no collation (offset/fetch
+   * only), no remap is needed.
+   */
+  private RelNode lowerProjectAboveSortBelowSort(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            return tryLower(visited);
+          }
+
+          @Override
+          public RelNode visit(org.apache.calcite.rel.logical.LogicalSort sort) {
+            RelNode visited = super.visit(sort);
+            return tryLower(visited);
+          }
+
+          private RelNode tryLower(RelNode visited) {
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalSort outerSort)) {
+              return visited;
+            }
+            if (!(outerSort.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalProject proj)) {
+              return visited;
+            }
+            if (!isPassthroughProject(proj)) return visited;
+            if (!(proj.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalSort innerSort)) {
+              return visited;
+            }
+            if (innerSort.fetch == null) return visited;
+            if (!innerSort.getCollation().getFieldCollations().isEmpty()) return visited;
+            // Only fire when the inner Sort wraps an Aggregate. This is the `stats | head N |
+            // head M from K` shape. Pattern with Scan input is handled by liftProjectBetween
+            // NestedSorts (the inverse direction); firing here would re-introduce the Project
+            // between Sorts and re-break those tests.
+            if (!(innerSort.getInput()
+                instanceof org.apache.calcite.rel.logical.LogicalAggregate)) {
+              return visited;
+            }
+            // Build the outer Project → inner-input index map (idx in proj's output → idx in
+            // proj's input row) so we can remap outer Sort collation through the Project.
+            int[] outToIn = new int[proj.getProjects().size()];
+            for (int i = 0; i < proj.getProjects().size(); i++) {
+              outToIn[i] =
+                  ((org.apache.calcite.rex.RexInputRef) proj.getProjects().get(i)).getIndex();
+            }
+            // Remap outer Sort's collation through outToIn.
+            java.util.List<org.apache.calcite.rel.RelFieldCollation> newOuterColl =
+                new java.util.ArrayList<>();
+            for (org.apache.calcite.rel.RelFieldCollation fc :
+                outerSort.getCollation().getFieldCollations()) {
+              int oldIdx = fc.getFieldIndex();
+              if (oldIdx < 0 || oldIdx >= outToIn.length) return visited;
+              newOuterColl.add(fc.withFieldIndex(outToIn[oldIdx]));
+            }
+            org.apache.calcite.rel.RelCollation remappedCollation =
+                org.apache.calcite.rel.RelCollations.of(newOuterColl);
+            // Project sits over X (innerSort's input). Project's output row type unchanged.
+            org.apache.calcite.rel.logical.LogicalProject newProj =
+                org.apache.calcite.rel.logical.LogicalProject.create(
+                    innerSort.getInput(),
+                    proj.getHints(),
+                    proj.getProjects(),
+                    proj.getRowType().getFieldNames(),
+                    proj.getVariablesSet());
+            // Inner Sort sits over the new Project, with original FETCH-only metadata.
+            org.apache.calcite.rel.logical.LogicalSort newInner =
+                org.apache.calcite.rel.logical.LogicalSort.create(
+                    newProj, innerSort.getCollation(), innerSort.offset, innerSort.fetch);
+            // Outer Sort sits over the new inner Sort. Its collation is remapped through proj.
+            return org.apache.calcite.rel.logical.LogicalSort.create(
+                newInner, remappedCollation, outerSort.offset, outerSort.fetch);
           }
         };
     return rel.accept(shuttle);

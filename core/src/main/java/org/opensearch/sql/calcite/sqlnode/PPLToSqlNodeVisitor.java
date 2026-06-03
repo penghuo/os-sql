@@ -7031,17 +7031,24 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     rightSide = rightSidePostMax;
     // Strip metadata fields from the LEFT side so the join's output schema matches v2's
     // emission (no `_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing` columns leaking
-    // into the join's row type). Conservative — only fires when the right side has been
-    // max-wrapped (max=N option present), and the left is a bare Relation. Wider application
-    // breaks tests like testMultipleJoinsWithoutTableAliases that rely on the inner relation's
-    // table identifier remaining visible in outer scope.
+    // into the join's row type). Two safe cases:
+    //   1. max=N is set (rightWasMaxWrapped) — the right side is already wrapped with
+    //      strip-meta, so wrapping the left side too aligns the output schema.
+    //   2. No ON-clause (joinCondition.isEmpty()) — the user wrote `| join F1 F2 ... <table>`
+    //      with a join field list, so no `<table>.<col>` references are possible. Hiding the
+    //      table identifier from outer scope is safe.
+    // Both cases additionally require the LEFT child to be a bare Relation (or
+    // SubqueryAlias-wrapped Relation). Multi-join chains like testMultipleJoinsWithoutTable
+    // Aliases have a Join AST as left child and stay untouched.
     UnresolvedPlan leftChild = node.getChildren().get(0);
     boolean leftIsBareRelationOrAlias =
         leftChild instanceof Relation
             || (leftChild instanceof SubqueryAlias sa
                 && !sa.getChild().isEmpty()
                 && sa.getChild().get(0) instanceof Relation);
-    if (rightWasMaxWrapped
+    boolean noOnClause = node.getJoinCondition().isEmpty();
+    boolean canStripBothSides = noOnClause && leftIsBareRelationOrAlias;
+    if ((rightWasMaxWrapped || canStripBothSides)
         && frame.currentFields != null
         && !frame.currentFields.isEmpty()
         && leftIsBareRelationOrAlias) {
@@ -7056,6 +7063,34 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             new SqlSelect(
                 POS, null, stripList, leftSide, null, null, null, null, null, null, null, null);
         frame.currentFields = leftNonMeta;
+      }
+    }
+    // Strip metadata fields from the RIGHT side when there's no ON-clause (no `<table>.<col>`
+    // references possible) AND the right side wasn't already max-wrapped. Same safety
+    // argument as the LEFT-side strip above for the no-ON-clause case.
+    if (canStripBothSides
+        && !rightWasMaxWrapped
+        && rightFrame.currentFields != null
+        && !rightFrame.currentFields.isEmpty()) {
+      UnresolvedPlan rightChild = node.getRight();
+      boolean rightIsBareRelationOrAlias =
+          rightChild instanceof Relation
+              || (rightChild instanceof SubqueryAlias sa
+                  && !sa.getChild().isEmpty()
+                  && sa.getChild().get(0) instanceof Relation);
+      if (rightIsBareRelationOrAlias) {
+        List<String> rightNonMeta = new ArrayList<>();
+        for (String c : rightFrame.currentFields) {
+          if (!OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) rightNonMeta.add(c);
+        }
+        if (!rightNonMeta.isEmpty() && rightNonMeta.size() < rightFrame.currentFields.size()) {
+          SqlNodeList stripList = new SqlNodeList(POS);
+          for (String c : rightNonMeta) stripList.add(new SqlIdentifier(c, POS));
+          rightSide =
+              new SqlSelect(
+                  POS, null, stripList, rightSide, null, null, null, null, null, null, null, null);
+          rightFrame.currentFields = rightNonMeta;
+        }
       }
     }
 

@@ -553,6 +553,11 @@ public final class SqlNodePlanner {
     // `IS EMPTY(arg)` shape. Validation already ran (and accepted ANY operand), so the rewrite
     // is post-conversion and avoids the strict collection-only check.
     rel = rewritePermissiveIsEmpty(rel);
+    // Annotate LogicalProject with variablesSet=[$cor0] when any project expression contains a
+    // RexSubQuery. v2's RelBuilder always tags Projects holding sub-queries with a CorrelationId
+    // even when the sub-query itself is uncorrelated; SqlToRelConverter (with expand=false) leaves
+    // the field empty. Match v2's emission shape so explain plan diffs collapse.
+    rel = annotateProjectVariablesSet(rel);
     // Rewrite `LENGTH(REPLACE(arg, ' ', '')) = 0` (emitted by visitFunc isblank) back to
     // v2's `IS_EMPTY(TRIM(BOTH ' ', arg))` shape. The SqlNode validator can't accept the TRIM
     // keyword-syntax form via SqlBasicCall, so we emit the equivalent LENGTH/REPLACE shape
@@ -2824,6 +2829,67 @@ public final class SqlNodePlanner {
    * SqlValidator stage to bypass the collection-only operand-type check; this shuttle converts the
    * resulting RexCall to the standard operator so explain output matches v2.
    */
+  /**
+   * Annotate LogicalProject / LogicalFilter nodes with {@code variablesSet=[$cor0]} when any
+   * expression contains a {@code RexSubQuery}. v2's RelBuilder eagerly registers a CorrelationId on
+   * the rel that introduces a sub-query (even uncorrelated ones); SqlToRelConverter with {@code
+   * withExpand(false)} leaves the variablesSet empty. Mirroring v2's emission keeps explain-plan
+   * output identical for sub-query tests.
+   */
+  private RelNode annotateProjectVariablesSet(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (visited instanceof org.apache.calcite.rel.logical.LogicalProject project) {
+              if (project.getVariablesSet().isEmpty() && containsSubQuery(project.getProjects())) {
+                java.util.Set<org.apache.calcite.rel.core.CorrelationId> vars =
+                    java.util.Set.of(visited.getCluster().createCorrel());
+                return org.apache.calcite.rel.logical.LogicalProject.create(
+                    project.getInput(),
+                    project.getHints(),
+                    project.getProjects(),
+                    project.getRowType(),
+                    vars);
+              }
+            } else if (visited instanceof org.apache.calcite.rel.logical.LogicalFilter filter) {
+              if (filter.getVariablesSet().isEmpty()
+                  && containsSubQuery(java.util.List.of(filter.getCondition()))) {
+                com.google.common.collect.ImmutableSet<org.apache.calcite.rel.core.CorrelationId>
+                    vars =
+                        com.google.common.collect.ImmutableSet.of(
+                            visited.getCluster().createCorrel());
+                return org.apache.calcite.rel.logical.LogicalFilter.create(
+                    filter.getInput(), filter.getCondition(), vars);
+              }
+            }
+            return visited;
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /** True if any rex in the given list (or its sub-trees) is a RexSubQuery. */
+  private static boolean containsSubQuery(
+      java.util.List<? extends org.apache.calcite.rex.RexNode> rexes) {
+    boolean[] found = {false};
+    org.apache.calcite.rex.RexShuttle probe =
+        new org.apache.calcite.rex.RexShuttle() {
+          @Override
+          public org.apache.calcite.rex.RexNode visitSubQuery(
+              org.apache.calcite.rex.RexSubQuery sq) {
+            found[0] = true;
+            return sq;
+          }
+        };
+    for (org.apache.calcite.rex.RexNode r : rexes) {
+      if (found[0]) break;
+      r.accept(probe);
+    }
+    return found[0];
+  }
+
   private RelNode rewritePermissiveIsEmpty(RelNode rel) {
     org.apache.calcite.rex.RexShuttle rexShuttle =
         new org.apache.calcite.rex.RexShuttle() {

@@ -7004,10 +7004,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     // max-wrapped (max=N option present), and the left is a bare Relation. Wider application
     // breaks tests like testMultipleJoinsWithoutTableAliases that rely on the inner relation's
     // table identifier remaining visible in outer scope.
+    UnresolvedPlan leftChild = node.getChildren().get(0);
+    boolean leftIsBareRelationOrAlias =
+        leftChild instanceof Relation
+            || (leftChild instanceof SubqueryAlias sa
+                && !sa.getChild().isEmpty()
+                && sa.getChild().get(0) instanceof Relation);
     if (rightWasMaxWrapped
         && frame.currentFields != null
         && !frame.currentFields.isEmpty()
-        && node.getChildren().get(0) instanceof Relation) {
+        && leftIsBareRelationOrAlias) {
       List<String> leftNonMeta = new ArrayList<>();
       for (String c : frame.currentFields) {
         if (!OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(c)) leftNonMeta.add(c);

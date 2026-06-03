@@ -1136,13 +1136,16 @@ public final class SqlNodePlanner {
             }
             if (pre.getProjects().size() != 3) return visited;
             if (agg.getGroupSet().cardinality() != 2) return visited;
-            if (agg.getAggCallList().size() != 1) return visited;
-            org.apache.calcite.rel.core.AggregateCall ac = agg.getAggCallList().get(0);
-            if (ac.getArgList().size() != 1) return visited;
+            // Allow multiple agg calls; each must be either no-arg (e.g. COUNT()) or single-arg
+            // referring to the third pre-Project column.
+            if (agg.getAggCallList().isEmpty()) return visited;
+            for (org.apache.calcite.rel.core.AggregateCall ac : agg.getAggCallList()) {
+              if (ac.getArgList().size() > 1) return visited;
+              if (ac.getArgList().size() == 1 && ac.getArgList().get(0) != 2) return visited;
+            }
             int g0 = agg.getGroupSet().nth(0);
             int g1 = agg.getGroupSet().nth(1);
-            int aggCol = ac.getArgList().get(0);
-            if (!(g0 == 0 && g1 == 1 && aggCol == 2)) return visited;
+            if (!(g0 == 0 && g1 == 1)) return visited;
             // Identify which group key is the SPAN.
             org.apache.calcite.rex.RexNode p0 = pre.getProjects().get(0);
             org.apache.calcite.rex.RexNode p1 = pre.getProjects().get(1);
@@ -1183,36 +1186,33 @@ public final class SqlNodePlanner {
             org.apache.calcite.rel.logical.LogicalProject newPre =
                 org.apache.calcite.rel.logical.LogicalProject.create(
                     pre.getInput(), pre.getHints(), newProjects, newNames, pre.getVariablesSet());
-            // Aggregate: group keys at positions 0 and 2, agg arg at 1.
+            // Aggregate: group keys at positions 0 and 2, single-arg aggs reference position 1.
             org.apache.calcite.util.ImmutableBitSet newGroup =
                 org.apache.calcite.util.ImmutableBitSet.of(0, 2);
-            org.apache.calcite.rel.core.AggregateCall newAc =
-                ac.copy(java.util.List.of(1), ac.filterArg, ac.collation);
+            java.util.List<org.apache.calcite.rel.core.AggregateCall> newAcs =
+                new java.util.ArrayList<>();
+            for (org.apache.calcite.rel.core.AggregateCall ac : agg.getAggCallList()) {
+              if (ac.getArgList().isEmpty()) {
+                newAcs.add(ac);
+              } else {
+                newAcs.add(ac.copy(java.util.List.of(1), ac.filterArg, ac.collation));
+              }
+            }
             org.apache.calcite.rel.logical.LogicalAggregate newAgg =
                 (org.apache.calcite.rel.logical.LogicalAggregate)
                     agg.copy(
-                        agg.getTraitSet(),
-                        newPre,
-                        newGroup,
-                        java.util.List.of(newGroup),
-                        java.util.List.of(newAc));
+                        agg.getTraitSet(), newPre, newGroup, java.util.List.of(newGroup), newAcs);
             // Post-aggregate output row order:
-            //   before: (groupKey@0=span, groupKey@1=non_span, agg) → indices 0=span, 1=non_span,
-            // 2=agg
-            //   after:  (groupKey@0=non_span, groupKey@2=span, agg) → indices 0=non_span, 1=span,
-            // 2=agg
-            // Build remap: oldIdx → newIdx.
-            //   nonSpanIdx == 1 (older second group): old position in agg output was 1 → new 0
-            //   spanIdx == 0 (older first group): old position in agg output was 0 → new 1
-            // (Or vice versa depending on which idx had span.)
-            // In our pre-swap: agg output[0] = pre[g0]=p0, agg output[1] = pre[g1]=p1.
-            // So before: agg-out[spanIdx]=span, agg-out[nonSpanIdx]=non_span.
-            // After: agg-out[0]=non_span, agg-out[1]=span.
-            // Remap: spanIdx → 1, nonSpanIdx → 0, 2 → 2.
-            int[] remap = new int[3];
+            //   before: (groupKey@0=span, groupKey@1=non_span, agg0, agg1, ...)
+            //   after:  (groupKey@0=non_span, groupKey@2=span, agg0, agg1, ...)
+            // Group keys swap positions; agg outputs stay at indices >= 2.
+            int totalCols = 2 + agg.getAggCallList().size();
+            int[] remap = new int[totalCols];
             remap[spanIdx] = 1;
             remap[nonSpanIdx] = 0;
-            remap[2] = 2;
+            for (int k = 2; k < totalCols; k++) {
+              remap[k] = k;
+            }
             org.apache.calcite.rel.type.RelDataType newAggType = newAgg.getRowType();
             org.apache.calcite.rex.RexShuttle remapShuttle =
                 new org.apache.calcite.rex.RexShuttle() {

@@ -178,6 +178,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> evalAliasTypes = new java.util.LinkedHashMap<>();
 
     /**
+     * Set of catalog column names whose Calcite type is ARRAY — these correspond to OpenSearch
+     * {@code type: nested} mappings. Populated by {@code populateColumnUdt} during {@link
+     * #visitRelation}. Consumed by {@link #detectNestedAggregationPattern} to detect aggregation
+     * over dotted fields whose ROOT is array-typed (true nested) — those queries are unsupported in
+     * the SqlNode pipeline and must fail with PPL's documented error message.
+     */
+    java.util.Set<String> arrayRootedFields = new java.util.LinkedHashSet<>();
+
+    /**
      * Per-column UDT name when the underlying catalog column has a PPL user-defined type ({@code
      * EXPR_TIMESTAMP}, {@code EXPR_DATE}, {@code EXPR_TIME}, {@code EXPR_IP}). Populated by {@link
      * #visitRelation} from the catalog row type and propagated through pipes that preserve column
@@ -434,6 +443,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       if (field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.MAP) {
         frame.mapColumns.add(field.getName());
       }
+      // Track ARRAY-typed columns (OpenSearch `type: nested` mappings appear as ARRAY in
+      // Calcite's row type). detectNestedAggregationPattern uses this to throw v2's documented
+      // "Cannot execute nested aggregation on" error when an aggregate's dotted argument has an
+      // array-rooted parent (true nested-type, not plain object/properties).
+      if (field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.ARRAY) {
+        frame.arrayRootedFields.add(field.getName());
+      }
     }
   }
 
@@ -443,7 +459,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
    * error at translation time so the user sees the documented message instead of a confusing "Table
    * not found" from the SQL validator.
    */
-  private static void detectNestedAggregationPattern(Aggregation node) {
+  private static void detectNestedAggregationPattern(Aggregation node, Frame frame) {
     java.util.Set<String> groupKeyNames = new java.util.LinkedHashSet<>();
     for (UnresolvedExpression g : node.getGroupExprList()) {
       UnresolvedExpression core = (g instanceof Alias a) ? a.getDelegated() : g;
@@ -454,7 +470,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         groupKeyNames.add(qn.toString());
       }
     }
-    if (groupKeyNames.isEmpty()) return;
+    // Pre-agg complexity: any non-trivial pipe upstream of the aggregation prevents the
+    // OpenSearch nested-aggregation pushdown rule from firing. v2's CalciteRelNodeVisitor sets
+    // `hadPreAggComplexity` when state.where/evalExtended/projectionReplaced/orderBy/fetch are
+    // populated. Mirror by walking the AST chain from the aggregation child downward: if we
+    // pass through anything other than a bare Relation (or its SubqueryAlias/AllFieldsExcludeMeta
+    // wrapper), there's pre-agg complexity. Specifically, Head/Limit upstream triggers this
+    // (see testNestedAggExplainWhenPushdownNotApplied: `... | head 10000 | stats ...`).
+    boolean hadPreAggComplexity = hasPreAggComplexity(node);
     for (UnresolvedExpression aggExpr : node.getAggExprList()) {
       UnresolvedExpression core = (aggExpr instanceof Alias a) ? a.getDelegated() : aggExpr;
       if (!(core instanceof AggregateFunction af)) continue;
@@ -462,17 +485,52 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       QualifiedName argQn = null;
       if (argField instanceof QualifiedName q) argQn = q;
       else if (argField instanceof Field f && f.getField() instanceof QualifiedName q) argQn = q;
-      if (argQn != null && argQn.getParts().size() >= 2) {
-        if (groupKeyNames.contains(argQn.getParts().get(0))) {
-          throw new IllegalArgumentException(
-              "Cannot execute nested aggregation: aggregating on '"
-                  + argQn
-                  + "' where '"
-                  + argQn.getParts().get(0)
-                  + "' is also a group key");
-        }
+      if (argQn == null || argQn.getParts().size() < 2) continue;
+      // Group-key-prefix path: agg over a dotted leaf whose first part is also a group key
+      // (e.g. `stats min(address.area) by address`). PPL rejects this because the leaf can't be
+      // reached through the STRUCT path that the validator must traverse.
+      if (groupKeyNames.contains(argQn.getParts().get(0))) {
+        throw new IllegalArgumentException(
+            "Cannot execute nested aggregation: aggregating on '"
+                + argQn
+                + "' where '"
+                + argQn.getParts().get(0)
+                + "' is also a group key");
+      }
+      // Array-rooted dotted-arg path: agg over a dotted leaf whose ROOT column is OpenSearch
+      // `type: nested` (Calcite ARRAY-typed). Only reject when there's pre-agg complexity —
+      // bare `stats agg(addr.x) by ...` lets the OpenSearch nested-aggregation pushdown rule
+      // handle it. With `head`/`where`/`eval`/`sort` upstream, pushdown is blocked and the
+      // SqlNode pipeline can't evaluate the nested-array reference. Mirror v2's
+      // CalciteEnumerableNestedAggregate runtime error message.
+      String rootName = argQn.getParts().get(0);
+      if (hadPreAggComplexity
+          && !groupKeyNames.isEmpty()
+          && frame.arrayRootedFields.contains(rootName)) {
+        throw new IllegalArgumentException("Cannot execute nested aggregation on " + argQn);
       }
     }
+  }
+
+  /**
+   * True if the chain from {@code node}'s child down to the bare Relation contains any non-trivial
+   * pipe (anything other than {@link Project} / {@link SubqueryAlias} / {@link Relation}). Mirrors
+   * v2's {@code hadPreAggComplexity} flag in PplToSqlNode#visitAggregation.
+   */
+  private static boolean hasPreAggComplexity(Aggregation node) {
+    if (node.getChild().isEmpty()) return false;
+    org.opensearch.sql.ast.Node c = node.getChild().get(0);
+    while (c != null) {
+      if (c instanceof Relation) return false;
+      if (c instanceof Project || c instanceof SubqueryAlias) {
+        if (c.getChild() == null || c.getChild().isEmpty()) return false;
+        c = (org.opensearch.sql.ast.Node) c.getChild().get(0);
+        continue;
+      }
+      // Anything else (Filter/Eval/Sort/Limit/Head/Rename/Join/...) is "complexity".
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -1272,13 +1330,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
 
   @Override
   public SqlNode visitAggregation(Aggregation node, Frame frame) {
-    // Pre-pass: detect nested-aggregation pattern. PPL `stats min(<group>.<leaf>) by <group>` runs
-    // an aggregate over a dotted-leaf whose parent is itself a group key — Calcite rejects this
-    // shape because the dotted name resolves through STRUCT path and the validator can't reach
-    // the leaf. Mirror v2's CalciteEnumerableNestedAggregate runtime error so users see the
-    // documented message instead of "Table 'X' not found".
-    detectNestedAggregationPattern(node);
     SqlNode from = node.getChild().get(0).accept(this, frame);
+    // Detect nested-aggregation pattern AFTER walking the child so {@link Frame#arrayRootedFields}
+    // (populated by visitRelation) is available for the array-rooted dotted-arg check. PPL
+    // `stats min(<group>.<leaf>) by <group>` and `stats agg(<arrayRoot>.<leaf>) ...` both raise
+    // PPL's documented "Cannot execute nested aggregation" error here so users see it instead
+    // of a confusing "Table 'X' not found" from the validator.
+    detectNestedAggregationPattern(node, frame);
     // Detect upstream join AFTER walking the child — only then has visitJoin's joinHints been
     // populated on the frame. (Before recursion the frame still reflects the calling pipe.)
     boolean joinUpstream = isJoinUpstream(frame);

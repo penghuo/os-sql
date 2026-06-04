@@ -537,6 +537,11 @@ public final class SqlNodePlanner {
         context != null && context.sysLimit != null ? context.sysLimit.subsearchLimit() : null;
     if (ssLimit != null && ssLimit > 0) {
       rel = applySubsearchLimitForIn(rel);
+      // After withExpand(true), the converter has already decorrelated IN/EXISTS into
+      // LogicalCorrelate, so RexSubQuery is gone — applySubsearchLimitForIn is a no-op for those.
+      // Walk LogicalCorrelate's right input here to inject SUBSEARCH_MAXOUT under the
+      // correlation-using LogicalFilter (matching v2's SubsearchUtils emission shape).
+      rel = applySubsearchLimitForCorrelate(rel, ssLimit);
     }
     // Relabel join-right LogicalSort(fetch=joinSubsearchLimit, no collation) to
     // LogicalSystemLimit(JOIN_SUBSEARCH_MAXOUT) to match v2's emission shape. v2's
@@ -2469,6 +2474,92 @@ public final class SqlNodePlanner {
           }
         };
     return rel.accept(relShuttle);
+  }
+
+  /**
+   * Inject {@link org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit} of type SUBSEARCH_MAXOUT
+   * for IN/EXISTS subqueries that withExpand(true) has already converted into {@link
+   * org.apache.calcite.rel.logical.LogicalCorrelate} or a {@link
+   * org.apache.calcite.rel.logical.LogicalJoin} over a deduplicating {@link
+   * org.apache.calcite.rel.logical.LogicalAggregate}. Mirrors v2's SubsearchUtils emission.
+   *
+   * <p>Two patterns:
+   *
+   * <ol>
+   *   <li>Correlated subquery (EXISTS-correlated, IN-correlated):
+   *       <pre>
+   *       LogicalCorrelate
+   *         left
+   *         &lt;right subtree containing LogicalFilter(=$cor0.X, ...)&gt;
+   *       </pre>
+   *       Apply {@link org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle}
+   *       on the right subtree — it splits the correlated filter and inserts SUBSEARCH_MAXOUT under
+   *       it.
+   *   <li>Uncorrelated IN: {@code LogicalJoin(inner) → LogicalAggregate(group={k}) → Project →
+   *       Scan}. Wrap the aggregate's input with SUBSEARCH_MAXOUT so the right-side stream is
+   *       bounded.
+   * </ol>
+   */
+  private RelNode applySubsearchLimitForCorrelate(RelNode rel, int ssLimit) {
+    org.apache.calcite.rex.RexBuilder rexBuilder = rel.getCluster().getRexBuilder();
+    org.apache.calcite.rel.type.RelDataType intType =
+        rexBuilder.getTypeFactory().createSqlType(org.apache.calcite.sql.type.SqlTypeName.INTEGER);
+    org.apache.calcite.rex.RexLiteral capLit =
+        (org.apache.calcite.rex.RexLiteral) rexBuilder.makeLiteral(ssLimit, intType, true);
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (visited instanceof org.apache.calcite.rel.logical.LogicalCorrelate corr) {
+              org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle
+                  innerShuttle =
+                      new org.opensearch.sql.calcite.utils.SubsearchUtils
+                          .SystemLimitInsertionShuttle(context);
+              RelNode newRight = corr.getRight().accept(innerShuttle);
+              if (newRight != corr.getRight()) {
+                return corr.copy(
+                    corr.getTraitSet(),
+                    corr.getLeft(),
+                    newRight,
+                    corr.getCorrelationId(),
+                    corr.getRequiredColumns(),
+                    corr.getJoinType());
+              }
+            } else if (visited instanceof org.apache.calcite.rel.logical.LogicalJoin join) {
+              // Uncorrelated IN: right side is LogicalAggregate(group={k}) directly produced by
+              // withExpand for `WHERE x IN (SELECT k FROM t)`. The aggregate dedups the
+              // candidates; cap upstream of it.
+              RelNode right = join.getRight();
+              if (right instanceof org.apache.calcite.rel.logical.LogicalAggregate agg
+                  && !agg.getGroupSet().isEmpty()
+                  && agg.getAggCallList().isEmpty()) {
+                RelNode capped =
+                    org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.create(
+                        org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType
+                            .SUBSEARCH_MAXOUT,
+                        agg.getInput(),
+                        capLit);
+                org.apache.calcite.rel.logical.LogicalAggregate newAgg =
+                    agg.copy(
+                        agg.getTraitSet(),
+                        capped,
+                        agg.getGroupSet(),
+                        agg.getGroupSets(),
+                        agg.getAggCallList());
+                return join.copy(
+                    join.getTraitSet(),
+                    join.getCondition(),
+                    join.getLeft(),
+                    newAgg,
+                    join.getJoinType(),
+                    join.isSemiJoinDone());
+              }
+            }
+            return visited;
+          }
+        };
+    return rel.accept(shuttle);
   }
 
   /** True if the rel tree contains any RexSubQuery (correlated or not). */

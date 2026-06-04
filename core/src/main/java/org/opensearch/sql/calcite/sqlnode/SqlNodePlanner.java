@@ -2512,11 +2512,7 @@ public final class SqlNodePlanner {
           public RelNode visit(RelNode other) {
             RelNode visited = super.visit(other);
             if (visited instanceof org.apache.calcite.rel.logical.LogicalCorrelate corr) {
-              org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle
-                  innerShuttle =
-                      new org.opensearch.sql.calcite.utils.SubsearchUtils
-                          .SystemLimitInsertionShuttle(context);
-              RelNode newRight = corr.getRight().accept(innerShuttle);
+              RelNode newRight = applyCorrelatedCap(corr.getRight(), capLit);
               if (newRight != corr.getRight()) {
                 return corr.copy(
                     corr.getTraitSet(),
@@ -2560,6 +2556,122 @@ public final class SqlNodePlanner {
           }
         };
     return rel.accept(shuttle);
+  }
+
+  /**
+   * Walk a Correlate's right subtree and inject SUBSEARCH_MAXOUT at the deepest correlated
+   * LogicalFilter that has both correlated AND non-correlated conjuncts. If no such filter exists,
+   * fall back to the standard {@link
+   * org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle} which inserts at
+   * the first (outer) correlated filter.
+   *
+   * <p>Why: nested correlations (e.g. {@code WHERE name IN (SELECT name FROM ... WHERE id=outer.id
+   * AND like(occupation,'...'))} have an outer correlated filter above the dedup Aggregate and an
+   * inner correlated+non-correlated filter beneath. Capping at the outer filter (which is entirely
+   * correlated, no non-corr part) limits dedup output, not raw scan output. v2's SubsearchUtils
+   * stops at the first correlated filter, but for tractability of the IN-correlated case we walk
+   * deeper to find the filter that actually has a non-corr predicate to split on.
+   */
+  private RelNode applyCorrelatedCap(RelNode subtree, org.apache.calcite.rex.RexLiteral capLit) {
+    // Find the deepest LogicalFilter that contains a correlated conjunct AND a non-correlated
+    // conjunct. If found, split that filter and insert the cap there. Otherwise fall back to v2's
+    // standard SystemLimitInsertionShuttle.
+    java.util.List<org.apache.calcite.rel.logical.LogicalFilter> candidates =
+        new java.util.ArrayList<>();
+    org.apache.calcite.rel.RelShuttle scanner =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            if (other instanceof org.apache.calcite.rel.logical.LogicalFilter f) {
+              java.util.List<org.apache.calcite.rex.RexNode> parts =
+                  org.apache.calcite.plan.RelOptUtil.conjunctions(f.getCondition());
+              boolean hasCorr =
+                  parts.stream()
+                      .anyMatch(org.opensearch.sql.calcite.utils.PlanUtils::containsCorrelVariable);
+              boolean hasNonCorr =
+                  parts.stream()
+                      .anyMatch(
+                          p ->
+                              !org.opensearch.sql.calcite.utils.PlanUtils.containsCorrelVariable(
+                                  p));
+              if (hasCorr && hasNonCorr) {
+                candidates.add(f);
+              }
+            }
+            return super.visit(other);
+          }
+        };
+    subtree.accept(scanner);
+    if (candidates.isEmpty()) {
+      // No mixed-conjunct filter; fall through to v2's shuttle which caps at the first
+      // correlated filter (existing single-correlation behavior).
+      org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle innerShuttle =
+          new org.opensearch.sql.calcite.utils.SubsearchUtils.SystemLimitInsertionShuttle(context);
+      return subtree.accept(innerShuttle);
+    }
+    // Use the deepest (last in tree-order) mixed-conjunct filter.
+    org.apache.calcite.rel.logical.LogicalFilter target = candidates.get(candidates.size() - 1);
+    return rebuildWithCapAtFilter(subtree, target, capLit);
+  }
+
+  /**
+   * Rebuild {@code root} replacing exactly one {@link org.apache.calcite.rel.logical.LogicalFilter}
+   * ({@code target}) with the v2-style split: Filter(corr-conjuncts) above
+   * SystemLimit(SUBSEARCH_MAXOUT) above Filter(non-corr-conjuncts) above the original input.
+   */
+  private RelNode rebuildWithCapAtFilter(
+      RelNode root,
+      org.apache.calcite.rel.logical.LogicalFilter target,
+      org.apache.calcite.rex.RexLiteral capLit) {
+    org.apache.calcite.rel.RelShuttle replacer =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            if (other == target) {
+              return splitAndInsertCap(target, capLit);
+            }
+            return super.visit(other);
+          }
+        };
+    return root.accept(replacer);
+  }
+
+  /**
+   * Apply v2's split-and-cap to a single LogicalFilter known to have both correlated and
+   * non-correlated conjuncts. Result: Filter(corr) → SystemLimit(SUBSEARCH_MAXOUT) →
+   * Filter(non-corr) → input.
+   */
+  private RelNode splitAndInsertCap(
+      org.apache.calcite.rel.logical.LogicalFilter f, org.apache.calcite.rex.RexLiteral capLit) {
+    java.util.List<org.apache.calcite.rex.RexNode> parts =
+        org.apache.calcite.plan.RelOptUtil.conjunctions(f.getCondition());
+    java.util.List<org.apache.calcite.rex.RexNode> corr = new java.util.ArrayList<>();
+    java.util.List<org.apache.calcite.rex.RexNode> nonCorr = new java.util.ArrayList<>();
+    for (org.apache.calcite.rex.RexNode p : parts) {
+      if (org.opensearch.sql.calcite.utils.PlanUtils.containsCorrelVariable(p)) {
+        corr.add(p);
+      } else {
+        nonCorr.add(p);
+      }
+    }
+    org.apache.calcite.rex.RexBuilder rb = f.getCluster().getRexBuilder();
+    RelNode input = f.getInput();
+    if (!nonCorr.isEmpty()) {
+      input =
+          org.apache.calcite.rel.logical.LogicalFilter.create(
+              input, org.apache.calcite.rex.RexUtil.composeConjunction(rb, nonCorr));
+    }
+    input =
+        org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.create(
+            org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType.SUBSEARCH_MAXOUT,
+            input,
+            capLit);
+    if (!corr.isEmpty()) {
+      input =
+          org.apache.calcite.rel.logical.LogicalFilter.create(
+              input, org.apache.calcite.rex.RexUtil.composeConjunction(rb, corr));
+    }
+    return input;
   }
 
   /** True if the rel tree contains any RexSubQuery (correlated or not). */

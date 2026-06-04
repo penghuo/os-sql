@@ -5508,6 +5508,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             null);
     // Step 3: outer Project — ITEM(elem, 'pattern'), 'pattern_count', 'tokens', 'sample_logs'.
     SqlNode elemRef = new SqlIdentifier(java.util.Arrays.asList(unnestAlias, elemName), POS);
+    // v2's flattenParsedPattern uses RexBuilder.makeCast(... safe=true) which surfaces in
+    // explain as `SAFE_CAST(arg)` (no `:TYPE` annotation — type comes from result inference).
+    // Use SqlLibraryOperators.SAFE_CAST so our emission matches the same shape.
+    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+            POS);
+    org.apache.calcite.sql.SqlDataTypeSpec bigintSpec =
+        new org.apache.calcite.sql.SqlDataTypeSpec(
+            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                org.apache.calcite.sql.type.SqlTypeName.BIGINT, POS),
+            POS);
     SqlNode itemPattern =
         new SqlBasicCall(
             SqlStdOperatorTable.ITEM,
@@ -5515,13 +5528,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
     SqlNode castPattern =
         new SqlBasicCall(
-            SqlStdOperatorTable.CAST,
-            List.of(
-                itemPattern,
-                new org.apache.calcite.sql.SqlDataTypeSpec(
-                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                        org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                    POS)),
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(itemPattern, varcharSpec),
             POS);
     SqlNode itemCount =
         new SqlBasicCall(
@@ -5530,14 +5538,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             POS);
     SqlNode castCount =
         new SqlBasicCall(
-            SqlStdOperatorTable.CAST,
-            List.of(
-                itemCount,
-                new org.apache.calcite.sql.SqlDataTypeSpec(
-                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                        org.apache.calcite.sql.type.SqlTypeName.BIGINT, POS),
-                    POS)),
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
+            List.of(itemCount, bigintSpec),
             POS);
+    // tokens / sample_logs: leave un-cast. v2's SAFE_CAST to MAP<VARCHAR, ARRAY> /
+    // ARRAY<VARCHAR> would match exactly, but emitting compound SqlDataTypeSpec for these
+    // tripped a validator AssertionError. Plain ITEM($elem, 'k') returns the right runtime
+    // shape — only the explain output differs cosmetically (`ITEM(...)` vs `SAFE_CAST(ITEM(...))`).
     SqlNode itemTokens =
         new SqlBasicCall(
             SqlStdOperatorTable.ITEM,
@@ -5706,9 +5713,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
             SqlStdOperatorTable.ITEM,
             List.of(parserCall, SqlLiteral.createCharString("pattern", POS)),
             POS);
+    // SAFE_CAST mirrors v2's flattenParsedPattern emission shape (RexBuilder.makeCast safe=true).
     SqlNode castPattern =
         new SqlBasicCall(
-            SqlStdOperatorTable.CAST,
+            org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
             List.of(
                 itemPattern,
                 new org.apache.calcite.sql.SqlDataTypeSpec(

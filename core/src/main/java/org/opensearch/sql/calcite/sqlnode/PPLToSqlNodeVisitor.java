@@ -1970,7 +1970,13 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           "bin command subtype " + node.getClass().getSimpleName() + " not yet supported");
     }
     // Project: emit non-bin columns in original order, then append the bin column at the end
-    // (mirrors v2's emission shape). Without a row-type oracle, walk frame.currentFields.
+    // (mirrors v2's emission shape). Without a row-type oracle, walk frame.currentFields. Skip:
+    //   - the bin alias itself (re-emitted as the bucketCall expression)
+    //   - intermediate MAP-typed columns (Frame.mapColumns); for OpenSearch nested mappings,
+    //     traverseAndFlatten populates currentFields with intermediate parents like `resource`,
+    //     `resource.attributes`, ... which v2's emission omits when binning a leaf path
+    // Metadata fields (`_id`, `_index`, ...) are KEPT in the inner Project — v2 emits them
+    // here and the implicit final-Project / user `| fields` drops them downstream.
     if (frame.currentFields == null) {
       throw new UnsupportedOperationException(
           "bin requires a known column list — call after a `| fields ...` pipe");
@@ -1979,7 +1985,12 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     List<String> visible = new ArrayList<>();
     for (String c : frame.currentFields) {
       if (c.equals(alias)) continue;
-      items.add(toIdentifier(c));
+      if (frame.mapColumns.contains(c)) continue;
+      // Dotted column names (flattened from OpenSearch nested mappings) need quoted single-part
+      // identifiers so the validator looks them up literally instead of treating the prefix as
+      // a table reference.
+      SqlNode ref = c.indexOf('.') < 0 ? toIdentifier(c) : quotedIdentifier(java.util.List.of(c));
+      items.add(ref);
       visible.add(c);
     }
     items.add(asAliased(bucketCall, alias));

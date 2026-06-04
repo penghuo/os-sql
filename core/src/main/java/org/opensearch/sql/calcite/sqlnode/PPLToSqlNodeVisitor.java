@@ -5400,6 +5400,14 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (!aggMode) {
       return labelSelect;
     }
+    if (showNumbered) {
+      // BRAIN AGG show_numbered=true: v2 emits INTERNAL_PATTERN as an AggCall (not OVER) with
+      // GROUP BY partitionBy, then UNNEST the ARRAY<MAP<VARCHAR,ANY>> result and project pattern,
+      // pattern_count, tokens, sample_logs from each MAP element. The LABEL-OVER path doesn't
+      // model the per-group token aggregation (it produces per-row tokens, then GROUP BY drops
+      // them); only the AggCall path returns the merged-per-group tokens map directly.
+      return emitBrainAggShowNumbered(node, frame, from, aliasField, patternArgs);
+    }
     // AGGREGATION mode: GROUP BY (partitionBy ..., patterns_field) post-LABEL. Reuse the
     // SIMPLE_PATTERN aggregator with a passthrough patternsExpr (the LABEL-emitted aliasField
     // column is already the patterns_field). Pass the actual user method (BRAIN) so the
@@ -5415,6 +5423,146 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         new SqlIdentifier(aliasField, POS),
         org.opensearch.sql.ast.expression.PatternMethod.BRAIN,
         /* showNumbered */ false);
+  }
+
+  /**
+   * Emit the BRAIN AGGREGATION-mode show_numbered=true path using INTERNAL_PATTERN as an AggCall
+   * (not OVER), then UNNEST the ARRAY&lt;MAP&gt; result. Mirrors v2's CalciteRelNodeVisitor BRAIN
+   * AGG flow.
+   *
+   * <p>Shape:
+   *
+   * <pre>
+   * SELECT s.&lt;partitionBy&gt;..., CAST(ITEM(t.elem, 'pattern') AS VARCHAR) AS &lt;aliasField&gt;,
+   *        ITEM(t.elem, 'pattern_count') AS pattern_count,
+   *        ITEM(t.elem, 'tokens') AS tokens,
+   *        ITEM(t.elem, 'sample_logs') AS sample_logs
+   * FROM   (SELECT &lt;partitionBy&gt;..., INTERNAL_PATTERN(source, max, buf, true, args)
+   *         FROM   &lt;input&gt;
+   *         GROUP BY &lt;partitionBy&gt;...) AS s
+   *      , UNNEST(s.agg_result) AS t(elem)
+   * </pre>
+   *
+   * @param patternArgs the validated argument list for INTERNAL_PATTERN (source, max, buf, true,
+   *     [variable_count, frequency_threshold ...])
+   */
+  private SqlNode emitBrainAggShowNumbered(
+      Patterns node, Frame frame, SqlNode from, String aliasField, List<SqlNode> patternArgs) {
+    // Step 1: aggregate. SELECT partitionBy..., INTERNAL_PATTERN(...) AS agg_result GROUP BY ...
+    SqlNodeList aggItems = new SqlNodeList(POS);
+    List<SqlNode> groupKeys = new ArrayList<>();
+    List<String> partitionByNames = new ArrayList<>();
+    if (node.getPartitionByList() != null) {
+      for (UnresolvedExpression p : node.getPartitionByList()) {
+        UnresolvedExpression core = (p instanceof Alias a) ? a.getDelegated() : p;
+        SqlNode key = expr(core);
+        groupKeys.add(key);
+        String name =
+            (p instanceof Alias a)
+                ? a.getName()
+                : (core instanceof QualifiedName qn ? qn.toString() : null);
+        if (name != null) {
+          aggItems.add(asAliased(key, name));
+          partitionByNames.add(name);
+        } else {
+          aggItems.add(key);
+        }
+      }
+    }
+    String aggResultName = "__pattern_agg__";
+    SqlNode patternAgg =
+        new SqlBasicCall(
+            org.opensearch.sql.expression.function.PPLBuiltinOperators.INTERNAL_PATTERN,
+            patternArgs,
+            POS);
+    aggItems.add(asAliased(patternAgg, aggResultName));
+    Frame aggFrame = new Frame();
+    List<String> aggVisible = new ArrayList<>(partitionByNames);
+    aggVisible.add(aggResultName);
+    SqlNode aggSelect =
+        SqlBuilder.select(aggItems)
+            .from(from)
+            .groupBy(groupKeys)
+            .withFields(aggVisible)
+            .wrap(aggFrame);
+    // Step 2: UNNEST. SELECT s.<partition...>, t.elem FROM (aggSelect) AS s, UNNEST(s.<agg>) AS t
+    String inputAlias = "__brain_s__";
+    String unnestAlias = "__brain_t__";
+    String elemName = "__brain_elem__";
+    SqlNode aliasedInput = SqlBuilder.aliasAs(aggSelect, inputAlias);
+    SqlNode unnestArg = new SqlIdentifier(java.util.Arrays.asList(inputAlias, aggResultName), POS);
+    SqlNode unnest = new SqlBasicCall(SqlStdOperatorTable.UNNEST, List.of(unnestArg), POS);
+    SqlNode aliasedUnnest =
+        new SqlBasicCall(
+            SqlStdOperatorTable.AS,
+            List.of(unnest, new SqlIdentifier(unnestAlias, POS), new SqlIdentifier(elemName, POS)),
+            POS);
+    SqlNode join =
+        new org.apache.calcite.sql.SqlJoin(
+            POS,
+            aliasedInput,
+            SqlLiteral.createBoolean(false, POS),
+            JoinType.COMMA.symbol(POS),
+            aliasedUnnest,
+            org.apache.calcite.sql.JoinConditionType.NONE.symbol(POS),
+            null);
+    // Step 3: outer Project — ITEM(elem, 'pattern'), 'pattern_count', 'tokens', 'sample_logs'.
+    SqlNode elemRef = new SqlIdentifier(java.util.Arrays.asList(unnestAlias, elemName), POS);
+    SqlNode itemPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(elemRef, SqlLiteral.createCharString("pattern", POS)),
+            POS);
+    SqlNode castPattern =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CAST,
+            List.of(
+                itemPattern,
+                new org.apache.calcite.sql.SqlDataTypeSpec(
+                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                        org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
+                    POS)),
+            POS);
+    SqlNode itemCount =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(elemRef, SqlLiteral.createCharString("pattern_count", POS)),
+            POS);
+    SqlNode castCount =
+        new SqlBasicCall(
+            SqlStdOperatorTable.CAST,
+            List.of(
+                itemCount,
+                new org.apache.calcite.sql.SqlDataTypeSpec(
+                    new org.apache.calcite.sql.SqlBasicTypeNameSpec(
+                        org.apache.calcite.sql.type.SqlTypeName.BIGINT, POS),
+                    POS)),
+            POS);
+    SqlNode itemTokens =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(elemRef, SqlLiteral.createCharString("tokens", POS)),
+            POS);
+    SqlNode itemSamples =
+        new SqlBasicCall(
+            SqlStdOperatorTable.ITEM,
+            List.of(elemRef, SqlLiteral.createCharString("sample_logs", POS)),
+            POS);
+    SqlNodeList outerItems = new SqlNodeList(POS);
+    List<String> outerVisible = new ArrayList<>();
+    for (String pn : partitionByNames) {
+      outerItems.add(new SqlIdentifier(java.util.Arrays.asList(inputAlias, pn), POS));
+      outerVisible.add(pn);
+    }
+    outerItems.add(asAliased(castPattern, aliasField));
+    outerVisible.add(aliasField);
+    outerItems.add(asAliased(castCount, "pattern_count"));
+    outerVisible.add("pattern_count");
+    outerItems.add(asAliased(itemTokens, "tokens"));
+    outerVisible.add("tokens");
+    outerItems.add(asAliased(itemSamples, "sample_logs"));
+    outerVisible.add("sample_logs");
+    return SqlBuilder.select(outerItems).from(join).withFields(outerVisible).wrap(frame);
   }
 
   /**

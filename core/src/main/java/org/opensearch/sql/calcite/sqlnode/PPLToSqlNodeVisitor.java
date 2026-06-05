@@ -5517,7 +5517,11 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         }
       }
     }
-    String aggResultName = "__pattern_agg__";
+    // Use the user-facing alias as the agg-result name to match v2's emission shape, where the
+    // RelBuilder calls aggregate(agg.named(aliasField, INTERNAL_PATTERN(...))) so the Aggregate
+    // rel's row type field is `aliasField` (e.g. `patterns_field`). Hardcoded internal names
+    // (`__pattern_agg__`) showed up in explain output, breaking plan-shape comparisons.
+    String aggResultName = aliasField;
     SqlNode patternAgg =
         new SqlBasicCall(
             org.opensearch.sql.expression.function.PPLBuiltinOperators.INTERNAL_PATTERN,

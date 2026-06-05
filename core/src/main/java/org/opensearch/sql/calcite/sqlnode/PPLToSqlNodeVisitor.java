@@ -6357,12 +6357,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
                 + " for top-level graphLookup.");
       }
       SqlNode innerFrom = node.getChild().get(0).accept(this, frame);
+      // Non-batch mode: emit SELECT * with LIMIT 100 (no narrowing list) so the source feeds
+      // the GraphLookup PTF without an intermediate metadata-strip Project — match v2's
+      // emission shape (LogicalSort(fetch=100) directly under LogicalGraphLookup).
+      // Batch mode: keep the narrowing list because the PTF's type signature requires the inner
+      // record to carry NOT NULL nullability (batch-mode tests fail with "RecordType ... NOT
+      // NULL ARRAY NOT NULL" type mismatch when SELECT * widens it).
+      SqlNodeList sourceSelectList;
+      if (node.isBatchMode()) {
+        sourceSelectList = graphLookupNonMetaSelectList(frame.currentFields);
+      } else {
+        sourceSelectList = new SqlNodeList(POS);
+        sourceSelectList.add(SqlIdentifier.star(POS));
+      }
       sourceSqlNode =
           new SqlSelect(
               POS,
               null,
-              graphLookupNonMetaSelectList(frame.currentFields),
+              sourceSelectList,
               innerFrom,
+              null,
               null,
               null,
               null,

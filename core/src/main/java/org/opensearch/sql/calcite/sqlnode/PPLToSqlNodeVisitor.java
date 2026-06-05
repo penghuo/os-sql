@@ -5891,6 +5891,44 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       throw new UnsupportedOperationException(
           "mvcombine requires a known column list — call after a `| fields ...` pipe");
     }
+    // PPL allows mvcombine on a MAP-leaf path (e.g. `mvcombine doc.user.name` after spath). The
+    // dotted leaf is not a flat column in currentFields. Lower the leaf through ITEM(map, 'key')
+    // and emit a per-row 1-element array (or null when the source is null) aliased back to the
+    // dotted name. Matches v2 semantics: each scalar leaf becomes a 1-element array column.
+    int firstDot = fieldName.indexOf('.');
+    if (!frame.currentFields.contains(fieldName)
+        && firstDot > 0
+        && frame.mapColumns.contains(fieldName.substring(0, firstDot))) {
+      String prefix = fieldName.substring(0, firstDot);
+      String subkey = fieldName.substring(firstDot + 1);
+      SqlNode itemAccess =
+          new SqlBasicCall(
+              SqlStdOperatorTable.ITEM,
+              List.of(new SqlIdentifier(prefix, POS), SqlLiteral.createCharString(subkey, POS)),
+              POS);
+      SqlNodeList selectItems = new SqlNodeList(POS);
+      List<String> newVisibleMap = new ArrayList<>(frame.currentFields.size());
+      for (String c : frame.currentFields) {
+        selectItems.add(toIdentifier(c));
+        newVisibleMap.add(c);
+      }
+      // CASE WHEN item IS NULL THEN NULL ELSE ARRAY[item] END AS "<dotted>". Plain
+      // ARRAY[item] would be a 1-element array containing NULL when the source is NULL —
+      // PPL semantics surface NULL as a NULL array, not [NULL].
+      SqlNodeList whens = new SqlNodeList(POS);
+      whens.add(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(itemAccess), POS));
+      SqlNodeList thens = new SqlNodeList(POS);
+      thens.add(SqlLiteral.createNull(POS));
+      SqlNode arrayCtor =
+          new SqlBasicCall(SqlStdOperatorTable.ARRAY_VALUE_CONSTRUCTOR, List.of(itemAccess), POS);
+      SqlNode caseExpr = new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, arrayCtor);
+      selectItems.add(asAliased(caseExpr, fieldName));
+      newVisibleMap.add(fieldName);
+      SqlNode mapLeafSelect =
+          SqlBuilder.select(selectItems).from(child).withFields(newVisibleMap).wrap(frame);
+      frame.currentFields = newVisibleMap;
+      return mapLeafSelect;
+    }
     if (!frame.currentFields.contains(fieldName)) {
       throw new IllegalArgumentException("Field [" + fieldName + "] not found.");
     }

@@ -695,7 +695,104 @@ public final class SqlNodePlanner {
     // This mirrors v2's PPLHintUtils.addIgnoreNullBucketHintToAggregate path applied when PPL
     // bucket_nullable=false (and for time-span aggregations).
     rel = addIgnoreNullBucketHint(rel);
+    // Strip identity LogicalProject over LogicalGraphLookup with literal start values. Our
+    // visitGraphLookup emits an outer `SELECT *` wrap to give downstream pipes a SqlSelect-shaped
+    // node, but for top-level (literal-start) GraphLookup the result has only one column
+    // (reportingHierarchy) so the wrap surfaces as a redundant identity Project. Match v2's
+    // shape (LogicalGraphLookup directly under LogicalSystemLimit, no outer Project).
+    rel = stripIdentityProjectOverGraphLookup(rel);
+    // Replace the dummy 1-row LogicalValues feeding the left side of a literal-start
+    // LogicalGraphLookup with empty Values. Our visitGraphLookup emits `SELECT 0 AS _dummy_` to
+    // satisfy SQL's requirement for a non-null FROM, but the GraphLookup PTF reads start values
+    // from its literal arg — the dummy row is unused at runtime. v2 emits empty Values
+    // (tuples=[[]]) to match.
+    rel = emptyValuesForLiteralStartGraphLookup(rel);
     return RelOptUtil.propagateRelHints(rel, false);
+  }
+
+  /**
+   * Replace the dummy 1-row LogicalValues feeding the left input of a literal-start
+   * LogicalGraphLookup with an empty (zero-row) LogicalValues. Our visitGraphLookup emits {@code
+   * SELECT 0 AS _dummy_} as a one-row source because SQL's FROM requires a non-null relation. The
+   * GraphLookup PTF reads its start values from its literal arg, so the dummy row is unused at
+   * runtime. v2's RelBuilder emits empty Values directly.
+   */
+  private RelNode emptyValuesForLiteralStartGraphLookup(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup gl)) {
+              return visited;
+            }
+            if (gl.getStartValues() == null || gl.getStartValues().isEmpty()) {
+              return visited;
+            }
+            // The left input is the source side. For literal-start mode it should be a
+            // LogicalValues with exactly one tuple (the dummy row).
+            java.util.List<RelNode> inputs = gl.getInputs();
+            if (inputs.isEmpty()) return visited;
+            RelNode left = inputs.get(0);
+            if (!(left instanceof org.apache.calcite.rel.logical.LogicalValues values)) {
+              return visited;
+            }
+            if (values.getTuples().size() != 1) return visited;
+            org.apache.calcite.rel.logical.LogicalValues empty =
+                org.apache.calcite.rel.logical.LogicalValues.create(
+                    values.getCluster(),
+                    values.getRowType(),
+                    com.google.common.collect.ImmutableList.of());
+            java.util.List<RelNode> newInputs = new java.util.ArrayList<>(inputs);
+            newInputs.set(0, empty);
+            return gl.copy(gl.getTraitSet(), newInputs);
+          }
+        };
+    return rel.accept(shuttle);
+  }
+
+  /**
+   * Remove redundant identity LogicalProject directly over a literal-start LogicalGraphLookup. The
+   * {@code visitGraphLookup} wraps the COLLECTION_TABLE output in {@code SELECT *} so downstream
+   * pipes see a SqlSelect-shaped node, but for top-level GraphLookup (no piped source) the result
+   * row type contains only the output column — making the wrap a redundant identity projection that
+   * breaks v2's expected explain shape.
+   */
+  private RelNode stripIdentityProjectOverGraphLookup(RelNode rel) {
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (!(visited instanceof org.apache.calcite.rel.logical.LogicalProject project)) {
+              return visited;
+            }
+            RelNode input = project.getInput();
+            if (!(input instanceof org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup gl)) {
+              return visited;
+            }
+            // Only strip when the GraphLookup is in literal-start (top-level) mode. Non-top-level
+            // GraphLookup feeds a piped source and the outer Project is meaningful (narrows the
+            // wider scan rowtype).
+            if (gl.getStartValues() == null || gl.getStartValues().isEmpty()) {
+              return visited;
+            }
+            // Identity: project list is a 1:1 mapping of input refs in original order, AND the
+            // output row type matches the input row type column-for-column.
+            java.util.List<org.apache.calcite.rex.RexNode> projects = project.getProjects();
+            if (projects.size() != input.getRowType().getFieldCount()) {
+              return visited;
+            }
+            for (int i = 0; i < projects.size(); i++) {
+              org.apache.calcite.rex.RexNode p = projects.get(i);
+              if (!(p instanceof org.apache.calcite.rex.RexInputRef ref) || ref.getIndex() != i) {
+                return visited;
+              }
+            }
+            return input;
+          }
+        };
+    return rel.accept(shuttle);
   }
 
   /**

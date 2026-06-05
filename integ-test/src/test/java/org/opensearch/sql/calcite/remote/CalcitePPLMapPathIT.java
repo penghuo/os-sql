@@ -484,21 +484,18 @@ public class CalcitePPLMapPathIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void testStreamstatsGlobalWindowByMapPath() {
-    // TODO: Fix requires propagating pre-materialized columns to the correlate right-side scan.
-    Throwable e =
-        assertThrows(
-            Exception.class,
-            () ->
-                ppl(
-                    """
-                    source=%s | spath input=doc
-                    | where isnotnull(doc.user.city)
-                    | streamstats global=true window=2 count() as cnt by doc.user.city
-                    | fields doc.user.city, cnt\
-                    """,
-                    TEST_INDEX));
-    verifyErrorMessageContains(e, "field [doc.user.city] not found");
+  public void testStreamstatsGlobalWindowByMapPath() throws IOException {
+    JSONObject result =
+        ppl(
+            """
+            source=%s | spath input=doc
+            | where isnotnull(doc.user.city)
+            | streamstats global=true window=2 count() as cnt by doc.user.city
+            | fields doc.user.city, cnt\
+            """,
+            TEST_INDEX);
+    verifySchema(result, schema("doc.user.city", "string"), schema("cnt", "bigint"));
+    verifyDataRows(result, rows("SF", 1), rows("LA", 1), rows("NYC", 1), rows("NYC", 1));
   }
 
   @Test

@@ -178,6 +178,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     java.util.Map<String, DataType> evalAliasTypes = new java.util.LinkedHashMap<>();
 
     /**
+     * Eval-alias → source-column name when the let RHS is a bare passthrough column reference
+     * ({@code eval name = lastname}). Populated by {@code visitEval} only for trivial passthroughs
+     * (bare {@link QualifiedName}); excluded for any computed RHS. Consumed by {@code
+     * visitAggregation}'s doc_count optimization to substitute the alias back to its source for the
+     * IS NOT NULL filter — mirrors v2's RelBuilder which preserves the original column index across
+     * rename-only Project layers.
+     */
+    java.util.Map<String, String> evalPassthroughSource = new java.util.LinkedHashMap<>();
+
+    /**
      * Set of catalog column names whose Calcite type is ARRAY — these correspond to OpenSearch
      * {@code type: nested} mappings. Populated by {@code populateColumnUdt} during {@link
      * #visitRelation}. Consumed by {@link #detectNestedAggregationPattern} to detect aggregation
@@ -1104,6 +1114,26 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         // Rebound alias with unknown type — drop the prior tracking.
         frame.evalAliasTypes.remove(alias);
       }
+      // Track passthrough alias (`eval new = oldField`) for downstream visitAggregation's
+      // doc_count optimization to substitute the alias back to its source column. Only applies
+      // when the RHS is a bare QualifiedName (or Field-wrapped one); computed expressions don't
+      // qualify.
+      UnresolvedExpression rhsExpr = let.getExpression();
+      QualifiedName rhsQn = null;
+      if (rhsExpr instanceof QualifiedName q) rhsQn = q;
+      else if (rhsExpr instanceof Field f && f.getField() instanceof QualifiedName q) rhsQn = q;
+      if (rhsQn != null && !rhsQn.toString().equals(alias)) {
+        // Resolve through prior passthroughs so chained renames terminate at the original.
+        String src = rhsQn.toString();
+        String resolved = src;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        while (frame.evalPassthroughSource.containsKey(resolved) && seen.add(resolved)) {
+          resolved = frame.evalPassthroughSource.get(resolved);
+        }
+        frame.evalPassthroughSource.put(alias, resolved);
+      } else {
+        frame.evalPassthroughSource.remove(alias);
+      }
       // Track MAP-producing eval aliases (e.g. {@code eval info = geoip(...)}). Downstream
       // dotted refs `info.city` get ITEM dispatch in expr(QualifiedName), same path as catalog
       // MAP columns. Detection: known MAP-returning function calls.
@@ -1493,7 +1523,16 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
           allEligible = false;
           break;
         }
-        distinctFields.add(qn.toString());
+        // Resolve through passthrough eval aliases so `count(lastname), count(name)` where
+        // `eval name = lastname` collapses to a single distinct field. Mirrors v2's alias-
+        // resolution which preserves the original column identity across rename-only Project
+        // layers.
+        String resolved = qn.toString();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        while (frame.evalPassthroughSource.containsKey(resolved) && seen.add(resolved)) {
+          resolved = frame.evalPassthroughSource.get(resolved);
+        }
+        distinctFields.add(resolved);
       }
       if (allEligible && distinctFields.size() == 1) {
         String fieldName = distinctFields.iterator().next();

@@ -917,10 +917,19 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   public SqlNode visitHead(Head node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
     SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getSize().toString(), POS);
-    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
     Integer fromOffset = node.getFrom();
-    if (fromOffset != null && fromOffset > 0) {
-      b.offset(SqlLiteral.createExactNumeric(fromOffset.toString(), POS));
+    SqlLiteral offset =
+        fromOffset != null && fromOffset > 0
+            ? SqlLiteral.createExactNumeric(fromOffset.toString(), POS)
+            : null;
+    // Same fold as visitLimit: `... | sort F | fields A | head N` → fold the head fetch into
+    // the upstream SqlOrderBy through the intervening Project. v2's RelBuilder produces
+    // `Project > Sort(fetch=N) > Filter` (single Sort with attached fetch).
+    SqlNode folded = foldFetchIntoChildOrderBy(from, offset, fetch);
+    if (folded != null) return folded;
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
+    if (offset != null) {
+      b.offset(offset);
     }
     return b.wrap(frame);
   }
@@ -7167,11 +7176,55 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     SqlNode peep =
         orderByOnChildSelectStar(from, java.util.Collections.emptyList(), offset, fetch, frame);
     if (peep != null) return peep;
+    // PPL `... | sort F | fields A | head N` — fold the fetch into the upstream SqlOrderBy
+    // through the intervening Project. v2's RelBuilder produces `Project > Sort(fetch=N) > Filter`;
+    // without folding we'd emit `Project > Sort(fetch=N) > Project > Sort > Filter` (two Sorts).
+    // Mutating the existing SqlSelect's FROM is safe — the fetch attaches to the inner SqlOrderBy
+    // which already holds the sort keys.
+    SqlNode folded = foldFetchIntoChildOrderBy(from, offset, fetch);
+    if (folded != null) return folded;
     SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
     if (offset != null) {
       b.offset(offset);
     }
     return reattachSubqueryAlias(b.wrap(frame), frame);
+  }
+
+  /**
+   * Fold a {@code FETCH N}/{@code OFFSET M} into a {@link SqlOrderBy} buried under a projection
+   * select. Two shapes match:
+   *
+   * <ul>
+   *   <li>{@code outer} is a {@link SqlOrderBy} (no fetch/offset) whose inner SELECT carries the
+   *       project list — visitProject's {@code projectIntoChildSelectStar} short-circuit returns
+   *       this shape when the user-projection was folded into the SqlOrderBy's wrapped SELECT.
+   *   <li>{@code outer} is {@code SELECT <list> FROM <SqlOrderBy>} where the SqlOrderBy has no
+   *       existing fetch/offset.
+   * </ul>
+   *
+   * <p>Mutates the matched node in place to attach fetch/offset. Returns the (possibly mutated)
+   * outer node, or null when shape doesn't match.
+   */
+  private static SqlNode foldFetchIntoChildOrderBy(
+      SqlNode outer, SqlLiteral offset, SqlLiteral fetch) {
+    if (outer instanceof org.apache.calcite.sql.SqlOrderBy ob
+        && ob.fetch == null
+        && ob.offset == null) {
+      return new org.apache.calcite.sql.SqlOrderBy(POS, ob.query, ob.orderList, offset, fetch);
+    }
+    if (!(outer instanceof SqlSelect outerSel)) return null;
+    if (outerSel.getFetch() != null || outerSel.getOffset() != null) return null;
+    if (outerSel.getOrderList() != null && !outerSel.getOrderList().getList().isEmpty()) {
+      return null;
+    }
+    SqlNode innerFrom = outerSel.getFrom();
+    if (!(innerFrom instanceof org.apache.calcite.sql.SqlOrderBy innerOrder)) return null;
+    if (innerOrder.fetch != null || innerOrder.offset != null) return null;
+    org.apache.calcite.sql.SqlOrderBy folded =
+        new org.apache.calcite.sql.SqlOrderBy(
+            POS, innerOrder.query, innerOrder.orderList, offset, fetch);
+    outerSel.setOperand(SqlSelect.FROM_OPERAND, folded);
+    return outerSel;
   }
 
   /**

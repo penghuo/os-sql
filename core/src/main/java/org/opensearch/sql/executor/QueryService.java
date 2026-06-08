@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Optional;
 import javax.annotation.Nullable;
 import lombok.AllArgsConstructor;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.calcite.jdbc.CalciteSchema;
@@ -30,7 +29,6 @@ import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.ast.tree.HighlightConfig;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
-import org.opensearch.sql.calcite.CalciteRelNodeVisitor;
 import org.opensearch.sql.calcite.OpenSearchSchema;
 import org.opensearch.sql.calcite.SysLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -64,9 +62,6 @@ public class QueryService {
   private final Planner planner;
   private DataSourceService dataSourceService;
   private Settings settings;
-
-  @Getter(lazy = true)
-  private final CalciteRelNodeVisitor relNodeVisitor = new CalciteRelNodeVisitor(dataSourceService);
 
   /** Helper: depending on the type of error, either re-raise or propagate to the listener. */
   private void propagateCalciteError(Throwable t, ResponseListener<?> listener)
@@ -170,7 +165,7 @@ public class QueryService {
                 () -> executionEngine.execute(calcitePlan, context, listener),
                 "while running the query");
           } catch (Throwable t) {
-            if (isCalciteFallbackAllowed(t) && !(t instanceof NonFallbackCalciteException)) {
+            if (isCalciteFallbackAllowed(t) && !isNonFallback(t)) {
               log.warn("Fallback to V2 query engine since got exception", t);
               executeWithLegacy(plan, queryType, listener, Optional.of(t));
             } else {
@@ -203,7 +198,7 @@ public class QueryService {
                 },
                 settings);
           } catch (Throwable t) {
-            if (isCalciteFallbackAllowed(t)) {
+            if (isCalciteFallbackAllowed(t) && !isNonFallback(t)) {
               log.warn("Fallback to V2 query engine since got exception", t);
               explainWithLegacy(plan, queryType, listener, mode, Optional.of(t));
             } else {
@@ -300,12 +295,211 @@ public class QueryService {
   }
 
   public RelNode analyze(UnresolvedPlan plan, CalcitePlanContext context) {
-    return getRelNodeVisitor().analyze(plan, context);
+    // Every PPL query goes through PPL→SqlNode→SqlValidator→SqlToRelConverter.
+    org.opensearch.sql.calcite.sqlnode.SqlNodePlanner planner =
+        new org.opensearch.sql.calcite.sqlnode.SqlNodePlanner(context.config, context);
+    // SysLimit fields are boxed Integers and can be null when settings haven't been wired
+    // (e.g. standalone test contexts). Treat null as 0 (no cap).
+    int subsearchLimit = 0;
+    int joinSubsearchLimit = 0;
+    if (context.sysLimit != null) {
+      Integer sl = context.sysLimit.subsearchLimit();
+      if (sl != null) subsearchLimit = sl;
+      Integer jsl = context.sysLimit.joinSubsearchLimit();
+      if (jsl != null) joinSubsearchLimit = jsl;
+    }
+    org.apache.calcite.sql.SqlNode sqlNode =
+        new org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor(
+                planner.tableFields(), planner.tableRowType())
+            .translate(plan);
+    RelNode rel = planner.plan(sqlNode);
+    // PPL setting plugins.ppl.join.subsearch_maxout caps the right side of every JOIN to N rows
+    // total. The SqlNode visitor doesn't model this directly because wrapping a bare relation
+    // would hide the table identifier from the JOIN's outer scope, breaking ON clauses written
+    // as `<table>.col`. Apply post-RelNode by injecting a LogicalSystemLimit on top of each
+    // LogicalJoin's right input.
+    if (joinSubsearchLimit > 0) {
+      rel = applyJoinSubsearchMaxOut(rel, joinSubsearchLimit);
+    }
+    // OpenSearch tables expose metadata fields (`_id`, `_index`, `_score`, ...) in their row
+    // type, but PPL hides them from user-facing output. The PPL→SqlNode visitor strips them at
+    // every explicit projection; queries with no outer projection (e.g. bare `source=X`) reach
+    // here with metadata still present. Add a top-level Project that drops them.
+    rel = stripMetadataFields(rel);
+    // Highlight is pushed into the storage scan, not modeled in the SqlNode tree (it comes
+    // from the request body's `highlight` parameter, parallel to the PPL pipe). Rewrite each
+    // LogicalTableScan to its pushDownHighlight form and add an outer Project that surfaces
+    // the `_highlight` column to the caller.
+    if (context.getHighlightConfig() != null) {
+      rel = injectHighlight(rel, context);
+      context.setHighlightConfig(null);
+    }
+    return rel;
+  }
+
+  /**
+   * Drop OpenSearch metadata fields ({@code _id}, {@code _index}, {@code _score}, ...) from the
+   * top-level row type. PPL hides these from user-facing output; only explicit references (e.g.
+   * {@code | fields _id, name}) keep them.
+   *
+   * <p>When the rel is already a {@link org.apache.calcite.rel.logical.LogicalProject}, compose the
+   * metadata-strip directly into that Project (drop the metadata-named columns) instead of wrapping
+   * in a new outer Project. This avoids producing an extra plan-shape layer that v2's RelBuilder
+   * doesn't emit (testExplainEvalMax et al.).
+   */
+  private static RelNode stripMetadataFields(RelNode rel) {
+    java.util.List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+        rel.getRowType().getFieldList();
+    boolean anyMeta =
+        fields.stream()
+            .anyMatch(
+                f ->
+                    org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP
+                        .containsKey(f.getName()));
+    if (!anyMeta) {
+      return rel;
+    }
+    if (rel instanceof org.apache.calcite.rel.logical.LogicalProject lp) {
+      java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>();
+      java.util.List<String> names = new java.util.ArrayList<>();
+      java.util.List<org.apache.calcite.rex.RexNode> existing = lp.getProjects();
+      java.util.List<String> existingNames = lp.getRowType().getFieldNames();
+      for (int i = 0; i < existing.size(); i++) {
+        String name = existingNames.get(i);
+        if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(
+            name)) {
+          continue;
+        }
+        projects.add(existing.get(i));
+        names.add(name);
+      }
+      if (projects.isEmpty()) {
+        return rel;
+      }
+      return org.apache.calcite.rel.logical.LogicalProject.create(
+          lp.getInput(), lp.getHints(), projects, names, lp.getVariablesSet());
+    }
+    org.apache.calcite.rex.RexBuilder rb = rel.getCluster().getRexBuilder();
+    java.util.List<org.apache.calcite.rex.RexNode> projects = new java.util.ArrayList<>();
+    java.util.List<String> names = new java.util.ArrayList<>();
+    for (org.apache.calcite.rel.type.RelDataTypeField f : fields) {
+      if (org.opensearch.sql.calcite.plan.OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(
+          f.getName())) {
+        continue;
+      }
+      projects.add(rb.makeInputRef(rel, f.getIndex()));
+      names.add(f.getName());
+    }
+    if (projects.isEmpty()) {
+      return rel;
+    }
+    return org.apache.calcite.rel.logical.LogicalProject.create(
+        rel, java.util.Collections.emptyList(), projects, names, java.util.Set.of());
+  }
+
+  private static RelNode injectHighlight(
+      RelNode rel, org.opensearch.sql.calcite.CalcitePlanContext context) {
+    org.opensearch.sql.ast.tree.HighlightConfig hl = context.getHighlightConfig();
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(org.apache.calcite.rel.core.TableScan scan) {
+            if (scan instanceof org.opensearch.sql.calcite.plan.HighlightPushDown hp) {
+              return hp.pushDownHighlight(hl);
+            }
+            return super.visit(scan);
+          }
+        };
+    RelNode rewritten = rel.accept(shuttle);
+    // If the rewritten relation's row-type now includes _highlight, surface it through an
+    // outer Project. The SqlNode→RelNode pipeline produced an explicit projection from the
+    // pipe's terminal `fields` (or implicit `fields *`); the column count there is fixed and
+    // doesn't pick up the appended _highlight. Add it explicitly only when the RelNode's
+    // current row type doesn't already include it (which it won't, because the project list
+    // was frozen at SqlNode time).
+    if (!rewritten
+        .getRowType()
+        .getFieldNames()
+        .contains(org.opensearch.sql.expression.HighlightExpression.HIGHLIGHT_FIELD)) {
+      // Walk down to find a node whose input has _highlight and re-project.
+      rewritten = surfaceHighlight(rewritten);
+    }
+    return rewritten;
+  }
+
+  /**
+   * Walk down to the deepest input that carries _highlight and re-build the project chain on top of
+   * it preserving the original column order, with _highlight appended.
+   */
+  private static RelNode surfaceHighlight(RelNode rel) {
+    String hlField = org.opensearch.sql.expression.HighlightExpression.HIGHLIGHT_FIELD;
+    if (rel.getInputs().isEmpty()) {
+      return rel;
+    }
+    java.util.List<RelNode> newInputs = new java.util.ArrayList<>();
+    for (RelNode input : rel.getInputs()) {
+      newInputs.add(surfaceHighlight(input));
+    }
+    RelNode replaced = rel.copy(rel.getTraitSet(), newInputs);
+    if (rel instanceof org.apache.calcite.rel.core.Project proj) {
+      RelNode input = newInputs.get(0);
+      int hlIdx = input.getRowType().getFieldNames().indexOf(hlField);
+      if (hlIdx >= 0 && !replaced.getRowType().getFieldNames().contains(hlField)) {
+        java.util.List<org.apache.calcite.rex.RexNode> projects =
+            new java.util.ArrayList<>(proj.getProjects());
+        java.util.List<String> names = new java.util.ArrayList<>(proj.getRowType().getFieldNames());
+        org.apache.calcite.rex.RexBuilder rb = proj.getCluster().getRexBuilder();
+        projects.add(rb.makeInputRef(input, hlIdx));
+        names.add(hlField);
+        return org.apache.calcite.rel.logical.LogicalProject.create(
+            input, java.util.Collections.emptyList(), projects, names, proj.getVariablesSet());
+      }
+    }
+    return replaced;
   }
 
   /** Analyze {@link UnresolvedPlan}. */
   public LogicalPlan analyze(UnresolvedPlan plan, QueryType queryType) {
     return analyzer.analyze(plan, new AnalysisContext(queryType));
+  }
+
+  /**
+   * Cap the right side of every {@link org.apache.calcite.rel.logical.LogicalJoin} with a {@link
+   * LogicalSystemLimit} of type {@code JOIN_SUBSEARCH_MAXOUT}. PPL setting {@code
+   * plugins.ppl.join.subsearch_maxout} requires the cluster-wide cap on every join's subsearch
+   * input. Done post-RelNode rather than at SqlNode time because wrapping a bare relation as {@code
+   * (SELECT * FROM X) FETCH N} hides {@code X} from the JOIN's outer scope and breaks ON clauses
+   * written as {@code X.col}.
+   */
+  private static RelNode applyJoinSubsearchMaxOut(RelNode rel, int limit) {
+    org.apache.calcite.rex.RexLiteral capLit =
+        rel.getCluster().getRexBuilder().makeExactLiteral(java.math.BigDecimal.valueOf(limit));
+    org.apache.calcite.rel.RelShuttle shuttle =
+        new org.apache.calcite.rel.RelHomogeneousShuttle() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode visited = super.visit(other);
+            if (visited instanceof org.apache.calcite.rel.logical.LogicalJoin join) {
+              RelNode right = join.getRight();
+              // Don't double-cap if the right side is already a JOIN_SUBSEARCH_MAXOUT.
+              if (right instanceof LogicalSystemLimit lsl
+                  && lsl.getType() == SystemLimitType.JOIN_SUBSEARCH_MAXOUT) {
+                return visited;
+              }
+              RelNode capped =
+                  LogicalSystemLimit.create(SystemLimitType.JOIN_SUBSEARCH_MAXOUT, right, capLit);
+              return join.copy(
+                  join.getTraitSet(),
+                  join.getCondition(),
+                  join.getLeft(),
+                  capped,
+                  join.getJoinType(),
+                  join.isSemiJoinDone());
+            }
+            return visited;
+          }
+        };
+    return rel.accept(shuttle);
   }
 
   /** Translate {@link LogicalPlan} to {@link PhysicalPlan}. */
@@ -318,6 +512,21 @@ public class QueryService {
       case null -> false;
       case CalciteUnsupportedException calciteUnsupportedException -> true;
       case ErrorReport errorReport when t.getCause() instanceof CalciteUnsupportedException -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * True when {@code t} (or its immediate cause, after StageErrorHandler wrapping) is a
+   * NonFallbackCalciteException. Used to suppress V2 fallback for translation errors that should
+   * surface to the user as documented PPL validation errors instead of being silently masked by the
+   * V2 path.
+   */
+  private boolean isNonFallback(@Nullable Throwable t) {
+    return switch (t) {
+      case null -> false;
+      case NonFallbackCalciteException nf -> true;
+      case ErrorReport errorReport when t.getCause() instanceof NonFallbackCalciteException -> true;
       default -> false;
     };
   }
@@ -392,9 +601,92 @@ public class QueryService {
      * For the redundant sort, we rely on Calcite optimizer to eliminate
      */
     RelCollation collation = calcitePlan.getTraitSet().getCollation();
+    // PPL preserves sort through pipes (e.g. `... | sort F | head N | fields cols` should expose
+    // the collation at the top-level LogicalSystemLimit). Calcite's automatic trait propagation
+    // doesn't carry an inner Sort's collation through a Project layer, so propagate it manually
+    // by descending through passthrough Projects below the LSL to find an inner Sort and remap
+    // its collation field indices through the Project's outputs. Mirrors v2's emission shape
+    // where the top-level Sort/SystemLimit directly carries the user's ORDER BY.
+    if (collation == null || collation == RelCollations.EMPTY) {
+      RelCollation propagated = derivePropagatedCollation(osPlan);
+      if (propagated != null && !propagated.getFieldCollations().isEmpty()) {
+        calcitePlan =
+            LogicalSystemLimit.create(
+                SystemLimitType.QUERY_SIZE_LIMIT,
+                attachCollationTrait(osPlan, propagated),
+                context.relBuilder.literal(context.sysLimit.querySizeLimit()));
+        collation = propagated;
+      }
+    }
     if (!(calcitePlan instanceof Sort) && collation != RelCollations.EMPTY) {
       calcitePlan = LogicalSort.create(calcitePlan, collation, null, null);
     }
     return calcitePlan;
+  }
+
+  /**
+   * Walk down through passthrough {@link org.apache.calcite.rel.logical.LogicalProject} layers to
+   * find an inner {@link org.apache.calcite.rel.core.Sort} carrying a collation, then remap the
+   * collation's field indices forward through each Project's RexInputRef outputs. Returns null when
+   * no propagation is possible (no inner Sort, or some Project isn't passthrough so we can't safely
+   * remap indices).
+   */
+  private static RelCollation derivePropagatedCollation(RelNode rel) {
+    java.util.List<int[]> projectMaps = new java.util.ArrayList<>();
+    RelNode cur = rel;
+    while (cur instanceof org.apache.calcite.rel.logical.LogicalProject proj) {
+      java.util.List<org.apache.calcite.rex.RexNode> exprs = proj.getProjects();
+      int[] map = new int[exprs.size()];
+      for (int i = 0; i < exprs.size(); i++) {
+        if (!(exprs.get(i) instanceof org.apache.calcite.rex.RexInputRef ref)) {
+          return null;
+        }
+        map[i] = ref.getIndex();
+      }
+      projectMaps.add(map);
+      cur = proj.getInput();
+    }
+    if (!(cur instanceof org.apache.calcite.rel.core.Sort sort)) {
+      return null;
+    }
+    if (sort.getCollation().getFieldCollations().isEmpty()) {
+      return null;
+    }
+    // Build inverse map for each project: input-position -> output-position. Apply inverses in
+    // reverse order (innermost project first, outermost last) so collation indices that
+    // referenced the Sort's input row type get translated to the topmost Project's output row
+    // type.
+    java.util.List<org.apache.calcite.rel.RelFieldCollation> fcs =
+        new java.util.ArrayList<>(sort.getCollation().getFieldCollations());
+    for (int p = projectMaps.size() - 1; p >= 0; p--) {
+      int[] map = projectMaps.get(p);
+      java.util.List<org.apache.calcite.rel.RelFieldCollation> remapped =
+          new java.util.ArrayList<>();
+      for (org.apache.calcite.rel.RelFieldCollation fc : fcs) {
+        int srcIdx = fc.getFieldIndex();
+        int outIdx = -1;
+        for (int j = 0; j < map.length; j++) {
+          if (map[j] == srcIdx) {
+            outIdx = j;
+            break;
+          }
+        }
+        if (outIdx < 0) return null; // Sort key isn't in the projection — can't propagate.
+        remapped.add(fc.withFieldIndex(outIdx));
+      }
+      fcs = remapped;
+    }
+    return org.apache.calcite.rel.RelCollations.of(fcs);
+  }
+
+  /**
+   * Re-create a passthrough {@link org.apache.calcite.rel.logical.LogicalProject} with an updated
+   * collation trait so its parent ({@link org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit})
+   * sees the propagated collation. Returns the input unchanged when not a Project.
+   */
+  private static RelNode attachCollationTrait(RelNode rel, RelCollation collation) {
+    if (!(rel instanceof org.apache.calcite.rel.logical.LogicalProject proj)) return rel;
+    org.apache.calcite.plan.RelTraitSet newTraits = proj.getTraitSet().replace(collation);
+    return proj.copy(newTraits, proj.getInputs());
   }
 }

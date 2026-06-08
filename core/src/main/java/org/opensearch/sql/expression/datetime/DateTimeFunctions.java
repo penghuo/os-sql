@@ -2198,6 +2198,19 @@ public class DateTimeFunctions {
         return value.dateValue().toEpochSecond(LocalTime.MIN, ZoneOffset.UTC) + 0d;
       case TIMESTAMP:
         return value.timestampValue().getEpochSecond() + value.timestampValue().getNano() / 1E9;
+      case STRING:
+        // PPL accepts a date/timestamp string literal — try to parse as a timestamp first.
+        // Numeric-string forms (YYMMDD, etc.) fall through to the numeric path.
+        try {
+          var ts = new ExprTimestampValue(value.stringValue());
+          return ts.timestampValue().getEpochSecond() + ts.timestampValue().getNano() / 1E9;
+        } catch (Exception ignored) {
+          try {
+            return transferUnixTimeStampFromDoubleInput(Double.parseDouble(value.stringValue()));
+          } catch (NumberFormatException nfe) {
+            return null;
+          }
+        }
       default:
         //     ... or a number in YYMMDD, YYMMDDhhmmss, YYYYMMDD, or YYYYMMDDhhmmss format.
         //     If the argument includes a time part, it may optionally include a fractional

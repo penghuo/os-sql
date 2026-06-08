@@ -117,9 +117,11 @@ public class ArrayFunctionImpl extends ImplementorUDF {
                 .collect(Collectors.toList());
         break;
       case VARCHAR, CHAR:
+        // Calcite casts operands to a CHAR(N) least-restrictive type before reaching us, which
+        // pads with trailing spaces. PPL semantics expect VARCHAR — strip trailing whitespace.
         result =
             originalList.stream()
-                .map(i -> i == null ? null : (Object) i.toString())
+                .map(i -> i == null ? null : (Object) i.toString().replaceAll("\\s+$", ""))
                 .collect(Collectors.toList());
         break;
       default:

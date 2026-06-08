@@ -107,6 +107,20 @@ public class GeoIpFunction extends ImplementorUDF {
       return fetchIpEnrichment(dataSource, ipAddress.toString(), options, nodeClient);
     }
 
+    /**
+     * Calcite's linq4j codegen resolves the static method by SQL operand types. The IP UDT surfaces
+     * as VARCHAR at the SQL layer, so the codegen looks for a {@code (String, String, String,
+     * NodeClient)} overload. The typed ExprIpValue overload above doesn't match. Provide an
+     * Object-typed overload so the SqlNode path resolves the 3-arg geoip(ds, ip, options) form.
+     */
+    public static Map<String, ?> fetchIpEnrichment(
+        String dataSource, Object ipAddress, String commaSeparatedOptions, NodeClient nodeClient) {
+      String unquotedOptions = StringUtils.unquoteText(commaSeparatedOptions);
+      final Set<String> options =
+          Arrays.stream(unquotedOptions.split(",")).map(String::trim).collect(Collectors.toSet());
+      return fetchIpEnrichment(dataSource, ipAddress.toString(), options, nodeClient);
+    }
+
     private static Map<String, ?> fetchIpEnrichment(
         String dataSource, String ipAddress, Set<String> options, NodeClient nodeClient) {
       IpEnrichmentActionClient ipClient = new IpEnrichmentActionClient(nodeClient);

@@ -105,8 +105,10 @@ public class UnifiedQueryOpenSearchIT extends PPLIntegTestCase implements Result
   }
 
   /**
-   * Creates a dynamic schema that creates OpenSearchIndex on-demand for any table name. This allows
-   * querying any index without pre-registering it.
+   * Creates a dynamic schema that creates OpenSearchIndex on-demand for any table name. Only
+   * returns a Table for index names that actually exist in the cluster — otherwise the validator's
+   * scope resolution would happily resolve random identifiers (like the schema's own name) to a
+   * dangling OpenSearchIndex and fail at row-type derivation time.
    */
   private AbstractSchema createOpenSearchSchema() {
     return new AbstractSchema() {
@@ -120,6 +122,9 @@ public class UnifiedQueryOpenSearchIT extends PPLIntegTestCase implements Result
           public Table get(Object key) {
             if (!super.containsKey(key)) {
               String indexName = (String) key;
+              if (!osClient.exists(indexName)) {
+                return null;
+              }
               super.put(indexName, new OpenSearchIndex(osClient, context.getSettings(), indexName));
             }
             return super.get(key);

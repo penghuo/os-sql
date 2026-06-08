@@ -44,6 +44,26 @@ public class ReduceFunctionImpl extends ImplementorUDF {
   public SqlReturnTypeInference getReturnTypeInference() {
     return sqlOperatorBinding -> {
       RelDataTypeFactory typeFactory = sqlOperatorBinding.getTypeFactory();
+      // The SqlNode→RelNode path invokes deriveType with a SqlCallBinding (at validation), not a
+      // RexCallBinding (the v2 RelBuilder path). When we don't have rex operands available, fall
+      // back to the base accumulator's type (operand 1) for the 3-arg form
+      // (\`reduce(arr, base, merge)\`) — the merge lambda usually preserves the base's type.
+      // For the 4-arg form (\`reduce(arr, base, merge, finalize)\`), the finalize lambda may
+      // widen the type (e.g., int → double via `acc -> acc * 10.0`); leave as ANY so the
+      // RexLambda path can compute it at sql2rel time. The 3-arg case covers most typical
+      // \`reduce(arr, 0, (acc,x) -> acc + x)\` patterns where response schema needs the base
+      // type instead of double.
+      if (!(sqlOperatorBinding instanceof RexCallBinding)) {
+        if (sqlOperatorBinding.getOperandCount() == 3) {
+          try {
+            return sqlOperatorBinding.getOperandType(1);
+          } catch (RuntimeException ignored) {
+            // fall through to ANY
+          }
+        }
+        return typeFactory.createTypeWithNullability(
+            typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.ANY), true);
+      }
       RexCallBinding rexCallBinding = (RexCallBinding) sqlOperatorBinding;
       List<RexNode> rexNodes = rexCallBinding.operands();
       ArraySqlType listType = (ArraySqlType) rexNodes.get(0).getType();

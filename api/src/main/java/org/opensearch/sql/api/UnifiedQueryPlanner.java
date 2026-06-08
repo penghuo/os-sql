@@ -21,7 +21,8 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Planner;
 import org.opensearch.sql.api.parser.UnifiedQueryParser;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
-import org.opensearch.sql.calcite.CalciteRelNodeVisitor;
+import org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor;
+import org.opensearch.sql.calcite.sqlnode.SqlNodePlanner;
 import org.opensearch.sql.common.antlr.SyntaxCheckException;
 import org.opensearch.sql.executor.QueryType;
 
@@ -100,12 +101,10 @@ public class UnifiedQueryPlanner {
     }
   }
 
-  /** AST-based planning via context-owned parser → UnresolvedPlan → CalciteRelNodeVisitor. */
+  /** AST-based planning via context-owned parser → UnresolvedPlan → SqlNode → RelNode. */
   private static class CustomVisitorStrategy implements PlanningStrategy {
     private final UnifiedQueryContext context;
     private final UnifiedQueryParser<UnresolvedPlan> parser;
-    private final CalciteRelNodeVisitor relNodeVisitor =
-        new CalciteRelNodeVisitor(new EmptyDataSourceService());
 
     @SuppressWarnings("unchecked")
     CustomVisitorStrategy(UnifiedQueryContext context) {
@@ -116,7 +115,11 @@ public class UnifiedQueryPlanner {
     @Override
     public RelNode plan(String query) {
       UnresolvedPlan ast = parser.parse(query);
-      RelNode logical = relNodeVisitor.analyze(ast, context.getPlanContext());
+      SqlNodePlanner planner =
+          new SqlNodePlanner(context.getPlanContext().config, context.getPlanContext());
+      SqlNode sqlNode =
+          new PPLToSqlNodeVisitor(planner.tableFields(), planner.tableRowType()).translate(ast);
+      RelNode logical = planner.plan(sqlNode);
       return preserveCollation(logical);
     }
 

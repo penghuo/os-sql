@@ -54,13 +54,20 @@ public class StrftimeFunction extends ImplementorUDF {
 
   @Override
   public UDFOperandMetadata getOperandMetadata() {
-    // Accepts (NUMERIC|TIMESTAMP, STRING) -> STRING
-    // Note: STRING is NOT accepted for first parameter - use unix_timestamp() to convert
-    // Calcite will auto-cast DATE and TIME to TIMESTAMP
+    // Accepts (NUMERIC|TIMESTAMP|CHARACTER, STRING) -> STRING. The runtime impl handles each
+    // input type explicitly. Permitting CHARACTER here avoids an automatic CHAR→NUMERIC
+    // coercion at validation time that triggers a runtime BigDecimal-scientific parse error
+    // when the string has no 'e' notation.
+    // Order matters: when SqlValidator type-coercion is on, an earlier-listed family that
+    // doesn't match the actual operand can trigger an implicit CAST. List CHARACTER and
+    // TIMESTAMP variants before NUMERIC so a UDT timestamp (which reports VARCHAR via UDT
+    // unwrap) matches CHARACTER directly without a CAST→NUMERIC insertion that throws at
+    // runtime ("Character array is missing 'e' notation exponential mark.").
     return UDFOperandMetadata.wrap(
         (CompositeOperandTypeChecker)
-            OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER)
-                .or(OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.CHARACTER)));
+            OperandTypes.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER)
+                .or(OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.CHARACTER))
+                .or(OperandTypes.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.CHARACTER)));
   }
 
   public static class StrftimeImplementor implements NotNullImplementor {
@@ -142,6 +149,13 @@ public class StrftimeFunction extends ImplementorUDF {
       return (double) value.integerValue();
     } else if (value instanceof ExprFloatValue) {
       return (double) value.floatValue();
+    } else if (value instanceof org.opensearch.sql.data.model.ExprStringValue) {
+      // String literal — try to parse as a UNIX timestamp.
+      try {
+        return Double.parseDouble(value.stringValue());
+      } catch (NumberFormatException e) {
+        return null;
+      }
     }
 
     // Not a numeric type

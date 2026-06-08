@@ -850,13 +850,15 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       seenLeaves.add(leaf);
     }
 
-    // Peephole: if the child is a SELECT * with no projection of its own (visitSort/visitFilter/
-    // visitHead style), pull the user-projection into THAT SELECT instead of nesting a new outer
-    // SELECT. Nesting would seal join aliases inside a subquery — `| sort a.age | fields a.name`
-    // produces `SELECT a.name FROM (SELECT * FROM <join> ORDER BY a.age)` where the outer SELECT
-    // can no longer see `a` from the inner FROM. Rewriting the inner select list keeps the join
-    // aliases live in the same SELECT scope.
     List<String> postFields = stripAliasPrefix(selected, frame);
+    // Correctness: when child is a `SELECT * FROM <relation/join>`, pull the user-projection
+    // INTO that SELECT instead of nesting a new outer SELECT. Nesting seals the join aliases
+    // inside the FROM subquery — `... | sort a.age | fields a.name` would produce `SELECT a.name
+    // FROM (SELECT * FROM <join> ORDER BY a.age)` and the outer SELECT can't see `a` from the
+    // inner FROM (Calcite throws "Table 'a' not found"). Rewriting the inner select list keeps
+    // the join aliases live in the same SELECT scope. Required by CalcitePPLJoinIT
+    // (testComplex*Join,
+    // testNonEquiJoin).
     SqlNode rewritten = projectIntoChildSelectStar(from, selectList);
     if (rewritten != null) {
       frame.currentFields = postFields;
@@ -866,10 +868,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   }
 
   /**
-   * If {@code from} is a {@code SELECT * FROM <inner>} (optionally wrapped in a SqlOrderBy or
-   * carrying ORDER BY/FETCH/OFFSET) and no GROUP BY / HAVING, swap its select list for {@code
-   * newList} in place and return the rewritten node. Returns null when the shape doesn't match —
-   * caller falls back to normal wrapping.
+   * If {@code from} is a {@code SELECT * FROM <inner>} (optionally wrapped in a {@link
+   * org.apache.calcite.sql.SqlOrderBy}) and has no GROUP BY / HAVING, swap its select list for
+   * {@code newList} in place and return the rewritten node. Returns null when the shape doesn't
+   * match — caller falls back to normal wrapping.
    */
   private static SqlNode projectIntoChildSelectStar(SqlNode from, SqlNodeList newList) {
     SqlSelect select = null;
@@ -888,14 +890,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     if (!(lone instanceof SqlIdentifier id) || !id.isStar()) return null;
     if (select.getGroup() != null && !select.getGroup().getList().isEmpty()) return null;
     if (select.getHaving() != null) return null;
-    // When the SELECT is wrapped in SqlOrderBy AND its inner FROM is itself a SqlSelect with
-    // computed (non-passthrough) projections (i.e. an eval-like wide Project), folding the
-    // narrow user-projection into the SqlOrderBy's SELECT * loses the wide-Project layer:
-    // Calcite trims unused eval cols, leaving only the user-requested cols. v2's emission
-    // keeps the wide eval Project under the Sort. Skip the peephole here so the visitor falls
-    // through to wrapping a fresh outer SELECT, preserving the wide Project. Mirrors v2's
-    // emission shape for `... | eval ... | sort ... | fields ...` patterns
-    // (e.g. testIssue5114SortExprHeadExplain).
+    // When the SELECT is wrapped in SqlOrderBy AND its inner FROM is itself a SqlSelect with a
+    // computed (non-passthrough) projection, folding the user-projection into the inner SELECT *
+    // would let Calcite trim the wide projection to only user-requested cols. Falling through to
+    // a fresh outer SELECT preserves the wide projection. Fall through.
     if (fromIsOrderBy
         && select.getFrom() instanceof SqlSelect inner
         && hasComputedProjection(inner.getSelectList())) {
@@ -909,9 +907,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
   private static boolean hasComputedProjection(SqlNodeList items) {
     if (items == null) return false;
     for (SqlNode item : items) {
-      // Bare * or bare identifier → passthrough.
       if (item instanceof SqlIdentifier) continue;
-      // `expr AS name` → check if expr is an identifier (passthrough rename) or computed.
       if (item instanceof SqlBasicCall call && call.getOperator() == SqlStdOperatorTable.AS) {
         if (call.getOperandList().size() >= 1
             && call.getOperandList().get(0) instanceof SqlIdentifier) continue;
@@ -930,11 +926,6 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
         fromOffset != null && fromOffset > 0
             ? SqlLiteral.createExactNumeric(fromOffset.toString(), POS)
             : null;
-    // Same fold as visitLimit: `... | sort F | fields A | head N` → fold the head fetch into
-    // the upstream SqlOrderBy through the intervening Project. v2's RelBuilder produces
-    // `Project > Sort(fetch=N) > Filter` (single Sort with attached fetch).
-    SqlNode folded = foldFetchIntoChildOrderBy(from, offset, fetch);
-    if (folded != null) return folded;
     SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
     if (offset != null) {
       b.offset(offset);
@@ -7245,9 +7236,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
       frame.reverseImplicitOrderBy = false;
       frame.lastOrderBy = null;
     }
-    // Peephole: when child is a SELECT * already (e.g. SEMI/ANTI's `SELECT * FROM <X AS a> WHERE
-    // EXISTS(...)`), wrap with SqlOrderBy directly instead of building a new SELECT around it.
+    // Correctness: when child is a `SELECT * FROM <X AS a> WHERE EXISTS(...)` (e.g. SEMI/ANTI
+    // join body), wrap with SqlOrderBy directly instead of building a new SELECT around it.
     // The new SELECT would seal the alias `a` inside its FROM subquery, breaking `ORDER BY a.col`.
+    // Required by CalcitePPLJoinIT (testComplexSemiJoin, testComplexAntiJoin).
     SqlNode peep = orderByOnChildSelectStar(from, orderKeys, null, fetch, frame);
     if (peep != null) return peep;
     SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).orderBy(orderKeys);
@@ -7257,75 +7249,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     return reattachSubqueryAlias(b.wrap(frame), frame);
   }
 
-  @Override
-  public SqlNode visitLimit(Limit node, Frame frame) {
-    SqlNode from = node.getChild().get(0).accept(this, frame);
-    SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getLimit().toString(), POS);
-    SqlLiteral offset =
-        node.getOffset() != null && node.getOffset() > 0
-            ? SqlLiteral.createExactNumeric(node.getOffset().toString(), POS)
-            : null;
-    SqlNode peep =
-        orderByOnChildSelectStar(from, java.util.Collections.emptyList(), offset, fetch, frame);
-    if (peep != null) return peep;
-    // PPL `... | sort F | fields A | head N` — fold the fetch into the upstream SqlOrderBy
-    // through the intervening Project. v2's RelBuilder produces `Project > Sort(fetch=N) > Filter`;
-    // without folding we'd emit `Project > Sort(fetch=N) > Project > Sort > Filter` (two Sorts).
-    // Mutating the existing SqlSelect's FROM is safe — the fetch attaches to the inner SqlOrderBy
-    // which already holds the sort keys.
-    SqlNode folded = foldFetchIntoChildOrderBy(from, offset, fetch);
-    if (folded != null) return folded;
-    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
-    if (offset != null) {
-      b.offset(offset);
-    }
-    return reattachSubqueryAlias(b.wrap(frame), frame);
-  }
-
-  /**
-   * Fold a {@code FETCH N}/{@code OFFSET M} into a {@link SqlOrderBy} buried under a projection
-   * select. Two shapes match:
-   *
-   * <ul>
-   *   <li>{@code outer} is a {@link SqlOrderBy} (no fetch/offset) whose inner SELECT carries the
-   *       project list — visitProject's {@code projectIntoChildSelectStar} short-circuit returns
-   *       this shape when the user-projection was folded into the SqlOrderBy's wrapped SELECT.
-   *   <li>{@code outer} is {@code SELECT <list> FROM <SqlOrderBy>} where the SqlOrderBy has no
-   *       existing fetch/offset.
-   * </ul>
-   *
-   * <p>Mutates the matched node in place to attach fetch/offset. Returns the (possibly mutated)
-   * outer node, or null when shape doesn't match.
-   */
-  private static SqlNode foldFetchIntoChildOrderBy(
-      SqlNode outer, SqlLiteral offset, SqlLiteral fetch) {
-    if (outer instanceof org.apache.calcite.sql.SqlOrderBy ob
-        && ob.fetch == null
-        && ob.offset == null) {
-      return new org.apache.calcite.sql.SqlOrderBy(POS, ob.query, ob.orderList, offset, fetch);
-    }
-    if (!(outer instanceof SqlSelect outerSel)) return null;
-    if (outerSel.getFetch() != null || outerSel.getOffset() != null) return null;
-    if (outerSel.getOrderList() != null && !outerSel.getOrderList().getList().isEmpty()) {
-      return null;
-    }
-    SqlNode innerFrom = outerSel.getFrom();
-    if (!(innerFrom instanceof org.apache.calcite.sql.SqlOrderBy innerOrder)) return null;
-    if (innerOrder.fetch != null || innerOrder.offset != null) return null;
-    org.apache.calcite.sql.SqlOrderBy folded =
-        new org.apache.calcite.sql.SqlOrderBy(
-            POS, innerOrder.query, innerOrder.orderList, offset, fetch);
-    outerSel.setOperand(SqlSelect.FROM_OPERAND, folded);
-    return outerSel;
-  }
-
   /**
    * Install ORDER BY / FETCH / OFFSET on a child {@code SELECT *} without nesting a new outer
-   * SELECT. When the child is a {@code SELECT * FROM <inner> [WHERE ...]} (no GROUP BY / HAVING /
-   * existing ORDER BY / FETCH / OFFSET, and the SELECT list is just {@code *}), wrap it with a
-   * {@link org.apache.calcite.sql.SqlOrderBy} that operates on the same SELECT's namespace —
-   * keeping the inner FROM's aliases visible to the new ORDER BY expressions. Returns null when the
-   * shape doesn't match; caller falls back to the standard {@link SqlBuilder} wrap.
+   * SELECT, so identifiers in {@code orderKeys} resolve against the inner FROM's aliases. Returns
+   * null when the shape doesn't match.
    */
   private static SqlNode orderByOnChildSelectStar(
       SqlNode from, List<SqlNode> orderKeys, SqlLiteral offset, SqlLiteral fetch, Frame frame) {
@@ -7349,6 +7276,21 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, PPLToSqlNo
     }
     frame.joinHints = null;
     return new org.apache.calcite.sql.SqlOrderBy(POS, select, ord, offset, fetch);
+  }
+
+  @Override
+  public SqlNode visitLimit(Limit node, Frame frame) {
+    SqlNode from = node.getChild().get(0).accept(this, frame);
+    SqlLiteral fetch = SqlLiteral.createExactNumeric(node.getLimit().toString(), POS);
+    SqlLiteral offset =
+        node.getOffset() != null && node.getOffset() > 0
+            ? SqlLiteral.createExactNumeric(node.getOffset().toString(), POS)
+            : null;
+    SqlBuilder.SelectBuilder b = SqlBuilder.select(starList()).from(from).fetch(fetch);
+    if (offset != null) {
+      b.offset(offset);
+    }
+    return reattachSubqueryAlias(b.wrap(frame), frame);
   }
 
   @Override

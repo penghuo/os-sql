@@ -18,8 +18,6 @@ import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
-import org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor.Frame;
-import org.opensearch.sql.calcite.sqlnode.PPLToSqlNodeVisitor.JoinHints;
 
 /**
  * DSL for the four SqlNode shapes {@link PPLToSqlNodeVisitor} produces: SELECT, JOIN, AS-alias, and

@@ -832,60 +832,23 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
   @Override
   public SqlNode visitEval(Eval node, Frame frame) {
     SqlNode from = node.getChild().get(0).accept(this, frame);
-    // PPL eval extends the row with N new columns: `SELECT *, e1 AS a1, e2 AS a2, ... FROM
-    // <child>`.
-    // Within a single eval, later lets may reference earlier aliases (PPL's left-to-right
-    // semantics); SQL doesn't allow SELECT-list aliases inside the same SELECT. We honour that by
-    // wrapping when a let references a name introduced earlier in this same eval.
+    // PPL eval extends the row with N new columns. Generally `SELECT *, e1 AS a1, ..., en AS an
+    // FROM <child>` — but PPL allows rebinding existing columns (`eval x = x + 1`) and forward
+    // refs between lets within the same eval (`eval a = b + 1, c = a + 2`); SQL forbids both.
+    // See computeEvalSelectPrefix and the mid-eval wrap loop below for how we work around them.
     List<String> visible =
         new ArrayList<>(frame.currentFields == null ? List.of() : frame.currentFields);
     Set<String> existingNames = new LinkedHashSet<>(visible);
-    // PPL semantics for `eval x = expr` when `x` already exists: replace the column. SQL's
-    // `SELECT *, expr AS x` would emit BOTH the original `x` (from `*`) and the new aliased one,
-    // producing duplicate-named columns. When ANY let rebinds an existing visible name, expand
-    // `*` into an explicit list of currentFields with the rebound names dropped — the eval's
-    // aliased projections then reintroduce them. Falls back to `*` when no rebind happens.
-    Set<String> rebound = new java.util.HashSet<>();
-    for (Let let : node.getExpressionList()) {
-      String name = let.getVar().getField().toString();
-      if (existingNames.contains(name)) {
-        rebound.add(name);
-      }
-    }
-    SqlNodeList items = new SqlNodeList(POS);
-    if (rebound.isEmpty() || frame.currentFields == null) {
-      items.add(SqlIdentifier.star(POS));
-    } else {
-      // When eval rebinds a dotted flattened-nested-leaf (e.g. `eval `a.b.c` = ...` where `a.b.c`
-      // was already a flat catalog column), also drop ALL ancestor structs (`a`, `a.b`) from
-      // the explicit list. PPL semantics (mirrors v2's tryToRemoveNestedFields):  a rebound
-      // leaf's override would otherwise be shadowed by the lingering struct parent that still
-      // contains the pre-override value. Keep sibling leaves visible (they're still flat
-      // columns, not under the rebound parent path).
-      java.util.Set<String> ancestorDrop = new java.util.HashSet<>();
-      for (String r : rebound) {
-        if (r.indexOf('.') < 0) continue;
-        // Add every prefix `a`, `a.b`, ..., `a.b.c.d` (excluding the leaf itself, which is the
-        // rebound name).
-        int idx = r.indexOf('.');
-        while (idx >= 0) {
-          ancestorDrop.add(r.substring(0, idx));
-          idx = r.indexOf('.', idx + 1);
-        }
-      }
-      for (String c : frame.currentFields) {
-        if (rebound.contains(c) || ancestorDrop.contains(c)) continue;
-        items.add(toIdentifier(c));
-      }
-      // Also remove ancestor structs from `visible` so downstream pipes don't see them.
-      visible.removeAll(ancestorDrop);
-    }
+    Set<String> rebound = computeReboundNames(node, existingNames);
+    SqlNodeList items = computeEvalSelectPrefix(rebound, frame, visible);
+
     Set<String> aliasesInThisSelect = new LinkedHashSet<>();
     boolean wrappedMidEval = false;
     for (Let let : node.getExpressionList()) {
       String alias = let.getVar().getField().toString();
-      // If this let's RHS references an alias introduced earlier in this same eval, the previous
-      // SELECT can't expose that alias to its own list — wrap and start a new SELECT.
+      // SQL forbids forward-reference between SELECT-list aliases. When a let references an alias
+      // introduced earlier in this same eval, wrap into a new SELECT * so the previous alias
+      // becomes an actual column visible to the next let.
       if (referencesAny(let.getExpression(), aliasesInThisSelect)) {
         from = SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
         items = new SqlNodeList(POS);
@@ -893,132 +856,116 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
         aliasesInThisSelect = new LinkedHashSet<>();
         wrappedMidEval = true;
       }
-      SqlNode rhs = expr(let.getExpression());
-      // Calcite types string literals as CHAR(N) where N is the literal length. When two branches
-      // of a downstream UNION (multisearch / append / chart pivot) bind the same alias to string
-      // literals of different lengths, the union widens the result to CHAR(max) and right-pads
-      // shorter values with spaces. PPL expects VARCHAR semantics, so cast a bare STRING literal
-      // RHS to VARCHAR.
-      if (let.getExpression() instanceof Literal stringLit
-          && stringLit.getType() == DataType.STRING) {
-        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-            new org.apache.calcite.sql.SqlDataTypeSpec(
-                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                POS);
-        // Use SqlStdOperatorTable.CAST (not SAFE_CAST) so the validator simplifies the typed
-        // literal to a bare `'literal':VARCHAR` annotation matching v2's RexBuilder.makeLiteral
-        // emission. SAFE_CAST leaves a `CAST(...)` wrapper visible in the explain plan.
-        rhs = new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(rhs, varcharSpec), POS);
-      }
-      // PPL `fieldformat alias = "prefix" . expr . "suffix"` parses into a Let with optional
-      // concatPrefix/concatSuffix literals. Rewrite to NULL-preserving SQL concat (`||`) — the
-      // CONCAT operator preserves NULLs (matches v2's emission shape; CONCAT_FUNCTION coerces
-      // NULL → empty string).
-      if (let.getConcatPrefix() != null || let.getConcatSuffix() != null) {
-        org.apache.calcite.sql.SqlDataTypeSpec varcharSpecForFieldformat =
-            new org.apache.calcite.sql.SqlDataTypeSpec(
-                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                POS);
-        SqlNode strRhs = rhs;
-        // Cast non-string rhs to VARCHAR so `||` produces a string column, not a coerced numeric.
-        strRhs =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(strRhs, varcharSpecForFieldformat),
-                POS);
-        if (let.getConcatPrefix() != null) {
-          // VARCHAR-cast prefix literal so emission shows `'$':VARCHAR` matching v2.
-          SqlNode prefixNode =
-              new SqlBasicCall(
-                  SqlStdOperatorTable.CAST,
-                  List.of(
-                      ExpressionConverter.literalToSqlNode(let.getConcatPrefix()),
-                      varcharSpecForFieldformat),
-                  POS);
-          strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(prefixNode, strRhs), POS);
-        }
-        if (let.getConcatSuffix() != null) {
-          SqlNode suffixNode =
-              new SqlBasicCall(
-                  SqlStdOperatorTable.CAST,
-                  List.of(
-                      ExpressionConverter.literalToSqlNode(let.getConcatSuffix()),
-                      varcharSpecForFieldformat),
-                  POS);
-          strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(strRhs, suffixNode), POS);
-        }
-        rhs = strRhs;
-      }
+      SqlNode rhs = ExpressionConverter.applyEvalRhsTransforms(expr(let.getExpression()), let);
       items.add(asAliased(rhs, alias));
       aliasesInThisSelect.add(alias);
       if (existingNames.add(alias)) {
         visible.add(alias);
       }
-      // Track this alias's static type when derivable, so downstream castExpr / Compare can
-      // dispatch type-specific helpers (NUMBER_TO_STRING, IP_TO_STRING, etc.) for column refs
-      // whose type would otherwise be unknown without a validator probe.
-      DataType staticType = ExpressionConverter.staticTypeOf(let.getExpression(), frame);
-      if (staticType != null) {
-        frame.evalAliasTypes.put(alias, staticType);
-      } else {
-        // Rebound alias with unknown type — drop the prior tracking.
-        frame.evalAliasTypes.remove(alias);
-      }
-      // Track passthrough alias (`eval new = oldField`) for downstream visitAggregation's
-      // doc_count optimization to substitute the alias back to its source column. Only applies
-      // when the RHS is a bare QualifiedName (or Field-wrapped one); computed expressions don't
-      // qualify.
-      UnresolvedExpression rhsExpr = let.getExpression();
-      QualifiedName rhsQn = null;
-      if (rhsExpr instanceof QualifiedName q) rhsQn = q;
-      else if (rhsExpr instanceof Field f && f.getField() instanceof QualifiedName q) rhsQn = q;
-      if (rhsQn != null && !rhsQn.toString().equals(alias)) {
-        // Resolve through prior passthroughs so chained renames terminate at the original.
-        String src = rhsQn.toString();
-        String resolved = src;
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        while (frame.evalPassthroughSource.containsKey(resolved) && seen.add(resolved)) {
-          resolved = frame.evalPassthroughSource.get(resolved);
-        }
-        frame.evalPassthroughSource.put(alias, resolved);
-      } else {
-        frame.evalPassthroughSource.remove(alias);
-      }
-      // Track MAP-producing eval aliases (e.g. {@code eval info = geoip(...)}). Downstream
-      // dotted refs `info.city` get ITEM dispatch in expr(QualifiedName), same path as catalog
-      // MAP columns. Detection: known MAP-returning function calls.
-      if (isMapProducingExpr(let.getExpression())) {
-        frame.mapColumns.add(alias);
-      } else if (rebound.contains(alias)) {
-        // Rebound to a non-MAP RHS — drop any prior MAP tracking for this name.
-        frame.mapColumns.remove(alias);
-      }
-      // Track eval aliases whose name contains a literal dot (e.g. spath rewriteAsEval emits
-      // `eval doc.user.name = json_extract(doc, '$.user.name')`). When a downstream expression
-      // references the alias by its dotted name, the validator's multi-part identifier
-      // resolution would interpret it as <table>.<col> — emit a quoted single-part identifier
-      // instead so the validator looks up the literal column.
-      if (alias.indexOf('.') >= 0) {
-        frame.dottedEvalAliases.add(alias);
-      }
+      updateFrameForLet(frame, alias, let, rebound);
     }
-    // Peephole: when child is a SELECT * (no GROUP BY / HAVING), append our extra eval items to
-    // its select list and reuse it. Avoids nesting `SELECT *, e1 AS a1 FROM (SELECT * FROM <X> AS
-    // a JOIN ...)` which seals join aliases inside the FROM subquery, breaking subsequent pipes
-    // that reference `a.col`. The `<child>` SELECT keeps its FROM scope live so `a.col` in our
-    // appended `e_i` items resolves.
-    //
-    // Skip the peephole when the eval forced a mid-eval wrap (because a later let references an
-    // earlier alias). The `from` we just built is the wrapped child; if we append our remaining
-    // items to its select list, we end up with `SELECT *, prev_alias AS x, x AS y FROM ...` —
-    // SQL doesn't let SELECT-list aliases reference each other within the same SELECT.
+    // Peephole: when the child is a SELECT * (no GROUP BY / HAVING), append our extra eval items
+    // to its select list and reuse it. Avoids nesting under a subquery that would seal upstream
+    // join aliases. Skip after a mid-eval wrap — the `from` we just built is itself the wrapped
+    // child, and appending more items would re-introduce the forbidden forward-reference shape.
     if (!wrappedMidEval) {
       SqlNode peep = appendEvalToChildSelectStar(from, items, visible, frame);
       if (peep != null) return peep;
     }
     return SqlBuilder.select(items).from(from).withFields(visible).wrap(frame);
+  }
+
+  /** Names of lets in {@code node} that rebind a column already visible in {@code existing}. */
+  private static Set<String> computeReboundNames(Eval node, Set<String> existing) {
+    Set<String> rebound = new java.util.HashSet<>();
+    for (Let let : node.getExpressionList()) {
+      String name = let.getVar().getField().toString();
+      if (existing.contains(name)) {
+        rebound.add(name);
+      }
+    }
+    return rebound;
+  }
+
+  /**
+   * Build the SELECT prefix in front of the eval's let projections.
+   *
+   * <ul>
+   *   <li>No rebound names (or no current-fields list available): emit a single {@code *}.
+   *   <li>Otherwise: expand to an explicit column list, dropping each rebound name AND its struct
+   *       ancestors (e.g. rebinding the flattened {@code a.b.c} also drops {@code a} and {@code
+   *       a.b}, since the lingering struct would shadow the rebind). Mutates {@code visible} in
+   *       place to remove the dropped ancestors so downstream pipes don't see them.
+   * </ul>
+   */
+  private SqlNodeList computeEvalSelectPrefix(
+      Set<String> rebound, Frame frame, List<String> visible) {
+    SqlNodeList items = new SqlNodeList(POS);
+    if (rebound.isEmpty() || frame.currentFields == null) {
+      items.add(SqlIdentifier.star(POS));
+      return items;
+    }
+    Set<String> ancestorDrop = new java.util.HashSet<>();
+    for (String r : rebound) {
+      int idx = r.indexOf('.');
+      while (idx >= 0) {
+        ancestorDrop.add(r.substring(0, idx));
+        idx = r.indexOf('.', idx + 1);
+      }
+    }
+    for (String c : frame.currentFields) {
+      if (rebound.contains(c) || ancestorDrop.contains(c)) continue;
+      items.add(toIdentifier(c));
+    }
+    visible.removeAll(ancestorDrop);
+    return items;
+  }
+
+  /**
+   * Update Frame metadata maps after an eval let creates or rebinds {@code alias}. Tracks
+   * downstream-visible facts that SQL emission alone can't carry through:
+   *
+   * <ul>
+   *   <li>{@code evalAliasTypes}: static PPL type when inferable, so downstream castExpr / Compare
+   *       can dispatch type-specific helpers without a validator probe.
+   *   <li>{@code evalPassthroughSource}: when the let is a rename-only passthrough ({@code eval new
+   *       = oldField}), record the original column so visitAggregation's doc_count optimization can
+   *       substitute back. Chained passthroughs collapse to the original.
+   *   <li>{@code mapColumns}: MAP-returning expressions (e.g. {@code geoip(...)}) so dotted refs
+   *       like {@code info.city} route through ITEM dispatch.
+   *   <li>{@code dottedEvalAliases}: alias names that themselves contain dots (e.g. spath's {@code
+   *       doc.user.name}) so downstream references emit a quoted single-part identifier.
+   * </ul>
+   */
+  private static void updateFrameForLet(Frame frame, String alias, Let let, Set<String> rebound) {
+    DataType staticType = ExpressionConverter.staticTypeOf(let.getExpression(), frame);
+    if (staticType != null) {
+      frame.evalAliasTypes.put(alias, staticType);
+    } else {
+      frame.evalAliasTypes.remove(alias);
+    }
+    UnresolvedExpression rhsExpr = let.getExpression();
+    QualifiedName rhsQn = null;
+    if (rhsExpr instanceof QualifiedName q) rhsQn = q;
+    else if (rhsExpr instanceof Field f && f.getField() instanceof QualifiedName q) rhsQn = q;
+    if (rhsQn != null && !rhsQn.toString().equals(alias)) {
+      String resolved = rhsQn.toString();
+      Set<String> seen = new java.util.HashSet<>();
+      while (frame.evalPassthroughSource.containsKey(resolved) && seen.add(resolved)) {
+        resolved = frame.evalPassthroughSource.get(resolved);
+      }
+      frame.evalPassthroughSource.put(alias, resolved);
+    } else {
+      frame.evalPassthroughSource.remove(alias);
+    }
+    if (isMapProducingExpr(let.getExpression())) {
+      frame.mapColumns.add(alias);
+    } else if (rebound.contains(alias)) {
+      frame.mapColumns.remove(alias);
+    }
+    if (alias.indexOf('.') >= 0) {
+      frame.dottedEvalAliases.add(alias);
+    }
   }
 
   /**

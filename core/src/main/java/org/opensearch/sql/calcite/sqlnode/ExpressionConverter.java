@@ -26,6 +26,7 @@ import org.opensearch.sql.ast.expression.Cast;
 import org.opensearch.sql.ast.expression.DataType;
 import org.opensearch.sql.ast.expression.Field;
 import org.opensearch.sql.ast.expression.Function;
+import org.opensearch.sql.ast.expression.Let;
 import org.opensearch.sql.ast.expression.Literal;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
@@ -275,5 +276,51 @@ final class ExpressionConverter {
       }
     }
     return null;
+  }
+
+  /**
+   * Apply PPL eval-RHS shape transforms to an already-converted SqlNode {@code rhs}, given the
+   * source {@link Let}:
+   *
+   * <ul>
+   *   <li>STRING-literal RHS: cast to VARCHAR so downstream UNION (multisearch / append / chart
+   *       pivot) doesn't widen unequal-length CHAR(N) literals to CHAR(max) and right-pad shorter
+   *       values with spaces. Uses CAST (not SAFE_CAST) so the validator simplifies the typed
+   *       literal to a bare {@code 'literal':VARCHAR} annotation.
+   *   <li>{@code fieldformat} concat: when the Let carries a {@code concatPrefix} or {@code
+   *       concatSuffix} literal, build a NULL-preserving CONCAT chain ({@code prefix || rhs ||
+   *       suffix}). The non-string RHS is itself SAFE_CAST to VARCHAR so {@code ||} produces a
+   *       string column, not a coerced numeric.
+   * </ul>
+   */
+  static SqlNode applyEvalRhsTransforms(SqlNode rhs, Let let) {
+    SqlDataTypeSpec varcharSpec =
+        new SqlDataTypeSpec(new SqlBasicTypeNameSpec(SqlTypeName.VARCHAR, POS), POS);
+    if (let.getExpression() instanceof Literal stringLit
+        && stringLit.getType() == DataType.STRING) {
+      rhs = new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(rhs, varcharSpec), POS);
+    }
+    if (let.getConcatPrefix() != null || let.getConcatSuffix() != null) {
+      SqlNode strRhs =
+          new SqlBasicCall(SqlLibraryOperators.SAFE_CAST, List.of(rhs, varcharSpec), POS);
+      if (let.getConcatPrefix() != null) {
+        SqlNode prefixNode =
+            new SqlBasicCall(
+                SqlStdOperatorTable.CAST,
+                List.of(literalToSqlNode(let.getConcatPrefix()), varcharSpec),
+                POS);
+        strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(prefixNode, strRhs), POS);
+      }
+      if (let.getConcatSuffix() != null) {
+        SqlNode suffixNode =
+            new SqlBasicCall(
+                SqlStdOperatorTable.CAST,
+                List.of(literalToSqlNode(let.getConcatSuffix()), varcharSpec),
+                POS);
+        strRhs = new SqlBasicCall(SqlStdOperatorTable.CONCAT, List.of(strRhs, suffixNode), POS);
+      }
+      return strRhs;
+    }
+    return rhs;
   }
 }

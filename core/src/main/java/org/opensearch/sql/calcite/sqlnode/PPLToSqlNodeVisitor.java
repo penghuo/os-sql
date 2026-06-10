@@ -18,7 +18,6 @@ import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlSelect;
-import org.apache.calcite.sql.SqlSelectKeyword;
 import org.apache.calcite.sql.SqlWindow;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -35,8 +34,6 @@ import org.opensearch.sql.ast.expression.DataType;
 import org.opensearch.sql.ast.expression.Field;
 import org.opensearch.sql.ast.expression.Let;
 import org.opensearch.sql.ast.expression.Literal;
-import org.opensearch.sql.ast.expression.Not;
-import org.opensearch.sql.ast.expression.Or;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.Span;
 import org.opensearch.sql.ast.expression.SpanUnit;
@@ -129,7 +126,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
           "array_join");
 
   /** Resolves a table qualified name (e.g. {@code ["my_index"]}) to its column names. */
-  private final Function<List<String>, List<String>> tableFields;
+  final Function<List<String>, List<String>> tableFields;
 
   /**
    * Resolves a table qualified name to its full {@link org.apache.calcite.rel.type.RelDataType}.
@@ -137,7 +134,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * single-arg ctor for tests). Visitors that need column types (e.g. UDT detection in {@link
    * #visitAppend}) fall through to type-agnostic emission when this is {@code null}.
    */
-  private final Function<List<String>, org.apache.calcite.rel.type.RelDataType> tableRowType;
+  final Function<List<String>, org.apache.calcite.rel.type.RelDataType> tableRowType;
 
   /**
    * The Frame currently in scope at expression-translation time. Set by {@link #translate} and
@@ -147,7 +144,10 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * call would cascade through many helpers; a transient pointer is simpler and the visit is
    * single-threaded.
    */
-  private Frame exprFrame;
+  Frame exprFrame;
+
+  /** Expression-to-SqlNode visitor. Holds back-ref to this; access {@link #exprFrame} via outer. */
+  final SqlExpressionVisitor rex = new SqlExpressionVisitor(this);
 
   public PPLToSqlNodeVisitor(Function<List<String>, List<String>> tableFields) {
     this(tableFields, null);
@@ -181,7 +181,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * it is NOT touched by this pass — only the AstBuilder-injected {@link AllFieldsExcludeMeta}
    * subclass marker is.
    */
-  private static UnresolvedPlan stripImplicitMetaProjects(UnresolvedPlan plan) {
+  static UnresolvedPlan stripImplicitMetaProjects(UnresolvedPlan plan) {
     if (plan instanceof Project p
         && !p.isExcluded()
         && p.getProjectList().size() == 1
@@ -1614,7 +1614,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * string, both date/time, or identical type). Used by the BETWEEN expression validator to throw
    * PPL's documented "BETWEEN expression types are incompatible" message.
    */
-  private static boolean pplBetweenBoundsCompatible(DataType a, DataType b) {
+  static boolean pplBetweenBoundsCompatible(DataType a, DataType b) {
     if (a == b) return true;
     if (isNumericPplType(a) && isNumericPplType(b)) return true;
     return false;
@@ -1677,7 +1677,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
   }
 
   /** Map PPL DataType to the SQL type name used in fillnull error messages. */
-  private static String pplTypeToSqlNameForError(DataType t) {
+  static String pplTypeToSqlNameForError(DataType t) {
     switch (t) {
       case BOOLEAN:
         return "BOOLEAN";
@@ -2028,7 +2028,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * QualifiedName/Field whose target column is in {@link Frame#columnUdt}, or {@code null}
    * otherwise.
    */
-  private String qualifiedNameUdt(UnresolvedExpression e) {
+  String qualifiedNameUdt(UnresolvedExpression e) {
     if (exprFrame == null || exprFrame.columnUdt.isEmpty()) return null;
     QualifiedName qn = null;
     if (e instanceof QualifiedName q) qn = q;
@@ -6715,7 +6715,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * distinct_count}). count() with {@link AllFields} arg becomes {@code COUNT(*)}.
    */
   private SqlNode aggCall(UnresolvedExpression e) {
-    return aggCall(e, false);
+    return rex.aggCall(e);
   }
 
   /**
@@ -6725,185 +6725,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * guard at the call site for the empty-group → NULL semantics).
    */
   private SqlNode aggCall(UnresolvedExpression e, boolean windowed) {
-    if (!(e instanceof AggregateFunction af)) {
-      throw new UnsupportedOperationException(
-          "stats aggregator must be an AggregateFunction, got: " + e.getClass().getSimpleName());
-    }
-    String fnLower = af.getFuncName().toLowerCase(java.util.Locale.ROOT);
-    boolean distinct = Boolean.TRUE.equals(af.getDistinct());
-    if (fnLower.equals("dc")
-        || fnLower.equals("distinct_count")
-        || fnLower.equals("distinct_count_approx")) {
-      // distinct_count_approx is HLL-style in v2 PPL but the legacy SqlNode visitor maps it to
-      // plain COUNT(DISTINCT) — match that behaviour.
-      fnLower = "count";
-      distinct = true;
-    } else if (fnLower.equals("c")) {
-      fnLower = "count";
-    }
-    // earliest/latest dispatch to Calcite's ARG_MIN/ARG_MAX with a (value, time-field) signature.
-    // The time-field defaults to @timestamp when not supplied (matches v2's resolveTimeField).
-    if (fnLower.equals("earliest") || fnLower.equals("latest")) {
-      List<SqlNode> args = new ArrayList<>();
-      UnresolvedExpression argExpr0 = af.getField();
-      args.add(argExpr0 instanceof AllFields ? SqlIdentifier.star(POS) : expr(argExpr0));
-      if (af.getArgList() != null) {
-        for (UnresolvedExpression extra : af.getArgList()) {
-          if (extra instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
-            args.add(expr(ua.getValue()));
-          } else {
-            args.add(expr(extra));
-          }
-        }
-      }
-      if (args.size() == 1) {
-        args.add(new SqlIdentifier(OpenSearchConstants.IMPLICIT_FIELD_TIMESTAMP, POS));
-      }
-      org.apache.calcite.sql.SqlOperator op0 =
-          fnLower.equals("earliest") ? SqlStdOperatorTable.ARG_MIN : SqlStdOperatorTable.ARG_MAX;
-      return new SqlBasicCall(op0, args, POS);
-    }
-    org.apache.calcite.sql.SqlAggFunction op =
-        switch (fnLower) {
-          case "count" -> SqlStdOperatorTable.COUNT;
-          case "sum" -> SqlStdOperatorTable.SUM;
-          // PPL stats AVG over an empty/all-NULL group should return NULL — Calcite's standard
-          // AVG return type is NOT NULL and trips a "Cannot convert null to double" runtime error
-          // when the group is empty. PPLBuiltinOperators.AVG_NULLABLE is a nullable wrapper that
-          // returns NULL in that case. In window context, the nullable variant has no enumerable
-          // implementor, so we use standard AVG and pair with a CASE-WHEN-COUNT guard at the
-          // visitWindow call site.
-          case "avg" ->
-              windowed
-                  ? SqlStdOperatorTable.AVG
-                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.AVG_NULLABLE;
-          case "min" -> SqlStdOperatorTable.MIN;
-          case "max" -> SqlStdOperatorTable.MAX;
-          // PPL `stddev` is sample-stddev (Bessel's correction), `stddev_pop` is population
-          // form. Same nullable-vs-windowed dispatch as AVG.
-          case "stddev", "stddev_samp" ->
-              windowed
-                  ? SqlStdOperatorTable.STDDEV_SAMP
-                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.STDDEV_SAMP_NULLABLE;
-          case "stddev_pop" ->
-              windowed
-                  ? SqlStdOperatorTable.STDDEV_POP
-                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.STDDEV_POP_NULLABLE;
-          case "variance", "var_samp" ->
-              windowed
-                  ? SqlStdOperatorTable.VAR_SAMP
-                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.VAR_SAMP_NULLABLE;
-          case "var_pop" ->
-              windowed
-                  ? SqlStdOperatorTable.VAR_POP
-                  : org.opensearch.sql.expression.function.PPLBuiltinOperators.VAR_POP_NULLABLE;
-          // percentile/percentile_approx/median dispatch to the OpenSearch T-Digest UDAF.
-          // median(x) is shorthand for percentile_approx(x, 50).
-          case "percentile", "percentile_approx", "median" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX;
-          // Multi-value aggregates: list/values collect group rows into a string array;
-          // first/last return the first/last value in the group's natural order; take returns
-          // the first N values (the N is passed as a second positional arg).
-          case "list" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LIST;
-          case "values" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.VALUES;
-          case "first" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.FIRST;
-          case "last" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST;
-          case "take" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE;
-          default ->
-              throw new UnsupportedOperationException(
-                  "Aggregate function not yet supported in PPLToSqlNodeVisitor: " + fnLower);
-        };
-    UnresolvedExpression argExpr = af.getField();
-    SqlNode arg;
-    if (argExpr instanceof AllFields) {
-      arg = SqlIdentifier.star(POS);
-    } else {
-      arg = expr(argExpr);
-    }
-    // Numeric aggs over a MAP-path (ITEM dispatch yields ANY-typed, not numeric): wrap with
-    // CAST(... AS DOUBLE) so SUM/AVG/MIN/MAX/STDDEV/VAR get a numeric input. Without the cast,
-    // Calcite's converter raises "type mismatch: DECIMAL(38,19) vs VARCHAR" because the
-    // aggregate's expected input type doesn't match ITEM's ANY type. Skip for COUNT, count is
-    // just row-count regardless of arg type.
-    boolean isNumericAgg =
-        fnLower.equals("sum")
-            || fnLower.equals("avg")
-            || fnLower.equals("min")
-            || fnLower.equals("max")
-            || fnLower.equals("stddev")
-            || fnLower.equals("stddev_samp")
-            || fnLower.equals("stddev_pop")
-            || fnLower.equals("var_samp")
-            || fnLower.equals("var_pop")
-            || fnLower.equals("median")
-            || fnLower.equals("percentile")
-            || fnLower.equals("percentile_approx");
-    if (isNumericAgg
-        && arg instanceof SqlBasicCall sbc
-        && sbc.getOperator() == SqlStdOperatorTable.ITEM) {
-      org.apache.calcite.sql.SqlDataTypeSpec doubleSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.DOUBLE, POS),
-              POS);
-      arg =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(arg, doubleSpec),
-              POS);
-    }
-    org.apache.calcite.sql.SqlLiteral quantifier =
-        distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
-    // percentile/percentile_approx (extra <percent> arg, with median defaulting to 50),
-    // first/last/take (optional <N>) all carry positional args that PPL stores in
-    // AggregateFunction.argList. Pass them through verbatim.
-    boolean takesExtraArgs =
-        op == org.opensearch.sql.expression.function.PPLBuiltinOperators.PERCENTILE_APPROX
-            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.FIRST
-            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST
-            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.TAKE
-            // VALUES carries an optional UnresolvedArgument("limit", n) injected by the parser
-            // when plugins.ppl.values.max.limit is configured. The runtime VALUES UDAF reads
-            // the limit from values[1].
-            || op == org.opensearch.sql.expression.function.PPLBuiltinOperators.VALUES;
-    if (takesExtraArgs) {
-      List<SqlNode> args = new ArrayList<>();
-      args.add(arg);
-      if (af.getArgList() != null) {
-        for (UnresolvedExpression extra : af.getArgList()) {
-          // PPL passes extra args as named UnresolvedArgument(name, value); unwrap the value.
-          if (extra instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
-            args.add(expr(ua.getValue()));
-          } else {
-            args.add(expr(extra));
-          }
-        }
-      }
-      if (fnLower.equals("median") && args.size() == 1) {
-        args.add(SqlLiteral.createExactNumeric("50", POS));
-      }
-      // v2's PERCENTILE_APPROX dispatcher appends a SYMBOL flag holding the field's SqlTypeName
-      // (rexBuilder.makeFlag(field.getType().getSqlTypeName())) so the runtime impl can return
-      // the correct numeric type. Mirror that here for percentile/median/percentile_approx;
-      // probe the field's primitive type via Frame.columnPrimitiveType / evalAliasTypes (no
-      // validator probe needed) and emit a SqlSymbolLiteral. Other aggregates in this dispatch
-      // (first/last/take/values) keep their original arity. Mirrors legacy commit 26d6ff2081.
-      if (fnLower.equals("percentile")
-          || fnLower.equals("percentile_approx")
-          || fnLower.equals("median")) {
-        DataType fieldDt = ExpressionConverter.staticTypeOf(argExpr, exprFrame);
-        if (fieldDt != null) {
-          try {
-            org.apache.calcite.sql.type.SqlTypeName sqlType = pplTypeToSqlType(fieldDt);
-            args.add(SqlLiteral.createSymbol(sqlType, POS));
-          } catch (UnsupportedOperationException ignored) {
-            // Field's PPL DataType doesn't map to a SqlTypeName — skip flag.
-          }
-        }
-      }
-      return new SqlBasicCall(op, args, POS, quantifier);
-    }
-    return new SqlBasicCall(op, List.of(arg), POS, quantifier);
+    return rex.aggCall(e, windowed);
   }
 
   /**
@@ -7789,301 +7611,8 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * Translate a PPL UnresolvedExpression to a Calcite SqlNode. Grows incrementally as visitors land
    * — current cases cover what visitJoin/visitFilter/visitEval exercise.
    */
-  private SqlNode expr(UnresolvedExpression e) {
-    if (e instanceof Literal lit) {
-      return ExpressionConverter.literalToSqlNode(lit);
-    }
-    if (e instanceof QualifiedName qn) {
-      List<String> parts = qn.getParts();
-      if (exprFrame != null
-          && !exprFrame.aliasSynonyms.isEmpty()
-          && parts.size() >= 2
-          && exprFrame.aliasSynonyms.containsKey(parts.get(0))) {
-        List<String> rewritten = new ArrayList<>(parts);
-        rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
-        return new SqlIdentifier(rewritten, POS);
-      }
-      // Spath/eval-with-dotted-alias case: {@code eval doc.user.name = json_extract(doc, ...)}
-      // produces an alias whose own name contains dots. A downstream `doc.user.name` reference
-      // must resolve to the literal column, not a multi-part identifier path.
-      if (parts.size() >= 2
-          && exprFrame != null
-          && exprFrame.dottedEvalAliases.contains(qn.toString())) {
-        return ExpressionConverter.quotedIdentifier(
-            java.util.Collections.singletonList(qn.toString()));
-      }
-      // OpenSearch flattens deeply-nested object/nested mappings into top-level dotted-name
-      // catalog columns (e.g. `address.city`, `projects.name`). When the full dotted name is a
-      // visible flat column AND the leading part isn't a known join-arg alias, emit it as a
-      // quoted single-part identifier so the validator looks it up literally instead of trying
-      // multi-part resolution (which fails with "Table 'X' not found"). Mirror toIdentifier's
-      // same-named rewrite for the WHERE/expression path.
-      if (parts.size() >= 2
-          && exprFrame != null
-          && !exprFrame.liveJoinAliases.contains(parts.get(0))
-          && exprFrame.aliasSynonyms.isEmpty()
-          && exprFrame.currentFields != null
-          && exprFrame.currentFields.contains(qn.toString())) {
-        return ExpressionConverter.quotedIdentifier(
-            java.util.Collections.singletonList(qn.toString()));
-      }
-      // OpenSearch "object" mappings become MAP<VARCHAR, ANY> in Calcite. A dotted reference
-      // {@code object_value.first} drills via {@code ITEM(object_value, 'first')} —
-      // multi-part identifier resolution would otherwise fail with "Table 'object_value' not
-      // found". Joins all trailing parts with '.' for OpenSearch's literal-dotted keys.
-      if (parts.size() >= 2 && exprFrame != null && exprFrame.mapColumns.contains(parts.get(0))) {
-        String subkey = String.join(".", parts.subList(1, parts.size()));
-        return new SqlBasicCall(
-            SqlStdOperatorTable.ITEM,
-            List.of(new SqlIdentifier(parts.get(0), POS), SqlLiteral.createCharString(subkey, POS)),
-            POS);
-      }
-      // Join-arg-aliased MAP-path: {@code l.doc.user.name} where {@code l} is a join-arg alias
-      // and {@code doc} is a MAP-typed column on l's side. Emit {@code ITEM(l.doc, 'user.name')}
-      // so the validator looks up {@code l.doc} as a column path and applies ITEM to drill the
-      // MAP value. Without this, multi-part resolution interprets {@code l.doc.user} as
-      // {@code <table>.<col>.<sub-col>} and fails.
-      if (parts.size() >= 3
-          && exprFrame != null
-          && exprFrame.liveJoinAliases.contains(parts.get(0))
-          && exprFrame.mapColumns.contains(parts.get(1))) {
-        String subkey = String.join(".", parts.subList(2, parts.size()));
-        SqlIdentifier mapRef = new SqlIdentifier(parts.subList(0, 2), POS);
-        return new SqlBasicCall(
-            SqlStdOperatorTable.ITEM,
-            List.of(mapRef, SqlLiteral.createCharString(subkey, POS)),
-            POS);
-      }
-      return new SqlIdentifier(parts, POS);
-    }
-    if (e instanceof Field f) {
-      return expr(f.getField());
-    }
-    if (e instanceof Compare c) {
-      String cOp =
-          c.getOperator() == null ? "" : c.getOperator().toLowerCase(java.util.Locale.ROOT);
-      // Boolean simplification: `<bool_field> = TRUE` → `<bool_field>`, `<bool_field> = FALSE` →
-      // `NOT(<bool_field>)`, `<bool_field> != TRUE` → `IS NOT TRUE(<bool_field>)`,
-      // `<bool_field> != FALSE` → `IS NOT FALSE(<bool_field>)`. Mirrors v2's emission shape so
-      // OpenSearch pushdown emits a single `term` query against the boolean. Detect the boolean
-      // side via Frame.columnPrimitiveType / Frame.evalAliasTypes (no validator probe required).
-      if (cOp.equals("=") || cOp.equals("!=") || cOp.equals("<>")) {
-        Boolean rightBool = ExpressionConverter.extractBoolLiteral(c.getRight());
-        Boolean leftBool = ExpressionConverter.extractBoolLiteral(c.getLeft());
-        UnresolvedExpression fieldAst = null;
-        Boolean boolValue = null;
-        if (rightBool != null) {
-          fieldAst = c.getLeft();
-          boolValue = rightBool;
-        } else if (leftBool != null) {
-          fieldAst = c.getRight();
-          boolValue = leftBool;
-        }
-        if (boolValue != null
-            && ExpressionConverter.staticTypeOf(fieldAst, exprFrame) == DataType.BOOLEAN) {
-          SqlNode fieldSide = expr(fieldAst);
-          boolean isEq = cOp.equals("=");
-          if (isEq) {
-            return boolValue
-                ? fieldSide
-                : new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(fieldSide), POS);
-          } else {
-            org.apache.calcite.sql.SqlOperator postfix =
-                boolValue ? SqlStdOperatorTable.IS_NOT_TRUE : SqlStdOperatorTable.IS_NOT_FALSE;
-            return new SqlBasicCall(postfix, List.of(fieldSide), POS);
-          }
-        }
-      }
-      SqlNode l = expr(c.getLeft());
-      SqlNode r = expr(c.getRight());
-      // Cross-type DATE/TIME/TIMESTAMP comparison: align both sides to TIMESTAMP so the runtime
-      // doesn't compare opaque UDT VARCHARs and produce wrong booleans. Mirrors v2's
-      // CoercionUtils.widenArguments. Detect statically when both operands are AST Cast nodes
-      // (or Function calls with names date/time/timestamp) that yield UDT datetime types.
-      String lDtName = ExpressionConverter.staticDateTimeUdtName(c.getLeft());
-      String rDtName = ExpressionConverter.staticDateTimeUdtName(c.getRight());
-      if (lDtName != null && rDtName != null && !lDtName.equals(rDtName)) {
-        if (!"timestamp".equals(lDtName)) {
-          l =
-              new SqlBasicCall(
-                  org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
-                  List.of(l),
-                  POS);
-        }
-        if (!"timestamp".equals(rDtName)) {
-          r =
-              new SqlBasicCall(
-                  org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
-                  List.of(r),
-                  POS);
-        }
-      }
-      // PPL-UDT comparison with a string literal: wrap the literal in the matching UDF so
-      // Calcite's operand checker accepts the comparison. e.g. `where host = '1.2.3.4'` with
-      // host:EXPR_IP becomes `host = IP('1.2.3.4')`. Without this, validator rejects with
-      // "Cannot apply '=' to arguments of type '<EXPR_IP> = <CHAR(7)>'". Detected via the
-      // per-column UDT map populated in visitRelation.
-      String lFieldUdt = qualifiedNameUdt(c.getLeft());
-      String rFieldUdt = qualifiedNameUdt(c.getRight());
-      // VARCHAR-cast the string literal before wrapping in the UDT UDF so the explain plan
-      // shows `TIMESTAMP('...':VARCHAR)` matching v2's RexBuilder emission. Without the cast
-      // Calcite emits CHAR(N) which renders without the type suffix and breaks plan-shape
-      // tests.
-      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-              POS);
-      if (lFieldUdt != null && ExpressionConverter.isStringLiteral(c.getRight())) {
-        org.apache.calcite.sql.SqlOperator op =
-            ExpressionConverter.udtConstructorOpForRoot(lFieldUdt);
-        if (op != null) {
-          SqlNode rArg =
-              new SqlBasicCall(
-                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                  List.of(r, varcharSpec),
-                  POS);
-          r = new SqlBasicCall(op, List.of(rArg), POS);
-        }
-      } else if (rFieldUdt != null && ExpressionConverter.isStringLiteral(c.getLeft())) {
-        org.apache.calcite.sql.SqlOperator op =
-            ExpressionConverter.udtConstructorOpForRoot(rFieldUdt);
-        if (op != null) {
-          SqlNode lArg =
-              new SqlBasicCall(
-                  org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                  List.of(l, varcharSpec),
-                  POS);
-          l = new SqlBasicCall(op, List.of(lArg), POS);
-        }
-      }
-      // EXPR_IP-aware comparator dispatch: when either side is an EXPR_IP field, use
-      // PPLBuiltinOperators IP comparators (GREATER_IP/LESS_IP/etc.) instead of standard
-      // operators. Mirrors v2's PPLFuncImpTable.registerOperator(GREATER, GREATER_IP, GT) which
-      // selects the IP variant when an operand has UDT IP type. Standard comparators run at
-      // runtime over EXPR_IP but produce a different explain-plan shape and may pushdown via a
-      // generic range query that doesn't preserve IP-aware ordering.
-      if ("ip".equals(lFieldUdt) || "ip".equals(rFieldUdt)) {
-        org.apache.calcite.sql.SqlOperator ipOp =
-            ExpressionConverter.ipComparisonOperator(
-                c.getOperator() == null ? "" : c.getOperator().toLowerCase(java.util.Locale.ROOT));
-        if (ipOp != null) {
-          return new SqlBasicCall(ipOp, List.of(l, r), POS);
-        }
-      }
-      return new SqlBasicCall(
-          ExpressionConverter.comparisonOperator(c.getOperator()), List.of(l, r), POS);
-    }
-    if (e instanceof And a) {
-      return new SqlBasicCall(
-          SqlStdOperatorTable.AND, List.of(expr(a.getLeft()), expr(a.getRight())), POS);
-    }
-    if (e instanceof Or o) {
-      return new SqlBasicCall(
-          SqlStdOperatorTable.OR, List.of(expr(o.getLeft()), expr(o.getRight())), POS);
-    }
-    if (e instanceof Not n) {
-      // Intercept `NOT(<bool_field> = <bool_lit>)` and flip the operator so the same boolean
-      // simplification path produces the matching IS NOT TRUE / IS NOT FALSE shape. v2's
-      // RexBuilder produces this shape directly; SqlValidator-default emission would leave a
-      // bare NOT(field) which doesn't match v2's plan-shape on pushdown.
-      UnresolvedExpression inner = n.getExpression();
-      if (inner instanceof Compare innerCmp) {
-        String iop =
-            innerCmp.getOperator() == null
-                ? ""
-                : innerCmp.getOperator().toLowerCase(java.util.Locale.ROOT);
-        if (iop.equals("=") || iop.equals("!=") || iop.equals("<>")) {
-          Boolean rb = ExpressionConverter.extractBoolLiteral(innerCmp.getRight());
-          Boolean lb = ExpressionConverter.extractBoolLiteral(innerCmp.getLeft());
-          UnresolvedExpression fieldAst = null;
-          if (rb != null) fieldAst = innerCmp.getLeft();
-          else if (lb != null) fieldAst = innerCmp.getRight();
-          if (fieldAst != null
-              && ExpressionConverter.staticTypeOf(fieldAst, exprFrame) == DataType.BOOLEAN) {
-            String flipped = iop.equals("=") ? "!=" : "=";
-            Compare flippedCmp = new Compare(flipped, innerCmp.getLeft(), innerCmp.getRight());
-            return expr(flippedCmp);
-          }
-        }
-      }
-      return new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(expr(n.getExpression())), POS);
-    }
-    if (e instanceof Cast c) {
-      return castExpr(c);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Function fn) {
-      return funcExpr(fn);
-    }
-    if (e instanceof Span sp) {
-      return spanExpr(sp);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.In in) {
-      return inExpr(in);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Case caseExpr) {
-      return caseExpr(caseExpr);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Interval interval) {
-      return intervalExpr(interval);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
-      return unresolvedArgExpr(ua);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
-      return relevanceFieldListExpr(rfl);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.LambdaFunction lf) {
-      // PPL lambdas (forall/exists/filter/transform/reduce/...) emit as Calcite SqlLambda whose
-      // parameter list is the PPL argument identifiers and whose body is the translated body.
-      // SqlToRelConverter turns this into a RexLambda that the PPL array UDFs invoke directly.
-      SqlNodeList paramList = new SqlNodeList(POS);
-      for (QualifiedName qn : lf.getFuncArgs()) {
-        paramList.add(new SqlIdentifier(qn.toString(), POS));
-      }
-      SqlNode body = expr(lf.getFunction());
-      return new org.apache.calcite.sql.SqlLambda(POS, paramList, body);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.subquery.InSubquery is) {
-      return inSubqueryExpr(is);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Between b) {
-      // PPL rejects BETWEEN with incompatible bound types statically (mirrors v2's
-      // SemanticCheckException). Detect when lower/upper are both literals AND one is STRING and
-      // the other is numeric — those don't widen cleanly. Throws PPL's documented message.
-      DataType lowerType = b.getLowerBound() instanceof Literal l ? l.getType() : null;
-      DataType upperType = b.getUpperBound() instanceof Literal u ? u.getType() : null;
-      if (lowerType != null
-          && upperType != null
-          && !pplBetweenBoundsCompatible(lowerType, upperType)) {
-        throw new IllegalArgumentException(
-            "BETWEEN expression types are incompatible: lower bound is "
-                + pplTypeToSqlNameForError(lowerType)
-                + ", upper bound is "
-                + pplTypeToSqlNameForError(upperType));
-      }
-      return new SqlBasicCall(
-          SqlStdOperatorTable.BETWEEN,
-          List.of(expr(b.getValue()), expr(b.getLowerBound()), expr(b.getUpperBound())),
-          POS);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Xor xor) {
-      // a XOR b ≡ (a OR b) AND NOT (a AND b)
-      SqlNode l = expr(xor.getLeft());
-      SqlNode r = expr(xor.getRight());
-      SqlNode or = new SqlBasicCall(SqlStdOperatorTable.OR, List.of(l, r), POS);
-      SqlNode and = new SqlBasicCall(SqlStdOperatorTable.AND, List.of(l, r), POS);
-      SqlNode notAnd = new SqlBasicCall(SqlStdOperatorTable.NOT, List.of(and), POS);
-      return new SqlBasicCall(SqlStdOperatorTable.AND, List.of(or, notAnd), POS);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.subquery.ExistsSubquery es) {
-      return existsSubqueryExpr(es);
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.subquery.ScalarSubquery ss) {
-      return scalarSubqueryExpr(ss);
-    }
-    throw new UnsupportedOperationException(
-        "Expression not yet supported in PPLToSqlNodeVisitor: " + e.getClass().getSimpleName());
+  SqlNode expr(UnresolvedExpression e) {
+    return rex.expr(e);
   }
 
   /**
@@ -8091,25 +7620,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * Calcite's correlated-subquery binding.
    */
   private SqlNode existsSubqueryExpr(org.opensearch.sql.ast.expression.subquery.ExistsSubquery es) {
-    Frame subFrame = new Frame();
-    Frame savedExpr = this.exprFrame;
-    this.exprFrame = subFrame;
-    SqlNode subQuery;
-    try {
-      subQuery = stripImplicitMetaProjects(es.getQuery()).accept(this, subFrame);
-    } finally {
-      this.exprFrame = savedExpr;
-    }
-    // Calcite's EXISTS expects a subquery (SELECT/AS), not a bare relation identifier. When the
-    // subsearch body is `source = X` (no other pipes), the visitor returns a SqlIdentifier; wrap
-    // it in `SELECT * FROM (...)` so the validator parses EXISTS correctly.
-    if (subQuery instanceof SqlIdentifier
-        || (subQuery instanceof SqlBasicCall sbc && sbc.getOperator() == SqlStdOperatorTable.AS)) {
-      SqlNodeList star = new SqlNodeList(POS);
-      star.add(SqlIdentifier.star(POS));
-      subQuery = SqlBuilder.select(star).from(subQuery).wrap(subFrame);
-    }
-    return new SqlBasicCall(SqlStdOperatorTable.EXISTS, List.of(subQuery), POS);
+    return rex.existsSubqueryExpr(es);
   }
 
   /**
@@ -8117,14 +7628,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * used in a comparable context (e.g. {@code col = (subquery)}).
    */
   private SqlNode scalarSubqueryExpr(org.opensearch.sql.ast.expression.subquery.ScalarSubquery ss) {
-    Frame subFrame = new Frame();
-    Frame savedExpr = this.exprFrame;
-    this.exprFrame = subFrame;
-    try {
-      return stripImplicitMetaProjects(ss.getQuery()).accept(this, subFrame);
-    } finally {
-      this.exprFrame = savedExpr;
-    }
+    return rex.scalarSubqueryExpr(ss);
   }
 
   /**
@@ -8134,37 +7638,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * row-typed subquery output.
    */
   private SqlNode inSubqueryExpr(org.opensearch.sql.ast.expression.subquery.InSubquery is) {
-    Frame subFrame = new Frame();
-    Frame savedExpr = this.exprFrame;
-    this.exprFrame = subFrame;
-    SqlNode subQuery;
-    try {
-      subQuery = stripImplicitMetaProjects(is.getQuery()).accept(this, subFrame);
-    } finally {
-      this.exprFrame = savedExpr;
-    }
-    // Column-count check: LHS arity must match subquery's output arity. Mirrors PPL's documented
-    // SemanticCheckException ("The number of columns in the left hand side of an IN subquery does
-    // not match the number of columns in the output of subquery"). Without this, Calcite raises a
-    // confusing "Values passed to IN operator must have compatible types" instead.
-    int lhsCount = is.getValue().size();
-    int rhsCount = subFrame.currentFields == null ? -1 : subFrame.currentFields.size();
-    if (rhsCount > 0 && lhsCount != rhsCount) {
-      throw new IllegalArgumentException(
-          "The number of columns in the left hand side of an IN subquery does not match the "
-              + "number of columns in the output of subquery");
-    }
-    SqlNode left;
-    if (is.getValue().size() == 1) {
-      left = expr(is.getValue().get(0));
-    } else {
-      List<SqlNode> rowOperands = new ArrayList<>(is.getValue().size());
-      for (UnresolvedExpression v : is.getValue()) {
-        rowOperands.add(expr(v));
-      }
-      left = new SqlBasicCall(SqlStdOperatorTable.ROW, rowOperands, POS);
-    }
-    return new SqlBasicCall(SqlStdOperatorTable.IN, List.of(left, subQuery), POS);
+    return rex.inSubqueryExpr(is);
   }
 
   /**
@@ -8174,21 +7648,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * Double>}. Cast each name to VARCHAR to avoid CHAR(N) length widening across entries.
    */
   private SqlNode relevanceFieldListExpr(org.opensearch.sql.ast.expression.RelevanceFieldList rfl) {
-    org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-        new org.apache.calcite.sql.SqlDataTypeSpec(
-            new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-            POS);
-    List<SqlNode> args = new ArrayList<>();
-    for (java.util.Map.Entry<String, Float> entry : rfl.getFieldList().entrySet()) {
-      args.add(
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(SqlLiteral.createCharString(entry.getKey(), POS), varcharSpec),
-              POS));
-      args.add(SqlLiteral.createApproxNumeric(entry.getValue() + "E0", POS));
-    }
-    return new SqlBasicCall(SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR, args, POS);
+    return rex.relevanceFieldListExpr(rfl);
   }
 
   /**
@@ -8199,24 +7659,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * the OpenSearch pushdown's exact-string match).
    */
   private SqlNode unresolvedArgExpr(org.opensearch.sql.ast.expression.UnresolvedArgument ua) {
-    SqlNode value = expr(ua.getValue());
-    if (value instanceof SqlLiteral lit
-        && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
-      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-              POS);
-      value =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(value, varcharSpec),
-              POS);
-    }
-    return new SqlBasicCall(
-        SqlStdOperatorTable.MAP_VALUE_CONSTRUCTOR,
-        List.of(SqlLiteral.createCharString(ua.getArgName(), POS), value),
-        POS);
+    return rex.unresolvedArgExpr(ua);
   }
 
   /**
@@ -8227,44 +7670,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * unresolved-function call (matches v2 emission for that rare path).
    */
   private SqlNode intervalExpr(org.opensearch.sql.ast.expression.Interval i) {
-    Object v = i.getValue() instanceof Literal lit ? lit.getValue() : null;
-    if (v == null) {
-      SqlNode value = expr(i.getValue());
-      return new SqlBasicCall(
-          new org.apache.calcite.sql.SqlUnresolvedFunction(
-              new SqlIdentifier("interval", POS),
-              null,
-              null,
-              null,
-              null,
-              org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-          List.of(value, SqlLiteral.createCharString(i.getUnit().name(), POS)),
-          POS);
-    }
-    String literalStr = v.toString();
-    org.apache.calcite.avatica.util.TimeUnit unit =
-        switch (i.getUnit()) {
-          case MICROSECOND -> org.apache.calcite.avatica.util.TimeUnit.MICROSECOND;
-          case MILLISECOND -> org.apache.calcite.avatica.util.TimeUnit.MILLISECOND;
-          case SECOND -> org.apache.calcite.avatica.util.TimeUnit.SECOND;
-          case MINUTE -> org.apache.calcite.avatica.util.TimeUnit.MINUTE;
-          case HOUR -> org.apache.calcite.avatica.util.TimeUnit.HOUR;
-          case DAY -> org.apache.calcite.avatica.util.TimeUnit.DAY;
-          case WEEK -> org.apache.calcite.avatica.util.TimeUnit.WEEK;
-          case MONTH -> org.apache.calcite.avatica.util.TimeUnit.MONTH;
-          case QUARTER -> org.apache.calcite.avatica.util.TimeUnit.QUARTER;
-          case YEAR -> org.apache.calcite.avatica.util.TimeUnit.YEAR;
-          default ->
-              throw new UnsupportedOperationException("Unsupported interval unit: " + i.getUnit());
-        };
-    org.apache.calcite.sql.SqlIntervalQualifier qualifier =
-        new org.apache.calcite.sql.SqlIntervalQualifier(unit, null, POS);
-    int sign = 1;
-    if (literalStr.startsWith("-")) {
-      sign = -1;
-      literalStr = literalStr.substring(1);
-    }
-    return SqlLiteral.createInterval(sign, literalStr, qualifier, POS);
+    return rex.intervalExpr(i);
   }
 
   /**
@@ -8273,45 +7679,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * row-type oracle and is deferred — Calcite's validator coerces silently in the meantime.
    */
   private SqlNode inExpr(org.opensearch.sql.ast.expression.In in) {
-    // PPL forbids mixing string and numeric literals inside the IN value list. v2 raises a
-    // SemanticCheckException at analyze time. Without a row-type oracle on the field side, do a
-    // best-effort check on the literals themselves: if the list contains both string and
-    // numeric literals, reject. This catches `field in (4180, 5686, '6077')`-style typos.
-    boolean hasString = false;
-    boolean hasNumeric = false;
-    for (UnresolvedExpression v : in.getValueList()) {
-      if (v instanceof Literal lit) {
-        DataType t = lit.getType();
-        if (t == DataType.STRING) hasString = true;
-        else if (t == DataType.INTEGER
-            || t == DataType.LONG
-            || t == DataType.SHORT
-            || t == DataType.DOUBLE
-            || t == DataType.FLOAT
-            || t == DataType.DECIMAL) hasNumeric = true;
-      }
-    }
-    if (hasString && hasNumeric) {
-      // Match v2's error-message shape so PPL clients (and tests) get a stable string.
-      // The "fields type" is reported as the wider numeric (LONG) since the literal types
-      // alone don't tell us the column type — without an oracle this is a best-effort check.
-      List<String> typeNames = new ArrayList<>();
-      for (UnresolvedExpression v : in.getValueList()) {
-        if (v instanceof Literal lit) {
-          typeNames.add(lit.getType().name());
-        } else {
-          typeNames.add("UNKNOWN");
-        }
-      }
-      throw new IllegalArgumentException(
-          "In expression types are incompatible: fields type LONG, values type " + typeNames);
-    }
-    SqlNode field = expr(in.getField());
-    SqlNodeList values = new SqlNodeList(POS);
-    for (UnresolvedExpression v : in.getValueList()) {
-      values.add(expr(v));
-    }
-    return new SqlBasicCall(SqlStdOperatorTable.IN, List.of(field, values), POS);
+    return rex.inExpr(in);
   }
 
   /**
@@ -8320,46 +7688,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * org.opensearch.sql.ast.expression.When} nodes plus an optional ELSE expression.
    */
   private SqlNode caseExpr(org.opensearch.sql.ast.expression.Case node) {
-    SqlNodeList whens = new SqlNodeList(POS);
-    SqlNodeList thens = new SqlNodeList(POS);
-    boolean allStringResults = true;
-    for (org.opensearch.sql.ast.expression.When when : node.getWhenClauses()) {
-      whens.add(expr(when.getCondition()));
-      thens.add(expr(when.getResult()));
-      allStringResults &=
-          when.getResult() instanceof Literal lit && lit.getType() == DataType.STRING;
-    }
-    SqlNode elseExpr =
-        node.getElseClause().isPresent()
-            ? expr(node.getElseClause().get())
-            : SqlLiteral.createNull(POS);
-    if (node.getElseClause().isPresent()) {
-      allStringResults &=
-          node.getElseClause().get() instanceof Literal lit && lit.getType() == DataType.STRING;
-    }
-    // Calcite widens unequal-length CHAR literals to a common CHAR(N), right-padding shorter
-    // values with spaces. PPL keeps strings VARCHAR-typed (no padding). When all THEN/ELSE
-    // values are string literals, cast each to VARCHAR so the CASE result type stays VARCHAR.
-    // Use SqlStdOperatorTable.CAST (not SAFE_CAST) so the validator simplifies each typed literal
-    // to a bare `'literal':VARCHAR` annotation, matching v2's RexBuilder.makeLiteral emission.
-    // SAFE_CAST would leave an OUTER `CAST(CASE(...)):VARCHAR` wrapper around the entire CASE
-    // when the CASE result type derivation widens to a common type — the explain plan would
-    // show the redundant outer CAST that v2's path doesn't emit.
-    if (allStringResults && !thens.isEmpty()) {
-      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-              POS);
-      for (int i = 0; i < thens.size(); i++) {
-        thens.set(
-            i, new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(thens.get(i), varcharSpec), POS));
-      }
-      if (node.getElseClause().isPresent()) {
-        elseExpr = new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(elseExpr, varcharSpec), POS);
-      }
-    }
-    return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, elseExpr);
+    return rex.caseExpr(node);
   }
 
   /**
@@ -8368,30 +7697,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * cast to NULL type for the numeric branch, a string literal for time units.
    */
   private SqlNode spanExpr(Span sp) {
-    SqlNode field = expr(sp.getField());
-    SqlNode value = expr(sp.getValue());
-    SpanUnit unit = sp.getUnit();
-    SqlNode unitNode;
-    if (unit == SpanUnit.NONE || unit == SpanUnit.UNKNOWN) {
-      // SqlLiteral.createNull() types as ANY by default; SpanFunction's dispatcher relies on
-      // SqlTypeUtil.isNull. Cast to NULL to land on the numeric-bucket branch.
-      org.apache.calcite.sql.SqlDataTypeSpec nullSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.NULL, POS),
-              POS);
-      unitNode =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(SqlLiteral.createNull(POS), nullSpec),
-              POS);
-    } else {
-      unitNode = SqlLiteral.createCharString(unit.getName(), POS);
-    }
-    return new SqlBasicCall(
-        org.opensearch.sql.expression.function.PPLBuiltinOperators.SPAN,
-        List.of(field, value, unitNode),
-        POS);
+    return rex.spanExpr(sp);
   }
 
   /**
@@ -8401,644 +7707,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * org.apache.calcite.sql.SqlUnresolvedFunction} so the validator's name lookup resolves them.
    */
   private SqlNode funcExpr(org.opensearch.sql.ast.expression.Function fn) {
-    // PPL parses the bare token `null` as a Field("null") (no typed null literal in PPL grammar).
-    // Inside coalesce/ifnull, the v2 path's QualifiedNameResolver replaces such operands with a
-    // typed NULL. Mirror that here at SqlNode time — without it, `coalesce(null, 42)` fails the
-    // validator with "Field [null] not found". (Missing-field replacement requires an oracle and
-    // is left for the row-type-aware path.)
-    String fnLower = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
-    // mvmap/transform: when the lambda body references names from the OUTER scope (e.g.
-    // `mvmap(arr, arr * multiplier)`), the SqlLambda validator only sees the lambda params and
-    // rejects the outer ref. Mirror v2's captured-variable rewrite — collect outer refs from the
-    // lambda body, append them to the lambda's parameter list, and pass them as additional outer
-    // arguments. TransformFunctionImpl.eval routes outer values into args[2..] of the lambda.
-    if (("mvmap".equals(fnLower) || "transform".equals(fnLower))
-        && fn.getFuncArgs().size() >= 2
-        && fn.getFuncArgs().get(1) instanceof org.opensearch.sql.ast.expression.LambdaFunction lf) {
-      java.util.Set<String> declared = new java.util.LinkedHashSet<>();
-      for (QualifiedName qn : lf.getFuncArgs()) declared.add(qn.toString());
-      java.util.LinkedHashMap<String, QualifiedName> captured = new java.util.LinkedHashMap<>();
-      collectCapturedRefs(lf.getFunction(), declared, captured);
-      if (!captured.isEmpty()) {
-        java.util.List<QualifiedName> newLambdaArgs = new ArrayList<>(lf.getFuncArgs());
-        newLambdaArgs.addAll(captured.values());
-        org.opensearch.sql.ast.expression.LambdaFunction extendedLambda =
-            new org.opensearch.sql.ast.expression.LambdaFunction(lf.getFunction(), newLambdaArgs);
-        java.util.List<UnresolvedExpression> newOuterArgs = new ArrayList<>();
-        newOuterArgs.add(fn.getFuncArgs().get(0));
-        newOuterArgs.add(extendedLambda);
-        for (QualifiedName qn : captured.values()) newOuterArgs.add(qn);
-        return funcExpr(
-            new org.opensearch.sql.ast.expression.Function(fn.getFuncName(), newOuterArgs));
-      }
-    }
-    boolean isCoalesce = "coalesce".equals(fnLower) || "ifnull".equals(fnLower);
-    List<SqlNode> args = new ArrayList<>(fn.getFuncArgs().size());
-    for (UnresolvedExpression a : fn.getFuncArgs()) {
-      if (isCoalesce && (isNullLiteralRef(a) || isUnknownFieldRef(a))) {
-        args.add(SqlLiteral.createNull(POS));
-      } else {
-        args.add(expr(a));
-      }
-    }
-    // Cast bare string-literal args to VARCHAR — v2's RexBuilder defaults to VARCHAR for char
-    // literals, so explain plans show `'...':VARCHAR`. Skip for functions whose pushdown
-    // semantics rely on CHAR-typed pattern matching (regex/like/replace/fillnull/transpose/
-    // array literals). Mirrors legacy commit 7e09dba5e4.
-    if (!FUNC_NAMES_KEEP_CHAR_LITERAL.contains(fnLower)) {
-      org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-              POS);
-      for (int i = 0; i < args.size(); i++) {
-        UnresolvedExpression a = fn.getFuncArgs().get(i);
-        if (a instanceof Literal lit
-            && lit.getType() == DataType.STRING
-            && lit.getValue() != null) {
-          args.set(
-              i,
-              new SqlBasicCall(SqlStdOperatorTable.CAST, List.of(args.get(i), varcharSpec), POS));
-        }
-      }
-    }
-    // v2 wraps a bare string literal first-arg in TIMESTAMP() for date-part extraction
-    // functions (week/weekofyear/yearweek). The PPL UDF accepts STRING but emits explain plans
-    // showing the explicit TIMESTAMP wrap. Mirror that emission so explain output matches.
-    // Mirrors legacy commit 987d3fd453.
-    if (!args.isEmpty()
-        && fn.getFuncArgs().get(0) instanceof Literal lit0
-        && lit0.getType() == DataType.STRING
-        && (fnLower.equals("week")
-            || fnLower.equals("weekofyear")
-            || fnLower.equals("week_of_year")
-            || fnLower.equals("yearweek"))) {
-      args.set(
-          0,
-          new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMP,
-              List.of(args.get(0)),
-              POS));
-    }
-    org.apache.calcite.sql.SqlOperator op = arithmeticOperator(fn.getFuncName());
-    if (op != null) {
-      // PPL overloads `+` as both numeric addition and string concatenation. When any operand is
-      // statically a string (literal, CAST(... AS STRING), or a `+` chain ending in one), emit
-      // CONCAT so the validator picks the string-concat overload.
-      if (op == SqlStdOperatorTable.PLUS && hasStringOperand(fn.getFuncArgs())) {
-        return new SqlBasicCall(SqlStdOperatorTable.CONCAT, args, POS);
-      }
-      // `<datetime> + <INTERVAL>` and `<datetime> - <INTERVAL>` dispatch to the PPL DATE_ADD /
-      // DATE_SUB UDFs (mirroring v2's RexBuilder which routes `+(timestamp, INTERVAL)` through
-      // these UDFs). Standard PLUS/MINUS over INTERVAL gets rewritten by Calcite's converter to
-      // ADDDATE/SUBTRACT_DATE which encode the interval value as ms (8.64E7 for 1d) rather than
-      // the original (1, 'd'). Detection: 2 args, second is an Interval AST node.
-      if ((op == SqlStdOperatorTable.PLUS || op == SqlStdOperatorTable.MINUS)
-          && fn.getFuncArgs().size() == 2
-          && fn.getFuncArgs().get(1) instanceof org.opensearch.sql.ast.expression.Interval) {
-        org.apache.calcite.sql.SqlOperator dateOp =
-            op == SqlStdOperatorTable.PLUS
-                ? org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_ADD
-                : org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_SUB;
-        return new SqlBasicCall(dateOp, args, POS);
-      }
-      return new SqlBasicCall(op, args, POS);
-    }
-    // PPL `typeof(expr)` returns the PPL legacy type name as a literal string. v2 computes this
-    // in PPLFuncImpTable at build time using a validator probe. Without an oracle, derive
-    // statically: literals carry their type, casts/typed-functions (`date()`, `now()`) likewise.
-    // Column refs whose type isn't trackable via {@link Frame#evalAliasTypes} fall through to an
-    // unresolved TYPEOF call (which the validator rejects — same outcome as before).
-    if ("typeof".equals(fnLower) && fn.getFuncArgs().size() == 1) {
-      String legacyName = pplLegacyTypeName(fn.getFuncArgs().get(0), exprFrame);
-      if (legacyName != null) {
-        return SqlLiteral.createCharString(legacyName, POS);
-      }
-    }
-    // PPL JSON manipulation UDFs that need explicit operator dispatch — Calcite's validator
-    // can't resolve the lowercase PPL names to PPLBuiltinOperators by signature alone.
-    if ("json_valid".equals(fnLower) && args.size() == 1) {
-      return new SqlBasicCall(SqlStdOperatorTable.IS_JSON_VALUE, args, POS);
-    }
-    if ("json_keys".equals(fnLower) && args.size() == 1) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_KEYS, args, POS);
-    }
-    if ("json_extract".equals(fnLower)) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_EXTRACT, args, POS);
-    }
-    if ("json_array_length".equals(fnLower) && args.size() == 1) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_ARRAY_LENGTH, args, POS);
-    }
-    if ("json_set".equals(fnLower)) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_SET, args, POS);
-    }
-    if ("json_append".equals(fnLower)) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_APPEND, args, POS);
-    }
-    if ("json_extend".equals(fnLower)) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_EXTEND, args, POS);
-    }
-    if ("json_delete".equals(fnLower)) {
-      return new SqlBasicCall(
-          org.opensearch.sql.expression.function.PPLBuiltinOperators.JSON_DELETE, args, POS);
-    }
-    // PPL `json_object('k', v, ...)` / `json_array(v, ...)`: Calcite's JSON_OBJECT/JSON_ARRAY
-    // require a leading null-behavior flag (NULL ON NULL). Nested json_object/json_array values
-    // are stringified to match v2's `{"outer":"{\"inner\":...}"}` shape — wrap them in CAST AS
-    // VARCHAR so the inner constructor's output stays as a string column instead of being merged
-    // into the outer JSON tree.
-    if ("json_object".equals(fnLower) || "json_array".equals(fnLower)) {
-      List<SqlNode> jsonArgs = new ArrayList<>();
-      jsonArgs.add(
-          SqlLiteral.createSymbol(
-              org.apache.calcite.sql.SqlJsonConstructorNullClause.NULL_ON_NULL, POS));
-      List<UnresolvedExpression> userArgs = fn.getFuncArgs();
-      boolean isObject = "json_object".equals(fnLower);
-      for (int i = 0; i < args.size(); i++) {
-        SqlNode a = args.get(i);
-        boolean isValuePos = !isObject || (i % 2) == 1;
-        boolean nestedJsonCtor =
-            i < userArgs.size()
-                && userArgs.get(i) instanceof org.opensearch.sql.ast.expression.Function nfn
-                && (nfn.getFuncName().equalsIgnoreCase("json_object")
-                    || nfn.getFuncName().equalsIgnoreCase("json_array"));
-        if (isValuePos && nestedJsonCtor) {
-          a =
-              new SqlBasicCall(
-                  SqlStdOperatorTable.CAST,
-                  List.of(
-                      a,
-                      new org.apache.calcite.sql.SqlDataTypeSpec(
-                          new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                              org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                          POS)),
-                  POS);
-        }
-        jsonArgs.add(a);
-      }
-      return new SqlBasicCall(
-          isObject ? SqlStdOperatorTable.JSON_OBJECT : SqlStdOperatorTable.JSON_ARRAY,
-          jsonArgs,
-          POS);
-    }
-    // PPL `isnull(x)` / `isnotnull(x)` / `like(s, p)` parse as Function calls but Calcite expects
-    // SqlOperator postfix/infix. Map directly. Other operator-shaped functions (regex, ...) come
-    // through PPLBuiltinOperators via the validator-resolved unresolved-function path.
-    String name = fn.getFuncName().toLowerCase(java.util.Locale.ROOT);
-    org.apache.calcite.sql.SqlOperator opOverride =
-        switch (name) {
-          case "isnull", "is_null", "is null" -> SqlStdOperatorTable.IS_NULL;
-          case "isnotnull", "is_not_null", "is not null", "ispresent" ->
-              SqlStdOperatorTable.IS_NOT_NULL;
-          case "like" -> SqlStdOperatorTable.LIKE;
-          case "not_like", "not like" -> SqlStdOperatorTable.NOT_LIKE;
-          case "ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
-          case "not_ilike", "not ilike" -> org.apache.calcite.sql.fun.SqlLibraryOperators.NOT_ILIKE;
-          // Standard SQL conditional functions: COALESCE / NULLIF. PPL's funcExpr unresolved-
-          // function path can't always resolve them via case-sensitive validator lookup;
-          // dispatch directly.
-          case "coalesce" -> SqlStdOperatorTable.COALESCE;
-          case "nullif" -> SqlStdOperatorTable.NULLIF;
-          // Common scalar functions whose case-sensitive validator lookup misses the lowercase
-          // PPL form. Direct mapping eliminates the "No match found for function signature"
-          // error for these names.
-          case "abs" -> SqlStdOperatorTable.ABS;
-          case "ceil", "ceiling" -> SqlStdOperatorTable.CEIL;
-          case "floor" -> SqlStdOperatorTable.FLOOR;
-          case "exp" -> SqlStdOperatorTable.EXP;
-          case "ln" -> SqlStdOperatorTable.LN;
-          case "log10" -> SqlStdOperatorTable.LOG10;
-          case "sqrt" -> SqlStdOperatorTable.SQRT;
-          case "round" -> SqlStdOperatorTable.ROUND;
-          // PPL MOD: divide-by-zero returns NULL and operand types promote wider than
-          // SqlStdOperatorTable.MOD's signature allows. Bind to the PPL UDF.
-          case "mod" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
-          case "pow", "power" -> SqlStdOperatorTable.POWER;
-          // PPL named-arithmetic forms parse as regular function calls; route them to the
-          // matching binary operator. These differ from the operator forms (`a + b`) which
-          // arithmeticOperator() handles above.
-          case "add" -> SqlStdOperatorTable.PLUS;
-          case "subtract" -> SqlStdOperatorTable.MINUS;
-          case "multiply" -> SqlStdOperatorTable.MULTIPLY;
-          case "divide" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE;
-          case "modulus" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
-          // Two-arg atan: PPL `atan(y, x)` is mathematically atan2; map to ATAN2.
-          case "atan2" -> SqlStdOperatorTable.ATAN2;
-          // PPL `signum` / `sign` both return -1/0/1 of a numeric; Calcite's SIGN op handles both.
-          case "sign", "signum" -> SqlStdOperatorTable.SIGN;
-          // PPL `conv(x, from, to)` — base conversion. Registered in PPLBuiltinOperators under
-          // the SQL-conventional name CONVERT.
-          case "conv" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.CONV;
-          // Date-part extractors: bind to PPL UDFs that handle EXPR_DATE / EXPR_TIMESTAMP. The
-          // standard YEAR/QUARTER/MONTH/HOUR/MINUTE/SECOND operators rewrite to EXTRACT(<unit>
-          // FROM <datetime>) and EXTRACT only accepts Calcite's built-in DATETIME types.
-          case "year" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.YEAR;
-          case "quarter" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.QUARTER;
-          case "month", "month_of_year" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.MONTH;
-          case "dayofyear", "day_of_year" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY_OF_YEAR;
-          case "dayofmonth", "day_of_month", "day" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY;
-          case "dayofweek", "day_of_week" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.DAY_OF_WEEK;
-          case "hour", "hour_of_day" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.HOUR;
-          case "minute", "minute_of_hour" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.MINUTE;
-          case "second", "second_of_minute" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.SECOND;
-          case "week", "week_of_year", "weekofyear" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.WEEK;
-          case "weekday" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.WEEKDAY;
-          case "yearweek" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.YEARWEEK;
-          // Date-arithmetic UDFs that share names with Calcite-standard operators (which expect
-          // INTERVAL qualifiers as the first arg, not strings). Bind directly to PPL UDFs.
-          case "timestampadd" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMPADD;
-          case "timestampdiff" ->
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMESTAMPDIFF;
-          case "last_day" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.LAST_DAY;
-          case "extract" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.EXTRACT;
-          // PPL `date_add(timestamp, INTERVAL N unit)` and `adddate(...)` accept (date, interval)
-          // with day-time interval as ms. v2 dispatches `date_add` to DATE_ADD UDF (preserving the
-          // original (N, unit) arity in the explain plan); `adddate` keeps ADDDATE.
-          case "date_add" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_ADD;
-          case "adddate" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDDATE;
-          case "date_sub" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATE_SUB;
-          case "subdate" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBDATE;
-          case "addtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.ADDTIME;
-          case "subtime" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.SUBTIME;
-          case "datediff" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DATEDIFF;
-          case "timediff" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.TIMEDIFF;
-          case "lower", "lcase" -> SqlStdOperatorTable.LOWER;
-          case "upper", "ucase" -> SqlStdOperatorTable.UPPER;
-          case "substring", "substr" -> SqlStdOperatorTable.SUBSTRING;
-          // PPL `replace` is regex-replace (AstExpressionBuilder remaps `regexp_replace` → REPLACE
-          // builtin name). Don't intercept via SqlStdOperatorTable.REPLACE (literal-replace);
-          // let it flow through the validator-resolved unresolved-function path which finds
-          // PPLBuiltinOperators.REGEXP_REPLACE.
-          // PPL `concat` is variadic; Calcite's std CONCAT is binary `||`. Use the library's
-          // CONCAT_FUNCTION which accepts arbitrary arity.
-          case "concat" -> org.apache.calcite.sql.fun.SqlLibraryOperators.CONCAT_FUNCTION;
-          case "length", "char_length", "character_length" ->
-              org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH;
-          // PPL `locate`/`position` need a function-call shape that Calcite POSITION doesn't
-          // accept directly (POSITION uses `IN` keyword syntax). Defer to PPLBuiltinOperators
-          // via the unresolved-function path; the validator's name lookup will find LOCATE.
-          default -> null;
-        };
-    // PPL `isempty(x)` — NULL or empty string. PPL `isblank(x)` — NULL or whitespace-only.
-    // Both desugar to `arg IS NULL OR IS_EMPTY(<adjusted>)`. Calcite's standard IS_EMPTY postfix
-    // operator rejects strings at validation time (collection-only), so route through
-    // PERMISSIVE_IS_EMPTY (a function-shape SqlOperator that accepts any operand). A post-
-    // conversion shuttle (`rewritePermissiveIsEmpty` / `rewriteIsBlankToTrimEmpty` in
-    // SqlNodePlanner) rewrites the RexCall back to the standard IS_EMPTY postfix operator and
-    // wraps `isblank` arg in TRIM, matching v2's `IS EMPTY(arg)` / `IS_EMPTY(TRIM(...))` shape
-    // in the explain output.
-    if (("isempty".equals(name) || "isblank".equals(name)) && args.size() == 1) {
-      SqlNode a = args.get(0);
-      SqlNode toCheck = a;
-      if ("isblank".equals(name)) {
-        // For isblank, strip whitespace before length check. The post-conversion
-        // rewriteIsBlankToTrimEmpty shuttle detects this LENGTH(REPLACE(..., ' ', '')) shape
-        // and rewrites it to v2's `IS_EMPTY(TRIM(BOTH ' ', arg))`.
-        toCheck =
-            new SqlBasicCall(
-                SqlStdOperatorTable.REPLACE,
-                List.of(
-                    a, SqlLiteral.createCharString(" ", POS), SqlLiteral.createCharString("", POS)),
-                POS);
-        SqlNode lenZero =
-            new SqlBasicCall(
-                SqlStdOperatorTable.EQUALS,
-                List.of(
-                    new SqlBasicCall(
-                        org.apache.calcite.sql.fun.SqlLibraryOperators.LENGTH,
-                        List.of(toCheck),
-                        POS),
-                    SqlLiteral.createExactNumeric("0", POS)),
-                POS);
-        return new SqlBasicCall(
-            SqlStdOperatorTable.OR,
-            List.of(new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS), lenZero),
-            POS);
-      }
-      // isempty: use PERMISSIVE_IS_EMPTY so the explain plan shows `IS EMPTY(arg)` (matches v2).
-      return new SqlBasicCall(
-          SqlStdOperatorTable.OR,
-          List.of(
-              new SqlBasicCall(SqlStdOperatorTable.IS_NULL, List.of(a), POS),
-              new SqlBasicCall(PermissiveIsEmpty.INSTANCE, List.of(toCheck), POS)),
-          POS);
-    }
-    // PPL `Like(field, pattern [, caseSensitive])` — wrap with an ESCAPE clause so that PPL
-    // queries can use `\%` / `\_` to match literal `%` / `_`. The 3-arg form picks LIKE vs
-    // ILIKE from the boolean third arg; the 2-arg form is case-sensitive by default.
-    // (ILike(...) flows through the simple opOverride mapping; this branch only handles the
-    // explicit-Like name.)
-    if ("like".equals(name) && (args.size() == 2 || args.size() == 3)) {
-      SqlNode escape = SqlLiteral.createCharString("\\", POS);
-      org.apache.calcite.sql.SqlOperator likeOp = SqlStdOperatorTable.LIKE;
-      if (args.size() == 3
-          && args.get(2) instanceof SqlLiteral lit
-          && Boolean.FALSE.equals(lit.getValue())) {
-        likeOp = org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
-      } else if (args.size() == 2
-          && Boolean.TRUE.equals(
-              org.opensearch.sql.calcite.CalcitePlanContext.isLegacyPreferred())) {
-        // PPL's legacy v2 syntax binds 2-arg LIKE as case-insensitive — match v2 emission shape.
-        likeOp = org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE;
-      }
-      return new SqlBasicCall(likeOp, List.of(args.get(0), args.get(1), escape), POS);
-    }
-    // atan: 1-arg → ATAN, 2-arg → ATAN2 (PPL allows both arities under the same name).
-    if ("atan".equals(name)) {
-      return new SqlBasicCall(
-          args.size() == 2 ? SqlStdOperatorTable.ATAN2 : SqlStdOperatorTable.ATAN, args, POS);
-    }
-    // log: 1-arg natural log; 2-arg log(b, x) is log_x(b) per PPL semantics. Calcite's
-    // SqlLibraryOperators.LOG signature is LOG(x, base), so swap operand order for the 2-arg form.
-    if ("log".equals(name)) {
-      if (args.size() == 1) {
-        return new SqlBasicCall(SqlStdOperatorTable.LN, args, POS);
-      }
-      if (args.size() == 2) {
-        return new SqlBasicCall(
-            org.apache.calcite.sql.fun.SqlLibraryOperators.LOG,
-            List.of(args.get(1), args.get(0)),
-            POS);
-      }
-    }
-    // PPL `replace(str, pattern, replacement)` is a regex replace (PCRE-style); SQL's standard
-    // REPLACE does literal substring replace only. Dispatch to REGEXP_REPLACE_3 and convert PPL's
-    // \1 \2 backrefs to Java's $1 $2. Validate the pattern at translation time so syntax errors
-    // surface as 400 Bad Request (IllegalArgumentException), not 500 from runtime
-    // PatternSyntaxException.
-    if ("replace".equals(name) && args.size() == 3) {
-      if (args.get(1) instanceof SqlLiteral patLit
-          && patLit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
-        String pattern = ((org.apache.calcite.util.NlsString) patLit.getValue()).getValue();
-        try {
-          java.util.regex.Pattern.compile(pattern);
-        } catch (java.util.regex.PatternSyntaxException pse) {
-          throw new IllegalArgumentException(
-              String.format("Invalid regex pattern '%s': %s", pattern, pse.getDescription()), pse);
-        }
-      }
-      SqlNode replacement = args.get(2);
-      if (replacement instanceof SqlLiteral lit
-          && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
-        String s = ((org.apache.calcite.util.NlsString) lit.getValue()).getValue();
-        StringBuilder converted = new StringBuilder();
-        for (int i = 0; i < s.length(); i++) {
-          char c = s.charAt(i);
-          if (c == '\\' && i + 1 < s.length() && Character.isDigit(s.charAt(i + 1))) {
-            converted.append('$');
-          } else if (c == '$') {
-            converted.append("\\$");
-          } else {
-            converted.append(c);
-          }
-        }
-        replacement = SqlLiteral.createCharString(converted.toString(), POS);
-      }
-      return new SqlBasicCall(
-          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
-          List.of(args.get(0), args.get(1), replacement),
-          POS);
-    }
-    // PPL `trim(str)` -> TRIM(BOTH ' ' FROM str). Calcite's TRIM is keyword-syntax that doesn't
-    // bind via SqlBasicCall function-call form; emulate via REGEXP_REPLACE.
-    if ("trim".equals(name) && args.size() == 1) {
-      return new SqlBasicCall(
-          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_REPLACE_3,
-          List.of(
-              args.get(0),
-              SqlLiteral.createCharString("^\\s+|\\s+$", POS),
-              SqlLiteral.createCharString("", POS)),
-          POS);
-    }
-    // PPL `locate(sub, str [, start])` -> INSTR(str, sub [, start]). PPL's argument order has the
-    // substring first; INSTR (Oracle-library) takes the full string first. Swap operands.
-    if ("locate".equals(name) && (args.size() == 2 || args.size() == 3)) {
-      List<SqlNode> swapped = new ArrayList<>();
-      swapped.add(args.get(1));
-      swapped.add(args.get(0));
-      if (args.size() == 3) swapped.add(args.get(2));
-      return new SqlBasicCall(org.apache.calcite.sql.fun.SqlLibraryOperators.INSTR, swapped, POS);
-    }
-    // Niladic datetime helpers — PPL parses `now()`, `current_date()`, etc. as Function calls
-    // with no args. Calcite's SqlStdOperatorTable defines LOCALTIME / CURRENT_DATE as niladic
-    // SqlOperators that reject the SqlBasicCall(empty-args) shape, so dispatch to the PPL UDF
-    // variants which mirror v2's PPLFuncImpTable mappings.
-    if (args.isEmpty()) {
-      switch (name) {
-        case "now":
-        case "current_timestamp":
-        case "localtime":
-        case "localtimestamp":
-          return new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.NOW, args, POS);
-        case "curtime":
-        case "current_time":
-          return new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.CURRENT_TIME, args, POS);
-        case "curdate":
-        case "current_date":
-          return new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.CURRENT_DATE, args, POS);
-        case "utc_timestamp":
-          return new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.UTC_TIMESTAMP, args, POS);
-        case "utc_time":
-          return new SqlBasicCall(
-              org.opensearch.sql.expression.function.PPLBuiltinOperators.UTC_TIME, args, POS);
-        default:
-          // fall through to other handlers
-      }
-    }
-    // PPL `regexp_match(str, pattern)` / `regexp(str, pattern)` map to REGEXP_CONTAINS. Cast a
-    // CHAR-typed pattern literal to VARCHAR so the validator picks the canonical operator
-    // overload (CHAR-typed pattern literal would otherwise miss the signature).
-    if (("regexp_match".equals(name) || "regexp".equals(name)) && args.size() == 2) {
-      SqlNode pattern = args.get(1);
-      if (pattern instanceof SqlLiteral lit
-          && lit.getTypeName() == org.apache.calcite.sql.type.SqlTypeName.CHAR) {
-        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-            new org.apache.calcite.sql.SqlDataTypeSpec(
-                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                POS);
-        pattern =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(pattern, varcharSpec),
-                POS);
-      }
-      return new SqlBasicCall(
-          org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_CONTAINS,
-          List.of(args.get(0), pattern),
-          POS);
-    }
-    // PPL `strcmp(s1, s2)` follows MySQL: returns -1 / 0 / 1. Express via CASE — Calcite's
-    // STRCMP sign convention differs from PPL's.
-    if ("strcmp".equals(name) && args.size() == 2) {
-      SqlNode a = args.get(0);
-      SqlNode b = args.get(1);
-      SqlNodeList whens = new SqlNodeList(POS);
-      whens.add(new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(a, b), POS));
-      whens.add(new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(a, b), POS));
-      SqlNodeList thens = new SqlNodeList(POS);
-      thens.add(SqlLiteral.createExactNumeric("-1", POS));
-      thens.add(SqlLiteral.createExactNumeric("0", POS));
-      return new org.apache.calcite.sql.fun.SqlCase(
-          POS, null, whens, thens, SqlLiteral.createExactNumeric("1", POS));
-    }
-    // PPL `split(str, delim)` returns each character as a separate element when delim is empty.
-    // Calcite's std SPLIT(str, '') returns a single-element array with the whole string. Mirror
-    // PPLFuncImpTable: `CASE WHEN delim='' THEN REGEXP_EXTRACT_ALL(str, '.') ELSE SPLIT(str,
-    // delim)`.
-    if ("split".equals(name) && args.size() == 2) {
-      SqlNode str = args.get(0);
-      SqlNode delim = args.get(1);
-      SqlNode emptyLit = SqlLiteral.createCharString("", POS);
-      SqlNode isEmpty = new SqlBasicCall(SqlStdOperatorTable.EQUALS, List.of(delim, emptyLit), POS);
-      SqlNode anyChar = SqlLiteral.createCharString(".", POS);
-      SqlNode regexExtract =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.REGEXP_EXTRACT_ALL,
-              List.of(str, anyChar),
-              POS);
-      SqlNode split =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SPLIT, List.of(str, delim), POS);
-      SqlNodeList whens = new SqlNodeList(POS);
-      whens.add(isEmpty);
-      SqlNodeList thens = new SqlNodeList(POS);
-      thens.add(regexExtract);
-      return new org.apache.calcite.sql.fun.SqlCase(POS, null, whens, thens, split);
-    }
-    // PPL `mvindex(array, index [, end])` — Calcite has no direct 3-arg counterpart. Map the
-    // 2-arg form to ITEM with PPL's 0-based / negative-from-end index normalisation, and the
-    // 3-arg form to ARRAY_SLICE(array, normStart+1, len).
-    if ("mvindex".equals(name) && (args.size() == 2 || args.size() == 3)) {
-      SqlNode arr = args.get(0);
-      SqlNode arrLen =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_LENGTH, List.of(arr), POS);
-      org.apache.calcite.sql.SqlDataTypeSpec intSpec =
-          new org.apache.calcite.sql.SqlDataTypeSpec(
-              new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                  org.apache.calcite.sql.type.SqlTypeName.INTEGER, POS),
-              POS);
-      SqlNode startIdx =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(args.get(1), intSpec),
-              POS);
-      SqlNode zero = SqlLiteral.createExactNumeric("0", POS);
-      SqlNode one = SqlLiteral.createExactNumeric("1", POS);
-      if (args.size() == 2) {
-        SqlNode isNeg =
-            new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(startIdx, zero), POS);
-        SqlNode lenPlusIdx =
-            new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, startIdx), POS);
-        SqlNode negCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(lenPlusIdx, one), POS);
-        SqlNode posCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(startIdx, one), POS);
-        SqlNodeList caseWhens = new SqlNodeList(POS);
-        caseWhens.add(isNeg);
-        SqlNodeList caseThens = new SqlNodeList(POS);
-        caseThens.add(negCase);
-        SqlNode norm =
-            new org.apache.calcite.sql.fun.SqlCase(POS, null, caseWhens, caseThens, posCase);
-        return new SqlBasicCall(SqlStdOperatorTable.ITEM, List.of(arr, norm), POS);
-      }
-      SqlNode endIdx =
-          new SqlBasicCall(
-              org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-              List.of(args.get(2), intSpec),
-              POS);
-      SqlNode startNeg =
-          new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(startIdx, zero), POS);
-      SqlNode startNegCase =
-          new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, startIdx), POS);
-      SqlNodeList sw = new SqlNodeList(POS);
-      sw.add(startNeg);
-      SqlNodeList st = new SqlNodeList(POS);
-      st.add(startNegCase);
-      SqlNode normStart = new org.apache.calcite.sql.fun.SqlCase(POS, null, sw, st, startIdx);
-      SqlNode endNeg = new SqlBasicCall(SqlStdOperatorTable.LESS_THAN, List.of(endIdx, zero), POS);
-      SqlNode endNegCase = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(arrLen, endIdx), POS);
-      SqlNodeList ew = new SqlNodeList(POS);
-      ew.add(endNeg);
-      SqlNodeList et = new SqlNodeList(POS);
-      et.add(endNegCase);
-      SqlNode normEnd = new org.apache.calcite.sql.fun.SqlCase(POS, null, ew, et, endIdx);
-      SqlNode diff = new SqlBasicCall(SqlStdOperatorTable.MINUS, List.of(normEnd, normStart), POS);
-      SqlNode len = new SqlBasicCall(SqlStdOperatorTable.PLUS, List.of(diff, one), POS);
-      return new SqlBasicCall(
-          org.apache.calcite.sql.fun.SqlLibraryOperators.ARRAY_SLICE,
-          List.of(arr, normStart, len),
-          POS);
-    }
-    if (opOverride != null) {
-      // LIKE/ILIKE/NOT_LIKE/NOT_ILIKE 2-arg keyword form: append the literal `\` escape arg so
-      // OpenSearch pushdown's wildcard query handles `\%`/`\_` literally. Mirrors v2's emission
-      // shape: `ILIKE($field, '%pat%', '\')`. The 3-arg `Like(field, pat, caseSensitive)` form
-      // (handled earlier via the explicit `like` branch) already supplies an escape; this guard
-      // only fires on the bare 2-arg keyword form going through opOverride.
-      if (args.size() == 2
-          && (opOverride == SqlStdOperatorTable.LIKE
-              || opOverride == SqlStdOperatorTable.NOT_LIKE
-              || opOverride == org.apache.calcite.sql.fun.SqlLibraryOperators.ILIKE
-              || opOverride == org.apache.calcite.sql.fun.SqlLibraryOperators.NOT_ILIKE)) {
-        java.util.List<SqlNode> withEscape = new ArrayList<>(3);
-        withEscape.add(args.get(0));
-        withEscape.add(args.get(1));
-        withEscape.add(SqlLiteral.createCharString("\\", POS));
-        return new SqlBasicCall(opOverride, withEscape, POS);
-      }
-      return new SqlBasicCall(opOverride, args, POS);
-    }
-    String resolvedName = mapPplFunctionName(name, fn.getFuncName());
-    return new SqlBasicCall(
-        new org.apache.calcite.sql.SqlUnresolvedFunction(
-            new SqlIdentifier(resolvedName, POS),
-            null,
-            null,
-            null,
-            null,
-            org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-        args,
-        POS);
-  }
-
-  /**
-   * PPL function names whose validator-resolved Calcite operator name differs from the PPL source
-   * token. Mirrors PPLFuncImpTable's name-to-operator registrations: when no entry exists, the
-   * original name is returned unchanged so the validator looks up by PPL-form name.
-   */
-  private static String mapPplFunctionName(String lower, String original) {
-    return switch (lower) {
-      case "mvjoin" -> "ARRAY_JOIN";
-      case "mvcount" -> "ARRAY_LENGTH";
-      case "mvsort" -> "SORT_ARRAY";
-      case "mvdedup" -> "ARRAY_DISTINCT";
-      case "mvcontains" -> "ARRAY_CONTAINS";
-      case "mvslice" -> "ARRAY_SLICE";
-      // mvmap binds to PPLBuiltinOperators.TRANSFORM via PPLFuncImpTable.
-      case "mvmap" -> "transform";
-      case "ifnull" -> "COALESCE";
-      case "json_valid" -> "IS_JSON_VALUE";
-      default -> original;
-    };
+    return rex.funcExpr(fn);
   }
 
   /**
@@ -9047,184 +7716,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * row-type — the UDF call establishes the EXPR_* type and uses PPL's format-permissive parser.
    */
   private SqlNode castExpr(Cast c) {
-    SqlNode value = expr(c.getExpression());
-    DataType targetType = c.getDataType();
-    // PPL `cast(<numeric> as ip)` is rejected: only STRING and IP types convert to IP.
-    if (targetType == DataType.IP) {
-      UnresolvedExpression src = c.getExpression();
-      if (src instanceof Literal lit) {
-        switch (lit.getType()) {
-          case SHORT, INTEGER, LONG, FLOAT, DOUBLE, DECIMAL ->
-              throw new IllegalArgumentException(
-                  String.format(
-                      "Cannot convert %s to IP, only STRING and IP types are supported",
-                      lit.getType()));
-          default -> {}
-        }
-      }
-    }
-    String udtFunc =
-        switch (targetType) {
-          case IP -> "IP";
-          case DATE -> "DATE";
-          case TIME -> "TIME";
-          case TIMESTAMP -> "TIMESTAMP";
-          default -> null;
-        };
-    if (udtFunc != null) {
-      return new SqlBasicCall(
-          new org.apache.calcite.sql.SqlUnresolvedFunction(
-              new SqlIdentifier(udtFunc, POS),
-              null,
-              null,
-              null,
-              null,
-              org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-          List.of(value),
-          POS);
-    }
-    org.apache.calcite.sql.type.SqlTypeName tn = pplTypeToSqlType(targetType);
-    // STRING target with floating-point/decimal source: Calcite SAFE_CAST stringifies 0.99 → ".99"
-    // and 0.0 → "0E0", but PPL expects "0.99" / "0.0" (Java toString semantics). Dispatch to
-    // NUMBER_TO_STRING UDF when the source type is statically derivable: a literal of
-    // FLOAT/DOUBLE/DECIMAL, an inner CAST AS those types, or a column ref to an eval alias whose
-    // type was tracked at eval time.
-    if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR) {
-      DataType srcType = ExpressionConverter.staticTypeOf(c.getExpression(), exprFrame);
-      if (srcType == DataType.FLOAT || srcType == DataType.DOUBLE || srcType == DataType.DECIMAL) {
-        return new SqlBasicCall(
-            new org.apache.calcite.sql.SqlUnresolvedFunction(
-                new SqlIdentifier("NUMBER_TO_STRING", POS),
-                null,
-                null,
-                null,
-                null,
-                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-            List.of(value),
-            POS);
-      }
-      // EXPR_IP → STRING: SAFE_CAST returns the opaque UDT VARCHAR repr; PPL expects the
-      // canonical IP-string form. Dispatch to IP_TO_STRING UDF when the source column has
-      // UDT type "ip" in {@link Frame#columnUdt} (populated from the catalog row type).
-      String fieldUdt = qualifiedNameUdt(c.getExpression());
-      if ("ip".equals(fieldUdt)) {
-        return new SqlBasicCall(
-            new org.apache.calcite.sql.SqlUnresolvedFunction(
-                new SqlIdentifier("IP_TO_STRING", POS),
-                null,
-                null,
-                null,
-                null,
-                org.apache.calcite.sql.SqlFunctionCategory.USER_DEFINED_FUNCTION),
-            List.of(value),
-            POS);
-      }
-    }
-    // BOOLEAN source → numeric/string target: Calcite SAFE_CAST rejects BOOLEAN→INTEGER with
-    // "Cast function cannot convert value of type BOOLEAN to type INTEGER". PPL semantics:
-    //   - BOOLEAN → INT/LONG/SHORT: TRUE→1, FALSE→0 via CASE.
-    //   - BOOLEAN → STRING: TRUE→'TRUE', FALSE→'FALSE' via UPPER + SAFE_CAST.
-    // Detect via the per-column primitive type map (populated from the catalog row type).
-    DataType srcStaticType = ExpressionConverter.staticTypeOf(c.getExpression(), exprFrame);
-    if (srcStaticType == DataType.BOOLEAN) {
-      if (tn == org.apache.calcite.sql.type.SqlTypeName.INTEGER
-          || tn == org.apache.calcite.sql.type.SqlTypeName.BIGINT
-          || tn == org.apache.calcite.sql.type.SqlTypeName.SMALLINT
-          || tn == org.apache.calcite.sql.type.SqlTypeName.TINYINT) {
-        SqlNodeList whens = new SqlNodeList(POS);
-        whens.add(value);
-        SqlNodeList thens = new SqlNodeList(POS);
-        thens.add(SqlLiteral.createExactNumeric("1", POS));
-        return new org.apache.calcite.sql.fun.SqlCase(
-            POS, null, whens, thens, SqlLiteral.createExactNumeric("0", POS));
-      }
-      if (tn == org.apache.calcite.sql.type.SqlTypeName.VARCHAR) {
-        // PPL emits 'TRUE' / 'FALSE' (uppercase) for BOOLEAN→STRING. Calcite's SAFE_CAST
-        // produces 'true' / 'false'; wrap in UPPER to match.
-        org.apache.calcite.sql.SqlDataTypeSpec varcharSpec =
-            new org.apache.calcite.sql.SqlDataTypeSpec(
-                new org.apache.calcite.sql.SqlBasicTypeNameSpec(
-                    org.apache.calcite.sql.type.SqlTypeName.VARCHAR, POS),
-                POS);
-        SqlNode cast =
-            new SqlBasicCall(
-                org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST,
-                List.of(value, varcharSpec),
-                POS);
-        return new SqlBasicCall(SqlStdOperatorTable.UPPER, List.of(cast), POS);
-      }
-    }
-    // BOOLEAN target with literal source: PPL semantics differ from Calcite's SAFE_CAST.
-    //   - numeric literal: `value != 0` (1→true, 0→false, 2→true).
-    //   - string literal: '1'→true, '0'→false, anything else→NULL (Spark/Postgres semantics).
-    // Without an oracle we can only handle literals; non-literal sources fall through to
-    // SAFE_CAST which would return NULL for these cross-family casts.
-    if (tn == org.apache.calcite.sql.type.SqlTypeName.BOOLEAN
-        && c.getExpression() instanceof Literal lit) {
-      switch (lit.getType()) {
-        case SHORT, INTEGER, LONG, FLOAT, DOUBLE, DECIMAL:
-          return new SqlBasicCall(
-              SqlStdOperatorTable.NOT_EQUALS,
-              List.of(value, SqlLiteral.createExactNumeric("0", POS)),
-              POS);
-        case STRING:
-          {
-            SqlNodeList whens = new SqlNodeList(POS);
-            whens.add(
-                new SqlBasicCall(
-                    SqlStdOperatorTable.EQUALS,
-                    List.of(value, SqlLiteral.createCharString("1", POS)),
-                    POS));
-            whens.add(
-                new SqlBasicCall(
-                    SqlStdOperatorTable.EQUALS,
-                    List.of(value, SqlLiteral.createCharString("0", POS)),
-                    POS));
-            SqlNodeList thens = new SqlNodeList(POS);
-            thens.add(SqlLiteral.createBoolean(true, POS));
-            thens.add(SqlLiteral.createBoolean(false, POS));
-            return new org.apache.calcite.sql.fun.SqlCase(
-                POS, null, whens, thens, SqlLiteral.createNull(POS));
-          }
-        default:
-          // BOOLEAN literal → BOOLEAN: identity, fall through.
-      }
-    }
-    org.apache.calcite.sql.SqlDataTypeSpec spec =
-        new org.apache.calcite.sql.SqlDataTypeSpec(
-            new org.apache.calcite.sql.SqlBasicTypeNameSpec(tn, POS), POS);
-    return new SqlBasicCall(
-        org.apache.calcite.sql.fun.SqlLibraryOperators.SAFE_CAST, List.of(value, spec), POS);
-  }
-
-  private static org.apache.calcite.sql.type.SqlTypeName pplTypeToSqlType(DataType t) {
-    return switch (t) {
-      case BOOLEAN -> org.apache.calcite.sql.type.SqlTypeName.BOOLEAN;
-      case SHORT -> org.apache.calcite.sql.type.SqlTypeName.SMALLINT;
-      case INTEGER -> org.apache.calcite.sql.type.SqlTypeName.INTEGER;
-      case LONG -> org.apache.calcite.sql.type.SqlTypeName.BIGINT;
-      case FLOAT -> org.apache.calcite.sql.type.SqlTypeName.FLOAT;
-      case DOUBLE -> org.apache.calcite.sql.type.SqlTypeName.DOUBLE;
-      case DECIMAL -> org.apache.calcite.sql.type.SqlTypeName.DECIMAL;
-      case STRING -> org.apache.calcite.sql.type.SqlTypeName.VARCHAR;
-      default ->
-          throw new UnsupportedOperationException(
-              "Cast target type not yet supported in PPLToSqlNodeVisitor: " + t);
-    };
-  }
-
-  private static org.apache.calcite.sql.SqlOperator arithmeticOperator(String name) {
-    if (name == null) return null;
-    return switch (name) {
-      case "+" -> SqlStdOperatorTable.PLUS;
-      case "-" -> SqlStdOperatorTable.MINUS;
-      case "*" -> SqlStdOperatorTable.MULTIPLY;
-      // PPL semantics for divide-by-zero is to return NULL (and PPL MOD likewise produces wider
-      // type promotion that SqlStdOperatorTable.MOD doesn't match). Bind to PPLBuiltinOperators.
-      case "/" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.DIVIDE;
-      case "%" -> org.opensearch.sql.expression.function.PPLBuiltinOperators.MOD;
-      default -> null;
-    };
+    return rex.castExpr(c);
   }
 
   /**
@@ -9239,139 +7731,6 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
     UnresolvedExpression core = e instanceof Alias al ? al.getDelegated() : e;
     return core instanceof Span sp
         && org.opensearch.sql.ast.expression.SpanUnit.isTimeUnit(sp.getUnit());
-  }
-
-  /**
-   * True when {@code e} is the PPL parse shape for a bare `null` token: a {@link QualifiedName} (or
-   * {@link Field} wrapping one) whose stringified name is "null" case-insensitively. PPL has no
-   * typed null literal in the grammar, so any place that wants to accept the keyword `null` must
-   * intercept this AST shape.
-   */
-  private static boolean isNullLiteralRef(UnresolvedExpression e) {
-    QualifiedName qn = null;
-    if (e instanceof QualifiedName q) qn = q;
-    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
-    return qn != null && "null".equalsIgnoreCase(qn.toString());
-  }
-
-  /**
-   * True when {@code e} is a single-part QualifiedName/Field whose name is NOT in the current
-   * scope's visible field list. Used inside coalesce/ifnull to mirror v2's
-   * QualifiedNameResolver.replaceWithNullLiteralInCoalesce: missing fields collapse to typed NULL
-   * rather than failing validation. Multi-part (dotted) names need a row-type oracle to verify
-   * struct paths and are left alone.
-   */
-  private boolean isUnknownFieldRef(UnresolvedExpression e) {
-    if (exprFrame == null || exprFrame.currentFields == null) return false;
-    QualifiedName qn = null;
-    if (e instanceof QualifiedName q) qn = q;
-    else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
-    if (qn == null) return false;
-    if (qn.getParts().size() != 1) return false;
-    return !exprFrame.currentFields.contains(qn.toString());
-  }
-
-  /**
-   * Walk a lambda body and collect QualifiedName references whose first part is NOT in {@code
-   * declared} (the lambda's own parameter set). These are outer-scope captures. Single-part bare
-   * names like {@code multiplier} are added under their own key; nested lambdas extend the shadow
-   * set.
-   */
-  private static void collectCapturedRefs(
-      UnresolvedExpression e,
-      java.util.Set<String> declared,
-      java.util.LinkedHashMap<String, QualifiedName> out) {
-    if (e == null) return;
-    if (e instanceof QualifiedName qn) {
-      String head = qn.getParts().isEmpty() ? qn.toString() : qn.getParts().get(0);
-      if (!declared.contains(head) && !out.containsKey(head)) {
-        out.put(head, qn);
-      }
-      return;
-    }
-    if (e instanceof Field fld && fld.getField() instanceof QualifiedName qn) {
-      String head = qn.getParts().isEmpty() ? qn.toString() : qn.getParts().get(0);
-      if (!declared.contains(head) && !out.containsKey(head)) {
-        out.put(head, qn);
-      }
-      return;
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.LambdaFunction nestedLf) {
-      java.util.Set<String> nested = new java.util.LinkedHashSet<>(declared);
-      for (QualifiedName p : nestedLf.getFuncArgs()) nested.add(p.toString());
-      collectCapturedRefs(nestedLf.getFunction(), nested, out);
-      return;
-    }
-    for (org.opensearch.sql.ast.Node child : e.getChild()) {
-      if (child instanceof UnresolvedExpression cu) {
-        collectCapturedRefs(cu, declared, out);
-      }
-    }
-  }
-
-  private static boolean hasStringOperand(List<UnresolvedExpression> args) {
-    for (UnresolvedExpression a : args) {
-      if (isStringExpr(a)) return true;
-    }
-    return false;
-  }
-
-  private static boolean isStringExpr(UnresolvedExpression e) {
-    if (e instanceof Literal lit) {
-      return lit.getType() == DataType.STRING;
-    }
-    if (e instanceof Cast c) {
-      return c.getDataType() == DataType.STRING;
-    }
-    if (e instanceof org.opensearch.sql.ast.expression.Function fn
-        && "+".equals(fn.getFuncName())) {
-      return hasStringOperand(fn.getFuncArgs());
-    }
-    return false;
-  }
-
-  /**
-   * Resolve PPL's user-facing type name for {@code typeof()}. Returns null when the source type
-   * can't be derived statically; the caller falls back to a TYPEOF() emission that the validator
-   * will handle (or reject with the same error as before).
-   */
-  private static String pplLegacyTypeName(UnresolvedExpression e, Frame frame) {
-    if (e instanceof org.opensearch.sql.ast.expression.Interval) {
-      return "INTERVAL";
-    }
-    // For column refs, prefer the catalog legacy type name (distinguishes TINYINT from SMALLINT,
-    // INT from BIGINT, etc.) over the coarser DataType-based mapping.
-    if (frame != null) {
-      QualifiedName qn = null;
-      if (e instanceof QualifiedName q) qn = q;
-      else if (e instanceof Field f && f.getField() instanceof QualifiedName q) qn = q;
-      if (qn != null && qn.getParts().size() == 1) {
-        String name = qn.toString();
-        String legacy = frame.columnLegacyTypeName.get(name);
-        if (legacy != null) return legacy;
-        // UDT columns (DATE/TIME/TIMESTAMP/IP) — typeof() returns the UDT name in uppercase.
-        String udt = frame.columnUdt.get(name);
-        if (udt != null) return udt.toUpperCase(java.util.Locale.ROOT);
-      }
-    }
-    DataType dt = ExpressionConverter.staticTypeOf(e, frame);
-    if (dt == null) return null;
-    return switch (dt) {
-      case SHORT -> "SMALLINT";
-      case INTEGER -> "INT";
-      case LONG -> "BIGINT";
-      case FLOAT -> "FLOAT";
-      case DOUBLE -> "DOUBLE";
-      case DECIMAL -> "DOUBLE";
-      case BOOLEAN -> "BOOLEAN";
-      case STRING -> "STRING";
-      case DATE -> "DATE";
-      case TIME -> "TIME";
-      case TIMESTAMP -> "TIMESTAMP";
-      case INTERVAL -> "INTERVAL";
-      case IP -> "IP";
-      default -> null;
-    };
   }
 
   /**
@@ -9541,34 +7900,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * SqlNode visitor's QPOS treatment of column references.
    */
   private SqlIdentifier toIdentifier(String name) {
-    List<String> parts = name.indexOf('.') < 0 ? List.of(name) : Arrays.asList(name.split("\\."));
-    if (exprFrame != null
-        && !exprFrame.aliasSynonyms.isEmpty()
-        && parts.size() >= 2
-        && exprFrame.aliasSynonyms.containsKey(parts.get(0))) {
-      List<String> rewritten = new ArrayList<>(parts);
-      rewritten.set(0, exprFrame.aliasSynonyms.get(parts.get(0)));
-      return ExpressionConverter.quotedIdentifier(rewritten);
-    }
-    // OpenSearch flattens deeply-nested object mappings into top-level dotted-name fields (e.g.
-    // {@code resource.attributes.telemetry.sdk.version}). When the full dotted name appears as a
-    // visible flat column AND the leading part isn't a known alias prefix, emit it as a quoted
-    // single-part identifier so the validator looks it up literally. Without this, multi-part
-    // identifier resolution would interpret the leading part as a table and fail with
-    // "Table 'X' not found". Skip when in join scope where alias-qualified refs ({@code a.col})
-    // are also valid.
-    if (parts.size() >= 2
-        && exprFrame != null
-        && !exprFrame.liveJoinAliases.contains(parts.get(0))
-        && exprFrame.aliasSynonyms.isEmpty()
-        && exprFrame.currentFields != null
-        && exprFrame.currentFields.contains(name)) {
-      return ExpressionConverter.quotedIdentifier(java.util.Collections.singletonList(name));
-    }
-    if (parts.size() >= 2 && exprFrame != null && exprFrame.dottedEvalAliases.contains(name)) {
-      return ExpressionConverter.quotedIdentifier(java.util.Collections.singletonList(name));
-    }
-    return ExpressionConverter.quotedIdentifier(parts);
+    return rex.toIdentifier(name);
   }
 
   /**
@@ -9578,14 +7910,7 @@ public class PPLToSqlNodeVisitor extends AbstractNodeVisitor<SqlNode, Frame> {
    * unchanged.
    */
   private SqlIdentifier qualifyIfAmbiguous(String name, Frame frame) {
-    JoinHints hints = frame.joinHints;
-    if (name.indexOf('.') < 0
-        && hints != null
-        && hints.leftAlias() != null
-        && hints.ambiguousColumns().contains(name)) {
-      return new SqlIdentifier(Arrays.asList(hints.leftAlias(), name), POS);
-    }
-    return toIdentifier(name);
+    return rex.qualifyIfAmbiguous(name, frame);
   }
 
   /**

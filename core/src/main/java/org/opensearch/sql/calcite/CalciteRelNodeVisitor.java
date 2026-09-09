@@ -3876,6 +3876,16 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     RexNode colSplit = relBuilder.field(1);
     String columnSplitName = relBuilder.peek().getRowType().getFieldNames().get(1);
     if (!SqlTypeUtil.isCharacter(colSplit.getType())) {
+      // Object, array and other non-scalar types have no string representation to pivot on
+      if (!SqlTypeUtil.isAtomic(colSplit.getType())) {
+        String containerType = OpenSearchTypeFactory.getContainerTypeName(colSplit.getType());
+        String reason =
+            "object".equals(containerType) ? "it is an object" : "it holds multiple values";
+        throw new IllegalArgumentException(
+            StringUtils.format(
+                "Cannot chart by [%s] because %s.",
+                StringUtils.unquoteIdentifier(columnSplitName), reason));
+      }
       colSplit =
           relBuilder.alias(
               context.rexBuilder.makeCast(

@@ -265,6 +265,18 @@ public class OpenSearchTypeFactory extends JavaTypeFactoryImpl {
         .toUpperCase(Locale.ROOT);
   }
 
+  /**
+   * Name a multi-value type the way a query author sees it in a mapping, for error messages:
+   * "object" for an object field, "array" for an array one. Returns null for scalar types.
+   */
+  public static @Nullable String getContainerTypeName(RelDataType relDataType) {
+    return switch (relDataType.getSqlTypeName()) {
+      case MAP, ROW -> "object";
+      case ARRAY, MULTISET -> "array";
+      default -> null;
+    };
+  }
+
   /** Converts a Calcite data type to OpenSearch ExprCoreType. */
   public static ExprType convertRelDataTypeToExprType(RelDataType type) {
     if (isUserDefinedType(type)) {

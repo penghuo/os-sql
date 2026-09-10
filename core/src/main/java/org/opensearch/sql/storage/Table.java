@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.storage;
 
+import java.util.List;
 import java.util.Map;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.executor.streaming.StreamingSource;
@@ -40,6 +41,25 @@ public interface Table {
 
   /** Get the {@link ExprType} for each meta-field (reserved fields) in the table. */
   default Map<String, ExprType> getReservedFieldTypes() {
+    return Map.of();
+  }
+
+  /**
+   * The container hierarchy declared by the table's schema: one entry for every field name in
+   * {@link #getFieldTypes()}, mapping it to the names of the container (object/nested) fields that
+   * declare it, outermost first. A field declared at the root of the schema maps to an empty list.
+   *
+   * <p>This is a structural relationship read from the schema, not a projection list, and it is the
+   * only authority on which field is nested inside which. It never infers structure from the field
+   * name, so it stays correct when a schema declares a single field whose name itself contains dots
+   * — as OpenSearch does for an object mapped with {@code disable_objects: true}, where {@code
+   * attributes} declares one child literally named {@code log.file.path}, and {@code
+   * attributes.log.file.path} therefore has the single ancestor {@code attributes}.
+   *
+   * <p>The default is empty, meaning the table declares no hierarchy and callers must fall back to
+   * their own convention.
+   */
+  default Map<String, List<String>> getFieldAncestors() {
     return Map.of();
   }
 

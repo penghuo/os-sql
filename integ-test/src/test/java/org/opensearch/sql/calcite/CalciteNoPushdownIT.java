@@ -35,6 +35,7 @@ import org.opensearch.sql.ppl.PPLIntegTestCase;
   CalciteDateTimeImplementationIT.class,
   CalciteDedupCommandIT.class,
   CalciteDescribeCommandIT.class,
+  CalciteDisableObjectsIT.class,
   CalciteExpandCommandIT.class,
   CalciteFieldFormatCommandIT.class,
   CalciteForeachCommandIT.class,

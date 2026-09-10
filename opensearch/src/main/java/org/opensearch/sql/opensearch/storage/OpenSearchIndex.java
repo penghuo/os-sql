@@ -10,6 +10,7 @@ import static org.opensearch.search.aggregations.MultiBucketConsumerService.DEFA
 import com.google.common.annotations.VisibleForTesting;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
@@ -89,6 +90,9 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   /** The cached ExprType of fields. */
   private Map<String, ExprType> cachedFieldTypes = null;
 
+  /** The cached container hierarchy of fields. */
+  private Map<String, List<String>> cachedFieldAncestors = null;
+
   /** The cached mapping of alias type field to its original path. */
   private Map<String, String> aliasMapping = null;
 
@@ -155,6 +159,19 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
                   Map::putAll);
     }
     return cachedFieldTypes;
+  }
+
+  /**
+   * Derived from the same parsed mapping tree as {@link #getFieldTypes()}, so the two views can
+   * never disagree about which field is nested inside which.
+   */
+  @Override
+  public Map<String, List<String>> getFieldAncestors() {
+    if (cachedFieldAncestors == null) {
+      cachedFieldAncestors =
+          OpenSearchDataType.traverseAndCollectAncestors(getFieldOpenSearchTypes());
+    }
+    return cachedFieldAncestors;
   }
 
   @Override

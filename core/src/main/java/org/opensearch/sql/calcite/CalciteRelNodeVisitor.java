@@ -28,8 +28,10 @@ import static org.opensearch.sql.calcite.utils.PlanUtils.transformPlanToAttachCh
 import static org.opensearch.sql.utils.SystemIndexUtils.DATASOURCES_TABLE_NAME;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Multiset;
 import com.google.common.collect.Streams;
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -56,11 +58,14 @@ import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelHomogeneousShuttle;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelVisitor;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalValues;
+import org.apache.calcite.rel.metadata.RelColumnOrigin;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFamily;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -202,6 +207,7 @@ import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLBuiltinOperators;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.expression.parse.RegexCommonUtils;
+import org.opensearch.sql.storage.Table;
 import org.opensearch.sql.utils.ParseUtils;
 import org.opensearch.sql.utils.WildcardRenameUtils;
 
@@ -661,18 +667,74 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     return OpenSearchConstants.METADATAFIELD_TYPE_MAP.containsKey(fieldName);
   }
 
-  /** See logic in {@link org.opensearch.sql.analysis.symbol.SymbolTable#lookupAllFields} */
+  /**
+   * Removes columns that a bare {@code *} should not surface because they are already carried by a
+   * container column in the same output.
+   *
+   * <p>Mapping semantics apply only to a column that still <em>is</em> a declared field: its name
+   * is present in {@link Table#getFieldAncestors()} and it reaches this point as a pass-through of
+   * that table field, established through {@link RelMetadataQuery#getColumnOrigins}. Such a column
+   * is removed when one of its declared ancestors is also in the row type. The hierarchy comes from
+   * the mapping rather than from the column name, so it holds for an object mapped with {@code
+   * disable_objects: true}, where {@code attributes.log.file.path} is a single declared child of
+   * {@code attributes} with no {@code attributes.log} level in between. See <a
+   * href="https://github.com/opensearch-project/sql/issues/5746">issue 5746</a>.
+   *
+   * <p>A column that merely reuses a declared name is a different value and is kept: an empty or
+   * derived origin means {@code eval} computed it, so deleting it would silently discard the user's
+   * value even though the parent struct is in the output.
+   *
+   * <p>Columns whose name no table declares - materialized from a MAP path by {@link
+   * MapPathPreMaterializer}, renamed by a join, or coming from a table that declares no hierarchy -
+   * keep the pre-existing convention that a column is nested when the name up to its last dot is
+   * also a column. So does a pass-through whose declaring table is scanned more than once, where
+   * table identity cannot say which occurrence a column came from.
+   *
+   * <p>Nothing here is cached across the plan: the hierarchy is read from the tables in the current
+   * subtree, provenance from the current node, and the presence test from the current row type, so
+   * none of the three goes stale behind intervening RelNodes.
+   *
+   * <p>See also the equivalent v2 logic in {@link
+   * org.opensearch.sql.analysis.symbol.SymbolTable#lookupAllFields}, which is name-based only and
+   * intentionally left unchanged.
+   */
   private static void tryToRemoveNestedFields(CalcitePlanContext context) {
-    Set<String> allFields = new HashSet<>(context.relBuilder.peek().getRowType().getFieldNames());
-    List<RexNode> duplicatedNestedFields =
-        allFields.stream()
-            .filter(
-                field -> {
-                  int lastDot = field.lastIndexOf(".");
-                  return -1 != lastDot && allFields.contains(field.substring(0, lastDot));
-                })
-            .map(field -> (RexNode) context.relBuilder.field(field))
-            .toList();
+    RelNode input = context.relBuilder.peek();
+    List<String> fieldNames = input.getRowType().getFieldNames();
+    Set<String> allFields = new HashSet<>(fieldNames);
+    ScannedTables scanned = collectScannedTables(input);
+    RelMetadataQuery mq = input.getCluster().getMetadataQuery();
+
+    List<RexNode> duplicatedNestedFields = new ArrayList<>();
+    for (int i = 0; i < fieldNames.size(); i++) {
+      String field = fieldNames.get(i);
+      boolean duplicated =
+          switch (lineageOf(mq, input, i, field)) {
+            // Proven to be this table's declared field: the schema decides, unless the table is
+            // scanned twice and identity cannot say which occurrence this column came from.
+            case Lineage.PassThrough declared ->
+                scanned.occurrences(declared.table()) > 1
+                    ? isNestedByImmediateParent(field, allFields)
+                    : hasAncestorCarryingIt(
+                        mq, input, fieldNames, declared.table(), declared.ancestors(), scanned);
+            // Proven to be a different value. Sharing a name with a declared field means nothing,
+            // so never delete it on the schema's behalf.
+            case Lineage.Computed ignored ->
+                !scanned.declaresName(field) && isNestedByImmediateParent(field, allFields);
+            // Not attributable. Use the schema only when the name could not have come from
+            // anywhere else, otherwise keep the pre-existing convention.
+            case Lineage.Unknown ignored -> {
+              Declaration sole = scanned.soleDeclaration(field);
+              yield sole != null && scanned.occurrences(sole.table()) == 1
+                  ? hasAncestorCarryingIt(
+                      mq, input, fieldNames, sole.table(), sole.ancestors(), scanned)
+                  : !scanned.declaresName(field) && isNestedByImmediateParent(field, allFields);
+            }
+          };
+      if (duplicated) {
+        duplicatedNestedFields.add(context.relBuilder.field(i));
+      }
+    }
     if (!duplicatedNestedFields.isEmpty()) {
       // This is a workaround to avoid the bug in Calcite:
       // In {@link RelBuilder#project_(Iterable, Iterable, Iterable, boolean, Iterable)},
@@ -683,6 +745,193 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       // equivalent to renaming the flattened sub-fields. E.g. emp.name -> name.
       forceProjectExcept(context.relBuilder, duplicatedNestedFields);
     }
+  }
+
+  /**
+   * The pre-existing, name-based convention: a column is nested when the name up to its last dot is
+   * also a column. Retained for every column this pass cannot tie to a declared schema field.
+   */
+  private static boolean isNestedByImmediateParent(String field, Set<String> allFields) {
+    int lastDot = field.lastIndexOf(".");
+    return -1 != lastDot && allFields.contains(field.substring(0, lastDot));
+  }
+
+  /**
+   * What is known about where an output column's value comes from. Three states, because "we could
+   * not tell" must not be confused with "it is a different value".
+   */
+  private sealed interface Lineage {
+    /** Proven to be {@code table}'s field of the same name, which declares {@code ancestors}. */
+    record PassThrough(List<String> table, List<String> ancestors) implements Lineage {}
+
+    /** Proven to be something else: a derived expression, or another field entirely. */
+    record Computed() implements Lineage {}
+
+    /** Metadata could not attribute the column to a single source. */
+    record Unknown() implements Lineage {}
+  }
+
+  private static final Lineage COMPUTED = new Lineage.Computed();
+  private static final Lineage UNKNOWN = new Lineage.Unknown();
+
+  /**
+   * Classifies an output column. {@link Lineage.PassThrough} needs exactly one non-derived origin
+   * that names this same field on a table declaring it - matching on the name rather than the
+   * ordinal alone keeps this correct if a scan's row type ever diverges from its table's.
+   *
+   * <p>{@link Lineage.Computed} covers every value the plan builds: no origin at all (a literal),
+   * any derived origin however many there are (an expression contributes one derived origin per
+   * column it references), and an origin naming a different field.
+   *
+   * <p>{@link Lineage.Unknown} is only genuine ignorance: metadata declined to answer, as when
+   * commands such as {@code expand} rebuild a column through a correlate, or several non-derived
+   * sources feed it, as in a union.
+   */
+  private static Lineage lineageOf(
+      RelMetadataQuery mq, RelNode input, int ordinal, String fieldName) {
+    Set<RelColumnOrigin> origins = mq.getColumnOrigins(input, ordinal);
+    if (origins == null) {
+      // Metadata declined to answer.
+      return UNKNOWN;
+    }
+    if (origins.isEmpty()) {
+      // Answered, and no input column contributed: a literal or other constant.
+      return COMPUTED;
+    }
+    // Derived-ness is decided before cardinality. An expression reports one derived origin per
+    // column it references, so a computed value legitimately has several origins, and reading that
+    // as "could not determine" would let the schema delete a value the user just computed.
+    if (origins.stream().anyMatch(RelColumnOrigin::isDerived)) {
+      return COMPUTED;
+    }
+    if (origins.size() != 1) {
+      // Several non-derived sources, e.g. a union: no single one of them carries this column.
+      return UNKNOWN;
+    }
+    RelColumnOrigin origin = origins.iterator().next();
+    RelOptTable originTable = origin.getOriginTable();
+    if (originTable == null) {
+      return UNKNOWN;
+    }
+    List<String> originFieldNames = originTable.getRowType().getFieldNames();
+    int originOrdinal = origin.getOriginColumnOrdinal();
+    if (originOrdinal < 0
+        || originOrdinal >= originFieldNames.size()
+        || !fieldName.equals(originFieldNames.get(originOrdinal))) {
+      return COMPUTED;
+    }
+    Table table = originTable.unwrap(Table.class);
+    if (table == null) {
+      return UNKNOWN;
+    }
+    List<String> ancestors = table.getFieldAncestors().get(fieldName);
+    return ancestors == null
+        ? COMPUTED
+        : new Lineage.PassThrough(originTable.getQualifiedName(), ancestors);
+  }
+
+  /** Whether any of a column's declared ancestors is present in this row as its true container. */
+  private static boolean hasAncestorCarryingIt(
+      RelMetadataQuery mq,
+      RelNode input,
+      List<String> fieldNames,
+      List<String> table,
+      List<String> ancestors,
+      ScannedTables scanned) {
+    return ancestors.stream()
+        .anyMatch(ancestor -> carriesChild(mq, input, fieldNames, ancestor, table, scanned));
+  }
+
+  /**
+   * Whether the column named {@code ancestorName} in this row is the container carrying the child.
+   * Proven to be the same table's field of that name, yes; proven computed or proven to be another
+   * table's, no. When lineage is unknown - {@code expand} and friends rebuild the parent through a
+   * correlate, leaving nothing to attribute - it is accepted only if that name could not have come
+   * from anywhere else: declared by the child's table alone, and that table scanned exactly once. A
+   * name appearing on more than one column is ambiguous and never qualifies.
+   */
+  private static boolean carriesChild(
+      RelMetadataQuery mq,
+      RelNode input,
+      List<String> fieldNames,
+      String ancestorName,
+      List<String> childTable,
+      ScannedTables scanned) {
+    int ordinal = fieldNames.indexOf(ancestorName);
+    if (ordinal < 0 || ordinal != fieldNames.lastIndexOf(ancestorName)) {
+      return false;
+    }
+    return switch (lineageOf(mq, input, ordinal, ancestorName)) {
+      case Lineage.PassThrough ancestor -> ancestor.table().equals(childTable);
+      case Lineage.Computed ignored -> false;
+      case Lineage.Unknown ignored ->
+          scanned.declaredExclusivelyBy(ancestorName, childTable)
+              && scanned.occurrences(childTable) == 1;
+    };
+  }
+
+  /** One table's declaration of a field name. */
+  private record Declaration(List<String> table, List<String> ancestors) {}
+
+  /**
+   * How each field name is declared by the tables in the given plan, and how many times each table
+   * is scanned. Walked on demand instead of being recorded when the scan was built, so it reflects
+   * the plan as it stands. Declarations are kept per table, not unioned, so a name two indices both
+   * declare is never mistaken for unambiguous.
+   */
+  private record ScannedTables(
+      Map<String, Map<List<String>, List<String>>> declarations,
+      Multiset<List<String>> occurrences) {
+
+    boolean declaresName(String name) {
+      return declarations.containsKey(name);
+    }
+
+    /** The declaration of this name when exactly one table declares it, else null. */
+    @Nullable Declaration soleDeclaration(String name) {
+      Map<List<String>, List<String>> byTable = declarations.get(name);
+      if (byTable == null || byTable.size() != 1) {
+        return null;
+      }
+      Map.Entry<List<String>, List<String>> only = byTable.entrySet().iterator().next();
+      return new Declaration(only.getKey(), only.getValue());
+    }
+
+    boolean declaredExclusivelyBy(String name, List<String> table) {
+      Declaration sole = soleDeclaration(name);
+      return sole != null && sole.table().equals(table);
+    }
+
+    int occurrences(List<String> qualifiedTableName) {
+      return occurrences.count(qualifiedTableName);
+    }
+  }
+
+  private static ScannedTables collectScannedTables(RelNode plan) {
+    Map<String, Map<List<String>, List<String>>> declarations = new HashMap<>();
+    Multiset<List<String>> occurrences = HashMultiset.create();
+    new RelVisitor() {
+      @Override
+      public void visit(RelNode node, int ordinal, RelNode parent) {
+        RelOptTable relOptTable = node.getTable();
+        if (relOptTable != null) {
+          Table table = relOptTable.unwrap(Table.class);
+          if (table != null) {
+            List<String> qualifiedName = relOptTable.getQualifiedName();
+            occurrences.add(qualifiedName);
+            table
+                .getFieldAncestors()
+                .forEach(
+                    (name, ancestors) ->
+                        declarations
+                            .computeIfAbsent(name, unused -> new HashMap<>())
+                            .put(qualifiedName, ancestors));
+          }
+        }
+        super.visit(node, ordinal, parent);
+      }
+    }.go(plan);
+    return new ScannedTables(declarations, occurrences);
   }
 
   /**

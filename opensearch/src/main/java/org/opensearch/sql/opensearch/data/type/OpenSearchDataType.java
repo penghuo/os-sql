@@ -5,10 +5,12 @@
 
 package org.opensearch.sql.opensearch.data.type;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.Serializable;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
 import lombok.EqualsAndHashCode;
@@ -311,6 +313,44 @@ public class OpenSearchDataType implements ExprType, Serializable {
         };
     visitLevel.accept(tree, "");
     validateAliasType(result);
+    return result;
+  }
+
+  /**
+   * Maps every field name produced by {@link #traverseAndFlatten(Map)} to the names of the
+   * container fields declaring it, outermost first; a field declared at the root of the mapping
+   * maps to an empty list. Walks the same tree as {@code traverseAndFlatten} but keeps the prefix
+   * chain instead of discarding it, so a mapping property whose name itself contains dots (an
+   * object mapped with {@code disable_objects: true}) reports only the containers that actually
+   * declare it.
+   *
+   * @param tree A parsed mapping tree - map between field name and its type.
+   * @return A map between flattened field name and its ancestor field names.
+   */
+  public static Map<String, List<String>> traverseAndCollectAncestors(
+      Map<String, OpenSearchDataType> tree) {
+    final Map<String, List<String>> result = new LinkedHashMap<>();
+    BiConsumer<Map<String, OpenSearchDataType>, List<String>> visitLevel =
+        new BiConsumer<>() {
+          @Override
+          public void accept(Map<String, OpenSearchDataType> subtree, List<String> ancestors) {
+            for (var entry : subtree.entrySet()) {
+              String prefix = ancestors.isEmpty() ? "" : ancestors.getLast();
+              String nextName =
+                  prefix.isEmpty()
+                      ? entry.getKey()
+                      : String.format("%s.%s", prefix, entry.getKey());
+              result.put(nextName, ancestors);
+              var nextSubtree = entry.getValue().getProperties();
+              if (!nextSubtree.isEmpty()) {
+                accept(
+                    nextSubtree,
+                    ImmutableList.<String>builder().addAll(ancestors).add(nextName).build());
+              }
+            }
+          }
+        };
+    visitLevel.accept(tree, List.of());
     return result;
   }
 

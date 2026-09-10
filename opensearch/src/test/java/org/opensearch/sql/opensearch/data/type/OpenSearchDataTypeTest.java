@@ -31,6 +31,7 @@ import static org.opensearch.sql.data.type.ExprCoreType.TIMESTAMP;
 import static org.opensearch.sql.data.type.ExprCoreType.UNKNOWN;
 import static org.opensearch.sql.opensearch.data.type.OpenSearchDataType.MappingType;
 
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.reflect.FieldUtils;
@@ -411,6 +412,94 @@ class OpenSearchDataTypeTest {
         () ->
             assertEquals(
                 OpenSearchDataType.of(MappingType.Keyword), type.getFields().get("words")));
+  }
+
+  @Test
+  public void traverseAndCollectAncestors_covers_every_flattened_field() {
+    var tree = getSampleMapping();
+    var ancestors = OpenSearchDataType.traverseAndCollectAncestors(tree);
+
+    assertAll(
+        // Same key set as the flattened view, so the two derived views cannot disagree.
+        () ->
+            assertEquals(OpenSearchDataType.traverseAndFlatten(tree).keySet(), ancestors.keySet()),
+        () -> assertEquals(List.of(), ancestors.get("mapping")),
+        () -> assertEquals(List.of("mapping"), ancestors.get("mapping.keyword")),
+        () -> assertEquals(List.of("mapping"), ancestors.get("mapping.submapping")),
+        () ->
+            assertEquals(
+                List.of("mapping", "mapping.submapping"),
+                ancestors.get("mapping.submapping.geo_point")),
+        () ->
+            assertEquals(
+                List.of("mapping", "mapping.submapping", "mapping.submapping.subsubmapping"),
+                ancestors.get("mapping.submapping.subsubmapping.texttype")));
+  }
+
+  /**
+   * An object mapped with {@code disable_objects: true} declares one child whose name contains
+   * dots, so the child's only ancestor is the object itself - there is no level in between. See <a
+   * href="https://github.com/opensearch-project/sql/issues/5746">issue 5746</a>.
+   */
+  @Test
+  public void traverseAndCollectAncestors_multi_level_property_name_has_only_declared_ancestor() {
+    Map<String, Object> attributes =
+        Map.of(
+            "properties",
+            Map.of(
+                "log.file.path", Map.of("type", "text"),
+                "logtag", Map.of("type", "keyword")));
+    var tree = Map.of("attributes", OpenSearchDataType.of(MappingType.Object, attributes));
+
+    var ancestors = OpenSearchDataType.traverseAndCollectAncestors(tree);
+
+    assertAll(
+        () -> assertEquals(3, ancestors.size()),
+        () -> assertEquals(List.of(), ancestors.get("attributes")),
+        () -> assertEquals(List.of("attributes"), ancestors.get("attributes.log.file.path")),
+        () -> assertEquals(List.of("attributes"), ancestors.get("attributes.logtag")),
+        // The intermediate levels a name-based rule would assume are absent.
+        () -> assertFalse(ancestors.containsKey("attributes.log")),
+        () -> assertFalse(ancestors.containsKey("attributes.log.file")));
+  }
+
+  /** A root property whose name contains dots is a root: it has no ancestors. */
+  @Test
+  public void traverseAndCollectAncestors_dotted_root_property_has_no_ancestors() {
+    var tree =
+        Map.of(
+            "s", OpenSearchDataType.of(MappingType.Object),
+            "s.address", OpenSearchDataType.of(MappingType.Keyword));
+
+    var ancestors = OpenSearchDataType.traverseAndCollectAncestors(tree);
+
+    assertAll(
+        () -> assertEquals(List.of(), ancestors.get("s")),
+        () -> assertEquals(List.of(), ancestors.get("s.address")));
+  }
+
+  /** Text multi-fields live under "fields", not "properties", so they are not part of the tree. */
+  @Test
+  public void traverseAndCollectAncestors_excludes_text_multi_fields() {
+    var ancestors =
+        OpenSearchDataType.traverseAndCollectAncestors(Map.of("source", textKeywordType));
+
+    assertAll(
+        () -> assertEquals(Map.of("source", List.of()), ancestors),
+        () -> assertFalse(ancestors.containsKey("source.keyword")));
+  }
+
+  @Test
+  public void traverseAndCollectAncestors_covers_nested_type_children() {
+    Map<String, Object> projects =
+        Map.of("type", "nested", "properties", Map.of("name", Map.of("type", "keyword")));
+    var tree = Map.of("projects", OpenSearchDataType.of(MappingType.Nested, projects));
+
+    var ancestors = OpenSearchDataType.traverseAndCollectAncestors(tree);
+
+    assertAll(
+        () -> assertEquals(List.of(), ancestors.get("projects")),
+        () -> assertEquals(List.of("projects"), ancestors.get("projects.name")));
   }
 
   private Map<String, OpenSearchDataType> getSampleMapping() {

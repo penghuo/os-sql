@@ -9,14 +9,19 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.search.TotalHits;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -31,9 +36,15 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.search.SearchShardTarget;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.sql.common.error.ErrorCode;
 import org.opensearch.sql.common.error.ErrorReport;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener.QueryProgress;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.sql.opensearch.executor.ProgressiveQueryContext;
+import org.opensearch.sql.opensearch.executor.ProgressiveQueryContext.SearchOperation;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchScrollRequest;
@@ -43,6 +54,9 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch connection by node client. */
 public class OpenSearchNodeClient implements OpenSearchClient {
+  private static final Logger LOG = LogManager.getLogger(OpenSearchNodeClient.class);
+  private static final int PROGRESSIVE_AGGREGATION_BATCHED_REDUCE_SIZE = 5;
+  private static final long PROGRESSIVE_AGGREGATION_SNAPSHOT_INTERVAL_NANOS = 500_000_000L;
 
   public static final Function<String, Predicate<String>> ALL_FIELDS =
       (anyIndex -> (anyField -> true));
@@ -166,15 +180,194 @@ public class OpenSearchNodeClient implements OpenSearchClient {
     return request.search(
         req -> {
           applyParentTask(req);
-          return client.search(req).actionGet();
+          return executeSearch(req, request);
         },
         req -> client.searchScroll(req).actionGet());
+  }
+
+  private SearchResponse executeSearch(SearchRequest request, OpenSearchRequest sqlRequest) {
+    CancellableTask parentTask = OpenSearchQueryManager.getCancellableTask();
+    if (parentTask != null && parentTask.isCancelled()) {
+      throw new org.opensearch.core.tasks.TaskCancelledException(parentTask.getReasonCancelled());
+    }
+
+    SearchOperation operation = ProgressiveQueryContext.startSearch(hasExactQueryFraction(request));
+    if (operation == null) {
+      return client.search(request).actionGet();
+    }
+
+    SearchProgressTracker progressTracker = new SearchProgressTracker(operation, sqlRequest);
+    SearchRequest monitoredRequest =
+        new SearchRequest(request) {
+          @Override
+          public SearchTask createTask(
+              long id,
+              String type,
+              String action,
+              TaskId parentTaskId,
+              Map<String, String> headers) {
+            SearchTask searchTask = super.createTask(id, type, action, parentTaskId, headers);
+            searchTask.setProgressListener(progressTracker);
+            operation.registerTask(searchTask);
+            return searchTask;
+          }
+        };
+    if (sqlRequest.supportsAggregationSnapshots()) {
+      monitoredRequest.setBatchedReduceSize(
+          Math.min(
+              monitoredRequest.getBatchedReduceSize(),
+              PROGRESSIVE_AGGREGATION_BATCHED_REDUCE_SIZE));
+    }
+
+    try {
+      SearchResponse response = client.search(monitoredRequest).actionGet();
+      progressTracker.onSearchComplete();
+      return response;
+    } finally {
+      operation.complete();
+    }
+  }
+
+  private static boolean hasExactQueryFraction(SearchRequest request) {
+    if (request.scroll() != null
+        || request.source() == null
+        || request.source().pointInTimeBuilder() != null) {
+      return false;
+    }
+    return request.source().aggregations() == null
+        || request.source().aggregations().getAggregatorFactories().stream()
+            .noneMatch(CompositeAggregationBuilder.class::isInstance);
   }
 
   private void applyParentTask(SearchRequest req) {
     CancellableTask task = OpenSearchQueryManager.getCancellableTask();
     if (task != null) {
       req.setParentTask(new TaskId(client.getLocalNodeId(), task.getId()));
+    }
+  }
+
+  /** Converts the core search progress callbacks into a PPL job progress snapshot. */
+  static final class SearchProgressTracker extends SearchProgressListener {
+    private final SearchOperation operation;
+    private final OpenSearchRequest request;
+    private final Set<Integer> completedShardIds = new HashSet<>();
+    private int totalShards = -1;
+    private int skippedShards;
+    private boolean fetchPhase;
+    private long lastAggregationSnapshotNanos = Long.MIN_VALUE;
+
+    SearchProgressTracker(SearchOperation operation, OpenSearchRequest request) {
+      this.operation = operation;
+      this.request = request;
+    }
+
+    @Override
+    protected synchronized void onListShards(
+        List<SearchShard> shards,
+        List<SearchShard> skippedShards,
+        SearchResponse.Clusters clusters,
+        boolean fetchPhase) {
+      this.totalShards = shards.size() + skippedShards.size();
+      this.skippedShards = skippedShards.size();
+      this.fetchPhase = fetchPhase;
+      publish();
+    }
+
+    @Override
+    protected synchronized void onQueryResult(int shardIndex) {
+      if (!fetchPhase) {
+        completedShardIds.add(shardIndex);
+        publish();
+      }
+    }
+
+    @Override
+    protected synchronized void onQueryFailure(
+        int shardIndex, SearchShardTarget shardTarget, Exception exc) {
+      if (!fetchPhase) {
+        completedShardIds.add(shardIndex);
+        publish();
+      }
+    }
+
+    @Override
+    protected synchronized void onFetchResult(int shardIndex) {
+      completedShardIds.add(shardIndex);
+      publish();
+    }
+
+    @Override
+    protected synchronized void onFetchFailure(
+        int shardIndex, SearchShardTarget shardTarget, Exception exc) {
+      completedShardIds.add(shardIndex);
+      publish();
+    }
+
+    @Override
+    protected synchronized void onPartialReduce(
+        List<SearchShard> shards,
+        TotalHits totalHits,
+        InternalAggregations aggregations,
+        int reducePhase) {
+      publish();
+      publishAggregationSnapshot(totalHits, aggregations);
+    }
+
+    @Override
+    protected synchronized void onFinalReduce(
+        List<SearchShard> shards,
+        TotalHits totalHits,
+        InternalAggregations aggregations,
+        int reducePhase) {
+      if (!fetchPhase && totalShards >= 0) {
+        for (int shardIndex = 0; shardIndex < totalShards; shardIndex++) {
+          completedShardIds.add(shardIndex);
+        }
+      }
+      publish();
+    }
+
+    private synchronized void onSearchComplete() {
+      if (totalShards >= 0) {
+        for (int shardIndex = 0; shardIndex < totalShards; shardIndex++) {
+          completedShardIds.add(shardIndex);
+        }
+      }
+      publish();
+    }
+
+    private void publish() {
+      if (!operation.exactFraction()) {
+        operation.publish(QueryProgress.UNKNOWN);
+        return;
+      }
+      int completed =
+          totalShards < 0 ? -1 : Math.min(totalShards, skippedShards + completedShardIds.size());
+      double fraction =
+          totalShards > 0 && completed < totalShards ? (double) completed / totalShards : -1D;
+      operation.publish(new QueryProgress(fraction, totalShards, completed));
+    }
+
+    private void publishAggregationSnapshot(
+        TotalHits totalHits, InternalAggregations aggregations) {
+      if (!request.supportsAggregationSnapshots()) {
+        return;
+      }
+      long now = System.nanoTime();
+      if (lastAggregationSnapshotNanos != Long.MIN_VALUE
+          && now - lastAggregationSnapshotNanos < PROGRESSIVE_AGGREGATION_SNAPSHOT_INTERVAL_NANOS) {
+        return;
+      }
+      try {
+        List<org.opensearch.sql.data.model.ExprValue> rows =
+            request.parseAggregationSnapshot(totalHits, aggregations);
+        if (!rows.isEmpty()) {
+          lastAggregationSnapshotNanos = now;
+          operation.publishAggregationSnapshot(rows);
+        }
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to parse an incremental aggregation reduce result", e);
+      }
     }
   }
 

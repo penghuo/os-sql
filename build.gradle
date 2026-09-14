@@ -165,6 +165,7 @@ allprojects {
         resolutionStrategy.force 'org.apache.commons:commons-text:1.11.0'
         resolutionStrategy.force 'commons-io:commons-io:2.15.0'
         resolutionStrategy.force 'org.yaml:snakeyaml:2.2'
+        resolutionStrategy.force "org.snakeyaml:snakeyaml-engine:${versions.snakeyaml_engine}"
         // Align Calcite 1.42.0's bumped transitive deps under strict conflict resolution
         resolutionStrategy.force 'com.jayway.jsonpath:json-path:2.10.0'
         resolutionStrategy.force 'org.jooq:joou-java-6:0.9.5'

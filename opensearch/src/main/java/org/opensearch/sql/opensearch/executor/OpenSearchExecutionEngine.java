@@ -24,9 +24,18 @@ import org.apache.calcite.avatica.util.StructImpl;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.SingleRel;
+import org.apache.calcite.rel.core.Aggregate;
+import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.SetOp;
+import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.core.Window;
 import org.apache.calcite.rel.externalize.RelJsonWriter;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.runtime.Hook;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.sql.SqlOperator;
@@ -39,8 +48,10 @@ import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.locationtech.jts.geom.Point;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
@@ -59,6 +70,9 @@ import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener.QueryProgress;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener.UpdateMode;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
@@ -69,6 +83,7 @@ import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
+import org.opensearch.sql.opensearch.storage.scan.CalciteEnumerableIndexScan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.protocol.response.format.Format;
 import org.opensearch.sql.storage.TableScanOperator;
@@ -77,6 +92,8 @@ import tools.jackson.databind.ObjectMapper;
 
 /** OpenSearch execution engine implementation. */
 public class OpenSearchExecutionEngine implements ExecutionEngine {
+  private static final int DEFAULT_PROGRESSIVE_PREVIEW_BATCH_SIZE = 200;
+  private static final long PROGRESSIVE_PREVIEW_INTERVAL_NANOS = 500_000_000L;
   private static final Logger logger = LogManager.getLogger(OpenSearchExecutionEngine.class);
   private static final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -166,6 +183,11 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
           RelRoot relRoot = (RelRoot) obj;
           physical.set(RelOptUtil.toString(relRoot.rel, level));
         });
+  }
+
+  private Hook.Closeable getOptimizedPlanInHook(AtomicReference<RelNode> optimizedPlan) {
+    return Hook.PLAN_BEFORE_IMPLEMENTATION.addThread(
+        (java.util.function.Consumer<Object>) obj -> optimizedPlan.set(((RelRoot) obj).rel));
   }
 
   private Hook.Closeable getCodegenInHook(AtomicReference<String> codegen) {
@@ -329,12 +351,44 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
-          try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+          AtomicReference<RelNode> optimizedPlan = new AtomicReference<>();
+          ProgressiveQueryResponseListener progressiveListener =
+              listener instanceof ProgressiveQueryResponseListener
+                  ? (ProgressiveQueryResponseListener) listener
+                  : null;
+          QueryProgressObserver progressObserver =
+              progressiveListener == null ? null : new QueryProgressObserver(progressiveListener);
+          ProgressiveQueryContext.Scope progressiveScope =
+              progressiveListener == null ? null : ProgressiveQueryContext.open(progressObserver);
+          try (progressiveScope;
+              Hook.Closeable closeable = getOptimizedPlanInHook(optimizedPlan);
+              PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
             QueryResponse response;
             try (ProfileScope executePhase = ProfileScope.open(MetricName.EXECUTE)) {
+              RelNode physicalPlan = optimizedPlan.get();
+              int previewBatchSize = 0;
+              int resultProgressTarget = 0;
+              if (progressiveListener != null) {
+                UpdateMode updateMode =
+                    isStablePrefixQuery(rel, physicalPlan) ? UpdateMode.APPEND : UpdateMode.REPLACE;
+                progressiveListener.onQueryClassified(updateMode);
+                if (updateMode == UpdateMode.APPEND) {
+                  previewBatchSize = stablePrefixBatchSize(physicalPlan);
+                  resultProgressTarget = stablePrefixProgressTarget(rel);
+                  progressObserver.useResultProgress();
+                } else if (supportsAggregationSnapshots(physicalPlan)) {
+                  progressObserver.enableAggregationSnapshots(physicalPlan.getRowType());
+                }
+              }
               ResultSet result = statement.executeQuery();
               response =
-                  buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit());
+                  buildResultSet(
+                      result,
+                      rel.getRowType(),
+                      context.sysLimit.querySizeLimit(),
+                      listener,
+                      previewBatchSize,
+                      resultProgressTarget);
             }
             listener.onResponse(response);
           } catch (SQLException e) {
@@ -430,15 +484,29 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   private QueryResponse buildResultSet(
-      ResultSet resultSet, RelDataType rowTypes, Integer querySizeLimit) throws SQLException {
+      ResultSet resultSet,
+      RelDataType rowTypes,
+      Integer querySizeLimit,
+      ResponseListener<QueryResponse> listener,
+      int previewBatchSize,
+      int resultProgressTarget)
+      throws SQLException {
     // Get the ResultSet metadata to know about columns
     ResultSetMetaData metaData = resultSet.getMetaData();
     int columnCount = metaData.getColumnCount();
     List<RelDataType> fieldTypes =
         rowTypes.getFieldList().stream().map(RelDataTypeField::getType).toList();
     List<ExprValue> values = new ArrayList<>();
+    int nextPreviewSize = previewBatchSize;
+    int lastPreviewSize = 0;
+    long lastPreviewNanos = System.nanoTime();
     // Iterate through the ResultSet
     while (resultSet.next() && (querySizeLimit == null || values.size() < querySizeLimit)) {
+      if (OpenSearchQueryManager.getCancellableTask() != null
+          && OpenSearchQueryManager.getCancellableTask().isCancelled()) {
+        throw new TaskCancelledException(
+            OpenSearchQueryManager.getCancellableTask().getReasonCancelled());
+      }
       Map<String, ExprValue> row = new LinkedHashMap<String, ExprValue>();
       // Loop through each column
       for (int i = 1; i <= columnCount; i++) {
@@ -449,28 +517,30 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
         row.put(columnName, exprValue);
       }
       values.add(ExprTupleValue.fromExprValueMap(row));
+      long now = System.nanoTime();
+      boolean sizeThresholdReached = previewBatchSize > 0 && values.size() >= nextPreviewSize;
+      boolean timeThresholdReached =
+          previewBatchSize > 0
+              && values.size() > lastPreviewSize
+              && now - lastPreviewNanos >= PROGRESSIVE_PREVIEW_INTERVAL_NANOS;
+      if (sizeThresholdReached || timeThresholdReached) {
+        Schema previewSchema = buildSchema(metaData, fieldTypes, values);
+        QueryResponse preview = new QueryResponse(previewSchema, List.copyOf(values), null);
+        publishPartialSafely(
+            (ProgressiveQueryResponseListener) listener,
+            preview,
+            resultProgress(values.size(), resultProgressTarget));
+        lastPreviewSize = values.size();
+        lastPreviewNanos = now;
+        nextPreviewSize =
+            (int)
+                Math.min(
+                    Integer.MAX_VALUE,
+                    Math.max((long) nextPreviewSize * 2, (long) values.size() + previewBatchSize));
+      }
     }
 
-    List<Column> columns = new ArrayList<>(metaData.getColumnCount());
-    for (int i = 1; i <= columnCount; ++i) {
-      String columnName = metaData.getColumnName(i);
-      RelDataType fieldType = fieldTypes.get(i - 1);
-      // TODO: Correct this after fixing issue github.com/opensearch-project/sql/issues/3751
-      //  The element type of struct and array is currently set to ANY.
-      //  We set them using the runtime type as a workaround.
-      ExprType exprType;
-      if (fieldType.getSqlTypeName() == SqlTypeName.ANY) {
-        if (!values.isEmpty()) {
-          exprType = values.getFirst().tupleValue().get(columnName).type();
-        } else {
-          // Using UNDEFINED instead of UNKNOWN to avoid throwing exception
-          exprType = ExprCoreType.UNDEFINED;
-        }
-      } else {
-        exprType = OpenSearchTypeFactory.convertRelDataTypeToExprType(fieldType);
-      }
-      columns.add(new Column(columnName, null, exprType));
-    }
+    List<Column> columns = buildColumns(metaData, fieldTypes, values);
     // Timewrap post-processing: pivot unpivoted rows into period columns. The pivot is shared with
     // the analytics route (AnalyticsExecutionEngine) so both engines produce identical output.
     if (TimewrapPivot.isTimewrap()) {
@@ -492,6 +562,253 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     QueryResponse response = new QueryResponse(schema, values, null);
     response.setWarnings(CalcitePlanContext.drainWarnings());
     return response;
+  }
+
+  private static Schema buildSchema(
+      ResultSetMetaData metaData, List<RelDataType> fieldTypes, List<ExprValue> values)
+      throws SQLException {
+    return new Schema(buildColumns(metaData, fieldTypes, values));
+  }
+
+  private static Schema buildSchema(RelDataType rowType, List<ExprValue> values) {
+    List<Column> columns = new ArrayList<>(rowType.getFieldCount());
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      ExprType exprType;
+      if (field.getType().getSqlTypeName() == SqlTypeName.ANY) {
+        ExprValue value =
+            values.isEmpty() ? null : values.getFirst().tupleValue().get(field.getName());
+        exprType = value == null ? ExprCoreType.UNDEFINED : value.type();
+      } else {
+        exprType = OpenSearchTypeFactory.convertRelDataTypeToExprType(field.getType());
+      }
+      columns.add(new Column(field.getName(), null, exprType));
+    }
+    return new Schema(columns);
+  }
+
+  private static List<Column> buildColumns(
+      ResultSetMetaData metaData, List<RelDataType> fieldTypes, List<ExprValue> values)
+      throws SQLException {
+    int columnCount = metaData.getColumnCount();
+    List<Column> columns = new ArrayList<>(columnCount);
+    for (int i = 1; i <= columnCount; ++i) {
+      String columnName = metaData.getColumnName(i);
+      RelDataType fieldType = fieldTypes.get(i - 1);
+      // TODO: Correct this after fixing issue github.com/opensearch-project/sql/issues/3751
+      //  The element type of struct and array is currently set to ANY.
+      //  We set them using the runtime type as a workaround.
+      ExprType exprType;
+      if (fieldType.getSqlTypeName() == SqlTypeName.ANY) {
+        if (!values.isEmpty()) {
+          exprType = values.getFirst().tupleValue().get(columnName).type();
+        } else {
+          // Using UNDEFINED instead of UNKNOWN to avoid throwing exception
+          exprType = ExprCoreType.UNDEFINED;
+        }
+      } else {
+        exprType = OpenSearchTypeFactory.convertRelDataTypeToExprType(fieldType);
+      }
+      columns.add(new Column(columnName, null, exprType));
+    }
+    return columns;
+  }
+
+  private static void publishPartialSafely(
+      ProgressiveQueryResponseListener listener, QueryResponse response) {
+    try {
+      listener.onPartial(response);
+    } catch (RuntimeException e) {
+      logger.warn("Failed to publish a progressive PPL query response", e);
+    }
+  }
+
+  private static void publishPartialSafely(
+      ProgressiveQueryResponseListener listener, QueryResponse response, QueryProgress progress) {
+    try {
+      if (progress == null) {
+        listener.onPartial(response);
+      } else {
+        listener.onPartial(response, progress);
+      }
+    } catch (RuntimeException e) {
+      logger.warn("Failed to publish a progressive PPL query response", e);
+    }
+  }
+
+  /**
+   * Returns whether the PPL logical semantics and optimized physical plan both prove that every
+   * emitted row is an immutable prefix row.
+   *
+   * <p>The logical plan check is intentional: a PPL aggregation remains progress-only even when
+   * optimization pushes it completely into an OpenSearch DSL aggregation.
+   */
+  static boolean isStablePrefixQuery(RelNode logicalPlan, RelNode physicalPlan) {
+    return !containsBlockingOrAggregation(logicalPlan)
+        && !containsBlockingOrAggregation(physicalPlan)
+        && stablePrefixBatchSize(physicalPlan) > 0;
+  }
+
+  private static boolean containsBlockingOrAggregation(RelNode rel) {
+    if (rel == null) {
+      return true;
+    }
+    if (rel instanceof Aggregate
+        || isBlockingSort(rel)
+        || rel instanceof Window
+        || rel instanceof Join
+        || rel instanceof SetOp) {
+      return true;
+    }
+    List<RelNode> inputs = rel.getInputs();
+    if (inputs.size() > 1) {
+      return true;
+    }
+    return inputs.size() == 1 && containsBlockingOrAggregation(inputs.getFirst());
+  }
+
+  /**
+   * Returns the snapshot batch size when the optimized plan can safely expose finalized root rows
+   * as progressive previews. Blocking or multi-input operators disable previews.
+   */
+  static int stablePrefixBatchSize(RelNode rel) {
+    if (rel == null || TimewrapPivot.isTimewrap()) {
+      return 0;
+    }
+    if (rel instanceof Aggregate
+        || isBlockingSort(rel)
+        || rel instanceof Window
+        || rel instanceof Join
+        || rel instanceof SetOp) {
+      return 0;
+    }
+    if (rel instanceof CalciteEnumerableIndexScan scan) {
+      var aggSpec = scan.getPushDownContext().getAggSpec();
+      return aggSpec == null ? DEFAULT_PROGRESSIVE_PREVIEW_BATCH_SIZE : 0;
+    }
+    if (rel instanceof SingleRel && rel.getInputs().size() == 1) {
+      return stablePrefixBatchSize(rel.getInput(0));
+    }
+    return 0;
+  }
+
+  /**
+   * Returns an exact result-row target for an append-safe logical plan.
+   *
+   * <p>A user {@code head}/{@code limit} supplies the denominator. System limits are ignored, and
+   * only row-preserving projections may appear between that limit and the scan. Operators such as
+   * filters can produce fewer rows than the limit, so their progress remains indeterminate.
+   */
+  static int stablePrefixProgressTarget(RelNode rel) {
+    return stablePrefixProgressTarget(rel, 0);
+  }
+
+  private static int stablePrefixProgressTarget(RelNode rel, int target) {
+    if (rel instanceof LogicalSystemLimit systemLimit) {
+      return stablePrefixProgressTarget(systemLimit.getInput(), target);
+    }
+    if (rel instanceof Sort sort) {
+      if (isBlockingSort(sort) || !(sort.fetch instanceof RexLiteral fetch)) {
+        return 0;
+      }
+      Integer limit = fetch.getValueAs(Integer.class);
+      if (limit == null || limit <= 0) {
+        return 0;
+      }
+      int effectiveTarget = target == 0 ? limit : Math.min(target, limit);
+      return stablePrefixProgressTarget(sort.getInput(), effectiveTarget);
+    }
+    if (rel instanceof Project project) {
+      return stablePrefixProgressTarget(project.getInput(), target);
+    }
+    return rel instanceof TableScan ? target : 0;
+  }
+
+  static QueryProgress resultProgress(int committedRows, int targetRows) {
+    if (targetRows <= 0) {
+      return null;
+    }
+    double fraction = Math.min((double) committedRows / targetRows, Math.nextDown(1D));
+    return new QueryProgress(fraction, -1, -1);
+  }
+
+  /**
+   * Only a single-request pushed-down aggregation can publish one self-contained reduce snapshot.
+   */
+  static boolean supportsAggregationSnapshots(RelNode rel) {
+    if (!(rel instanceof CalciteEnumerableIndexScan scan)) {
+      return false;
+    }
+    var aggSpec = scan.getPushDownContext().getAggSpec();
+    return aggSpec != null && !aggSpec.isCompositeAggregation();
+  }
+
+  static List<ExprValue> orderAggregationRows(RelDataType rowType, List<ExprValue> unorderedRows) {
+    return unorderedRows.stream()
+        .map(
+            row -> {
+              Map<String, ExprValue> ordered = new LinkedHashMap<>();
+              for (RelDataTypeField field : rowType.getFieldList()) {
+                ordered.put(field.getName(), row.tupleValue().get(field.getName()));
+              }
+              return (ExprValue) ExprTupleValue.fromExprValueMap(ordered);
+            })
+        .toList();
+  }
+
+  /**
+   * Calcite represents both ordered sorting and an unordered LIMIT/OFFSET with {@link Sort}.
+   * LIMIT/OFFSET preserves the stability of every row it emits; only a non-empty collation can
+   * revise earlier output after seeing later input.
+   */
+  private static boolean isBlockingSort(RelNode rel) {
+    return rel instanceof Sort sort && !sort.getCollation().getFieldCollations().isEmpty();
+  }
+
+  private static final class QueryProgressObserver implements ProgressiveQueryContext.Observer {
+    private final ProgressiveQueryResponseListener listener;
+    private volatile RelDataType aggregationRowType;
+    private volatile boolean resultProgress;
+
+    private QueryProgressObserver(ProgressiveQueryResponseListener listener) {
+      this.listener = listener;
+    }
+
+    @Override
+    public void onProgress(QueryProgress progress) {
+      if (!resultProgress) {
+        listener.onProgress(progress);
+      }
+    }
+
+    private void useResultProgress() {
+      resultProgress = true;
+    }
+
+    private void enableAggregationSnapshots(RelDataType rowType) {
+      aggregationRowType = rowType;
+    }
+
+    @Override
+    public void onAggregationSnapshot(List<ExprValue> rows) {
+      RelDataType rowType = aggregationRowType;
+      if (rowType == null || rows.isEmpty()) {
+        return;
+      }
+      List<ExprValue> orderedRows = orderAggregationRows(rowType, rows);
+      publishPartialSafely(
+          listener,
+          new QueryResponse(buildSchema(rowType, orderedRows), List.copyOf(orderedRows), null));
+    }
+
+    @Override
+    public void onSearchTaskStarted(long operationId, Runnable cancelAction) {
+      listener.onSearchTaskStarted(operationId, cancelAction);
+    }
+
+    @Override
+    public void onSearchTaskFinished(long operationId) {
+      listener.onSearchTaskFinished(operationId);
+    }
   }
 
   /** Registers opensearch-dependent functions */

@@ -11,6 +11,7 @@ import static org.opensearch.sql.lang.PPLLangSpec.PPL_SPEC;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -19,6 +20,10 @@ import java.util.function.Supplier;
 import org.apache.calcite.rel.RelNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.opensearch.ResourceNotFoundException;
+import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -28,6 +33,7 @@ import org.opensearch.common.inject.Guice;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.ModulesBuilder;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -36,14 +42,20 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener.QueryProgress;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener.UpdateMode;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.monitor.profile.ProfileScope;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
+import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.executor.tracing.TracingPhaseListener;
 import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
+import org.opensearch.sql.opensearch.storage.TransportAwareOpenSearchDataSourceService;
 import org.opensearch.sql.plugin.config.EngineExtensionsHolder;
 import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.plugin.rest.AnalyticsEngineFormatSupport;
@@ -60,6 +72,7 @@ import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
 import org.opensearch.sql.protocol.response.format.YamlResponseFormatter;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanCreationContext;
@@ -67,6 +80,8 @@ import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.telemetry.tracing.attributes.Attributes;
 import org.opensearch.telemetry.tracing.listener.TraceableActionListener;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -75,6 +90,7 @@ public class TransportPPLQueryAction
     extends HandledTransportAction<ActionRequest, TransportPPLQueryResponse> {
 
   private static final Logger LOG = LogManager.getLogger(TransportPPLQueryAction.class);
+  private static final String SECURITY_USER_INFO_THREAD_CONTEXT = "_opendistro_security_user_info";
 
   private final Injector injector;
 
@@ -87,7 +103,9 @@ public class TransportPPLQueryAction
 
   private final NodeClient clientRef;
   private final ClusterService clusterServiceRef;
+  private final TransportService transportServiceRef;
   private final org.opensearch.sql.common.setting.Settings pluginSettingsRef;
+  private final PPLAsyncQueryJobService asyncJobService;
 
   @Inject
   public TransportPPLQueryAction(
@@ -102,17 +120,27 @@ public class TransportPPLQueryAction
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
     this.clientRef = client;
     this.clusterServiceRef = clusterService;
+    this.transportServiceRef = transportService;
+    this.asyncJobService = new PPLAsyncQueryJobService(client::getLocalNodeId, client.threadPool());
+    client
+        .threadPool()
+        .scheduleWithFixedDelay(
+            asyncJobService::reapExpired, TimeValue.timeValueMinutes(1), ThreadPool.Names.GENERIC);
 
     ModulesBuilder modules = new ModulesBuilder();
-    modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
+    OpenSearchClient openSearchClient = new OpenSearchNodeClient(client);
+    modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer, openSearchClient));
     org.opensearch.sql.common.setting.Settings pluginSettings =
         new OpenSearchSettings(clusterService.getClusterSettings());
     this.pluginSettingsRef = pluginSettings;
+    DataSourceService transportAwareDataSourceService =
+        new TransportAwareOpenSearchDataSourceService(
+            dataSourceService, openSearchClient, pluginSettings);
     modules.add(
         b -> {
           b.bind(NodeClient.class).toInstance(client);
           b.bind(org.opensearch.sql.common.setting.Settings.class).toInstance(pluginSettings);
-          b.bind(DataSourceService.class).toInstance(dataSourceService);
+          b.bind(DataSourceService.class).toInstance(transportAwareDataSourceService);
         });
     this.injector = Guice.createInjector(modules);
     this.tracer = tracer;
@@ -182,6 +210,51 @@ public class TransportPPLQueryAction
       listener.onResponse(new TransportPPLQueryResponse("{}"));
       return;
     }
+    try {
+      String requestedId = requestedId(transportRequest);
+      if (requestedId != null) {
+        if (routeJobRequestIfNeeded(transportRequest, requestedId, listener)) {
+          return;
+        }
+        if (isDeleteRequest(transportRequest)) {
+          PPLAsyncQueryJobService.Snapshot snapshot =
+              asyncJobService.cancelAndRemove(requestedId, currentUser());
+          listener.onResponse(formatDeleteResponse(snapshot));
+          clearRequestScopedState();
+          return;
+        }
+        PollParameters poll = parsePollParameters(transportRequest);
+        ActionListener<PPLAsyncQueryJobService.Snapshot> pollListener =
+            ActionListener.wrap(
+                snapshot -> {
+                  try {
+                    listener.onResponse(formatAsyncJob(snapshot, poll.offset(), poll.count()));
+                  } finally {
+                    clearRequestScopedState();
+                  }
+                },
+                e -> {
+                  clearRequestScopedState();
+                  listener.onFailure(e);
+                });
+        if (poll.waitForSequence() < 0) {
+          pollListener.onResponse(
+              asyncJobService.get(requestedId, currentUser(), poll.keepAlive()));
+        } else {
+          asyncJobService.awaitSequence(
+              requestedId,
+              currentUser(),
+              poll.waitForSequence(),
+              poll.waitTimeout(),
+              poll.keepAlive(),
+              pollListener);
+        }
+        return;
+      }
+    } catch (Exception e) {
+      listener.onFailure(e);
+      return;
+    }
 
     if (task instanceof PPLQueryTask pplQueryTask) {
       OpenSearchQueryManager.setCancellableTask(pplQueryTask);
@@ -200,6 +273,11 @@ public class TransportPPLQueryAction
     transformedRequest.warningsSupported(warningsSupported(transformedRequest));
     // Per-request override (e.g. a Dashboards toggle); null defers to the cluster setting.
     QueryContext.setPartialResultOverride(transformedRequest.partialResult());
+    boolean asyncRequest =
+        isAsyncRequest(transportRequest)
+            && !transformedRequest.isExplainRequest()
+            && !transformedRequest.analyze()
+            && !transformedRequest.profile();
 
     // Start root span with OTel DB semantic convention attributes
     Span rootSpan =
@@ -228,6 +306,12 @@ public class TransportPPLQueryAction
       // Route to analytics engine for non-Lucene (e.g., Parquet-backed) indices.
       if (unifiedQueryHandler != null
           && unifiedQueryHandler.isAnalyticsIndex(transformedRequest.getRequest(), QueryType.PPL)) {
+        if (asyncRequest) {
+          clearingListener.onFailure(
+              new IllegalArgumentException(
+                  "Asynchronous PPL execution supports the Calcite execution path only"));
+          return;
+        }
         LOG.info("[{}] Routing PPL query to analytics engine", QueryContext.getRequestId());
         // Pass this PPL task so the analytics engine links its query task to it for cancellation.
         if (transformedRequest.isExplainRequest()) {
@@ -270,11 +354,42 @@ public class TransportPPLQueryAction
             createAnalyzeResponseListener(transformedRequest, clearingListener),
             anonymizedQuerySink);
       } else {
-        pplService.execute(
-            transformedRequest,
-            createListener(transformedRequest, clearingListener),
-            createExplainResponseListener(transformedRequest, clearingListener),
-            anonymizedQuerySink);
+        if (asyncRequest) {
+          validateAsyncRequest(transformedRequest);
+          String user = currentUser();
+          String jobId =
+              asyncJobService.create(
+                  user,
+                  requestedSubmitKeepAlive(transportRequest),
+                  task instanceof CancellableTask cancellableTask ? cancellableTask : null);
+          pplService.execute(
+              transformedRequest,
+              createAsyncListener(jobId),
+              createExplainResponseListener(transformedRequest, clearingListener),
+              anonymizedQuerySink);
+          asyncJobService.awaitCompletion(
+              jobId,
+              user,
+              requestedSubmitWaitTimeout(transportRequest),
+              ActionListener.wrap(
+                  snapshot -> {
+                    if (snapshot.status() == PPLAsyncQueryJobService.Status.SUCCEEDED) {
+                      PPLAsyncQueryJobService.Snapshot completed =
+                          asyncJobService.removeSuccessfulFastPath(jobId, user);
+                      clearingListener.onResponse(formatFastPath(completed));
+                    } else {
+                      clearingListener.onResponse(
+                          formatAsyncJob(snapshot, 0, PPLAsyncQueryJobService.DEFAULT_PAGE_SIZE));
+                    }
+                  },
+                  clearingListener::onFailure));
+        } else {
+          pplService.execute(
+              transformedRequest,
+              createListener(transformedRequest, clearingListener),
+              createExplainResponseListener(transformedRequest, clearingListener),
+              anonymizedQuerySink);
+        }
       }
     } catch (Exception e) {
       clearingListener.onFailure(e);
@@ -392,6 +507,298 @@ public class TransportPPLQueryAction
         listener.onFailure(e);
       }
     };
+  }
+
+  private ProgressiveQueryResponseListener createAsyncListener(String jobId) {
+    return new ProgressiveQueryResponseListener() {
+      @Override
+      public void onQueryClassified(UpdateMode updateMode) {
+        asyncJobService.classify(jobId, updateMode);
+      }
+
+      @Override
+      public void onProgress(QueryProgress progress) {
+        asyncJobService.progress(jobId, progress);
+      }
+
+      @Override
+      public void onSearchTaskStarted(long operationId, Runnable cancelAction) {
+        asyncJobService.searchTaskStarted(jobId, operationId, cancelAction);
+      }
+
+      @Override
+      public void onSearchTaskFinished(long operationId) {
+        asyncJobService.searchTaskFinished(jobId, operationId);
+      }
+
+      @Override
+      public void onPartial(ExecutionEngine.QueryResponse response) {
+        asyncJobService.partial(jobId, response);
+      }
+
+      @Override
+      public void onPartial(ExecutionEngine.QueryResponse response, QueryProgress progress) {
+        asyncJobService.partial(jobId, response, progress);
+      }
+
+      @Override
+      public void onResponse(ExecutionEngine.QueryResponse response) {
+        try {
+          asyncJobService.complete(jobId, response);
+        } finally {
+          clearRequestScopedState();
+        }
+      }
+
+      @Override
+      public void onFailure(Exception e) {
+        try {
+          asyncJobService.fail(jobId, e);
+        } finally {
+          clearRequestScopedState();
+        }
+      }
+    };
+  }
+
+  private TransportPPLQueryResponse formatFastPath(PPLAsyncQueryJobService.Snapshot snapshot) {
+    JSONObject json = formatRows(snapshot.response(), 0, Integer.MAX_VALUE, false);
+    json.put("status", snapshot.status().name());
+    json.put("took", snapshot.tookMillis());
+    json.put("start_time_in_millis", snapshot.startTimeMillis());
+    return new TransportPPLQueryResponse(json.toString(2));
+  }
+
+  private TransportPPLQueryResponse formatAsyncJob(
+      PPLAsyncQueryJobService.Snapshot snapshot, int offset, int count) {
+    JSONObject json = formatRows(snapshot.response(), offset, count, true);
+    json.put("id", snapshot.id());
+    json.put("status", snapshot.status().name());
+    json.put("sequence", snapshot.sequence());
+    json.put("start_time_in_millis", snapshot.startTimeMillis());
+    json.put("expiration_time_in_millis", snapshot.expirationTimeMillis());
+    if (snapshot.classified()) {
+      json.put("update_mode", snapshot.updateMode().name());
+    }
+    json.put(
+        "progress",
+        new JSONObject()
+            .put("fraction_done", snapshot.progress().fractionDone())
+            .put("shards_total", snapshot.progress().shardsTotal())
+            .put("shards_completed", snapshot.progress().shardsCompleted()));
+    if (snapshot.status() != PPLAsyncQueryJobService.Status.RUNNING) {
+      json.put("took", snapshot.tookMillis());
+    }
+    if (snapshot.failure() != null) {
+      json.put(
+          "error",
+          new JSONObject()
+              .put("type", snapshot.failure().getClass().getSimpleName())
+              .put("reason", snapshot.failure().getMessage()));
+    }
+    return new TransportPPLQueryResponse(json.toString(2));
+  }
+
+  private TransportPPLQueryResponse formatDeleteResponse(
+      PPLAsyncQueryJobService.Snapshot snapshot) {
+    return new TransportPPLQueryResponse(
+        new JSONObject()
+            .put("id", snapshot.id())
+            .put("status", snapshot.status().name())
+            .toString(2));
+  }
+
+  private static JSONObject formatRows(
+      ExecutionEngine.QueryResponse response, int offset, int count, boolean includeWindow) {
+    if (response == null) {
+      JSONObject empty =
+          new JSONObject()
+              .put("schema", new JSONArray())
+              .put("datarows", new JSONArray())
+              .put("total", 0)
+              .put("size", 0);
+      if (includeWindow) {
+        empty.put("window", new JSONObject().put("offset", offset).put("count", count));
+      }
+      return empty;
+    }
+
+    List<org.opensearch.sql.data.model.ExprValue> allRows = response.getResults();
+    int from = Math.min(offset, allRows.size());
+    int to = Math.min(allRows.size(), from + count);
+    ExecutionEngine.QueryResponse windowed =
+        new ExecutionEngine.QueryResponse(
+            response.getSchema(), List.copyOf(allRows.subList(from, to)), null);
+    windowed.setWarnings(List.copyOf(response.getWarnings()));
+    SimpleJsonResponseFormatter formatter =
+        new SimpleJsonResponseFormatter(JsonResponseFormatter.Style.PRETTY);
+    JSONObject json =
+        new JSONObject(
+            formatter.format(
+                new QueryResult(
+                    windowed.getSchema(),
+                    windowed.getResults(),
+                    null,
+                    PPL_SPEC,
+                    windowed.getWarnings())));
+    json.put("total", allRows.size());
+    json.put("size", to - from);
+    if (includeWindow) {
+      json.put("window", new JSONObject().put("offset", offset).put("count", count));
+    }
+    return json;
+  }
+
+  private static String requestedId(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    if (json == null || !json.has("id")) {
+      return null;
+    }
+    String id = json.optString("id", "").trim();
+    if (id.isEmpty()) {
+      throw new IllegalArgumentException("[id] must not be empty");
+    }
+    return id;
+  }
+
+  private static boolean isAsyncRequest(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    return json != null && (json.has("wait_for_completion_timeout") || json.has("keep_alive"));
+  }
+
+  private boolean routeJobRequestIfNeeded(
+      TransportPPLQueryRequest request,
+      String id,
+      ActionListener<TransportPPLQueryResponse> listener) {
+    PPLAsyncQueryJobId parsed = PPLAsyncQueryJobId.parse(id);
+    if (clientRef.getLocalNodeId().equals(parsed.ownerNodeId())) {
+      return false;
+    }
+    var targetNode = clusterServiceRef.state().nodes().get(parsed.ownerNodeId());
+    if (targetNode == null) {
+      listener.onFailure(
+          new ResourceNotFoundException(
+              "PPL job owner node [" + parsed.ownerNodeId() + "] is not available"));
+      return true;
+    }
+    transportServiceRef.sendRequest(
+        targetNode,
+        PPLQueryAction.NAME,
+        request,
+        TransportRequestOptions.EMPTY,
+        new ActionListenerResponseHandler<>(listener, TransportPPLQueryResponse::new));
+    return true;
+  }
+
+  private String currentUser() {
+    return clientRef
+        .threadPool()
+        .getThreadContext()
+        .getTransient(SECURITY_USER_INFO_THREAD_CONTEXT);
+  }
+
+  private static TimeValue requestedSubmitKeepAlive(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    if (json == null || !json.has("keep_alive")) {
+      return PPLAsyncQueryJobService.DEFAULT_KEEP_ALIVE;
+    }
+    return TimeValue.parseTimeValue(
+        json.getString("keep_alive"), PPLAsyncQueryJobService.DEFAULT_KEEP_ALIVE, "keep_alive");
+  }
+
+  private static TimeValue requestedSubmitWaitTimeout(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    if (json == null || !json.has("wait_for_completion_timeout")) {
+      return PPLAsyncQueryJobService.DEFAULT_WAIT_FOR_COMPLETION;
+    }
+    TimeValue timeout =
+        TimeValue.parseTimeValue(
+            json.getString("wait_for_completion_timeout"),
+            PPLAsyncQueryJobService.DEFAULT_WAIT_FOR_COMPLETION,
+            "wait_for_completion_timeout");
+    PPLAsyncQueryJobService.validateWaitTimeout(timeout);
+    return timeout;
+  }
+
+  private static boolean isDeleteRequest(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    return json != null && "DELETE".equals(json.optString("operation"));
+  }
+
+  private PollParameters parsePollParameters(TransportPPLQueryRequest request) {
+    JSONObject json = request.getJsonContent();
+    long waitForSequence = longParameter(json, "wait_for_sequence", -1L);
+    if (waitForSequence < -1L) {
+      throw new IllegalArgumentException("[wait_for_sequence] must be -1 or greater");
+    }
+    TimeValue waitTimeout =
+        json.has("wait_for_completion_timeout")
+            ? TimeValue.parseTimeValue(
+                json.getString("wait_for_completion_timeout"),
+                TimeValue.ZERO,
+                "wait_for_completion_timeout")
+            : TimeValue.ZERO;
+    PPLAsyncQueryJobService.validateWaitTimeout(waitTimeout);
+    TimeValue keepAlive =
+        json.has("keep_alive")
+            ? TimeValue.parseTimeValue(
+                json.getString("keep_alive"),
+                PPLAsyncQueryJobService.DEFAULT_KEEP_ALIVE,
+                "keep_alive")
+            : null;
+    if (keepAlive != null) {
+      PPLAsyncQueryJobService.validateKeepAlive(keepAlive);
+    }
+    int offset = intParameter(json, "offset", 0);
+    if (offset < 0) {
+      throw new IllegalArgumentException("[offset] must be greater than or equal to 0");
+    }
+    int count = intParameter(json, "count", PPLAsyncQueryJobService.DEFAULT_PAGE_SIZE);
+    int maxPageSize = pluginSettingsRef.getSettingValue(Settings.Key.PPL_ASYNC_MAX_PAGE_SIZE);
+    if (count < 1 || count > maxPageSize) {
+      throw new IllegalArgumentException("[count] must be between 1 and " + maxPageSize);
+    }
+    return new PollParameters(waitForSequence, waitTimeout, keepAlive, offset, count);
+  }
+
+  private static long longParameter(JSONObject json, String name, long defaultValue) {
+    if (!json.has(name)) {
+      return defaultValue;
+    }
+    try {
+      return Long.parseLong(json.get(name).toString());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("[" + name + "] must be an integer", e);
+    }
+  }
+
+  private static int intParameter(JSONObject json, String name, int defaultValue) {
+    long value = longParameter(json, name, defaultValue);
+    if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("[" + name + "] is outside the integer range");
+    }
+    return (int) value;
+  }
+
+  private record PollParameters(
+      long waitForSequence, TimeValue waitTimeout, TimeValue keepAlive, int offset, int count) {}
+
+  private void validateAsyncRequest(PPLQueryRequest request) {
+    if (request.isExplainRequest() || request.profile() || request.analyze()) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution supports query execution only");
+    }
+    Format responseFormat = format(request);
+    if (responseFormat.equals(Format.CSV)
+        || responseFormat.equals(Format.RAW)
+        || responseFormat.equals(Format.VIZ)) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution supports JSON-compatible response formats only");
+    }
+    if (!(Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED)) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution requires the Calcite PPL engine to be enabled");
+    }
   }
 
   private Format format(PPLQueryRequest pplRequest) {

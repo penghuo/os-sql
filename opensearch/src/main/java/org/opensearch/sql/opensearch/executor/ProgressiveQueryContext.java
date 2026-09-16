@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.data.model.ExprValue;
@@ -30,9 +31,34 @@ public final class ProgressiveQueryContext {
 
     default void onAggregationSnapshot(List<ExprValue> rows) {}
 
+    default void onCompositeAggregationSnapshot(List<ExprValue> rows) {}
+
+    default boolean acceptsCompositeAggregationSnapshots() {
+      return false;
+    }
+
+    default void onOperatorSnapshot(OperatorSnapshot snapshot) {}
+
     void onSearchTaskStarted(long operationId, Runnable cancelAction);
 
     void onSearchTaskFinished(long operationId);
+  }
+
+  /** A provisional result produced directly from one live Calcite operator state. */
+  public record OperatorSnapshot(
+      Object operatorIdentity,
+      String operator,
+      RelDataType rowType,
+      List<Object[]> rows,
+      long rowsConsumed,
+      long stateUpdates,
+      long snapshotSequence) {
+    public OperatorSnapshot {
+      Objects.requireNonNull(operatorIdentity);
+      Objects.requireNonNull(operator);
+      Objects.requireNonNull(rowType);
+      rows = List.copyOf(rows);
+    }
   }
 
   /** Captured context that may be propagated to another worker thread. */
@@ -83,6 +109,37 @@ public final class ProgressiveQueryContext {
 
   public static boolean isActive() {
     return CURRENT.get() != null;
+  }
+
+  /** Publishes a snapshot without replaying the source or Calcite plan. */
+  public static void publishOperatorSnapshot(OperatorSnapshot snapshot) {
+    Captured captured = CURRENT.get();
+    if (captured == null) {
+      return;
+    }
+    try {
+      captured.observer().onOperatorSnapshot(snapshot);
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to publish an incremental Calcite operator snapshot", e);
+    }
+  }
+
+  /** Publishes all finalized buckets from completed composite aggregation pages. */
+  public static void publishCompositeAggregationSnapshot(List<ExprValue> rows) {
+    Captured captured = CURRENT.get();
+    if (captured == null) {
+      return;
+    }
+    try {
+      captured.observer().onCompositeAggregationSnapshot(List.copyOf(rows));
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to publish a composite aggregation page snapshot", e);
+    }
+  }
+
+  public static boolean acceptsCompositeAggregationSnapshots() {
+    Captured captured = CURRENT.get();
+    return captured != null && captured.observer().acceptsCompositeAggregationSnapshots();
   }
 
   /**

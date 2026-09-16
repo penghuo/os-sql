@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.opensearch.executor;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -14,7 +15,10 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ProgressiveQueryResponseListener.QueryProgress;
 import org.opensearch.tasks.CancellableTask;
 
@@ -81,5 +85,39 @@ class ProgressiveQueryContextTest {
     }
 
     assertFalse(ProgressiveQueryContext.isActive());
+  }
+
+  @Test
+  void composite_page_snapshot_is_forwarded_as_an_immutable_list() {
+    AtomicReference<List<ExprValue>> received = new AtomicReference<>();
+    ProgressiveQueryContext.Observer observer =
+        new ProgressiveQueryContext.Observer() {
+          @Override
+          public void onProgress(QueryProgress progress) {}
+
+          @Override
+          public void onCompositeAggregationSnapshot(List<ExprValue> rows) {
+            received.set(rows);
+          }
+
+          @Override
+          public boolean acceptsCompositeAggregationSnapshots() {
+            return true;
+          }
+
+          @Override
+          public void onSearchTaskStarted(long operationId, Runnable cancelAction) {}
+
+          @Override
+          public void onSearchTaskFinished(long operationId) {}
+        };
+    ExprValue row = mock(ExprValue.class);
+
+    try (ProgressiveQueryContext.Scope ignored = ProgressiveQueryContext.open(observer)) {
+      assertTrue(ProgressiveQueryContext.acceptsCompositeAggregationSnapshots());
+      ProgressiveQueryContext.publishCompositeAggregationSnapshot(List.of(row));
+    }
+    assertEquals(List.of(row), received.get());
+    assertFalse(ProgressiveQueryContext.acceptsCompositeAggregationSnapshots());
   }
 }

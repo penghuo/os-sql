@@ -20,10 +20,13 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import org.apache.calcite.adapter.enumerable.EnumerableCalc;
+import org.apache.calcite.adapter.enumerable.EnumerableLimit;
 import org.apache.calcite.avatica.util.StructImpl;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.RelShuttleImpl;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
@@ -51,6 +54,7 @@ import org.locationtech.jts.geom.Point;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.plan.ProgressivePlanningContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
@@ -83,6 +87,11 @@ import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalAggregate;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalCalc;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalDedup;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalTopK;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalWindow;
 import org.opensearch.sql.opensearch.storage.scan.CalciteEnumerableIndexScan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.protocol.response.format.Format;
@@ -360,9 +369,14 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
               progressiveListener == null ? null : new QueryProgressObserver(progressiveListener);
           ProgressiveQueryContext.Scope progressiveScope =
               progressiveListener == null ? null : ProgressiveQueryContext.open(progressObserver);
-          try (progressiveScope;
+          ProgressivePlanningContext.Scope progressivePlanningScope =
+              progressiveListener == null ? null : ProgressivePlanningContext.open();
+          RelNode executionRel =
+              progressiveListener == null ? rel : prepareProgressivePhysicalPlan(rel);
+          try (progressivePlanningScope;
+              progressiveScope;
               Hook.Closeable closeable = getOptimizedPlanInHook(optimizedPlan);
-              PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+              PreparedStatement statement = OpenSearchRelRunners.run(context, executionRel)) {
             QueryResponse response;
             try (ProfileScope executePhase = ProfileScope.open(MetricName.EXECUTE)) {
               RelNode physicalPlan = optimizedPlan.get();
@@ -378,6 +392,13 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                   progressObserver.useResultProgress();
                 } else if (supportsAggregationSnapshots(physicalPlan)) {
                   progressObserver.enableAggregationSnapshots(physicalPlan.getRowType());
+                } else if (supportsCompositeAggregationSnapshots(physicalPlan)) {
+                  progressObserver.enableCompositeAggregationSnapshots(physicalPlan.getRowType());
+                } else if (supportsIncrementalOperatorSnapshots(physicalPlan)) {
+                  progressObserver.enableOperatorSnapshots(
+                      incrementalOperatorSnapshotTarget(physicalPlan),
+                      incrementalOperatorSnapshotWindow(
+                          physicalPlan, context.sysLimit.querySizeLimit()));
                 }
               }
               ResultSet result = statement.executeQuery();
@@ -407,6 +428,27 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                   .build();
             }
             throw new RuntimeException(e);
+          }
+        });
+  }
+
+  /**
+   * Performs deterministic async-only physical lowering after QueryService has frozen the plan.
+   *
+   * <p>Calc nodes can be introduced by late Project/Filter fusion after the regular progressive
+   * rules have run. Replacing them here preserves keyed changes between independently selected
+   * incremental operators without changing synchronous plans.
+   */
+  static RelNode prepareProgressivePhysicalPlan(RelNode rel) {
+    return rel.accept(
+        new RelShuttleImpl() {
+          @Override
+          public RelNode visit(RelNode other) {
+            RelNode rewritten = super.visit(other);
+            if (rewritten instanceof EnumerableCalc calc) {
+              return new CalciteEnumerableIncrementalCalc(calc);
+            }
+            return rewritten;
           }
         });
   }
@@ -742,6 +784,19 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
     return aggSpec != null && !aggSpec.isCompositeAggregation();
   }
 
+  /**
+   * A fully pushed composite aggregation publishes cumulative finalized bucket rows after every
+   * completed OpenSearch page. Coordinator operators are deliberately excluded: they must expose
+   * their own incremental state before their output can be published correctly.
+   */
+  static boolean supportsCompositeAggregationSnapshots(RelNode rel) {
+    if (!(rel instanceof CalciteEnumerableIndexScan scan)) {
+      return false;
+    }
+    var aggSpec = scan.getPushDownContext().getAggSpec();
+    return aggSpec != null && aggSpec.isCompositeAggregation();
+  }
+
   static List<ExprValue> orderAggregationRows(RelDataType rowType, List<ExprValue> unorderedRows) {
     return unorderedRows.stream()
         .map(
@@ -756,6 +811,78 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   }
 
   /**
+   * Publishes directly from a live operator only when no row-changing operator exists between it
+   * and the root. EnumerableLimit is safe because the observer applies the same result cap before
+   * publishing.
+   */
+  static boolean supportsIncrementalOperatorSnapshots(RelNode rel) {
+    return incrementalOperatorSnapshotTarget(rel) != null;
+  }
+
+  /**
+   * Selects the root-most incremental operator whose schema is the query response schema.
+   *
+   * <p>An incremental operator may contain another incremental operator. Both maintain live state
+   * and publish checkpoints, but only the root-most operator is a valid query response. Filtering
+   * by object identity prevents an inner checkpoint from being exposed with the wrong schema.
+   */
+  static RelNode incrementalOperatorSnapshotTarget(RelNode rel) {
+    RelNode current = rel;
+    while (current instanceof EnumerableLimit && current.getInputs().size() == 1) {
+      current = current.getInput(0);
+    }
+    return current instanceof CalciteEnumerableIncrementalAggregate
+            || current instanceof CalciteEnumerableIncrementalCalc
+            || current instanceof CalciteEnumerableIncrementalDedup
+            || current instanceof CalciteEnumerableIncrementalTopK
+            || current instanceof CalciteEnumerableIncrementalWindow
+        ? current
+        : null;
+  }
+
+  /**
+   * Returns the root row window that must be applied to a snapshot published below one or more
+   * {@link EnumerableLimit} nodes.
+   *
+   * <p>The operator publishes its complete live state. Applying the composed offset/fetch window
+   * here makes the provisional response obey the same head/limit semantics as the final result.
+   */
+  static OperatorSnapshotWindow incrementalOperatorSnapshotWindow(
+      RelNode rel, int systemResultLimit) {
+    List<EnumerableLimit> limits = new ArrayList<>();
+    RelNode current = rel;
+    while (current instanceof EnumerableLimit limit) {
+      limits.add(limit);
+      current = limit.getInput();
+    }
+    int offset = 0;
+    int count = Integer.MAX_VALUE;
+    for (int i = limits.size() - 1; i >= 0; i--) {
+      EnumerableLimit limit = limits.get(i);
+      int limitOffset = literalInt(limit.offset, 0);
+      int limitCount = literalInt(limit.fetch, Integer.MAX_VALUE);
+      offset = saturatedAdd(offset, limitOffset);
+      count = Math.max(0, Math.min(Math.max(0, count - limitOffset), limitCount));
+    }
+    return new OperatorSnapshotWindow(offset, Math.min(count, systemResultLimit));
+  }
+
+  private static int literalInt(org.apache.calcite.rex.RexNode value, int defaultValue) {
+    if (!(value instanceof RexLiteral literal)) {
+      return defaultValue;
+    }
+    Integer result = literal.getValueAs(Integer.class);
+    return result == null || result < 0 ? defaultValue : result;
+  }
+
+  private static int saturatedAdd(int left, int right) {
+    long result = (long) left + right;
+    return result >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) result;
+  }
+
+  record OperatorSnapshotWindow(int offset, int count) {}
+
+  /**
    * Calcite represents both ordered sorting and an unordered LIMIT/OFFSET with {@link Sort}.
    * LIMIT/OFFSET preserves the stability of every row it emits; only a non-empty collation can
    * revise earlier output after seeing later input.
@@ -767,6 +894,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   private static final class QueryProgressObserver implements ProgressiveQueryContext.Observer {
     private final ProgressiveQueryResponseListener listener;
     private volatile RelDataType aggregationRowType;
+    private volatile RelDataType compositeAggregationRowType;
+    private volatile boolean operatorSnapshots;
+    private volatile Object operatorSnapshotTarget;
+    private volatile OperatorSnapshotWindow operatorSnapshotWindow;
     private volatile boolean resultProgress;
 
     private QueryProgressObserver(ProgressiveQueryResponseListener listener) {
@@ -788,6 +919,22 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       aggregationRowType = rowType;
     }
 
+    private void enableCompositeAggregationSnapshots(RelDataType rowType) {
+      compositeAggregationRowType = rowType;
+    }
+
+    @Override
+    public boolean acceptsCompositeAggregationSnapshots() {
+      return compositeAggregationRowType != null;
+    }
+
+    private void enableOperatorSnapshots(
+        Object operatorSnapshotTarget, OperatorSnapshotWindow snapshotWindow) {
+      operatorSnapshots = true;
+      this.operatorSnapshotTarget = operatorSnapshotTarget;
+      operatorSnapshotWindow = snapshotWindow;
+    }
+
     @Override
     public void onAggregationSnapshot(List<ExprValue> rows) {
       RelDataType rowType = aggregationRowType;
@@ -798,6 +945,57 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       publishPartialSafely(
           listener,
           new QueryResponse(buildSchema(rowType, orderedRows), List.copyOf(orderedRows), null));
+    }
+
+    @Override
+    public void onCompositeAggregationSnapshot(List<ExprValue> rows) {
+      RelDataType rowType = compositeAggregationRowType;
+      if (rowType == null || rows.isEmpty()) {
+        return;
+      }
+      List<ExprValue> orderedRows = orderAggregationRows(rowType, rows);
+      publishPartialSafely(
+          listener,
+          new QueryResponse(buildSchema(rowType, orderedRows), List.copyOf(orderedRows), null));
+    }
+
+    @Override
+    public void onOperatorSnapshot(ProgressiveQueryContext.OperatorSnapshot snapshot) {
+      if (!operatorSnapshots
+          || snapshot.operatorIdentity() != operatorSnapshotTarget
+          || snapshot.rows().isEmpty()) {
+        return;
+      }
+      OperatorSnapshotWindow snapshotWindow = operatorSnapshotWindow;
+      int offset = snapshotWindow == null ? 0 : snapshotWindow.offset();
+      int from = Math.min(offset, snapshot.rows().size());
+      int count = snapshotWindow == null ? snapshot.rows().size() : snapshotWindow.count();
+      int to = Math.min(snapshot.rows().size(), saturatedAdd(from, count));
+      List<ExprValue> values = new ArrayList<>(to - from);
+      List<RelDataTypeField> fields = snapshot.rowType().getFieldList();
+      try {
+        for (int rowIndex = from; rowIndex < to; rowIndex++) {
+          Object[] raw = snapshot.rows().get(rowIndex);
+          Map<String, ExprValue> row = new LinkedHashMap<>();
+          for (int fieldIndex = 0; fieldIndex < fields.size(); fieldIndex++) {
+            RelDataTypeField field = fields.get(fieldIndex);
+            Object converted = processValue(raw[fieldIndex], field.getType());
+            row.put(field.getName(), ExprValueUtils.fromObjectValue(converted));
+          }
+          values.add(ExprTupleValue.fromExprValueMap(row));
+        }
+      } catch (SQLException | RuntimeException e) {
+        logger.warn(
+            "Failed to convert {} snapshot {} after {} source rows",
+            snapshot.operator(),
+            snapshot.snapshotSequence(),
+            snapshot.rowsConsumed(),
+            e);
+        return;
+      }
+      publishPartialSafely(
+          listener,
+          new QueryResponse(buildSchema(snapshot.rowType(), values), List.copyOf(values), null));
     }
 
     @Override

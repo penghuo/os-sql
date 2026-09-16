@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.opensearch.storage.scan;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -19,6 +20,7 @@ import org.opensearch.sql.expression.HighlightExpression;
 import org.opensearch.sql.monitor.ResourceMonitor;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.sql.opensearch.executor.ProgressiveQueryContext;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.tasks.CancellableTask;
 
@@ -60,6 +62,9 @@ public class OpenSearchIndexEnumerator implements Enumerator<Object> {
 
   private CancellableTask cancellableTask;
 
+  /** Finalized bucket rows accumulated across completed composite aggregation pages. */
+  private final List<ExprValue> compositeRows = new ArrayList<>();
+
   public OpenSearchIndexEnumerator(
       OpenSearchClient client,
       List<String> fields,
@@ -90,6 +95,16 @@ public class OpenSearchIndexEnumerator implements Enumerator<Object> {
 
   private Iterator<ExprValue> fetchNextBatch() {
     BackgroundSearchScanner.SearchBatchResult result = bgScanner.fetchNextBatch(request);
+    if (result.compositeAggregation()
+        && ProgressiveQueryContext.acceptsCompositeAggregationSnapshots()) {
+      List<ExprValue> page = new ArrayList<>();
+      result.iterator().forEachRemaining(page::add);
+      compositeRows.addAll(page);
+      if (!page.isEmpty()) {
+        ProgressiveQueryContext.publishCompositeAggregationSnapshot(compositeRows);
+      }
+      return page.iterator();
+    }
     return result.iterator();
   }
 
@@ -151,14 +166,16 @@ public class OpenSearchIndexEnumerator implements Enumerator<Object> {
   @Override
   public void reset() {
     bgScanner.reset(request);
-    iterator = bgScanner.fetchNextBatch(request).iterator();
     queryCount = 0;
+    compositeRows.clear();
+    iterator = fetchNextBatch();
   }
 
   @Override
   public void close() {
     iterator = Collections.emptyIterator();
     queryCount = 0;
+    compositeRows.clear();
     bgScanner.close();
     if (request != null) {
       client.forceCleanup(request);

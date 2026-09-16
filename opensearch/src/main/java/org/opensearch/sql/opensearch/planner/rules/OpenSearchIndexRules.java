@@ -18,18 +18,35 @@ public class OpenSearchIndexRules {
       EnumerableNestedAggregateRule.DEFAULT_CONFIG.toRule();
   private static final RelOptRule GRAPH_LOOKUP_RULE =
       EnumerableGraphLookupRule.DEFAULT_CONFIG.toRule();
+  private static final RelOptRule PROGRESSIVE_AGGREGATE_RULE =
+      ProgressiveEnumerableAggregateRule.INSTANCE;
+  private static final RelOptRule PROGRESSIVE_WINDOW_RULE =
+      ProgressiveEnumerableWindowRule.INSTANCE;
+  private static final RelOptRule PROGRESSIVE_DEDUP_RULE =
+      ProgressiveEnumerableDedupRule.DEFAULT_CONFIG.toRule();
+  private static final RelOptRule PROGRESSIVE_CALC_RULE = ProgressiveEnumerableCalcRule.INSTANCE;
+  private static final RelOptRule PROGRESSIVE_PHYSICAL_CALC_RULE =
+      ProgressivePhysicalCalcRule.INSTANCE;
   // Rule that always pushes down relevance functions regardless of pushdown settings
   private static final RelevanceFunctionPushdownRule RELEVANCE_FUNCTION_RULE =
       RelevanceFunctionPushdownRule.Config.DEFAULT.toRule();
 
+  /** Rules that self-gate on the active async planning or execution context. */
+  private static final List<RelOptRule> PROGRESSIVE_RULES =
+      ImmutableList.of(
+          PROGRESSIVE_AGGREGATE_RULE,
+          PROGRESSIVE_WINDOW_RULE,
+          PROGRESSIVE_DEDUP_RULE,
+          PROGRESSIVE_CALC_RULE,
+          PROGRESSIVE_PHYSICAL_CALC_RULE);
+
   /** The rules will apply whatever the pushdown setting is. */
   public static final List<RelOptRule> OPEN_SEARCH_NON_PUSHDOWN_RULES =
-      ImmutableList.of(
-          INDEX_SCAN_RULE,
-          CATALOG_SCAN_RULE,
-          NESTED_AGGREGATE_RULE,
-          GRAPH_LOOKUP_RULE,
-          RELEVANCE_FUNCTION_RULE);
+      ImmutableList.<RelOptRule>builder()
+          .add(INDEX_SCAN_RULE, CATALOG_SCAN_RULE, NESTED_AGGREGATE_RULE, GRAPH_LOOKUP_RULE)
+          .addAll(PROGRESSIVE_RULES)
+          .add(RELEVANCE_FUNCTION_RULE)
+          .build();
 
   private static final ProjectIndexScanRule PROJECT_INDEX_SCAN =
       ProjectIndexScanRule.Config.DEFAULT.toRule();

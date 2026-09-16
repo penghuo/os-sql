@@ -9,7 +9,10 @@ import org.apache.calcite.adapter.enumerable.EnumerableLimit;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.immutables.value.Value;
+import org.opensearch.sql.calcite.plan.ProgressivePlanningContext;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRuleConfig;
+import org.opensearch.sql.opensearch.executor.ProgressiveQueryContext;
+import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableIncrementalTopK;
 import org.opensearch.sql.opensearch.planner.physical.CalciteEnumerableTopK;
 
 /**
@@ -27,8 +30,11 @@ public class EnumerableTopKMergeRule extends InterruptibleRelRule<EnumerableTopK
     final EnumerableLimit limit = call.rel(0);
     final EnumerableSort sort = call.rel(1);
     final CalciteEnumerableTopK topK =
-        CalciteEnumerableTopK.create(
-            sort.getInput(), sort.getCollation(), limit.offset, limit.fetch);
+        (ProgressivePlanningContext.isActive() || ProgressiveQueryContext.isActive())
+            ? CalciteEnumerableIncrementalTopK.create(
+                sort.getInput(), sort.getCollation(), limit.offset, limit.fetch)
+            : CalciteEnumerableTopK.create(
+                sort.getInput(), sort.getCollation(), limit.offset, limit.fetch);
     call.transformTo(topK);
   }
 

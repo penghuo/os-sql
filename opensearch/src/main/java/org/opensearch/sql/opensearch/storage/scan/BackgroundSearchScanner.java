@@ -162,11 +162,12 @@ public class BackgroundSearchScanner {
    */
   public SearchBatchResult fetchNextBatch(OpenSearchRequest request) {
     OpenSearchResponse response = getCurrentResponse(request);
+    boolean compositeAggregation = response.isCompositeAggregationResponse();
 
     // Determine if we need future batches
     if (response.isCountResponse()) {
       stopIteration = true;
-    } else if (response.isCompositeAggregationResponse()) {
+    } else if (compositeAggregation) {
       // For composite aggregations, if we get fewer buckets than requested, we're done
       stopIteration = response.getCompositeBucketSize() < queryBucketSize;
     } else if (response.isAggregationResponse()) {
@@ -194,7 +195,7 @@ public class BackgroundSearchScanner {
       stopIteration = true;
     }
 
-    return new SearchBatchResult(iterator, stopIteration);
+    return new SearchBatchResult(iterator, stopIteration, compositeAggregation);
   }
 
   /**
@@ -219,5 +220,6 @@ public class BackgroundSearchScanner {
     }
   }
 
-  public record SearchBatchResult(Iterator<ExprValue> iterator, boolean stopIteration) {}
+  public record SearchBatchResult(
+      Iterator<ExprValue> iterator, boolean stopIteration, boolean compositeAggregation) {}
 }

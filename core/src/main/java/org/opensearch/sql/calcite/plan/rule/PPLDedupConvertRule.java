@@ -21,6 +21,7 @@ import org.apache.calcite.rex.RexWindowBounds;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.tools.RelBuilder;
 import org.immutables.value.Value;
+import org.opensearch.sql.calcite.plan.ProgressivePlanningContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalDedup;
 
 /**
@@ -45,6 +46,11 @@ public class PPLDedupConvertRule extends RelRule<PPLDedupConvertRule.Config> {
   /** Creates a PPLDedupConvertRule. */
   protected PPLDedupConvertRule(Config config) {
     super(config);
+  }
+
+  @Override
+  public boolean matches(RelOptRuleCall call) {
+    return !ProgressivePlanningContext.isActive();
   }
 
   @Override

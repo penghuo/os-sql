@@ -10,6 +10,10 @@ import static org.opensearch.sql.executor.ExecutionEngine.ExplainResponse.normal
 import static org.opensearch.sql.lang.PPLLangSpec.PPL_SPEC;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -20,7 +24,6 @@ import java.util.function.Supplier;
 import org.apache.calcite.rel.RelNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.json.JSONArray;
 import org.json.JSONObject;
 import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.ActionListenerResponseHandler;
@@ -91,6 +94,8 @@ public class TransportPPLQueryAction
 
   private static final Logger LOG = LogManager.getLogger(TransportPPLQueryAction.class);
   private static final String SECURITY_USER_INFO_THREAD_CONTEXT = "_opendistro_security_user_info";
+  private static final Gson ASYNC_RESPONSE_GSON =
+      new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
   private final Injector injector;
 
@@ -562,41 +567,39 @@ public class TransportPPLQueryAction
   }
 
   private TransportPPLQueryResponse formatFastPath(PPLAsyncQueryJobService.Snapshot snapshot) {
-    JSONObject json = formatRows(snapshot.response(), 0, Integer.MAX_VALUE, false);
-    json.put("status", snapshot.status().name());
-    json.put("took", snapshot.tookMillis());
-    json.put("start_time_in_millis", snapshot.startTimeMillis());
-    return new TransportPPLQueryResponse(json.toString(2));
+    JsonObject json = formatRows(snapshot.response(), 0, Integer.MAX_VALUE, false);
+    json.addProperty("status", snapshot.status().name());
+    json.addProperty("took", snapshot.tookMillis());
+    json.addProperty("start_time_in_millis", snapshot.startTimeMillis());
+    return new TransportPPLQueryResponse(ASYNC_RESPONSE_GSON.toJson(json));
   }
 
   private TransportPPLQueryResponse formatAsyncJob(
       PPLAsyncQueryJobService.Snapshot snapshot, int offset, int count) {
-    JSONObject json = formatRows(snapshot.response(), offset, count, true);
-    json.put("id", snapshot.id());
-    json.put("status", snapshot.status().name());
-    json.put("sequence", snapshot.sequence());
-    json.put("start_time_in_millis", snapshot.startTimeMillis());
-    json.put("expiration_time_in_millis", snapshot.expirationTimeMillis());
+    JsonObject json = formatRows(snapshot.response(), offset, count, true);
+    json.addProperty("id", snapshot.id());
+    json.addProperty("status", snapshot.status().name());
+    json.addProperty("sequence", snapshot.sequence());
+    json.addProperty("start_time_in_millis", snapshot.startTimeMillis());
+    json.addProperty("expiration_time_in_millis", snapshot.expirationTimeMillis());
     if (snapshot.classified()) {
-      json.put("update_mode", snapshot.updateMode().name());
+      json.addProperty("update_mode", snapshot.updateMode().name());
     }
-    json.put(
-        "progress",
-        new JSONObject()
-            .put("fraction_done", snapshot.progress().fractionDone())
-            .put("shards_total", snapshot.progress().shardsTotal())
-            .put("shards_completed", snapshot.progress().shardsCompleted()));
+    JsonObject progress = new JsonObject();
+    progress.addProperty("fraction_done", snapshot.progress().fractionDone());
+    progress.addProperty("shards_total", snapshot.progress().shardsTotal());
+    progress.addProperty("shards_completed", snapshot.progress().shardsCompleted());
+    json.add("progress", progress);
     if (snapshot.status() != PPLAsyncQueryJobService.Status.RUNNING) {
-      json.put("took", snapshot.tookMillis());
+      json.addProperty("took", snapshot.tookMillis());
     }
     if (snapshot.failure() != null) {
-      json.put(
-          "error",
-          new JSONObject()
-              .put("type", snapshot.failure().getClass().getSimpleName())
-              .put("reason", snapshot.failure().getMessage()));
+      JsonObject error = new JsonObject();
+      error.addProperty("type", snapshot.failure().getClass().getSimpleName());
+      error.addProperty("reason", snapshot.failure().getMessage());
+      json.add("error", error);
     }
-    return new TransportPPLQueryResponse(json.toString(2));
+    return new TransportPPLQueryResponse(ASYNC_RESPONSE_GSON.toJson(json));
   }
 
   private TransportPPLQueryResponse formatDeleteResponse(
@@ -608,17 +611,19 @@ public class TransportPPLQueryAction
             .toString(2));
   }
 
-  private static JSONObject formatRows(
+  static JsonObject formatRows(
       ExecutionEngine.QueryResponse response, int offset, int count, boolean includeWindow) {
     if (response == null) {
-      JSONObject empty =
-          new JSONObject()
-              .put("schema", new JSONArray())
-              .put("datarows", new JSONArray())
-              .put("total", 0)
-              .put("size", 0);
+      JsonObject empty = new JsonObject();
+      empty.add("schema", new JsonArray());
+      empty.add("datarows", new JsonArray());
+      empty.addProperty("total", 0);
+      empty.addProperty("size", 0);
       if (includeWindow) {
-        empty.put("window", new JSONObject().put("offset", offset).put("count", count));
+        JsonObject window = new JsonObject();
+        window.addProperty("offset", offset);
+        window.addProperty("count", count);
+        empty.add("window", window);
       }
       return empty;
     }
@@ -632,19 +637,18 @@ public class TransportPPLQueryAction
     windowed.setWarnings(List.copyOf(response.getWarnings()));
     SimpleJsonResponseFormatter formatter =
         new SimpleJsonResponseFormatter(JsonResponseFormatter.Style.PRETTY);
-    JSONObject json =
-        new JSONObject(
-            formatter.format(
-                new QueryResult(
-                    windowed.getSchema(),
-                    windowed.getResults(),
-                    null,
-                    PPL_SPEC,
-                    windowed.getWarnings())));
-    json.put("total", allRows.size());
-    json.put("size", to - from);
+    QueryResult result =
+        new QueryResult(
+            windowed.getSchema(), windowed.getResults(), null, PPL_SPEC, windowed.getWarnings());
+    JsonObject json =
+        ASYNC_RESPONSE_GSON.toJsonTree(formatter.buildJsonObject(result)).getAsJsonObject();
+    json.addProperty("total", allRows.size());
+    json.addProperty("size", to - from);
     if (includeWindow) {
-      json.put("window", new JSONObject().put("offset", offset).put("count", count));
+      JsonObject window = new JsonObject();
+      window.addProperty("offset", offset);
+      window.addProperty("count", count);
+      json.add("window", window);
     }
     return json;
   }

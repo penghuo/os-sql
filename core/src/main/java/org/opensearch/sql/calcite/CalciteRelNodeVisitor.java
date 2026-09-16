@@ -177,6 +177,8 @@ import org.opensearch.sql.calcite.plan.AbstractOpenSearchTable;
 import org.opensearch.sql.calcite.plan.AliasFieldsWrappable;
 import org.opensearch.sql.calcite.plan.HighlightPushDown;
 import org.opensearch.sql.calcite.plan.OpenSearchConstants;
+import org.opensearch.sql.calcite.plan.ProgressivePlanningContext;
+import org.opensearch.sql.calcite.plan.rel.LogicalDedup;
 import org.opensearch.sql.calcite.plan.rel.LogicalGraphLookup;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit.SystemLimitType;
@@ -2254,6 +2256,18 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     List<RexNode> dedupeFields =
         node.getFields().stream().map(f -> rexVisitor.analyze(f, context)).toList();
     RelCollation inputCollation = stripInputSort(context.relBuilder);
+    if (ProgressivePlanningContext.isActive()) {
+      PlanUtils.replaceTop(
+          context.relBuilder,
+          LogicalDedup.create(
+              context.relBuilder.peek(),
+              dedupeFields,
+              allowedDuplication,
+              keepEmpty,
+              consecutive,
+              inputCollation));
+      return context.relBuilder.peek();
+    }
     if (keepEmpty) {
       buildDedupOrNull(context.relBuilder, dedupeFields, allowedDuplication, inputCollation);
     } else {

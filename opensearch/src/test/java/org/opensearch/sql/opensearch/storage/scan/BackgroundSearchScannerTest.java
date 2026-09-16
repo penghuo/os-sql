@@ -67,6 +67,7 @@ class BackgroundSearchScannerTest {
 
     assertFalse(
         result.stopIteration(), "Expected iteration to continue after fetching one full page");
+    assertFalse(result.compositeAggregation());
     verify(syncClient, times(1)).search(request);
   }
 
@@ -102,6 +103,20 @@ class BackgroundSearchScannerTest {
     BackgroundSearchScanner.SearchBatchResult result = scanner.fetchNextBatch(request);
 
     assertTrue(scanner.isScanDone());
+  }
+
+  @Test
+  void identifiesCompositeAggregationPage() {
+    OpenSearchResponse response = mockResponse(false, false, 10);
+    when(response.isCompositeAggregationResponse()).thenReturn(true);
+    when(response.getCompositeBucketSize()).thenReturn(10);
+    when(client.search(request)).thenReturn(response);
+
+    scanner.startScanning(request);
+    BackgroundSearchScanner.SearchBatchResult result = scanner.fetchNextBatch(request);
+
+    assertTrue(result.compositeAggregation());
+    assertFalse(result.stopIteration());
   }
 
   @Test

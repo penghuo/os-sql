@@ -65,6 +65,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.data.model.ExprIntegerValue;
@@ -74,6 +75,8 @@ import org.opensearch.sql.opensearch.data.type.OpenSearchAliasType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchTextType;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
+import org.opensearch.sql.opensearch.executor.CalciteStateQueryContext;
+import org.opensearch.sql.opensearch.executor.StateStore;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchQueryRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
@@ -146,6 +149,26 @@ class OpenSearchNodeClientTest {
     when(nodeClient.admin().indices().create(any())).thenThrow(RuntimeException.class);
 
     assertThrows(IllegalStateException.class, () -> client.createIndex("test", ImmutableMap.of()));
+  }
+
+  @Test
+  void aggregation_state_adapter_publishes_partial_reduce_as_replace_snapshot() {
+    OpenSearchRequest request = mock(OpenSearchRequest.class);
+    InternalAggregations aggregations = mock(InternalAggregations.class);
+    TotalHits totalHits = new TotalHits(10, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+    ExprValue row = ExprTupleValue.fromExprValueMap(Map.of("count", new ExprIntegerValue(10)));
+    when(request.parseAggregationSnapshot(totalHits, aggregations)).thenReturn(List.of(row));
+    StateStore store = new StateStore(StateStore.UpdateMode.REPLACE);
+
+    try (CalciteStateQueryContext.Scope ignored = CalciteStateQueryContext.open(store)) {
+      OpenSearchNodeClient.AggregationStateAdapter adapter =
+          new OpenSearchNodeClient.AggregationStateAdapter(
+              request, CalciteStateQueryContext.capture());
+      adapter.onPartialReduce(List.of(), totalHits, aggregations, 1);
+    }
+
+    assertEquals(1, store.snapshot().generation());
+    assertEquals(List.of(row), store.snapshot().segments().getFirst());
   }
 
   @Test

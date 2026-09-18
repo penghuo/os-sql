@@ -17,6 +17,7 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.lucene.search.TotalHits;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -31,8 +32,10 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.sql.common.error.ErrorCode;
 import org.opensearch.sql.common.error.ErrorReport;
+import org.opensearch.sql.opensearch.executor.CalciteStateQueryContext;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
@@ -43,6 +46,8 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch connection by node client. */
 public class OpenSearchNodeClient implements OpenSearchClient {
+  private static final int STATE_AGGREGATION_BATCHED_REDUCE_SIZE = 5;
+  private static final long STATE_AGGREGATION_INTERVAL_NANOS = 500_000_000L;
 
   public static final Function<String, Predicate<String>> ALL_FIELDS =
       (anyIndex -> (anyField -> true));
@@ -166,9 +171,64 @@ public class OpenSearchNodeClient implements OpenSearchClient {
     return request.search(
         req -> {
           applyParentTask(req);
-          return client.search(req).actionGet();
+          return executeSearch(req, request);
         },
         req -> client.searchScroll(req).actionGet());
+  }
+
+  private SearchResponse executeSearch(SearchRequest request, OpenSearchRequest sqlRequest) {
+    if (!CalciteStateQueryContext.isActive() || !sqlRequest.supportsAggregationSnapshots()) {
+      return client.search(request).actionGet();
+    }
+    AggregationStateAdapter adapter =
+        new AggregationStateAdapter(sqlRequest, CalciteStateQueryContext.capture());
+    SearchRequest monitored =
+        new SearchRequest(request) {
+          @Override
+          public SearchTask createTask(
+              long id,
+              String type,
+              String action,
+              TaskId parentTaskId,
+              Map<String, String> headers) {
+            SearchTask task = super.createTask(id, type, action, parentTaskId, headers);
+            task.setProgressListener(adapter);
+            return task;
+          }
+        };
+    monitored.setBatchedReduceSize(
+        Math.min(monitored.getBatchedReduceSize(), STATE_AGGREGATION_BATCHED_REDUCE_SIZE));
+    return client.search(monitored).actionGet();
+  }
+
+  static final class AggregationStateAdapter extends SearchProgressListener {
+    private final OpenSearchRequest request;
+    private final CalciteStateQueryContext.Captured context;
+    private long lastPublishedNanos = Long.MIN_VALUE;
+
+    AggregationStateAdapter(OpenSearchRequest request, CalciteStateQueryContext.Captured context) {
+      this.request = request;
+      this.context = context;
+    }
+
+    @Override
+    protected synchronized void onPartialReduce(
+        List<SearchShard> shards,
+        TotalHits totalHits,
+        InternalAggregations aggregations,
+        int reducePhase) {
+      long now = System.nanoTime();
+      if (lastPublishedNanos != Long.MIN_VALUE
+          && now - lastPublishedNanos < STATE_AGGREGATION_INTERVAL_NANOS) {
+        return;
+      }
+      List<org.opensearch.sql.data.model.ExprValue> rows =
+          request.parseAggregationSnapshot(totalHits, aggregations);
+      if (!rows.isEmpty()) {
+        lastPublishedNanos = now;
+        context.publish(rows);
+      }
+    }
   }
 
   private void applyParentTask(SearchRequest req) {

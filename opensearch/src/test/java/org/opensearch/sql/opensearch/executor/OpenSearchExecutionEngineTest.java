@@ -50,7 +50,10 @@ import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
 import org.opensearch.sql.opensearch.executor.protector.OpenSearchExecutionProtector;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
+import org.opensearch.sql.opensearch.storage.scan.CalciteEnumerableIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
+import org.opensearch.sql.opensearch.storage.scan.context.AggSpec;
+import org.opensearch.sql.opensearch.storage.scan.context.PushDownContext;
 import org.opensearch.sql.planner.SerializablePlan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 import org.opensearch.sql.storage.TableScanOperator;
@@ -302,6 +305,41 @@ class OpenSearchExecutionEngineTest {
         };
 
     assertFalse(OpenSearchExecutionEngine.isPitContextLimitReached(selfReferential));
+  }
+
+  @Test
+  void plain_scan_supports_stable_root_rows() {
+    CalciteEnumerableIndexScan scan = mock(CalciteEnumerableIndexScan.class);
+    PushDownContext pushDownContext = mock(PushDownContext.class);
+    when(scan.getPushDownContext()).thenReturn(pushDownContext);
+
+    assertTrue(OpenSearchExecutionEngine.supportsStableRootRows(scan));
+  }
+
+  @Test
+  void non_composite_aggregation_supports_source_snapshots() {
+    CalciteEnumerableIndexScan scan = mock(CalciteEnumerableIndexScan.class);
+    PushDownContext pushDownContext = mock(PushDownContext.class);
+    AggSpec aggSpec = mock(AggSpec.class);
+    when(scan.getPushDownContext()).thenReturn(pushDownContext);
+    when(pushDownContext.getAggSpec()).thenReturn(aggSpec);
+    when(aggSpec.isCompositeAggregation()).thenReturn(false);
+
+    assertTrue(OpenSearchExecutionEngine.supportsAggregationSnapshots(scan));
+    assertFalse(OpenSearchExecutionEngine.supportsCompositePartialResults(scan));
+  }
+
+  @Test
+  void composite_aggregation_supports_root_replacement_snapshots() {
+    CalciteEnumerableIndexScan scan = mock(CalciteEnumerableIndexScan.class);
+    PushDownContext pushDownContext = mock(PushDownContext.class);
+    AggSpec aggSpec = mock(AggSpec.class);
+    when(scan.getPushDownContext()).thenReturn(pushDownContext);
+    when(pushDownContext.getAggSpec()).thenReturn(aggSpec);
+    when(aggSpec.isCompositeAggregation()).thenReturn(true);
+
+    assertTrue(OpenSearchExecutionEngine.supportsCompositePartialResults(scan));
+    assertFalse(OpenSearchExecutionEngine.supportsAggregationSnapshots(scan));
   }
 
   @RequiredArgsConstructor

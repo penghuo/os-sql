@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import lombok.SneakyThrows;
 import org.apache.commons.lang3.reflect.FieldUtils;
 import org.apache.lucene.search.TotalHits;
@@ -65,6 +66,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.data.model.ExprIntegerValue;
@@ -74,6 +76,7 @@ import org.opensearch.sql.opensearch.data.type.OpenSearchAliasType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchTextType;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
+import org.opensearch.sql.opensearch.executor.PartialResultContext;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchQueryRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
@@ -146,6 +149,23 @@ class OpenSearchNodeClientTest {
     when(nodeClient.admin().indices().create(any())).thenThrow(RuntimeException.class);
 
     assertThrows(IllegalStateException.class, () -> client.createIndex("test", ImmutableMap.of()));
+  }
+
+  @Test
+  void aggregation_listener_publishes_parsed_source_rows() {
+    OpenSearchRequest request = mock(OpenSearchRequest.class);
+    when(request.parseAggregationSnapshot(any(), any())).thenReturn(List.of(exprTupleValue));
+    AtomicReference<List<ExprValue>> observed = new AtomicReference<>();
+
+    try (PartialResultContext.Scope ignored = PartialResultContext.open(observed::set)) {
+      OpenSearchNodeClient.AggregationSnapshotAdapter listener =
+          new OpenSearchNodeClient.AggregationSnapshotAdapter(
+              request, PartialResultContext.capture());
+      listener.onPartialReduce(
+          List.of(), new TotalHits(1, TotalHits.Relation.EQUAL_TO), InternalAggregations.EMPTY, 1);
+    }
+
+    assertEquals(List.of(exprTupleValue), observed.get());
   }
 
   @Test

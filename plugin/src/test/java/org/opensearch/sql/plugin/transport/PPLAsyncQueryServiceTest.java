@@ -29,6 +29,7 @@ import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
+import org.opensearch.sql.executor.ProgressiveQueryContext;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.TaskManager;
 
@@ -55,7 +56,8 @@ public class PPLAsyncQueryServiceTest {
               responses.incrementAndGet();
             }));
     now.addAndGet(25);
-    service.complete(id, response(2));
+    service.attachContext(id, context(response(2)));
+    service.complete(id);
 
     assertEquals(1, responses.get());
     assertNull(result.get().id());
@@ -85,7 +87,8 @@ public class PPLAsyncQueryServiceTest {
     assertEquals(1, service.retainedJobCount());
 
     now.addAndGet(25);
-    service.complete(id, response(2));
+    service.attachContext(id, context(response(2)));
+    service.complete(id);
     PPLAsyncQueryService.JobSnapshot completed = service.get(id, OWNER, null);
 
     assertEquals(id, completed.id());
@@ -176,7 +179,8 @@ public class PPLAsyncQueryServiceTest {
     CancellableTask task = mock(CancellableTask.class);
     String id = createJob(task);
     service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
-    service.complete(id, response(1));
+    service.attachContext(id, context(response(1)));
+    service.complete(id);
 
     PPLAsyncQueryService.DeleteResult result = service.delete(id, OWNER);
 
@@ -241,10 +245,28 @@ public class PPLAsyncQueryServiceTest {
         new QueryResponse(
             new Schema(List.of(new Column("state", null, ExprCoreType.STRING))), rows, null);
 
-    service.complete(id, response);
+    service.attachContext(id, context(response));
+    service.complete(id);
     rows.add(ExprValueUtils.stringValue("second"));
 
     assertEquals(1, result.get().response().getResults().size());
+  }
+
+  @Test
+  public void runningSnapshotReadsTheCurrentContextResult() {
+    String id = createJob(null);
+    AtomicReference<QueryResponse> current = new AtomicReference<>(response(1));
+    service.attachContext(id, context(current));
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
+    service.awaitSubmit(id, TimeValue.ZERO, listener(submit::set));
+
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, submit.get().status());
+    assertEquals(1, submit.get().response().getResults().size());
+
+    current.set(response(3));
+    PPLAsyncQueryService.JobSnapshot polled = service.get(id, OWNER, null);
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, polled.status());
+    assertEquals(3, polled.response().getResults().size());
   }
 
   @Test
@@ -298,5 +320,21 @@ public class PPLAsyncQueryServiceTest {
             .mapToObj(i -> ExprValueUtils.stringValue("state-" + i))
             .toList(),
         null);
+  }
+
+  private static ProgressiveQueryContext context(QueryResponse response) {
+    return context(new AtomicReference<>(response));
+  }
+
+  private static ProgressiveQueryContext context(AtomicReference<QueryResponse> response) {
+    return new ProgressiveQueryContext() {
+      @Override
+      public QueryResponse currentResult() {
+        return response.get();
+      }
+
+      @Override
+      public void close() {}
+    };
   }
 }

@@ -38,6 +38,8 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.ProgressiveQueryContext;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -488,11 +490,16 @@ public class TransportPPLQueryAction
 
   private ResponseListener<ExecutionEngine.QueryResponse> createAsyncListener(
       String jobId, RegisteredAsyncTask registeredTask) {
-    return new ResponseListener<>() {
+    return new ProgressiveQueryResponseListener() {
+      @Override
+      public void onContextReady(ProgressiveQueryContext context) {
+        asyncQueryService.attachContext(jobId, context);
+      }
+
       @Override
       public void onResponse(ExecutionEngine.QueryResponse response) {
         try {
-          asyncQueryService.complete(jobId, response);
+          asyncQueryService.complete(jobId);
         } finally {
           registeredTask.close();
           clearRequestScopedState();

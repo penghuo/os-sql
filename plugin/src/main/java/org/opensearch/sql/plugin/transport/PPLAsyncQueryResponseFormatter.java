@@ -18,10 +18,7 @@ import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 final class PPLAsyncQueryResponseFormatter {
 
   TransportPPLQueryResponse format(PPLAsyncQueryService.JobSnapshot snapshot) {
-    JSONObject json =
-        snapshot.status() == PPLAsyncQueryService.Status.SUCCEEDED
-            ? formatRows(snapshot.response())
-            : emptyResult();
+    JSONObject json = snapshot.response() == null ? emptyResult() : formatRows(snapshot.response());
 
     if (snapshot.id() != null) {
       json.put("id", snapshot.id());

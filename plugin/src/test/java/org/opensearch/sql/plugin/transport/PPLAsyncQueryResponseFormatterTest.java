@@ -74,6 +74,26 @@ public class PPLAsyncQueryResponseFormatterTest {
   }
 
   @Test
+  public void runningResponseMayContainCurrentRows() {
+    QueryResponse response =
+        new QueryResponse(
+            new Schema(List.of(new Column("event_id", null, ExprCoreType.LONG))),
+            List.of(
+                ExprValueUtils.tupleValue(new LinkedHashMap<>(java.util.Map.of("event_id", 7L)))),
+            null);
+
+    JSONObject json =
+        json(
+            formatter.format(
+                new PPLAsyncQueryService.JobSnapshot(
+                    "job-id", PPLAsyncQueryService.Status.RUNNING, response, null, -1)));
+
+    assertEquals("RUNNING", json.getString("status"));
+    assertEquals(1, json.getJSONArray("datarows").length());
+    assertEquals(7L, json.getJSONArray("datarows").getJSONArray(0).getLong(0));
+  }
+
+  @Test
   public void failedResponseContainsSanitizedLifecycleShape() {
     JSONObject json =
         json(

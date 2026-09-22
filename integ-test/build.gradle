@@ -490,6 +490,10 @@ testClusters {
         setting "plugins.query.datasources.encryption.masterkey", "1234567812345678"
         // Only /_cluster/health is registered; pin the allow-list to it for the rest ITs.
         setting 'plugins.ppl.rest.allowed_endpoints', '/_cluster/health'
+        if (System.getProperty("ppl.progressive.prototype") == "true") {
+            jvmArgs '-Xms16g'
+            jvmArgs '-Xmx16g'
+        }
     }
     tracingIntegTest {
         testDistribution = 'archive'

@@ -55,11 +55,26 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     TimeoutHandle schedule(TimeValue delay, Runnable task);
   }
 
-  record Snapshot(
+  /**
+   * Detached point-in-time view of a job used to build an HTTP response.
+   *
+   * <p>This is an internal response model, not part of the public API. The public API is the JSON
+   * produced by {@link PPLAsyncQueryResponseFormatter}. A snapshot deliberately copies data out of
+   * the mutable {@link Job}, so response formatting never reads live job state.
+   *
+   * @param id opaque job ID, or {@code null} for a terminal response returned directly by submit
+   * @param status lifecycle state captured with the result
+   * @param response complete query result for {@link Status#SUCCEEDED}, otherwise {@code null}
+   * @param failure sanitized failure for {@link Status#FAILED}, otherwise {@code null}
+   * @param tookMillis elapsed execution time, available for a completed job
+   */
+  record JobSnapshot(
       String id, Status status, QueryResponse response, Failure failure, long tookMillis) {}
 
+  /** Response model returned after DELETE removes a retained job. */
   record DeleteResult(String id, Status status) {}
 
+  /** Sanitized failure retained by a job; raw exception messages are not stored. */
   record Failure(String type, String reason) {
     private static Failure from(Exception exception) {
       String type =
@@ -172,14 +187,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   }
 
   boolean awaitSubmit(
-      String id, TimeValue waitForCompletion, ActionListener<Snapshot> responseListener) {
+      String id, TimeValue waitForCompletion, ActionListener<JobSnapshot> responseListener) {
     validateWaitForCompletion(waitForCompletion);
     LocatedJob located = findLocal(id);
     SubmitWaiter waiter = new SubmitWaiter(responseListener);
-    Registration registration =
+    SubmitRegistration registration =
         located.job.registerSubmitWaiter(waiter, waitForCompletion.millis() == 0);
-    if (registration.publication != null) {
-      applyPublication(located, registration.publication);
+    if (registration.immediateTransition != null) {
+      applyTransition(located, registration.immediateTransition);
       return true;
     }
 
@@ -188,7 +203,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
           timeoutScheduler.schedule(
               waitForCompletion,
               () ->
-                  applyPublication(
+                  applyTransition(
                       located, located.job.timeout(waiter, currentTimeMillis.getAsLong())));
       waiter.setTimeout(timeout);
       return true;
@@ -203,22 +218,21 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   void complete(String id, QueryResponse response) {
     LocatedJob located = findInternal(id);
     if (located != null) {
-      applyPublication(
-          located, located.job.complete(copy(response), currentTimeMillis.getAsLong()));
+      applyTransition(located, located.job.complete(copy(response), currentTimeMillis.getAsLong()));
     }
   }
 
   void fail(String id, Exception failure) {
     LocatedJob located = findInternal(id);
     if (located != null) {
-      applyPublication(
+      applyTransition(
           located,
           located.job.fail(
               Failure.from(Objects.requireNonNull(failure)), currentTimeMillis.getAsLong()));
     }
   }
 
-  Snapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
+  JobSnapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
     if (requestedKeepAlive != null) {
       validateKeepAlive(requestedKeepAlive);
     }
@@ -294,18 +308,26 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  private void applyPublication(LocatedJob located, Publication publication) {
-    if (publication == null) {
+  /**
+   * Applies side effects selected by a {@link Job} transition.
+   *
+   * <p>The job decides its state change while holding the job lock, then returns a value describing
+   * the required side effects. Map mutation, capacity accounting, and listener callbacks happen
+   * here after the lock has been released.
+   */
+  private void applyTransition(LocatedJob located, JobTransition transition) {
+    if (transition == null) {
       return;
     }
-    if (publication.releaseRunning) {
+    if (transition.runningSlotAction == RunningSlotAction.RELEASE) {
       releaseRunning();
     }
-    if (publication.remove && jobs.remove(located.contextId, located.job)) {
+    if (transition.jobRetention == JobRetention.REMOVE
+        && jobs.remove(located.contextId, located.job)) {
       releaseRetained();
     }
-    if (publication.waiter != null) {
-      publication.waiter.respond(publication.snapshot);
+    if (transition.submitResponse != null) {
+      transition.submitResponse.waiter.respond(transition.submitResponse.snapshot);
     }
   }
 
@@ -314,7 +336,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       return;
     }
     if (jobs.remove(located.contextId, located.job)) {
-      if (removal.releaseRunning) {
+      if (removal.releaseRunningSlot) {
         releaseRunning();
       }
       releaseRetained();
@@ -439,17 +461,76 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
 
   private record LocatedJob(String contextId, Job job) {}
 
-  private record Registration(Publication publication) {
-    private static Registration waiting() {
-      return new Registration(null);
+  /**
+   * Result of attaching the original POST listener to a job.
+   *
+   * @param immediateTransition non-null when submit must respond immediately; null when the waiter
+   *     was attached and the query/timeout race should continue
+   */
+  private record SubmitRegistration(JobTransition immediateTransition) {
+    private static SubmitRegistration waiting() {
+      return new SubmitRegistration(null);
+    }
+
+    private static SubmitRegistration respondImmediately(JobTransition transition) {
+      return new SubmitRegistration(transition);
     }
   }
 
-  private record Publication(
-      Snapshot snapshot, SubmitWaiter waiter, boolean remove, boolean releaseRunning) {}
+  /** Whether the service should keep or remove the job after applying a transition. */
+  private enum JobRetention {
+    RETAIN,
+    REMOVE
+  }
 
-  private record Access(Snapshot snapshot, Removal removal) {
-    private static Access snapshot(Snapshot snapshot) {
+  /** Whether a transition keeps or releases the per-node running-query capacity slot. */
+  private enum RunningSlotAction {
+    KEEP,
+    RELEASE
+  }
+
+  /**
+   * The original POST response selected by a job transition.
+   *
+   * <p>It is absent after submit already returned a job ID; in that case a later GET creates a new
+   * snapshot from the retained job.
+   *
+   * @param snapshot point-in-time job data to format for the POST response
+   * @param waiter one-shot listener for the POST request that is still waiting
+   */
+  private record SubmitResponse(JobSnapshot snapshot, SubmitWaiter waiter) {}
+
+  /**
+   * Side effects selected atomically by a {@link Job} state transition.
+   *
+   * @param submitResponse response for the original POST, or {@code null} when POST already
+   *     returned
+   * @param jobRetention whether the owner-node job map keeps or removes the job
+   * @param runningSlotAction whether this transition releases running-query capacity
+   */
+  private record JobTransition(
+      SubmitResponse submitResponse,
+      JobRetention jobRetention,
+      RunningSlotAction runningSlotAction) {
+
+    private static JobTransition respond(
+        JobSnapshot snapshot,
+        SubmitWaiter waiter,
+        JobRetention jobRetention,
+        RunningSlotAction runningSlotAction) {
+      return new JobTransition(
+          new SubmitResponse(snapshot, waiter), jobRetention, runningSlotAction);
+    }
+
+    private static JobTransition withoutSubmitResponse(
+        JobRetention jobRetention, RunningSlotAction runningSlotAction) {
+      return new JobTransition(null, jobRetention, runningSlotAction);
+    }
+  }
+
+  /** Result of reading a job: either a snapshot or removal of an expired job. */
+  private record Access(JobSnapshot snapshot, Removal removal) {
+    private static Access snapshot(JobSnapshot snapshot) {
       return new Access(snapshot, null);
     }
 
@@ -458,19 +539,34 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
+  /**
+   * Side effects required after DELETE, expiry, abort, or service shutdown removes a job.
+   *
+   * @param responseStatus status returned by DELETE when applicable
+   * @param task running task to cancel, or {@code null} for a terminal job
+   * @param reason non-sensitive cancellation reason
+   * @param expired whether the caller should observe the removal as not found
+   * @param releaseRunningSlot whether running-query capacity must be released
+   */
   private record Removal(
       Status responseStatus,
       CancellableTask task,
       String reason,
       boolean expired,
-      boolean releaseRunning) {}
+      boolean releaseRunningSlot) {}
 
+  /**
+   * One-shot responder for the original asynchronous POST request.
+   *
+   * <p>Query completion and the submit timeout race to use this waiter. The atomic guard guarantees
+   * that exactly one path invokes the external listener.
+   */
   private static final class SubmitWaiter {
-    private final ActionListener<Snapshot> listener;
+    private final ActionListener<JobSnapshot> listener;
     private final AtomicBoolean responded = new AtomicBoolean();
     private volatile TimeoutHandle timeout;
 
-    private SubmitWaiter(ActionListener<Snapshot> listener) {
+    private SubmitWaiter(ActionListener<JobSnapshot> listener) {
       this.listener = Objects.requireNonNull(listener);
     }
 
@@ -481,7 +577,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       }
     }
 
-    private void respond(Snapshot snapshot) {
+    private void respond(JobSnapshot snapshot) {
       if (responded.compareAndSet(false, true)) {
         TimeoutHandle scheduled = timeout;
         if (scheduled != null) {
@@ -502,6 +598,13 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
+  /**
+   * Mutable state machine for one asynchronous PPL query.
+   *
+   * <p>Every lifecycle and lease transition is synchronized on this object. Methods mutate only
+   * job-owned state and return immutable transition values; they never call listeners, mutate the
+   * service map, update capacity counters, or cancel tasks while holding the lock.
+   */
   private static final class Job {
     private final String id;
     private final PPLAsyncQueryUser owner;
@@ -531,7 +634,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       this.task = task;
     }
 
-    private synchronized Registration registerSubmitWaiter(
+    private synchronized SubmitRegistration registerSubmitWaiter(
         SubmitWaiter waiter, boolean returnImmediately) {
       ensurePresent();
       if (submitWaiter != null) {
@@ -539,29 +642,35 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       }
       if (status != Status.RUNNING) {
         removed = true;
-        return new Registration(new Publication(snapshot(false), waiter, true, false));
+        return SubmitRegistration.respondImmediately(
+            JobTransition.respond(
+                snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.KEEP));
       }
       if (returnImmediately) {
-        return new Registration(new Publication(snapshot(true), waiter, false, false));
+        return SubmitRegistration.respondImmediately(
+            JobTransition.respond(
+                snapshot(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP));
       }
       submitWaiter = waiter;
-      return Registration.waiting();
+      return SubmitRegistration.waiting();
     }
 
-    private synchronized Publication timeout(SubmitWaiter waiter, long now) {
+    private synchronized JobTransition timeout(SubmitWaiter waiter, long now) {
       if (removed || submitWaiter != waiter) {
         return null;
       }
       submitWaiter = null;
       if (status == Status.RUNNING) {
         expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-        return new Publication(snapshot(true), waiter, false, false);
+        return JobTransition.respond(
+            snapshot(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP);
       }
       removed = true;
-      return new Publication(snapshot(false), waiter, true, false);
+      return JobTransition.respond(
+          snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.KEEP);
     }
 
-    private synchronized Publication complete(QueryResponse response, long now) {
+    private synchronized JobTransition complete(QueryResponse response, long now) {
       if (removed || status != Status.RUNNING) {
         return null;
       }
@@ -572,7 +681,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       return terminalPublication();
     }
 
-    private synchronized Publication fail(Failure failure, long now) {
+    private synchronized JobTransition fail(Failure failure, long now) {
       if (removed || status != Status.RUNNING) {
         return null;
       }
@@ -583,14 +692,15 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       return terminalPublication();
     }
 
-    private Publication terminalPublication() {
+    private JobTransition terminalPublication() {
       SubmitWaiter waiter = submitWaiter;
       submitWaiter = null;
       if (waiter != null) {
         removed = true;
-        return new Publication(snapshot(false), waiter, true, true);
+        return JobTransition.respond(
+            snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.RELEASE);
       }
-      return new Publication(snapshot(true), null, false, true);
+      return JobTransition.withoutSubmitResponse(JobRetention.RETAIN, RunningSlotAction.RELEASE);
     }
 
     private synchronized Access get(
@@ -668,10 +778,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       return new Removal(status, taskToCancel, reason, false, wasRunning);
     }
 
-    private Snapshot snapshot(boolean includeId) {
+    private JobSnapshot snapshot(boolean includeId) {
       long tookMillis =
           completionTimeMillis < 0 ? -1L : Math.max(0L, completionTimeMillis - startTimeMillis);
-      return new Snapshot(includeId ? id : null, status, response, failure, tookMillis);
+      return new JobSnapshot(includeId ? id : null, status, response, failure, tookMillis);
     }
 
     private void ensurePresent() {

@@ -27,7 +27,7 @@ public class PPLAsyncQueryResponseFormatterTest {
     JSONObject json =
         json(
             formatter.format(
-                new PPLAsyncQueryService.Snapshot(
+                new PPLAsyncQueryService.JobSnapshot(
                     "job-id", PPLAsyncQueryService.Status.RUNNING, null, null, -1)));
 
     assertEquals("job-id", json.getString("id"));
@@ -60,7 +60,7 @@ public class PPLAsyncQueryResponseFormatterTest {
     JSONObject json =
         json(
             formatter.format(
-                new PPLAsyncQueryService.Snapshot(
+                new PPLAsyncQueryService.JobSnapshot(
                     null, PPLAsyncQueryService.Status.SUCCEEDED, response, null, 42)));
 
     assertFalse(json.has("id"));
@@ -78,7 +78,7 @@ public class PPLAsyncQueryResponseFormatterTest {
     JSONObject json =
         json(
             formatter.format(
-                new PPLAsyncQueryService.Snapshot(
+                new PPLAsyncQueryService.JobSnapshot(
                     "job-id",
                     PPLAsyncQueryService.Status.FAILED,
                     null,

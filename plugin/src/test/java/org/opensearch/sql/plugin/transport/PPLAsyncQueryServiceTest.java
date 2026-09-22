@@ -43,7 +43,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void fastSuccessReturnsDirectResultWithoutRetainingJob() {
     String id = createJob(null);
-    AtomicReference<PPLAsyncQueryService.Snapshot> result = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     AtomicInteger responses = new AtomicInteger();
 
     service.awaitSubmit(
@@ -73,7 +73,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void timeoutReturnsIdAndLaterGetReturnsCompleteResult() {
     String id = createJob(null);
-    AtomicReference<PPLAsyncQueryService.Snapshot> submit = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
     service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     timeoutTask.get().run();
@@ -86,7 +86,7 @@ public class PPLAsyncQueryServiceTest {
 
     now.addAndGet(25);
     service.complete(id, response(2));
-    PPLAsyncQueryService.Snapshot completed = service.get(id, OWNER, null);
+    PPLAsyncQueryService.JobSnapshot completed = service.get(id, OWNER, null);
 
     assertEquals(id, completed.id());
     assertEquals(PPLAsyncQueryService.Status.SUCCEEDED, completed.status());
@@ -98,7 +98,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void submitWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
     String id = service.create(OWNER, TimeValue.timeValueSeconds(1), null);
-    AtomicReference<PPLAsyncQueryService.Snapshot> submit = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
     service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     now.addAndGet(TimeValue.timeValueSeconds(2).millis());
@@ -121,7 +121,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void fastFailureReturnsDirectFailureWithoutId() {
     String id = createJob(null);
-    AtomicReference<PPLAsyncQueryService.Snapshot> result = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(result::set));
 
     service.fail(id, new IllegalStateException("boom"));
@@ -141,7 +141,7 @@ public class PPLAsyncQueryServiceTest {
     service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
 
     now.addAndGet(TimeValue.timeValueMinutes(4).millis());
-    PPLAsyncQueryService.Snapshot renewed = service.get(id, OWNER, null);
+    PPLAsyncQueryService.JobSnapshot renewed = service.get(id, OWNER, null);
     assertEquals(PPLAsyncQueryService.Status.RUNNING, renewed.status());
 
     now.addAndGet(TimeValue.timeValueMinutes(4).millis());
@@ -233,7 +233,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void finalSnapshotDefensivelyCopiesRows() {
     String id = createJob(null);
-    AtomicReference<PPLAsyncQueryService.Snapshot> result = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(result::set));
     List<org.opensearch.sql.data.model.ExprValue> rows = new ArrayList<>();
     rows.add(ExprValueUtils.stringValue("first"));
@@ -281,8 +281,8 @@ public class PPLAsyncQueryServiceTest {
     return service.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, task);
   }
 
-  private static ActionListener<PPLAsyncQueryService.Snapshot> listener(
-      java.util.function.Consumer<PPLAsyncQueryService.Snapshot> consumer) {
+  private static ActionListener<PPLAsyncQueryService.JobSnapshot> listener(
+      java.util.function.Consumer<PPLAsyncQueryService.JobSnapshot> consumer) {
     return ActionListener.wrap(
         snapshot -> consumer.accept(snapshot),
         failure -> {

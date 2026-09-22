@@ -24,6 +24,7 @@ import org.opensearch.sql.executor.DefaultQueryManager;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
+import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.executor.pagination.Cursor;
@@ -113,6 +114,27 @@ public class PPLServiceTest {
         new PPLQueryRequest("search source=t a=1", null, QUERY),
         getQueryListener(false),
         getExplainListener(false));
+  }
+
+  @Test
+  public void testExecuteProgressivelyReturnsCompletionHandle() {
+    doAnswer(
+            invocation -> {
+              ResponseListener<QueryResponse> listener = invocation.getArgument(4);
+              listener.onResponse(new QueryResponse(schema, Collections.emptyList(), Cursor.None));
+              return null;
+            })
+        .when(queryService)
+        .execute(any(), any(), any(), anyBoolean(), any());
+
+    ProgressiveQueryExecution execution =
+        pplService.executeProgressively(
+            new PPLQueryRequest("search source=t a=1", null, QUERY),
+            getExplainListener(false),
+            PPLService.NO_ANONYMIZED_QUERY_SINK);
+
+    execution.completion().toCompletableFuture().join();
+    Assert.assertTrue(execution.completion().toCompletableFuture().isDone());
   }
 
   @Test

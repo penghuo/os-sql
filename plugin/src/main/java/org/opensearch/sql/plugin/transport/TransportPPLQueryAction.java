@@ -38,8 +38,7 @@ import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
 import org.opensearch.sql.executor.ExecutionEngine;
-import org.opensearch.sql.executor.ProgressiveQueryContext;
-import org.opensearch.sql.executor.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -462,11 +461,25 @@ public class TransportPPLQueryAction
 
     OpenSearchQueryManager.setCancellableTask(registeredTask.task());
     try {
-      pplService.execute(
-          request,
-          createAsyncListener(jobId, registeredTask),
-          createAsyncExplainListener(jobId, registeredTask),
-          anonymizedQuerySink);
+      ProgressiveQueryExecution execution =
+          pplService.executeProgressively(
+              request, createAsyncExplainListener(jobId, registeredTask), anonymizedQuerySink);
+      asyncQueryService.attachExecution(jobId, execution);
+      execution
+          .completion()
+          .whenComplete(
+              (ignored, failure) -> {
+                try {
+                  if (failure == null) {
+                    asyncQueryService.complete(jobId);
+                  } else {
+                    asyncQueryService.fail(jobId, asException(failure));
+                  }
+                } finally {
+                  registeredTask.close();
+                  clearRequestScopedState();
+                }
+              });
     } catch (Exception e) {
       try {
         asyncQueryService.fail(jobId, e);
@@ -488,34 +501,12 @@ public class TransportPPLQueryAction
     return new RegisteredAsyncTask(taskManager, pplQueryTask);
   }
 
-  private ResponseListener<ExecutionEngine.QueryResponse> createAsyncListener(
-      String jobId, RegisteredAsyncTask registeredTask) {
-    return new ProgressiveQueryResponseListener() {
-      @Override
-      public void onContextReady(ProgressiveQueryContext context) {
-        asyncQueryService.attachContext(jobId, context);
-      }
-
-      @Override
-      public void onResponse(ExecutionEngine.QueryResponse response) {
-        try {
-          asyncQueryService.complete(jobId);
-        } finally {
-          registeredTask.close();
-          clearRequestScopedState();
-        }
-      }
-
-      @Override
-      public void onFailure(Exception e) {
-        try {
-          asyncQueryService.fail(jobId, e);
-        } finally {
-          registeredTask.close();
-          clearRequestScopedState();
-        }
-      }
-    };
+  private static Exception asException(Throwable failure) {
+    Throwable cause =
+        failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+            ? failure.getCause()
+            : failure;
+    return cause instanceof Exception exception ? exception : new RuntimeException(cause);
   }
 
   private ResponseListener<ExecutionEngine.ExplainResponse> createAsyncExplainListener(

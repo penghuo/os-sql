@@ -161,6 +161,12 @@ public class TransportPPLQueryRequest extends ActionRequest {
     return path != null && path.endsWith("/_grammar");
   }
 
+  /** Whether the request selected the asynchronous submit path. */
+  public boolean isAsyncQueryRequest() {
+    return jsonContent != null
+        && (jsonContent.has("wait_for_completion_timeout") || jsonContent.has("keep_alive"));
+  }
+
   /** Decide on the formatter by the requested format. */
   public Format format() {
     Optional<Format> optionalFormat = Format.of(format);
@@ -185,6 +191,9 @@ public class TransportPPLQueryRequest extends ActionRequest {
 
   @Override
   public String getDescription() {
+    if (isAsyncQueryRequest()) {
+      return "PPL asynchronous query";
+    }
     String prefix = (queryId != null) ? "PPL [queryId=" + queryId + "]: " : "PPL: ";
     return prefix + pplQuery;
   }

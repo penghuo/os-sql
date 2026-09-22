@@ -15,7 +15,7 @@ You can disable SQL plugin to reject all coming requests.
 1. The default value is true.  
 2. This setting is node scope.  
 3. This setting can be updated dynamically.  
-  
+
 Notes. Calls to _plugins/_ppl include index names in the request body, so they have the same access policy considerations as the bulk, mget, and msearch operations. if rest.action.multi.allow_explicit_index set to false, PPL plugin will be disabled.
 ### Example 1  
 
@@ -109,7 +109,20 @@ Expected output:
   }
 }
 ```
-  
+
+## PPL asynchronous query settings
+
+The asynchronous PPL lifecycle API uses the following dynamic, node-scoped settings:
+
+| Setting | Default | Description |
+| --- | ---: | --- |
+| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Maximum asynchronous PPL queries running on one owner node. |
+| `plugins.ppl.async.max_retained_jobs` | `100` | Maximum combined running and terminal jobs retained on one owner node. |
+| `plugins.ppl.async.max_wait_for_completion_timeout` | `60s` | Maximum submit wait requested by `wait_for_completion_timeout`. |
+| `plugins.ppl.async.max_keep_alive` | `24h` | Maximum submit or poll lease requested by `keep_alive`. |
+
+Lowering a capacity setting affects new submissions and does not evict retained jobs.
+
 ## plugins.query.memory_limit
 
 ### Version
@@ -179,7 +192,6 @@ Expected output:
   "transient": {}
 }
 ```
-  
 Note: the legacy settings of `opendistro.query.size_limit` is deprecated, it will fallback to the new settings if you request an update with the legacy name.
 ## plugins.query.buckets
 
@@ -472,4 +484,3 @@ Expected output:
   "transient": {}
 }
 ```
-  

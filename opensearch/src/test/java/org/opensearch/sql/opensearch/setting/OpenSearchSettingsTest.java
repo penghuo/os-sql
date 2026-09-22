@@ -28,6 +28,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.utils.DeserializationFilterUtil;
@@ -166,6 +167,35 @@ class OpenSearchSettingsTest {
     assertTrue(pluginSettings.contains(OpenSearchSettings.DESERIALIZATION_MAX_DEPTH_SETTING));
     assertTrue(pluginSettings.contains(OpenSearchSettings.DESERIALIZATION_MAX_REFS_SETTING));
     assertTrue(pluginSettings.contains(OpenSearchSettings.DESERIALIZATION_MAX_BYTES_SETTING));
+  }
+
+  @Test
+  void pplAsyncSettingsHaveExpectedDefaultsAndAreDynamic() {
+    org.opensearch.common.settings.Settings empty = org.opensearch.common.settings.Settings.EMPTY;
+
+    assertEquals(
+        20, OpenSearchSettings.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING.get(empty));
+    assertEquals(100, OpenSearchSettings.PPL_ASYNC_MAX_RETAINED_JOBS_SETTING.get(empty));
+    assertEquals(
+        TimeValue.timeValueSeconds(60),
+        OpenSearchSettings.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING.get(empty));
+    assertEquals(
+        TimeValue.timeValueHours(24),
+        OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING.get(empty));
+
+    List<Setting<?>> pluginSettings = OpenSearchSettings.pluginSettings();
+    assertTrue(
+        pluginSettings.contains(
+            OpenSearchSettings.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING));
+    assertTrue(pluginSettings.contains(OpenSearchSettings.PPL_ASYNC_MAX_RETAINED_JOBS_SETTING));
+    assertTrue(
+        pluginSettings.contains(
+            OpenSearchSettings.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING));
+    assertTrue(pluginSettings.contains(OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING));
+    assertTrue(OpenSearchSettings.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING.isDynamic());
+    assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_RETAINED_JOBS_SETTING.isDynamic());
+    assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING.isDynamic());
+    assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING.isDynamic());
   }
 
   @Test

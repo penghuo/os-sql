@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.apache.calcite.rel.RelNode;
@@ -28,6 +29,7 @@ import org.opensearch.common.inject.Guice;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.ModulesBuilder;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -61,6 +63,7 @@ import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.VisualizationResponseFormatter;
 import org.opensearch.sql.protocol.response.format.YamlResponseFormatter;
 import org.opensearch.tasks.Task;
+import org.opensearch.tasks.TaskManager;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanCreationContext;
 import org.opensearch.telemetry.tracing.SpanScope;
@@ -88,6 +91,9 @@ public class TransportPPLQueryAction
   private final NodeClient clientRef;
   private final ClusterService clusterServiceRef;
   private final org.opensearch.sql.common.setting.Settings pluginSettingsRef;
+  private final PPLAsyncQueryService asyncQueryService;
+  private final PPLAsyncQueryResponseFormatter asyncResponseFormatter;
+  private final TaskManager taskManager;
 
   @Inject
   public TransportPPLQueryAction(
@@ -98,10 +104,15 @@ public class TransportPPLQueryAction
       DataSourceServiceImpl dataSourceService,
       org.opensearch.common.settings.Settings clusterSettings,
       EngineExtensionsHolder extensionsHolder,
-      Tracer tracer) {
+      Tracer tracer,
+      PPLAsyncQueryService asyncQueryService) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
     this.clientRef = client;
     this.clusterServiceRef = clusterService;
+    this.asyncQueryService = asyncQueryService;
+    this.asyncResponseFormatter = new PPLAsyncQueryResponseFormatter();
+    this.taskManager = transportService.getTaskManager();
+    this.asyncQueryService.attachTaskManager(taskManager);
 
     ModulesBuilder modules = new ModulesBuilder();
     modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
@@ -198,6 +209,7 @@ public class TransportPPLQueryAction
     // data silently. Carried on the request (not Log4j ThreadContext) so it survives the
     // transport→worker handoff, which the security plugin's interceptor does not preserve.
     transformedRequest.warningsSupported(warningsSupported(transformedRequest));
+    boolean asyncRequest = transportRequest.isAsyncQueryRequest();
     // The per-request partial-result override (e.g. a Dashboards toggle) rides on the request →
     // plan → worker thread (see PPLService/QueryPlan), not Log4j ThreadContext, for the same
     // handoff-survival reason as warningsSupported. null defers to the cluster setting.
@@ -226,9 +238,19 @@ public class TransportPPLQueryAction
         wrapWithProfilingClear(tracedListener);
 
     try {
+      if (asyncRequest) {
+        validateAsyncRequest(transformedRequest);
+      }
+
       // Route to analytics engine for non-Lucene (e.g., Parquet-backed) indices.
       if (unifiedQueryHandler != null
           && unifiedQueryHandler.isAnalyticsIndex(transformedRequest.getRequest(), QueryType.PPL)) {
+        if (asyncRequest) {
+          clearingListener.onFailure(
+              new IllegalArgumentException(
+                  "Asynchronous PPL execution supports the Calcite execution path only"));
+          return;
+        }
         LOG.info("[{}] Routing PPL query to analytics engine", QueryContext.getRequestId());
         // Pass this PPL task so the analytics engine links its query task to it for cancellation.
         if (transformedRequest.isExplainRequest()) {
@@ -271,11 +293,20 @@ public class TransportPPLQueryAction
             createAnalyzeResponseListener(transformedRequest, clearingListener),
             anonymizedQuerySink);
       } else {
-        pplService.execute(
-            transformedRequest,
-            createListener(transformedRequest, clearingListener),
-            createExplainResponseListener(transformedRequest, clearingListener),
-            anonymizedQuerySink);
+        if (asyncRequest) {
+          startAsyncQuery(
+              transportRequest,
+              transformedRequest,
+              pplService,
+              clearingListener,
+              anonymizedQuerySink);
+        } else {
+          pplService.execute(
+              transformedRequest,
+              createListener(transformedRequest, clearingListener),
+              createExplainResponseListener(transformedRequest, clearingListener),
+              anonymizedQuerySink);
+        }
       }
     } catch (Exception e) {
       clearingListener.onFailure(e);
@@ -395,6 +426,157 @@ public class TransportPPLQueryAction
     };
   }
 
+  private void startAsyncQuery(
+      TransportPPLQueryRequest transportRequest,
+      PPLQueryRequest request,
+      PPLService pplService,
+      ActionListener<TransportPPLQueryResponse> submitListener,
+      Consumer<String> anonymizedQuerySink) {
+    TimeValue keepAlive = requestedKeepAlive(request);
+    TimeValue waitForCompletion = requestedWaitForCompletion(request);
+    asyncQueryService.validateKeepAlive(keepAlive);
+    asyncQueryService.validateWaitForCompletion(waitForCompletion);
+
+    PPLAsyncQueryUser owner = PPLAsyncQueryUser.current(clientRef.threadPool().getThreadContext());
+    RegisteredAsyncTask registeredTask = registerAsyncTask(transportRequest);
+    String jobId;
+    try {
+      jobId = asyncQueryService.create(owner, keepAlive, registeredTask.task());
+    } catch (RuntimeException e) {
+      registeredTask.close();
+      throw e;
+    }
+    boolean ready =
+        asyncQueryService.awaitSubmit(
+            jobId,
+            waitForCompletion,
+            ActionListener.wrap(
+                snapshot -> submitListener.onResponse(asyncResponseFormatter.format(snapshot)),
+                submitListener::onFailure));
+    if (!ready) {
+      registeredTask.close();
+      return;
+    }
+
+    OpenSearchQueryManager.setCancellableTask(registeredTask.task());
+    try {
+      pplService.execute(
+          request,
+          createAsyncListener(jobId, registeredTask),
+          createAsyncExplainListener(jobId, registeredTask),
+          anonymizedQuerySink);
+    } catch (Exception e) {
+      try {
+        asyncQueryService.fail(jobId, e);
+      } finally {
+        registeredTask.close();
+        clearRequestScopedState();
+      }
+    } finally {
+      OpenSearchQueryManager.clearCancellableTask();
+    }
+  }
+
+  private RegisteredAsyncTask registerAsyncTask(TransportPPLQueryRequest request) {
+    Task registered = taskManager.register("transport", PPLQueryAction.NAME, request);
+    if (!(registered instanceof PPLQueryTask pplQueryTask)) {
+      taskManager.unregister(registered);
+      throw new IllegalStateException("Failed to create PPL asynchronous query task");
+    }
+    return new RegisteredAsyncTask(taskManager, pplQueryTask);
+  }
+
+  private ResponseListener<ExecutionEngine.QueryResponse> createAsyncListener(
+      String jobId, RegisteredAsyncTask registeredTask) {
+    return new ResponseListener<>() {
+      @Override
+      public void onResponse(ExecutionEngine.QueryResponse response) {
+        try {
+          asyncQueryService.complete(jobId, response);
+        } finally {
+          registeredTask.close();
+          clearRequestScopedState();
+        }
+      }
+
+      @Override
+      public void onFailure(Exception e) {
+        try {
+          asyncQueryService.fail(jobId, e);
+        } finally {
+          registeredTask.close();
+          clearRequestScopedState();
+        }
+      }
+    };
+  }
+
+  private ResponseListener<ExecutionEngine.ExplainResponse> createAsyncExplainListener(
+      String jobId, RegisteredAsyncTask registeredTask) {
+    return new ResponseListener<>() {
+      @Override
+      public void onResponse(ExecutionEngine.ExplainResponse response) {
+        try {
+          asyncQueryService.fail(
+              jobId,
+              new IllegalArgumentException(
+                  "Asynchronous PPL execution does not support explain queries"));
+        } finally {
+          registeredTask.close();
+          clearRequestScopedState();
+        }
+      }
+
+      @Override
+      public void onFailure(Exception e) {
+        try {
+          asyncQueryService.fail(jobId, e);
+        } finally {
+          registeredTask.close();
+          clearRequestScopedState();
+        }
+      }
+    };
+  }
+
+  private static TimeValue requestedKeepAlive(PPLQueryRequest request) {
+    if (request.getJsonContent() == null || !request.getJsonContent().has("keep_alive")) {
+      return PPLAsyncQueryService.DEFAULT_KEEP_ALIVE;
+    }
+    return TimeValue.parseTimeValue(request.getJsonContent().getString("keep_alive"), "keep_alive");
+  }
+
+  private static TimeValue requestedWaitForCompletion(PPLQueryRequest request) {
+    if (request.getJsonContent() == null
+        || !request.getJsonContent().has("wait_for_completion_timeout")) {
+      return PPLAsyncQueryService.DEFAULT_WAIT_FOR_COMPLETION;
+    }
+    return TimeValue.parseTimeValue(
+        request.getJsonContent().getString("wait_for_completion_timeout"),
+        "wait_for_completion_timeout");
+  }
+
+  private void validateAsyncRequest(PPLQueryRequest request) {
+    if (request.isExplainRequest()
+        || request.profile()
+        || request.analyze()
+        || request.getRequest().trim().toLowerCase(Locale.ROOT).startsWith("explain")) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution supports query execution only");
+    }
+    if (request.getJsonContent() != null && request.getJsonContent().has("partial_result")) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution does not support partial results");
+    }
+    if (!format(request).equals(Format.JDBC)) {
+      throw new IllegalArgumentException("Asynchronous PPL execution supports JSON responses only");
+    }
+    if (!(Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED)) {
+      throw new IllegalArgumentException(
+          "Asynchronous PPL execution requires the Calcite PPL engine to be enabled");
+    }
+  }
+
   private Format format(PPLQueryRequest pplRequest) {
     String format = pplRequest.getFormat();
     Optional<Format> optionalFormat = Format.of(format);
@@ -453,5 +635,20 @@ public class TransportPPLQueryAction
    */
   private static void clearRequestScopedState() {
     QueryProfiling.clear();
+  }
+
+  private record RegisteredAsyncTask(
+      TaskManager taskManager, PPLQueryTask task, AtomicBoolean closed) implements AutoCloseable {
+
+    private RegisteredAsyncTask(TaskManager taskManager, PPLQueryTask task) {
+      this(taskManager, task, new AtomicBoolean());
+    }
+
+    @Override
+    public void close() {
+      if (closed.compareAndSet(false, true)) {
+        taskManager.unregister(task);
+      }
+    }
   }
 }

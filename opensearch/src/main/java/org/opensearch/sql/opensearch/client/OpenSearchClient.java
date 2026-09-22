@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.opensearch.action.search.CreatePitRequest;
 import org.opensearch.action.search.DeletePitRequest;
+import org.opensearch.sql.opensearch.executor.progressive.SearchExecutionObserver;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
@@ -62,6 +63,11 @@ public interface OpenSearchClient {
    * @return search response
    */
   OpenSearchResponse search(OpenSearchRequest request);
+
+  default OpenSearchResponse search(
+      OpenSearchRequest request, SearchExecutionObserver searchObserver) {
+    return search(request);
+  }
 
   /**
    * Get the combination of the indices and the alias.

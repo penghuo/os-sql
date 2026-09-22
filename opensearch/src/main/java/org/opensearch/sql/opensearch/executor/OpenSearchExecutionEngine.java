@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.apache.calcite.avatica.util.StructImpl;
 import org.apache.calcite.plan.RelOptUtil;
@@ -36,6 +37,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.util.ListSqlOperatorTable;
 import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
 import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
+import org.apache.calcite.tools.RelRunner;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.locationtech.jts.geom.Point;
@@ -59,6 +61,7 @@ import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
+import org.opensearch.sql.executor.ProgressiveQueryResponseListener;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
@@ -66,6 +69,8 @@ import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileScope;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
+import org.opensearch.sql.opensearch.executor.progressive.ProgressiveQueryContextFactory;
+import org.opensearch.sql.opensearch.executor.progressive.ProgressiveQueryContextImpl;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
@@ -329,6 +334,10 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
+          if (listener instanceof ProgressiveQueryResponseListener progressiveListener) {
+            executeProgressively(rel, context, progressiveListener);
+            return;
+          }
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
             QueryResponse response;
             try (ProfileScope executePhase = ProfileScope.open(MetricName.EXECUTE)) {
@@ -355,6 +364,59 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             throw new RuntimeException(e);
           }
         });
+  }
+
+  private void executeProgressively(
+      RelNode rel, CalcitePlanContext context, ProgressiveQueryResponseListener listener) {
+    ProgressiveQueryContextImpl progressiveContext = null;
+    try (PreparedPhysicalPlan prepared = preparePhysicalPlan(context, rel)) {
+      try {
+        ProgressiveQueryContextFactory contextFactory = new ProgressiveQueryContextFactory();
+        progressiveContext =
+            contextFactory.create(prepared.plan(), plan -> prepareStatement(context, plan));
+        listener.onContextReady(progressiveContext);
+
+        try (ResultSet resultSet = prepared.statement().executeQuery()) {
+          progressiveContext.consume(resultSet, context.sysLimit.querySizeLimit());
+        }
+        listener.onResponse(progressiveContext.currentResult());
+      } finally {
+        context.connection.close();
+      }
+    } catch (Exception e) {
+      logger.error("Progressive prototype execution failed", e);
+      listener.onFailure(e instanceof Exception ? (Exception) e : new RuntimeException(e));
+    }
+  }
+
+  private static PreparedPhysicalPlan preparePhysicalPlan(
+      CalcitePlanContext context, RelNode logicalPlan) throws SQLException {
+    AtomicReference<RelNode> physicalPlan = new AtomicReference<>();
+    PreparedStatement statement;
+    try (Hook.Closeable ignored =
+        Hook.PLAN_BEFORE_IMPLEMENTATION.addThread(
+            (Consumer<RelRoot>) value -> physicalPlan.set(value.rel))) {
+      statement = prepareStatement(context, logicalPlan);
+    }
+    if (physicalPlan.get() == null) {
+      statement.close();
+      throw new IllegalStateException("Calcite did not publish an optimized physical plan");
+    }
+    return new PreparedPhysicalPlan(physicalPlan.get(), statement);
+  }
+
+  private record PreparedPhysicalPlan(RelNode plan, PreparedStatement statement)
+      implements AutoCloseable {
+    @Override
+    public void close() throws SQLException {
+      statement.close();
+    }
+  }
+
+  private static PreparedStatement prepareStatement(CalcitePlanContext context, RelNode rel)
+      throws SQLException {
+    RelRunner runner = context.connection.unwrap(RelRunner.class);
+    return runner.prepareStatement(rel);
   }
 
   /**

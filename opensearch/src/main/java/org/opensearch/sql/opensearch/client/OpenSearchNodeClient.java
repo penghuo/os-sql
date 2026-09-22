@@ -17,6 +17,7 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.lucene.search.TotalHits;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -25,15 +26,18 @@ import org.opensearch.action.admin.indices.get.GetIndexResponse;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.settings.get.GetSettingsResponse;
 import org.opensearch.action.search.*;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.common.action.ActionFuture;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.sql.common.error.ErrorCode;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.sql.opensearch.executor.progressive.SearchExecutionObserver;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchScrollRequest;
@@ -43,7 +47,6 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch connection by node client. */
 public class OpenSearchNodeClient implements OpenSearchClient {
-
   public static final Function<String, Predicate<String>> ALL_FIELDS =
       (anyIndex -> (anyField -> true));
 
@@ -169,6 +172,70 @@ public class OpenSearchNodeClient implements OpenSearchClient {
           return client.search(req).actionGet();
         },
         req -> client.searchScroll(req).actionGet());
+  }
+
+  @Override
+  public OpenSearchResponse search(
+      OpenSearchRequest request, SearchExecutionObserver searchObserver) {
+    return request.search(
+        req -> executeSearch(req, searchObserver), req -> client.searchScroll(req).actionGet());
+  }
+
+  private SearchResponse executeSearch(
+      SearchRequest request, SearchExecutionObserver searchObserver) {
+    applyParentTask(request);
+    PlainActionFuture<SearchResponse> future = PlainActionFuture.newFuture();
+    SearchProgressActionListener listener =
+        new SearchProgressActionListener() {
+          @Override
+          protected void onPartialReduce(
+              List<SearchShard> shards,
+              TotalHits totalHits,
+              InternalAggregations aggregations,
+              int reducePhase) {
+            searchObserver.onPartialReduce(totalHits, aggregations, reducePhase);
+          }
+
+          @Override
+          protected void onFinalReduce(
+              List<SearchShard> shards,
+              TotalHits totalHits,
+              InternalAggregations aggregations,
+              int reducePhase) {
+            searchObserver.onFinalReduce(totalHits, aggregations, reducePhase);
+          }
+
+          @Override
+          public void onResponse(SearchResponse response) {
+            future.onResponse(response);
+          }
+
+          @Override
+          public void onFailure(Exception failure) {
+            future.onFailure(failure);
+          }
+        };
+    SearchRequest monitoredRequest =
+        new SearchRequest(request) {
+          @Override
+          public SearchTask createTask(
+              long id,
+              String type,
+              String action,
+              TaskId parentTaskId,
+              Map<String, String> headers) {
+            SearchTask task = super.createTask(id, type, action, parentTaskId, headers);
+            task.setProgressListener(listener);
+            return task;
+          }
+        };
+    if (searchObserver.needsPartialReduces() && monitoredRequest.getBatchedReduceSize() > 2) {
+      // Prototype setting: force more than one reduce on ordinary shard counts so the design can
+      // be validated. Production code should expose a bounded setting and measure its overhead.
+      monitoredRequest.setBatchedReduceSize(2);
+    }
+    client.executeLocally(SearchAction.INSTANCE, monitoredRequest, listener);
+    return future.actionGet();
   }
 
   private void applyParentTask(SearchRequest req) {

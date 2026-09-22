@@ -92,6 +92,51 @@ public class PPLProgressiveQueryPrototypeIT extends PPLIntegTestCase {
   }
 
   @Test
+  public void aggregationReduceAtPhysicalRootIsVisibleBeforeFinalResult() throws Exception {
+    String query = "source=" + INDEX + " | stats sum(event_id % 1000) as total";
+    Observation observation = observe(query);
+    JSONObject synchronous = executeSynchronous(query);
+
+    assertNotNull(
+        "Expected a RUNNING root aggregation response containing rows", observation.firstData());
+    assertEquals(1, observation.firstData().getInt("total"));
+    long partialValue = observation.firstData().getJSONArray("datarows").getJSONArray(0).getLong(0);
+    long finalValue =
+        observation.finalResponse().getJSONArray("datarows").getJSONArray(0).getLong(0);
+    assertTrue(partialValue > 0);
+    assertTrue(partialValue < finalValue);
+    assertEquals(
+        synchronous.getJSONArray("schema").toString(),
+        observation.finalResponse().getJSONArray("schema").toString());
+    assertEquals(
+        synchronous.getJSONArray("datarows").toString(),
+        observation.finalResponse().getJSONArray("datarows").toString());
+  }
+
+  @Test
+  public void compositePagesAreVisibleBeforeFinalResult() throws Exception {
+    String query =
+        "source="
+            + INDEX
+            + " | stats count() as cnt by event_id"
+            + " | fields event_id, cnt"
+            + " | head "
+            + ROOT_RESULT_COUNT;
+    Observation observation = observe(query);
+    JSONObject synchronous = executeSynchronous(query);
+
+    assertNotNull("Expected a RUNNING composite response containing rows", observation.firstData());
+    assertTrue(observation.firstData().getInt("total") > 0);
+    assertTrue(observation.firstData().getInt("total") < synchronous.getInt("total"));
+    assertEquals(
+        synchronous.getJSONArray("schema").toString(),
+        observation.finalResponse().getJSONArray("schema").toString());
+    assertEquals(
+        synchronous.getJSONArray("datarows").toString(),
+        observation.finalResponse().getJSONArray("datarows").toString());
+  }
+
+  @Test
   public void countAsTotalHitsUsesTheStandardMapperAndMatchesSynchronousResult() throws Exception {
     String query =
         "source="

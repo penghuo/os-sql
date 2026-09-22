@@ -21,7 +21,6 @@ public final class ProgressiveQueryContextImpl implements ProgressiveQueryContex
   private final QueryStateStore store;
   private final CalciteResultSetMaterializer materializer;
   private final Consumer<ExprValue> rowConsumer;
-  private final SearchExecutionObserver searchObserver;
   private final PreparedStatement previewStatement;
   private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
   private boolean closed;
@@ -30,21 +29,15 @@ public final class ProgressiveQueryContextImpl implements ProgressiveQueryContex
       QueryStateStore store,
       CalciteResultSetMaterializer materializer,
       Consumer<ExprValue> rowConsumer,
-      SearchExecutionObserver searchObserver,
       PreparedStatement previewStatement) {
     this.store = Objects.requireNonNull(store);
     this.materializer = Objects.requireNonNull(materializer);
     this.rowConsumer = Objects.requireNonNull(rowConsumer);
-    this.searchObserver = Objects.requireNonNull(searchObserver);
     this.previewStatement = previewStatement;
   }
 
   public void consume(ResultSet resultSet, Integer querySizeLimit) throws SQLException {
     materializer.drain(resultSet, querySizeLimit, rowConsumer);
-  }
-
-  public SearchExecutionObserver searchObserver() {
-    return searchObserver;
   }
 
   @Override

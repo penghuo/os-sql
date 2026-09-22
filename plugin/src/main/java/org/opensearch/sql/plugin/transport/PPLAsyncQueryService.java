@@ -641,6 +641,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * <p>Every lifecycle and lease transition is synchronized on this object. Methods mutate only
    * job-owned state and return immutable transition values; they never call listeners, mutate the
    * service map, update capacity counters, or cancel tasks while holding the lock.
+   *
+   * <p>The job owns its {@link ProgressiveQueryContext} after {@link #attachContext} accepts it.
+   * Reads borrow the context through a {@link JobView}; removal transitions detach it so the
+   * service can close it outside the job lock.
    */
   private static final class Job {
     private final String id;

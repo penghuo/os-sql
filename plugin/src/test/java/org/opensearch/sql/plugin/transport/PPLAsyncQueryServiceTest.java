@@ -46,6 +46,7 @@ public class PPLAsyncQueryServiceTest {
     String id = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     AtomicInteger responses = new AtomicInteger();
+    TrackingContext context = new TrackingContext(response(2));
 
     service.awaitSubmit(
         id,
@@ -56,7 +57,7 @@ public class PPLAsyncQueryServiceTest {
               responses.incrementAndGet();
             }));
     now.addAndGet(25);
-    service.attachContext(id, context(response(2)));
+    service.attachContext(id, context);
     service.complete(id);
 
     assertEquals(1, responses.get());
@@ -66,6 +67,8 @@ public class PPLAsyncQueryServiceTest {
     assertEquals(25, result.get().tookMillis());
     assertEquals(0, service.runningQueryCount());
     assertEquals(0, service.retainedJobCount());
+    assertEquals(1, context.reads.get());
+    assertEquals(1, context.closes.get());
     assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
 
     timeoutTask.get().run();
@@ -270,6 +273,37 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
+  public void retainedJobOwnsContextUntilDelete() {
+    String id = createJob(null);
+    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    TrackingContext context = new TrackingContext(response(2));
+
+    service.attachContext(id, context);
+    service.complete(id);
+
+    assertEquals(0, context.closes.get());
+    assertEquals(2, service.get(id, OWNER, null).response().getResults().size());
+    assertEquals(1, context.reads.get());
+
+    service.delete(id, OWNER);
+
+    assertEquals(1, context.closes.get());
+  }
+
+  @Test
+  public void contextRejectedAfterJobRemovalIsClosedByService() {
+    String id = createJob(null);
+    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.delete(id, OWNER);
+    TrackingContext context = new TrackingContext(response(1));
+
+    service.attachContext(id, context);
+
+    assertEquals(0, context.reads.get());
+    assertEquals(1, context.closes.get());
+  }
+
+  @Test
   public void validatesDurationBounds() {
     assertThrows(IllegalArgumentException.class, () -> service.validateKeepAlive(TimeValue.ZERO));
     assertThrows(
@@ -336,5 +370,26 @@ public class PPLAsyncQueryServiceTest {
       @Override
       public void close() {}
     };
+  }
+
+  private static final class TrackingContext implements ProgressiveQueryContext {
+    private final QueryResponse response;
+    private final AtomicInteger reads = new AtomicInteger();
+    private final AtomicInteger closes = new AtomicInteger();
+
+    private TrackingContext(QueryResponse response) {
+      this.response = response;
+    }
+
+    @Override
+    public QueryResponse currentResult() {
+      reads.incrementAndGet();
+      return response;
+    }
+
+    @Override
+    public void close() {
+      closes.incrementAndGet();
+    }
   }
 }

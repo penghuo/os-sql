@@ -49,17 +49,15 @@ public final class ProgressiveQueryContextFactory {
       SearchExecutionObserver observer = new AggregationStatePublisher(store, mapper);
       bindObserver(physicalPlan, observer);
       if (physicalPlan == aggregationLeaf) {
-        return new ProgressiveQueryContextImpl(store, materializer, ignored -> {}, observer, null);
+        return new ProgressiveQueryContextImpl(store, materializer, ignored -> {}, null);
       }
       RelNode previewPlan = replaceLeaf(physicalPlan, aggregationLeaf, store);
       PreparedStatement previewStatement = compiler.compile(previewPlan);
-      return new ProgressiveQueryContextImpl(
-          store, materializer, ignored -> {}, observer, previewStatement);
+      return new ProgressiveQueryContextImpl(store, materializer, ignored -> {}, previewStatement);
     }
 
     AppendOnlyStateStore store = new AppendOnlyStateStore();
-    return new ProgressiveQueryContextImpl(
-        store, materializer, store::append, SearchExecutionObserver.NOOP, null);
+    return new ProgressiveQueryContextImpl(store, materializer, store::append, null);
   }
 
   private static List<CalciteEnumerableIndexScan> findNonCompositeAggregationLeaves(

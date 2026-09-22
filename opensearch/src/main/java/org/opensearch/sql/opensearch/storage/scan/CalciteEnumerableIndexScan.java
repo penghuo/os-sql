@@ -6,6 +6,7 @@
 package org.opensearch.sql.opensearch.storage.scan;
 
 import java.util.List;
+import java.util.Optional;
 import org.apache.calcite.adapter.enumerable.EnumerableRel;
 import org.apache.calcite.adapter.enumerable.EnumerableRelImplementor;
 import org.apache.calcite.adapter.enumerable.PhysType;
@@ -29,6 +30,8 @@ import org.apache.logging.log4j.Logger;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRules;
+import org.opensearch.sql.opensearch.executor.progressive.AggregationResultMapper;
+import org.opensearch.sql.opensearch.executor.progressive.SearchExecutionObserver;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownContext;
@@ -38,6 +41,7 @@ import org.opensearch.sql.opensearch.util.OpenSearchRelOptUtil;
 public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
     implements Scannable, EnumerableRel {
   private static final Logger LOG = LogManager.getLogger(CalciteEnumerableIndexScan.class);
+  private volatile SearchExecutionObserver searchObserver;
 
   /**
    * Creates an CalciteOpenSearchIndexScan.
@@ -54,7 +58,28 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
       OpenSearchIndex osIndex,
       RelDataType schema,
       PushDownContext pushDownContext) {
+    this(
+        cluster,
+        traitSet,
+        hints,
+        table,
+        osIndex,
+        schema,
+        pushDownContext,
+        SearchExecutionObserver.NOOP);
+  }
+
+  private CalciteEnumerableIndexScan(
+      RelOptCluster cluster,
+      RelTraitSet traitSet,
+      List<RelHint> hints,
+      RelOptTable table,
+      OpenSearchIndex osIndex,
+      RelDataType schema,
+      PushDownContext pushDownContext,
+      SearchExecutionObserver searchObserver) {
     super(cluster, traitSet, hints, table, osIndex, schema, pushDownContext);
+    this.searchObserver = searchObserver;
   }
 
   @Override
@@ -67,13 +92,32 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
       RelDataType schema,
       PushDownContext pushDownContext) {
     return new CalciteEnumerableIndexScan(
-        cluster, traitSet, hints, table, osIndex, schema, pushDownContext);
+        cluster, traitSet, hints, table, osIndex, schema, pushDownContext, searchObserver);
   }
 
   @Override
   public AbstractCalciteIndexScan copy() {
     return new CalciteEnumerableIndexScan(
-        getCluster(), traitSet, hints, table, osIndex, schema, pushDownContext.clone());
+        getCluster(),
+        traitSet,
+        hints,
+        table,
+        osIndex,
+        schema,
+        pushDownContext.clone(),
+        searchObserver);
+  }
+
+  public void bindSearchObserver(SearchExecutionObserver observer) {
+    this.searchObserver = observer;
+  }
+
+  public Optional<AggregationResultMapper> aggregationResultMapper() {
+    if (!pushDownContext.isAggregatePushed()) {
+      return Optional.empty();
+    }
+    OpenSearchRequestBuilder requestBuilder = pushDownContext.createRequestBuilder();
+    return Optional.of(new AggregationResultMapper(requestBuilder.getExprValueFactory()));
   }
 
   @Override
@@ -126,7 +170,8 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
             requestBuilder.getMaxResultWindow(),
             osIndex.getQueryBucketSize(),
             osIndex.buildRequest(requestBuilder),
-            osIndex.createOpenSearchResourceMonitor());
+            osIndex.createOpenSearchResourceMonitor(),
+            searchObserver);
       }
     };
   }

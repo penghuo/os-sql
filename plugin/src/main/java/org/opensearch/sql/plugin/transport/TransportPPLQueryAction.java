@@ -190,7 +190,8 @@ public class TransportPPLQueryAction
       return;
     }
 
-    if (task instanceof PPLQueryTask pplQueryTask) {
+    PPLQueryTask pplQueryTask = task instanceof PPLQueryTask ? (PPLQueryTask) task : null;
+    if (pplQueryTask != null) {
       OpenSearchQueryManager.setCancellableTask(pplQueryTask);
     }
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_TOTAL).increment();
@@ -283,7 +284,12 @@ public class TransportPPLQueryAction
                 && transformedRequest.supportsAsyncExecution()
                 && (Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED);
         if (asyncExecution) {
+          if (pplQueryTask == null) {
+            throw new IllegalStateException(
+                "PPL asynchronous query requires a cancellable submit task");
+          }
           startAsyncQuery(
+              pplQueryTask,
               transportRequest,
               transformedRequest,
               pplService,
@@ -416,6 +422,7 @@ public class TransportPPLQueryAction
   }
 
   private void startAsyncQuery(
+      PPLQueryTask submitTask,
       TransportPPLQueryRequest transportRequest,
       PPLQueryRequest request,
       PPLService pplService,
@@ -428,6 +435,7 @@ public class TransportPPLQueryAction
             request.getKeepAlive(),
             request.getWaitForCompletionTimeout(),
             transportRequest,
+            submitTask,
             ActionListener.wrap(
                 snapshot -> submitListener.onResponse(asyncResponseFormatter.format(snapshot)),
                 submitListener::onFailure));

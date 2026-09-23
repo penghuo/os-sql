@@ -19,10 +19,13 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceNotFoundException;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
@@ -209,6 +212,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       String requestedKeepAlive,
       String requestedWaitForCompletion,
       TransportPPLQueryRequest request,
+      PPLQueryTask submitTask,
       ActionListener<JobSnapshot> responseListener) {
     TimeValue keepAlive =
         TimeValue.parseTimeValue(requestedKeepAlive, PPLQueryRequest.KEEP_ALIVE_FIELD);
@@ -217,7 +221,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
             requestedWaitForCompletion, PPLQueryRequest.WAIT_FOR_COMPLETION_TIMEOUT_FIELD);
     validateKeepAlive(keepAlive);
     validateWaitForCompletion(waitForCompletion);
-    RegisteredAsyncTask registeredTask = registerAsyncTask(request);
+    RegisteredAsyncTask registeredTask = registerAsyncTask(request, submitTask);
     String id = null;
     try {
       id = create(owner, keepAlive, new JobTask(registeredTask.task(), registeredTask::close));
@@ -587,16 +591,38 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  private RegisteredAsyncTask registerAsyncTask(TransportPPLQueryRequest request) {
+  private RegisteredAsyncTask registerAsyncTask(
+      TransportPPLQueryRequest request, PPLQueryTask submitTask) {
     TaskManager currentTaskManager =
         Objects.requireNonNull(
             taskManager, "PPL asynchronous query task manager is not initialized");
-    Task registered = currentTaskManager.register("transport", PPLQueryAction.NAME, request);
-    if (!(registered instanceof PPLQueryTask pplQueryTask)) {
-      currentTaskManager.unregister(registered);
-      throw new IllegalStateException("Failed to create PPL asynchronous query task");
+    Objects.requireNonNull(submitTask, "PPL asynchronous query submit task is not initialized");
+    DiscoveryNode localNode =
+        Objects.requireNonNull(currentTaskManager.localNode(), "Local node is not initialized");
+
+    // This task is registered directly rather than through TransportAction.execute(), so reproduce
+    // the two pieces of OpenSearch child-task bookkeeping that TransportAction normally performs.
+    // The child-node registration lets parent cancellation send a ban to this node; parentTaskId
+    // lets that ban find and cancel the retained task.
+    Releasable childNodeRegistration =
+        currentTaskManager.registerChildNode(submitTask.getId(), localNode);
+    TaskId originalParent = request.getParentTask();
+    boolean registered = false;
+    try {
+      request.setParentTask(localNode.getId(), submitTask.getId());
+      Task task = currentTaskManager.register("transport", PPLQueryAction.NAME, request);
+      if (!(task instanceof PPLQueryTask pplQueryTask)) {
+        currentTaskManager.unregister(task);
+        throw new IllegalStateException("Failed to create PPL asynchronous query task");
+      }
+      registered = true;
+      return new RegisteredAsyncTask(currentTaskManager, pplQueryTask, childNodeRegistration);
+    } finally {
+      request.setParentTask(originalParent);
+      if (!registered) {
+        childNodeRegistration.close();
+      }
     }
-    return new RegisteredAsyncTask(currentTaskManager, pplQueryTask);
   }
 
   private static Exception asException(Throwable failure) {
@@ -657,11 +683,16 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  private record RegisteredAsyncTask(TaskManager taskManager, PPLQueryTask task)
+  private record RegisteredAsyncTask(
+      TaskManager taskManager, PPLQueryTask task, Releasable childNodeRegistration)
       implements AutoCloseable {
     @Override
     public void close() {
-      taskManager.unregister(task);
+      try {
+        taskManager.unregister(task);
+      } finally {
+        childNodeRegistration.close();
+      }
     }
   }
 

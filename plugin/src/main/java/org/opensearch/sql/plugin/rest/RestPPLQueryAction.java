@@ -131,22 +131,17 @@ public class RestPPLQueryAction extends BaseRestHandler {
     PPLQueryRequest pplQueryRequest = PPLQueryRequestFactory.getPPLRequest(request);
     TransportPPLQueryRequest transportPPLQueryRequest =
         new TransportPPLQueryRequest(pplQueryRequest);
-    boolean asyncRequest =
-        pplQueryRequest.isAsyncQueryRequest() && pplQueryRequest.supportsAsyncExecution();
 
-    // RestCancellableNodeClient cancels the PPLQueryTask on client disconnect, which cascades to
-    // the analytics query + fragments. An asynchronous submit is detached and is cancelled through
-    // its retained job lifecycle.
-    return channel -> {
-      ActionListener<TransportPPLQueryResponse> listener =
-          responseListener(channel, asyncRequest, transportPPLQueryRequest.isExplainRequest());
-      if (asyncRequest) {
-        nodeClient.execute(PPLQueryAction.INSTANCE, transportPPLQueryRequest, listener);
-      } else {
+    // The transport action decides whether this is synchronous or asynchronous. Before an
+    // asynchronous submit responds, its retained task is a child of this cancellable POST task.
+    // RestCancellableNodeClient stops tracking the POST task before delivering the response, which
+    // is the detach boundary after a job ID has been returned.
+    return channel ->
         new RestCancellableNodeClient(nodeClient, request.getHttpChannel())
-            .execute(PPLQueryAction.INSTANCE, transportPPLQueryRequest, listener);
-      }
-    };
+            .execute(
+                PPLQueryAction.INSTANCE,
+                transportPPLQueryRequest,
+                responseListener(channel, transportPPLQueryRequest.isExplainRequest()));
   }
 
   private RestChannelConsumer prepareGetRequest(RestRequest request, NodeClient nodeClient) {
@@ -158,42 +153,47 @@ public class RestPPLQueryAction extends BaseRestHandler {
         new PPLAsyncGetResultRequest(request.param("id"), keepAlive);
     return channel ->
         nodeClient.execute(
-            PPLAsyncGetResultAction.INSTANCE,
-            transportRequest,
-            responseListener(channel, true, false));
+            PPLAsyncGetResultAction.INSTANCE, transportRequest, asyncResponseListener(channel));
   }
 
   private RestChannelConsumer prepareDeleteRequest(RestRequest request, NodeClient nodeClient) {
     PPLAsyncDeleteRequest transportRequest = new PPLAsyncDeleteRequest(request.param("id"));
     return channel ->
         nodeClient.execute(
-            PPLAsyncDeleteAction.INSTANCE,
-            transportRequest,
-            responseListener(channel, true, false));
+            PPLAsyncDeleteAction.INSTANCE, transportRequest, asyncResponseListener(channel));
   }
 
   private ActionListener<TransportPPLQueryResponse> responseListener(
-      RestChannel channel, boolean asyncRequest, boolean explainRequest) {
+      RestChannel channel, boolean explainRequest) {
+    return responseListener(channel, explainRequest, false);
+  }
+
+  private ActionListener<TransportPPLQueryResponse> asyncResponseListener(RestChannel channel) {
+    return responseListener(channel, false, true);
+  }
+
+  private ActionListener<TransportPPLQueryResponse> responseListener(
+      RestChannel channel, boolean explainRequest, boolean noStore) {
     return new ActionListener<>() {
       @Override
       public void onResponse(TransportPPLQueryResponse response) {
-        sendResponse(channel, OK, response.getContentType(), response.getResult(), asyncRequest);
+        sendResponse(
+            channel,
+            OK,
+            response.getContentType(),
+            response.getResult(),
+            noStore || response.isAsyncQueryResponse());
       }
 
       @Override
       public void onFailure(Exception e) {
         RestStatus status = loggedErrorCode(e);
-        if (asyncRequest) {
-          LOG.error(
-              "PPL asynchronous request failed (status {}, type {})",
-              status,
-              e.getClass().getSimpleName());
-        } else if (explainRequest) {
+        if (explainRequest) {
           LOG.error("Error happened during explain (status {})", status, e);
         } else {
           LOG.error("Error happened during query handling (status {})", status, e);
         }
-        reportError(channel, e, status, asyncRequest);
+        reportError(channel, e, status, noStore);
       }
     };
   }

@@ -215,9 +215,11 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
               .put("wait_for_completion_timeout", "0s")
               .toString());
 
-      JSONObject response = new JSONObject(getResponseBody(client().performRequest(request), true));
+      Response restResponse = client().performRequest(request);
+      JSONObject response = new JSONObject(getResponseBody(restResponse, true));
       assertFalse(response.has("status"));
       assertTrue(response.has("size"));
+      assertNull(restResponse.getHeader("Cache-Control"));
     } finally {
       enableCalcite();
     }

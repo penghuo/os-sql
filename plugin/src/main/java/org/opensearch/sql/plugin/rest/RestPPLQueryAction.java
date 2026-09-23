@@ -39,7 +39,6 @@ import org.opensearch.sql.plugin.transport.PPLAsyncGetResultRequest;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
-import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.transport.client.node.NodeClient;
 
 public class RestPPLQueryAction extends BaseRestHandler {
@@ -128,20 +127,40 @@ public class RestPPLQueryAction extends BaseRestHandler {
       return prepareDeleteRequest(request, nodeClient);
     }
 
-    PPLQueryRequest pplQueryRequest = PPLQueryRequestFactory.getPPLRequest(request);
     TransportPPLQueryRequest transportPPLQueryRequest =
-        new TransportPPLQueryRequest(pplQueryRequest);
+        new TransportPPLQueryRequest(PPLQueryRequestFactory.getPPLRequest(request));
 
-    // The transport action decides whether this is synchronous or asynchronous. Before an
-    // asynchronous submit responds, its retained task is a child of this cancellable POST task.
-    // RestCancellableNodeClient stops tracking the POST task before delivering the response, which
-    // is the detach boundary after a job ID has been returned.
-    return channel ->
-        new RestCancellableNodeClient(nodeClient, request.getHttpChannel())
-            .execute(
-                PPLQueryAction.INSTANCE,
-                transportPPLQueryRequest,
-                responseListener(channel, transportPPLQueryRequest.isExplainRequest()));
+    // RestCancellableNodeClient cancels the PPLQueryTask on client disconnect, which cascades to
+    // the analytics query + fragments.
+    return channel -> {
+      RestCancellableNodeClient cancellableClient =
+          new RestCancellableNodeClient(nodeClient, request.getHttpChannel());
+      cancellableClient.execute(
+          PPLQueryAction.INSTANCE,
+          transportPPLQueryRequest,
+          new ActionListener<>() {
+            @Override
+            public void onResponse(TransportPPLQueryResponse response) {
+              sendResponse(
+                  channel,
+                  OK,
+                  response.getContentType(),
+                  response.getResult(),
+                  response.isAsyncQueryResponse());
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+              RestStatus status = loggedErrorCode(e);
+              if (transportPPLQueryRequest.isExplainRequest()) {
+                LOG.error("Error happened during explain (status {})", status, e);
+              } else {
+                LOG.error("Error happened during query handling (status {})", status, e);
+              }
+              reportError(channel, e, status);
+            }
+          });
+    };
   }
 
   private RestChannelConsumer prepareGetRequest(RestRequest request, NodeClient nodeClient) {
@@ -163,39 +182,27 @@ public class RestPPLQueryAction extends BaseRestHandler {
             PPLAsyncDeleteAction.INSTANCE, transportRequest, asyncResponseListener(channel));
   }
 
-  private ActionListener<TransportPPLQueryResponse> responseListener(
-      RestChannel channel, boolean explainRequest) {
-    return responseListener(channel, explainRequest, false);
-  }
-
   private ActionListener<TransportPPLQueryResponse> asyncResponseListener(RestChannel channel) {
-    return responseListener(channel, false, true);
-  }
-
-  private ActionListener<TransportPPLQueryResponse> responseListener(
-      RestChannel channel, boolean explainRequest, boolean noStore) {
     return new ActionListener<>() {
       @Override
       public void onResponse(TransportPPLQueryResponse response) {
-        sendResponse(
-            channel,
-            OK,
-            response.getContentType(),
-            response.getResult(),
-            noStore || response.isAsyncQueryResponse());
+        sendResponse(channel, OK, response.getContentType(), response.getResult(), true);
       }
 
       @Override
       public void onFailure(Exception e) {
         RestStatus status = loggedErrorCode(e);
-        if (explainRequest) {
-          LOG.error("Error happened during explain (status {})", status, e);
-        } else {
-          LOG.error("Error happened during query handling (status {})", status, e);
-        }
-        reportError(channel, e, status, noStore);
+        LOG.error(
+            "PPL asynchronous request failed (status {}, type {})",
+            status,
+            e.getClass().getSimpleName());
+        reportError(channel, e, status, true);
       }
     };
+  }
+
+  private void reportError(final RestChannel channel, final Exception e, final RestStatus status) {
+    reportError(channel, e, status, false);
   }
 
   private void sendResponse(

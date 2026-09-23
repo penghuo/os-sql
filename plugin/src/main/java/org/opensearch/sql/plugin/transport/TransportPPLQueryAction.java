@@ -279,11 +279,7 @@ public class TransportPPLQueryAction
             createAnalyzeResponseListener(transformedRequest, clearingListener),
             anonymizedQuerySink);
       } else {
-        boolean asyncExecution =
-            transformedRequest.isAsyncQueryRequest()
-                && transformedRequest.supportsAsyncExecution()
-                && (Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED);
-        if (asyncExecution) {
+        if (shouldExecuteAsync(transformedRequest)) {
           if (pplQueryTask == null) {
             throw new IllegalStateException(
                 "PPL asynchronous query requires a cancellable submit task");
@@ -419,6 +415,12 @@ public class TransportPPLQueryAction
         listener.onFailure(e);
       }
     };
+  }
+
+  private boolean shouldExecuteAsync(PPLQueryRequest request) {
+    return request.isAsyncQueryRequest()
+        && request.supportsAsyncExecution()
+        && (Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED);
   }
 
   private void startAsyncQuery(

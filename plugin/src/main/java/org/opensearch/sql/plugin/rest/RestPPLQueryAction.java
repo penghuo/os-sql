@@ -32,13 +32,13 @@ import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.opensearch.response.error.ErrorMessageFactory;
 import org.opensearch.sql.plugin.request.PPLQueryRequestFactory;
-import org.opensearch.sql.plugin.transport.PPLAsyncDeleteAction;
-import org.opensearch.sql.plugin.transport.PPLAsyncDeleteRequest;
-import org.opensearch.sql.plugin.transport.PPLAsyncGetResultAction;
-import org.opensearch.sql.plugin.transport.PPLAsyncGetResultRequest;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncDeleteAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncDeleteRequest;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncGetResultAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncGetResultRequest;
 import org.opensearch.transport.client.node.NodeClient;
 
 public class RestPPLQueryAction extends BaseRestHandler {

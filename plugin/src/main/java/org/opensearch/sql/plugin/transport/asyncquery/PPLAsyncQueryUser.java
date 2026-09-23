@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.plugin.transport.asyncquery;
 
 import java.util.List;
 import java.util.Objects;
@@ -14,17 +14,17 @@ import org.opensearch.commons.authuser.User;
 import org.opensearch.core.rest.RestStatus;
 
 /** Immutable submitter identity used to authorize retained asynchronous query state. */
-record PPLAsyncQueryUser(
+public record PPLAsyncQueryUser(
     boolean securityEnabled, String name, String requestedTenant, List<String> backendRoles) {
 
-  PPLAsyncQueryUser {
+  public PPLAsyncQueryUser {
     backendRoles = backendRoles == null ? List.of() : List.copyOf(backendRoles);
     if (securityEnabled && (name == null || name.isBlank())) {
       throw new IllegalArgumentException("Security-enabled PPL user must have a principal");
     }
   }
 
-  static PPLAsyncQueryUser current(ThreadContext threadContext) {
+  public static PPLAsyncQueryUser current(ThreadContext threadContext) {
     try {
       Object serialized =
           threadContext.getTransient(ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT);

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -44,6 +44,9 @@ import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
+import org.opensearch.sql.plugin.transport.PPLQueryAction;
+import org.opensearch.sql.plugin.transport.PPLQueryTask;
+import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.TaskManager;
 

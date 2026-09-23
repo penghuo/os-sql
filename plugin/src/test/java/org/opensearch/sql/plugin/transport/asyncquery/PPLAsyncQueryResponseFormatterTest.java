@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -18,6 +18,7 @@ import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
+import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 
 public class PPLAsyncQueryResponseFormatterTest {
   private final PPLAsyncQueryResponseFormatter formatter = new PPLAsyncQueryResponseFormatter();

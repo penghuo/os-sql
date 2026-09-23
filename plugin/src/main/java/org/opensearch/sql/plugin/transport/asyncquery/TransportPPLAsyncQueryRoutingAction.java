@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.plugin.transport.asyncquery;
 
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.ResourceNotFoundException;
@@ -15,6 +15,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.node.NodeClosedException;
+import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.ConnectTransportException;
 import org.opensearch.transport.NodeDisconnectedException;

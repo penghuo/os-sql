@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.sql.plugin.transport;
+package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.opensearch.sql.lang.PPLLangSpec.PPL_SPEC;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
@@ -11,13 +11,16 @@ import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
+import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.sql.protocol.response.QueryResult;
 import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 
 /** Formats the minimal asynchronous lifecycle envelope. */
-final class PPLAsyncQueryResponseFormatter {
+public final class PPLAsyncQueryResponseFormatter {
 
-  TransportPPLQueryResponse format(PPLAsyncQueryService.JobSnapshot snapshot) {
+  public PPLAsyncQueryResponseFormatter() {}
+
+  public TransportPPLQueryResponse format(PPLAsyncQueryService.JobSnapshot snapshot) {
     JSONObject json =
         snapshot.status() == PPLAsyncQueryService.Status.SUCCEEDED
             ? formatRows(snapshot.response())

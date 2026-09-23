@@ -20,6 +20,25 @@ import org.opensearch.tasks.CancellableTask;
  *
  * <p>After attachment, the job owns one {@link AsyncQueryExecution}. Reads borrow it through a
  * {@link View}; removal transitions detach it so the service can close it outside the lock.
+ *
+ * <pre>
+ * Initial condition                         Initial state
+ * wait_for_completion_timeout &gt; 0          SUBMIT_WAITING
+ * wait_for_completion_timeout = 0          RETAINED_RUNNING (POST returns the job ID)
+ *
+ * Current state          Event              Next state             Submit response
+ * SUBMIT_WAITING         success            REMOVED                final result without job ID
+ * SUBMIT_WAITING         failure            REMOVED                failure without job ID
+ * SUBMIT_WAITING         timeout            RETAINED_RUNNING       running status with job ID
+ * RETAINED_RUNNING       success            RETAINED_SUCCEEDED     none
+ * RETAINED_RUNNING       failure            RETAINED_FAILED        none
+ * SUBMIT_WAITING         delete/abort/close REMOVED                none
+ * RETAINED_*             delete/expire/abort/close REMOVED         none
+ * </pre>
+ *
+ * <p>GET lease renewal and execution attachment do not change the lifecycle state. Events received
+ * after {@code REMOVED} are ignored or reported as not found; a late execution handle is rejected
+ * so the service can close it.
  */
 final class PPLAsyncQueryJob {
   private final String id;

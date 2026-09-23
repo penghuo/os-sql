@@ -9,7 +9,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ProgressiveQueryExecution;
@@ -24,37 +23,22 @@ import org.opensearch.sql.executor.ProgressiveQueryExecution;
 final class DefaultProgressiveQueryExecution
     implements ProgressiveQueryExecution, ResponseListener<QueryResponse> {
   private final CompletableFuture<Void> completion = new CompletableFuture<>();
-  private final AtomicBoolean closed = new AtomicBoolean();
-
-  private QueryResponse finalResult;
-  private boolean terminal;
+  private volatile QueryResponse finalResult;
 
   @Override
   public void onResponse(QueryResponse response) {
-    synchronized (this) {
-      if (terminal) {
-        return;
-      }
-      finalResult = Objects.requireNonNull(response);
-      terminal = true;
-    }
+    finalResult = Objects.requireNonNull(response);
     // Publish completion only after currentResult() can observe the authoritative final response.
     completion.complete(null);
   }
 
   @Override
   public void onFailure(Exception failure) {
-    synchronized (this) {
-      if (terminal) {
-        return;
-      }
-      terminal = true;
-    }
     completion.completeExceptionally(Objects.requireNonNull(failure));
   }
 
   @Override
-  public synchronized Optional<QueryResponse> currentResult() {
+  public Optional<QueryResponse> currentResult() {
     return Optional.ofNullable(finalResult);
   }
 
@@ -65,8 +49,6 @@ final class DefaultProgressiveQueryExecution
 
   @Override
   public void close() {
-    // The final-only adapter owns no result resources yet. Retain the immutable terminal reference
-    // so a currentResult() already racing with lifecycle removal remains safe.
-    closed.compareAndSet(false, true);
+    // This final-only adapter owns no execution resources.
   }
 }

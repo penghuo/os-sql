@@ -64,8 +64,6 @@ final class PPLAsyncQueryResponseFormatter {
   }
 
   private static JSONObject formatFailure(PPLAsyncQueryService.Failure failure) {
-    String type = failure == null ? "Exception" : failure.type();
-    String reason = failure == null ? "query execution failed" : failure.reason();
-    return new JSONObject().put("type", type).put("reason", reason);
+    return new JSONObject().put("type", failure.type()).put("reason", failure.reason());
   }
 }

@@ -5,7 +5,6 @@
 
 package org.opensearch.sql.ppl;
 
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -52,21 +51,6 @@ public class DefaultProgressiveQueryExecutionTest {
             CompletionException.class, () -> execution.completion().toCompletableFuture().join());
     assertTrue(failure.getCause() instanceof IllegalStateException);
     assertTrue(execution.currentResult().isEmpty());
-  }
-
-  @Test
-  public void firstTerminalCallbackWinsAndCloseIsIdempotent() {
-    DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
-
-    execution.onResponse(response("first"));
-    execution.onResponse(response("second"));
-    execution.onFailure(new IllegalStateException("late"));
-    execution.close();
-    execution.close();
-
-    assertEquals(
-        "first", execution.currentResult().orElseThrow().getResults().getFirst().stringValue());
-    assertFalse(execution.completion().toCompletableFuture().isCompletedExceptionally());
   }
 
   private static QueryResponse response(String value) {

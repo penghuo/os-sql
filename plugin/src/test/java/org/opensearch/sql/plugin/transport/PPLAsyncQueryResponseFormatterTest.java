@@ -24,13 +24,12 @@ public class PPLAsyncQueryResponseFormatterTest {
 
   @Test
   public void runningResponseContainsOnlyMinimalEmptySnapshot() {
-    TransportPPLQueryResponse response =
-        formatter.format(
-            new PPLAsyncQueryService.JobSnapshot(
-                "job-id", PPLAsyncQueryService.Status.RUNNING, null, null, -1));
-    JSONObject json = json(response);
+    JSONObject json =
+        json(
+            formatter.format(
+                new PPLAsyncQueryService.JobSnapshot(
+                    "job-id", PPLAsyncQueryService.Status.RUNNING, null, null, -1)));
 
-    assertTrue(response.isAsyncQueryResponse());
     assertEquals("job-id", json.getString("id"));
     assertEquals("RUNNING", json.getString("status"));
     assertEquals(0, json.getJSONArray("schema").length());

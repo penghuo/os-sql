@@ -33,11 +33,11 @@ final class PPLAsyncQueryResponseFormatter {
     } else if (snapshot.status() == PPLAsyncQueryService.Status.FAILED) {
       json.put("error", formatFailure(snapshot.failure()));
     }
-    return TransportPPLQueryResponse.asyncQueryResponse(json.toString(2));
+    return new TransportPPLQueryResponse(json.toString(2));
   }
 
   TransportPPLQueryResponse format(PPLAsyncQueryService.DeleteResult result) {
-    return TransportPPLQueryResponse.asyncQueryResponse(
+    return new TransportPPLQueryResponse(
         new JSONObject().put("id", result.id()).put("status", result.status().name()).toString(2));
   }
 

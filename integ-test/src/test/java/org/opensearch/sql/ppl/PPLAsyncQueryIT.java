@@ -8,7 +8,6 @@ package org.opensearch.sql.ppl;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
@@ -43,7 +42,6 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
     JSONObject submit = new JSONObject(getResponseBody(submitResponse, true));
 
     assertEquals(200, submitResponse.getStatusLine().getStatusCode());
-    assertEquals("no-store", submitResponse.getHeader("Cache-Control"));
     assertEquals("RUNNING", submit.getString("status"));
     assertTrue(submit.has("id"));
     assertMinimalRunningSnapshot(submit);
@@ -135,7 +133,6 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
     String csvResponse = getResponseBody(csvRestResponse, true);
     assertTrue(csvResponse.startsWith("account_number"));
     assertFalse(csvResponse.contains("\"status\""));
-    assertNull(csvRestResponse.getHeader("Cache-Control"));
 
     Request jdbc = new Request("POST", QUERY_API_ENDPOINT + "?format=jdbc");
     jdbc.setJsonEntity(
@@ -148,7 +145,6 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
     JSONObject jdbcResponse = new JSONObject(getResponseBody(jdbcRestResponse, true));
     assertFalse(jdbcResponse.has("status"));
     assertTrue(jdbcResponse.has("size"));
-    assertNull(jdbcRestResponse.getHeader("Cache-Control"));
   }
 
   @Test
@@ -219,7 +215,6 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
       JSONObject response = new JSONObject(getResponseBody(restResponse, true));
       assertFalse(response.has("status"));
       assertTrue(response.has("size"));
-      assertNull(restResponse.getHeader("Cache-Control"));
     } finally {
       enableCalcite();
     }

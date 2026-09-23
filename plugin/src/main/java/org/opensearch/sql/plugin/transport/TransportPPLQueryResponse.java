@@ -20,40 +20,26 @@ public class TransportPPLQueryResponse extends ActionResponse {
   @Getter private final String result;
   @Getter private final String contentType;
 
-  /** True when the transport action selected the asynchronous lifecycle API. */
-  @Getter private final boolean asyncQueryResponse;
-
   public TransportPPLQueryResponse(String result) {
-    this(result, "application/json; charset=UTF-8");
+    this.result = result;
+    this.contentType = "application/json; charset=UTF-8";
   }
 
   public TransportPPLQueryResponse(String result, String contentType) {
-    this(result, contentType, false);
-  }
-
-  private TransportPPLQueryResponse(String result, String contentType, boolean asyncQueryResponse) {
     this.result = result;
     this.contentType = contentType;
-    this.asyncQueryResponse = asyncQueryResponse;
-  }
-
-  /** Creates a response produced by the asynchronous query lifecycle API. */
-  static TransportPPLQueryResponse asyncQueryResponse(String result) {
-    return new TransportPPLQueryResponse(result, "application/json; charset=UTF-8", true);
   }
 
   public TransportPPLQueryResponse(StreamInput in) throws IOException {
     super(in);
     result = in.readString();
     contentType = in.readString();
-    asyncQueryResponse = in.readBoolean();
   }
 
   @Override
   public void writeTo(StreamOutput out) throws IOException {
     out.writeString(result);
     out.writeString(contentType);
-    out.writeBoolean(asyncQueryResponse);
   }
 
   public static TransportPPLQueryResponse fromActionResponse(ActionResponse actionResponse) {

@@ -141,12 +141,7 @@ public class RestPPLQueryAction extends BaseRestHandler {
           new ActionListener<>() {
             @Override
             public void onResponse(TransportPPLQueryResponse response) {
-              sendResponse(
-                  channel,
-                  OK,
-                  response.getContentType(),
-                  response.getResult(),
-                  response.isAsyncQueryResponse());
+              sendResponse(channel, OK, response.getContentType(), response.getResult());
             }
 
             @Override
@@ -186,7 +181,7 @@ public class RestPPLQueryAction extends BaseRestHandler {
     return new ActionListener<>() {
       @Override
       public void onResponse(TransportPPLQueryResponse response) {
-        sendResponse(channel, OK, response.getContentType(), response.getResult(), true);
+        sendResponse(channel, OK, response.getContentType(), response.getResult());
       }
 
       @Override
@@ -196,32 +191,19 @@ public class RestPPLQueryAction extends BaseRestHandler {
             "PPL asynchronous request failed (status {}, type {})",
             status,
             e.getClass().getSimpleName());
-        reportError(channel, e, status, true);
+        reportError(channel, e, status);
       }
     };
   }
 
-  private void reportError(final RestChannel channel, final Exception e, final RestStatus status) {
-    reportError(channel, e, status, false);
-  }
-
   private void sendResponse(
-      RestChannel channel, RestStatus status, String contentType, String content, boolean noStore) {
-    BytesRestResponse response = new BytesRestResponse(status, contentType, content);
-    if (noStore) {
-      response.addHeader("Cache-Control", "no-store");
-    }
-    channel.sendResponse(response);
+      RestChannel channel, RestStatus status, String contentType, String content) {
+    channel.sendResponse(new BytesRestResponse(status, contentType, content));
   }
 
-  private void reportError(
-      final RestChannel channel, final Exception e, final RestStatus status, boolean noStore) {
-    BytesRestResponse response =
+  private void reportError(final RestChannel channel, final Exception e, final RestStatus status) {
+    channel.sendResponse(
         new BytesRestResponse(
-            status, ErrorMessageFactory.createErrorMessage(e, status.getStatus()).toString());
-    if (noStore) {
-      response.addHeader("Cache-Control", "no-store");
-    }
-    channel.sendResponse(response);
+            status, ErrorMessageFactory.createErrorMessage(e, status.getStatus()).toString()));
   }
 }

@@ -13,10 +13,25 @@ import org.opensearch.commons.ConfigConstants;
 import org.opensearch.commons.authuser.User;
 import org.opensearch.core.rest.RestStatus;
 
-/** Immutable submitter identity used to authorize retained asynchronous query state. */
+/**
+ * Immutable submitter identity used to authorize retained asynchronous query state.
+ *
+ * @param securityEnabled whether the security plugin supplied an authenticated identity
+ * @param name authenticated principal
+ * @param requestedTenant requested security tenant
+ * @param backendRoles backend roles captured at submission
+ */
 public record PPLAsyncQueryUser(
     boolean securityEnabled, String name, String requestedTenant, List<String> backendRoles) {
 
+  /**
+   * Creates an immutable asynchronous query identity.
+   *
+   * @param securityEnabled whether the security plugin supplied an authenticated identity
+   * @param name authenticated principal
+   * @param requestedTenant requested security tenant
+   * @param backendRoles backend roles captured at submission
+   */
   public PPLAsyncQueryUser {
     backendRoles = backendRoles == null ? List.of() : List.copyOf(backendRoles);
     if (securityEnabled && (name == null || name.isBlank())) {
@@ -24,6 +39,12 @@ public record PPLAsyncQueryUser(
     }
   }
 
+  /**
+   * Captures the current caller from the OpenSearch thread context.
+   *
+   * @param threadContext current request thread context
+   * @return immutable caller identity
+   */
   public static PPLAsyncQueryUser current(ThreadContext threadContext) {
     try {
       Object serialized =

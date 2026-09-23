@@ -18,8 +18,15 @@ import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
 /** Formats the minimal asynchronous lifecycle envelope. */
 public final class PPLAsyncQueryResponseFormatter {
 
+  /** Creates an asynchronous PPL response formatter. */
   public PPLAsyncQueryResponseFormatter() {}
 
+  /**
+   * Formats a point-in-time job snapshot.
+   *
+   * @param snapshot immutable lifecycle and result snapshot
+   * @return transport response containing the asynchronous response JSON
+   */
   public TransportPPLQueryResponse format(PPLAsyncQueryService.JobSnapshot snapshot) {
     JSONObject json =
         snapshot.status() == PPLAsyncQueryService.Status.SUCCEEDED

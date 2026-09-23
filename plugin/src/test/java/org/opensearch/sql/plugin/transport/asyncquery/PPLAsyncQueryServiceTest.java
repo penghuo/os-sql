@@ -60,12 +60,13 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void fastSuccessReturnsDirectResultWithoutRetainingJob() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     AtomicInteger responses = new AtomicInteger();
 
     service.registerSubmitWaiter(
-        id,
+        job,
         TimeValue.timeValueSeconds(5),
         listener(
             snapshot -> {
@@ -73,9 +74,9 @@ public class PPLAsyncQueryServiceTest {
               responses.incrementAndGet();
             }));
     TrackingExecution execution = new TrackingExecution(response(2));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
     now.addAndGet(25);
-    service.complete(id);
+    service.complete(job);
 
     assertEquals(1, responses.get());
     assertNull(result.get().id());
@@ -94,9 +95,10 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void timeoutReturnsIdAndLaterGetReturnsCompleteResult() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
     AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(submit::set));
+    service.registerSubmitWaiter(job, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     timeoutTask.get().run();
 
@@ -108,8 +110,8 @@ public class PPLAsyncQueryServiceTest {
 
     now.addAndGet(25);
     TrackingExecution execution = new TrackingExecution(response(2));
-    service.attachExecution(id, execution);
-    service.complete(id);
+    service.attachExecution(job, execution);
+    service.complete(job);
     PPLAsyncQueryService.JobSnapshot completed = service.get(id, OWNER, null);
 
     assertEquals(id, completed.id());
@@ -122,9 +124,10 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void submitWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
-    String id = service.create(OWNER, TimeValue.timeValueSeconds(1), null);
+    PPLAsyncQueryJob job = service.create(OWNER, TimeValue.timeValueSeconds(1), null);
+    String id = job.id();
     AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(submit::set));
+    service.registerSubmitWaiter(job, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     now.addAndGet(TimeValue.timeValueSeconds(2).millis());
     service.reapExpired();
@@ -145,13 +148,13 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void fastFailureReturnsDirectFailureWithoutId() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(job, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
-    service.fail(id, new IllegalStateException("boom"));
+    service.fail(job, new IllegalStateException("boom"));
 
     assertNull(result.get().id());
     assertEquals(PPLAsyncQueryService.Status.FAILED, result.get().status());
@@ -167,10 +170,11 @@ public class PPLAsyncQueryServiceTest {
   public void getRenewsLeaseAndExpiryCancelsRunningTask() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
-    String id = createJob(task);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(task);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     now.addAndGet(TimeValue.timeValueMinutes(4).millis());
     PPLAsyncQueryService.JobSnapshot renewed = service.get(id, OWNER, null);
@@ -191,10 +195,11 @@ public class PPLAsyncQueryServiceTest {
   public void deleteCancelsRunningJobAndReleasesState() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
-    String id = createJob(task);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(task);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     PPLAsyncQueryService.DeleteResult result = service.delete(id, OWNER);
 
@@ -210,11 +215,12 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void deleteReturnsExistingTerminalStatus() {
     CancellableTask task = mock(CancellableTask.class);
-    String id = createJob(task);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(task);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(id, execution);
-    service.complete(id);
+    service.attachExecution(job, execution);
+    service.complete(job);
 
     PPLAsyncQueryService.DeleteResult result = service.delete(id, OWNER);
 
@@ -230,10 +236,10 @@ public class PPLAsyncQueryServiceTest {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     service.attachTaskManager(taskManager);
-    String id = createJob(task);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(task);
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
 
-    service.delete(id, OWNER);
+    service.delete(job.id(), OWNER);
 
     verify(taskManager)
         .cancelTaskAndDescendants(
@@ -415,8 +421,10 @@ public class PPLAsyncQueryServiceTest {
     PPLAsyncQueryUser securedOwner =
         new PPLAsyncQueryUser(true, "alice", "tenant", List.of("role-a"));
     PPLAsyncQueryUser otherUser = new PPLAsyncQueryUser(true, "bob", "tenant", List.of("role-a"));
-    String id = service.create(securedOwner, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job =
+        service.create(securedOwner, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
 
     assertThrows(OpenSearchSecurityException.class, () -> service.get(id, otherUser, null));
     assertThrows(OpenSearchSecurityException.class, () -> service.delete(id, otherUser));
@@ -437,18 +445,38 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
+  public void createFailureReleasesReservedCapacity() {
+    PPLAsyncQueryService missingOwnerNode =
+        new PPLAsyncQueryService(
+            (String) null,
+            now::get,
+            (delay, task) -> () -> {},
+            () -> 1,
+            () -> 1,
+            () -> TimeValue.timeValueSeconds(60),
+            () -> TimeValue.timeValueHours(24));
+
+    assertThrows(
+        NullPointerException.class,
+        () -> missingOwnerNode.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null));
+
+    assertEquals(0, missingOwnerNode.runningQueryCount());
+    assertEquals(0, missingOwnerNode.retainedJobCount());
+  }
+
+  @Test
   public void finalSnapshotDefensivelyCopiesRows() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(job, TimeValue.timeValueSeconds(5), listener(result::set));
     List<org.opensearch.sql.data.model.ExprValue> rows = new ArrayList<>();
     rows.add(ExprValueUtils.stringValue("first"));
     QueryResponse response =
         new QueryResponse(
             new Schema(List.of(new Column("state", null, ExprCoreType.STRING))), rows, null);
 
-    service.attachExecution(id, new TrackingExecution(response));
-    service.complete(id);
+    service.attachExecution(job, new TrackingExecution(response));
+    service.complete(job);
     rows.add(ExprValueUtils.stringValue("second"));
 
     assertEquals(1, result.get().response().getResults().size());
@@ -456,13 +484,13 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void completedExecutionCanBeAttachedBeforeCompletionIsObserved() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(job, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(null);
 
     execution.succeed(response(2));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     assertEquals(PPLAsyncQueryService.Status.SUCCEEDED, result.get().status());
     assertEquals(2, result.get().response().getResults().size());
@@ -471,10 +499,11 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void runningGetMaterializesCurrentResultOutsideJob() {
-    String id = createJob(null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     PPLAsyncQueryService.JobSnapshot first = service.get(id, OWNER, null);
     execution.setCurrent(response(3));
@@ -487,12 +516,13 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void failedRetainedJobReturnsNoProvisionalRowsAndClosesExecution() {
-    String id = createJob(null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
-    service.fail(id, new IllegalStateException("boom"));
+    service.fail(job, new IllegalStateException("boom"));
     PPLAsyncQueryService.JobSnapshot failed = service.get(id, OWNER, null);
 
     assertEquals(PPLAsyncQueryService.Status.FAILED, failed.status());
@@ -503,12 +533,13 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void deleteBeforeExecutionAttachmentClosesLateHandle() {
-    String id = createJob(null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     service.delete(id, OWNER);
     TrackingExecution execution = new TrackingExecution(response(1));
 
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     assertEquals(1, execution.closes.get());
     assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
@@ -516,10 +547,11 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void concurrentGetDoesNotBlockDeleteOnResultMaterialization() throws Exception {
-    String id = createJob(null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(null);
+    String id = job.id();
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     BlockingExecution execution = new BlockingExecution(response(1));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     CompletableFuture<PPLAsyncQueryService.JobSnapshot> get =
         CompletableFuture.supplyAsync(() -> service.get(id, OWNER, null));
@@ -540,10 +572,10 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void shutdownClosesRetainedExecutionExactlyOnce() throws Exception {
-    String id = createJob(null);
-    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
+    PPLAsyncQueryJob job = createJob(null);
+    service.registerSubmitWaiter(job, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     service.close();
     service.close();
@@ -566,16 +598,17 @@ public class PPLAsyncQueryServiceTest {
             () -> 100,
             () -> TimeValue.timeValueSeconds(60),
             () -> TimeValue.timeValueHours(24));
-    String id = abortingService.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
+    PPLAsyncQueryJob job =
+        abortingService.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
     TrackingExecution execution = new TrackingExecution(null);
-    abortingService.attachExecution(id, execution);
+    abortingService.attachExecution(job, execution);
 
     IllegalStateException failure =
         assertThrows(
             IllegalStateException.class,
             () ->
                 abortingService.registerSubmitWaiter(
-                    id, TimeValue.timeValueSeconds(5), listener(snapshot -> {})));
+                    job, TimeValue.timeValueSeconds(5), listener(snapshot -> {})));
 
     assertEquals("scheduler unavailable", failure.getMessage());
     assertEquals(1, execution.closes.get());
@@ -585,14 +618,14 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void successfulCompletionRequiresFinalResultToBeVisible() {
-    String id = createJob(null);
+    PPLAsyncQueryJob job = createJob(null);
     AtomicReference<Exception> failure = new AtomicReference<>();
     service.registerSubmitWaiter(
-        id, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
+        job, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
-    service.complete(id);
+    service.complete(job);
 
     assertTrue(failure.get() instanceof IllegalStateException);
     assertEquals(1, execution.closes.get());
@@ -603,12 +636,13 @@ public class PPLAsyncQueryServiceTest {
   public void submitMaterializationFailureAbortsUndeliverableRetainedJob() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
-    String id = createJob(task);
+    PPLAsyncQueryJob job = createJob(task);
+    String id = job.id();
     AtomicReference<Exception> failure = new AtomicReference<>();
     service.registerSubmitWaiter(
-        id, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
+        job, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
     ThrowingExecution execution = new ThrowingExecution();
-    service.attachExecution(id, execution);
+    service.attachExecution(job, execution);
 
     timeoutTask.get().run();
 
@@ -650,7 +684,7 @@ public class PPLAsyncQueryServiceTest {
         () -> TimeValue.timeValueHours(24));
   }
 
-  private String createJob(CancellableTask task) {
+  private PPLAsyncQueryJob createJob(CancellableTask task) {
     return service.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, task);
   }
 

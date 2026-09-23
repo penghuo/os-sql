@@ -29,12 +29,14 @@ abstract class AbstractPPLAsyncQueryRequest extends ActionRequest {
     return id;
   }
 
+  /** {@inheritDoc} */
   @Override
   public void writeTo(StreamOutput out) throws IOException {
     super.writeTo(out);
     out.writeString(id);
   }
 
+  /** {@inheritDoc} */
   @Override
   public ActionRequestValidationException validate() {
     ActionRequestValidationException validationException = null;
@@ -44,6 +46,7 @@ abstract class AbstractPPLAsyncQueryRequest extends ActionRequest {
     return validationException;
   }
 
+  /** {@inheritDoc} */
   @Override
   public String getDescription() {
     return "PPL asynchronous query lifecycle request";

@@ -13,12 +13,21 @@ import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
+/** Routes asynchronous PPL GET requests to the job owner node and returns its current snapshot. */
 public final class TransportPPLAsyncGetResultAction
     extends TransportPPLAsyncQueryRoutingAction<PPLAsyncGetResultRequest> {
 
   private final PPLAsyncQueryService asyncQueryService;
   private final PPLAsyncQueryResponseFormatter responseFormatter;
 
+  /**
+   * Creates the asynchronous PPL GET transport action.
+   *
+   * @param transportService node transport service
+   * @param actionFilters configured transport action filters
+   * @param clusterService current cluster state service
+   * @param asyncQueryService owner-node asynchronous query lifecycle service
+   */
   @Inject
   public TransportPPLAsyncGetResultAction(
       TransportService transportService,

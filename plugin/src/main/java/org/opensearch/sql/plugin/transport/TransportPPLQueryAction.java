@@ -95,6 +95,19 @@ public class TransportPPLQueryAction
   private final PPLAsyncQueryService asyncQueryService;
   private final PPLAsyncQueryResponseFormatter asyncResponseFormatter;
 
+  /**
+   * Creates the PPL transport action.
+   *
+   * @param transportService node transport service
+   * @param actionFilters configured transport action filters
+   * @param client node client used by PPL execution
+   * @param clusterService current cluster state service
+   * @param dataSourceService data source registry
+   * @param clusterSettings OpenSearch cluster settings
+   * @param extensionsHolder registered execution engine extensions
+   * @param tracer query tracer
+   * @param asyncQueryService asynchronous PPL lifecycle service
+   */
   @Inject
   public TransportPPLQueryAction(
       TransportService transportService,
@@ -136,7 +149,11 @@ public class TransportPPLQueryAction
                         .getSettingValue(Settings.Key.PPL_ENABLED);
   }
 
-  /** Invoked by Guice iff analytics-engine bound {@code QueryPlanExecutor}. */
+  /**
+   * Installs the optional analytics query plan executor.
+   *
+   * @param queryPlanExecutor analytics query plan executor
+   */
   @Inject(optional = true)
   public void setQueryPlanExecutor(
       QueryPlanExecutor<RelNode, Iterable<Object[]>> queryPlanExecutor) {
@@ -146,7 +163,11 @@ public class TransportPPLQueryAction
     buildUnifiedQueryHandlerIfReady();
   }
 
-  /** Invoked by Guice iff analytics-engine bound {@code EngineContextProvider}. */
+  /**
+   * Installs the optional analytics engine context.
+   *
+   * @param contextProvider analytics engine context provider
+   */
   @Inject(optional = true)
   public void setEngineContext(org.opensearch.analytics.EngineContextProvider contextProvider) {
     org.opensearch.sql.plugin.rest.EngineContextProviderHolder.set(contextProvider);

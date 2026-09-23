@@ -37,10 +37,19 @@ public class PPLQueryRequest {
   private static final String START_TIME_FIELD = "start_time";
   private static final String END_TIME_FIELD = "end_time";
   private static final String TIME_FIELD_FIELD = "time_field";
+
+  /** JSON field selecting the asynchronous job lease. */
   public static final String KEEP_ALIVE_FIELD = "keep_alive";
+
+  /** JSON field selecting how long submit waits for direct completion. */
   public static final String WAIT_FOR_COMPLETION_TIMEOUT_FIELD = "wait_for_completion_timeout";
+
+  /** Default asynchronous job lease. */
   public static final String DEFAULT_KEEP_ALIVE = "5m";
+
+  /** Default submit wait-for-completion timeout. */
   public static final String DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT = "5s";
+
   private static final int MAX_HIGHLIGHT_FIELDS = 100;
   private static final int MAX_TAG_ENTRIES = 10;
 
@@ -150,12 +159,22 @@ public class PPLQueryRequest {
     return path.endsWith("/_explain");
   }
 
+  /**
+   * Returns whether the request contains an asynchronous lifecycle field.
+   *
+   * @return {@code true} when keep-alive or wait-for-completion was explicitly requested
+   */
   public boolean isAsyncQueryRequest() {
     return jsonContent != null
         && (jsonContent.has(WAIT_FOR_COMPLETION_TIMEOUT_FIELD)
             || jsonContent.has(KEEP_ALIVE_FIELD));
   }
 
+  /**
+   * Returns the requested asynchronous job lease.
+   *
+   * @return requested lease or {@link #DEFAULT_KEEP_ALIVE}
+   */
   public String getKeepAlive() {
     if (jsonContent == null || !jsonContent.has(KEEP_ALIVE_FIELD)) {
       return DEFAULT_KEEP_ALIVE;
@@ -163,6 +182,11 @@ public class PPLQueryRequest {
     return jsonContent.getString(KEEP_ALIVE_FIELD);
   }
 
+  /**
+   * Returns how long asynchronous submit waits for direct completion.
+   *
+   * @return requested timeout or {@link #DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT}
+   */
   public String getWaitForCompletionTimeout() {
     if (jsonContent == null || !jsonContent.has(WAIT_FOR_COMPLETION_TIMEOUT_FIELD)) {
       return DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT;
@@ -170,6 +194,11 @@ public class PPLQueryRequest {
     return jsonContent.getString(WAIT_FOR_COMPLETION_TIMEOUT_FIELD);
   }
 
+  /**
+   * Returns whether this request mode and response format support asynchronous execution.
+   *
+   * @return {@code true} for a normal query using the default JSON response format
+   */
   public boolean supportsAsyncExecution() {
     return !isExplainRequest()
         && !profile

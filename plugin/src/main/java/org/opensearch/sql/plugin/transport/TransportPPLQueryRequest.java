@@ -169,7 +169,11 @@ public class TransportPPLQueryRequest extends ActionRequest {
     return path != null && path.endsWith("/_grammar");
   }
 
-  /** Whether the request selected the asynchronous submit path. */
+  /**
+   * Returns whether the request contains an asynchronous lifecycle field.
+   *
+   * @return {@code true} when keep-alive or wait-for-completion was explicitly requested
+   */
   public boolean isAsyncQueryRequest() {
     return jsonContent != null
         && (jsonContent.has(PPLQueryRequest.WAIT_FOR_COMPLETION_TIMEOUT_FIELD)

@@ -95,6 +95,10 @@ public class PPLService {
    * <p>The existing callback execution remains internal to the PPL execution module. This
    * final-only implementation exposes no current result until the callback publishes the
    * authoritative response.
+   *
+   * @param request PPL query request
+   * @param anonymizedQuerySink receives anonymized query text for metrics
+   * @return lifecycle-facing asynchronous execution handle
    */
   public AsyncQueryExecution executeAsync(
       PPLQueryRequest request, Consumer<String> anonymizedQuerySink) {

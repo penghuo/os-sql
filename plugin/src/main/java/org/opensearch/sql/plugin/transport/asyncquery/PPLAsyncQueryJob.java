@@ -94,13 +94,13 @@ final class PPLAsyncQueryJob {
         view, waiter, Retention.REMOVE, RunningSlotAction.KEEP, executionToClose, null);
   }
 
-  synchronized AsyncQueryExecution attachExecution(AsyncQueryExecution execution) {
+  synchronized boolean tryAttachExecution(AsyncQueryExecution execution) {
     Objects.requireNonNull(execution);
     if (removed || status != PPLAsyncQueryService.Status.RUNNING || this.execution != null) {
-      return execution;
+      return false;
     }
     this.execution = execution;
-    return null;
+    return true;
   }
 
   synchronized Transition complete(long now) {

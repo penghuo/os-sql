@@ -86,6 +86,7 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /** Maximum number of asynchronous PPL queries running concurrently on one node. */
   public static final Setting<Integer> PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING =
       Setting.intSetting(
           Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES.getKeyValue(),
@@ -94,6 +95,7 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /** Maximum number of asynchronous PPL jobs retained on one node. */
   public static final Setting<Integer> PPL_ASYNC_MAX_RETAINED_JOBS_SETTING =
       Setting.intSetting(
           Key.PPL_ASYNC_MAX_RETAINED_JOBS.getKeyValue(),
@@ -102,6 +104,7 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /** Maximum accepted submit wait-for-completion timeout. */
   public static final Setting<TimeValue> PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING =
       Setting.positiveTimeSetting(
           Key.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT.getKeyValue(),
@@ -109,6 +112,7 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /** Maximum accepted asynchronous PPL job lease. */
   public static final Setting<TimeValue> PPL_ASYNC_MAX_KEEP_ALIVE_SETTING =
       Setting.positiveTimeSetting(
           Key.PPL_ASYNC_MAX_KEEP_ALIVE.getKeyValue(),

@@ -19,6 +19,7 @@ import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.executor.AnalyzeResponse;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
+import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryManager;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.executor.execution.AbstractPlan;
@@ -86,6 +87,22 @@ public class PPLService {
     } catch (Exception e) {
       queryListener.onFailure(e);
     }
+  }
+
+  /**
+   * Starts query execution and immediately returns its lifecycle-facing handle.
+   *
+   * <p>The existing callback execution remains internal to the PPL execution module. This
+   * final-only implementation exposes no current result until the callback publishes the
+   * authoritative response.
+   */
+  public ProgressiveQueryExecution executeProgressively(
+      PPLQueryRequest request,
+      ResponseListener<ExplainResponse> explainListener,
+      Consumer<String> anonymizedQuerySink) {
+    DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
+    execute(request, execution, explainListener, anonymizedQuerySink);
+    return execution;
   }
 
   /**

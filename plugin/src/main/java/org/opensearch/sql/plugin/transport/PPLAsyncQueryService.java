@@ -25,12 +25,13 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
+import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.TaskManager;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
-/** Owner-node lifecycle and complete-result store for asynchronous PPL queries. */
+/** Owner-node lifecycle and current-result access for asynchronous PPL queries. */
 public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   private static final Logger LOG = LogManager.getLogger(PPLAsyncQueryService.class);
 
@@ -64,12 +65,25 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *
    * @param id opaque job ID, or {@code null} for a terminal response returned directly by submit
    * @param status lifecycle state captured with the result
-   * @param response complete query result for {@link Status#SUCCEEDED}, otherwise {@code null}
+   * @param response current query result, or {@code null} before a result is available
    * @param failure sanitized failure for {@link Status#FAILED}, otherwise {@code null}
    * @param tookMillis elapsed execution time, available for a completed job
    */
   record JobSnapshot(
       String id, Status status, QueryResponse response, Failure failure, long tookMillis) {}
+
+  /**
+   * Lightweight lifecycle state captured atomically under the job lock.
+   *
+   * <p>The service reads {@link #execution} and creates a {@link JobSnapshot} only after the job
+   * lock has been released.
+   */
+  private record JobView(
+      String id,
+      Status status,
+      ProgressiveQueryExecution execution,
+      Failure failure,
+      long tookMillis) {}
 
   /** Response model returned after DELETE removes a retained job. */
   record DeleteResult(String id, Status status) {}
@@ -215,10 +229,28 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  void complete(String id, QueryResponse response) {
+  /**
+   * Transfers ownership of an execution handle to its job.
+   *
+   * <p>If the job was already removed, the late handle is closed immediately.
+   */
+  void attachExecution(String id, ProgressiveQueryExecution execution) {
+    Objects.requireNonNull(execution);
+    LocatedJob located = findInternal(id);
+    if (located == null) {
+      closeExecution(execution);
+      return;
+    }
+    ProgressiveQueryExecution rejected = located.job.attachExecution(execution);
+    if (rejected != null) {
+      closeExecution(rejected);
+    }
+  }
+
+  void complete(String id) {
     LocatedJob located = findInternal(id);
     if (located != null) {
-      applyTransition(located, located.job.complete(copy(response), currentTimeMillis.getAsLong()));
+      applyTransition(located, located.job.complete(currentTimeMillis.getAsLong()));
     }
   }
 
@@ -242,7 +274,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       applyRemoval(located, access.removal);
       throw notFound();
     }
-    return access.snapshot;
+    return materialize(access.view);
   }
 
   DeleteResult delete(String id, PPLAsyncQueryUser caller) {
@@ -326,8 +358,28 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         && jobs.remove(located.contextId, located.job)) {
       releaseRetained();
     }
+
+    JobSnapshot snapshot = null;
+    RuntimeException materializationFailure = null;
+    try {
+      if (transition.submitResponse != null) {
+        snapshot = materialize(transition.submitResponse.view);
+      }
+    } catch (RuntimeException e) {
+      materializationFailure = e;
+    } finally {
+      closeExecution(transition.executionToClose);
+    }
+
     if (transition.submitResponse != null) {
-      transition.submitResponse.waiter.respond(transition.submitResponse.snapshot);
+      if (materializationFailure == null) {
+        transition.submitResponse.waiter.respond(snapshot);
+      } else {
+        if (transition.jobRetention == JobRetention.RETAIN) {
+          applyRemoval(located, located.job.abort());
+        }
+        transition.submitResponse.waiter.fail(materializationFailure);
+      }
     }
   }
 
@@ -342,6 +394,34 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       releaseRetained();
     }
     cancel(removal.task, removal.reason);
+    closeExecution(removal.execution);
+  }
+
+  private JobSnapshot materialize(JobView view) {
+    QueryResponse response = null;
+    if (view.status == Status.SUCCEEDED || view.status == Status.RUNNING) {
+      response =
+          view.execution == null
+              ? null
+              : view.execution.currentResult().map(PPLAsyncQueryService::copy).orElse(null);
+    }
+    if (view.status == Status.SUCCEEDED && response == null) {
+      throw new IllegalStateException(
+          "Successful PPL asynchronous execution completed without a final result");
+    }
+    return new JobSnapshot(view.id, view.status, response, view.failure, view.tookMillis);
+  }
+
+  private static void closeExecution(ProgressiveQueryExecution execution) {
+    if (execution == null) {
+      return;
+    }
+    try {
+      execution.close();
+    } catch (RuntimeException e) {
+      LOG.warn(
+          "Failed to close PPL asynchronous query execution ({})", e.getClass().getSimpleName());
+    }
   }
 
   private LocatedJob findLocal(String encodedId) {
@@ -495,10 +575,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * <p>It is absent after submit already returned a job ID; in that case a later GET creates a new
    * snapshot from the retained job.
    *
-   * @param snapshot point-in-time job data to format for the POST response
+   * @param view point-in-time job state to materialize for the POST response
    * @param waiter one-shot listener for the POST request that is still waiting
    */
-  private record SubmitResponse(JobSnapshot snapshot, SubmitWaiter waiter) {}
+  private record SubmitResponse(JobView view, SubmitWaiter waiter) {}
 
   /**
    * Side effects selected atomically by a {@link Job} state transition.
@@ -507,31 +587,36 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *     returned
    * @param jobRetention whether the owner-node job map keeps or removes the job
    * @param runningSlotAction whether this transition releases running-query capacity
+   * @param executionToClose execution-owned resources to release after response materialization
    */
   private record JobTransition(
       SubmitResponse submitResponse,
       JobRetention jobRetention,
-      RunningSlotAction runningSlotAction) {
+      RunningSlotAction runningSlotAction,
+      ProgressiveQueryExecution executionToClose) {
 
     private static JobTransition respond(
-        JobSnapshot snapshot,
+        JobView view,
         SubmitWaiter waiter,
         JobRetention jobRetention,
-        RunningSlotAction runningSlotAction) {
+        RunningSlotAction runningSlotAction,
+        ProgressiveQueryExecution executionToClose) {
       return new JobTransition(
-          new SubmitResponse(snapshot, waiter), jobRetention, runningSlotAction);
+          new SubmitResponse(view, waiter), jobRetention, runningSlotAction, executionToClose);
     }
 
     private static JobTransition withoutSubmitResponse(
-        JobRetention jobRetention, RunningSlotAction runningSlotAction) {
-      return new JobTransition(null, jobRetention, runningSlotAction);
+        JobRetention jobRetention,
+        RunningSlotAction runningSlotAction,
+        ProgressiveQueryExecution executionToClose) {
+      return new JobTransition(null, jobRetention, runningSlotAction, executionToClose);
     }
   }
 
-  /** Result of reading a job: either a snapshot or removal of an expired job. */
-  private record Access(JobSnapshot snapshot, Removal removal) {
-    private static Access snapshot(JobSnapshot snapshot) {
-      return new Access(snapshot, null);
+  /** Result of reading a job: either a view to materialize or removal of an expired job. */
+  private record Access(JobView view, Removal removal) {
+    private static Access view(JobView view) {
+      return new Access(view, null);
     }
 
     private static Access removed(Removal removal) {
@@ -544,6 +629,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *
    * @param responseStatus status returned by DELETE when applicable
    * @param task running task to cancel, or {@code null} for a terminal job
+   * @param execution execution-owned resources detached from the job
    * @param reason non-sensitive cancellation reason
    * @param expired whether the caller should observe the removal as not found
    * @param releaseRunningSlot whether running-query capacity must be released
@@ -551,6 +637,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   private record Removal(
       Status responseStatus,
       CancellableTask task,
+      ProgressiveQueryExecution execution,
       String reason,
       boolean expired,
       boolean releaseRunningSlot) {}
@@ -604,6 +691,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * <p>Every lifecycle and lease transition is synchronized on this object. Methods mutate only
    * job-owned state and return immutable transition values; they never call listeners, mutate the
    * service map, update capacity counters, or cancel tasks while holding the lock.
+   *
+   * <p>After attachment, the job owns one {@link ProgressiveQueryExecution}. Reads borrow it
+   * through a {@link JobView}; removal transitions detach it so the service can close it outside
+   * the lock.
    */
   private static final class Job {
     private final String id;
@@ -614,7 +705,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     private long keepAliveMillis;
     private long expirationTimeMillis;
     private Status status = Status.RUNNING;
-    private QueryResponse response;
+    private ProgressiveQueryExecution execution;
     private Failure failure;
     private long completionTimeMillis = -1L;
     private SubmitWaiter submitWaiter;
@@ -642,14 +733,16 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       }
       if (status != Status.RUNNING) {
         removed = true;
+        JobView view = view(false);
+        ProgressiveQueryExecution executionToClose = detachExecution();
         return SubmitRegistration.respondImmediately(
             JobTransition.respond(
-                snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.KEEP));
+                view, waiter, JobRetention.REMOVE, RunningSlotAction.KEEP, executionToClose));
       }
       if (returnImmediately) {
         return SubmitRegistration.respondImmediately(
             JobTransition.respond(
-                snapshot(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP));
+                view(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP, null));
       }
       submitWaiter = waiter;
       return SubmitRegistration.waiting();
@@ -663,22 +756,37 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       if (status == Status.RUNNING) {
         expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
         return JobTransition.respond(
-            snapshot(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP);
+            view(true), waiter, JobRetention.RETAIN, RunningSlotAction.KEEP, null);
       }
       removed = true;
+      JobView view = view(false);
+      ProgressiveQueryExecution executionToClose = detachExecution();
       return JobTransition.respond(
-          snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.KEEP);
+          view, waiter, JobRetention.REMOVE, RunningSlotAction.KEEP, executionToClose);
     }
 
-    private synchronized JobTransition complete(QueryResponse response, long now) {
+    private synchronized ProgressiveQueryExecution attachExecution(
+        ProgressiveQueryExecution execution) {
+      Objects.requireNonNull(execution);
+      if (removed || status != Status.RUNNING || this.execution != null) {
+        return execution;
+      }
+      this.execution = execution;
+      return null;
+    }
+
+    private synchronized JobTransition complete(long now) {
       if (removed || status != Status.RUNNING) {
         return null;
       }
-      this.response = response;
+      if (execution == null) {
+        throw new IllegalStateException(
+            "PPL asynchronous execution must be attached before successful completion");
+      }
       task = null;
       status = Status.SUCCEEDED;
       completionTimeMillis = now;
-      return terminalPublication();
+      return terminalTransition();
     }
 
     private synchronized JobTransition fail(Failure failure, long now) {
@@ -689,18 +797,25 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       task = null;
       status = Status.FAILED;
       completionTimeMillis = now;
-      return terminalPublication();
+      return terminalTransition();
     }
 
-    private JobTransition terminalPublication() {
+    private JobTransition terminalTransition() {
       SubmitWaiter waiter = submitWaiter;
       submitWaiter = null;
       if (waiter != null) {
         removed = true;
+        JobView view = view(false);
+        ProgressiveQueryExecution executionToClose = detachExecution();
         return JobTransition.respond(
-            snapshot(false), waiter, JobRetention.REMOVE, RunningSlotAction.RELEASE);
+            view, waiter, JobRetention.REMOVE, RunningSlotAction.RELEASE, executionToClose);
       }
-      return JobTransition.withoutSubmitResponse(JobRetention.RETAIN, RunningSlotAction.RELEASE);
+      if (status == Status.FAILED) {
+        return JobTransition.withoutSubmitResponse(
+            JobRetention.RETAIN, RunningSlotAction.RELEASE, detachExecution());
+      }
+      return JobTransition.withoutSubmitResponse(
+          JobRetention.RETAIN, RunningSlotAction.RELEASE, null);
     }
 
     private synchronized Access get(
@@ -714,7 +829,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         keepAliveMillis = requestedKeepAlive.millis();
       }
       expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-      return Access.snapshot(snapshot(true));
+      return Access.view(view(true));
     }
 
     private synchronized Removal delete(PPLAsyncQueryUser caller, long now) {
@@ -726,12 +841,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       boolean wasRunning = status == Status.RUNNING;
       Status responseStatus = wasRunning ? Status.CANCELLED : status;
       CancellableTask taskToCancel = wasRunning ? task : null;
+      ProgressiveQueryExecution executionToClose = detachExecution();
       task = null;
       removed = true;
       submitWaiter = null;
       return new Removal(
           responseStatus,
           taskToCancel,
+          executionToClose,
           "PPL asynchronous query cancelled by user",
           false,
           wasRunning);
@@ -747,10 +864,11 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     private Removal expireLocked(String reason) {
       boolean wasRunning = status == Status.RUNNING;
       CancellableTask taskToCancel = wasRunning ? task : null;
+      ProgressiveQueryExecution executionToClose = detachExecution();
       task = null;
       removed = true;
       submitWaiter = null;
-      return new Removal(status, taskToCancel, reason, true, wasRunning);
+      return new Removal(status, taskToCancel, executionToClose, reason, true, wasRunning);
     }
 
     private synchronized Removal abort() {
@@ -759,11 +877,17 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       }
       boolean wasRunning = status == Status.RUNNING;
       CancellableTask taskToCancel = wasRunning ? task : null;
+      ProgressiveQueryExecution executionToClose = detachExecution();
       task = null;
       removed = true;
       submitWaiter = null;
       return new Removal(
-          status, taskToCancel, "PPL asynchronous query submission failed", false, wasRunning);
+          status,
+          taskToCancel,
+          executionToClose,
+          "PPL asynchronous query submission failed",
+          false,
+          wasRunning);
     }
 
     private synchronized Removal close(String reason) {
@@ -772,16 +896,23 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       }
       boolean wasRunning = status == Status.RUNNING;
       CancellableTask taskToCancel = wasRunning ? task : null;
+      ProgressiveQueryExecution executionToClose = detachExecution();
       task = null;
       removed = true;
       submitWaiter = null;
-      return new Removal(status, taskToCancel, reason, false, wasRunning);
+      return new Removal(status, taskToCancel, executionToClose, reason, false, wasRunning);
     }
 
-    private JobSnapshot snapshot(boolean includeId) {
+    private JobView view(boolean includeId) {
       long tookMillis =
           completionTimeMillis < 0 ? -1L : Math.max(0L, completionTimeMillis - startTimeMillis);
-      return new JobSnapshot(includeId ? id : null, status, response, failure, tookMillis);
+      return new JobView(includeId ? id : null, status, execution, failure, tookMillis);
+    }
+
+    private ProgressiveQueryExecution detachExecution() {
+      ProgressiveQueryExecution detached = execution;
+      execution = null;
+      return detached;
     }
 
     private void ensurePresent() {

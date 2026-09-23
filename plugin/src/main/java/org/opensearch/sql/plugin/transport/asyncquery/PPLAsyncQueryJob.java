@@ -29,74 +29,54 @@ final class PPLAsyncQueryJob {
 
   private long keepAliveMillis;
   private long expirationTimeMillis;
-  private PPLAsyncQueryService.Status status = PPLAsyncQueryService.Status.RUNNING;
+  private State state;
   private AsyncQueryExecution execution;
   private PPLAsyncQueryService.Failure failure;
   private long completionTimeMillis = -1L;
-  private PPLAsyncQueryService.SubmitWaiter submitWaiter;
-  private boolean removed;
 
   PPLAsyncQueryJob(
       String id,
       PPLAsyncQueryUser owner,
       long startTimeMillis,
       long keepAliveMillis,
-      JobTask task) {
+      JobTask task,
+      State initialState) {
     this.id = id;
     this.owner = owner;
     this.startTimeMillis = startTimeMillis;
     this.keepAliveMillis = keepAliveMillis;
     this.expirationTimeMillis = addWithoutOverflow(startTimeMillis, keepAliveMillis);
     this.task = task;
+    if (initialState != State.SUBMIT_WAITING && initialState != State.RETAINED_RUNNING) {
+      throw new IllegalArgumentException("Invalid initial PPL asynchronous query state");
+    }
+    this.state = initialState;
   }
 
   String id() {
     return id;
   }
 
-  synchronized SubmitRegistration registerSubmitWaiter(
-      PPLAsyncQueryService.SubmitWaiter waiter, boolean returnImmediately) {
+  synchronized Transition initialSubmitResponse() {
     ensurePresent();
-    if (submitWaiter != null) {
-      throw new IllegalStateException("PPL asynchronous submit waiter is already registered");
+    if (state != State.RETAINED_RUNNING) {
+      throw new IllegalStateException("PPL asynchronous query is waiting for submit completion");
     }
-    if (status != PPLAsyncQueryService.Status.RUNNING) {
-      removed = true;
-      View view = view(false);
-      AsyncQueryExecution executionToClose = detachExecution();
-      return SubmitRegistration.respondImmediately(
-          Transition.respond(
-              view, waiter, Retention.REMOVE, RunningSlotAction.KEEP, executionToClose, null));
-    }
-    if (returnImmediately) {
-      return SubmitRegistration.respondImmediately(
-          Transition.respond(
-              view(true), waiter, Retention.RETAIN, RunningSlotAction.KEEP, null, null));
-    }
-    submitWaiter = waiter;
-    return SubmitRegistration.waiting();
+    return Transition.respond(view(true), Retention.RETAIN, RunningSlotAction.KEEP, null, null);
   }
 
-  synchronized Transition timeout(PPLAsyncQueryService.SubmitWaiter waiter, long now) {
-    if (removed || submitWaiter != waiter) {
+  synchronized Transition timeout(long now) {
+    if (state != State.SUBMIT_WAITING) {
       return null;
     }
-    submitWaiter = null;
-    if (status == PPLAsyncQueryService.Status.RUNNING) {
-      expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-      return Transition.respond(
-          view(true), waiter, Retention.RETAIN, RunningSlotAction.KEEP, null, null);
-    }
-    removed = true;
-    View view = view(false);
-    AsyncQueryExecution executionToClose = detachExecution();
-    return Transition.respond(
-        view, waiter, Retention.REMOVE, RunningSlotAction.KEEP, executionToClose, null);
+    state = State.RETAINED_RUNNING;
+    expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
+    return Transition.respond(view(true), Retention.RETAIN, RunningSlotAction.KEEP, null, null);
   }
 
   synchronized boolean tryAttachExecution(AsyncQueryExecution execution) {
     Objects.requireNonNull(execution);
-    if (removed || status != PPLAsyncQueryService.Status.RUNNING || this.execution != null) {
+    if (!isExecuting() || this.execution != null) {
       return false;
     }
     this.execution = execution;
@@ -104,41 +84,37 @@ final class PPLAsyncQueryJob {
   }
 
   synchronized Transition complete(long now) {
-    if (removed || status != PPLAsyncQueryService.Status.RUNNING) {
+    if (!isExecuting()) {
       return null;
     }
     if (execution == null) {
       throw new IllegalStateException(
           "PPL asynchronous execution must be attached before successful completion");
     }
-    JobTask taskToClose = detachTask();
-    status = PPLAsyncQueryService.Status.SUCCEEDED;
-    completionTimeMillis = now;
-    return terminalTransition(taskToClose);
+    return finish(State.RETAINED_SUCCEEDED, now);
   }
 
   synchronized Transition fail(PPLAsyncQueryService.Failure failure, long now) {
-    if (removed || status != PPLAsyncQueryService.Status.RUNNING) {
+    if (!isExecuting()) {
       return null;
     }
     this.failure = failure;
-    JobTask taskToClose = detachTask();
-    status = PPLAsyncQueryService.Status.FAILED;
-    completionTimeMillis = now;
-    return terminalTransition(taskToClose);
+    return finish(State.RETAINED_FAILED, now);
   }
 
-  private Transition terminalTransition(JobTask taskToClose) {
-    PPLAsyncQueryService.SubmitWaiter waiter = submitWaiter;
-    submitWaiter = null;
-    if (waiter != null) {
-      removed = true;
+  private Transition finish(State terminalState, long now) {
+    boolean submitWaiting = state == State.SUBMIT_WAITING;
+    JobTask taskToClose = detachTask();
+    state = terminalState;
+    completionTimeMillis = now;
+    if (submitWaiting) {
       View view = view(false);
       AsyncQueryExecution executionToClose = detachExecution();
+      state = State.REMOVED;
       return Transition.respond(
-          view, waiter, Retention.REMOVE, RunningSlotAction.RELEASE, executionToClose, taskToClose);
+          view, Retention.REMOVE, RunningSlotAction.RELEASE, executionToClose, taskToClose);
     }
-    if (status == PPLAsyncQueryService.Status.FAILED) {
+    if (state == State.RETAINED_FAILED) {
       return Transition.withoutSubmitResponse(
           Retention.RETAIN, RunningSlotAction.RELEASE, detachExecution(), taskToClose);
     }
@@ -165,13 +141,12 @@ final class PPLAsyncQueryJob {
     if (now >= expirationTimeMillis) {
       return expireLocked("PPL asynchronous query expired");
     }
-    boolean wasRunning = status == PPLAsyncQueryService.Status.RUNNING;
+    boolean wasRunning = isExecuting();
     PPLAsyncQueryService.Status responseStatus =
-        wasRunning ? PPLAsyncQueryService.Status.CANCELLED : status;
+        wasRunning ? PPLAsyncQueryService.Status.CANCELLED : responseStatus();
     JobTask taskToCancel = wasRunning ? detachTask() : null;
     AsyncQueryExecution executionToClose = detachExecution();
-    removed = true;
-    submitWaiter = null;
+    state = State.REMOVED;
     return new Removal(
         responseStatus,
         taskToCancel,
@@ -182,32 +157,32 @@ final class PPLAsyncQueryJob {
   }
 
   synchronized Removal expire(long now) {
-    if (removed || submitWaiter != null || now < expirationTimeMillis) {
+    if (state == State.REMOVED || state == State.SUBMIT_WAITING || now < expirationTimeMillis) {
       return null;
     }
     return expireLocked("PPL asynchronous query expired");
   }
 
   private Removal expireLocked(String reason) {
-    boolean wasRunning = status == PPLAsyncQueryService.Status.RUNNING;
+    boolean wasRunning = isExecuting();
+    PPLAsyncQueryService.Status responseStatus = responseStatus();
     JobTask taskToCancel = wasRunning ? detachTask() : null;
     AsyncQueryExecution executionToClose = detachExecution();
-    removed = true;
-    submitWaiter = null;
-    return new Removal(status, taskToCancel, executionToClose, reason, true, wasRunning);
+    state = State.REMOVED;
+    return new Removal(responseStatus, taskToCancel, executionToClose, reason, true, wasRunning);
   }
 
   synchronized Removal abort() {
-    if (removed) {
+    if (state == State.REMOVED) {
       return null;
     }
-    boolean wasRunning = status == PPLAsyncQueryService.Status.RUNNING;
+    boolean wasRunning = isExecuting();
+    PPLAsyncQueryService.Status responseStatus = responseStatus();
     JobTask taskToCancel = wasRunning ? detachTask() : null;
     AsyncQueryExecution executionToClose = detachExecution();
-    removed = true;
-    submitWaiter = null;
+    state = State.REMOVED;
     return new Removal(
-        status,
+        responseStatus,
         taskToCancel,
         executionToClose,
         "PPL asynchronous query submission failed",
@@ -216,21 +191,34 @@ final class PPLAsyncQueryJob {
   }
 
   synchronized Removal close(String reason) {
-    if (removed) {
+    if (state == State.REMOVED) {
       return null;
     }
-    boolean wasRunning = status == PPLAsyncQueryService.Status.RUNNING;
+    boolean wasRunning = isExecuting();
+    PPLAsyncQueryService.Status responseStatus = responseStatus();
     JobTask taskToCancel = wasRunning ? detachTask() : null;
     AsyncQueryExecution executionToClose = detachExecution();
-    removed = true;
-    submitWaiter = null;
-    return new Removal(status, taskToCancel, executionToClose, reason, false, wasRunning);
+    state = State.REMOVED;
+    return new Removal(responseStatus, taskToCancel, executionToClose, reason, false, wasRunning);
   }
 
   private View view(boolean includeId) {
     long tookMillis =
         completionTimeMillis < 0 ? -1L : Math.max(0L, completionTimeMillis - startTimeMillis);
-    return new View(includeId ? id : null, status, execution, failure, tookMillis);
+    return new View(includeId ? id : null, responseStatus(), execution, failure, tookMillis);
+  }
+
+  private boolean isExecuting() {
+    return state == State.SUBMIT_WAITING || state == State.RETAINED_RUNNING;
+  }
+
+  private PPLAsyncQueryService.Status responseStatus() {
+    return switch (state) {
+      case SUBMIT_WAITING, RETAINED_RUNNING -> PPLAsyncQueryService.Status.RUNNING;
+      case RETAINED_SUCCEEDED -> PPLAsyncQueryService.Status.SUCCEEDED;
+      case RETAINED_FAILED -> PPLAsyncQueryService.Status.FAILED;
+      case REMOVED -> throw new IllegalStateException("PPL asynchronous query was removed");
+    };
   }
 
   private AsyncQueryExecution detachExecution() {
@@ -246,7 +234,7 @@ final class PPLAsyncQueryJob {
   }
 
   private void ensurePresent() {
-    if (removed) {
+    if (state == State.REMOVED) {
       throw new ResourceNotFoundException("PPL asynchronous query not found");
     }
   }
@@ -272,14 +260,13 @@ final class PPLAsyncQueryJob {
     }
   }
 
-  record SubmitRegistration(Transition immediateTransition) {
-    private static SubmitRegistration waiting() {
-      return new SubmitRegistration(null);
-    }
-
-    private static SubmitRegistration respondImmediately(Transition transition) {
-      return new SubmitRegistration(transition);
-    }
+  /** Internal lifecycle; unlike the response status, this includes submit waiting and removal. */
+  enum State {
+    SUBMIT_WAITING,
+    RETAINED_RUNNING,
+    RETAINED_SUCCEEDED,
+    RETAINED_FAILED,
+    REMOVED
   }
 
   enum Retention {
@@ -292,10 +279,8 @@ final class PPLAsyncQueryJob {
     RELEASE
   }
 
-  record SubmitResponse(View view, PPLAsyncQueryService.SubmitWaiter waiter) {}
-
   record Transition(
-      SubmitResponse submitResponse,
+      View submitView,
       Retention retention,
       RunningSlotAction runningSlotAction,
       AsyncQueryExecution executionToClose,
@@ -303,17 +288,11 @@ final class PPLAsyncQueryJob {
 
     private static Transition respond(
         View view,
-        PPLAsyncQueryService.SubmitWaiter waiter,
         Retention retention,
         RunningSlotAction runningSlotAction,
         AsyncQueryExecution executionToClose,
         JobTask taskToClose) {
-      return new Transition(
-          new SubmitResponse(view, waiter),
-          retention,
-          runningSlotAction,
-          executionToClose,
-          taskToClose);
+      return new Transition(view, retention, runningSlotAction, executionToClose, taskToClose);
     }
 
     private static Transition withoutSubmitResponse(

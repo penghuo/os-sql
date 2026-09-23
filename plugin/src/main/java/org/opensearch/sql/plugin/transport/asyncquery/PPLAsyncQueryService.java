@@ -38,7 +38,7 @@ import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.JobTask;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Removal;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Retention;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.RunningSlotAction;
-import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.SubmitRegistration;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.State;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Transition;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.View;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
@@ -114,10 +114,12 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   public final class Submission {
     private final PPLAsyncQueryJob job;
     private final CancellableTask task;
+    private final SubmitWaiter waiter;
 
-    private Submission(PPLAsyncQueryJob job, CancellableTask task) {
+    private Submission(PPLAsyncQueryJob job, CancellableTask task, SubmitWaiter waiter) {
       this.job = job;
       this.task = task;
+      this.waiter = waiter;
     }
 
     /**
@@ -128,10 +130,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     public void start(Function<CancellableTask, AsyncQueryExecution> executionStarter) {
       try {
         AsyncQueryExecution execution = Objects.requireNonNull(executionStarter.apply(task));
-        attachExecution(job, execution);
+        attachExecution(this, execution);
       } catch (RuntimeException e) {
-        PPLAsyncQueryService.this.fail(job, e);
+        PPLAsyncQueryService.this.fail(this, e);
       }
+    }
+
+    String id() {
+      return job.id();
     }
   }
 
@@ -265,29 +271,36 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     validateKeepAlive(keepAlive);
     validateWaitForCompletion(waitForCompletion);
     JobTask jobTask = registerJobTask(request, submitTask);
+    return createSubmission(owner, keepAlive, waitForCompletion, jobTask, responseListener);
+  }
+
+  Submission createSubmission(
+      PPLAsyncQueryUser owner,
+      TimeValue keepAlive,
+      TimeValue waitForCompletion,
+      JobTask task,
+      ActionListener<JobSnapshot> responseListener) {
     PPLAsyncQueryJob job;
     try {
-      job = create(owner, keepAlive, jobTask);
+      job = createJob(owner, keepAlive, waitForCompletion, task);
     } catch (RuntimeException | Error e) {
-      jobTask.close();
+      task.close();
       throw e;
     }
+
+    Submission submission = new Submission(job, task.task(), new SubmitWaiter(responseListener));
     try {
-      registerSubmitWaiter(job, waitForCompletion, responseListener);
-      return new Submission(job, jobTask.task());
+      startSubmit(submission, waitForCompletion);
+      return submission;
     } catch (RuntimeException | Error e) {
       applyRemoval(job, job.abort());
       throw e;
     }
   }
 
-  PPLAsyncQueryJob create(PPLAsyncQueryUser owner, TimeValue keepAlive, CancellableTask task) {
-    return create(owner, keepAlive, new JobTask(task, () -> {}));
-  }
-
-  private PPLAsyncQueryJob create(PPLAsyncQueryUser owner, TimeValue keepAlive, JobTask task) {
+  private PPLAsyncQueryJob createJob(
+      PPLAsyncQueryUser owner, TimeValue keepAlive, TimeValue waitForCompletion, JobTask task) {
     Objects.requireNonNull(owner);
-    validateKeepAlive(keepAlive);
     reserveCapacity();
     try {
       String ownerNodeId =
@@ -297,7 +310,13 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         PPLAsyncQueryJobId jobId = PPLAsyncQueryJobId.create(ownerNodeId);
         String encodedId = jobId.encode();
         PPLAsyncQueryJob job =
-            new PPLAsyncQueryJob(encodedId, owner, now, keepAlive.millis(), task);
+            new PPLAsyncQueryJob(
+                encodedId,
+                owner,
+                now,
+                keepAlive.millis(),
+                task,
+                waitForCompletion.millis() == 0 ? State.RETAINED_RUNNING : State.SUBMIT_WAITING);
         if (jobs.putIfAbsent(encodedId, job) == null) {
           return job;
         }
@@ -308,30 +327,18 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  void registerSubmitWaiter(
-      PPLAsyncQueryJob job,
-      TimeValue waitForCompletion,
-      ActionListener<JobSnapshot> responseListener) {
-    validateWaitForCompletion(waitForCompletion);
-    SubmitWaiter waiter = new SubmitWaiter(responseListener);
-    SubmitRegistration registration =
-        job.registerSubmitWaiter(waiter, waitForCompletion.millis() == 0);
-    if (registration.immediateTransition() != null) {
-      applyTransition(job, registration.immediateTransition());
+  private void startSubmit(Submission submission, TimeValue waitForCompletion) {
+    if (waitForCompletion.millis() == 0) {
+      applyTransition(submission, submission.job.initialSubmitResponse());
       return;
     }
 
-    try {
-      TimeoutHandle timeout =
-          timeoutScheduler.schedule(
-              waitForCompletion,
-              () -> applyTransition(job, job.timeout(waiter, currentTimeMillis.getAsLong())));
-      waiter.setTimeout(timeout);
-    } catch (RuntimeException e) {
-      Removal removal = job.abort();
-      applyRemoval(job, removal);
-      throw e;
-    }
+    TimeoutHandle timeout =
+        timeoutScheduler.schedule(
+            waitForCompletion,
+            () ->
+                applyTransition(submission, submission.job.timeout(currentTimeMillis.getAsLong())));
+    submission.waiter.setTimeout(timeout);
   }
 
   /**
@@ -339,9 +346,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *
    * <p>If the job was already removed, the late handle is closed immediately.
    */
-  void attachExecution(PPLAsyncQueryJob job, AsyncQueryExecution execution) {
-    Objects.requireNonNull(job);
+  void attachExecution(Submission submission, AsyncQueryExecution execution) {
+    Objects.requireNonNull(submission);
     Objects.requireNonNull(execution);
+    PPLAsyncQueryJob job = submission.job;
     if (!job.tryAttachExecution(execution)) {
       closeExecution(execution);
       return;
@@ -351,21 +359,22 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         .whenComplete(
             (ignored, failure) -> {
               if (failure == null) {
-                complete(job);
+                complete(submission);
               } else {
-                fail(job, asException(failure));
+                fail(submission, asException(failure));
               }
             });
   }
 
-  void complete(PPLAsyncQueryJob job) {
-    applyTransition(job, job.complete(currentTimeMillis.getAsLong()));
+  void complete(Submission submission) {
+    applyTransition(submission, submission.job.complete(currentTimeMillis.getAsLong()));
   }
 
-  void fail(PPLAsyncQueryJob job, Exception failure) {
+  void fail(Submission submission, Exception failure) {
     applyTransition(
-        job,
-        job.fail(Failure.from(Objects.requireNonNull(failure)), currentTimeMillis.getAsLong()));
+        submission,
+        submission.job.fail(
+            Failure.from(Objects.requireNonNull(failure)), currentTimeMillis.getAsLong()));
   }
 
   JobSnapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
@@ -467,10 +476,11 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * the required side effects. Map mutation, capacity accounting, and listener callbacks happen
    * here after the lock has been released.
    */
-  private void applyTransition(PPLAsyncQueryJob job, Transition transition) {
+  private void applyTransition(Submission submission, Transition transition) {
     if (transition == null) {
       return;
     }
+    PPLAsyncQueryJob job = submission.job;
     if (transition.runningSlotAction() == RunningSlotAction.RELEASE) {
       releaseRunning();
     }
@@ -481,8 +491,8 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     JobSnapshot snapshot = null;
     RuntimeException materializationFailure = null;
     try {
-      if (transition.submitResponse() != null) {
-        snapshot = materialize(transition.submitResponse().view());
+      if (transition.submitView() != null) {
+        snapshot = materialize(transition.submitView());
       }
     } catch (RuntimeException e) {
       materializationFailure = e;
@@ -491,14 +501,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       closeTask(transition.taskToClose());
     }
 
-    if (transition.submitResponse() != null) {
+    if (transition.submitView() != null) {
       if (materializationFailure == null) {
-        transition.submitResponse().waiter().respond(snapshot);
+        submission.waiter.respond(snapshot);
       } else {
         if (transition.retention() == Retention.RETAIN) {
           applyRemoval(job, job.abort());
         }
-        transition.submitResponse().waiter().fail(materializationFailure);
+        submission.waiter.fail(materializationFailure);
       }
     }
   }

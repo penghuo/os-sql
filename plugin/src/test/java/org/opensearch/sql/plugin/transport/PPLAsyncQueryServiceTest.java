@@ -40,10 +40,10 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.data.type.ExprCoreType;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
-import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.TaskManager;
 
@@ -691,7 +691,7 @@ public class PPLAsyncQueryServiceTest {
         null);
   }
 
-  private static final class TrackingExecution implements ProgressiveQueryExecution {
+  private static final class TrackingExecution implements AsyncQueryExecution {
     private final AtomicReference<QueryResponse> current;
     private final CompletableFuture<Void> completion = new CompletableFuture<>();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -730,7 +730,7 @@ public class PPLAsyncQueryServiceTest {
     }
   }
 
-  private static final class BlockingExecution implements ProgressiveQueryExecution {
+  private static final class BlockingExecution implements AsyncQueryExecution {
     private final QueryResponse response;
     private final CountDownLatch readStarted = new CountDownLatch(1);
     private final CountDownLatch allowRead = new CountDownLatch(1);
@@ -766,7 +766,7 @@ public class PPLAsyncQueryServiceTest {
     }
   }
 
-  private static final class ThrowingExecution implements ProgressiveQueryExecution {
+  private static final class ThrowingExecution implements AsyncQueryExecution {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicInteger closes = new AtomicInteger();
 

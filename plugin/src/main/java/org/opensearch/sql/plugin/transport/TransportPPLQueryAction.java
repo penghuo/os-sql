@@ -35,8 +35,8 @@ import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine;
-import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
@@ -279,11 +279,7 @@ public class TransportPPLQueryAction
             createAnalyzeResponseListener(transformedRequest, clearingListener),
             anonymizedQuerySink);
       } else {
-        if (shouldExecuteAsync(transformedRequest)) {
-          if (pplQueryTask == null) {
-            throw new IllegalStateException(
-                "PPL asynchronous query requires a cancellable submit task");
-          }
+        if (shouldExecuteAsync(transformedRequest) && pplQueryTask != null) {
           startAsyncQuery(
               pplQueryTask,
               transportRequest,
@@ -446,8 +442,7 @@ public class TransportPPLQueryAction
         task -> {
           OpenSearchQueryManager.setCancellableTask(task);
           try {
-            ProgressiveQueryExecution execution =
-                pplService.executeProgressively(request, anonymizedQuerySink);
+            AsyncQueryExecution execution = pplService.executeAsync(request, anonymizedQuerySink);
             execution.completion().whenComplete((ignored, failure) -> clearRequestScopedState());
             return execution;
           } finally {

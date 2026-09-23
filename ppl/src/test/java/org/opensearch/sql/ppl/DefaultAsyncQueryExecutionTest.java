@@ -19,11 +19,11 @@ import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 
-public class DefaultProgressiveQueryExecutionTest {
+public class DefaultAsyncQueryExecutionTest {
 
   @Test
   public void finalResultIsVisibleBeforeSuccessfulCompletionNotification() {
-    DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
+    DefaultAsyncQueryExecution execution = new DefaultAsyncQueryExecution();
     AtomicBoolean visibleFromCompletion = new AtomicBoolean();
     execution
         .completion()
@@ -42,7 +42,7 @@ public class DefaultProgressiveQueryExecutionTest {
 
   @Test
   public void failureCompletesExceptionallyWithoutPublishingRows() {
-    DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
+    DefaultAsyncQueryExecution execution = new DefaultAsyncQueryExecution();
 
     execution.onFailure(new IllegalStateException("boom"));
 

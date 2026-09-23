@@ -18,8 +18,8 @@ import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.executor.AnalyzeResponse;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
-import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryManager;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.executor.execution.AbstractPlan;
@@ -96,9 +96,9 @@ public class PPLService {
    * final-only implementation exposes no current result until the callback publishes the
    * authoritative response.
    */
-  public ProgressiveQueryExecution executeProgressively(
+  public AsyncQueryExecution executeAsync(
       PPLQueryRequest request, Consumer<String> anonymizedQuerySink) {
-    DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
+    DefaultAsyncQueryExecution execution = new DefaultAsyncQueryExecution();
     execute(
         request,
         execution,
@@ -107,7 +107,7 @@ public class PPLService {
           public void onResponse(ExplainResponse response) {
             execution.onFailure(
                 new IllegalStateException(
-                    "Progressive query execution received an explain response"));
+                    "Asynchronous query execution received an explain response"));
           }
 
           @Override

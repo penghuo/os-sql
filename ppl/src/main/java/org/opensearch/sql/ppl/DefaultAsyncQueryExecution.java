@@ -10,18 +10,18 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import org.opensearch.sql.common.response.ResponseListener;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
-import org.opensearch.sql.executor.ProgressiveQueryExecution;
 
 /**
- * Final-result implementation of the progressive execution contract.
+ * Final-result implementation of the asynchronous execution contract.
  *
- * <p>This adapter keeps the existing callback-based query execution unchanged. Until progressive
- * result producers are added, {@link #currentResult()} is empty while execution is running and
- * exposes the final response immediately before successful completion is published.
+ * <p>This adapter keeps the existing callback-based query execution unchanged. Until partial-result
+ * producers are added, {@link #currentResult()} is empty while execution is running and exposes the
+ * final response immediately before successful completion is published.
  */
-final class DefaultProgressiveQueryExecution
-    implements ProgressiveQueryExecution, ResponseListener<QueryResponse> {
+final class DefaultAsyncQueryExecution
+    implements AsyncQueryExecution, ResponseListener<QueryResponse> {
   private final CompletableFuture<Void> completion = new CompletableFuture<>();
   private volatile QueryResponse finalResult;
 

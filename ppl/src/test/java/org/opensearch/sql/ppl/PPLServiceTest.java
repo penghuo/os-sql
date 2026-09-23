@@ -20,11 +20,11 @@ import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.DefaultQueryManager;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
-import org.opensearch.sql.executor.ProgressiveQueryExecution;
 import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.executor.pagination.Cursor;
@@ -117,7 +117,7 @@ public class PPLServiceTest {
   }
 
   @Test
-  public void testExecuteProgressivelyReturnsCompletedFinalResult() {
+  public void testExecuteAsyncReturnsCompletedFinalResult() {
     QueryResponse response = new QueryResponse(schema, Collections.emptyList(), Cursor.None);
     doAnswer(
             invocation -> {
@@ -128,8 +128,8 @@ public class PPLServiceTest {
         .when(queryService)
         .execute(any(), any(), any(), anyBoolean(), any());
 
-    ProgressiveQueryExecution execution =
-        pplService.executeProgressively(
+    AsyncQueryExecution execution =
+        pplService.executeAsync(
             new PPLQueryRequest("search source=t a=1", null, QUERY),
             PPLService.NO_ANONYMIZED_QUERY_SINK);
 

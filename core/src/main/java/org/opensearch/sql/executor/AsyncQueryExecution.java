@@ -10,7 +10,7 @@ import java.util.concurrent.CompletionStage;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 
 /**
- * Lifecycle-facing handle for one progressive query execution.
+ * Lifecycle-facing handle for one asynchronous query execution.
  *
  * <p>The execution module owns result production and execution-specific resources. The lifecycle
  * module owns this handle after submission and uses it to read the current result, observe terminal
@@ -20,7 +20,7 @@ import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
  * #currentResult()} before {@link #completion()} completes normally. Implementations must make
  * {@link #close()} idempotent and safe to call concurrently with {@link #currentResult()}.
  */
-public interface ProgressiveQueryExecution extends AutoCloseable {
+public interface AsyncQueryExecution extends AutoCloseable {
 
   /** Returns the complete result currently visible, or empty before a result is available. */
   Optional<QueryResponse> currentResult();

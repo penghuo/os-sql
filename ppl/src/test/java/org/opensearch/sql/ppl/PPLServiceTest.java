@@ -131,7 +131,6 @@ public class PPLServiceTest {
     ProgressiveQueryExecution execution =
         pplService.executeProgressively(
             new PPLQueryRequest("search source=t a=1", null, QUERY),
-            getExplainListener(false),
             PPLService.NO_ANONYMIZED_QUERY_SINK);
 
     execution.completion().toCompletableFuture().join();

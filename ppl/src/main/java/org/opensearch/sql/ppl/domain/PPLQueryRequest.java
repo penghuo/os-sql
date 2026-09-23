@@ -37,6 +37,10 @@ public class PPLQueryRequest {
   private static final String START_TIME_FIELD = "start_time";
   private static final String END_TIME_FIELD = "end_time";
   private static final String TIME_FIELD_FIELD = "time_field";
+  public static final String KEEP_ALIVE_FIELD = "keep_alive";
+  public static final String WAIT_FOR_COMPLETION_TIMEOUT_FIELD = "wait_for_completion_timeout";
+  public static final String DEFAULT_KEEP_ALIVE = "5m";
+  public static final String DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT = "5s";
   private static final int MAX_HIGHLIGHT_FIELDS = 100;
   private static final int MAX_TAG_ENTRIES = 10;
 
@@ -47,6 +51,11 @@ public class PPLQueryRequest {
   @Getter private final String path;
   @Getter private String format = "";
   @Getter private String explainMode;
+
+  @Setter
+  @Getter
+  @Accessors(fluent = true)
+  private boolean formatExplicitlySpecified = false;
 
   @Setter
   @Getter
@@ -139,6 +148,34 @@ public class PPLQueryRequest {
    */
   public boolean isExplainRequest() {
     return path.endsWith("/_explain");
+  }
+
+  public boolean isAsyncQueryRequest() {
+    return jsonContent != null
+        && (jsonContent.has(WAIT_FOR_COMPLETION_TIMEOUT_FIELD)
+            || jsonContent.has(KEEP_ALIVE_FIELD));
+  }
+
+  public String getKeepAlive() {
+    if (jsonContent == null || !jsonContent.has(KEEP_ALIVE_FIELD)) {
+      return DEFAULT_KEEP_ALIVE;
+    }
+    return jsonContent.getString(KEEP_ALIVE_FIELD);
+  }
+
+  public String getWaitForCompletionTimeout() {
+    if (jsonContent == null || !jsonContent.has(WAIT_FOR_COMPLETION_TIMEOUT_FIELD)) {
+      return DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT;
+    }
+    return jsonContent.getString(WAIT_FOR_COMPLETION_TIMEOUT_FIELD);
+  }
+
+  public boolean supportsAsyncExecution() {
+    return !isExplainRequest()
+        && !profile
+        && !analyze
+        && !pplQuery.trim().toLowerCase(Locale.ROOT).startsWith("explain")
+        && !formatExplicitlySpecified;
   }
 
   /** Decide on the formatter by the requested format. */

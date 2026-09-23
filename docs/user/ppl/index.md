@@ -20,7 +20,6 @@ source=accounts
 * **Interfaces**  
   - [Endpoint](interfaces/endpoint.md)  
   - [Protocol](interfaces/protocol.md)  
-  - [Asynchronous queries](interfaces/async-query.md)
 * **Administration**  
   - [Plugin Settings](admin/settings.md)  
   - [Security Settings](admin/security.md)  

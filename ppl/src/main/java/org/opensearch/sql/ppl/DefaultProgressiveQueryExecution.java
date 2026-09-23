@@ -28,7 +28,6 @@ final class DefaultProgressiveQueryExecution
   @Override
   public void onResponse(QueryResponse response) {
     finalResult = Objects.requireNonNull(response);
-    // Publish completion only after currentResult() can observe the authoritative final response.
     completion.complete(null);
   }
 
@@ -48,7 +47,5 @@ final class DefaultProgressiveQueryExecution
   }
 
   @Override
-  public void close() {
-    // This final-only adapter owns no execution resources.
-  }
+  public void close() {}
 }

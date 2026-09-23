@@ -6,12 +6,13 @@
 package org.opensearch.sql.plugin.transport;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -55,7 +56,7 @@ public class PPLAsyncQueryServiceTest {
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     AtomicInteger responses = new AtomicInteger();
 
-    service.awaitSubmit(
+    service.registerSubmitWaiter(
         id,
         TimeValue.timeValueSeconds(5),
         listener(
@@ -87,7 +88,7 @@ public class PPLAsyncQueryServiceTest {
   public void timeoutReturnsIdAndLaterGetReturnsCompleteResult() {
     String id = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(submit::set));
+    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     timeoutTask.get().run();
 
@@ -115,7 +116,7 @@ public class PPLAsyncQueryServiceTest {
   public void submitWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
     String id = service.create(OWNER, TimeValue.timeValueSeconds(1), null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(submit::set));
+    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(submit::set));
 
     now.addAndGet(TimeValue.timeValueSeconds(2).millis());
     service.reapExpired();
@@ -138,7 +139,7 @@ public class PPLAsyncQueryServiceTest {
   public void fastFailureReturnsDirectFailureWithoutId() {
     String id = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(response(1));
     service.attachExecution(id, execution);
 
@@ -159,7 +160,7 @@ public class PPLAsyncQueryServiceTest {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     String id = createJob(task);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(null);
     service.attachExecution(id, execution);
 
@@ -183,7 +184,7 @@ public class PPLAsyncQueryServiceTest {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     String id = createJob(task);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(null);
     service.attachExecution(id, execution);
 
@@ -202,7 +203,7 @@ public class PPLAsyncQueryServiceTest {
   public void deleteReturnsExistingTerminalStatus() {
     CancellableTask task = mock(CancellableTask.class);
     String id = createJob(task);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
     service.attachExecution(id, execution);
     service.complete(id);
@@ -222,7 +223,7 @@ public class PPLAsyncQueryServiceTest {
     when(task.isCancelled()).thenReturn(false);
     service.attachTaskManager(taskManager);
     String id = createJob(task);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
 
     service.delete(id, OWNER);
 
@@ -235,12 +236,133 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
+  public void submitRegistersTaskAndCompletionReleasesIt() {
+    TaskManager taskManager = mock(TaskManager.class);
+    PPLQueryTask task = mock(PPLQueryTask.class);
+    TransportPPLQueryRequest request =
+        new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
+    when(taskManager.register("transport", PPLQueryAction.NAME, request)).thenReturn(task);
+    service.attachTaskManager(taskManager);
+
+    PPLAsyncQueryService.Submission submission =
+        service.submit(
+            OWNER,
+            "5m",
+            "0s",
+            request,
+            listener(
+                snapshot -> assertEquals(PPLAsyncQueryService.Status.RUNNING, snapshot.status())));
+    TrackingExecution execution = new TrackingExecution(null);
+    submission.start(ignored -> execution);
+    execution.succeed(response(1));
+
+    verify(taskManager).register("transport", PPLQueryAction.NAME, request);
+    verify(taskManager).unregister(task);
+    assertEquals(0, service.runningQueryCount());
+    assertEquals(1, service.retainedJobCount());
+  }
+
+  @Test
+  public void submissionStartFailureCompletesJobAndReleasesTask() {
+    TaskManager taskManager = mock(TaskManager.class);
+    PPLQueryTask task = mock(PPLQueryTask.class);
+    TransportPPLQueryRequest request =
+        new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
+    when(taskManager.register("transport", PPLQueryAction.NAME, request)).thenReturn(task);
+    service.attachTaskManager(taskManager);
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> response = new AtomicReference<>();
+
+    PPLAsyncQueryService.Submission submission =
+        service.submit(OWNER, "5m", "5s", request, listener(response::set));
+    submission.start(
+        ignored -> {
+          throw new IllegalStateException("execution did not start");
+        });
+
+    assertEquals(PPLAsyncQueryService.Status.FAILED, response.get().status());
+    assertNull(response.get().id());
+    verify(taskManager, times(1)).unregister(task);
+    assertEquals(0, service.runningQueryCount());
+    assertEquals(0, service.retainedJobCount());
+  }
+
+  @Test
+  public void deleteCancelsAndReleasesServiceOwnedTask() {
+    TaskManager taskManager = mock(TaskManager.class);
+    PPLQueryTask task = mock(PPLQueryTask.class);
+    when(task.isCancelled()).thenReturn(false);
+    TransportPPLQueryRequest request =
+        new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
+    when(taskManager.register("transport", PPLQueryAction.NAME, request)).thenReturn(task);
+    doAnswer(
+            invocation -> {
+              ActionListener<Void> listener = invocation.getArgument(3);
+              listener.onResponse(null);
+              return null;
+            })
+        .when(taskManager)
+        .cancelTaskAndDescendants(
+            org.mockito.ArgumentMatchers.eq(task),
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.eq(false),
+            org.mockito.ArgumentMatchers.any());
+    service.attachTaskManager(taskManager);
+    AtomicReference<String> id = new AtomicReference<>();
+
+    PPLAsyncQueryService.Submission submission =
+        service.submit(OWNER, "5m", "0s", request, listener(snapshot -> id.set(snapshot.id())));
+    submission.start(ignored -> new TrackingExecution(null));
+
+    service.delete(id.get(), OWNER);
+
+    verify(taskManager)
+        .cancelTaskAndDescendants(
+            org.mockito.ArgumentMatchers.eq(task),
+            org.mockito.ArgumentMatchers.eq("PPL asynchronous query cancelled by user"),
+            org.mockito.ArgumentMatchers.eq(false),
+            org.mockito.ArgumentMatchers.any());
+    verify(taskManager, times(1)).unregister(task);
+  }
+
+  @Test
+  public void submitFailureAfterJobCreationReleasesServiceOwnedTask() {
+    PPLAsyncQueryService abortingService =
+        new PPLAsyncQueryService(
+            "node-a",
+            now::get,
+            (delay, task) -> {
+              throw new IllegalStateException("scheduler unavailable");
+            },
+            () -> 20,
+            () -> 100,
+            () -> TimeValue.timeValueSeconds(60),
+            () -> TimeValue.timeValueHours(24));
+    TaskManager taskManager = mock(TaskManager.class);
+    PPLQueryTask task = mock(PPLQueryTask.class);
+    when(task.isCancelled()).thenReturn(true);
+    TransportPPLQueryRequest request =
+        new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
+    when(taskManager.register("transport", PPLQueryAction.NAME, request)).thenReturn(task);
+    abortingService.attachTaskManager(taskManager);
+
+    IllegalStateException failure =
+        assertThrows(
+            IllegalStateException.class,
+            () -> abortingService.submit(OWNER, "5m", "5s", request, listener(snapshot -> {})));
+
+    assertEquals("scheduler unavailable", failure.getMessage());
+    verify(taskManager, times(1)).unregister(task);
+    assertEquals(0, abortingService.runningQueryCount());
+    assertEquals(0, abortingService.retainedJobCount());
+  }
+
+  @Test
   public void rejectsUnauthorizedCallerWithoutRenewingOrDeleting() {
     PPLAsyncQueryUser securedOwner =
         new PPLAsyncQueryUser(true, "alice", "tenant", List.of("role-a"));
     PPLAsyncQueryUser otherUser = new PPLAsyncQueryUser(true, "bob", "tenant", List.of("role-a"));
     String id = service.create(securedOwner, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
 
     assertThrows(OpenSearchSecurityException.class, () -> service.get(id, otherUser, null));
     assertThrows(OpenSearchSecurityException.class, () -> service.delete(id, otherUser));
@@ -264,7 +386,7 @@ public class PPLAsyncQueryServiceTest {
   public void finalSnapshotDefensivelyCopiesRows() {
     String id = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
     List<org.opensearch.sql.data.model.ExprValue> rows = new ArrayList<>();
     rows.add(ExprValueUtils.stringValue("first"));
     QueryResponse response =
@@ -282,12 +404,11 @@ public class PPLAsyncQueryServiceTest {
   public void completedExecutionCanBeAttachedBeforeCompletionIsObserved() {
     String id = createJob(null);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    service.awaitSubmit(id, TimeValue.timeValueSeconds(5), listener(result::set));
+    service.registerSubmitWaiter(id, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(null);
 
     execution.succeed(response(2));
     service.attachExecution(id, execution);
-    observeCompletion(id, execution);
 
     assertEquals(PPLAsyncQueryService.Status.SUCCEEDED, result.get().status());
     assertEquals(2, result.get().response().getResults().size());
@@ -297,7 +418,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void runningGetMaterializesCurrentResultOutsideJob() {
     String id = createJob(null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
     service.attachExecution(id, execution);
 
@@ -313,7 +434,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void failedRetainedJobReturnsNoProvisionalRowsAndClosesExecution() {
     String id = createJob(null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
     service.attachExecution(id, execution);
 
@@ -329,7 +450,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void deleteBeforeExecutionAttachmentClosesLateHandle() {
     String id = createJob(null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     service.delete(id, OWNER);
     TrackingExecution execution = new TrackingExecution(response(1));
 
@@ -342,7 +463,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void concurrentGetDoesNotBlockDeleteOnResultMaterialization() throws Exception {
     String id = createJob(null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     BlockingExecution execution = new BlockingExecution(response(1));
     service.attachExecution(id, execution);
 
@@ -366,7 +487,7 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void shutdownClosesRetainedExecutionExactlyOnce() throws Exception {
     String id = createJob(null);
-    service.awaitSubmit(id, TimeValue.ZERO, listener(snapshot -> {}));
+    service.registerSubmitWaiter(id, TimeValue.ZERO, listener(snapshot -> {}));
     TrackingExecution execution = new TrackingExecution(response(1));
     service.attachExecution(id, execution);
 
@@ -394,14 +515,15 @@ public class PPLAsyncQueryServiceTest {
     String id = abortingService.create(OWNER, PPLAsyncQueryService.DEFAULT_KEEP_ALIVE, null);
     TrackingExecution execution = new TrackingExecution(null);
     abortingService.attachExecution(id, execution);
-    AtomicReference<Exception> failure = new AtomicReference<>();
 
-    boolean ready =
-        abortingService.awaitSubmit(
-            id, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
+    IllegalStateException failure =
+        assertThrows(
+            IllegalStateException.class,
+            () ->
+                abortingService.registerSubmitWaiter(
+                    id, TimeValue.timeValueSeconds(5), listener(snapshot -> {})));
 
-    assertFalse(ready);
-    assertTrue(failure.get() instanceof IllegalStateException);
+    assertEquals("scheduler unavailable", failure.getMessage());
     assertEquals(1, execution.closes.get());
     assertEquals(0, abortingService.runningQueryCount());
     assertEquals(0, abortingService.retainedJobCount());
@@ -411,7 +533,7 @@ public class PPLAsyncQueryServiceTest {
   public void successfulCompletionRequiresFinalResultToBeVisible() {
     String id = createJob(null);
     AtomicReference<Exception> failure = new AtomicReference<>();
-    service.awaitSubmit(
+    service.registerSubmitWaiter(
         id, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
     TrackingExecution execution = new TrackingExecution(null);
     service.attachExecution(id, execution);
@@ -429,7 +551,7 @@ public class PPLAsyncQueryServiceTest {
     when(task.isCancelled()).thenReturn(false);
     String id = createJob(task);
     AtomicReference<Exception> failure = new AtomicReference<>();
-    service.awaitSubmit(
+    service.registerSubmitWaiter(
         id, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
     ThrowingExecution execution = new ThrowingExecution();
     service.attachExecution(id, execution);
@@ -495,19 +617,6 @@ public class PPLAsyncQueryServiceTest {
             .mapToObj(i -> ExprValueUtils.stringValue("state-" + i))
             .toList(),
         null);
-  }
-
-  private void observeCompletion(String id, ProgressiveQueryExecution execution) {
-    execution
-        .completion()
-        .whenComplete(
-            (ignored, failure) -> {
-              if (failure == null) {
-                service.complete(id);
-              } else {
-                service.fail(id, (Exception) failure);
-              }
-            });
   }
 
   private static final class TrackingExecution implements ProgressiveQueryExecution {

@@ -39,6 +39,7 @@ import org.opensearch.sql.plugin.transport.PPLAsyncGetResultRequest;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
+import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.transport.client.node.NodeClient;
 
 public class RestPPLQueryAction extends BaseRestHandler {
@@ -127,9 +128,11 @@ public class RestPPLQueryAction extends BaseRestHandler {
       return prepareDeleteRequest(request, nodeClient);
     }
 
+    PPLQueryRequest pplQueryRequest = PPLQueryRequestFactory.getPPLRequest(request);
     TransportPPLQueryRequest transportPPLQueryRequest =
-        new TransportPPLQueryRequest(PPLQueryRequestFactory.getPPLRequest(request));
-    boolean asyncRequest = transportPPLQueryRequest.isAsyncQueryRequest();
+        new TransportPPLQueryRequest(pplQueryRequest);
+    boolean asyncRequest =
+        pplQueryRequest.isAsyncQueryRequest() && pplQueryRequest.supportsAsyncExecution();
 
     // RestCancellableNodeClient cancels the PPLQueryTask on client disconnect, which cascades to
     // the analytics query + fragments. An asynchronous submit is detached and is cancelled through

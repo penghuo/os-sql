@@ -110,19 +110,6 @@ Expected output:
 }
 ```
 
-## PPL asynchronous query settings
-
-The asynchronous PPL lifecycle API uses the following dynamic, node-scoped settings:
-
-| Setting | Default | Description |
-| --- | ---: | --- |
-| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Maximum asynchronous PPL queries running on one owner node. |
-| `plugins.ppl.async.max_retained_jobs` | `100` | Maximum combined running and terminal jobs retained on one owner node. |
-| `plugins.ppl.async.max_wait_for_completion_timeout` | `60s` | Maximum submit wait requested by `wait_for_completion_timeout`. |
-| `plugins.ppl.async.max_keep_alive` | `24h` | Maximum submit or poll lease requested by `keep_alive`. |
-
-Lowering a capacity setting affects new submissions and does not evict retained jobs.
-
 ## plugins.query.memory_limit
 
 ### Version

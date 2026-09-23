@@ -8,6 +8,7 @@ package org.opensearch.sql.ppl;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
@@ -109,33 +110,49 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void asyncQueryRejectsPartialResultsAndNonJsonFormats() {
+  public void partialResultRemainsAsyncAndExplicitFormatsFallBackToSync() throws IOException {
     Request partial = new Request("POST", QUERY_API_ENDPOINT);
     partial.setJsonEntity(
         new JSONObject()
             .put("query", "source=" + TEST_INDEX_BANK)
-            .put("wait_for_completion_timeout", "0s")
+            .put("wait_for_completion_timeout", "30s")
             .put("partial_result", true)
             .toString());
 
-    ResponseException partialFailure =
-        assertThrows(ResponseException.class, () -> client().performRequest(partial));
-    assertEquals(400, partialFailure.getResponse().getStatusLine().getStatusCode());
+    JSONObject partialResponse =
+        new JSONObject(getResponseBody(client().performRequest(partial), true));
+    assertEquals("SUCCEEDED", partialResponse.getString("status"));
+    assertFalse(partialResponse.has("id"));
 
     Request csv = new Request("POST", QUERY_API_ENDPOINT + "?format=csv");
     csv.setJsonEntity(
         new JSONObject()
-            .put("query", "source=" + TEST_INDEX_BANK)
+            .put("query", "source=" + TEST_INDEX_BANK + " | head 1 | fields account_number")
             .put("wait_for_completion_timeout", "0s")
             .toString());
 
-    ResponseException csvFailure =
-        assertThrows(ResponseException.class, () -> client().performRequest(csv));
-    assertEquals(400, csvFailure.getResponse().getStatusLine().getStatusCode());
+    Response csvRestResponse = client().performRequest(csv);
+    String csvResponse = getResponseBody(csvRestResponse, true);
+    assertTrue(csvResponse.startsWith("account_number"));
+    assertFalse(csvResponse.contains("\"status\""));
+    assertNull(csvRestResponse.getHeader("Cache-Control"));
+
+    Request jdbc = new Request("POST", QUERY_API_ENDPOINT + "?format=jdbc");
+    jdbc.setJsonEntity(
+        new JSONObject()
+            .put("query", "source=" + TEST_INDEX_BANK + " | head 1")
+            .put("keep_alive", "5m")
+            .toString());
+
+    Response jdbcRestResponse = client().performRequest(jdbc);
+    JSONObject jdbcResponse = new JSONObject(getResponseBody(jdbcRestResponse, true));
+    assertFalse(jdbcResponse.has("status"));
+    assertTrue(jdbcResponse.has("size"));
+    assertNull(jdbcRestResponse.getHeader("Cache-Control"));
   }
 
   @Test
-  public void asyncQueryRejectsExplainAndAnalyzeModes() {
+  public void asyncFieldsAreIgnoredForExplainAnalyzeAndProfile() throws IOException {
     Request explain = new Request("POST", "/_plugins/_ppl/_explain");
     explain.setJsonEntity(
         new JSONObject()
@@ -143,9 +160,22 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
             .put("wait_for_completion_timeout", "0s")
             .toString());
 
-    ResponseException explainFailure =
-        assertThrows(ResponseException.class, () -> client().performRequest(explain));
-    assertEquals(400, explainFailure.getResponse().getStatusLine().getStatusCode());
+    JSONObject explainResponse =
+        new JSONObject(getResponseBody(client().performRequest(explain), true));
+    assertTrue(explainResponse.has("calcite"));
+    assertFalse(explainResponse.has("status"));
+
+    Request explainCommand = new Request("POST", QUERY_API_ENDPOINT);
+    explainCommand.setJsonEntity(
+        new JSONObject()
+            .put("query", "explain source=" + TEST_INDEX_BANK)
+            .put("keep_alive", "5m")
+            .toString());
+
+    JSONObject explainCommandResponse =
+        new JSONObject(getResponseBody(client().performRequest(explainCommand), true));
+    assertTrue(explainCommandResponse.has("calcite"));
+    assertFalse(explainCommandResponse.has("status"));
 
     Request analyze = new Request("POST", QUERY_API_ENDPOINT);
     analyze.setJsonEntity(
@@ -155,9 +185,42 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
             .put("wait_for_completion_timeout", "0s")
             .toString());
 
-    ResponseException analyzeFailure =
-        assertThrows(ResponseException.class, () -> client().performRequest(analyze));
-    assertEquals(400, analyzeFailure.getResponse().getStatusLine().getStatusCode());
+    JSONObject analyzeResponse =
+        new JSONObject(getResponseBody(client().performRequest(analyze), true));
+    assertTrue(analyzeResponse.has("logicalPlan"));
+    assertFalse(analyzeResponse.has("status"));
+
+    Request profile = new Request("POST", QUERY_API_ENDPOINT);
+    profile.setJsonEntity(
+        new JSONObject()
+            .put("query", "source=" + TEST_INDEX_BANK + " | head 1")
+            .put("profile", true)
+            .put("keep_alive", "5m")
+            .toString());
+
+    JSONObject profileResponse =
+        new JSONObject(getResponseBody(client().performRequest(profile), true));
+    assertTrue(profileResponse.has("profile"));
+    assertFalse(profileResponse.has("status"));
+  }
+
+  @Test
+  public void asyncFieldsAreIgnoredWhenCalciteIsDisabled() throws IOException {
+    disableCalcite();
+    try {
+      Request request = new Request("POST", QUERY_API_ENDPOINT);
+      request.setJsonEntity(
+          new JSONObject()
+              .put("query", "source=" + TEST_INDEX_BANK + " | head 1")
+              .put("wait_for_completion_timeout", "0s")
+              .toString());
+
+      JSONObject response = new JSONObject(getResponseBody(client().performRequest(request), true));
+      assertFalse(response.has("status"));
+      assertTrue(response.has("size"));
+    } finally {
+      enableCalcite();
+    }
   }
 
   private Response submit(String query, String waitForCompletion, String keepAlive)

@@ -97,11 +97,25 @@ public class PPLService {
    * authoritative response.
    */
   public ProgressiveQueryExecution executeProgressively(
-      PPLQueryRequest request,
-      ResponseListener<ExplainResponse> explainListener,
-      Consumer<String> anonymizedQuerySink) {
+      PPLQueryRequest request, Consumer<String> anonymizedQuerySink) {
     DefaultProgressiveQueryExecution execution = new DefaultProgressiveQueryExecution();
-    execute(request, execution, explainListener, anonymizedQuerySink);
+    execute(
+        request,
+        execution,
+        new ResponseListener<>() {
+          @Override
+          public void onResponse(ExplainResponse response) {
+            execution.onFailure(
+                new IllegalStateException(
+                    "Progressive query execution received an explain response"));
+          }
+
+          @Override
+          public void onFailure(Exception e) {
+            execution.onFailure(e);
+          }
+        },
+        anonymizedQuerySink);
     return execution;
   }
 

@@ -750,7 +750,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     if (threadPool != null) {
       reaper =
           threadPool.scheduleWithFixedDelay(
-              this::safeReapExpired, REAPER_INTERVAL, ThreadPool.Names.GENERIC);
+              this::reapExpired, REAPER_INTERVAL, ThreadPool.Names.GENERIC);
     }
   }
 
@@ -775,13 +775,5 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     acceptingNewJobs = false;
     jobs.forEach(
         (id, job) -> applyRemoval(job, job.close("PPL asynchronous query service is closing")));
-  }
-
-  private void safeReapExpired() {
-    try {
-      reapExpired();
-    } catch (RuntimeException e) {
-      LOG.warn("Failed to reap expired PPL asynchronous queries");
-    }
   }
 }

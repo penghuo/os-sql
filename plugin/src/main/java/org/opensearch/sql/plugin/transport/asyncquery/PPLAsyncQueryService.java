@@ -38,7 +38,6 @@ import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.JobTask;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Removal;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.ResponseContext;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Retention;
-import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.RunningSlotAction;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Transition;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.tasks.CancellableTask;
@@ -522,7 +521,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     if (transition == null) {
       return;
     }
-    if (transition.runningSlotAction() == RunningSlotAction.RELEASE) {
+    if (transition.releasesRunningSlot()) {
       releaseRunning();
     }
     if (transition.retention() == Retention.REMOVE && jobs.remove(job.id(), job)) {
@@ -559,7 +558,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       return;
     }
     if (jobs.remove(job.id(), job)) {
-      if (removal.releaseRunningSlot()) {
+      if (removal.releasesRunningSlot()) {
         releaseRunning();
       }
       releaseRetained();

@@ -72,7 +72,7 @@ final class PPLAsyncQueryJob {
     this.startTimeMillis = startTimeMillis;
     this.keepAliveMillis = keepAliveMillis;
     this.expirationTimeMillis = startTimeMillis + keepAliveMillis;
-    this.task = task;
+    this.task = Objects.requireNonNull(task);
     this.state = State.RUNNING;
   }
 
@@ -159,20 +159,17 @@ final class PPLAsyncQueryJob {
   }
 
   private Transition finish(State terminalState, long now) {
-    boolean retained = state == State.RETAINED_RUNNING;
+    boolean returnDirect = state == State.RUNNING;
     JobTask taskToClose = detachTask();
     state = terminalState;
     completionTimeMillis = now;
-    if (!retained) {
+    if (returnDirect) {
       ResponseContext response = directResponse();
-      AsyncQueryExecution executionToClose = detachExecution();
       state = State.REMOVED;
-      return Transition.returnDirect(response, executionToClose, taskToClose);
+      return Transition.returnDirect(response, detachExecution(), taskToClose);
     }
-    if (state == State.RETAINED_FAILED) {
-      return Transition.finishRetained(detachExecution(), taskToClose);
-    }
-    return Transition.finishRetained(null, taskToClose);
+    return Transition.finishRetained(
+        terminalState == State.RETAINED_FAILED ? detachExecution() : null, taskToClose);
   }
 
   /**
@@ -210,19 +207,9 @@ final class PPLAsyncQueryJob {
     if (now >= expirationTimeMillis) {
       return expireLocked("PPL asynchronous query expired");
     }
-    boolean wasRunning = isExecuting();
-    PPLAsyncQueryService.Status responseStatus =
-        wasRunning ? PPLAsyncQueryService.Status.CANCELLED : responseStatus();
-    JobTask taskToCancel = wasRunning ? detachTask() : null;
-    AsyncQueryExecution executionToClose = detachExecution();
-    state = State.REMOVED;
-    return new Removal(
-        responseStatus,
-        taskToCancel,
-        executionToClose,
-        "PPL asynchronous query cancelled by user",
-        false,
-        wasRunning);
+    return remove(
+        isExecuting() ? PPLAsyncQueryService.Status.CANCELLED : responseStatus(),
+        "PPL asynchronous query cancelled by user");
   }
 
   /**
@@ -239,12 +226,7 @@ final class PPLAsyncQueryJob {
   }
 
   private Removal expireLocked(String reason) {
-    boolean wasRunning = isExecuting();
-    PPLAsyncQueryService.Status responseStatus = responseStatus();
-    JobTask taskToCancel = wasRunning ? detachTask() : null;
-    AsyncQueryExecution executionToClose = detachExecution();
-    state = State.REMOVED;
-    return new Removal(responseStatus, taskToCancel, executionToClose, reason, true, wasRunning);
+    return remove(responseStatus(), reason, true);
   }
 
   /**
@@ -253,21 +235,7 @@ final class PPLAsyncQueryJob {
    * @return removal with detached resources, or {@code null} if already removed
    */
   synchronized Removal abort() {
-    if (state == State.REMOVED) {
-      return null;
-    }
-    boolean wasRunning = isExecuting();
-    PPLAsyncQueryService.Status responseStatus = responseStatus();
-    JobTask taskToCancel = wasRunning ? detachTask() : null;
-    AsyncQueryExecution executionToClose = detachExecution();
-    state = State.REMOVED;
-    return new Removal(
-        responseStatus,
-        taskToCancel,
-        executionToClose,
-        "PPL asynchronous query startup failed",
-        false,
-        wasRunning);
+    return removeIfPresent("PPL asynchronous query startup failed");
   }
 
   /**
@@ -277,15 +245,25 @@ final class PPLAsyncQueryJob {
    * @return removal with detached resources, or {@code null} if already removed
    */
   synchronized Removal close(String reason) {
+    return removeIfPresent(reason);
+  }
+
+  private Removal removeIfPresent(String reason) {
     if (state == State.REMOVED) {
       return null;
     }
-    boolean wasRunning = isExecuting();
-    PPLAsyncQueryService.Status responseStatus = responseStatus();
-    JobTask taskToCancel = wasRunning ? detachTask() : null;
-    AsyncQueryExecution executionToClose = detachExecution();
+    return remove(responseStatus(), reason);
+  }
+
+  private Removal remove(PPLAsyncQueryService.Status responseStatus, String reason) {
+    return remove(responseStatus, reason, false);
+  }
+
+  private Removal remove(
+      PPLAsyncQueryService.Status responseStatus, String reason, boolean expired) {
+    Removal removal = new Removal(responseStatus, detachTask(), detachExecution(), reason, expired);
     state = State.REMOVED;
-    return new Removal(responseStatus, taskToCancel, executionToClose, reason, false, wasRunning);
+    return removal;
   }
 
   private ResponseContext directResponse() {
@@ -377,42 +355,37 @@ final class PPLAsyncQueryJob {
     REMOVE
   }
 
-  /** Whether a transition keeps or releases one running-query capacity slot. */
-  enum RunningSlotAction {
-    KEEP,
-    RELEASE
-  }
-
   /**
    * State-machine output consumed by {@link PPLAsyncQueryService}.
    *
    * @param response response to materialize and publish, or {@code null} when none is due
    * @param retention registry action
-   * @param runningSlotAction running-capacity action
    * @param executionToClose execution handle detached by the transition
    * @param taskToClose completed task registration detached by the transition
    */
   record Transition(
       ResponseContext response,
       Retention retention,
-      RunningSlotAction runningSlotAction,
       AsyncQueryExecution executionToClose,
       JobTask taskToClose) {
 
     private static Transition retain(ResponseContext response) {
-      return new Transition(response, Retention.RETAIN, RunningSlotAction.KEEP, null, null);
+      return new Transition(response, Retention.RETAIN, null, null);
     }
 
     private static Transition returnDirect(
         ResponseContext response, AsyncQueryExecution executionToClose, JobTask taskToClose) {
-      return new Transition(
-          response, Retention.REMOVE, RunningSlotAction.RELEASE, executionToClose, taskToClose);
+      return new Transition(response, Retention.REMOVE, executionToClose, taskToClose);
     }
 
     private static Transition finishRetained(
         AsyncQueryExecution executionToClose, JobTask taskToClose) {
-      return new Transition(
-          null, Retention.RETAIN, RunningSlotAction.RELEASE, executionToClose, taskToClose);
+      return new Transition(null, Retention.RETAIN, executionToClose, taskToClose);
+    }
+
+    /** Returns whether this transition releases a running-query capacity slot. */
+    boolean releasesRunningSlot() {
+      return taskToClose != null;
     }
   }
 
@@ -441,13 +414,17 @@ final class PPLAsyncQueryJob {
    * @param execution execution handle to close
    * @param reason cancellation or removal reason
    * @param expired whether expiration caused the removal
-   * @param releaseRunningSlot whether the service must release running capacity
    */
   record Removal(
       PPLAsyncQueryService.Status responseStatus,
       JobTask task,
       AsyncQueryExecution execution,
       String reason,
-      boolean expired,
-      boolean releaseRunningSlot) {}
+      boolean expired) {
+
+    /** Returns whether this removal releases a running-query capacity slot. */
+    boolean releasesRunningSlot() {
+      return task != null;
+    }
+  }
 }

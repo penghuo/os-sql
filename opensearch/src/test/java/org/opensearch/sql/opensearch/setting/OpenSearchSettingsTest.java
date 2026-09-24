@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.AdditionalMatchers.not;
 import static org.mockito.AdditionalMatchers.or;
@@ -196,6 +197,21 @@ class OpenSearchSettingsTest {
     assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_RETAINED_JOBS_SETTING.isDynamic());
     assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING.isDynamic());
     assertTrue(OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING.isDynamic());
+  }
+
+  @Test
+  void pplAsyncMaxKeepAliveIsCappedAt24Hours() {
+    String key = Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE.getKeyValue();
+
+    assertEquals(
+        TimeValue.timeValueHours(24),
+        OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING.get(
+            org.opensearch.common.settings.Settings.builder().put(key, "24h").build()));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            OpenSearchSettings.PPL_ASYNC_MAX_KEEP_ALIVE_SETTING.get(
+                org.opensearch.common.settings.Settings.builder().put(key, "25h").build()));
   }
 
   @Test

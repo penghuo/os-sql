@@ -36,6 +36,8 @@ import org.opensearch.sql.utils.DeserializationFilterUtil;
 /** Setting implementation on OpenSearch. */
 @Log4j2
 public class OpenSearchSettings extends Settings {
+  private static final TimeValue MAX_PPL_ASYNC_KEEP_ALIVE = TimeValue.timeValueHours(24);
+
   /** Default settings. */
   private final Map<Settings.Key, Setting<?>> defaultSettings;
 
@@ -112,11 +114,13 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
-  /** Maximum accepted asynchronous PPL job lease. */
+  /** Configurable asynchronous PPL job lease limit, capped at 24 hours. */
   public static final Setting<TimeValue> PPL_ASYNC_MAX_KEEP_ALIVE_SETTING =
-      Setting.positiveTimeSetting(
+      Setting.timeSetting(
           Key.PPL_ASYNC_MAX_KEEP_ALIVE.getKeyValue(),
-          TimeValue.timeValueHours(24),
+          MAX_PPL_ASYNC_KEEP_ALIVE,
+          TimeValue.ZERO,
+          MAX_PPL_ASYNC_KEEP_ALIVE,
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 

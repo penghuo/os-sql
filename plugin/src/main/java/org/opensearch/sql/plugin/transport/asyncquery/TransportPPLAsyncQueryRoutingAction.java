@@ -5,7 +5,9 @@
 
 package org.opensearch.sql.plugin.transport.asyncquery;
 
+import java.util.function.Supplier;
 import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.support.ActionFilters;
@@ -14,7 +16,10 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.node.NodeClosedException;
+import org.opensearch.sql.common.setting.Settings;
+import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.ConnectTransportException;
@@ -29,6 +34,7 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   private final String actionName;
   private final TransportService transportService;
   private final ClusterService clusterService;
+  private final Supplier<Boolean> pplEnabled;
   final PPLAsyncQueryService asyncQueryService;
 
   TransportPPLAsyncQueryRoutingAction(
@@ -44,15 +50,16 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
     this.transportService = transportService;
     this.clusterService = clusterService;
     this.asyncQueryService = asyncQueryService;
+    Settings pluginSettings = new OpenSearchSettings(clusterService.getClusterSettings());
+    this.pplEnabled = () -> (Boolean) pluginSettings.getSettingValue(Settings.Key.PPL_ENABLED);
   }
 
   @Override
   protected final void doExecute(
       Task task, Request request, ActionListener<TransportPPLQueryResponse> listener) {
-    try {
-      asyncQueryService.ensurePplEnabled();
-    } catch (RuntimeException e) {
-      listener.onFailure(e);
+    if (!pplEnabled.get()) {
+      listener.onFailure(
+          new OpenSearchStatusException("plugins.ppl.enabled is false", RestStatus.BAD_REQUEST));
       return;
     }
     PPLAsyncQueryJobId jobId = PPLAsyncQueryJobId.parse(request.id());

@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -147,7 +146,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   private final IntSupplier maxRetainedJobs;
   private final Supplier<TimeValue> maxWaitForCompletion;
   private final Supplier<TimeValue> maxKeepAlive;
-  private final BooleanSupplier pplEnabled;
   private final ThreadPool threadPool;
   private final ConcurrentMap<String, PPLAsyncQueryJob> jobs = new ConcurrentHashMap<>();
   private final Object admissionLock = new Object();
@@ -163,7 +161,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *
    * @param ownerNodeIdSupplier supplies the current local node ID
    * @param threadPool schedules retention deadlines and expiration reaping
-   * @param settings supplies dynamic PPL enablement, capacity, and duration limits
+   * @param settings supplies asynchronous query capacity and duration limits
    */
   public PPLAsyncQueryService(
       Supplier<String> ownerNodeIdSupplier, ThreadPool threadPool, Settings settings) {
@@ -183,7 +181,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
             (TimeValue)
                 settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT),
         () -> (TimeValue) settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE),
-        () -> (Boolean) settings.getSettingValue(Settings.Key.PPL_ENABLED),
         threadPool);
   }
 
@@ -203,7 +200,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         maxRetainedJobs,
         maxWaitForCompletion,
         maxKeepAlive,
-        () -> true,
         null);
   }
 
@@ -215,7 +211,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       IntSupplier maxRetainedJobs,
       Supplier<TimeValue> maxWaitForCompletion,
       Supplier<TimeValue> maxKeepAlive,
-      BooleanSupplier pplEnabled,
       ThreadPool threadPool) {
     this.ownerNodeIdSupplier = Objects.requireNonNull(ownerNodeIdSupplier);
     this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis);
@@ -224,7 +219,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     this.maxRetainedJobs = Objects.requireNonNull(maxRetainedJobs);
     this.maxWaitForCompletion = Objects.requireNonNull(maxWaitForCompletion);
     this.maxKeepAlive = Objects.requireNonNull(maxKeepAlive);
-    this.pplEnabled = Objects.requireNonNull(pplEnabled);
     this.threadPool = threadPool;
   }
 
@@ -638,13 +632,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         || waitForCompletion.millis() > maximum.millis()) {
       throw new IllegalArgumentException(
           "[wait_for_completion_timeout] must be between 0 and " + maximum);
-    }
-  }
-
-  /** Rejects an asynchronous REST operation while the dynamic PPL kill switch is disabled. */
-  void ensurePplEnabled() {
-    if (!pplEnabled.getAsBoolean()) {
-      throw new OpenSearchStatusException("plugins.ppl.enabled is false", RestStatus.BAD_REQUEST);
     }
   }
 

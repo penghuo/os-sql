@@ -41,6 +41,11 @@ public class TransportPPLQueryRequest extends ActionRequest {
   @Setter
   @Getter
   @Accessors(fluent = true)
+  private boolean formatExplicitlySpecified = false;
+
+  @Setter
+  @Getter
+  @Accessors(fluent = true)
   private boolean sanitize = true;
 
   @Setter
@@ -78,6 +83,7 @@ public class TransportPPLQueryRequest extends ActionRequest {
     jsonContent = pplQueryRequest.getJsonContent();
     path = pplQueryRequest.getPath();
     format = pplQueryRequest.getFormat();
+    formatExplicitlySpecified = pplQueryRequest.formatExplicitlySpecified();
     sanitize = pplQueryRequest.sanitize();
     style = pplQueryRequest.style();
     profile = pplQueryRequest.profile();
@@ -92,6 +98,7 @@ public class TransportPPLQueryRequest extends ActionRequest {
     super(in);
     pplQuery = in.readOptionalString();
     format = in.readOptionalString();
+    formatExplicitlySpecified = in.readBoolean();
     explainMode = in.readOptionalString();
     String jsonContentString = in.readOptionalString();
     jsonContent = jsonContentString != null ? new JSONObject(jsonContentString) : null;
@@ -128,6 +135,7 @@ public class TransportPPLQueryRequest extends ActionRequest {
     super.writeTo(out);
     out.writeOptionalString(pplQuery);
     out.writeOptionalString(format);
+    out.writeBoolean(formatExplicitlySpecified);
     out.writeOptionalString(explainMode);
     out.writeOptionalString(jsonContent != null ? jsonContent.toString() : null);
     out.writeOptionalString(path);
@@ -161,6 +169,17 @@ public class TransportPPLQueryRequest extends ActionRequest {
     return path != null && path.endsWith("/_grammar");
   }
 
+  /**
+   * Returns whether the request contains an asynchronous lifecycle field.
+   *
+   * @return {@code true} when keep-alive or wait-for-completion was explicitly requested
+   */
+  public boolean isAsyncQueryRequest() {
+    return jsonContent != null
+        && (jsonContent.has(PPLQueryRequest.WAIT_FOR_COMPLETION_TIMEOUT_FIELD)
+            || jsonContent.has(PPLQueryRequest.KEEP_ALIVE_FIELD));
+  }
+
   /** Decide on the formatter by the requested format. */
   public Format format() {
     Optional<Format> optionalFormat = Format.of(format);
@@ -185,6 +204,9 @@ public class TransportPPLQueryRequest extends ActionRequest {
 
   @Override
   public String getDescription() {
+    if (isAsyncQueryRequest()) {
+      return "PPL asynchronous query";
+    }
     String prefix = (queryId != null) ? "PPL [queryId=" + queryId + "]: " : "PPL: ";
     return prefix + pplQuery;
   }
@@ -193,6 +215,7 @@ public class TransportPPLQueryRequest extends ActionRequest {
   public PPLQueryRequest toPPLQueryRequest() {
     PPLQueryRequest pplQueryRequest =
         new PPLQueryRequest(pplQuery, jsonContent, path, format, explainMode, profile, analyze);
+    pplQueryRequest.formatExplicitlySpecified(formatExplicitlySpecified);
     pplQueryRequest.sanitize(sanitize);
     pplQueryRequest.style(style);
     pplQueryRequest.queryId(queryId);

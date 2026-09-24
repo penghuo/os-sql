@@ -119,6 +119,7 @@ public class PPLQueryRequestFactory {
               explainMode,
               enableProfile,
               enableAnalyze);
+      pplRequest.formatExplicitlySpecified(restRequest.params().containsKey(QUERY_PARAMS_FORMAT));
       // set sanitize option if csv format
       if (format.equals(Format.CSV)) {
         pplRequest.sanitize(getSanitizeOption(restRequest.params()));

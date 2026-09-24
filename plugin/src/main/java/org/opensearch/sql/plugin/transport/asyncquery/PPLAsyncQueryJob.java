@@ -86,6 +86,15 @@ final class PPLAsyncQueryJob {
   }
 
   /**
+   * Returns the immutable identity captured when this job was created.
+   *
+   * @return job owner used by the service for GET and DELETE authorization
+   */
+  PPLAsyncQueryUser owner() {
+    return owner;
+  }
+
+  /**
    * Retains a running job after its initial response wait expires.
    *
    * @param now time at which the job becomes visible to GET and DELETE
@@ -167,21 +176,18 @@ final class PPLAsyncQueryJob {
   }
 
   /**
-   * Authorizes access and returns the current retained response.
+   * Returns the current retained response.
    *
    * <p>A supplied {@code requestedKeepAlive} starts a new lease from {@code now}. A request at or
    * after the existing expiration time returns an expiration removal instead of data.
    *
-   * @param caller current caller
    * @param now request time
    * @param requestedKeepAlive replacement lease, or {@code null} to keep the current expiration
    * @return current response or the removal required for an expired job
    * @throws ResourceNotFoundException if the job was already removed
-   * @throws org.opensearch.OpenSearchSecurityException if the caller does not match the job owner
    */
-  synchronized GetResult get(PPLAsyncQueryUser caller, long now, TimeValue requestedKeepAlive) {
+  synchronized GetResult get(long now, TimeValue requestedKeepAlive) {
     ensurePresent();
-    owner.authorize(caller);
     if (now >= expirationTimeMillis) {
       return new GetResult.Expired(expireLocked("PPL asynchronous query expired"));
     }
@@ -193,17 +199,14 @@ final class PPLAsyncQueryJob {
   }
 
   /**
-   * Authorizes, cancels if still running, and removes this job.
+   * Cancels if still running and removes this job.
    *
-   * @param caller current caller
    * @param now request time
    * @return removal containing the response status and detached resources
    * @throws ResourceNotFoundException if the job was already removed
-   * @throws org.opensearch.OpenSearchSecurityException if the caller does not match the job owner
    */
-  synchronized Removal delete(PPLAsyncQueryUser caller, long now) {
+  synchronized Removal delete(long now) {
     ensurePresent();
-    owner.authorize(caller);
     if (now >= expirationTimeMillis) {
       return expireLocked("PPL asynchronous query expired");
     }

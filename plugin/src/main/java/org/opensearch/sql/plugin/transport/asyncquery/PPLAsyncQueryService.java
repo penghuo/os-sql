@@ -400,8 +400,9 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   /**
    * Returns the current snapshot of a retained job.
    *
-   * <p>Authorization and lease changes occur under the job lock. Result materialization happens
-   * afterward and therefore cannot block lifecycle transitions.
+   * <p>The service authorizes the caller against the immutable job owner before requesting a
+   * synchronized lease transition. Result materialization happens afterward and therefore cannot
+   * block lifecycle transitions.
    *
    * @param id opaque job ID owned by this node
    * @param caller caller to compare with the stored job owner
@@ -413,7 +414,8 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       validateKeepAlive(requestedKeepAlive);
     }
     PPLAsyncQueryJob job = findLocal(id);
-    GetResult result = job.get(caller, currentTimeMillis.getAsLong(), requestedKeepAlive);
+    job.owner().authorize(caller);
+    GetResult result = job.get(currentTimeMillis.getAsLong(), requestedKeepAlive);
     if (result instanceof GetResult.Expired expired) {
       applyRemoval(job, expired.removal());
       throw notFound();
@@ -430,7 +432,8 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    */
   DeleteResult delete(String id, PPLAsyncQueryUser caller) {
     PPLAsyncQueryJob job = findLocal(id);
-    Removal removal = job.delete(caller, currentTimeMillis.getAsLong());
+    job.owner().authorize(caller);
+    Removal removal = job.delete(currentTimeMillis.getAsLong());
     applyRemoval(job, removal);
     if (removal.expired()) {
       throw notFound();

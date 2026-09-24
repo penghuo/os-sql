@@ -55,8 +55,7 @@ import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.TaskManager;
 
 public class PPLAsyncQueryServiceTest {
-  private static final PPLAsyncQueryUser OWNER =
-      new PPLAsyncQueryUser(false, null, null, List.of());
+  private static final PPLAsyncQueryUser OWNER = new PPLAsyncQueryUser(null, null, List.of());
 
   private final AtomicLong now = new AtomicLong(1_000);
   private final AtomicReference<Runnable> timeoutTask = new AtomicReference<>();
@@ -443,9 +442,8 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void rejectsUnauthorizedCallerWithoutRenewingOrDeleting() {
-    PPLAsyncQueryUser securedOwner =
-        new PPLAsyncQueryUser(true, "alice", "tenant", List.of("role-a"));
-    PPLAsyncQueryUser otherUser = new PPLAsyncQueryUser(true, "bob", "tenant", List.of("role-a"));
+    PPLAsyncQueryUser securedOwner = new PPLAsyncQueryUser("alice", "tenant", List.of("role-a"));
+    PPLAsyncQueryUser otherUser = new PPLAsyncQueryUser("bob", "tenant", List.of("role-a"));
     AtomicReference<String> id = new AtomicReference<>();
     service.start(
         securedOwner,
@@ -560,17 +558,24 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void failedRetainedJobReturnsNoProvisionalRowsAndClosesExecution() {
-    TrackingExecution execution = new TrackingExecution(response(1));
-    String id = startRetainedQuery(service, null, execution);
+    NumericMetric<Long> failures =
+        new NumericMetric<>(MetricName.PPL_FAILED_REQ_COUNT_SYS.getName(), new BasicCounter());
+    Metrics.getInstance().registerMetric(failures);
+    try {
+      TrackingExecution execution = new TrackingExecution(response(1));
+      String id = startRetainedQuery(service, null, execution);
 
-    execution.fail(new IllegalStateException("boom"));
-    PPLAsyncQueryService.JobSnapshot failed = service.get(id, OWNER, null);
+      execution.fail(new IllegalStateException("boom"));
+      PPLAsyncQueryService.JobSnapshot failed = service.get(id, OWNER, null);
 
-    assertEquals(PPLAsyncQueryService.Status.FAILED, failed.status());
-    assertEquals("boom", failed.failure().reason());
-    assertNull(failed.response());
-    assertEquals(0, execution.reads.get());
-    assertEquals(1, execution.closes.get());
+      assertEquals(PPLAsyncQueryService.Status.FAILED, failed.status());
+      assertEquals("boom", failed.failure().reason());
+      assertNull(failed.response());
+      assertEquals(0, execution.reads.get());
+      assertEquals(1, execution.closes.get());
+    } finally {
+      Metrics.getInstance().unregisterMetric(failures.getName());
+    }
   }
 
   @Test
@@ -698,42 +703,6 @@ public class PPLAsyncQueryServiceTest {
     service.validateWaitForCompletion(TimeValue.ZERO);
     service.validateWaitForCompletion(TimeValue.timeValueSeconds(60));
     service.validateKeepAlive(TimeValue.timeValueHours(24));
-  }
-
-  @Test
-  public void disabledPplRejectsAllAsyncOperations() {
-    AtomicBoolean enabled = new AtomicBoolean(true);
-    PPLAsyncQueryService switchable =
-        new PPLAsyncQueryService(
-            "node-a",
-            now::get,
-            (delay, task) -> () -> {},
-            () -> 20,
-            () -> 100,
-            () -> TimeValue.timeValueSeconds(60),
-            () -> TimeValue.timeValueHours(24),
-            enabled::get);
-    String id = startRetainedQuery(switchable, null, new TrackingExecution(null));
-    enabled.set(false);
-
-    try {
-      OpenSearchStatusException getFailure =
-          assertThrows(OpenSearchStatusException.class, () -> switchable.get(id, OWNER, null));
-      assertEquals(400, getFailure.status().getStatus());
-      assertThrows(OpenSearchStatusException.class, () -> switchable.delete(id, OWNER));
-      assertThrows(
-          OpenSearchStatusException.class,
-          () ->
-              startQuery(
-                  switchable,
-                  null,
-                  TimeValue.ZERO,
-                  new TrackingExecution(null),
-                  listener(ignored -> {})));
-    } finally {
-      enabled.set(true);
-      switchable.delete(id, OWNER);
-    }
   }
 
   private PPLAsyncQueryService service(int maxRunning, int maxRetained) {

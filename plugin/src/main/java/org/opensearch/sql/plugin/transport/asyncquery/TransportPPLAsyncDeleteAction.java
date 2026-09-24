@@ -11,13 +11,13 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /** Routes asynchronous PPL DELETE requests to the job owner node and performs cancellation. */
 public final class TransportPPLAsyncDeleteAction
     extends TransportPPLAsyncQueryRoutingAction<PPLAsyncDeleteRequest> {
 
-  private final PPLAsyncQueryService asyncQueryService;
   private final PPLAsyncQueryResponseFormatter responseFormatter;
 
   /**
@@ -40,8 +40,8 @@ public final class TransportPPLAsyncDeleteAction
         actionFilters,
         PPLAsyncDeleteRequest::new,
         clusterService,
-        asyncQueryService);
-    this.asyncQueryService = asyncQueryService;
+        asyncQueryService,
+        ThreadPool.Names.SAME);
     this.responseFormatter = new PPLAsyncQueryResponseFormatter();
   }
 

@@ -48,7 +48,21 @@ import org.opensearch.tasks.TaskManager;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
-/** Owner-node lifecycle and current-result access for asynchronous PPL queries. */
+/**
+ * Owns the asynchronous PPL jobs assigned to the local node.
+ *
+ * <p>{@link PPLAsyncQueryJob} owns the mutable state of one job. This service owns the job registry
+ * and performs the work requested by each state transition: capacity accounting, task management,
+ * result materialization, listener notification, and execution cleanup. Those side effects happen
+ * after the job lock is released.
+ *
+ * <p>POST races query completion against {@code wait_for_completion_timeout}. Completion wins by
+ * returning the final result directly and removing the job. The timeout wins by retaining the job
+ * and returning its opaque ID. GET and DELETE are then routed to this owner node.
+ *
+ * <p>This class is thread-safe. The registry is concurrent, capacity counters are guarded by {@code
+ * admissionLock}, and each job synchronizes its own lifecycle transitions.
+ */
 public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   private static final Logger LOG = LogManager.getLogger(PPLAsyncQueryService.class);
 
@@ -88,11 +102,11 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   }
 
   /**
-   * Detached point-in-time view of a job used to build an HTTP response.
+   * Immutable point-in-time response view of a job.
    *
-   * <p>This is an internal response model, not part of the public API. The public API is the JSON
-   * produced by {@link PPLAsyncQueryResponseFormatter}. A snapshot deliberately copies data out of
-   * the mutable {@link PPLAsyncQueryJob}, so response formatting never reads live job state.
+   * <p>The formatter converts this internal model to the public JSON response. Query data is copied
+   * from the execution after releasing the job lock, so formatting never observes mutable job
+   * state.
    *
    * @param id opaque job ID, or {@code null} for a terminal response returned directly by POST
    * @param status lifecycle state captured with the result
@@ -149,7 +163,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    *
    * @param ownerNodeIdSupplier supplies the current local node ID
    * @param threadPool schedules retention deadlines and expiration reaping
-   * @param settings supplies asynchronous query capacity and duration limits
+   * @param settings supplies dynamic PPL enablement, capacity, and duration limits
    */
   public PPLAsyncQueryService(
       Supplier<String> ownerNodeIdSupplier, ThreadPool threadPool, Settings settings) {
@@ -193,27 +207,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         null);
   }
 
-  PPLAsyncQueryService(
-      String ownerNodeId,
-      LongSupplier currentTimeMillis,
-      TimeoutScheduler timeoutScheduler,
-      IntSupplier maxRunningQueries,
-      IntSupplier maxRetainedJobs,
-      Supplier<TimeValue> maxWaitForCompletion,
-      Supplier<TimeValue> maxKeepAlive,
-      BooleanSupplier pplEnabled) {
-    this(
-        () -> ownerNodeId,
-        currentTimeMillis,
-        timeoutScheduler,
-        maxRunningQueries,
-        maxRetainedJobs,
-        maxWaitForCompletion,
-        maxKeepAlive,
-        pplEnabled,
-        null);
-  }
-
   private PPLAsyncQueryService(
       Supplier<String> ownerNodeIdSupplier,
       LongSupplier currentTimeMillis,
@@ -244,7 +237,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * Otherwise, the job becomes retained and the listener receives its current result with an opaque
    * ID.
    *
-   * @param owner authenticated owner retained with the job
+   * @param owner submit caller retained with the job for later authorization
    * @param requestedKeepAlive requested job lease
    * @param requestedWaitForCompletion maximum time to wait for a direct result
    * @param request transport request used to register the job task
@@ -260,7 +253,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       PPLQueryTask requestTask,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
       ActionListener<JobSnapshot> responseListener) {
-    ensurePplEnabled();
     TimeValue keepAlive =
         TimeValue.parseTimeValue(requestedKeepAlive, PPLQueryRequest.KEEP_ALIVE_FIELD);
     TimeValue waitForCompletion =
@@ -279,7 +271,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * the same production lifecycle: create the job, establish its retention deadline, start
    * execution, and transfer ownership of the execution handle to the job.
    *
-   * @param owner authenticated owner retained with the job
+   * @param owner submit caller retained with the job for later authorization
    * @param keepAlive validated job lease
    * @param waitForCompletion validated direct-result wait
    * @param task job-owned task and registration cleanup
@@ -293,7 +285,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       JobTask task,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
       ActionListener<JobSnapshot> responseListener) {
-    ensurePplEnabled();
     PPLAsyncQueryJob job;
     try {
       Objects.requireNonNull(task);
@@ -400,15 +391,30 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     if (transition == null) {
       return;
     }
-    boolean directFailure = transition.response() != null;
-    if (!directFailure) {
+    if (transition.response() == null) {
       PPLQueryErrorHandler.recordFailure(failure);
+      applyTransition(job, transition, responseListener);
+      return;
     }
-    applyTransition(job, transition, responseListener, directFailure ? failure : null);
+    applyTransition(
+        job,
+        transition,
+        ActionListener.wrap(
+            ignored -> responseListener.onFailure(failure), responseListener::onFailure));
   }
 
+  /**
+   * Returns the current snapshot of a retained job.
+   *
+   * <p>Authorization and lease changes occur under the job lock. Result materialization happens
+   * afterward and therefore cannot block lifecycle transitions.
+   *
+   * @param id opaque job ID owned by this node
+   * @param caller caller to compare with the stored job owner
+   * @param requestedKeepAlive new lease duration, or {@code null} to leave the lease unchanged
+   * @return immutable current job snapshot
+   */
   JobSnapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
-    ensurePplEnabled();
     if (requestedKeepAlive != null) {
       validateKeepAlive(requestedKeepAlive);
     }
@@ -421,8 +427,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     return materialize(((GetResult.Found) result).response());
   }
 
+  /**
+   * Cancels and removes a retained job.
+   *
+   * @param id opaque job ID owned by this node
+   * @param caller caller to compare with the stored job owner
+   * @return the status observed when the job was removed
+   */
   DeleteResult delete(String id, PPLAsyncQueryUser caller) {
-    ensurePplEnabled();
     PPLAsyncQueryJob job = findLocal(id);
     Removal removal = job.delete(caller, currentTimeMillis.getAsLong());
     applyRemoval(job, removal);
@@ -510,14 +522,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    */
   private void applyTransition(
       PPLAsyncQueryJob job, Transition transition, ActionListener<JobSnapshot> responseListener) {
-    applyTransition(job, transition, responseListener, null);
-  }
-
-  private void applyTransition(
-      PPLAsyncQueryJob job,
-      Transition transition,
-      ActionListener<JobSnapshot> responseListener,
-      Exception directFailure) {
     if (transition == null) {
       return;
     }
@@ -531,7 +535,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     JobSnapshot snapshot = null;
     RuntimeException materializationFailure = null;
     try {
-      if (transition.response() != null && directFailure == null) {
+      if (transition.response() != null) {
         snapshot = materialize(transition.response());
       }
     } catch (RuntimeException e) {
@@ -542,9 +546,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
 
     if (transition.response() != null) {
-      if (directFailure != null) {
-        responseListener.onFailure(directFailure);
-      } else if (materializationFailure == null) {
+      if (materializationFailure == null) {
         responseListener.onResponse(snapshot);
       } else {
         if (transition.retention() == Retention.RETAIN) {
@@ -639,7 +641,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  /** Rejects asynchronous lifecycle operations while the dynamic PPL kill switch is disabled. */
+  /** Rejects an asynchronous REST operation while the dynamic PPL kill switch is disabled. */
   void ensurePplEnabled() {
     if (!pplEnabled.getAsBoolean()) {
       throw new OpenSearchStatusException("plugins.ppl.enabled is false", RestStatus.BAD_REQUEST);

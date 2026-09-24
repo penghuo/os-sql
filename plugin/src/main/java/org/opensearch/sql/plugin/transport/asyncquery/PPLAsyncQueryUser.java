@@ -16,26 +16,23 @@ import org.opensearch.core.rest.RestStatus;
 /**
  * Immutable owner identity used to authorize retained asynchronous query state.
  *
- * @param securityEnabled whether the security plugin supplied an authenticated identity
- * @param name authenticated principal
+ * @param name authenticated principal, or {@code null} when no identity was supplied
  * @param requestedTenant requested security tenant
  * @param backendRoles backend roles captured when the job starts
  */
-public record PPLAsyncQueryUser(
-    boolean securityEnabled, String name, String requestedTenant, List<String> backendRoles) {
+public record PPLAsyncQueryUser(String name, String requestedTenant, List<String> backendRoles) {
 
   /**
    * Creates an immutable asynchronous query identity.
    *
-   * @param securityEnabled whether the security plugin supplied an authenticated identity
-   * @param name authenticated principal
+   * @param name authenticated principal, or {@code null} when no identity was supplied
    * @param requestedTenant requested security tenant
    * @param backendRoles backend roles captured when the job starts
    */
   public PPLAsyncQueryUser {
     backendRoles = backendRoles == null ? List.of() : List.copyOf(backendRoles);
-    if (securityEnabled && (name == null || name.isBlank())) {
-      throw new IllegalArgumentException("Security-enabled PPL user must have a principal");
+    if (name != null && name.isBlank()) {
+      throw new IllegalArgumentException("PPL asynchronous query user must not be blank");
     }
   }
 
@@ -50,7 +47,7 @@ public record PPLAsyncQueryUser(
       Object serialized =
           threadContext.getTransient(ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT);
       if (serialized == null) {
-        return new PPLAsyncQueryUser(false, null, null, List.of());
+        return new PPLAsyncQueryUser(null, null, List.of());
       }
       User user =
           serialized instanceof User currentUser
@@ -60,19 +57,14 @@ public record PPLAsyncQueryUser(
         throw forbidden();
       }
       return new PPLAsyncQueryUser(
-          true, user.getName(), user.getRequestedTenant(), user.getBackendRoles());
+          user.getName(), user.getRequestedTenant(), user.getBackendRoles());
     } catch (RuntimeException e) {
       throw forbidden();
     }
   }
 
   void authorize(PPLAsyncQueryUser caller) {
-    if (!securityEnabled && !caller.securityEnabled) {
-      return;
-    }
-    if (!securityEnabled
-        || !caller.securityEnabled
-        || !Objects.equals(name, caller.name)
+    if (!Objects.equals(name, caller.name)
         || !Objects.equals(requestedTenant, caller.requestedTenant)
         || !caller.backendRoles.containsAll(backendRoles)) {
       throw forbidden();

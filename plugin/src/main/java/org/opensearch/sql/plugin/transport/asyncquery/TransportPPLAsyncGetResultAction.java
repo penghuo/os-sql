@@ -7,7 +7,6 @@ package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.opensearch.sql.opensearch.executor.OpenSearchQueryManager.SQL_WORKER_THREAD_POOL_NAME;
 
-import java.util.concurrent.Executor;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -20,9 +19,7 @@ import org.opensearch.transport.TransportService;
 public final class TransportPPLAsyncGetResultAction
     extends TransportPPLAsyncQueryRoutingAction<PPLAsyncGetResultRequest> {
 
-  private final PPLAsyncQueryService asyncQueryService;
   private final PPLAsyncQueryResponseFormatter responseFormatter;
-  private final Executor worker;
 
   /**
    * Creates the asynchronous PPL GET transport action.
@@ -44,10 +41,9 @@ public final class TransportPPLAsyncGetResultAction
         actionFilters,
         PPLAsyncGetResultRequest::new,
         clusterService,
-        asyncQueryService);
-    this.asyncQueryService = asyncQueryService;
+        asyncQueryService,
+        SQL_WORKER_THREAD_POOL_NAME);
     this.responseFormatter = new PPLAsyncQueryResponseFormatter();
-    this.worker = transportService.getThreadPool().executor(SQL_WORKER_THREAD_POOL_NAME);
   }
 
   @Override
@@ -55,17 +51,10 @@ public final class TransportPPLAsyncGetResultAction
       Task task,
       PPLAsyncGetResultRequest request,
       ActionListener<TransportPPLQueryResponse> listener) {
-    PPLAsyncQueryUser caller = currentUser();
-    try {
-      worker.execute(
-          () ->
-              ActionListener.completeWith(
-                  listener,
-                  () ->
-                      responseFormatter.format(
-                          asyncQueryService.get(request.id(), caller, request.keepAlive()))));
-    } catch (RuntimeException e) {
-      listener.onFailure(e);
-    }
+    ActionListener.completeWith(
+        listener,
+        () ->
+            responseFormatter.format(
+                asyncQueryService.get(request.id(), currentUser(), request.keepAlive())));
   }
 }

@@ -29,7 +29,7 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   private final String actionName;
   private final TransportService transportService;
   private final ClusterService clusterService;
-  private final PPLAsyncQueryService asyncQueryService;
+  final PPLAsyncQueryService asyncQueryService;
 
   TransportPPLAsyncQueryRoutingAction(
       String actionName,
@@ -37,8 +37,9 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
       ActionFilters actionFilters,
       Writeable.Reader<Request> requestReader,
       ClusterService clusterService,
-      PPLAsyncQueryService asyncQueryService) {
-    super(actionName, transportService, actionFilters, requestReader);
+      PPLAsyncQueryService asyncQueryService,
+      String executor) {
+    super(actionName, transportService, actionFilters, requestReader, executor);
     this.actionName = actionName;
     this.transportService = transportService;
     this.clusterService = clusterService;

@@ -16,7 +16,6 @@ import org.opensearch.sql.datasources.exceptions.DataSourceClientException;
 import org.opensearch.sql.exception.QueryEngineException;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
-import org.opensearch.sql.legacy.metrics.NumericMetric;
 
 /** Classifies PPL failures and records the corresponding customer or system error metric. */
 public final class PPLQueryErrorHandler {
@@ -63,9 +62,6 @@ public final class PPLQueryErrorHandler {
   }
 
   private static void increment(MetricName metricName) {
-    NumericMetric<?> metric = Metrics.getInstance().getNumericalMetric(metricName);
-    if (metric != null) {
-      metric.increment();
-    }
+    Metrics.getInstance().getNumericalMetric(metricName).increment();
   }
 }

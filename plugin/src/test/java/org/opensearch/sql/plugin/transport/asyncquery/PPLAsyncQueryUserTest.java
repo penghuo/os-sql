@@ -6,7 +6,7 @@
 package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 
 import java.util.List;
@@ -52,34 +52,34 @@ public class PPLAsyncQueryUserTest {
   public void missingIdentityRepresentsAnUnsecuredCaller() {
     ThreadContext context = new ThreadContext(Settings.EMPTY);
 
-    assertFalse(PPLAsyncQueryUser.current(context).securityEnabled());
+    assertNull(PPLAsyncQueryUser.current(context).name());
   }
 
   @Test
   public void requiresSamePrincipalTenantAndOriginalBackendRoles() {
-    PPLAsyncQueryUser owner = new PPLAsyncQueryUser(true, "alice", "tenant-a", List.of("role-a"));
+    PPLAsyncQueryUser owner = new PPLAsyncQueryUser("alice", "tenant-a", List.of("role-a"));
 
     owner.authorize(
-        new PPLAsyncQueryUser(true, "alice", "tenant-a", List.of("role-a", "newly-added-role")));
+        new PPLAsyncQueryUser("alice", "tenant-a", List.of("role-a", "newly-added-role")));
 
     assertThrows(
         OpenSearchSecurityException.class,
-        () -> owner.authorize(new PPLAsyncQueryUser(true, "bob", "tenant-a", List.of("role-a"))));
+        () -> owner.authorize(new PPLAsyncQueryUser("bob", "tenant-a", List.of("role-a"))));
     assertThrows(
         OpenSearchSecurityException.class,
-        () -> owner.authorize(new PPLAsyncQueryUser(true, "alice", "tenant-b", List.of("role-a"))));
+        () -> owner.authorize(new PPLAsyncQueryUser("alice", "tenant-b", List.of("role-a"))));
     assertThrows(
         OpenSearchSecurityException.class,
-        () -> owner.authorize(new PPLAsyncQueryUser(true, "alice", "tenant-a", List.of())));
+        () -> owner.authorize(new PPLAsyncQueryUser("alice", "tenant-a", List.of())));
   }
 
   @Test
   public void unsecuredModeRequiresAnUnsecuredCaller() {
-    PPLAsyncQueryUser unsecured = new PPLAsyncQueryUser(false, null, null, List.of());
-    unsecured.authorize(new PPLAsyncQueryUser(false, null, null, List.of()));
+    PPLAsyncQueryUser unsecured = new PPLAsyncQueryUser(null, null, List.of());
+    unsecured.authorize(new PPLAsyncQueryUser(null, null, List.of()));
 
     assertThrows(
         OpenSearchSecurityException.class,
-        () -> unsecured.authorize(new PPLAsyncQueryUser(true, "alice", null, List.of("role-a"))));
+        () -> unsecured.authorize(new PPLAsyncQueryUser("alice", null, List.of("role-a"))));
   }
 }

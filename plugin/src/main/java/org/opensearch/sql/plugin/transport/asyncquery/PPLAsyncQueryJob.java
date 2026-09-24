@@ -19,21 +19,22 @@ import org.opensearch.tasks.CancellableTask;
  * service map, update capacity counters, or cancel tasks while holding the lock.
  *
  * <p>After attachment, the job owns one {@link AsyncQueryExecution}. Reads borrow it through a
- * {@link View}; removal transitions detach it so the service can close it outside the lock.
+ * {@link ResponseContext}; removal transitions detach it so the service can close it outside the
+ * lock.
  *
  * <pre>
  * Initial condition                         Initial state
- * wait_for_completion_timeout &gt; 0          SUBMIT_WAITING
+ * wait_for_completion_timeout &gt; 0          AWAITING_INITIAL_RESPONSE
  * wait_for_completion_timeout = 0          RETAINED_RUNNING (POST returns the job ID)
  *
- * Current state          Event              Next state             Submit response
- * SUBMIT_WAITING         success            REMOVED                final result without job ID
- * SUBMIT_WAITING         failure            REMOVED                failure without job ID
- * SUBMIT_WAITING         timeout            RETAINED_RUNNING       running status with job ID
- * RETAINED_RUNNING       success            RETAINED_SUCCEEDED     none
- * RETAINED_RUNNING       failure            RETAINED_FAILED        none
- * SUBMIT_WAITING         delete/abort/close REMOVED                none
- * RETAINED_*             delete/expire/abort/close REMOVED         none
+ * Current state               Event              Next state             Initial response
+ * AWAITING_INITIAL_RESPONSE   success            REMOVED                final result without ID
+ * AWAITING_INITIAL_RESPONSE   failure            REMOVED                failure without ID
+ * AWAITING_INITIAL_RESPONSE   timeout            RETAINED_RUNNING       running status with ID
+ * RETAINED_RUNNING            success            RETAINED_SUCCEEDED     none
+ * RETAINED_RUNNING            failure            RETAINED_FAILED        none
+ * AWAITING_INITIAL_RESPONSE   delete/abort/close REMOVED                none
+ * RETAINED_*                  delete/expire/abort/close REMOVED         none
  * </pre>
  *
  * <p>GET lease renewal and execution attachment do not change the lifecycle state. Events received
@@ -66,7 +67,7 @@ final class PPLAsyncQueryJob {
     this.keepAliveMillis = keepAliveMillis;
     this.expirationTimeMillis = addWithoutOverflow(startTimeMillis, keepAliveMillis);
     this.task = task;
-    if (initialState != State.SUBMIT_WAITING && initialState != State.RETAINED_RUNNING) {
+    if (initialState != State.AWAITING_INITIAL_RESPONSE && initialState != State.RETAINED_RUNNING) {
       throw new IllegalArgumentException("Invalid initial PPL asynchronous query state");
     }
     this.state = initialState;
@@ -76,21 +77,21 @@ final class PPLAsyncQueryJob {
     return id;
   }
 
-  synchronized Transition initialSubmitResponse() {
+  synchronized Transition initialResponse() {
     ensurePresent();
     if (state != State.RETAINED_RUNNING) {
-      throw new IllegalStateException("PPL asynchronous query is waiting for submit completion");
+      throw new IllegalStateException("PPL asynchronous query is awaiting its initial response");
     }
-    return Transition.respond(view(true), Retention.RETAIN, RunningSlotAction.KEEP, null, null);
+    return Transition.returnJob(retainedResponse());
   }
 
   synchronized Transition timeout(long now) {
-    if (state != State.SUBMIT_WAITING) {
+    if (state != State.AWAITING_INITIAL_RESPONSE) {
       return null;
     }
     state = State.RETAINED_RUNNING;
     expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-    return Transition.respond(view(true), Retention.RETAIN, RunningSlotAction.KEEP, null, null);
+    return Transition.returnJob(retainedResponse());
   }
 
   synchronized boolean tryAttachExecution(AsyncQueryExecution execution) {
@@ -122,36 +123,33 @@ final class PPLAsyncQueryJob {
   }
 
   private Transition finish(State terminalState, long now) {
-    boolean submitWaiting = state == State.SUBMIT_WAITING;
+    boolean awaitingInitialResponse = state == State.AWAITING_INITIAL_RESPONSE;
     JobTask taskToClose = detachTask();
     state = terminalState;
     completionTimeMillis = now;
-    if (submitWaiting) {
-      View view = view(false);
+    if (awaitingInitialResponse) {
+      ResponseContext response = directResponse();
       AsyncQueryExecution executionToClose = detachExecution();
       state = State.REMOVED;
-      return Transition.respond(
-          view, Retention.REMOVE, RunningSlotAction.RELEASE, executionToClose, taskToClose);
+      return Transition.returnDirect(response, executionToClose, taskToClose);
     }
     if (state == State.RETAINED_FAILED) {
-      return Transition.withoutSubmitResponse(
-          Retention.RETAIN, RunningSlotAction.RELEASE, detachExecution(), taskToClose);
+      return Transition.finishRetained(detachExecution(), taskToClose);
     }
-    return Transition.withoutSubmitResponse(
-        Retention.RETAIN, RunningSlotAction.RELEASE, null, taskToClose);
+    return Transition.finishRetained(null, taskToClose);
   }
 
-  synchronized Access get(PPLAsyncQueryUser caller, long now, TimeValue requestedKeepAlive) {
+  synchronized GetResult get(PPLAsyncQueryUser caller, long now, TimeValue requestedKeepAlive) {
     ensurePresent();
     owner.authorize(caller);
     if (now >= expirationTimeMillis) {
-      return Access.removed(expireLocked("PPL asynchronous query expired"));
+      return new GetResult.Expired(expireLocked("PPL asynchronous query expired"));
     }
     if (requestedKeepAlive != null) {
       keepAliveMillis = requestedKeepAlive.millis();
     }
     expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-    return Access.view(view(true));
+    return new GetResult.Found(retainedResponse());
   }
 
   synchronized Removal delete(PPLAsyncQueryUser caller, long now) {
@@ -176,7 +174,9 @@ final class PPLAsyncQueryJob {
   }
 
   synchronized Removal expire(long now) {
-    if (state == State.REMOVED || state == State.SUBMIT_WAITING || now < expirationTimeMillis) {
+    if (state == State.REMOVED
+        || state == State.AWAITING_INITIAL_RESPONSE
+        || now < expirationTimeMillis) {
       return null;
     }
     return expireLocked("PPL asynchronous query expired");
@@ -204,7 +204,7 @@ final class PPLAsyncQueryJob {
         responseStatus,
         taskToCancel,
         executionToClose,
-        "PPL asynchronous query submission failed",
+        "PPL asynchronous query startup failed",
         false,
         wasRunning);
   }
@@ -221,19 +221,27 @@ final class PPLAsyncQueryJob {
     return new Removal(responseStatus, taskToCancel, executionToClose, reason, false, wasRunning);
   }
 
-  private View view(boolean includeId) {
+  private ResponseContext directResponse() {
+    return responseContext(null);
+  }
+
+  private ResponseContext retainedResponse() {
+    return responseContext(id);
+  }
+
+  private ResponseContext responseContext(String responseId) {
     long tookMillis =
         completionTimeMillis < 0 ? -1L : Math.max(0L, completionTimeMillis - startTimeMillis);
-    return new View(includeId ? id : null, responseStatus(), execution, failure, tookMillis);
+    return new ResponseContext(responseId, responseStatus(), execution, failure, tookMillis);
   }
 
   private boolean isExecuting() {
-    return state == State.SUBMIT_WAITING || state == State.RETAINED_RUNNING;
+    return state == State.AWAITING_INITIAL_RESPONSE || state == State.RETAINED_RUNNING;
   }
 
   private PPLAsyncQueryService.Status responseStatus() {
     return switch (state) {
-      case SUBMIT_WAITING, RETAINED_RUNNING -> PPLAsyncQueryService.Status.RUNNING;
+      case AWAITING_INITIAL_RESPONSE, RETAINED_RUNNING -> PPLAsyncQueryService.Status.RUNNING;
       case RETAINED_SUCCEEDED -> PPLAsyncQueryService.Status.SUCCEEDED;
       case RETAINED_FAILED -> PPLAsyncQueryService.Status.FAILED;
       case REMOVED -> throw new IllegalStateException("PPL asynchronous query was removed");
@@ -266,7 +274,7 @@ final class PPLAsyncQueryJob {
     }
   }
 
-  record View(
+  record ResponseContext(
       String id,
       PPLAsyncQueryService.Status status,
       AsyncQueryExecution execution,
@@ -279,9 +287,9 @@ final class PPLAsyncQueryJob {
     }
   }
 
-  /** Internal lifecycle; unlike the response status, this includes submit waiting and removal. */
+  /** Internal lifecycle; unlike the response status, this includes initial waiting and removal. */
   enum State {
-    SUBMIT_WAITING,
+    AWAITING_INITIAL_RESPONSE,
     RETAINED_RUNNING,
     RETAINED_SUCCEEDED,
     RETAINED_FAILED,
@@ -299,38 +307,33 @@ final class PPLAsyncQueryJob {
   }
 
   record Transition(
-      View submitView,
+      ResponseContext initialResponse,
       Retention retention,
       RunningSlotAction runningSlotAction,
       AsyncQueryExecution executionToClose,
       JobTask taskToClose) {
 
-    private static Transition respond(
-        View view,
-        Retention retention,
-        RunningSlotAction runningSlotAction,
-        AsyncQueryExecution executionToClose,
-        JobTask taskToClose) {
-      return new Transition(view, retention, runningSlotAction, executionToClose, taskToClose);
+    private static Transition returnJob(ResponseContext response) {
+      return new Transition(response, Retention.RETAIN, RunningSlotAction.KEEP, null, null);
     }
 
-    private static Transition withoutSubmitResponse(
-        Retention retention,
-        RunningSlotAction runningSlotAction,
-        AsyncQueryExecution executionToClose,
-        JobTask taskToClose) {
-      return new Transition(null, retention, runningSlotAction, executionToClose, taskToClose);
+    private static Transition returnDirect(
+        ResponseContext response, AsyncQueryExecution executionToClose, JobTask taskToClose) {
+      return new Transition(
+          response, Retention.REMOVE, RunningSlotAction.RELEASE, executionToClose, taskToClose);
+    }
+
+    private static Transition finishRetained(
+        AsyncQueryExecution executionToClose, JobTask taskToClose) {
+      return new Transition(
+          null, Retention.RETAIN, RunningSlotAction.RELEASE, executionToClose, taskToClose);
     }
   }
 
-  record Access(View view, Removal removal) {
-    private static Access view(View view) {
-      return new Access(view, null);
-    }
+  sealed interface GetResult {
+    record Found(ResponseContext response) implements GetResult {}
 
-    private static Access removed(Removal removal) {
-      return new Access(null, removal);
-    }
+    record Expired(Removal removal) implements GetResult {}
   }
 
   record Removal(

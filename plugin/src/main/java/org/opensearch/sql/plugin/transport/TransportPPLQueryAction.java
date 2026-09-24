@@ -444,25 +444,19 @@ public class TransportPPLQueryAction
   }
 
   private void startAsyncQuery(
-      PPLQueryTask submitTask,
+      PPLQueryTask requestTask,
       TransportPPLQueryRequest transportRequest,
       PPLQueryRequest request,
       PPLService pplService,
-      ActionListener<TransportPPLQueryResponse> submitListener,
+      ActionListener<TransportPPLQueryResponse> initialResponseListener,
       Consumer<String> anonymizedQuerySink) {
     PPLAsyncQueryUser owner = PPLAsyncQueryUser.current(clientRef.threadPool().getThreadContext());
-    PPLAsyncQueryService.Submission submission =
-        asyncQueryService.submit(
-            owner,
-            request.getKeepAlive(),
-            request.getWaitForCompletionTimeout(),
-            transportRequest,
-            submitTask,
-            ActionListener.wrap(
-                snapshot -> submitListener.onResponse(asyncResponseFormatter.format(snapshot)),
-                submitListener::onFailure));
-
-    submission.start(
+    asyncQueryService.start(
+        owner,
+        request.getKeepAlive(),
+        request.getWaitForCompletionTimeout(),
+        transportRequest,
+        requestTask,
         task -> {
           OpenSearchQueryManager.setCancellableTask(task);
           try {
@@ -472,7 +466,10 @@ public class TransportPPLQueryAction
           } finally {
             OpenSearchQueryManager.clearCancellableTask();
           }
-        });
+        },
+        ActionListener.wrap(
+            snapshot -> initialResponseListener.onResponse(asyncResponseFormatter.format(snapshot)),
+            initialResponseListener::onFailure));
   }
 
   private Format format(PPLQueryRequest pplRequest) {

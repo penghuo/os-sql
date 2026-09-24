@@ -11,7 +11,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_BANK;
-import static org.opensearch.sql.plugin.transport.PPLAsyncDeleteAction.NAME;
+import static org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncDeleteAction.NAME;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -21,7 +21,7 @@ import org.opensearch.client.Request;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
-import org.opensearch.sql.plugin.transport.PPLAsyncGetResultAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncGetResultAction;
 import org.opensearch.sql.util.ClusterPlugins;
 
 /** FGAC integration tests for asynchronous PPL submit, get, delete, and owner isolation. */

@@ -56,27 +56,26 @@ public class PPLAsyncQueryServiceTest {
 
   private final AtomicLong now = new AtomicLong(1_000);
   private final AtomicReference<Runnable> timeoutTask = new AtomicReference<>();
+  private final AtomicBoolean timeoutCancelled = new AtomicBoolean();
   private final PPLAsyncQueryService service = service(20, 100);
 
   @Test
   public void fastSuccessReturnsDirectResultWithoutRetainingJob() {
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
     AtomicInteger responses = new AtomicInteger();
-
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(
-            null,
-            TimeValue.timeValueSeconds(5),
-            listener(
-                snapshot -> {
-                  result.set(snapshot);
-                  responses.incrementAndGet();
-                }));
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(response(2));
-    service.attachExecution(submission, execution);
+    startQuery(
+        service,
+        null,
+        TimeValue.timeValueSeconds(5),
+        execution,
+        listener(
+            snapshot -> {
+              result.set(snapshot);
+              responses.incrementAndGet();
+            }));
     now.addAndGet(25);
-    service.complete(submission);
+    execution.complete();
 
     assertEquals(1, responses.get());
     assertNull(result.get().id());
@@ -87,7 +86,7 @@ public class PPLAsyncQueryServiceTest {
     assertEquals(0, service.retainedJobCount());
     assertEquals(1, execution.reads.get());
     assertEquals(1, execution.closes.get());
-    assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
+    assertTrue(timeoutCancelled.get());
 
     timeoutTask.get().run();
     assertEquals(1, responses.get());
@@ -95,23 +94,21 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void timeoutReturnsIdAndLaterGetReturnsCompleteResult() {
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(null, TimeValue.timeValueSeconds(5), listener(submit::set));
-    String id = submission.id();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> initialResponse = new AtomicReference<>();
+    TrackingExecution execution = new TrackingExecution(null);
+    startQuery(
+        service, null, TimeValue.timeValueSeconds(5), execution, listener(initialResponse::set));
 
     timeoutTask.get().run();
 
-    assertEquals(id, submit.get().id());
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, submit.get().status());
-    assertNull(submit.get().response());
+    String id = initialResponse.get().id();
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, initialResponse.get().status());
+    assertNull(initialResponse.get().response());
     assertEquals(1, service.runningQueryCount());
     assertEquals(1, service.retainedJobCount());
 
     now.addAndGet(25);
-    TrackingExecution execution = new TrackingExecution(response(2));
-    service.attachExecution(submission, execution);
-    service.complete(submission);
+    execution.succeed(response(2));
     PPLAsyncQueryService.JobSnapshot completed = service.get(id, OWNER, null);
 
     assertEquals(id, completed.id());
@@ -123,27 +120,25 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void submitWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> submit = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        service.createSubmission(
-            OWNER,
-            TimeValue.timeValueSeconds(1),
-            TimeValue.timeValueSeconds(5),
-            jobTask(null),
-            listener(submit::set));
-    String id = submission.id();
+  public void initialResponseWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> initialResponse = new AtomicReference<>();
+    startQuery(
+        service,
+        null,
+        TimeValue.timeValueSeconds(1),
+        TimeValue.timeValueSeconds(5),
+        new TrackingExecution(null),
+        listener(initialResponse::set));
 
     now.addAndGet(TimeValue.timeValueSeconds(2).millis());
     service.reapExpired();
 
-    assertNull(submit.get());
+    assertNull(initialResponse.get());
     assertEquals(1, service.runningQueryCount());
     assertEquals(1, service.retainedJobCount());
 
     timeoutTask.get().run();
-    assertEquals(id, submit.get().id());
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, submit.get().status());
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, initialResponse.get().status());
 
     now.addAndGet(TimeValue.timeValueSeconds(1).millis() + 1);
     service.reapExpired();
@@ -154,12 +149,10 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void fastFailureReturnsDirectFailureWithoutId() {
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(null, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(submission, execution);
+    startQuery(service, null, TimeValue.timeValueSeconds(5), execution, listener(result::set));
 
-    service.fail(submission, new IllegalStateException("boom"));
+    execution.fail(new IllegalStateException("boom"));
 
     assertNull(result.get().id());
     assertEquals(PPLAsyncQueryService.Status.FAILED, result.get().status());
@@ -175,10 +168,8 @@ public class PPLAsyncQueryServiceTest {
   public void getRenewsLeaseAndExpiryCancelsRunningTask() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
-    PPLAsyncQueryService.Submission submission = createSubmission(task);
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(submission, execution);
+    String id = startRetainedQuery(service, task, execution);
 
     now.addAndGet(TimeValue.timeValueMinutes(4).millis());
     PPLAsyncQueryService.JobSnapshot renewed = service.get(id, OWNER, null);
@@ -199,10 +190,8 @@ public class PPLAsyncQueryServiceTest {
   public void deleteCancelsRunningJobAndReleasesState() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
-    PPLAsyncQueryService.Submission submission = createSubmission(task);
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(submission, execution);
+    String id = startRetainedQuery(service, task, execution);
 
     PPLAsyncQueryService.DeleteResult result = service.delete(id, OWNER);
 
@@ -218,11 +207,9 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void deleteReturnsExistingTerminalStatus() {
     CancellableTask task = mock(CancellableTask.class);
-    PPLAsyncQueryService.Submission submission = createSubmission(task);
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(submission, execution);
-    service.complete(submission);
+    String id = startRetainedQuery(service, task, execution);
+    execution.complete();
 
     PPLAsyncQueryService.DeleteResult result = service.delete(id, OWNER);
 
@@ -238,9 +225,9 @@ public class PPLAsyncQueryServiceTest {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     service.attachTaskManager(taskManager);
-    PPLAsyncQueryService.Submission submission = createSubmission(task);
+    String id = startRetainedQuery(service, task, new TrackingExecution(null));
 
-    service.delete(submission.id(), OWNER);
+    service.delete(id, OWNER);
 
     verify(taskManager)
         .cancelTaskAndDescendants(
@@ -251,31 +238,29 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void submitRegistersTaskAndCompletionReleasesIt() {
+  public void startRegistersTaskAndCompletionReleasesIt() {
     TaskManager taskManager = mock(TaskManager.class);
     PPLQueryTask task = mock(PPLQueryTask.class);
     TransportPPLQueryRequest request =
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
-    SubmitTaskRegistration registration = registerSubmitTask(taskManager, request, task);
+    RequestTaskRegistration registration = registerRequestTask(taskManager, request, task);
     service.attachTaskManager(taskManager);
 
-    PPLAsyncQueryService.Submission submission =
-        service.submit(
-            OWNER,
-            "5m",
-            "0s",
-            request,
-            registration.submitTask(),
-            listener(
-                snapshot -> assertEquals(PPLAsyncQueryService.Status.RUNNING, snapshot.status())));
     TrackingExecution execution = new TrackingExecution(null);
-    submission.start(ignored -> execution);
+    service.start(
+        OWNER,
+        "5m",
+        "0s",
+        request,
+        registration.requestTask(),
+        ignored -> execution,
+        listener(snapshot -> assertEquals(PPLAsyncQueryService.Status.RUNNING, snapshot.status())));
     execution.succeed(response(1));
 
     InOrder registrationOrder = inOrder(taskManager);
     registrationOrder
         .verify(taskManager)
-        .registerChildNode(registration.submitTask().getId(), registration.localNode());
+        .registerChildNode(registration.requestTask().getId(), registration.localNode());
     registrationOrder.verify(taskManager).register("transport", PPLQueryAction.NAME, request);
     assertEquals(TaskId.EMPTY_TASK_ID, request.getParentTask());
     verify(taskManager).unregister(task);
@@ -285,22 +270,25 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void submissionStartFailureCompletesJobAndReleasesTask() {
+  public void executionStartFailureCompletesJobAndReleasesTask() {
     TaskManager taskManager = mock(TaskManager.class);
     PPLQueryTask task = mock(PPLQueryTask.class);
     TransportPPLQueryRequest request =
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
-    SubmitTaskRegistration registration = registerSubmitTask(taskManager, request, task);
+    RequestTaskRegistration registration = registerRequestTask(taskManager, request, task);
     service.attachTaskManager(taskManager);
     AtomicReference<PPLAsyncQueryService.JobSnapshot> response = new AtomicReference<>();
 
-    PPLAsyncQueryService.Submission submission =
-        service.submit(
-            OWNER, "5m", "5s", request, registration.submitTask(), listener(response::set));
-    submission.start(
+    service.start(
+        OWNER,
+        "5m",
+        "5s",
+        request,
+        registration.requestTask(),
         ignored -> {
           throw new IllegalStateException("execution did not start");
-        });
+        },
+        listener(response::set));
 
     assertEquals(PPLAsyncQueryService.Status.FAILED, response.get().status());
     assertNull(response.get().id());
@@ -317,7 +305,7 @@ public class PPLAsyncQueryServiceTest {
     when(task.isCancelled()).thenReturn(false);
     TransportPPLQueryRequest request =
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
-    SubmitTaskRegistration registration = registerSubmitTask(taskManager, request, task);
+    RequestTaskRegistration registration = registerRequestTask(taskManager, request, task);
     doAnswer(
             invocation -> {
               ActionListener<Void> listener = invocation.getArgument(3);
@@ -333,15 +321,14 @@ public class PPLAsyncQueryServiceTest {
     service.attachTaskManager(taskManager);
     AtomicReference<String> id = new AtomicReference<>();
 
-    PPLAsyncQueryService.Submission submission =
-        service.submit(
-            OWNER,
-            "5m",
-            "0s",
-            request,
-            registration.submitTask(),
-            listener(snapshot -> id.set(snapshot.id())));
-    submission.start(ignored -> new TrackingExecution(null));
+    service.start(
+        OWNER,
+        "5m",
+        "0s",
+        request,
+        registration.requestTask(),
+        ignored -> new TrackingExecution(null),
+        listener(snapshot -> id.set(snapshot.id())));
 
     service.delete(id.get(), OWNER);
 
@@ -356,7 +343,7 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void submitFailureAfterJobCreationReleasesServiceOwnedTask() {
+  public void startupFailureAfterJobCreationReleasesServiceOwnedTask() {
     PPLAsyncQueryService abortingService =
         new PPLAsyncQueryService(
             "node-a",
@@ -373,19 +360,20 @@ public class PPLAsyncQueryServiceTest {
     when(task.isCancelled()).thenReturn(true);
     TransportPPLQueryRequest request =
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
-    SubmitTaskRegistration registration = registerSubmitTask(taskManager, request, task);
+    RequestTaskRegistration registration = registerRequestTask(taskManager, request, task);
     abortingService.attachTaskManager(taskManager);
 
     IllegalStateException failure =
         assertThrows(
             IllegalStateException.class,
             () ->
-                abortingService.submit(
+                abortingService.start(
                     OWNER,
                     "5m",
                     "5s",
                     request,
-                    registration.submitTask(),
+                    registration.requestTask(),
+                    ignored -> new TrackingExecution(null),
                     listener(snapshot -> {})));
 
     assertEquals("scheduler unavailable", failure.getMessage());
@@ -398,11 +386,11 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void childTrackingFailurePreventsRetainedTaskRegistration() {
     TaskManager taskManager = mock(TaskManager.class);
-    PPLQueryTask submitTask = mock(PPLQueryTask.class);
+    PPLQueryTask requestTask = mock(PPLQueryTask.class);
     DiscoveryNode localNode = mock(DiscoveryNode.class);
     TransportPPLQueryRequest request =
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
-    when(submitTask.getId()).thenReturn(42L);
+    when(requestTask.getId()).thenReturn(42L);
     when(taskManager.localNode()).thenReturn(localNode);
     when(taskManager.registerChildNode(42L, localNode))
         .thenThrow(new IllegalStateException("channel closed"));
@@ -410,7 +398,15 @@ public class PPLAsyncQueryServiceTest {
 
     assertThrows(
         IllegalStateException.class,
-        () -> service.submit(OWNER, "5m", "5s", request, submitTask, listener(snapshot -> {})));
+        () ->
+            service.start(
+                OWNER,
+                "5m",
+                "5s",
+                request,
+                requestTask,
+                ignored -> new TrackingExecution(null),
+                listener(snapshot -> {})));
 
     verify(taskManager, never()).register("transport", PPLQueryAction.NAME, request);
     assertEquals(0, service.runningQueryCount());
@@ -422,39 +418,42 @@ public class PPLAsyncQueryServiceTest {
     PPLAsyncQueryUser securedOwner =
         new PPLAsyncQueryUser(true, "alice", "tenant", List.of("role-a"));
     PPLAsyncQueryUser otherUser = new PPLAsyncQueryUser(true, "bob", "tenant", List.of("role-a"));
-    PPLAsyncQueryService.Submission submission =
-        service.createSubmission(
-            securedOwner,
-            PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
-            TimeValue.ZERO,
-            jobTask(null),
-            listener(snapshot -> {}));
-    String id = submission.id();
+    AtomicReference<String> id = new AtomicReference<>();
+    service.start(
+        securedOwner,
+        PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
+        TimeValue.ZERO,
+        jobTask(null),
+        ignored -> new TrackingExecution(null),
+        listener(snapshot -> id.set(snapshot.id())));
 
-    assertThrows(OpenSearchSecurityException.class, () -> service.get(id, otherUser, null));
-    assertThrows(OpenSearchSecurityException.class, () -> service.delete(id, otherUser));
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, service.get(id, securedOwner, null).status());
+    assertThrows(OpenSearchSecurityException.class, () -> service.get(id.get(), otherUser, null));
+    assertThrows(OpenSearchSecurityException.class, () -> service.delete(id.get(), otherUser));
+    assertEquals(
+        PPLAsyncQueryService.Status.RUNNING, service.get(id.get(), securedOwner, null).status());
   }
 
   @Test
   public void enforcesRunningAndRetainedCapacity() {
     PPLAsyncQueryService limited = service(1, 1);
-    limited.createSubmission(
+    limited.start(
         OWNER,
         PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
         TimeValue.ZERO,
         jobTask(null),
+        ignored -> new TrackingExecution(null),
         listener(snapshot -> {}));
 
     OpenSearchStatusException exception =
         assertThrows(
             OpenSearchStatusException.class,
             () ->
-                limited.createSubmission(
+                limited.start(
                     OWNER,
                     PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
                     TimeValue.ZERO,
                     jobTask(null),
+                    ignored -> new TrackingExecution(null),
                     listener(snapshot -> {})));
 
     assertEquals(429, exception.status().getStatus());
@@ -475,11 +474,12 @@ public class PPLAsyncQueryServiceTest {
     assertThrows(
         NullPointerException.class,
         () ->
-            missingOwnerNode.createSubmission(
+            missingOwnerNode.start(
                 OWNER,
                 PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
                 TimeValue.ZERO,
                 jobTask(null),
+                ignored -> new TrackingExecution(null),
                 listener(snapshot -> {})));
 
     assertEquals(0, missingOwnerNode.runningQueryCount());
@@ -489,16 +489,15 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void finalSnapshotDefensivelyCopiesRows() {
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(null, TimeValue.timeValueSeconds(5), listener(result::set));
     List<org.opensearch.sql.data.model.ExprValue> rows = new ArrayList<>();
     rows.add(ExprValueUtils.stringValue("first"));
     QueryResponse response =
         new QueryResponse(
             new Schema(List.of(new Column("state", null, ExprCoreType.STRING))), rows, null);
 
-    service.attachExecution(submission, new TrackingExecution(response));
-    service.complete(submission);
+    TrackingExecution execution = new TrackingExecution(response);
+    startQuery(service, null, TimeValue.timeValueSeconds(5), execution, listener(result::set));
+    execution.complete();
     rows.add(ExprValueUtils.stringValue("second"));
 
     assertEquals(1, result.get().response().getResults().size());
@@ -507,12 +506,10 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void completedExecutionCanBeAttachedBeforeCompletionIsObserved() {
     AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(null, TimeValue.timeValueSeconds(5), listener(result::set));
     TrackingExecution execution = new TrackingExecution(null);
 
     execution.succeed(response(2));
-    service.attachExecution(submission, execution);
+    startQuery(service, null, TimeValue.timeValueSeconds(5), execution, listener(result::set));
 
     assertEquals(PPLAsyncQueryService.Status.SUCCEEDED, result.get().status());
     assertEquals(2, result.get().response().getResults().size());
@@ -521,10 +518,8 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void runningGetMaterializesCurrentResultOutsideJob() {
-    PPLAsyncQueryService.Submission submission = createSubmission(null);
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(submission, execution);
+    String id = startRetainedQuery(service, null, execution);
 
     PPLAsyncQueryService.JobSnapshot first = service.get(id, OWNER, null);
     execution.setCurrent(response(3));
@@ -537,12 +532,10 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void failedRetainedJobReturnsNoProvisionalRowsAndClosesExecution() {
-    PPLAsyncQueryService.Submission submission = createSubmission(null);
-    String id = submission.id();
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(submission, execution);
+    String id = startRetainedQuery(service, null, execution);
 
-    service.fail(submission, new IllegalStateException("boom"));
+    execution.fail(new IllegalStateException("boom"));
     PPLAsyncQueryService.JobSnapshot failed = service.get(id, OWNER, null);
 
     assertEquals(PPLAsyncQueryService.Status.FAILED, failed.status());
@@ -553,23 +546,28 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void deleteBeforeExecutionAttachmentClosesLateHandle() {
-    PPLAsyncQueryService.Submission submission = createSubmission(null);
-    String id = submission.id();
-    service.delete(id, OWNER);
     TrackingExecution execution = new TrackingExecution(response(1));
+    AtomicReference<String> id = new AtomicReference<>();
 
-    service.attachExecution(submission, execution);
+    service.start(
+        OWNER,
+        PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
+        TimeValue.ZERO,
+        jobTask(null),
+        ignored -> {
+          service.delete(id.get(), OWNER);
+          return execution;
+        },
+        listener(snapshot -> id.set(snapshot.id())));
 
     assertEquals(1, execution.closes.get());
-    assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
+    assertThrows(ResourceNotFoundException.class, () -> service.get(id.get(), OWNER, null));
   }
 
   @Test
   public void concurrentGetDoesNotBlockDeleteOnResultMaterialization() throws Exception {
-    PPLAsyncQueryService.Submission submission = createSubmission(null);
-    String id = submission.id();
     BlockingExecution execution = new BlockingExecution(response(1));
-    service.attachExecution(submission, execution);
+    String id = startRetainedQuery(service, null, execution);
 
     CompletableFuture<PPLAsyncQueryService.JobSnapshot> get =
         CompletableFuture.supplyAsync(() -> service.get(id, OWNER, null));
@@ -590,9 +588,8 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void shutdownClosesRetainedExecutionExactlyOnce() throws Exception {
-    PPLAsyncQueryService.Submission submission = createSubmission(null);
     TrackingExecution execution = new TrackingExecution(response(1));
-    service.attachExecution(submission, execution);
+    startRetainedQuery(service, null, execution);
 
     service.close();
     service.close();
@@ -605,13 +602,15 @@ public class PPLAsyncQueryServiceTest {
   @Test
   public void successfulCompletionRequiresFinalResultToBeVisible() {
     AtomicReference<Exception> failure = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(
-            null, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
     TrackingExecution execution = new TrackingExecution(null);
-    service.attachExecution(submission, execution);
+    startQuery(
+        service,
+        null,
+        TimeValue.timeValueSeconds(5),
+        execution,
+        ActionListener.wrap(snapshot -> {}, failure::set));
 
-    service.complete(submission);
+    execution.complete();
 
     assertTrue(failure.get() instanceof IllegalStateException);
     assertEquals(1, execution.closes.get());
@@ -619,25 +618,25 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void submitMaterializationFailureAbortsUndeliverableRetainedJob() {
+  public void initialResponseMaterializationFailureAbortsUndeliverableRetainedJob() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     AtomicReference<Exception> failure = new AtomicReference<>();
-    PPLAsyncQueryService.Submission submission =
-        createSubmission(
-            task, TimeValue.timeValueSeconds(5), ActionListener.wrap(snapshot -> {}, failure::set));
-    String id = submission.id();
     ThrowingExecution execution = new ThrowingExecution();
-    service.attachExecution(submission, execution);
+    startQuery(
+        service,
+        task,
+        TimeValue.timeValueSeconds(5),
+        execution,
+        ActionListener.wrap(snapshot -> {}, failure::set));
 
     timeoutTask.get().run();
 
     assertTrue(failure.get() instanceof IllegalStateException);
-    verify(task).cancel("PPL asynchronous query submission failed");
+    verify(task).cancel("PPL asynchronous query startup failed");
     assertEquals(1, execution.closes.get());
     assertEquals(0, service.runningQueryCount());
     assertEquals(0, service.retainedJobCount());
-    assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
   }
 
   @Test
@@ -661,8 +660,8 @@ public class PPLAsyncQueryServiceTest {
         now::get,
         (delay, task) -> {
           timeoutTask.set(task);
-          AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
-          return () -> cancelled.set(true);
+          timeoutCancelled.set(false);
+          return () -> timeoutCancelled.set(true);
         },
         () -> maxRunning,
         () -> maxRetained,
@@ -670,32 +669,54 @@ public class PPLAsyncQueryServiceTest {
         () -> TimeValue.timeValueHours(24));
   }
 
-  private PPLAsyncQueryService.Submission createSubmission(CancellableTask task) {
-    return createSubmission(task, TimeValue.ZERO, listener(snapshot -> {}));
+  private String startRetainedQuery(
+      PPLAsyncQueryService targetService, CancellableTask task, AsyncQueryExecution execution) {
+    AtomicReference<String> id = new AtomicReference<>();
+    startQuery(
+        targetService,
+        task,
+        TimeValue.ZERO,
+        execution,
+        listener(snapshot -> id.set(snapshot.id())));
+    return id.get();
   }
 
-  private PPLAsyncQueryService.Submission createSubmission(
+  private void startQuery(
+      PPLAsyncQueryService targetService,
       CancellableTask task,
       TimeValue waitForCompletion,
+      AsyncQueryExecution execution,
       ActionListener<PPLAsyncQueryService.JobSnapshot> responseListener) {
-    return service.createSubmission(
-        OWNER,
+    startQuery(
+        targetService,
+        task,
         PPLAsyncQueryService.DEFAULT_KEEP_ALIVE,
         waitForCompletion,
-        jobTask(task),
+        execution,
         responseListener);
+  }
+
+  private void startQuery(
+      PPLAsyncQueryService targetService,
+      CancellableTask task,
+      TimeValue keepAlive,
+      TimeValue waitForCompletion,
+      AsyncQueryExecution execution,
+      ActionListener<PPLAsyncQueryService.JobSnapshot> responseListener) {
+    targetService.start(
+        OWNER, keepAlive, waitForCompletion, jobTask(task), ignored -> execution, responseListener);
   }
 
   private static PPLAsyncQueryJob.JobTask jobTask(CancellableTask task) {
     return new PPLAsyncQueryJob.JobTask(task, () -> {});
   }
 
-  private static SubmitTaskRegistration registerSubmitTask(
+  private static RequestTaskRegistration registerRequestTask(
       TaskManager taskManager, TransportPPLQueryRequest request, PPLQueryTask retainedTask) {
-    PPLQueryTask submitTask = mock(PPLQueryTask.class);
+    PPLQueryTask requestTask = mock(PPLQueryTask.class);
     DiscoveryNode localNode = mock(DiscoveryNode.class);
     Releasable childNodeRegistration = mock(Releasable.class);
-    when(submitTask.getId()).thenReturn(42L);
+    when(requestTask.getId()).thenReturn(42L);
     when(localNode.getId()).thenReturn("node-a");
     when(taskManager.localNode()).thenReturn(localNode);
     when(taskManager.registerChildNode(42L, localNode)).thenReturn(childNodeRegistration);
@@ -705,11 +726,11 @@ public class PPLAsyncQueryServiceTest {
               assertEquals(new TaskId("node-a", 42L), request.getParentTask());
               return retainedTask;
             });
-    return new SubmitTaskRegistration(submitTask, localNode, childNodeRegistration);
+    return new RequestTaskRegistration(requestTask, localNode, childNodeRegistration);
   }
 
-  private record SubmitTaskRegistration(
-      PPLQueryTask submitTask, DiscoveryNode localNode, Releasable childNodeRegistration) {}
+  private record RequestTaskRegistration(
+      PPLQueryTask requestTask, DiscoveryNode localNode, Releasable childNodeRegistration) {}
 
   private static ActionListener<PPLAsyncQueryService.JobSnapshot> listener(
       java.util.function.Consumer<PPLAsyncQueryService.JobSnapshot> consumer) {
@@ -748,6 +769,14 @@ public class PPLAsyncQueryServiceTest {
     private void succeed(QueryResponse response) {
       current.set(response);
       completion.complete(null);
+    }
+
+    private void complete() {
+      completion.complete(null);
+    }
+
+    private void fail(Exception failure) {
+      completion.completeExceptionally(failure);
     }
 
     @Override

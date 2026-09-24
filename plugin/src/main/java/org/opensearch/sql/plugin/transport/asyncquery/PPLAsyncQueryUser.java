@@ -28,6 +28,7 @@ public record PPLAsyncQueryUser(String name, String requestedTenant, List<String
    * @param name authenticated principal, or {@code null} when no identity was supplied
    * @param requestedTenant requested security tenant
    * @param backendRoles backend roles captured when the job starts
+   * @throws IllegalArgumentException if {@code name} is blank
    */
   public PPLAsyncQueryUser {
     backendRoles = backendRoles == null ? List.of() : List.copyOf(backendRoles);
@@ -41,6 +42,7 @@ public record PPLAsyncQueryUser(String name, String requestedTenant, List<String
    *
    * @param threadContext current request thread context
    * @return immutable caller identity
+   * @throws OpenSearchSecurityException if the security identity cannot be parsed
    */
   public static PPLAsyncQueryUser current(ThreadContext threadContext) {
     try {
@@ -63,6 +65,12 @@ public record PPLAsyncQueryUser(String name, String requestedTenant, List<String
     }
   }
 
+  /**
+   * Verifies that a caller may access asynchronous query state owned by this identity.
+   *
+   * @param caller identity of the caller requesting access
+   * @throws OpenSearchSecurityException if the caller does not match the owner identity
+   */
   void authorize(PPLAsyncQueryUser caller) {
     if (!Objects.equals(name, caller.name)
         || !Objects.equals(requestedTenant, caller.requestedTenant)

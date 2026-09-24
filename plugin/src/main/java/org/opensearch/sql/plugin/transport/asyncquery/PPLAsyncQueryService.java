@@ -607,12 +607,6 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   }
 
   private PPLAsyncQueryJob findLocal(String encodedId) {
-    PPLAsyncQueryJobId jobId = PPLAsyncQueryJobId.parse(encodedId);
-    String localNodeId =
-        Objects.requireNonNull(ownerNodeIdSupplier.get(), "Local node ID is not initialized");
-    if (!localNodeId.equals(jobId.ownerNodeId())) {
-      throw new IllegalArgumentException("PPL asynchronous query is not owned by this node");
-    }
     PPLAsyncQueryJob job = jobs.get(encodedId);
     if (job == null) {
       throw notFound();

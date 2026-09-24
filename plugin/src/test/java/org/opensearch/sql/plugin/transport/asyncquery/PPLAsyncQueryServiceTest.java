@@ -211,6 +211,14 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
+  public void missingLocalJobReturnsNotFound() {
+    String remoteId = PPLAsyncQueryJobId.create("node-b").encode();
+
+    assertThrows(ResourceNotFoundException.class, () -> service.get(remoteId, OWNER, null));
+    assertThrows(ResourceNotFoundException.class, () -> service.delete(remoteId, OWNER));
+  }
+
+  @Test
   public void deleteCancelsRunningJobAndReleasesState() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);

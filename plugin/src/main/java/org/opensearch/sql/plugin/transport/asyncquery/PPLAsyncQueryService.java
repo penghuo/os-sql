@@ -38,7 +38,6 @@ import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Removal;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.ResponseContext;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Retention;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.RunningSlotAction;
-import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.State;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryJob.Transition;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.tasks.CancellableTask;
@@ -142,7 +141,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * Creates the owner-node lifecycle service.
    *
    * @param ownerNodeIdSupplier supplies the current local node ID
-   * @param threadPool schedules initial response deadlines and expiration reaping
+   * @param threadPool schedules retention deadlines and expiration reaping
    * @param settings supplies asynchronous query capacity and duration limits
    */
   public PPLAsyncQueryService(
@@ -205,12 +204,13 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   }
 
   /**
-   * Starts an asynchronous PPL query and produces its initial response.
+   * Starts an asynchronous PPL query and produces its POST response.
    *
-   * <p>The service registers and owns a job task, schedules the initial response deadline, starts
+   * <p>The service registers and owns a job task, schedules its retention deadline, starts
    * execution, and attaches the returned execution handle to the same job. If execution finishes
-   * before the deadline, {@code initialResponseListener} receives the final result without a job
-   * ID. Otherwise, it receives the current result with an opaque retained job ID.
+   * before the deadline, {@code responseListener} receives the final result without a job ID.
+   * Otherwise, the job becomes retained and the listener receives its current result with an opaque
+   * ID.
    *
    * @param owner authenticated owner retained with the job
    * @param requestedKeepAlive requested job lease
@@ -218,7 +218,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * @param request transport request used to register the job task
    * @param requestTask task associated with the POST request
    * @param executionStarter starts execution using the job-owned cancellable task
-   * @param initialResponseListener receives either the direct result or retained job ID
+   * @param responseListener receives either the direct result or retained job ID
    */
   public void start(
       PPLAsyncQueryUser owner,
@@ -227,7 +227,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       TransportPPLQueryRequest request,
       PPLQueryTask requestTask,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
-      ActionListener<JobSnapshot> initialResponseListener) {
+      ActionListener<JobSnapshot> responseListener) {
     TimeValue keepAlive =
         TimeValue.parseTimeValue(requestedKeepAlive, PPLQueryRequest.KEEP_ALIVE_FIELD);
     TimeValue waitForCompletion =
@@ -236,14 +236,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     validateKeepAlive(keepAlive);
     validateWaitForCompletion(waitForCompletion);
     JobTask jobTask = registerJobTask(request, requestTask);
-    start(owner, keepAlive, waitForCompletion, jobTask, executionStarter, initialResponseListener);
+    start(owner, keepAlive, waitForCompletion, jobTask, executionStarter, responseListener);
   }
 
   /**
    * Starts a job using an already registered task.
    *
    * <p>This package-private entry point keeps task registration separate for tests while preserving
-   * the same production lifecycle: create the job, establish its initial response deadline, start
+   * the same production lifecycle: create the job, establish its retention deadline, start
    * execution, and transfer ownership of the execution handle to the job.
    *
    * @param owner authenticated owner retained with the job
@@ -251,7 +251,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * @param waitForCompletion validated direct-result wait
    * @param task job-owned task and registration cleanup
    * @param executionStarter starts execution using the job task
-   * @param initialResponseListener receives the one initial response
+   * @param responseListener receives the POST response
    */
   void start(
       PPLAsyncQueryUser owner,
@@ -259,30 +259,29 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       TimeValue waitForCompletion,
       JobTask task,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
-      ActionListener<JobSnapshot> initialResponseListener) {
+      ActionListener<JobSnapshot> responseListener) {
     PPLAsyncQueryJob job;
     try {
       Objects.requireNonNull(task);
       Objects.requireNonNull(executionStarter);
-      Objects.requireNonNull(initialResponseListener);
-      job = createJob(owner, keepAlive, waitForCompletion, task);
+      Objects.requireNonNull(responseListener);
+      job = createJob(owner, keepAlive, task);
     } catch (RuntimeException | Error e) {
       closeTask(task);
       throw e;
     }
 
-    TimeoutHandle timeoutHandle;
+    TimeoutHandle retentionDeadline;
     try {
-      timeoutHandle = prepareInitialResponse(job, waitForCompletion, initialResponseListener);
+      retentionDeadline = scheduleRetention(job, waitForCompletion, responseListener);
     } catch (RuntimeException | Error e) {
       applyRemoval(job, job.abort());
       throw e;
     }
-    startExecution(job, task.task(), executionStarter, initialResponseListener, timeoutHandle);
+    startExecution(job, task.task(), executionStarter, responseListener, retentionDeadline);
   }
 
-  private PPLAsyncQueryJob createJob(
-      PPLAsyncQueryUser owner, TimeValue keepAlive, TimeValue waitForCompletion, JobTask task) {
+  private PPLAsyncQueryJob createJob(PPLAsyncQueryUser owner, TimeValue keepAlive, JobTask task) {
     Objects.requireNonNull(owner);
     reserveCapacity();
     try {
@@ -293,15 +292,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         PPLAsyncQueryJobId jobId = PPLAsyncQueryJobId.create(ownerNodeId);
         String encodedId = jobId.encode();
         PPLAsyncQueryJob job =
-            new PPLAsyncQueryJob(
-                encodedId,
-                owner,
-                now,
-                keepAlive.millis(),
-                task,
-                waitForCompletion.millis() == 0
-                    ? State.RETAINED_RUNNING
-                    : State.AWAITING_INITIAL_RESPONSE);
+            new PPLAsyncQueryJob(encodedId, owner, now, keepAlive.millis(), task);
         if (jobs.putIfAbsent(encodedId, job) == null) {
           return job;
         }
@@ -312,44 +303,42 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
-  private TimeoutHandle prepareInitialResponse(
+  private TimeoutHandle scheduleRetention(
       PPLAsyncQueryJob job,
       TimeValue waitForCompletion,
-      ActionListener<JobSnapshot> initialResponseListener) {
+      ActionListener<JobSnapshot> responseListener) {
     if (waitForCompletion.millis() == 0) {
-      applyTransition(job, job.initialResponse(), initialResponseListener);
+      applyTransition(job, job.retain(currentTimeMillis.getAsLong()), responseListener);
       return NO_TIMEOUT;
     }
 
     return timeoutScheduler.schedule(
         waitForCompletion,
-        () ->
-            applyTransition(
-                job, job.timeout(currentTimeMillis.getAsLong()), initialResponseListener));
+        () -> applyTransition(job, job.retain(currentTimeMillis.getAsLong()), responseListener));
   }
 
   private void startExecution(
       PPLAsyncQueryJob job,
       CancellableTask task,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
-      ActionListener<JobSnapshot> initialResponseListener,
-      TimeoutHandle timeoutHandle) {
+      ActionListener<JobSnapshot> responseListener,
+      TimeoutHandle retentionDeadline) {
     try {
       AsyncQueryExecution execution = Objects.requireNonNull(executionStarter.apply(task));
-      attachExecution(job, execution, initialResponseListener, timeoutHandle);
+      attachExecution(job, execution, responseListener, retentionDeadline);
     } catch (RuntimeException e) {
-      timeoutHandle.cancel();
-      fail(job, e, initialResponseListener);
+      retentionDeadline.cancel();
+      fail(job, e, responseListener);
     }
   }
 
   private void attachExecution(
       PPLAsyncQueryJob job,
       AsyncQueryExecution execution,
-      ActionListener<JobSnapshot> initialResponseListener,
-      TimeoutHandle timeoutHandle) {
+      ActionListener<JobSnapshot> responseListener,
+      TimeoutHandle retentionDeadline) {
     if (!job.tryAttachExecution(execution)) {
-      timeoutHandle.cancel();
+      retentionDeadline.cancel();
       closeExecution(execution);
       return;
     }
@@ -357,27 +346,25 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         .completion()
         .whenComplete(
             (ignored, failure) -> {
-              timeoutHandle.cancel();
+              retentionDeadline.cancel();
               if (failure == null) {
-                complete(job, initialResponseListener);
+                complete(job, responseListener);
               } else {
-                fail(job, asException(failure), initialResponseListener);
+                fail(job, asException(failure), responseListener);
               }
             });
   }
 
-  private void complete(PPLAsyncQueryJob job, ActionListener<JobSnapshot> initialResponseListener) {
-    applyTransition(job, job.complete(currentTimeMillis.getAsLong()), initialResponseListener);
+  private void complete(PPLAsyncQueryJob job, ActionListener<JobSnapshot> responseListener) {
+    applyTransition(job, job.complete(currentTimeMillis.getAsLong()), responseListener);
   }
 
   private void fail(
-      PPLAsyncQueryJob job,
-      Exception failure,
-      ActionListener<JobSnapshot> initialResponseListener) {
+      PPLAsyncQueryJob job, Exception failure, ActionListener<JobSnapshot> responseListener) {
     applyTransition(
         job,
         job.fail(Failure.from(Objects.requireNonNull(failure)), currentTimeMillis.getAsLong()),
-        initialResponseListener);
+        responseListener);
   }
 
   JobSnapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
@@ -480,9 +467,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * here after the lock has been released.
    */
   private void applyTransition(
-      PPLAsyncQueryJob job,
-      Transition transition,
-      ActionListener<JobSnapshot> initialResponseListener) {
+      PPLAsyncQueryJob job, Transition transition, ActionListener<JobSnapshot> responseListener) {
     if (transition == null) {
       return;
     }
@@ -496,8 +481,8 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     JobSnapshot snapshot = null;
     RuntimeException materializationFailure = null;
     try {
-      if (transition.initialResponse() != null) {
-        snapshot = materialize(transition.initialResponse());
+      if (transition.response() != null) {
+        snapshot = materialize(transition.response());
       }
     } catch (RuntimeException e) {
       materializationFailure = e;
@@ -506,14 +491,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       closeTask(transition.taskToClose());
     }
 
-    if (transition.initialResponse() != null) {
+    if (transition.response() != null) {
       if (materializationFailure == null) {
-        initialResponseListener.onResponse(snapshot);
+        responseListener.onResponse(snapshot);
       } else {
         if (transition.retention() == Retention.RETAIN) {
           applyRemoval(job, job.abort());
         }
-        initialResponseListener.onFailure(materializationFailure);
+        responseListener.onFailure(materializationFailure);
       }
     }
   }

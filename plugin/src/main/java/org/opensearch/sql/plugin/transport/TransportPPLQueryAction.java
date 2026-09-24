@@ -448,7 +448,7 @@ public class TransportPPLQueryAction
       TransportPPLQueryRequest transportRequest,
       PPLQueryRequest request,
       PPLService pplService,
-      ActionListener<TransportPPLQueryResponse> initialResponseListener,
+      ActionListener<TransportPPLQueryResponse> responseListener,
       Consumer<String> anonymizedQuerySink) {
     PPLAsyncQueryUser owner = PPLAsyncQueryUser.current(clientRef.threadPool().getThreadContext());
     asyncQueryService.start(
@@ -468,8 +468,8 @@ public class TransportPPLQueryAction
           }
         },
         ActionListener.wrap(
-            snapshot -> initialResponseListener.onResponse(asyncResponseFormatter.format(snapshot)),
-            initialResponseListener::onFailure));
+            snapshot -> responseListener.onResponse(asyncResponseFormatter.format(snapshot)),
+            responseListener::onFailure));
   }
 
   private Format format(PPLQueryRequest pplRequest) {

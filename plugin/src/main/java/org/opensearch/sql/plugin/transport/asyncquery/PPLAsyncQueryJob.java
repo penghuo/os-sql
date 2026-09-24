@@ -23,18 +23,16 @@ import org.opensearch.tasks.CancellableTask;
  * lock.
  *
  * <pre>
- * Initial condition                         Initial state
- * wait_for_completion_timeout &gt; 0          AWAITING_INITIAL_RESPONSE
- * wait_for_completion_timeout = 0          RETAINED_RUNNING (POST returns the job ID)
+ * Every job starts in RUNNING. It becomes retained when wait_for_completion_timeout expires.
  *
- * Current state               Event              Next state             Initial response
- * AWAITING_INITIAL_RESPONSE   success            REMOVED                final result without ID
- * AWAITING_INITIAL_RESPONSE   failure            REMOVED                failure without ID
- * AWAITING_INITIAL_RESPONSE   timeout            RETAINED_RUNNING       running status with ID
- * RETAINED_RUNNING            success            RETAINED_SUCCEEDED     none
- * RETAINED_RUNNING            failure            RETAINED_FAILED        none
- * AWAITING_INITIAL_RESPONSE   delete/abort/close REMOVED                none
- * RETAINED_*                  delete/expire/abort/close REMOVED         none
+ * Current state       Event              Next state             Response
+ * RUNNING             success            REMOVED                final result without ID
+ * RUNNING             failure            REMOVED                failure without ID
+ * RUNNING             retain             RETAINED_RUNNING       running status with ID
+ * RETAINED_RUNNING    success            RETAINED_SUCCEEDED     none
+ * RETAINED_RUNNING    failure            RETAINED_FAILED        none
+ * RUNNING             abort/close        REMOVED                none
+ * RETAINED_*          delete/expire/abort/close REMOVED         none
  * </pre>
  *
  * <p>GET lease renewal and execution attachment do not change the lifecycle state. Events received
@@ -59,39 +57,27 @@ final class PPLAsyncQueryJob {
       PPLAsyncQueryUser owner,
       long startTimeMillis,
       long keepAliveMillis,
-      JobTask task,
-      State initialState) {
+      JobTask task) {
     this.id = id;
     this.owner = owner;
     this.startTimeMillis = startTimeMillis;
     this.keepAliveMillis = keepAliveMillis;
     this.expirationTimeMillis = addWithoutOverflow(startTimeMillis, keepAliveMillis);
     this.task = task;
-    if (initialState != State.AWAITING_INITIAL_RESPONSE && initialState != State.RETAINED_RUNNING) {
-      throw new IllegalArgumentException("Invalid initial PPL asynchronous query state");
-    }
-    this.state = initialState;
+    this.state = State.RUNNING;
   }
 
   String id() {
     return id;
   }
 
-  synchronized Transition initialResponse() {
-    ensurePresent();
-    if (state != State.RETAINED_RUNNING) {
-      throw new IllegalStateException("PPL asynchronous query is awaiting its initial response");
-    }
-    return Transition.returnJob(retainedResponse());
-  }
-
-  synchronized Transition timeout(long now) {
-    if (state != State.AWAITING_INITIAL_RESPONSE) {
+  synchronized Transition retain(long now) {
+    if (state != State.RUNNING) {
       return null;
     }
     state = State.RETAINED_RUNNING;
     expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
-    return Transition.returnJob(retainedResponse());
+    return Transition.retain(retainedResponse());
   }
 
   synchronized boolean tryAttachExecution(AsyncQueryExecution execution) {
@@ -123,11 +109,11 @@ final class PPLAsyncQueryJob {
   }
 
   private Transition finish(State terminalState, long now) {
-    boolean awaitingInitialResponse = state == State.AWAITING_INITIAL_RESPONSE;
+    boolean retained = state == State.RETAINED_RUNNING;
     JobTask taskToClose = detachTask();
     state = terminalState;
     completionTimeMillis = now;
-    if (awaitingInitialResponse) {
+    if (!retained) {
       ResponseContext response = directResponse();
       AsyncQueryExecution executionToClose = detachExecution();
       state = State.REMOVED;
@@ -174,9 +160,7 @@ final class PPLAsyncQueryJob {
   }
 
   synchronized Removal expire(long now) {
-    if (state == State.REMOVED
-        || state == State.AWAITING_INITIAL_RESPONSE
-        || now < expirationTimeMillis) {
+    if (state == State.REMOVED || state == State.RUNNING || now < expirationTimeMillis) {
       return null;
     }
     return expireLocked("PPL asynchronous query expired");
@@ -236,12 +220,12 @@ final class PPLAsyncQueryJob {
   }
 
   private boolean isExecuting() {
-    return state == State.AWAITING_INITIAL_RESPONSE || state == State.RETAINED_RUNNING;
+    return state == State.RUNNING || state == State.RETAINED_RUNNING;
   }
 
   private PPLAsyncQueryService.Status responseStatus() {
     return switch (state) {
-      case AWAITING_INITIAL_RESPONSE, RETAINED_RUNNING -> PPLAsyncQueryService.Status.RUNNING;
+      case RUNNING, RETAINED_RUNNING -> PPLAsyncQueryService.Status.RUNNING;
       case RETAINED_SUCCEEDED -> PPLAsyncQueryService.Status.SUCCEEDED;
       case RETAINED_FAILED -> PPLAsyncQueryService.Status.FAILED;
       case REMOVED -> throw new IllegalStateException("PPL asynchronous query was removed");
@@ -287,9 +271,9 @@ final class PPLAsyncQueryJob {
     }
   }
 
-  /** Internal lifecycle; unlike the response status, this includes initial waiting and removal. */
+  /** Internal lifecycle; unlike the response status, this includes retention and removal. */
   enum State {
-    AWAITING_INITIAL_RESPONSE,
+    RUNNING,
     RETAINED_RUNNING,
     RETAINED_SUCCEEDED,
     RETAINED_FAILED,
@@ -307,13 +291,13 @@ final class PPLAsyncQueryJob {
   }
 
   record Transition(
-      ResponseContext initialResponse,
+      ResponseContext response,
       Retention retention,
       RunningSlotAction runningSlotAction,
       AsyncQueryExecution executionToClose,
       JobTask taskToClose) {
 
-    private static Transition returnJob(ResponseContext response) {
+    private static Transition retain(ResponseContext response) {
       return new Transition(response, Retention.RETAIN, RunningSlotAction.KEEP, null, null);
     }
 

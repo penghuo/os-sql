@@ -94,16 +94,16 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void timeoutReturnsIdAndLaterGetReturnsCompleteResult() {
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> initialResponse = new AtomicReference<>();
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> retainedResponse = new AtomicReference<>();
     TrackingExecution execution = new TrackingExecution(null);
     startQuery(
-        service, null, TimeValue.timeValueSeconds(5), execution, listener(initialResponse::set));
+        service, null, TimeValue.timeValueSeconds(5), execution, listener(retainedResponse::set));
 
     timeoutTask.get().run();
 
-    String id = initialResponse.get().id();
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, initialResponse.get().status());
-    assertNull(initialResponse.get().response());
+    String id = retainedResponse.get().id();
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, retainedResponse.get().status());
+    assertNull(retainedResponse.get().response());
     assertEquals(1, service.runningQueryCount());
     assertEquals(1, service.retainedJobCount());
 
@@ -120,25 +120,25 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void initialResponseWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> initialResponse = new AtomicReference<>();
+  public void retentionWaitPreventsExpiryAndLeaseStartsWhenIdIsReturned() {
+    AtomicReference<PPLAsyncQueryService.JobSnapshot> retainedResponse = new AtomicReference<>();
     startQuery(
         service,
         null,
         TimeValue.timeValueSeconds(1),
         TimeValue.timeValueSeconds(5),
         new TrackingExecution(null),
-        listener(initialResponse::set));
+        listener(retainedResponse::set));
 
     now.addAndGet(TimeValue.timeValueSeconds(2).millis());
     service.reapExpired();
 
-    assertNull(initialResponse.get());
+    assertNull(retainedResponse.get());
     assertEquals(1, service.runningQueryCount());
     assertEquals(1, service.retainedJobCount());
 
     timeoutTask.get().run();
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, initialResponse.get().status());
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, retainedResponse.get().status());
 
     now.addAndGet(TimeValue.timeValueSeconds(1).millis() + 1);
     service.reapExpired();
@@ -618,7 +618,7 @@ public class PPLAsyncQueryServiceTest {
   }
 
   @Test
-  public void initialResponseMaterializationFailureAbortsUndeliverableRetainedJob() {
+  public void retentionResponseMaterializationFailureAbortsUndeliverableJob() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     AtomicReference<Exception> failure = new AtomicReference<>();

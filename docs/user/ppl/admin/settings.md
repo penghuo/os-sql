@@ -11,11 +11,12 @@ When OpenSearch bootstraps, PPL plugin will register a few settings in OpenSearc
 
 ### Description  
 
-You can disable SQL plugin to reject all coming requests.
+You can disable PPL to reject all incoming PPL requests, including asynchronous submit, poll, and
+delete requests.
 1. The default value is true.  
 2. This setting is node scope.  
 3. This setting can be updated dynamically.  
-  
+
 Notes. Calls to _plugins/_ppl include index names in the request body, so they have the same access policy considerations as the bulk, mget, and msearch operations. if rest.action.multi.allow_explicit_index set to false, PPL plugin will be disabled.
 ### Example 1  
 
@@ -109,7 +110,7 @@ Expected output:
   }
 }
 ```
-  
+
 ## plugins.query.memory_limit
 
 ### Version
@@ -179,7 +180,6 @@ Expected output:
   "transient": {}
 }
 ```
-  
 Note: the legacy settings of `opendistro.query.size_limit` is deprecated, it will fallback to the new settings if you request an update with the legacy name.
 ## plugins.query.buckets
 
@@ -472,4 +472,3 @@ Expected output:
   "transient": {}
 }
 ```
-  

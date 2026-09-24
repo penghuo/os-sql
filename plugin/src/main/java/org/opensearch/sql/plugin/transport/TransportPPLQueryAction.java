@@ -28,6 +28,7 @@ import org.opensearch.common.inject.Guice;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.ModulesBuilder;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -35,6 +36,7 @@ import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.datasource.DataSourceService;
 import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
+import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
@@ -49,6 +51,9 @@ import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.plugin.rest.AnalyticsEngineFormatSupport;
 import org.opensearch.sql.plugin.rest.AnalyticsExecutorHolder;
 import org.opensearch.sql.plugin.rest.RestUnifiedQueryAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryResponseFormatter;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryService;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryUser;
 import org.opensearch.sql.ppl.PPLService;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 import org.opensearch.sql.protocol.response.QueryResult;
@@ -88,7 +93,22 @@ public class TransportPPLQueryAction
   private final NodeClient clientRef;
   private final ClusterService clusterServiceRef;
   private final org.opensearch.sql.common.setting.Settings pluginSettingsRef;
+  private final PPLAsyncQueryService asyncQueryService;
+  private final PPLAsyncQueryResponseFormatter asyncResponseFormatter;
 
+  /**
+   * Creates the PPL transport action.
+   *
+   * @param transportService node transport service
+   * @param actionFilters configured transport action filters
+   * @param client node client used by PPL execution
+   * @param clusterService current cluster state service
+   * @param dataSourceService data source registry
+   * @param clusterSettings OpenSearch cluster settings
+   * @param extensionsHolder registered execution engine extensions
+   * @param tracer query tracer
+   * @param asyncQueryService asynchronous PPL lifecycle service
+   */
   @Inject
   public TransportPPLQueryAction(
       TransportService transportService,
@@ -98,10 +118,14 @@ public class TransportPPLQueryAction
       DataSourceServiceImpl dataSourceService,
       org.opensearch.common.settings.Settings clusterSettings,
       EngineExtensionsHolder extensionsHolder,
-      Tracer tracer) {
+      Tracer tracer,
+      PPLAsyncQueryService asyncQueryService) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
     this.clientRef = client;
     this.clusterServiceRef = clusterService;
+    this.asyncQueryService = asyncQueryService;
+    this.asyncResponseFormatter = new PPLAsyncQueryResponseFormatter();
+    this.asyncQueryService.attachTaskManager(transportService.getTaskManager());
 
     ModulesBuilder modules = new ModulesBuilder();
     modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
@@ -126,7 +150,11 @@ public class TransportPPLQueryAction
                         .getSettingValue(Settings.Key.PPL_ENABLED);
   }
 
-  /** Invoked by Guice iff analytics-engine bound {@code QueryPlanExecutor}. */
+  /**
+   * Installs the optional analytics query plan executor.
+   *
+   * @param queryPlanExecutor analytics query plan executor
+   */
   @Inject(optional = true)
   public void setQueryPlanExecutor(
       QueryPlanExecutor<RelNode, Iterable<Object[]>> queryPlanExecutor) {
@@ -136,7 +164,11 @@ public class TransportPPLQueryAction
     buildUnifiedQueryHandlerIfReady();
   }
 
-  /** Invoked by Guice iff analytics-engine bound {@code EngineContextProvider}. */
+  /**
+   * Installs the optional analytics engine context.
+   *
+   * @param contextProvider analytics engine context provider
+   */
   @Inject(optional = true)
   public void setEngineContext(org.opensearch.analytics.EngineContextProvider contextProvider) {
     org.opensearch.sql.plugin.rest.EngineContextProviderHolder.set(contextProvider);
@@ -183,7 +215,8 @@ public class TransportPPLQueryAction
       return;
     }
 
-    if (task instanceof PPLQueryTask pplQueryTask) {
+    PPLQueryTask pplQueryTask = task instanceof PPLQueryTask ? (PPLQueryTask) task : null;
+    if (pplQueryTask != null) {
       OpenSearchQueryManager.setCancellableTask(pplQueryTask);
     }
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_TOTAL).increment();
@@ -271,11 +304,21 @@ public class TransportPPLQueryAction
             createAnalyzeResponseListener(transformedRequest, clearingListener),
             anonymizedQuerySink);
       } else {
-        pplService.execute(
-            transformedRequest,
-            createListener(transformedRequest, clearingListener),
-            createExplainResponseListener(transformedRequest, clearingListener),
-            anonymizedQuerySink);
+        if (shouldExecuteAsync(transformedRequest) && pplQueryTask != null) {
+          startAsyncQuery(
+              pplQueryTask,
+              transportRequest,
+              transformedRequest,
+              pplService,
+              clearingListener,
+              anonymizedQuerySink);
+        } else {
+          pplService.execute(
+              transformedRequest,
+              createListener(transformedRequest, clearingListener),
+              createExplainResponseListener(transformedRequest, clearingListener),
+              anonymizedQuerySink);
+        }
       }
     } catch (Exception e) {
       clearingListener.onFailure(e);
@@ -393,6 +436,43 @@ public class TransportPPLQueryAction
         listener.onFailure(e);
       }
     };
+  }
+
+  private boolean shouldExecuteAsync(PPLQueryRequest request) {
+    return request.isAsyncQueryRequest()
+        && request.supportsAsyncExecution()
+        && (Boolean) pluginSettingsRef.getSettingValue(Settings.Key.CALCITE_ENGINE_ENABLED);
+  }
+
+  private void startAsyncQuery(
+      PPLQueryTask requestTask,
+      TransportPPLQueryRequest transportRequest,
+      PPLQueryRequest request,
+      PPLService pplService,
+      ActionListener<TransportPPLQueryResponse> responseListener,
+      Consumer<String> anonymizedQuerySink) {
+    PPLAsyncQueryUser owner = PPLAsyncQueryUser.current(clientRef.threadPool().getThreadContext());
+    asyncQueryService.start(
+        owner,
+        TimeValue.parseTimeValue(request.getKeepAlive(), PPLQueryRequest.KEEP_ALIVE_FIELD),
+        TimeValue.parseTimeValue(
+            request.getWaitForCompletionTimeout(),
+            PPLQueryRequest.WAIT_FOR_COMPLETION_TIMEOUT_FIELD),
+        transportRequest,
+        requestTask,
+        task -> {
+          OpenSearchQueryManager.setCancellableTask(task);
+          try {
+            AsyncQueryExecution execution = pplService.executeAsync(request, anonymizedQuerySink);
+            execution.completion().whenComplete((ignored, failure) -> clearRequestScopedState());
+            return execution;
+          } finally {
+            OpenSearchQueryManager.clearCancellableTask();
+          }
+        },
+        ActionListener.wrap(
+            snapshot -> responseListener.onResponse(asyncResponseFormatter.format(snapshot)),
+            responseListener::onFailure));
   }
 
   private Format format(PPLQueryRequest pplRequest) {

@@ -123,7 +123,6 @@ import org.opensearch.sql.plugin.transport.TransportPPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncDeleteAction;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncGetResultAction;
-import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQuerySecurity;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryService;
 import org.opensearch.sql.plugin.transport.asyncquery.TransportPPLAsyncDeleteAction;
 import org.opensearch.sql.plugin.transport.asyncquery.TransportPPLAsyncGetResultAction;
@@ -449,8 +448,6 @@ public class SQLPlugin extends Plugin
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);
 
     EngineExtensionsHolder extensionsHolder = new EngineExtensionsHolder(executionEngineExtensions);
-    PPLAsyncQuerySecurity pplAsyncQuerySecurity =
-        PPLAsyncQuerySecurity.fromEnvironment(environment);
     PPLAsyncQueryService pplAsyncQueryService =
         new PPLAsyncQueryService(this.client::getLocalNodeId, threadPool, pluginSettings);
 
@@ -461,7 +458,6 @@ public class SQLPlugin extends Plugin
         pluginSettings,
         directQueryExecutorService,
         extensionsHolder,
-        pplAsyncQuerySecurity,
         pplAsyncQueryService);
   }
 

@@ -51,7 +51,6 @@ import org.opensearch.sql.plugin.rest.AnalyticsEngineFormatSupport;
 import org.opensearch.sql.plugin.rest.AnalyticsExecutorHolder;
 import org.opensearch.sql.plugin.rest.RestUnifiedQueryAction;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryResponseFormatter;
-import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQuerySecurity;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryService;
 import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryUser;
 import org.opensearch.sql.ppl.PPLService;
@@ -95,7 +94,6 @@ public class TransportPPLQueryAction
   private final org.opensearch.sql.common.setting.Settings pluginSettingsRef;
   private final PPLAsyncQueryService asyncQueryService;
   private final PPLAsyncQueryResponseFormatter asyncResponseFormatter;
-  private final PPLAsyncQuerySecurity asyncQuerySecurity;
 
   /**
    * Creates the PPL transport action.
@@ -109,7 +107,6 @@ public class TransportPPLQueryAction
    * @param extensionsHolder registered execution engine extensions
    * @param tracer query tracer
    * @param asyncQueryService asynchronous PPL lifecycle service
-   * @param asyncQuerySecurity asynchronous query caller identity provider
    */
   @Inject
   public TransportPPLQueryAction(
@@ -121,14 +118,12 @@ public class TransportPPLQueryAction
       org.opensearch.common.settings.Settings clusterSettings,
       EngineExtensionsHolder extensionsHolder,
       Tracer tracer,
-      PPLAsyncQueryService asyncQueryService,
-      PPLAsyncQuerySecurity asyncQuerySecurity) {
+      PPLAsyncQueryService asyncQueryService) {
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
     this.clientRef = client;
     this.clusterServiceRef = clusterService;
     this.asyncQueryService = asyncQueryService;
     this.asyncResponseFormatter = new PPLAsyncQueryResponseFormatter();
-    this.asyncQuerySecurity = asyncQuerySecurity;
     this.asyncQueryService.attachTaskManager(transportService.getTaskManager());
 
     ModulesBuilder modules = new ModulesBuilder();
@@ -455,8 +450,7 @@ public class TransportPPLQueryAction
       PPLService pplService,
       ActionListener<TransportPPLQueryResponse> responseListener,
       Consumer<String> anonymizedQuerySink) {
-    PPLAsyncQueryUser owner =
-        asyncQuerySecurity.currentUser(clientRef.threadPool().getThreadContext());
+    PPLAsyncQueryUser owner = PPLAsyncQueryUser.current(clientRef.threadPool().getThreadContext());
     asyncQueryService.start(
         owner,
         request.getKeepAlive(),

@@ -27,22 +27,19 @@ public final class TransportPPLAsyncDeleteAction
    * @param actionFilters configured transport action filters
    * @param clusterService current cluster state service
    * @param asyncQueryService owner-node asynchronous query lifecycle service
-   * @param asyncQuerySecurity asynchronous query caller identity provider
    */
   @Inject
   public TransportPPLAsyncDeleteAction(
       TransportService transportService,
       ActionFilters actionFilters,
       ClusterService clusterService,
-      PPLAsyncQueryService asyncQueryService,
-      PPLAsyncQuerySecurity asyncQuerySecurity) {
+      PPLAsyncQueryService asyncQueryService) {
     super(
         PPLAsyncDeleteAction.NAME,
         transportService,
         actionFilters,
         PPLAsyncDeleteRequest::new,
         clusterService,
-        asyncQuerySecurity,
         asyncQueryService);
     this.asyncQueryService = asyncQueryService;
     this.responseFormatter = new PPLAsyncQueryResponseFormatter();

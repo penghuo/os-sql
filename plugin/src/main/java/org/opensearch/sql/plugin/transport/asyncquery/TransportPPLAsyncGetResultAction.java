@@ -31,22 +31,19 @@ public final class TransportPPLAsyncGetResultAction
    * @param actionFilters configured transport action filters
    * @param clusterService current cluster state service
    * @param asyncQueryService owner-node asynchronous query lifecycle service
-   * @param asyncQuerySecurity asynchronous query caller identity provider
    */
   @Inject
   public TransportPPLAsyncGetResultAction(
       TransportService transportService,
       ActionFilters actionFilters,
       ClusterService clusterService,
-      PPLAsyncQueryService asyncQueryService,
-      PPLAsyncQuerySecurity asyncQuerySecurity) {
+      PPLAsyncQueryService asyncQueryService) {
     super(
         PPLAsyncGetResultAction.NAME,
         transportService,
         actionFilters,
         PPLAsyncGetResultRequest::new,
         clusterService,
-        asyncQuerySecurity,
         asyncQueryService);
     this.asyncQueryService = asyncQueryService;
     this.responseFormatter = new PPLAsyncQueryResponseFormatter();

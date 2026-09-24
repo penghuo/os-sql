@@ -26,7 +26,7 @@ public class PPLAsyncQueryUserTest {
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT,
         "alice|backend-a|ppl-role|tenant-a");
 
-    PPLAsyncQueryUser identity = new PPLAsyncQuerySecurity(true).currentUser(context);
+    PPLAsyncQueryUser identity = PPLAsyncQueryUser.current(context);
 
     assertEquals("alice", identity.name());
     assertEquals("tenant-a", identity.requestedTenant());
@@ -39,23 +39,20 @@ public class PPLAsyncQueryUserTest {
     objectContext.putTransient(
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT,
         new User("alice", List.of("backend-a"), List.of("ppl-role"), null, "tenant-a"));
-    PPLAsyncQuerySecurity security = new PPLAsyncQuerySecurity(true);
-    assertEquals("alice", security.currentUser(objectContext).name());
+    assertEquals("alice", PPLAsyncQueryUser.current(objectContext).name());
 
     ThreadContext invalidContext = new ThreadContext(Settings.EMPTY);
     invalidContext.putTransient(
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT, new Object());
-    assertThrows(OpenSearchSecurityException.class, () -> security.currentUser(invalidContext));
+    assertThrows(
+        OpenSearchSecurityException.class, () -> PPLAsyncQueryUser.current(invalidContext));
   }
 
   @Test
-  public void missingIdentityFailsClosedWhenSecurityIsEnabled() {
+  public void missingIdentityRepresentsAnUnsecuredCaller() {
     ThreadContext context = new ThreadContext(Settings.EMPTY);
 
-    assertThrows(
-        OpenSearchSecurityException.class,
-        () -> new PPLAsyncQuerySecurity(true).currentUser(context));
-    assertFalse(new PPLAsyncQuerySecurity(false).currentUser(context).securityEnabled());
+    assertFalse(PPLAsyncQueryUser.current(context).securityEnabled());
   }
 
   @Test

@@ -29,7 +29,6 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   private final String actionName;
   private final TransportService transportService;
   private final ClusterService clusterService;
-  private final PPLAsyncQuerySecurity asyncQuerySecurity;
   private final PPLAsyncQueryService asyncQueryService;
 
   TransportPPLAsyncQueryRoutingAction(
@@ -38,13 +37,11 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
       ActionFilters actionFilters,
       Writeable.Reader<Request> requestReader,
       ClusterService clusterService,
-      PPLAsyncQuerySecurity asyncQuerySecurity,
       PPLAsyncQueryService asyncQueryService) {
     super(actionName, transportService, actionFilters, requestReader);
     this.actionName = actionName;
     this.transportService = transportService;
     this.clusterService = clusterService;
-    this.asyncQuerySecurity = asyncQuerySecurity;
     this.asyncQueryService = asyncQueryService;
   }
 
@@ -81,7 +78,7 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   }
 
   protected final PPLAsyncQueryUser currentUser() {
-    return asyncQuerySecurity.currentUser(transportService.getThreadPool().getThreadContext());
+    return PPLAsyncQueryUser.current(transportService.getThreadPool().getThreadContext());
   }
 
   protected abstract void executeOnOwner(

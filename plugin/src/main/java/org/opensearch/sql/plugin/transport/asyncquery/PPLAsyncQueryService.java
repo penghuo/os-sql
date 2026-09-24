@@ -759,6 +759,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     return new ResourceNotFoundException("PPL asynchronous query not found");
   }
 
+  /** Starts accepting submissions and schedules periodic retained-job expiration. */
   @Override
   protected void doStart() {
     acceptingNewJobs = true;
@@ -769,6 +770,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
+  /** Stops accepting submissions and cancels the periodic expiration task. */
   @Override
   protected void doStop() {
     acceptingNewJobs = false;
@@ -779,6 +781,11 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
   }
 
+  /**
+   * Removes all remaining jobs and releases their task and execution resources.
+   *
+   * @throws IOException if lifecycle shutdown fails
+   */
   @Override
   protected void doClose() throws IOException {
     acceptingNewJobs = false;

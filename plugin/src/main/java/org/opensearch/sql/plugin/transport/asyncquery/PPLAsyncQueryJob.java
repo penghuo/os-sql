@@ -52,6 +52,15 @@ final class PPLAsyncQueryJob {
   private PPLAsyncQueryService.Failure failure;
   private long completionTimeMillis = -1L;
 
+  /**
+   * Creates an unretained job in the {@link State#RUNNING} state.
+   *
+   * @param id opaque ID assigned by the owner node
+   * @param owner caller that is allowed to access the retained job
+   * @param startTimeMillis execution start time
+   * @param keepAliveMillis lease duration applied when the job is retained
+   * @param task independently cancellable task owned by the job
+   */
   PPLAsyncQueryJob(
       String id,
       PPLAsyncQueryUser owner,
@@ -67,10 +76,21 @@ final class PPLAsyncQueryJob {
     this.state = State.RUNNING;
   }
 
+  /**
+   * Returns the opaque ID assigned to this job.
+   *
+   * @return job ID used as the service registry key
+   */
   String id() {
     return id;
   }
 
+  /**
+   * Retains a running job after its initial response wait expires.
+   *
+   * @param now time at which the job becomes visible to GET and DELETE
+   * @return transition that publishes the job ID, or {@code null} if the job already finished
+   */
   synchronized Transition retain(long now) {
     if (state != State.RUNNING) {
       return null;
@@ -80,6 +100,13 @@ final class PPLAsyncQueryJob {
     return Transition.retain(retainedResponse());
   }
 
+  /**
+   * Transfers ownership of an execution handle to this job.
+   *
+   * @param execution handle that produces current and final query results
+   * @return {@code true} when attached; {@code false} when the caller must close the rejected
+   *     handle
+   */
   synchronized boolean tryAttachExecution(AsyncQueryExecution execution) {
     Objects.requireNonNull(execution);
     if (!isExecuting() || this.execution != null) {
@@ -89,6 +116,13 @@ final class PPLAsyncQueryJob {
     return true;
   }
 
+  /**
+   * Records successful execution completion.
+   *
+   * @param now completion time
+   * @return direct-response or retained-completion transition, or {@code null} after removal
+   * @throws IllegalStateException if successful completion is reported before execution attachment
+   */
   synchronized Transition complete(long now) {
     if (!isExecuting()) {
       return null;
@@ -100,6 +134,13 @@ final class PPLAsyncQueryJob {
     return finish(State.RETAINED_SUCCEEDED, now);
   }
 
+  /**
+   * Records failed execution completion.
+   *
+   * @param failure client-visible failure retained with the job
+   * @param now completion time
+   * @return direct-response or retained-completion transition, or {@code null} after removal
+   */
   synchronized Transition fail(PPLAsyncQueryService.Failure failure, long now) {
     if (!isExecuting()) {
       return null;
@@ -125,6 +166,19 @@ final class PPLAsyncQueryJob {
     return Transition.finishRetained(null, taskToClose);
   }
 
+  /**
+   * Authorizes access and returns the current retained response.
+   *
+   * <p>A supplied {@code requestedKeepAlive} starts a new lease from {@code now}. A request at or
+   * after the existing expiration time returns an expiration removal instead of data.
+   *
+   * @param caller current caller
+   * @param now request time
+   * @param requestedKeepAlive replacement lease, or {@code null} to keep the current expiration
+   * @return current response or the removal required for an expired job
+   * @throws ResourceNotFoundException if the job was already removed
+   * @throws org.opensearch.OpenSearchSecurityException if the caller does not match the job owner
+   */
   synchronized GetResult get(PPLAsyncQueryUser caller, long now, TimeValue requestedKeepAlive) {
     ensurePresent();
     owner.authorize(caller);
@@ -138,6 +192,15 @@ final class PPLAsyncQueryJob {
     return new GetResult.Found(retainedResponse());
   }
 
+  /**
+   * Authorizes, cancels if still running, and removes this job.
+   *
+   * @param caller current caller
+   * @param now request time
+   * @return removal containing the response status and detached resources
+   * @throws ResourceNotFoundException if the job was already removed
+   * @throws org.opensearch.OpenSearchSecurityException if the caller does not match the job owner
+   */
   synchronized Removal delete(PPLAsyncQueryUser caller, long now) {
     ensurePresent();
     owner.authorize(caller);
@@ -159,6 +222,12 @@ final class PPLAsyncQueryJob {
         wasRunning);
   }
 
+  /**
+   * Removes a retained job whose lease has expired.
+   *
+   * @param now expiration check time
+   * @return removal with detached resources, or {@code null} if no expiration is due
+   */
   synchronized Removal expire(long now) {
     if (state == State.REMOVED || state == State.RUNNING || now < expirationTimeMillis) {
       return null;
@@ -175,6 +244,11 @@ final class PPLAsyncQueryJob {
     return new Removal(responseStatus, taskToCancel, executionToClose, reason, true, wasRunning);
   }
 
+  /**
+   * Removes a job whose submission could not be completed.
+   *
+   * @return removal with detached resources, or {@code null} if already removed
+   */
   synchronized Removal abort() {
     if (state == State.REMOVED) {
       return null;
@@ -193,6 +267,12 @@ final class PPLAsyncQueryJob {
         wasRunning);
   }
 
+  /**
+   * Removes this job during service shutdown.
+   *
+   * @param reason cancellation reason used if execution is still running
+   * @return removal with detached resources, or {@code null} if already removed
+   */
   synchronized Removal close(String reason) {
     if (state == State.REMOVED) {
       return null;
@@ -258,6 +338,15 @@ final class PPLAsyncQueryJob {
     }
   }
 
+  /**
+   * Lifecycle data captured under the job lock for later response materialization.
+   *
+   * @param id job ID included in a retained response, or {@code null} for a direct POST response
+   * @param status public lifecycle status
+   * @param execution execution handle borrowed for result materialization
+   * @param failure failure returned for a failed job
+   * @param tookMillis elapsed execution time, or {@code -1} while running
+   */
   record ResponseContext(
       String id,
       PPLAsyncQueryService.Status status,
@@ -265,7 +354,14 @@ final class PPLAsyncQueryJob {
       PPLAsyncQueryService.Failure failure,
       long tookMillis) {}
 
+  /**
+   * Cancellable task and the cleanup that releases its TaskManager registrations.
+   *
+   * @param task task used to cancel query execution
+   * @param release registration cleanup
+   */
   record JobTask(CancellableTask task, Runnable release) {
+    /** Releases the task and child-node registrations owned by this wrapper. */
     void close() {
       release.run();
     }
@@ -280,16 +376,27 @@ final class PPLAsyncQueryJob {
     REMOVED
   }
 
+  /** Whether a transition keeps the job in or removes it from the service registry. */
   enum Retention {
     RETAIN,
     REMOVE
   }
 
+  /** Whether a transition keeps or releases one running-query capacity slot. */
   enum RunningSlotAction {
     KEEP,
     RELEASE
   }
 
+  /**
+   * State-machine output consumed by {@link PPLAsyncQueryService}.
+   *
+   * @param response response to materialize and publish, or {@code null} when none is due
+   * @param retention registry action
+   * @param runningSlotAction running-capacity action
+   * @param executionToClose execution handle detached by the transition
+   * @param taskToClose completed task registration detached by the transition
+   */
   record Transition(
       ResponseContext response,
       Retention retention,
@@ -314,12 +421,33 @@ final class PPLAsyncQueryJob {
     }
   }
 
+  /** Result of an authorized GET attempt. */
   sealed interface GetResult {
+    /**
+     * GET result for a live retained job.
+     *
+     * @param response current response context
+     */
     record Found(ResponseContext response) implements GetResult {}
 
+    /**
+     * GET result when the lease expired before the request.
+     *
+     * @param removal cleanup required for the expired job
+     */
     record Expired(Removal removal) implements GetResult {}
   }
 
+  /**
+   * Resources and accounting changes produced when a job leaves the registry.
+   *
+   * @param responseStatus status returned to DELETE when the job has not expired
+   * @param task running task to cancel
+   * @param execution execution handle to close
+   * @param reason cancellation or removal reason
+   * @param expired whether expiration caused the removal
+   * @param releaseRunningSlot whether the service must release running capacity
+   */
   record Removal(
       PPLAsyncQueryService.Status responseStatus,
       JobTask task,

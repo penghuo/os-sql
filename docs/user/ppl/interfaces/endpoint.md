@@ -1,14 +1,23 @@
-# Endpoint  
+# PPL API endpoints
 
-## Introduction  
+## Execute a query
 
-To send query request to PPL plugin, you MUST use HTTP POST request. POST request doesn't have length limitation and allows for other parameters passed to plugin for other functionality such as prepared statement. And also the explain endpoint is used very often for query translation and troubleshooting.
-## POST  
+Use `POST /_plugins/_ppl` to execute a PPL query.
 
-### Description  
+### Request fields
 
-You can send HTTP POST request to endpoint **/_plugins/_ppl** with your query in request body.
-### Example  
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | String | Yes | PPL query to execute. |
+| `wait_for_completion_timeout` | Time value | No | Selects asynchronous execution and waits up to this duration for a final response. Defaults to `5s`. |
+| `keep_alive` | Time value | No | Selects asynchronous execution and controls how long the job is retained. Defaults to `5m`. |
+| `profile` | Boolean | No | Returns profiling information through synchronous execution. |
+| `analyze` | Boolean | No | Returns analysis information through synchronous execution. |
+| `partial_result` | Boolean | No | Existing partial-result behavior; it is independent of asynchronous lifecycle delivery. |
+
+Requests without `wait_for_completion_timeout` or `keep_alive` use the existing synchronous API.
+
+### Synchronous example
   
 ```bash ppl
 curl -sS -H 'Content-Type: application/json' \
@@ -52,8 +61,96 @@ Expected output:
   "size": 4
 }
 ```
-  
-## Explain  
+
+### Synchronous response fields
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `schema` | Array | Result column names and types. |
+| `datarows` | Array | Complete query result rows. |
+| `total` | Integer | Number of result rows. |
+| `size` | Integer | Number of returned rows. |
+
+## Execute a query asynchronously
+
+The existing `POST /_plugins/_ppl` endpoint becomes asynchronous when the request contains `wait_for_completion_timeout` or `keep_alive`.
+
+If the query completes before `wait_for_completion_timeout`, POST returns the final result without an `id`. Otherwise, POST returns `RUNNING` with an opaque job `id`. Every later GET returns the complete current result snapshot; the API does not expose paging, progress, or delta delivery.
+
+Async lifecycle fields are ignored and the existing synchronous path is used for:
+
+- `/_plugins/_ppl/_explain` and `explain` queries.
+- `profile=true` or `analyze=true`.
+- An explicit response `format`, including `jdbc`, `csv`, `raw`, or `viz`.
+- Queries executed while the Calcite engine is disabled.
+- Queries routed to the analytics engine.
+
+### Submit
+
+```bash ppl ignore
+curl -sS -H 'Content-Type: application/json' \
+  -X POST localhost:9200/_plugins/_ppl \
+  -d '{
+        "query": "source=accounts | sort account_number",
+        "wait_for_completion_timeout": "1s",
+        "keep_alive": "5m"
+      }'
+```
+
+When the wait period expires first:
+
+```json
+{
+  "id": "<opaque-job-id>",
+  "status": "RUNNING",
+  "schema": [],
+  "datarows": [],
+  "total": 0
+}
+```
+
+When the query completes first, the response has `status: SUCCEEDED`, the complete `schema`, `datarows`, and `total`, and no `id`.
+
+If the query fails before the wait period expires, POST returns the same HTTP error status and
+message as the equivalent synchronous query and does not retain a job. If a retained query fails
+after POST returned an `id`, GET returns `200` with `status: FAILED` and the query error.
+
+### Poll
+
+Use `GET /_plugins/_ppl/jobs/{id}` to read a retained job. An authorized poll can renew its lease by passing `keep_alive`.
+
+```bash ignore
+curl -sS -X GET \
+  'localhost:9200/_plugins/_ppl/jobs/<opaque-job-id>?keep_alive=5m'
+```
+
+### Cancel or delete
+
+Use `DELETE /_plugins/_ppl/jobs/{id}` to cancel a running query or delete a retained terminal result.
+
+```bash ignore
+curl -sS -X DELETE \
+  'localhost:9200/_plugins/_ppl/jobs/<opaque-job-id>'
+```
+
+### Asynchronous response fields
+
+| Field | Type | States | Description |
+| --- | --- | --- | --- |
+| `id` | String | Retained jobs | Opaque job identifier used by GET and DELETE. |
+| `status` | String | All | `RUNNING`, `SUCCEEDED`, `FAILED`, or `CANCELLED`. |
+| `schema` | Array | POST/GET | Complete result schema when successful; otherwise empty. |
+| `datarows` | Array | POST/GET | Complete result rows when successful; otherwise empty. |
+| `total` | Integer | POST/GET | Number of successful result rows; otherwise `0`. |
+| `took` | Integer | `SUCCEEDED` | Execution time in milliseconds. |
+| `error` | Object | `FAILED` | Query error type and reason. |
+
+Expired jobs and jobs whose owner node has left the cluster return `404`. Results remain subject to `plugins.query.size_limit`, which is 10,000 rows by default.
+
+Asynchronous execution remains subject to `plugins.ppl.query.timeout`. `keep_alive` controls how
+long job state and results are retained; it does not extend query execution time.
+
+## Explain
 
 ### Description  
 

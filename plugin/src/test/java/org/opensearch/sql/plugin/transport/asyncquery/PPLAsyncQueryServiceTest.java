@@ -44,6 +44,10 @@ import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
+import org.opensearch.sql.legacy.metrics.BasicCounter;
+import org.opensearch.sql.legacy.metrics.MetricName;
+import org.opensearch.sql.legacy.metrics.Metrics;
+import org.opensearch.sql.legacy.metrics.NumericMetric;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.PPLQueryTask;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
@@ -148,42 +152,63 @@ public class PPLAsyncQueryServiceTest {
 
   @Test
   public void fastFailureReturnsDirectFailureWithoutId() {
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> result = new AtomicReference<>();
+    AtomicReference<Exception> failure = new AtomicReference<>();
     TrackingExecution execution = new TrackingExecution(response(1));
-    startQuery(service, null, TimeValue.timeValueSeconds(5), execution, listener(result::set));
+    startQuery(
+        service,
+        null,
+        TimeValue.timeValueSeconds(5),
+        execution,
+        ActionListener.wrap(
+            ignored -> {
+              throw new AssertionError("Expected direct query failure");
+            },
+            failure::set));
 
     execution.fail(new IllegalStateException("boom"));
 
-    assertNull(result.get().id());
-    assertEquals(PPLAsyncQueryService.Status.FAILED, result.get().status());
-    assertEquals("IllegalStateException", result.get().failure().type());
-    assertEquals("query execution failed", result.get().failure().reason());
-    assertNull(result.get().response());
+    assertEquals("boom", failure.get().getMessage());
     assertEquals(0, execution.reads.get());
     assertEquals(1, execution.closes.get());
     assertEquals(0, service.retainedJobCount());
   }
 
   @Test
-  public void getRenewsLeaseAndExpiryCancelsRunningTask() {
+  public void getWithoutKeepAliveDoesNotRenewLease() {
     CancellableTask task = mock(CancellableTask.class);
     when(task.isCancelled()).thenReturn(false);
     TrackingExecution execution = new TrackingExecution(null);
     String id = startRetainedQuery(service, task, execution);
 
     now.addAndGet(TimeValue.timeValueMinutes(4).millis());
-    PPLAsyncQueryService.JobSnapshot renewed = service.get(id, OWNER, null);
-    assertEquals(PPLAsyncQueryService.Status.RUNNING, renewed.status());
-
-    now.addAndGet(TimeValue.timeValueMinutes(4).millis());
     assertEquals(PPLAsyncQueryService.Status.RUNNING, service.get(id, OWNER, null).status());
 
-    now.addAndGet(TimeValue.timeValueMinutes(5).millis() + 1);
+    now.addAndGet(TimeValue.timeValueMinutes(1).millis() + 1);
     assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
     verify(task).cancel("PPL asynchronous query expired");
     assertEquals(1, execution.closes.get());
     assertEquals(0, service.runningQueryCount());
     assertEquals(0, service.retainedJobCount());
+  }
+
+  @Test
+  public void getWithKeepAliveRenewsLease() {
+    CancellableTask task = mock(CancellableTask.class);
+    when(task.isCancelled()).thenReturn(false);
+    TrackingExecution execution = new TrackingExecution(null);
+    String id = startRetainedQuery(service, task, execution);
+
+    now.addAndGet(TimeValue.timeValueMinutes(4).millis());
+    assertEquals(
+        PPLAsyncQueryService.Status.RUNNING,
+        service.get(id, OWNER, TimeValue.timeValueMinutes(5)).status());
+
+    now.addAndGet(TimeValue.timeValueMinutes(4).millis());
+    assertEquals(PPLAsyncQueryService.Status.RUNNING, service.get(id, OWNER, null).status());
+
+    now.addAndGet(TimeValue.timeValueMinutes(1).millis() + 1);
+    assertThrows(ResourceNotFoundException.class, () -> service.get(id, OWNER, null));
+    verify(task).cancel("PPL asynchronous query expired");
   }
 
   @Test
@@ -277,7 +302,7 @@ public class PPLAsyncQueryServiceTest {
         new TransportPPLQueryRequest("source=t", new org.json.JSONObject(), "/_plugins/_ppl");
     RequestTaskRegistration registration = registerRequestTask(taskManager, request, task);
     service.attachTaskManager(taskManager);
-    AtomicReference<PPLAsyncQueryService.JobSnapshot> response = new AtomicReference<>();
+    AtomicReference<Exception> failure = new AtomicReference<>();
 
     service.start(
         OWNER,
@@ -288,10 +313,13 @@ public class PPLAsyncQueryServiceTest {
         ignored -> {
           throw new IllegalStateException("execution did not start");
         },
-        listener(response::set));
+        ActionListener.wrap(
+            ignored -> {
+              throw new AssertionError("Expected execution startup failure");
+            },
+            failure::set));
 
-    assertEquals(PPLAsyncQueryService.Status.FAILED, response.get().status());
-    assertNull(response.get().id());
+    assertEquals("execution did not start", failure.get().getMessage());
     verify(taskManager, times(1)).unregister(task);
     verify(registration.childNodeRegistration()).close();
     assertEquals(0, service.runningQueryCount());
@@ -539,9 +567,27 @@ public class PPLAsyncQueryServiceTest {
     PPLAsyncQueryService.JobSnapshot failed = service.get(id, OWNER, null);
 
     assertEquals(PPLAsyncQueryService.Status.FAILED, failed.status());
+    assertEquals("boom", failed.failure().reason());
     assertNull(failed.response());
     assertEquals(0, execution.reads.get());
     assertEquals(1, execution.closes.get());
+  }
+
+  @Test
+  public void failedRetainedJobRecordsFailureMetric() {
+    NumericMetric<Long> failures =
+        new NumericMetric<>(MetricName.PPL_FAILED_REQ_COUNT_CUS.getName(), new BasicCounter());
+    Metrics.getInstance().registerMetric(failures);
+    try {
+      TrackingExecution execution = new TrackingExecution(null);
+      startRetainedQuery(service, null, execution);
+
+      execution.fail(new IllegalArgumentException("invalid query"));
+
+      assertEquals(Long.valueOf(1), failures.getValue());
+    } finally {
+      Metrics.getInstance().unregisterMetric(failures.getName());
+    }
   }
 
   @Test
@@ -652,6 +698,42 @@ public class PPLAsyncQueryServiceTest {
     service.validateWaitForCompletion(TimeValue.ZERO);
     service.validateWaitForCompletion(TimeValue.timeValueSeconds(60));
     service.validateKeepAlive(TimeValue.timeValueHours(24));
+  }
+
+  @Test
+  public void disabledPplRejectsAllAsyncOperations() {
+    AtomicBoolean enabled = new AtomicBoolean(true);
+    PPLAsyncQueryService switchable =
+        new PPLAsyncQueryService(
+            "node-a",
+            now::get,
+            (delay, task) -> () -> {},
+            () -> 20,
+            () -> 100,
+            () -> TimeValue.timeValueSeconds(60),
+            () -> TimeValue.timeValueHours(24),
+            enabled::get);
+    String id = startRetainedQuery(switchable, null, new TrackingExecution(null));
+    enabled.set(false);
+
+    try {
+      OpenSearchStatusException getFailure =
+          assertThrows(OpenSearchStatusException.class, () -> switchable.get(id, OWNER, null));
+      assertEquals(400, getFailure.status().getStatus());
+      assertThrows(OpenSearchStatusException.class, () -> switchable.delete(id, OWNER));
+      assertThrows(
+          OpenSearchStatusException.class,
+          () ->
+              startQuery(
+                  switchable,
+                  null,
+                  TimeValue.ZERO,
+                  new TrackingExecution(null),
+                  listener(ignored -> {})));
+    } finally {
+      enabled.set(true);
+      switchable.delete(id, OWNER);
+    }
   }
 
   private PPLAsyncQueryService service(int maxRunning, int maxRetained) {

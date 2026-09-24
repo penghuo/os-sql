@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -29,6 +30,7 @@ import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.AsyncQueryExecution;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
+import org.opensearch.sql.plugin.PPLQueryErrorHandler;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.PPLQueryTask;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
@@ -95,7 +97,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    * @param id opaque job ID, or {@code null} for a terminal response returned directly by POST
    * @param status lifecycle state captured with the result
    * @param response current query result, or {@code null} before a result is available
-   * @param failure sanitized failure for {@link Status#FAILED}, otherwise {@code null}
+   * @param failure client-visible failure for {@link Status#FAILED}, otherwise {@code null}
    * @param tookMillis elapsed execution time, available for a completed job
    */
   public record JobSnapshot(
@@ -105,10 +107,10 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   record DeleteResult(String id, Status status) {}
 
   /**
-   * Sanitized failure retained by a job; raw exception messages are not stored.
+   * Client-visible failure retained by a job and returned only after owner authorization.
    *
-   * @param type exception type without sensitive query data
-   * @param reason stable client-facing failure reason
+   * @param type exception type
+   * @param reason client-facing failure reason
    */
   public record Failure(String type, String reason) {
     private static Failure from(Exception exception) {
@@ -116,7 +118,11 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
           exception.getClass().getSimpleName().isBlank()
               ? exception.getClass().getName()
               : exception.getClass().getSimpleName();
-      return new Failure(type, "query execution failed");
+      String reason =
+          exception.getMessage() == null || exception.getMessage().isBlank()
+              ? "query execution failed"
+              : exception.getMessage();
+      return new Failure(type, reason);
     }
   }
 
@@ -127,6 +133,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   private final IntSupplier maxRetainedJobs;
   private final Supplier<TimeValue> maxWaitForCompletion;
   private final Supplier<TimeValue> maxKeepAlive;
+  private final BooleanSupplier pplEnabled;
   private final ThreadPool threadPool;
   private final ConcurrentMap<String, PPLAsyncQueryJob> jobs = new ConcurrentHashMap<>();
   private final Object admissionLock = new Object();
@@ -162,6 +169,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
             (TimeValue)
                 settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT),
         () -> (TimeValue) settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE),
+        () -> (Boolean) settings.getSettingValue(Settings.Key.PPL_ENABLED),
         threadPool);
   }
 
@@ -181,6 +189,28 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         maxRetainedJobs,
         maxWaitForCompletion,
         maxKeepAlive,
+        () -> true,
+        null);
+  }
+
+  PPLAsyncQueryService(
+      String ownerNodeId,
+      LongSupplier currentTimeMillis,
+      TimeoutScheduler timeoutScheduler,
+      IntSupplier maxRunningQueries,
+      IntSupplier maxRetainedJobs,
+      Supplier<TimeValue> maxWaitForCompletion,
+      Supplier<TimeValue> maxKeepAlive,
+      BooleanSupplier pplEnabled) {
+    this(
+        () -> ownerNodeId,
+        currentTimeMillis,
+        timeoutScheduler,
+        maxRunningQueries,
+        maxRetainedJobs,
+        maxWaitForCompletion,
+        maxKeepAlive,
+        pplEnabled,
         null);
   }
 
@@ -192,6 +222,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       IntSupplier maxRetainedJobs,
       Supplier<TimeValue> maxWaitForCompletion,
       Supplier<TimeValue> maxKeepAlive,
+      BooleanSupplier pplEnabled,
       ThreadPool threadPool) {
     this.ownerNodeIdSupplier = Objects.requireNonNull(ownerNodeIdSupplier);
     this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis);
@@ -200,6 +231,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     this.maxRetainedJobs = Objects.requireNonNull(maxRetainedJobs);
     this.maxWaitForCompletion = Objects.requireNonNull(maxWaitForCompletion);
     this.maxKeepAlive = Objects.requireNonNull(maxKeepAlive);
+    this.pplEnabled = Objects.requireNonNull(pplEnabled);
     this.threadPool = threadPool;
   }
 
@@ -228,6 +260,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       PPLQueryTask requestTask,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
       ActionListener<JobSnapshot> responseListener) {
+    ensurePplEnabled();
     TimeValue keepAlive =
         TimeValue.parseTimeValue(requestedKeepAlive, PPLQueryRequest.KEEP_ALIVE_FIELD);
     TimeValue waitForCompletion =
@@ -260,6 +293,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
       JobTask task,
       Function<CancellableTask, AsyncQueryExecution> executionStarter,
       ActionListener<JobSnapshot> responseListener) {
+    ensurePplEnabled();
     PPLAsyncQueryJob job;
     try {
       Objects.requireNonNull(task);
@@ -361,13 +395,20 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
 
   private void fail(
       PPLAsyncQueryJob job, Exception failure, ActionListener<JobSnapshot> responseListener) {
-    applyTransition(
-        job,
-        job.fail(Failure.from(Objects.requireNonNull(failure)), currentTimeMillis.getAsLong()),
-        responseListener);
+    Objects.requireNonNull(failure);
+    Transition transition = job.fail(Failure.from(failure), currentTimeMillis.getAsLong());
+    if (transition == null) {
+      return;
+    }
+    boolean directFailure = transition.response() != null;
+    if (!directFailure) {
+      PPLQueryErrorHandler.recordFailure(failure);
+    }
+    applyTransition(job, transition, responseListener, directFailure ? failure : null);
   }
 
   JobSnapshot get(String id, PPLAsyncQueryUser caller, TimeValue requestedKeepAlive) {
+    ensurePplEnabled();
     if (requestedKeepAlive != null) {
       validateKeepAlive(requestedKeepAlive);
     }
@@ -381,6 +422,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
   }
 
   DeleteResult delete(String id, PPLAsyncQueryUser caller) {
+    ensurePplEnabled();
     PPLAsyncQueryJob job = findLocal(id);
     Removal removal = job.delete(caller, currentTimeMillis.getAsLong());
     applyRemoval(job, removal);
@@ -468,6 +510,14 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
    */
   private void applyTransition(
       PPLAsyncQueryJob job, Transition transition, ActionListener<JobSnapshot> responseListener) {
+    applyTransition(job, transition, responseListener, null);
+  }
+
+  private void applyTransition(
+      PPLAsyncQueryJob job,
+      Transition transition,
+      ActionListener<JobSnapshot> responseListener,
+      Exception directFailure) {
     if (transition == null) {
       return;
     }
@@ -481,7 +531,7 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     JobSnapshot snapshot = null;
     RuntimeException materializationFailure = null;
     try {
-      if (transition.response() != null) {
+      if (transition.response() != null && directFailure == null) {
         snapshot = materialize(transition.response());
       }
     } catch (RuntimeException e) {
@@ -492,7 +542,9 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
     }
 
     if (transition.response() != null) {
-      if (materializationFailure == null) {
+      if (directFailure != null) {
+        responseListener.onFailure(directFailure);
+      } else if (materializationFailure == null) {
         responseListener.onResponse(snapshot);
       } else {
         if (transition.retention() == Retention.RETAIN) {
@@ -584,6 +636,13 @@ public final class PPLAsyncQueryService extends AbstractLifecycleComponent {
         || waitForCompletion.millis() > maximum.millis()) {
       throw new IllegalArgumentException(
           "[wait_for_completion_timeout] must be between 0 and " + maximum);
+    }
+  }
+
+  /** Rejects asynchronous lifecycle operations while the dynamic PPL kill switch is disabled. */
+  void ensurePplEnabled() {
+    if (!pplEnabled.getAsBoolean()) {
+      throw new OpenSearchStatusException("plugins.ppl.enabled is false", RestStatus.BAD_REQUEST);
     }
   }
 

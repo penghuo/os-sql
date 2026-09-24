@@ -94,17 +94,92 @@ public class PPLAsyncQueryIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void fastFailureReturnsSanitizedTerminalResponseWithoutId() throws IOException {
-    JSONObject response =
+  public void fastFailurePreservesSynchronousErrorStatusAndMessage() throws IOException {
+    String query = "source=" + TEST_INDEX_BANK + " | unsupported_async_command";
+
+    ResponseException synchronous =
+        assertThrows(ResponseException.class, () -> executeQuery(query));
+    ResponseException asynchronous =
+        assertThrows(ResponseException.class, () -> submit(query, "30s", "5m"));
+
+    assertEquals(
+        synchronous.getResponse().getStatusLine().getStatusCode(),
+        asynchronous.getResponse().getStatusLine().getStatusCode());
+    JSONObject synchronousError =
+        new JSONObject(getResponseBody(synchronous.getResponse(), true)).getJSONObject("error");
+    JSONObject asynchronousError =
+        new JSONObject(getResponseBody(asynchronous.getResponse(), true)).getJSONObject("error");
+    assertEquals(synchronousError.getString("details"), asynchronousError.getString("details"));
+  }
+
+  @Test
+  public void retainedFailurePreservesMessage() throws Exception {
+    JSONObject submitted =
         new JSONObject(
             getResponseBody(
-                submit("source=" + TEST_INDEX_BANK + " | unsupported_async_command", "30s", "5m"),
+                submit("source=" + TEST_INDEX_BANK + " | unsupported_async_command", "0s", "5m"),
                 true));
 
-    assertEquals("FAILED", response.getString("status"));
-    assertFalse(response.has("id"));
-    assertEquals("query execution failed", response.getJSONObject("error").getString("reason"));
-    assertMinimalRunningSnapshot(response);
+    JSONObject failed = pollUntilTerminal(submitted.getString("id"));
+
+    assertEquals("FAILED", failed.getString("status"));
+    assertTrue(
+        failed.getJSONObject("error").getString("reason").contains("unsupported_async_command"));
+  }
+
+  @Test
+  public void numericAsyncLifecycleFieldsReturnBadRequest() {
+    Request numericKeepAlive = new Request("POST", QUERY_API_ENDPOINT);
+    numericKeepAlive.setJsonEntity(
+        new JSONObject()
+            .put("query", "source=" + TEST_INDEX_BANK)
+            .put("keep_alive", 300)
+            .toString());
+    Request numericWait = new Request("POST", QUERY_API_ENDPOINT);
+    numericWait.setJsonEntity(
+        new JSONObject()
+            .put("query", "source=" + TEST_INDEX_BANK)
+            .put("wait_for_completion_timeout", 1)
+            .toString());
+
+    ResponseException keepAliveFailure =
+        assertThrows(ResponseException.class, () -> client().performRequest(numericKeepAlive));
+    ResponseException waitFailure =
+        assertThrows(ResponseException.class, () -> client().performRequest(numericWait));
+
+    assertEquals(400, keepAliveFailure.getResponse().getStatusLine().getStatusCode());
+    assertEquals(400, waitFailure.getResponse().getStatusLine().getStatusCode());
+  }
+
+  @Test
+  public void disabledPplRejectsSubmitGetAndDelete() throws Exception {
+    JSONObject submitted =
+        new JSONObject(
+            getResponseBody(submit("source=" + TEST_INDEX_BANK + " | head 1", "0s", "5m"), true));
+    String id = submitted.getString("id");
+
+    updateClusterSettings(new ClusterSetting(PERSISTENT, "plugins.ppl.enabled", "false"));
+    try {
+      ResponseException submitFailure =
+          assertThrows(
+              ResponseException.class,
+              () -> submit("source=" + TEST_INDEX_BANK + " | head 1", "0s", "5m"));
+      ResponseException getFailure = assertThrows(ResponseException.class, () -> get(id, null));
+      ResponseException deleteFailure =
+          assertThrows(
+              ResponseException.class,
+              () ->
+                  client()
+                      .performRequest(
+                          new Request("DELETE", ASYNC_JOB_API_ENDPOINT.replace("{id}", id))));
+
+      assertEquals(400, submitFailure.getResponse().getStatusLine().getStatusCode());
+      assertEquals(400, getFailure.getResponse().getStatusLine().getStatusCode());
+      assertEquals(400, deleteFailure.getResponse().getStatusLine().getStatusCode());
+    } finally {
+      updateClusterSettings(new ClusterSetting(PERSISTENT, "plugins.ppl.enabled", null));
+    }
+    delete(id);
   }
 
   @Test

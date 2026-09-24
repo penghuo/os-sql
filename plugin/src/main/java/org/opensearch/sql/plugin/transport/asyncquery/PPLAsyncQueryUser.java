@@ -43,13 +43,17 @@ public record PPLAsyncQueryUser(
    * Captures the current caller from the OpenSearch thread context.
    *
    * @param threadContext current request thread context
+   * @param securityEnabled whether OpenSearch Security is installed and enabled
    * @return immutable caller identity
    */
-  public static PPLAsyncQueryUser current(ThreadContext threadContext) {
+  static PPLAsyncQueryUser current(ThreadContext threadContext, boolean securityEnabled) {
     try {
       Object serialized =
           threadContext.getTransient(ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT);
       if (serialized == null) {
+        if (securityEnabled) {
+          throw forbidden();
+        }
         return new PPLAsyncQueryUser(false, null, null, List.of());
       }
       User user =

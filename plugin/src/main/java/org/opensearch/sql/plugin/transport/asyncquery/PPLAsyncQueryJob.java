@@ -133,8 +133,8 @@ final class PPLAsyncQueryJob {
     }
     if (requestedKeepAlive != null) {
       keepAliveMillis = requestedKeepAlive.millis();
+      expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
     }
-    expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
     return new GetResult.Found(retainedResponse());
   }
 

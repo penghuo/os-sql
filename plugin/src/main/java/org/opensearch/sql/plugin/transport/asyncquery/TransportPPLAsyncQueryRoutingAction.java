@@ -29,22 +29,34 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   private final String actionName;
   private final TransportService transportService;
   private final ClusterService clusterService;
+  private final PPLAsyncQuerySecurity asyncQuerySecurity;
+  private final PPLAsyncQueryService asyncQueryService;
 
   TransportPPLAsyncQueryRoutingAction(
       String actionName,
       TransportService transportService,
       ActionFilters actionFilters,
       Writeable.Reader<Request> requestReader,
-      ClusterService clusterService) {
+      ClusterService clusterService,
+      PPLAsyncQuerySecurity asyncQuerySecurity,
+      PPLAsyncQueryService asyncQueryService) {
     super(actionName, transportService, actionFilters, requestReader);
     this.actionName = actionName;
     this.transportService = transportService;
     this.clusterService = clusterService;
+    this.asyncQuerySecurity = asyncQuerySecurity;
+    this.asyncQueryService = asyncQueryService;
   }
 
   @Override
   protected final void doExecute(
       Task task, Request request, ActionListener<TransportPPLQueryResponse> listener) {
+    try {
+      asyncQueryService.ensurePplEnabled();
+    } catch (RuntimeException e) {
+      listener.onFailure(e);
+      return;
+    }
     PPLAsyncQueryJobId jobId = PPLAsyncQueryJobId.parse(request.id());
     if (clusterService.localNode().getId().equals(jobId.ownerNodeId())) {
       executeOnOwner(task, request, listener);
@@ -69,7 +81,7 @@ abstract class TransportPPLAsyncQueryRoutingAction<Request extends AbstractPPLAs
   }
 
   protected final PPLAsyncQueryUser currentUser() {
-    return PPLAsyncQueryUser.current(transportService.getThreadPool().getThreadContext());
+    return asyncQuerySecurity.currentUser(transportService.getThreadPool().getThreadContext());
   }
 
   protected abstract void executeOnOwner(

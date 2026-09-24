@@ -111,6 +111,10 @@ When the wait period expires first:
 
 When the query completes first, the response has `status: SUCCEEDED`, the complete `schema`, `datarows`, and `total`, and no `id`.
 
+If the query fails before the wait period expires, POST returns the same HTTP error status and
+message as the equivalent synchronous query and does not retain a job. If a retained query fails
+after POST returned an `id`, GET returns `200` with `status: FAILED` and the query error.
+
 ### Poll
 
 Use `GET /_plugins/_ppl/jobs/{id}` to read a retained job. An authorized poll can renew its lease by passing `keep_alive`.
@@ -139,9 +143,12 @@ curl -sS -X DELETE \
 | `datarows` | Array | POST/GET | Complete result rows when successful; otherwise empty. |
 | `total` | Integer | POST/GET | Number of successful result rows; otherwise `0`. |
 | `took` | Integer | `SUCCEEDED` | Execution time in milliseconds. |
-| `error` | Object | `FAILED` | Sanitized error type and reason. |
+| `error` | Object | `FAILED` | Query error type and reason. |
 
 Expired jobs and jobs whose owner node has left the cluster return `404`. Results remain subject to `plugins.query.size_limit`, which is 10,000 rows by default.
+
+Asynchronous execution remains subject to `plugins.ppl.query.timeout`. `keep_alive` controls how
+long job state and results are retained; it does not extend query execution time.
 
 ## Explain
 

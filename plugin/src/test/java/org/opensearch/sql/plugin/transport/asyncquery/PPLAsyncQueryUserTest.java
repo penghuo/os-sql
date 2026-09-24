@@ -6,6 +6,7 @@
 package org.opensearch.sql.plugin.transport.asyncquery;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 
 import java.util.List;
@@ -25,7 +26,7 @@ public class PPLAsyncQueryUserTest {
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT,
         "alice|backend-a|ppl-role|tenant-a");
 
-    PPLAsyncQueryUser identity = PPLAsyncQueryUser.current(context);
+    PPLAsyncQueryUser identity = new PPLAsyncQuerySecurity(true).currentUser(context);
 
     assertEquals("alice", identity.name());
     assertEquals("tenant-a", identity.requestedTenant());
@@ -38,13 +39,23 @@ public class PPLAsyncQueryUserTest {
     objectContext.putTransient(
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT,
         new User("alice", List.of("backend-a"), List.of("ppl-role"), null, "tenant-a"));
-    assertEquals("alice", PPLAsyncQueryUser.current(objectContext).name());
+    PPLAsyncQuerySecurity security = new PPLAsyncQuerySecurity(true);
+    assertEquals("alice", security.currentUser(objectContext).name());
 
     ThreadContext invalidContext = new ThreadContext(Settings.EMPTY);
     invalidContext.putTransient(
         ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT, new Object());
+    assertThrows(OpenSearchSecurityException.class, () -> security.currentUser(invalidContext));
+  }
+
+  @Test
+  public void missingIdentityFailsClosedWhenSecurityIsEnabled() {
+    ThreadContext context = new ThreadContext(Settings.EMPTY);
+
     assertThrows(
-        OpenSearchSecurityException.class, () -> PPLAsyncQueryUser.current(invalidContext));
+        OpenSearchSecurityException.class,
+        () -> new PPLAsyncQuerySecurity(true).currentUser(context));
+    assertFalse(new PPLAsyncQuerySecurity(false).currentUser(context).securityEnabled());
   }
 
   @Test

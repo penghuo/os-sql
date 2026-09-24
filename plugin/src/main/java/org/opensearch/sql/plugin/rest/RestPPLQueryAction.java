@@ -14,23 +14,16 @@ import java.util.List;
 import java.util.Set;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.OpenSearchException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestCancellableNodeClient;
-import org.opensearch.sql.common.antlr.SyntaxCheckException;
-import org.opensearch.sql.common.error.ErrorReport;
-import org.opensearch.sql.datasources.exceptions.DataSourceClientException;
-import org.opensearch.sql.exception.QueryEngineException;
-import org.opensearch.sql.legacy.metrics.MetricName;
-import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.opensearch.response.error.ErrorMessageFactory;
+import org.opensearch.sql.plugin.PPLQueryErrorHandler;
 import org.opensearch.sql.plugin.request.PPLQueryRequestFactory;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryRequest;
@@ -55,47 +48,8 @@ public class RestPPLQueryAction extends BaseRestHandler {
     super();
   }
 
-  private static boolean isClientError(Exception ex) {
-    // (Tombstone) NullPointerException has historically been treated as a client error, but
-    // nowadays they're rare and should be treated as system errors, since it represents a broken
-    // data model in our logic.
-    return ex instanceof IllegalArgumentException
-        || ex instanceof IndexNotFoundException
-        || ex instanceof QueryEngineException
-        || ex instanceof SyntaxCheckException
-        || ex instanceof DataSourceClientException
-        || ex instanceof IllegalAccessException;
-  }
-
-  private static int getRawErrorCode(Exception ex) {
-    if (ex instanceof ErrorReport) {
-      return getRawErrorCode(((ErrorReport) ex).getCause());
-    }
-    if (ex instanceof OpenSearchException) {
-      return ((OpenSearchException) ex).status().getStatus();
-    }
-    // Possible future work: We currently do this on exception types, when we have more robust
-    // ErrorCodes in more locations it may be worth switching this to be based on those instead.
-    // That lets us identify specific error cases at a granularity higher than exception types.
-    if (isClientError(ex)) {
-      return 400;
-    }
-    return 500;
-  }
-
   private static RestStatus loggedErrorCode(Exception ex) {
-    int code = getRawErrorCode(ex);
-
-    // If we hit neither branch, no-op as false alarm error? I don't believe we can ever hit this
-    // scenario.
-    if (400 <= code && code < 500) {
-      Metrics.getInstance().getNumericalMetric(MetricName.PPL_FAILED_REQ_COUNT_CUS).increment();
-    } else if (500 <= code && code < 600) {
-      Metrics.getInstance().getNumericalMetric(MetricName.PPL_FAILED_REQ_COUNT_SYS).increment();
-    } else {
-      LOG.warn("Got an exception returning non-error status {}", RestStatus.fromCode(code), ex);
-    }
-    return RestStatus.fromCode(code);
+    return PPLQueryErrorHandler.recordFailure(ex);
   }
 
   @Override

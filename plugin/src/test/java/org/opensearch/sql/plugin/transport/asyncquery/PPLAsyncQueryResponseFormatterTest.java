@@ -75,7 +75,7 @@ public class PPLAsyncQueryResponseFormatterTest {
   }
 
   @Test
-  public void failedResponseContainsSanitizedLifecycleShape() {
+  public void failedResponseContainsLifecycleError() {
     JSONObject json =
         json(
             formatter.format(
@@ -83,13 +83,12 @@ public class PPLAsyncQueryResponseFormatterTest {
                     "job-id",
                     PPLAsyncQueryService.Status.FAILED,
                     null,
-                    new PPLAsyncQueryService.Failure(
-                        "IllegalStateException", "query execution failed"),
+                    new PPLAsyncQueryService.Failure("IllegalStateException", "invalid query"),
                     10)));
 
     assertEquals("FAILED", json.getString("status"));
     assertEquals("IllegalStateException", json.getJSONObject("error").getString("type"));
-    assertEquals("query execution failed", json.getJSONObject("error").getString("reason"));
+    assertEquals("invalid query", json.getJSONObject("error").getString("reason"));
     assertTrue(json.getJSONArray("datarows").isEmpty());
     assertFalse(json.has("took"));
   }

@@ -83,6 +83,22 @@ public class PPLQueryRequestTest {
   }
 
   @Test
+  public void asyncLifecycleFieldsMustBeStrings() {
+    PPLQueryRequest numericKeepAlive =
+        new PPLQueryRequest("source=t", new JSONObject().put("keep_alive", 300), "/_plugins/_ppl");
+    PPLQueryRequest numericWait =
+        new PPLQueryRequest(
+            "source=t", new JSONObject().put("wait_for_completion_timeout", 1), "/_plugins/_ppl");
+
+    IllegalArgumentException keepAliveFailure =
+        assertThrows(IllegalArgumentException.class, numericKeepAlive::getKeepAlive);
+    assertEquals("[keep_alive] must be a string", keepAliveFailure.getMessage());
+    IllegalArgumentException waitFailure =
+        assertThrows(IllegalArgumentException.class, numericWait::getWaitForCompletionTimeout);
+    assertEquals("[wait_for_completion_timeout] must be a string", waitFailure.getMessage());
+  }
+
+  @Test
   public void defaultFormatQuerySupportsAsyncExecution() {
     assertTrue(
         new PPLQueryRequest("source=t", null, "/_plugins/_ppl", "jdbc").supportsAsyncExecution());

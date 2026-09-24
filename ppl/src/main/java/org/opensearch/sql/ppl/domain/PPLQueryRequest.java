@@ -179,7 +179,7 @@ public class PPLQueryRequest {
     if (jsonContent == null || !jsonContent.has(KEEP_ALIVE_FIELD)) {
       return DEFAULT_KEEP_ALIVE;
     }
-    return jsonContent.getString(KEEP_ALIVE_FIELD);
+    return stringLifecycleField(KEEP_ALIVE_FIELD);
   }
 
   /**
@@ -191,7 +191,15 @@ public class PPLQueryRequest {
     if (jsonContent == null || !jsonContent.has(WAIT_FOR_COMPLETION_TIMEOUT_FIELD)) {
       return DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT;
     }
-    return jsonContent.getString(WAIT_FOR_COMPLETION_TIMEOUT_FIELD);
+    return stringLifecycleField(WAIT_FOR_COMPLETION_TIMEOUT_FIELD);
+  }
+
+  private String stringLifecycleField(String field) {
+    Object value = jsonContent.get(field);
+    if (!(value instanceof String text)) {
+      throw new IllegalArgumentException("[" + field + "] must be a string");
+    }
+    return text;
   }
 
   /**

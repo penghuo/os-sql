@@ -11,7 +11,8 @@ When OpenSearch bootstraps, PPL plugin will register a few settings in OpenSearc
 
 ### Description  
 
-You can disable SQL plugin to reject all coming requests.
+You can disable PPL to reject all incoming PPL requests, including asynchronous submit, poll, and
+delete requests.
 1. The default value is true.  
 2. This setting is node scope.  
 3. This setting can be updated dynamically.  

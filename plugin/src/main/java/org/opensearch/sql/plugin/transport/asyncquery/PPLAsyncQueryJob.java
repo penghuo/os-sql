@@ -71,7 +71,7 @@ final class PPLAsyncQueryJob {
     this.owner = owner;
     this.startTimeMillis = startTimeMillis;
     this.keepAliveMillis = keepAliveMillis;
-    this.expirationTimeMillis = addWithoutOverflow(startTimeMillis, keepAliveMillis);
+    this.expirationTimeMillis = startTimeMillis + keepAliveMillis;
     this.task = task;
     this.state = State.RUNNING;
   }
@@ -96,7 +96,7 @@ final class PPLAsyncQueryJob {
       return null;
     }
     state = State.RETAINED_RUNNING;
-    expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
+    expirationTimeMillis = now + keepAliveMillis;
     return Transition.retain(retainedResponse());
   }
 
@@ -187,7 +187,7 @@ final class PPLAsyncQueryJob {
     }
     if (requestedKeepAlive != null) {
       keepAliveMillis = requestedKeepAlive.millis();
-      expirationTimeMillis = addWithoutOverflow(now, keepAliveMillis);
+      expirationTimeMillis = now + keepAliveMillis;
     }
     return new GetResult.Found(retainedResponse());
   }
@@ -327,14 +327,6 @@ final class PPLAsyncQueryJob {
   private void ensurePresent() {
     if (state == State.REMOVED) {
       throw new ResourceNotFoundException("PPL asynchronous query not found");
-    }
-  }
-
-  private static long addWithoutOverflow(long left, long right) {
-    try {
-      return Math.addExact(left, right);
-    } catch (ArithmeticException e) {
-      return Long.MAX_VALUE;
     }
   }
 

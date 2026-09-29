@@ -2,7 +2,9 @@
 
 ## Introduction  
 
-User needs `cluster:admin/opensearch/ppl` permission to use PPL plugin. User also needs indices level permission `indices:admin/mappings/get` to get field mappings, `indices:monitor/settings/get` to get cluster settings, and `indices:data/read/search*` to search index.
+User needs `cluster:admin/opensearch/ppl` permission to submit synchronous or asynchronous PPL queries. Polling and deleting retained asynchronous jobs are independently authorized with `cluster:admin/opensearch/ppl/async_query/result` and `cluster:admin/opensearch/ppl/async_query/delete`. User also needs indices level permission `indices:admin/mappings/get` to get field mappings, `indices:monitor/settings/get` to get cluster settings, and `indices:data/read/search*` to search index.
+
+Every asynchronous GET and DELETE request is reauthorized. Knowing a job ID does not grant access to its metadata or result. The caller must have the operation permission, match the submitting user and tenant, and retain all backend roles captured at submission.
 ## Using Rest API  
 
 **--INTRODUCED 2.1--**  
@@ -14,7 +16,9 @@ Example: Create the ppl_role for test_user. then test_user could use PPL to quer
 PUT _plugins/_security/api/roles/ppl_role
 {
   "cluster_permissions": [
-    "cluster:admin/opensearch/ppl"
+    "cluster:admin/opensearch/ppl",
+    "cluster:admin/opensearch/ppl/async_query/result",
+    "cluster:admin/opensearch/ppl/async_query/delete"
   ],
   "index_permissions": [{
     "index_patterns": [
@@ -54,7 +58,9 @@ Example: Create ppl_access permission and add to existing role
 PUT _plugins/_security/api/actiongroups/ppl_access
 {
   "allowed_actions": [
-    "cluster:admin/opensearch/ppl"
+    "cluster:admin/opensearch/ppl",
+    "cluster:admin/opensearch/ppl/async_query/result",
+    "cluster:admin/opensearch/ppl/async_query/delete"
   ]
 }
 

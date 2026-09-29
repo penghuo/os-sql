@@ -527,6 +527,12 @@ testClusters {
         // Only /_cluster/health is registered; pin the allow-list to it for RestCommandSecurityIT.
         setting 'plugins.ppl.rest.allowed_endpoints', '/_cluster/health'
     }
+    pplAsyncQueryMultiNodeSecurityIT {
+        testDistribution = 'archive'
+        numberOfNodes = 3
+        plugin(getJobSchedulerPlugin())
+        plugin ":opensearch-sql-plugin"
+    }
     remoteIntegTestWithSecurity {
         testDistribution = 'archive'
         plugin(getJobSchedulerPlugin())
@@ -544,6 +550,8 @@ testClusters {
         setting 'cluster.pluggable.dataformat', 'composite'
     }
 }
+
+configureSecurityPlugin(testClusters.pplAsyncQueryMultiNodeSecurityIT)
 
 def isPrometheusRunning() {
     try {
@@ -762,6 +770,7 @@ task integJdbcTest(type: RestIntegTestTask) {
 }
 
 task integTestWithSecurity(type: RestIntegTestTask) {
+    dependsOn 'pplAsyncQueryMultiNodeSecurityIT'
     useCluster testClusters.integTestWithSecurity
     useCluster testClusters.remoteIntegTestWithSecurity
 
@@ -826,6 +835,31 @@ task integTestWithSecurity(type: RestIntegTestTask) {
 
     filter {
         includeTestsMatching 'org.opensearch.sql.security.*'
+        excludeTestsMatching 'org.opensearch.sql.security.PPLAsyncQueryMultiNodeIT'
+    }
+}
+
+task pplAsyncQueryMultiNodeSecurityIT(type: RestIntegTestTask) {
+    useCluster testClusters.pplAsyncQueryMultiNodeSecurityIT
+    dependsOn ':opensearch-sql-plugin:bundlePlugin'
+
+    systemProperty 'tests.required.plugins', 'opensearch-security'
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'project.root', project.projectDir.absolutePath
+
+    doFirst {
+        systemProperty "https", "false"
+        systemProperty "user", "admin"
+        systemProperty "password", "admin"
+    }
+
+    filter {
+        includeTestsMatching 'org.opensearch.sql.security.PPLAsyncQueryMultiNodeIT'
+    }
+
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
     }
 }
 

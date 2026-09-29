@@ -122,6 +122,11 @@ import org.opensearch.sql.plugin.rest.RestUnifiedQueryAction;
 import org.opensearch.sql.plugin.transport.PPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryAction;
 import org.opensearch.sql.plugin.transport.TransportPPLQueryResponse;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncDeleteAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncGetResultAction;
+import org.opensearch.sql.plugin.transport.asyncquery.PPLAsyncQueryService;
+import org.opensearch.sql.plugin.transport.asyncquery.TransportPPLAsyncDeleteAction;
+import org.opensearch.sql.plugin.transport.asyncquery.TransportPPLAsyncGetResultAction;
 import org.opensearch.sql.prometheus.storage.PrometheusStorageFactory;
 import org.opensearch.sql.protocol.response.format.JsonResponseFormatter;
 import org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style;
@@ -365,6 +370,9 @@ public class SQLPlugin extends Plugin
             new ActionType<>(PPLQueryAction.NAME, TransportPPLQueryResponse::new),
             TransportPPLQueryAction.class),
         new ActionHandler<>(
+            PPLAsyncGetResultAction.INSTANCE, TransportPPLAsyncGetResultAction.class),
+        new ActionHandler<>(PPLAsyncDeleteAction.INSTANCE, TransportPPLAsyncDeleteAction.class),
+        new ActionHandler<>(
             new ActionType<>(
                 TransportCreateDataSourceAction.NAME, CreateDataSourceActionResponse::new),
             TransportCreateDataSourceAction.class),
@@ -473,6 +481,8 @@ public class SQLPlugin extends Plugin
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);
 
     EngineExtensionsHolder extensionsHolder = new EngineExtensionsHolder(executionEngineExtensions);
+    PPLAsyncQueryService pplAsyncQueryService =
+        new PPLAsyncQueryService(this.client::getLocalNodeId, threadPool, pluginSettings);
 
     return ImmutableList.of(
         dataSourceService,
@@ -480,7 +490,8 @@ public class SQLPlugin extends Plugin
         clusterManagerEventListener,
         pluginSettings,
         directQueryExecutorService,
-        extensionsHolder);
+        extensionsHolder,
+        pplAsyncQueryService);
   }
 
   @Override

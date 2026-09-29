@@ -131,8 +131,7 @@ public class CalciteFlattenCommandIT extends PPLIntegTestCase {
     Request deleteRequest =
         new Request(
             "DELETE",
-            String.format(
-                "/%s/_doc/%d?refresh=true", TEST_INDEX_NESTED_TYPE_WITHOUT_ARRAYS, docId));
+            "/" + TEST_INDEX_NESTED_TYPE_WITHOUT_ARRAYS + "/_doc/" + docId + "?refresh=true");
     client().performRequest(deleteRequest);
   }
 

@@ -59,14 +59,17 @@ public class TransportGetAsyncQueryResultActionTest {
   public void setUp() {
     action =
         new TransportGetAsyncQueryResultAction(
-            transportService, new ActionFilters(new HashSet<>()), jobExecutorService);
+            transportService,
+            new ActionFilters(new HashSet<>()),
+            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
+            jobExecutorService);
   }
 
   @Test
   public void testDoExecute() {
     GetAsyncQueryResultActionRequest request = new GetAsyncQueryResultActionRequest("jobId");
     AsyncQueryExecutionResponse asyncQueryExecutionResponse =
-        new AsyncQueryExecutionResponse("IN_PROGRESS", null, null, null, null);
+        new AsyncQueryExecutionResponse("IN_PROGRESS", null, null, null, null, null);
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
         .thenReturn(asyncQueryExecutionResponse);
 
@@ -95,6 +98,7 @@ public class TransportGetAsyncQueryResultActionTest {
             Arrays.asList(
                 tupleValue(ImmutableMap.of("name", "John", "age", 20)),
                 tupleValue(ImmutableMap.of("name", "Smith", "age", 30))),
+            null,
             null,
             null);
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
@@ -149,5 +153,46 @@ public class TransportGetAsyncQueryResultActionTest {
     Exception exception = exceptionArgumentCaptor.getValue();
     Assertions.assertTrue(exception instanceof RuntimeException);
     Assertions.assertEquals("JobId 123 not found", exception.getMessage());
+  }
+
+  @Test
+  public void queryJobNotFound_translatesToResourceNotFoundException() {
+    GetAsyncQueryResultActionRequest request = new GetAsyncQueryResultActionRequest("missing");
+    doThrow(new org.opensearch.sql.job.exceptions.QueryJobNotFoundException(
+            new org.opensearch.sql.job.QueryJobId("node-a", "ctx-x")))
+        .when(jobExecutorService)
+        .getAsyncQueryResults(eq("missing"), any());
+
+    action.doExecute(task, request, actionListener);
+
+    verify(actionListener).onFailure(exceptionArgumentCaptor.capture());
+    Exception captured = exceptionArgumentCaptor.getValue();
+    // Transport-serializable OpenSearchException with status NOT_FOUND — survives cross-node
+    // forwarding without being wrapped as NotSerializableExceptionWrapper(500).
+    Assertions.assertTrue(
+        captured instanceof org.opensearch.ResourceNotFoundException,
+        "expected ResourceNotFoundException, got " + captured.getClass());
+    Assertions.assertEquals(
+        org.opensearch.core.rest.RestStatus.NOT_FOUND,
+        ((org.opensearch.ResourceNotFoundException) captured).status());
+  }
+
+  @Test
+  public void queryJobForbidden_translatesToOpenSearchStatusForbidden() {
+    GetAsyncQueryResultActionRequest request = new GetAsyncQueryResultActionRequest("foreign");
+    doThrow(new org.opensearch.sql.job.exceptions.QueryJobForbiddenException())
+        .when(jobExecutorService)
+        .getAsyncQueryResults(eq("foreign"), any());
+
+    action.doExecute(task, request, actionListener);
+
+    verify(actionListener).onFailure(exceptionArgumentCaptor.capture());
+    Exception captured = exceptionArgumentCaptor.getValue();
+    Assertions.assertTrue(
+        captured instanceof org.opensearch.OpenSearchStatusException,
+        "expected OpenSearchStatusException, got " + captured.getClass());
+    Assertions.assertEquals(
+        org.opensearch.core.rest.RestStatus.FORBIDDEN,
+        ((org.opensearch.OpenSearchStatusException) captured).status());
   }
 }

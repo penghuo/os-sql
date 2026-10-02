@@ -9,7 +9,7 @@ Compatible with OpenSearch and OpenSearch Dashboards version 3.10.0
 ### Bug Fixes
 
 * Release jobs that return rows, explain output, or failures inline without creating retention timers. Retain terminal results only for submissions that return a polling ID.
-* Stop a cancelled PPL query instead of restarting it on the legacy engine when `plugins.calcite.fallback.allowed` is enabled, and stop legacy-engine index scans when their query task is cancelled.
+* Stop a cancelled Calcite PPL query instead of restarting it on the legacy engine when `plugins.calcite.fallback.allowed` is enabled.
 
 ### Compatibility Notes
 

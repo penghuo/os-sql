@@ -16,19 +16,16 @@ import org.jetbrains.annotations.TestOnly;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.BytesStreamInput;
-import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.exception.NoCursorException;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
-import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.request.OpenSearchQueryRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
 import org.opensearch.sql.planner.SerializablePlan;
 import org.opensearch.sql.storage.TableScanOperator;
-import org.opensearch.tasks.CancellableTask;
 
 /** OpenSearch index scan operator. */
 @EqualsAndHashCode(onlyExplicitlyIncluded = true, callSuper = false)
@@ -56,9 +53,6 @@ public class OpenSearchIndexScan extends TableScanOperator implements Serializab
   /** Search response for current batch. */
   private Iterator<ExprValue> iterator;
 
-  /** Task of the request executing this scan, captured on the execution thread in open(). */
-  private CancellableTask cancellableTask;
-
   /** Creates index scan based on a provided OpenSearchRequestBuilder. */
   public OpenSearchIndexScan(
       OpenSearchClient client, int maxResponseSize, OpenSearchRequest request) {
@@ -75,7 +69,6 @@ public class OpenSearchIndexScan extends TableScanOperator implements Serializab
   @Override
   public void open() {
     super.open();
-    cancellableTask = OpenSearchQueryManager.getCancellableTask();
     iterator = Collections.emptyIterator();
     queryCount = 0;
     fetchNextBatch();
@@ -87,7 +80,6 @@ public class OpenSearchIndexScan extends TableScanOperator implements Serializab
     if (Thread.currentThread().isInterrupted()) {
       throw new OpenSearchTimeoutException(new InterruptedException("Query execution interrupted"));
     }
-    checkCancelled();
 
     // For pagination and limit, we need to limit the return rows count to pageSize or limit size
     if (queryCount >= maxResponseSize) {
@@ -106,23 +98,15 @@ public class OpenSearchIndexScan extends TableScanOperator implements Serializab
     if (Thread.currentThread().isInterrupted()) {
       throw new OpenSearchTimeoutException(new InterruptedException("Query execution interrupted"));
     }
-    checkCancelled();
 
     queryCount++;
     return iterator.next();
   }
 
   private void fetchNextBatch() {
-    checkCancelled();
     OpenSearchResponse response = client.search(request);
     if (!response.isEmpty()) {
       iterator = response.iterator();
-    }
-  }
-
-  private void checkCancelled() {
-    if (cancellableTask != null && cancellableTask.isCancelled()) {
-      throw new TaskCancelledException("The task is cancelled.");
     }
   }
 

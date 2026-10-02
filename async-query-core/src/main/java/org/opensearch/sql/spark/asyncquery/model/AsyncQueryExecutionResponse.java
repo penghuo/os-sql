@@ -10,6 +10,7 @@ import java.util.Map;
 import lombok.Data;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.progress.QueryProgress;
 
 /** AsyncQueryExecutionResponse to store the response form spark job execution. */
 @Data
@@ -28,15 +29,12 @@ public class AsyncQueryExecutionResponse {
    */
   private final ExecutionEngine.ExplainResponse explain;
 
-  /**
-   * Structured error payload — the same map {@code SyncErrorReportRenderer} produces for the sync
-   * REST path. Populated only on the PPL {@code FAILED} path so an async GET returns the full
-   * sync-shape error body. {@code null} on every other path, including every Spark construction
-   * site; the formatter keeps the existing {@code "error"}-as-string branch for Spark.
-   */
+  /** Structured synchronous error details, populated on the PPL failure path. */
   private final Map<String, Object> errorDetails;
 
-  /** Spark-shaped constructor; keeps callers that never populate structured error details. */
+  /** Completion estimate, or {@code null} when the underlying path reports none. */
+  private final QueryProgress progress;
+
   public AsyncQueryExecutionResponse(
       String status,
       ExecutionEngine.Schema schema,
@@ -44,12 +42,9 @@ public class AsyncQueryExecutionResponse {
       String error,
       String sessionId,
       ExecutionEngine.ExplainResponse explain) {
-    this(status, schema, results, error, sessionId, explain, null);
+    this(status, schema, results, error, sessionId, explain, null, null);
   }
 
-  /**
-   * Full constructor including the structured error payload. Used by the PPL async failure path.
-   */
   public AsyncQueryExecutionResponse(
       String status,
       ExecutionEngine.Schema schema,
@@ -58,6 +53,18 @@ public class AsyncQueryExecutionResponse {
       String sessionId,
       ExecutionEngine.ExplainResponse explain,
       Map<String, Object> errorDetails) {
+    this(status, schema, results, error, sessionId, explain, errorDetails, null);
+  }
+
+  public AsyncQueryExecutionResponse(
+      String status,
+      ExecutionEngine.Schema schema,
+      List<ExprValue> results,
+      String error,
+      String sessionId,
+      ExecutionEngine.ExplainResponse explain,
+      Map<String, Object> errorDetails,
+      QueryProgress progress) {
     this.status = status;
     this.schema = schema;
     this.results = results;
@@ -65,5 +72,6 @@ public class AsyncQueryExecutionResponse {
     this.sessionId = sessionId;
     this.explain = explain;
     this.errorDetails = errorDetails;
+    this.progress = progress;
   }
 }

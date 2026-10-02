@@ -15,6 +15,7 @@ import java.util.Optional;
 import org.json.JSONObject;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.Principal;
 import org.opensearch.sql.job.QueryFailure;
 import org.opensearch.sql.job.QueryJobId;
@@ -160,6 +161,7 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
             result,
             null,
             sessionId,
+            null,
             null);
       } else {
         return new AsyncQueryExecutionResponse(
@@ -168,6 +170,7 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
             null,
             jsonObject.optString(ERROR_FIELD, ""),
             sessionId,
+            null,
             null);
       }
     }
@@ -215,15 +218,23 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
    * carry no rows.
    */
   private static AsyncQueryExecutionResponse toAsyncResponse(QueryJobStatus status) {
+    QueryProgress progress = status.progress();
     if (status.state() == QueryJobState.SUCCEEDED && status.result().isPresent()) {
       QueryResult result = status.result().get();
       if (result instanceof QueryResult.Rows rows) {
         return new AsyncQueryExecutionResponse(
-            status.state().name(), rows.schema(), rows.rows(), null, null, null);
+            status.state().name(), rows.schema(), rows.rows(), null, null, null, null, progress);
       }
       if (result instanceof QueryResult.Explain explain) {
         return new AsyncQueryExecutionResponse(
-            status.state().name(), EMPTY_SCHEMA, List.of(), null, null, explain.response());
+            status.state().name(),
+            EMPTY_SCHEMA,
+            List.of(),
+            null,
+            null,
+            explain.response(),
+            null,
+            progress);
       }
     }
     if (status.state() == QueryJobState.FAILED) {
@@ -242,9 +253,10 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
           status.failure().map(QueryFailure::reason).orElse("query execution failed"),
           null,
           null,
-          details);
+          details,
+          progress);
     }
     return new AsyncQueryExecutionResponse(
-        status.state().name(), EMPTY_SCHEMA, List.of(), null, null, null);
+        status.state().name(), EMPTY_SCHEMA, List.of(), null, null, null, null, progress);
   }
 }

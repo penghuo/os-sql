@@ -6,6 +6,7 @@
 package org.opensearch.sql.job;
 
 import java.util.concurrent.CompletionStage;
+import org.opensearch.sql.executor.progress.QueryProgress;
 
 /**
  * Engine adapter that produces a {@link QueryResult} for one submitted query.
@@ -25,4 +26,16 @@ public interface QueryRunner {
 
   /** Requests cooperative cancellation. Safe to call from any state. */
   void cancel();
+
+  /**
+   * Returns the progress currently observed for this query.
+   *
+   * <p>Called by {@link QueryJob} on every status snapshot, so it must be cheap and non-blocking —
+   * reading already-accumulated counters, never computing or waiting. Runners that cannot observe
+   * their own progress keep the default and their jobs report {@code 0.0} until the lifecycle layer
+   * publishes {@code 1.0} on success.
+   */
+  default QueryProgress progress() {
+    return QueryProgress.ZERO;
+  }
 }

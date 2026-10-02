@@ -9,14 +9,18 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -24,16 +28,26 @@ import org.opensearch.action.admin.indices.exists.indices.IndicesExistsResponse;
 import org.opensearch.action.admin.indices.get.GetIndexResponse;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.settings.get.GetSettingsResponse;
+import org.opensearch.action.admin.indices.stats.IndicesStatsRequest;
+import org.opensearch.action.admin.indices.stats.IndicesStatsResponse;
+import org.opensearch.action.admin.indices.stats.ShardStats;
 import org.opensearch.action.search.*;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.common.action.ActionFuture;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.sql.common.error.ErrorCode;
 import org.opensearch.sql.common.error.ErrorReport;
+import org.opensearch.sql.executor.progress.SourceShardKey;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.sql.opensearch.executor.progress.ObservedSearchRequest;
+import org.opensearch.sql.opensearch.executor.progress.ProgressiveQueryContext;
+import org.opensearch.sql.opensearch.executor.progress.SearchProgressReport;
+import org.opensearch.sql.opensearch.executor.progress.SourceChannel;
+import org.opensearch.sql.opensearch.executor.progress.SourceEstimate;
 import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchScrollRequest;
@@ -43,6 +57,8 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch connection by node client. */
 public class OpenSearchNodeClient implements OpenSearchClient {
+
+  private static final Logger LOG = LogManager.getLogger(OpenSearchNodeClient.class);
 
   public static final Function<String, Predicate<String>> ALL_FIELDS =
       (anyIndex -> (anyField -> true));
@@ -163,18 +179,118 @@ public class OpenSearchNodeClient implements OpenSearchClient {
   /** TODO: Scroll doesn't work for aggregation. Support aggregation later. */
   @Override
   public OpenSearchResponse search(OpenSearchRequest request) {
+    // One channel per physical search: shard bookkeeping is per-search, so a paged scan must not
+    // have
+    // page N's shard list confused with page N-1's.
+    SourceChannel channel = ProgressiveQueryContext.openChannel();
     return request.search(
-        req -> {
-          applyParentTask(req);
-          return client.search(req).actionGet();
-        },
+        req ->
+            executeObservedSearch(
+                req, channel, searchRequest -> client.search(searchRequest).actionGet()),
+        // Scroll continuations carry only a scroll id, so there is nothing to observe on them; the
+        // scroll's
+        // opening search went through the branch above.
         req -> client.searchScroll(req).actionGet());
+  }
+
+  /**
+   * Runs one physical search and reports what it contributed.
+   *
+   * <p>Package-private, and parameterised on the transport call, so tests can exercise this exact
+   * sequence — parent-task application, wrapper construction, response reporting — without a live
+   * cluster. The wiring between those steps is where progress reporting can silently break existing
+   * behaviour, so it is worth testing as a unit rather than only through its parts.
+   */
+  SearchResponse executeObservedSearch(
+      SearchRequest req,
+      SourceChannel channel,
+      Function<SearchRequest, SearchResponse> searchAction) {
+    applyParentTask(req);
+    SearchResponse response = searchAction.apply(ObservedSearchRequest.wrap(req, channel));
+    reportSearchProgress(channel, req, response);
+    return response;
+  }
+
+  /**
+   * Reports what one search response contributed.
+   *
+   * <p>The scan already declared its shape, so this only supplies the numbers — it never re-derives
+   * the shape, because a response cannot tell a paged page from a single request's only answer.
+   * Source completion is likewise not decided here: only the scan knows whether another page will
+   * be requested.
+   */
+  private static void reportSearchProgress(
+      SourceChannel channel, SearchRequest request, SearchResponse response) {
+    if (channel.isNoop() || response == null) {
+      return;
+    }
+    try {
+      SearchProgressReport report =
+          SearchProgressReport.of(request, response, channel.declaredUnit());
+      channel.rowsObserved(report.completedUnits(), report.pageSize(), report.observedTotal());
+    } catch (RuntimeException e) {
+      // Progress reporting is strictly advisory. A malformed aggregation tree must not turn a
+      // successful
+      // search into a failed query.
+      LOG.debug("Failed to report search progress", e);
+    }
   }
 
   private void applyParentTask(SearchRequest req) {
     CancellableTask task = OpenSearchQueryManager.getCancellableTask();
     if (task != null) {
       req.setParentTask(new TaskId(client.getLocalNodeId(), task.getId()));
+    }
+  }
+
+  @Override
+  public Optional<SourceEstimate> documentCountEstimate(String[] indices, long timeoutMillis) {
+    if (indices == null || indices.length == 0) {
+      return Optional.empty();
+    }
+    try {
+      IndicesStatsRequest statsRequest = new IndicesStatsRequest().clear().docs(true);
+      statsRequest.indices(indices);
+      // Bounded wait: §8.2 requires that an unavailable estimate select the documented fallback
+      // immediately rather than delaying execution.
+      IndicesStatsResponse stats =
+          client
+              .admin()
+              .indices()
+              .stats(statsRequest)
+              .actionGet(timeoutMillis, TimeUnit.MILLISECONDS);
+      if (stats.getFailedShards() > 0) {
+        // Partial stats are discarded: a denominator that omits a failed shard's documents would
+        // make
+        // progress overshoot and then stall at the clamp.
+        return Optional.empty();
+      }
+      Map<SourceShardKey, Long> shardDocs = new HashMap<>();
+      long total = 0L;
+      for (ShardStats shard : stats.getShards()) {
+        if (!shard.getShardRouting().primary()) {
+          continue;
+        }
+        if (shard.getStats() == null || shard.getStats().getDocs() == null) {
+          return Optional.empty();
+        }
+        long count = shard.getStats().getDocs().getCount();
+        if (count < 0) {
+          return Optional.empty();
+        }
+        ShardId shardId = shard.getShardRouting().shardId();
+        shardDocs.put(new SourceShardKey(shardId.getIndex().getUUID(), shardId.id()), count);
+        total += count;
+      }
+      if (shardDocs.isEmpty()) {
+        return Optional.empty();
+      }
+      return Optional.of(new SourceEstimate(total, shardDocs));
+    } catch (Exception e) {
+      // Includes OpenSearchSecurityException (caller cannot read _stats) and timeouts. Progress is
+      // advisory, so every failure mode degrades to equal-weight accounting.
+      LOG.debug("Document count estimate unavailable for {}", Arrays.toString(indices), e);
+      return Optional.empty();
     }
   }
 

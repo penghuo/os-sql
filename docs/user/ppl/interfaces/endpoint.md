@@ -682,7 +682,7 @@ Parameters:
 
 ### Example
 
-Submit a query with a wait budget large enough for completion. The response is the same shape as a synchronous PPL response — no `id`, no polling needed:
+Submit a query with a wait budget large enough for completion. The response carries the same schema and rows as a synchronous PPL response — no `id`, no polling needed — plus `progress`, which reports `1.0` because the query finished:
 
 ```bash ppl
 curl -sS -H 'Content-Type: application/json' \
@@ -706,7 +706,10 @@ Expected output:
     ]
   ],
   "total": 1,
-  "size": 1
+  "size": 1,
+  "progress": {
+    "fraction_done": 1.0
+  }
 }
 ```
 
@@ -718,7 +721,10 @@ If the query is still running when the wait expires, the response is:
   "status": "RUNNING",
   "schema": [],
   "datarows": [],
-  "total": 0
+  "total": 0,
+  "progress": {
+    "fraction_done": 0.12
+  }
 }
 ```
 
@@ -746,8 +752,48 @@ Both terminal states return HTTP `200`. The body shape differs by state:
       "stage_description": "Parsing and validating the query"
     },
     "location": ["while preparing and validating the query plan"]
+  },
+  "progress": {
+    "fraction_done": 0.0
   }
 }
 ```
 
 The GET HTTP status is `200` whenever the poll itself succeeds. `404` from GET means the id is unknown or has expired beyond `keep_alive`; `403` means the caller is not the job's owner.
+
+## Async progress — `progress.fraction_done`
+
+### Description
+
+Every asynchronous response carries a `progress` object reporting how far the query has got. It is present on the submit response, on every poll, and on the terminal response, so a client never has to treat a missing field as a particular value.
+
+```json
+"progress": {
+  "fraction_done": 0.44
+}
+```
+
+`fraction_done` is a bounded, best-effort estimate derived from signals OpenSearch already produces — per-shard query completion, page counts, Composite bucket counts, and a cheap index-size lookup taken before execution. It does not require `track_total_hits` and does not change how the query runs.
+
+Guarantees a client can rely on:
+
+| Property | Behavior |
+|---|---|
+| Range | Always finite and within `[0.0, 1.0]`. |
+| Monotonic | Never decreases across responses for one job. |
+| Running ceiling | A `RUNNING` response never exceeds `0.8`. The top 20% is reserved so that finishing every source cannot report a result that is not ready — the coordinator may still be sorting, joining, or reducing. |
+| Success | `SUCCEEDED` reports exactly `1.0`. Treat `1.0` as "the result is ready". |
+| Failure and cancellation | Retain the last running value instead of being rounded up, so a query that failed early is distinguishable from one that failed near the end. |
+
+### Interpretation
+
+`fraction_done` measures progress through the query's **source work**, not the fraction of the final result that is available. A blocking query — a sort, a join, a non-pushed aggregation — can sit at `0.8` while the coordinator finishes, and it reports no rows until it succeeds. Equally, the estimate is derived from index size rather than filter selectivity, so a highly selective query advances faster than its denominator implies.
+
+A plan whose sources all run concurrently is combined by document count: for a join over a nine-million-document index and a one-million-document index, the small side finishing contributes 10% of the source work, not 50%.
+
+### Limitations
+
+- A query the engine answers without an OpenSearch scan — one that falls back to the V2 engine, or is routed to the analytics engine — reports `0.0` while running and `1.0` on success. There is no instrumented source to observe.
+- The index-size lookup is bounded and all-or-nothing. If it is unavailable — the caller lacks permission to read `_stats`, the call times out, or a primary shard failed — progress falls back to weighting every source and every shard equally. The query is unaffected.
+- A single-request source has only one round trip to observe, so its progress comes entirely from shard completion and it has no sub-shard resolution.
+- Statement-level `explain` reports `1.0` alongside its plan output; there is no meaningful intermediate value for a plan that is never executed.

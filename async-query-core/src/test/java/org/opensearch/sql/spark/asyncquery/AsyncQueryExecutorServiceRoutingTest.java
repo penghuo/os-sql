@@ -27,6 +27,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponseNodeV2;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.Principal;
 import org.opensearch.sql.job.QueryFailure;
 import org.opensearch.sql.job.QueryJobId;
@@ -163,7 +164,9 @@ class AsyncQueryExecutorServiceRoutingTest {
   @Test
   void runningMarkerIsNotRenderedAsFinalRows() {
     stubSnapshot(
-        QueryJobState.SUCCEEDED, Optional.of(new QueryResult.Running(JOB_ID)), Optional.empty());
+        QueryJobState.SUCCEEDED,
+        Optional.of(new QueryResult.Running(JOB_ID, QueryProgress.ZERO)),
+        Optional.empty());
 
     AsyncQueryExecutionResponse response = fetch();
 
@@ -267,7 +270,8 @@ class AsyncQueryExecutorServiceRoutingTest {
         state == QueryJobState.PENDING ? OptionalLong.empty() : OptionalLong.of(1),
         state.isTerminal() ? OptionalLong.of(2) : OptionalLong.empty(),
         failure,
-        result);
+        result,
+        state == QueryJobState.SUCCEEDED ? QueryProgress.COMPLETE : QueryProgress.ZERO);
   }
 
   private void assertEmptyResults(AsyncQueryExecutionResponse response) {

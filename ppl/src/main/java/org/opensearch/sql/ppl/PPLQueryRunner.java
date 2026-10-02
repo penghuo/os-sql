@@ -14,6 +14,10 @@ import java.util.function.Consumer;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
+import org.opensearch.sql.executor.progress.ProgressObserver;
+import org.opensearch.sql.executor.progress.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.progress.ProgressiveSourceProgress;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.QueryResult;
 import org.opensearch.sql.job.QueryRunner;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
@@ -28,6 +32,12 @@ import org.opensearch.sql.ppl.domain.PPLQueryRequest;
  * <p>Cancellation is best-effort: {@link PPLService} does not surface an interrupt hook for
  * synchronous execution, so {@link #cancel()} marks the future as cancelled and lets a late
  * response drop on the floor.
+ *
+ * <p>The row listener handed to {@link PPLService} is a {@link ProgressiveQueryResponseListener},
+ * which is how the storage layer discovers that this query is observed: the listener is the only
+ * object that already travels from here into the execution engine. Progress itself is produced
+ * entirely by the OpenSearch scan path; a plan with no instrumented scan — the V2 fallback, the
+ * analytics-engine route — registers no sources and reports {@code 0.0} until the job succeeds.
  */
 public final class PPLQueryRunner implements QueryRunner {
 
@@ -37,6 +47,7 @@ public final class PPLQueryRunner implements QueryRunner {
   private final Clock clock;
   private final AtomicBoolean started = new AtomicBoolean();
   private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
+  private final ProgressiveSourceProgress sourceProgress = new ProgressiveSourceProgress();
 
   /**
    * @param pplService live PPL service; not owned by the runner
@@ -66,7 +77,7 @@ public final class PPLQueryRunner implements QueryRunner {
     long startMillis = clock.millis();
     pplService.execute(
         request,
-        new ResponseListener<QueryResponse>() {
+        new ProgressiveQueryResponseListener<QueryResponse>() {
           @Override
           public void onResponse(QueryResponse response) {
             future.complete(QueryResult.of(response, clock.millis() - startMillis));
@@ -75,6 +86,11 @@ public final class PPLQueryRunner implements QueryRunner {
           @Override
           public void onFailure(Exception e) {
             future.completeExceptionally(e);
+          }
+
+          @Override
+          public ProgressObserver progressObserver() {
+            return sourceProgress;
           }
         },
         new ResponseListener<ExplainResponse>() {
@@ -95,5 +111,10 @@ public final class PPLQueryRunner implements QueryRunner {
   @Override
   public void cancel() {
     future.cancel(false);
+  }
+
+  @Override
+  public QueryProgress progress() {
+    return sourceProgress.current();
   }
 }

@@ -19,6 +19,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.stream.Collectors;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -146,6 +147,24 @@ public class OpenSearchResponse implements Iterable<ExprValue> {
 
   public int getHitsSize() {
     return hits == null ? 0 : hits.getHits() == null ? 0 : hits.getHits().length;
+  }
+
+  /**
+   * Lower bound on the number of documents matching the query, as reported by OpenSearch.
+   *
+   * <p>With the default {@code track_total_hits} the returned value saturates at 10,000 and its
+   * relation is {@code GREATER_THAN_OR_EQUAL_TO}, so this is explicitly a bound and not a count.
+   * Progress reporting treats it that way: the bound seeds the denominator and is revised upward if
+   * the scan keeps producing documents past it. Empty when the response carries no total — a scroll
+   * continuation or an aggregation-only request.
+   *
+   * @return matched-document lower bound, or empty when unavailable
+   */
+  public OptionalLong getTotalHitsLowerBound() {
+    if (hits == null || hits.getTotalHits() == null) {
+      return OptionalLong.empty();
+    }
+    return OptionalLong.of(hits.getTotalHits().value());
   }
 
   /**

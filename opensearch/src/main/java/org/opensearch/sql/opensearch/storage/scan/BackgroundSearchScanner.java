@@ -21,6 +21,7 @@ import org.opensearch.sql.exception.NonFallbackCalciteException;
 import org.opensearch.sql.monitor.profile.ProfileContext;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.executor.progress.ProgressiveQueryContext;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 
@@ -71,11 +72,30 @@ public class BackgroundSearchScanner {
   private final int maxResultWindow;
   private final int queryBucketSize;
 
+  /**
+   * Progress identity of the scan this scanner serves, or {@code null} when the query is not
+   * observed.
+   *
+   * <p>Carried explicitly because page fetches run on {@code sql_background_io}, which inherits no
+   * thread-local state. Replaying it around each search is what lets the node client attribute
+   * shard callbacks and response rows to the right source.
+   */
+  @Nullable private final ProgressiveQueryContext.Binding progressBinding;
+
   public BackgroundSearchScanner(
       OpenSearchClient client, int maxResultWindow, int queryBucketSize) {
+    this(client, maxResultWindow, queryBucketSize, null);
+  }
+
+  public BackgroundSearchScanner(
+      OpenSearchClient client,
+      int maxResultWindow,
+      int queryBucketSize,
+      @Nullable ProgressiveQueryContext.Binding progressBinding) {
     this.client = client;
     this.maxResultWindow = maxResultWindow;
     this.queryBucketSize = queryBucketSize;
+    this.progressBinding = progressBinding;
     // We can only actually do the background operation if we have the ability to access the thread
     // pool. Otherwise, fallback to synchronous fetch.
     if (client.getNodeClient().isPresent()) {
@@ -108,8 +128,21 @@ public class BackgroundSearchScanner {
       ProfileContext ctx = QueryProfiling.current();
       nextBatchFuture =
           CompletableFuture.supplyAsync(
-              () -> QueryProfiling.withCurrentContext(ctx, () -> client.search(request)),
+              () -> QueryProfiling.withCurrentContext(ctx, () -> observedSearch(request)),
               backgroundExecutor);
+    }
+  }
+
+  /**
+   * Runs one search with this scan's progress binding installed.
+   *
+   * <p>Background IO threads are pooled and inherit nothing, so without this the node client would
+   * see no binding and silently report the search against no source. The scope restores the
+   * previous binding on the way out so the pooled thread carries nothing into the next task.
+   */
+  private OpenSearchResponse observedSearch(OpenSearchRequest request) {
+    try (ProgressiveQueryContext.Scope scope = ProgressiveQueryContext.restore(progressBinding)) {
+      return client.search(request);
     }
   }
 
@@ -142,7 +175,7 @@ public class BackgroundSearchScanner {
             e);
       }
     } else {
-      return client.search(request);
+      return observedSearch(request);
     }
   }
 
@@ -176,8 +209,11 @@ public class BackgroundSearchScanner {
 
       // Pre-fetch next batch if needed
       if (!stopIteration && isAsync()) {
+        ProfileContext ctx = QueryProfiling.current();
         nextBatchFuture =
-            CompletableFuture.supplyAsync(() -> client.search(request), backgroundExecutor);
+            CompletableFuture.supplyAsync(
+                () -> QueryProfiling.withCurrentContext(ctx, () -> observedSearch(request)),
+                backgroundExecutor);
       }
     } else {
       iterator = Collections.emptyIterator();

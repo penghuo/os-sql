@@ -38,9 +38,11 @@ import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
 import org.apache.calcite.sql.validate.SqlUserDefinedFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.locationtech.jts.geom.Point;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.plan.PhysicalPlanHook;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper;
 import org.opensearch.sql.calcite.utils.CalciteToolsHelper.OpenSearchRelRunners;
 import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
@@ -60,12 +62,17 @@ import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.Schema.Column;
 import org.opensearch.sql.executor.Explain;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
+import org.opensearch.sql.executor.progress.ProgressObserver;
+import org.opensearch.sql.executor.progress.ProgressiveQueryResponseListener;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileScope;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
+import org.opensearch.sql.opensearch.executor.progress.ProgressLimitInstrumentation;
+import org.opensearch.sql.opensearch.executor.progress.ProgressiveQueryContext;
+import org.opensearch.sql.opensearch.executor.progress.SourceRegistrar;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
 import org.opensearch.sql.opensearch.functions.DistinctCountApproxAggFunction;
 import org.opensearch.sql.opensearch.functions.GeoIpFunction;
@@ -327,15 +334,55 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   @Override
   public void execute(
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
+    ProgressObserver progressObserver = ProgressiveQueryResponseListener.observerOf(listener);
     client.schedule(
         () -> {
-          try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+          // Opened around the whole execution so that enumerators created during code generation,
+          // and the
+          // page fetches they spawn, can reach the observer. Scoped: the worker thread is pooled
+          // and must
+          // not carry this job's identity into the next query.
+          ProgressiveQueryContext progressContext =
+              ProgressiveQueryContext.create(progressObserver);
+          try (ProgressiveQueryContext.Scope progressScope =
+                  ProgressiveQueryContext.open(progressContext);
+              SourceRegistrar.Registration registration =
+                  SourceRegistrar.install(progressContext, progressObserver);
+              // Installed for the duration of statement preparation. The plan handed over below is
+              // still logical —
+              // a `head` is a LogicalSort until the planner inside preparation converts it — so
+              // limits can only be
+              // instrumented from the physical-plan callback, not from here.
+              PhysicalPlanHook.Scope limitScope =
+                  PhysicalPlanHook.install(
+                      physicalPlan ->
+                          ProgressLimitInstrumentation.instrument(physicalPlan, progressContext));
+              PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
+            // Code generation is done, so the physical plan has been walked and every source
+            // registered. A
+            // plan that genuinely has no scan never fired the hook; seal here so it publishes 0.0
+            // while
+            // running instead of staying permanently unsealed.
+            registration.sealIfPending();
             QueryResponse response;
             try (ProfileScope executePhase = ProfileScope.open(MetricName.EXECUTE)) {
               ResultSet result = statement.executeQuery();
               response =
                   buildResultSet(result, rel.getRowType(), context.sysLimit.querySizeLimit());
+            } catch (RuntimeException | Error | SQLException e) {
+              // Flag before anything else unwinds. Sources that a coordinator limit closed early
+              // are waiting for
+              // confirmation that the stop was deliberate, and a failure is exactly the case where
+              // it was not.
+              markAborted(progressContext);
+              throw e;
             }
+            // Draining succeeded, so any source its consumer closed early was closed on purpose.
+            // This is the
+            // unambiguous signal a bare close cannot give: Linq4j closes a source from its own
+            // finally block,
+            // which runs identically whether the query is finishing or failing.
+            confirmConsumerClosedSources(progressContext);
             listener.onResponse(response);
           } catch (SQLException e) {
             if (isPitContextLimitReached(e)) {
@@ -355,6 +402,21 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
             throw new RuntimeException(e);
           }
         });
+  }
+
+  /** Null-tolerant: an unobserved query has no context to flag. */
+  private static void markAborted(@Nullable ProgressiveQueryContext progressContext) {
+    if (progressContext != null) {
+      progressContext.markAborted();
+    }
+  }
+
+  /** Null-tolerant counterpart of {@link #markAborted}. */
+  private static void confirmConsumerClosedSources(
+      @Nullable ProgressiveQueryContext progressContext) {
+    if (progressContext != null) {
+      progressContext.completeConsumerClosedSources();
+    }
   }
 
   /**

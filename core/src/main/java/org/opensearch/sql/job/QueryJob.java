@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
+import org.opensearch.sql.executor.progress.QueryProgress;
 
 /**
  * Active object that carries one query through the lifecycle state machine.
@@ -54,6 +55,19 @@ public final class QueryJob {
   private Optional<QueryResult> result = Optional.empty();
 
   /**
+   * Highest fraction this job has ever handed to a caller, and the value a non-successful terminal
+   * state freezes at. Guarded by {@code this}, like every other mutable field.
+   *
+   * <p>Sampling the engine's observer and committing the terminal transition have to happen in the
+   * same critical section as the reads. If a terminal thread sampled outside the monitor, a poll
+   * could publish a higher running value in the gap and the terminal state would then freeze the
+   * older, lower one — a client would watch progress go backwards at exactly the moment the query
+   * stopped. Keeping the maximum here and only ever raising it makes that unrepresentable: a frozen
+   * value is by construction at least as high as anything already published.
+   */
+  private QueryProgress publishedProgress = QueryProgress.ZERO;
+
+  /**
    * Creates a job in {@link QueryJobState#PENDING}. Package-private: only {@link QueryJobService}
    * implementations, which share this package, may construct a job. The submission time is captured
    * from {@code clock} at construction; the runner is not started here.
@@ -86,7 +100,69 @@ public final class QueryJob {
   /** Returns an immutable snapshot of the job's current state. */
   public synchronized QueryJobStatus status() {
     return new QueryJobStatus(
-        id, state, submittedAtMillis, startedAtMillis, completedAtMillis, failure, result);
+        id,
+        state,
+        submittedAtMillis,
+        startedAtMillis,
+        completedAtMillis,
+        failure,
+        result,
+        currentProgress());
+  }
+
+  /**
+   * Resolves the fraction to publish for the current state. Caller must hold {@code this}.
+   *
+   * <p>The lifecycle, not the engine, decides what {@code 1.0} means. {@code SUCCEEDED} is the only
+   * state whose result is ready, so it is the only state that reports {@code 1.0}; a job that
+   * failed or was cancelled keeps the frozen maximum, which is what lets a client tell a query that
+   * died early from one that died near the end.
+   */
+  private QueryProgress currentProgress() {
+    return switch (state) {
+      case SUCCEEDED -> QueryProgress.COMPLETE;
+      case PENDING -> QueryProgress.ZERO;
+      case RUNNING -> raisePublished(runnerProgress());
+      case FAILED, CANCELLED -> publishedProgress;
+    };
+  }
+
+  /**
+   * Raises the published maximum to {@code candidate} and returns the maximum. Caller must hold
+   * {@code this}.
+   */
+  private QueryProgress raisePublished(QueryProgress candidate) {
+    if (candidate.fractionDone() > publishedProgress.fractionDone()) {
+      publishedProgress = candidate;
+    }
+    return publishedProgress;
+  }
+
+  /**
+   * Reads the runner's observer defensively. Caller must hold {@code this}, so that sampling cannot
+   * interleave with a state transition.
+   *
+   * <p>{@link QueryRunner#progress()} is engine-supplied, so a runner that returns {@code null} or
+   * throws degrades to "nothing observed" rather than failing the poll a client is using to
+   * discover the job's state. It is contractually cheap and non-blocking, which is what makes it
+   * safe to call from inside this monitor; the observer's own lock is a leaf — producers never
+   * reach back into the job.
+   */
+  private QueryProgress runnerProgress() {
+    try {
+      QueryProgress snapshot = runner.progress();
+      if (snapshot == null) {
+        return QueryProgress.ZERO;
+      }
+      // Source accounting must never claim completion while the job is still running. Clamping to
+      // the
+      // public ceiling beats letting QueryJobStatus reject the snapshot, which would turn a
+      // progress
+      // bug into a failed poll — and clamping rather than zeroing keeps the value monotonic.
+      return snapshot.fractionDone() >= 1.0 ? QueryProgress.PUBLIC_CEILING : snapshot;
+    } catch (RuntimeException e) {
+      return QueryProgress.ZERO;
+    }
   }
 
   /**
@@ -115,13 +191,45 @@ public final class QueryJob {
           out.completeExceptionally(cause);
         });
     long millis = budget == null ? 0L : budget.toMillis();
-    QueryResult.Running running = new QueryResult.Running(id);
     if (millis <= 0L) {
-      out.complete(running);
+      out.complete(runningSnapshot());
     } else {
-      out.completeOnTimeout(running, millis, TimeUnit.MILLISECONDS);
+      // Supply the timeout value lazily: completeOnTimeout takes a fixed value, so the fraction has
+      // to be read when the budget actually expires rather than at registration time, when the
+      // query
+      // has not started yet. Cancelling the trigger once `out` settles releases the JDK Delayer
+      // task
+      // instead of leaving it queued for the remainder of the budget.
+      CompletableFuture<Void> trigger = new CompletableFuture<>();
+      trigger.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
+      trigger.thenRun(() -> out.complete(runningSnapshot()));
+      out.whenComplete((value, throwable) -> trigger.cancel(false));
     }
     return out.minimalCompletionStage();
+  }
+
+  /**
+   * Builds the submit-time {@code RUNNING} payload.
+   *
+   * <p>Reads through the same critical section as {@link #status()} rather than sampling the engine
+   * directly. The submit timeout races every terminal transition: a job can commit {@code
+   * CANCELLED} at a frozen fraction and have late source callbacks advance the observer before the
+   * timeout fires. Sampling the observer here would publish that higher value in the submit
+   * response and the client's first GET would then report a lower one.
+   *
+   * <p>Also guards the {@code RUNNING} payload against {@code 1.0}. If success won the race the
+   * caller gets the terminal result instead of this, so a {@code RUNNING} body claiming completion
+   * could only ever mislead.
+   */
+  private QueryResult.Running runningSnapshot() {
+    QueryProgress progress;
+    synchronized (this) {
+      progress = currentProgress();
+    }
+    if (progress.fractionDone() >= 1.0) {
+      progress = QueryProgress.PUBLIC_CEILING;
+    }
+    return new QueryResult.Running(id, progress);
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -141,6 +249,10 @@ public final class QueryJob {
       if (state.isTerminal()) {
         return;
       }
+      // Sample and freeze inside the monitor, before the state flips. Sampling outside would let a
+      // concurrent poll publish a higher running value in the gap, which this transition would then
+      // overwrite with the older one.
+      raisePublished(runnerProgress());
       state = QueryJobState.CANCELLED;
       completedAtMillis = OptionalLong.of(clock.millis());
       shouldCancelRunner = true;
@@ -223,6 +335,10 @@ public final class QueryJob {
       if (state != QueryJobState.RUNNING && state != QueryJobState.PENDING) {
         return;
       }
+      // Same ordering as cancel(): freeze under the monitor so the frozen value cannot be lower
+      // than a
+      // concurrently published running one.
+      raisePublished(runnerProgress());
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable));

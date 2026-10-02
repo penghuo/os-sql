@@ -18,7 +18,6 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
-import org.opensearch.sql.spark.asyncquery.exceptions.AsyncQueryNotFoundException;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportService;
@@ -62,7 +61,7 @@ final class AsyncQueryOwnerRouting {
     DiscoveryNode ownerNode = clusterService.state().nodes().get(jobId.ownerNodeId());
     if (ownerNode == null) {
       listener.onFailure(
-          new AsyncQueryNotFoundException("QueryId: " + jobId.encode() + " not found"));
+          new ResourceNotFoundException("QueryId: " + jobId.encode() + " not found"));
       return;
     }
     transportService.sendRequest(

@@ -6,10 +6,11 @@
 package org.opensearch.sql.ppl;
 
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
-import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.submitAndCancel;
 import static org.opensearch.sql.util.MatcherUtils.rows;
 import static org.opensearch.sql.util.MatcherUtils.schema;
 import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
@@ -34,8 +35,8 @@ import org.opensearch.client.RestClient;
  *   <li>GET on node B forwards to node A and returns the terminal snapshot with full schema + rows;
  *   <li>statement-level explain submitted on node A and fetched on node B returns the explain body
  *       produced by the owner's sync explain path;
- *   <li>DELETE on node B forwards to node A and cancels the job there; an unknown id returns 404
- *       across forwarding.
+ *   <li>DELETE on node B forwards to node A, returns the job's final status, and removes it from
+ *       node A; an unknown id returns 404 across forwarding.
  * </ul>
  *
  * <p>Each request is pinned to a specific node by constructing a dedicated {@link RestClient} for
@@ -124,11 +125,18 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     JSONObject body = new JSONObject();
     body.put("query", "source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
     body.put("wait_for_completion_timeout", "0");
+    String queryId = new JSONObject(postPpl(nodeA, body)).getString("id");
+    Assert.assertEquals("SUCCEEDED", pollUntilTerminal(nodeA, queryId, 30_000).getString("status"));
 
-    String queryId = submitAndCancel(nodeA, nodeB, body);
+    org.opensearch.client.Response deleted = deleteAsyncQuery(nodeB, queryId);
 
+    Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
     Assert.assertEquals(
-        "CANCELLED", new JSONObject(getAsyncQuery(nodeB, queryId)).getString("status"));
+        "SUCCEEDED",
+        new JSONObject(org.opensearch.sql.legacy.TestUtils.getResponseBody(deleted, true))
+            .getString("status"));
+    assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+    assertNotFound(() -> getAsyncQuery(nodeB, queryId));
   }
 
   @Test

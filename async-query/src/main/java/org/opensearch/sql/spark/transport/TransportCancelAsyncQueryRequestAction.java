@@ -8,6 +8,7 @@
 package org.opensearch.sql.spark.transport;
 
 import java.util.Optional;
+import org.json.JSONObject;
 import org.opensearch.action.ActionType;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -15,6 +16,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.job.QueryJobId;
+import org.opensearch.sql.job.QueryJobStatus;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
 import org.opensearch.sql.spark.asyncquery.model.NullAsyncQueryRequestContext;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionRequest;
@@ -62,6 +64,13 @@ public class TransportCancelAsyncQueryRequestAction
             request,
             CancelAsyncQueryActionResponse::new,
             listener);
+        return;
+      }
+      Optional<QueryJobStatus> deleted = asyncQueryExecutorService.deleteQueryJob(queryId);
+      if (deleted.isPresent()) {
+        listener.onResponse(
+            new CancelAsyncQueryActionResponse(
+                new JSONObject().put("status", deleted.get().state().name()).toString()));
         return;
       }
       String cancelledId =

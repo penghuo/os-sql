@@ -44,7 +44,7 @@ import org.opensearch.sql.spark.rest.model.CreateAsyncQueryResponse;
  *
  * <p>Also serves as the id-shape router in front of the in-JVM {@link QueryJobService} for PPL
  * async submissions per issue #5765. When {@link #queryJobService} is non-null and a queryId parses
- * as {@link QueryJobId}, get and cancel are dispatched to the neutral job service; the Spark path
+ * as {@link QueryJobId}, get and delete are dispatched to the neutral job service; the Spark path
  * is otherwise unchanged. This keeps the existing {@code /_plugins/_async_query} transport actions
  * untouched and avoids adding new REST endpoints or new transport {@code ActionType}s.
  */
@@ -75,7 +75,7 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
 
   /**
    * Full constructor including the in-JVM job service and security adapter. When both are provided,
-   * get and cancel dispatch to {@link QueryJobService} for ids that parse as {@link QueryJobId};
+   * get and delete dispatch to {@link QueryJobService} for ids that parse as {@link QueryJobId};
    * other ids fall through to the Spark path.
    */
   public AsyncQueryExecutorServiceImpl(
@@ -178,11 +178,6 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
 
   @Override
   public String cancelQuery(String queryId, AsyncQueryRequestContext asyncQueryRequestContext) {
-    Optional<QueryJobId> jobId = asJobId(queryId);
-    if (jobId.isPresent() && queryJobService != null) {
-      queryJobService.cancel(jobId.get(), currentPrincipal());
-      return queryId;
-    }
     Optional<AsyncQueryJobMetadata> asyncQueryJobMetadata =
         asyncQueryJobMetadataStorageService.getJobMetadata(queryId);
     if (asyncQueryJobMetadata.isPresent()) {
@@ -193,6 +188,19 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
       return result;
     }
     throw new AsyncQueryNotFoundException(String.format("QueryId: %s not found", queryId));
+  }
+
+  /**
+   * Deletes the job through {@link QueryJobService#delete} and returns its final snapshot. Returns
+   * empty when {@code queryId} is not a {@link QueryJobId} or no job service is wired; the caller
+   * then cancels through the Spark path with {@link #cancelQuery}.
+   */
+  public Optional<QueryJobStatus> deleteQueryJob(String queryId) {
+    Optional<QueryJobId> jobId = asJobId(queryId);
+    if (jobId.isEmpty() || queryJobService == null) {
+      return Optional.empty();
+    }
+    return Optional.of(queryJobService.delete(jobId.get(), currentPrincipal()));
   }
 
   /**

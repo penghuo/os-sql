@@ -6,8 +6,10 @@
 package org.opensearch.sql.job;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -16,6 +18,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.lang.ref.WeakReference;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -113,6 +116,35 @@ class RetentionPolicyTest {
     eviction.getValue().run();
 
     assertSame(replacement, store.find(original.id()).orElseThrow());
+  }
+
+  @Test
+  void pendingEviction_doesNotKeepRemovedJobReachable() throws InterruptedException {
+    InMemoryQueryJobStore store = new InMemoryQueryJobStore();
+    ThreadPool threadPool = mock(ThreadPool.class);
+    RetentionPolicy policy = new RetentionPolicy(store, threadPool);
+    RecordingRunner runner = new RecordingRunner();
+    QueryJob job = newJob(runner);
+    store.register(job);
+    policy.arm(job, TTL);
+    job.startRunner();
+    runner.complete();
+    ArgumentCaptor<Runnable> eviction = ArgumentCaptor.forClass(Runnable.class);
+    verify(threadPool).schedule(eviction.capture(), any(), anyString());
+    Runnable pendingEviction = eviction.getValue();
+    WeakReference<QueryJob> probe = new WeakReference<>(job);
+    store.remove(job.id(), job);
+    job = null;
+    runner = null;
+
+    for (int attempt = 0; attempt < 50 && probe.get() != null; attempt++) {
+      System.gc();
+      Thread.sleep(10);
+    }
+
+    assertNull(probe.get(), "pending eviction must not strongly reference the removed job");
+    pendingEviction.run();
+    assertTrue(store.jobs().isEmpty());
   }
 
   @Test

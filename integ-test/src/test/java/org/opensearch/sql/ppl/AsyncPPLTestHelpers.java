@@ -10,8 +10,10 @@ import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import java.io.IOException;
 import org.json.JSONObject;
 import org.junit.Assert;
+import org.junit.function.ThrowingRunnable;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 
 /**
@@ -45,31 +47,15 @@ final class AsyncPPLTestHelpers {
     return getResponseBody(response, true);
   }
 
-  /** DELETE {@code /_plugins/_async_query/{id}}; returns the HTTP status code. */
-  static int deleteAsyncQuery(RestClient client, String queryId) throws IOException {
-    Request request = new Request("DELETE", ASYNC_QUERY_ENDPOINT + queryId);
-    return client.performRequest(request).getStatusLine().getStatusCode();
+  /** DELETE {@code /_plugins/_async_query/{id}}; returns the response. */
+  static Response deleteAsyncQuery(RestClient client, String queryId) throws IOException {
+    return client.performRequest(new Request("DELETE", ASYNC_QUERY_ENDPOINT + queryId));
   }
 
-  /**
-   * Submits {@code body} on {@code submitNode}, cancels on {@code cancelNode}, and returns the id
-   * of the first job whose cancel landed while it was still running. A fast query can finish
-   * between submit and DELETE; such attempts must keep their result and are retried.
-   */
-  static String submitAndCancel(RestClient submitNode, RestClient cancelNode, JSONObject body)
-      throws Exception {
-    int attempts = 5;
-    for (int i = 0; i < attempts; i++) {
-      String queryId = new JSONObject(postPpl(submitNode, body)).getString("id");
-      Assert.assertEquals(204, deleteAsyncQuery(cancelNode, queryId));
-      String status = new JSONObject(getAsyncQuery(submitNode, queryId)).getString("status");
-      if ("CANCELLED".equals(status)) {
-        return queryId;
-      }
-      Assert.assertEquals("cancel that lost the race must keep the result", "SUCCEEDED", status);
-    }
-    Assert.fail("no DELETE landed on a running job in " + attempts + " attempts");
-    return null; // unreachable
+  /** Asserts that {@code request} fails with HTTP 404. */
+  static void assertNotFound(ThrowingRunnable request) {
+    ResponseException ex = Assert.assertThrows(ResponseException.class, request);
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
   }
 
   /** Resolves the id of the node that serves {@code client}'s requests. */

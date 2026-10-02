@@ -19,6 +19,8 @@ import static org.mockito.Mockito.when;
 import static org.opensearch.sql.spark.constants.TestConstants.EMR_JOB_ID;
 
 import java.util.HashSet;
+import java.util.Optional;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -38,10 +40,11 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.job.QueryJobId;
+import org.opensearch.sql.job.QueryJobState;
+import org.opensearch.sql.job.QueryJobStatus;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
-import org.opensearch.sql.spark.asyncquery.exceptions.AsyncQueryNotFoundException;
 import org.opensearch.sql.spark.asyncquery.model.NullAsyncQueryRequestContext;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionRequest;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
@@ -110,18 +113,31 @@ public class TransportCancelAsyncQueryRequestActionTest {
   }
 
   @Test
-  public void localPplJobIsCancelledByLocalExecutor() {
+  public void localRunningPplJobIsDeletedAndAcknowledgedAsCancelled() {
     stubLocalNode(JOB_ID.ownerNodeId());
-    when(asyncQueryExecutorService.cancelQuery(eq(JOB_ID.encode()), any()))
-        .thenReturn(JOB_ID.encode());
+    when(asyncQueryExecutorService.deleteQueryJob(JOB_ID.encode()))
+        .thenReturn(Optional.of(status(QueryJobState.CANCELLED)));
 
     action.doExecute(task, new CancelAsyncQueryActionRequest(JOB_ID.encode()), actionListener);
 
     verify(actionListener).onResponse(deleteJobActionResponseArgumentCaptor.capture());
     Assertions.assertEquals(
-        "Deleted async query with id: " + JOB_ID.encode(),
-        deleteJobActionResponseArgumentCaptor.getValue().getResult());
+        "{\"status\":\"CANCELLED\"}", deleteJobActionResponseArgumentCaptor.getValue().getResult());
+    verify(asyncQueryExecutorService, never()).cancelQuery(any(), any());
     verifyNoForwarding();
+  }
+
+  @Test
+  public void localTerminalPplJobIsDeletedAndAcknowledgedWithPriorStatus() {
+    stubLocalNode(JOB_ID.ownerNodeId());
+    when(asyncQueryExecutorService.deleteQueryJob(JOB_ID.encode()))
+        .thenReturn(Optional.of(status(QueryJobState.SUCCEEDED)));
+
+    action.doExecute(task, new CancelAsyncQueryActionRequest(JOB_ID.encode()), actionListener);
+
+    verify(actionListener).onResponse(deleteJobActionResponseArgumentCaptor.capture());
+    Assertions.assertEquals(
+        "{\"status\":\"SUCCEEDED\"}", deleteJobActionResponseArgumentCaptor.getValue().getResult());
   }
 
   @Test
@@ -143,7 +159,7 @@ public class TransportCancelAsyncQueryRequestActionTest {
             eq(TransportRequestOptions.EMPTY),
             handlerCaptor.capture());
     CancelAsyncQueryActionResponse response =
-        new CancelAsyncQueryActionResponse("Deleted async query with id: " + JOB_ID.encode());
+        new CancelAsyncQueryActionResponse("{\"status\":\"CANCELLED\"}");
     handlerCaptor.getValue().handleResponse(response);
     verify(actionListener).onResponse(response);
     verifyNoInteractions(asyncQueryExecutorService);
@@ -157,7 +173,10 @@ public class TransportCancelAsyncQueryRequestActionTest {
     action.doExecute(task, new CancelAsyncQueryActionRequest(JOB_ID.encode()), actionListener);
 
     verify(actionListener).onFailure(exceptionArgumentCaptor.capture());
-    Assertions.assertInstanceOf(AsyncQueryNotFoundException.class, exceptionArgumentCaptor.getValue());
+    ResourceNotFoundException captured =
+        Assertions.assertInstanceOf(
+            ResourceNotFoundException.class, exceptionArgumentCaptor.getValue());
+    Assertions.assertEquals(RestStatus.NOT_FOUND, captured.status());
     verifyNoInteractions(asyncQueryExecutorService);
     verifyNoForwarding();
   }
@@ -167,7 +186,7 @@ public class TransportCancelAsyncQueryRequestActionTest {
     stubLocalNode(JOB_ID.ownerNodeId());
     doThrow(new QueryJobNotFoundException(JOB_ID))
         .when(asyncQueryExecutorService)
-        .cancelQuery(eq(JOB_ID.encode()), any());
+        .deleteQueryJob(JOB_ID.encode());
 
     action.doExecute(task, new CancelAsyncQueryActionRequest(JOB_ID.encode()), actionListener);
 
@@ -183,7 +202,7 @@ public class TransportCancelAsyncQueryRequestActionTest {
     stubLocalNode(JOB_ID.ownerNodeId());
     doThrow(new QueryJobForbiddenException())
         .when(asyncQueryExecutorService)
-        .cancelQuery(eq(JOB_ID.encode()), any());
+        .deleteQueryJob(JOB_ID.encode());
 
     action.doExecute(task, new CancelAsyncQueryActionRequest(JOB_ID.encode()), actionListener);
 
@@ -192,6 +211,17 @@ public class TransportCancelAsyncQueryRequestActionTest {
         Assertions.assertInstanceOf(
             OpenSearchStatusException.class, exceptionArgumentCaptor.getValue());
     Assertions.assertEquals(RestStatus.FORBIDDEN, captured.status());
+  }
+
+  private static QueryJobStatus status(QueryJobState state) {
+    return new QueryJobStatus(
+        JOB_ID,
+        state,
+        0,
+        OptionalLong.of(1),
+        OptionalLong.of(2),
+        Optional.empty(),
+        Optional.empty());
   }
 
   private void verifyNoForwarding() {

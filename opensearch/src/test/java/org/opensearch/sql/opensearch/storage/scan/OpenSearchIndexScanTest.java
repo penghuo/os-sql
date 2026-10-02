@@ -36,6 +36,8 @@ import org.mockito.stubbing.Answer;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchHit;
@@ -52,12 +54,14 @@ import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprValueFactory;
+import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.request.OpenSearchQueryRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
+import org.opensearch.tasks.CancellableTask;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
@@ -313,6 +317,49 @@ class OpenSearchIndexScanTest {
     indexScan.close();
     verify(client).cleanup(request);
     verify(client, never()).forceCleanup(any());
+  }
+
+  @Test
+  void open_fails_without_searching_when_task_is_cancelled() {
+    var request = mock(OpenSearchRequest.class);
+    CancellableTask task = cancellableTask();
+    task.cancel("test");
+    OpenSearchQueryManager.setCancellableTask(task);
+    try (var indexScan = new OpenSearchIndexScan(client, request)) {
+      assertThrows(TaskCancelledException.class, indexScan::open);
+      verify(client, never()).search(any());
+    } finally {
+      OpenSearchQueryManager.clearCancellableTask();
+    }
+  }
+
+  @Test
+  void hasNext_and_next_fail_once_task_captured_in_open_is_cancelled() {
+    var request = mock(OpenSearchRequest.class);
+    var response = mock(OpenSearchResponse.class);
+    when(client.search(request)).thenReturn(response);
+    when(response.isEmpty()).thenReturn(false);
+    when(response.iterator()).thenReturn(List.of(employee(1, "John", "IT")).iterator());
+    CancellableTask task = cancellableTask();
+    OpenSearchQueryManager.setCancellableTask(task);
+    try (var indexScan = new OpenSearchIndexScan(client, request)) {
+      indexScan.open();
+      OpenSearchQueryManager.clearCancellableTask();
+      task.cancel("test");
+
+      assertThrows(TaskCancelledException.class, indexScan::hasNext);
+      assertThrows(TaskCancelledException.class, indexScan::next);
+      verify(client, times(1)).search(request);
+    }
+  }
+
+  private static CancellableTask cancellableTask() {
+    return new CancellableTask(1, "transport", "ppl", "test", TaskId.EMPTY_TASK_ID, Map.of()) {
+      @Override
+      public boolean shouldCancelChildrenOnCancellation() {
+        return true;
+      }
+    };
   }
 
   /** forceClose() should always force-delete the PIT regardless of pagination state. */

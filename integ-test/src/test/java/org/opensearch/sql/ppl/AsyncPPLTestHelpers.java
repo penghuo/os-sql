@@ -45,6 +45,39 @@ final class AsyncPPLTestHelpers {
     return getResponseBody(response, true);
   }
 
+  /** DELETE {@code /_plugins/_async_query/{id}}; returns the HTTP status code. */
+  static int deleteAsyncQuery(RestClient client, String queryId) throws IOException {
+    Request request = new Request("DELETE", ASYNC_QUERY_ENDPOINT + queryId);
+    return client.performRequest(request).getStatusLine().getStatusCode();
+  }
+
+  /**
+   * Submits {@code body} on {@code submitNode}, cancels on {@code cancelNode}, and returns the id
+   * of the first job whose cancel landed while it was still running. A fast query can finish
+   * between submit and DELETE; such attempts must keep their result and are retried.
+   */
+  static String submitAndCancel(RestClient submitNode, RestClient cancelNode, JSONObject body)
+      throws Exception {
+    int attempts = 5;
+    for (int i = 0; i < attempts; i++) {
+      String queryId = new JSONObject(postPpl(submitNode, body)).getString("id");
+      Assert.assertEquals(204, deleteAsyncQuery(cancelNode, queryId));
+      String status = new JSONObject(getAsyncQuery(submitNode, queryId)).getString("status");
+      if ("CANCELLED".equals(status)) {
+        return queryId;
+      }
+      Assert.assertEquals("cancel that lost the race must keep the result", "SUCCEEDED", status);
+    }
+    Assert.fail("no DELETE landed on a running job in " + attempts + " attempts");
+    return null; // unreachable
+  }
+
+  /** Resolves the id of the node that serves {@code client}'s requests. */
+  static String localNodeId(RestClient client) throws IOException {
+    Response response = client.performRequest(new Request("GET", "/_nodes/_local"));
+    return new JSONObject(getResponseBody(response, true)).getJSONObject("nodes").keys().next();
+  }
+
   /** Polls GET until the job reaches a terminal state or the timeout expires. */
   static JSONObject pollUntilTerminal(RestClient client, String queryId, long timeoutMillis)
       throws Exception {

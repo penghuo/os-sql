@@ -9,6 +9,7 @@ import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.submitAndCancel;
 import static org.opensearch.sql.util.MatcherUtils.rows;
 import static org.opensearch.sql.util.MatcherUtils.schema;
 import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
@@ -32,7 +33,9 @@ import org.opensearch.client.RestClient;
  *   <li>submit lands on node A; the returned queryId encodes node A as owner;
  *   <li>GET on node B forwards to node A and returns the terminal snapshot with full schema + rows;
  *   <li>statement-level explain submitted on node A and fetched on node B returns the explain body
- *       produced by the owner's sync explain path.
+ *       produced by the owner's sync explain path;
+ *   <li>DELETE on node B forwards to node A and cancels the job there; an unknown id returns 404
+ *       across forwarding.
  * </ul>
  *
  * <p>Each request is pinned to a specific node by constructing a dedicated {@link RestClient} for
@@ -114,6 +117,30 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     // Owner's QueryJobNotFoundException must translate to a transport-serializable 404 so
     // forwarding doesn't drop it to 500.
     Assert.assertEquals("expected 404 across owner-node forwarding, got " + code, 404, code);
+  }
+
+  @Test
+  public void delete_forwardsFromNonOwnerNodeToOwner() throws Exception {
+    JSONObject body = new JSONObject();
+    body.put("query", "source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
+    body.put("wait_for_completion_timeout", "0");
+
+    String queryId = submitAndCancel(nodeA, nodeB, body);
+
+    Assert.assertEquals(
+        "CANCELLED", new JSONObject(getAsyncQuery(nodeB, queryId)).getString("status"));
+  }
+
+  @Test
+  public void deleteUnknownPplIdFromNonOwner_returns404() throws Exception {
+    String fakeId = org.opensearch.sql.job.QueryJobId.create(nodeIdOf(nodeA)).encode();
+    org.opensearch.client.Request request =
+        new org.opensearch.client.Request(
+            "DELETE", AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT + fakeId);
+    org.opensearch.client.ResponseException ex =
+        Assert.assertThrows(
+            org.opensearch.client.ResponseException.class, () -> nodeB.performRequest(request));
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
   }
 
   private static String nodeIdOf(org.opensearch.client.RestClient client) throws IOException {

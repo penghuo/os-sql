@@ -677,8 +677,8 @@ Parameters:
 
 - Async submit is only available for standard PPL queries. The following request shapes always run synchronously and ignore `wait_for_completion_timeout` / `keep_alive`: the `/_plugins/_ppl/_explain` endpoint, requests with `"profile": true`, and non-JSON response formats (`format=csv`, `format=raw`, `format=viz`).
 - Results are retained in memory on the owner node for the duration of `keep_alive`. Set it as low as practical for your polling cadence; the default is `5m`.
-- Submitting an async query requires `cluster:admin/opensearch/ppl`; fetching requires `cluster:admin/opensearch/ql/async_query/result`. Users on custom roles must be granted both — a submit without the fetch grant produces an id that returns `403` on GET.
-- Cancellation through `DELETE /_plugins/_async_query/{id}` is not yet supported for PPL jobs.
+- Submitting an async query requires `cluster:admin/opensearch/ppl`; fetching requires `cluster:admin/opensearch/ql/async_query/result`; cancelling requires `cluster:admin/opensearch/ql/async_query/delete`. Users on custom roles must be granted each action they use — a submit without the fetch grant produces an id that returns `403` on GET.
+- When the security plugin is enabled, only the user who submitted a query can fetch or cancel it; other users receive `403`.
 
 ### Example
 
@@ -722,8 +722,14 @@ If the query is still running when the wait expires, the response is:
 }
 ```
 
-The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED` or `FAILED`):
+The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED`, `FAILED`, or `CANCELLED`):
 
 ```
 GET    /_plugins/_async_query/<id>
+```
+
+To cancel a query that is still running, send `DELETE /_plugins/_async_query/{id}`. A successful request returns `204 No Content`, and the query stops at its next cancellation check. A subsequent GET returns `{"status": "CANCELLED"}` until `keep_alive` expires. Cancelling a query that has already finished has no effect; its result stays available until `keep_alive` expires. An unknown or expired id returns `404`.
+
+```
+DELETE /_plugins/_async_query/<id>
 ```

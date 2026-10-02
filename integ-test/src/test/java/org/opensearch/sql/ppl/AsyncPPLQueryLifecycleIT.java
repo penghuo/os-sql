@@ -8,9 +8,12 @@ package org.opensearch.sql.ppl;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.PPL_ENDPOINT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.localNodeId;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.submitAndCancel;
 import static org.opensearch.sql.util.MatcherUtils.rows;
 import static org.opensearch.sql.util.MatcherUtils.schema;
 import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
@@ -23,6 +26,7 @@ import org.junit.Assert;
 import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.client.ResponseException;
+import org.opensearch.sql.job.QueryJobId;
 
 /**
  * End-to-end IT for the async PPL lifecycle (issue #5765). Verifies:
@@ -40,7 +44,9 @@ import org.opensearch.client.ResponseException;
  *       and returns the explain body on GET;
  *   <li>sync-only request shapes (explain endpoint, analyze endpoint, profile flag, csv format) are
  *       rejected with 400 when they carry {@code wait_for_completion_timeout};
- *   <li>{@code keep_alive} drives retention — a job is evicted after its TTL elapses.
+ *   <li>{@code keep_alive} drives retention — a job is evicted after its TTL elapses;
+ *   <li>{@code DELETE /_plugins/_async_query/{id}} cancels a running job, is idempotent, leaves a
+ *       completed job's result intact, and returns 404 for an unknown id.
  * </ul>
  */
 public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
@@ -236,6 +242,46 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
       Thread.sleep(200);
     }
     Assert.fail("job [" + queryId + "] was not evicted within 3s after keep_alive=1s");
+  }
+
+  @Test
+  public void async_cancelRunningJobReportsCancelled() throws Exception {
+    String queryId =
+        submitAndCancel(
+            client(), client(), withAsyncWait("source=" + TEST_INDEX_ACCOUNT + " | stats count()"));
+
+    // Repeat DELETE is idempotent and leaves the job CANCELLED.
+    Assert.assertEquals(204, deleteAsyncQuery(client(), queryId));
+    JSONObject fetched = new JSONObject(getAsyncQuery(client(), queryId));
+    Assert.assertEquals("CANCELLED", fetched.getString("status"));
+    Assert.assertFalse("cancelled job must not carry rows", fetched.has("datarows"));
+  }
+
+  @Test
+  public void async_cancelCompletedJobKeepsResult() throws Exception {
+    String queryId =
+        new JSONObject(
+                postPpl(
+                    client(),
+                    withAsyncWait("source=" + TEST_INDEX_ACCOUNT + " | stats count() as c")))
+            .getString("id");
+    Assert.assertEquals(
+        "SUCCEEDED", pollUntilTerminal(client(), queryId, 30_000).getString("status"));
+
+    Assert.assertEquals(204, deleteAsyncQuery(client(), queryId));
+
+    JSONObject fetched = new JSONObject(getAsyncQuery(client(), queryId));
+    Assert.assertEquals("SUCCEEDED", fetched.getString("status"));
+    verifyDataRows(fetched, rows(1000));
+  }
+
+  @Test
+  public void async_cancelUnknownQueryIdReturns404() throws IOException {
+    String unknownId = QueryJobId.create(localNodeId(client())).encode();
+    Request request = new Request("DELETE", ASYNC_QUERY_ENDPOINT + unknownId);
+    ResponseException ex =
+        Assert.assertThrows(ResponseException.class, () -> client().performRequest(request));
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
   }
 
   @Test

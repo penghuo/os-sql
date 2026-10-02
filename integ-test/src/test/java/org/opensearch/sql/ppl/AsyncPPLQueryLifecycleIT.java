@@ -48,14 +48,19 @@ import org.opensearch.sql.job.QueryJobId;
  *       rejected with 400 when they carry {@code wait_for_completion_timeout};
  *   <li>{@code keep_alive} drives retention — a job is evicted after its TTL elapses;
  *   <li>{@code DELETE /_plugins/_async_query/{id}} acknowledges with the job's final status and
- *       removes it, so later GET and DELETE return 404; an unknown id returns 404.
+ *       removes it, so later GET and DELETE return 404; unknown, expired, and absent-owner ids
+ *       return 404.
  * </ul>
+ *
+ * <p>Runs on the Calcite engine. Cancellation of running queries is covered by {@link
+ * AsyncPPLCancellationIT}.
  */
 public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
 
   @Override
   protected void init() throws Exception {
     super.init();
+    enableCalcite();
     loadIndex(Index.ACCOUNT);
   }
 
@@ -270,6 +275,38 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
   public void async_deleteUnknownQueryIdReturns404() throws IOException {
     String unknownId = QueryJobId.create(localNodeId(client())).encode();
     assertNotFound(() -> deleteAsyncQuery(client(), unknownId));
+  }
+
+  @Test
+  public void async_deleteExpiredJobReturns404() throws Exception {
+    JSONObject body = withAsyncWait("source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
+    body.put("keep_alive", "1s");
+    String queryId = new JSONObject(postPpl(client(), body)).getString("id");
+    Assert.assertEquals(
+        "SUCCEEDED", pollUntilTerminal(client(), queryId, 5_000).getString("status"));
+
+    long deadline = System.currentTimeMillis() + 3_000L;
+    while (true) {
+      try {
+        getAsyncQuery(client(), queryId);
+      } catch (ResponseException e) {
+        Assert.assertEquals(404, e.getResponse().getStatusLine().getStatusCode());
+        break;
+      }
+      Assert.assertTrue(
+          "job [" + queryId + "] was not evicted within 3s after keep_alive=1s",
+          System.currentTimeMillis() < deadline);
+      Thread.sleep(200);
+    }
+
+    assertNotFound(() -> deleteAsyncQuery(client(), queryId));
+  }
+
+  @Test
+  public void async_queryIdOfAbsentOwnerReturns404() {
+    String absentOwnerId = QueryJobId.create("absent-node").encode();
+    assertNotFound(() -> getAsyncQuery(client(), absentOwnerId));
+    assertNotFound(() -> deleteAsyncQuery(client(), absentOwnerId));
   }
 
   @Test

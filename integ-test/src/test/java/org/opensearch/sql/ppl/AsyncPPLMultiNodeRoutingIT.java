@@ -51,6 +51,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
   @Override
   protected void init() throws Exception {
     super.init();
+    enableCalcite();
     loadIndex(Index.ACCOUNT);
 
     // getClusterHosts() returns one HttpHost per bound address — in test clusters each node binds

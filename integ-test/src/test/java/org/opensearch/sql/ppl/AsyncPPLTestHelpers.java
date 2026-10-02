@@ -10,8 +10,10 @@ import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import java.io.IOException;
 import org.json.JSONObject;
 import org.junit.Assert;
+import org.junit.function.ThrowingRunnable;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 
 /**
@@ -43,6 +45,23 @@ final class AsyncPPLTestHelpers {
     Request request = new Request("GET", ASYNC_QUERY_ENDPOINT + queryId);
     Response response = client.performRequest(request);
     return getResponseBody(response, true);
+  }
+
+  /** DELETE {@code /_plugins/_async_query/{id}}; returns the response. */
+  static Response deleteAsyncQuery(RestClient client, String queryId) throws IOException {
+    return client.performRequest(new Request("DELETE", ASYNC_QUERY_ENDPOINT + queryId));
+  }
+
+  /** Asserts that {@code request} fails with HTTP 404. */
+  static void assertNotFound(ThrowingRunnable request) {
+    ResponseException ex = Assert.assertThrows(ResponseException.class, request);
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
+  }
+
+  /** Resolves the id of the node that serves {@code client}'s requests. */
+  static String localNodeId(RestClient client) throws IOException {
+    Response response = client.performRequest(new Request("GET", "/_nodes/_local"));
+    return new JSONObject(getResponseBody(response, true)).getJSONObject("nodes").keys().next();
   }
 
   /** Polls GET until the job reaches a terminal state or the timeout expires. */

@@ -6,6 +6,8 @@
 package org.opensearch.sql.ppl;
 
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
@@ -32,7 +34,9 @@ import org.opensearch.client.RestClient;
  *   <li>submit lands on node A; the returned queryId encodes node A as owner;
  *   <li>GET on node B forwards to node A and returns the terminal snapshot with full schema + rows;
  *   <li>statement-level explain submitted on node A and fetched on node B returns the explain body
- *       produced by the owner's sync explain path.
+ *       produced by the owner's sync explain path;
+ *   <li>DELETE on node B forwards to node A, returns the job's final status, and removes it from
+ *       node A; an unknown id returns 404 across forwarding.
  * </ul>
  *
  * <p>Each request is pinned to a specific node by constructing a dedicated {@link RestClient} for
@@ -47,6 +51,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
   @Override
   protected void init() throws Exception {
     super.init();
+    enableCalcite();
     loadIndex(Index.ACCOUNT);
 
     // getClusterHosts() returns one HttpHost per bound address — in test clusters each node binds
@@ -114,6 +119,37 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     // Owner's QueryJobNotFoundException must translate to a transport-serializable 404 so
     // forwarding doesn't drop it to 500.
     Assert.assertEquals("expected 404 across owner-node forwarding, got " + code, 404, code);
+  }
+
+  @Test
+  public void delete_forwardsFromNonOwnerNodeToOwner() throws Exception {
+    JSONObject body = new JSONObject();
+    body.put("query", "source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
+    body.put("wait_for_completion_timeout", "0");
+    String queryId = new JSONObject(postPpl(nodeA, body)).getString("id");
+    Assert.assertEquals("SUCCEEDED", pollUntilTerminal(nodeA, queryId, 30_000).getString("status"));
+
+    org.opensearch.client.Response deleted = deleteAsyncQuery(nodeB, queryId);
+
+    Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+    Assert.assertEquals(
+        "SUCCEEDED",
+        new JSONObject(org.opensearch.sql.legacy.TestUtils.getResponseBody(deleted, true))
+            .getString("status"));
+    assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+    assertNotFound(() -> getAsyncQuery(nodeB, queryId));
+  }
+
+  @Test
+  public void deleteUnknownPplIdFromNonOwner_returns404() throws Exception {
+    String fakeId = org.opensearch.sql.job.QueryJobId.create(nodeIdOf(nodeA)).encode();
+    org.opensearch.client.Request request =
+        new org.opensearch.client.Request(
+            "DELETE", AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT + fakeId);
+    org.opensearch.client.ResponseException ex =
+        Assert.assertThrows(
+            org.opensearch.client.ResponseException.class, () -> nodeB.performRequest(request));
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
   }
 
   private static String nodeIdOf(org.opensearch.client.RestClient client) throws IOException {

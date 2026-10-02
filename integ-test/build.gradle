@@ -497,6 +497,7 @@ testClusters {
         numberOfNodes = 2
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
+        plugin ":integ-test:async-query-test-plugin"
         setting "plugins.query.datasources.encryption.masterkey", "1234567812345678"
     }
     tracingIntegTest {
@@ -539,6 +540,14 @@ testClusters {
         testDistribution = 'archive'
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
+    }
+    // Dedicated two-node secured cluster for async PPL ownership checks across owner forwarding.
+    asyncSecurityMultiNodeIT {
+        testDistribution = 'archive'
+        numberOfNodes = 2
+        plugin(getJobSchedulerPlugin())
+        plugin ":opensearch-sql-plugin"
+        plugin ":integ-test:async-query-test-plugin"
     }
     // Smoke test: verify sql loads cleanly alongside analytics-engine.
     analyticsEngineCompat {
@@ -773,6 +782,7 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
     useCluster testClusters.asyncMultiNodeIT
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
+    dependsOn ':integ-test:async-query-test-plugin:bundlePlugin'
 
     systemProperty 'tests.security.manager', 'false'
     // Resolve dataset files (accounts.json, bank.json, ...) relative to the project.
@@ -787,6 +797,7 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
 
     filter {
         includeTestsMatching 'org.opensearch.sql.ppl.AsyncPPLMultiNodeRoutingIT'
+        includeTestsMatching 'org.opensearch.sql.ppl.AsyncPPLCancellationIT'
     }
 }
 
@@ -794,6 +805,31 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
 // single-node integTest. Without this, AsyncPPLMultiNodeRoutingIT is excluded from `integTest`
 // (needs a 2-node cluster) and would never actually run.
 check.dependsOn asyncMultiNodeIT
+
+configureSecurityPlugin(testClusters.asyncSecurityMultiNodeIT)
+
+task asyncSecurityMultiNodeIT(type: RestIntegTestTask) {
+    useCluster testClusters.asyncSecurityMultiNodeIT
+
+    dependsOn ':opensearch-sql-plugin:bundlePlugin'
+    dependsOn ':integ-test:async-query-test-plugin:bundlePlugin'
+
+    // Fail instead of skipping when the security plugin is missing.
+    systemProperty 'tests.required.plugins', 'opensearch-security'
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'project.root', project.projectDir.absolutePath
+    systemProperty 'defaultQuerySizeLimit', '10000'
+    doFirst {
+        systemProperty 'cluster.debug', getDebug()
+        systemProperty "https", "false"
+        systemProperty "user", "admin"
+        systemProperty "password", "admin"
+    }
+
+    filter {
+        includeTestsMatching 'org.opensearch.sql.security.AsyncPPLSecurityIT'
+    }
+}
 
 task integTestWithSecurity(type: RestIntegTestTask) {
     useCluster testClusters.integTestWithSecurity
@@ -805,6 +841,9 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     // on integTestRemote.
     systemProperty 'tests.required.plugins', 'opensearch-security'
     systemProperty 'tests.required.remote.cluster', 'true'
+
+    // The secured async ownership IT needs two nodes and the async query test plugin.
+    dependsOn asyncSecurityMultiNodeIT
 
     systemProperty "cluster.names",
         getClusters().stream().map(cluster -> cluster.getName()).collect(Collectors.joining(","))
@@ -824,6 +863,7 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     // Exclude tests that require the analytics engine plugin stack (run separately via analyticsEngineSecurityIT)
     filter {
         excludeTestsMatching 'org.opensearch.sql.security.AnalyticsEngineSecurityIT'
+        excludeTestsMatching 'org.opensearch.sql.security.AsyncPPLSecurityIT'
     }
 
     systemProperty 'tests.security.manager', 'false'
@@ -948,6 +988,7 @@ integTest {
 
     // Run on dedicated two-node cluster via :integ-test:asyncMultiNodeIT.
     exclude 'org/opensearch/sql/ppl/AsyncPPLMultiNodeRoutingIT.class'
+    exclude 'org/opensearch/sql/ppl/AsyncPPLCancellationIT.class'
 
     // Exclude tests that require the analytics engine plugin stack (run separately via dedicated tasks)
     exclude 'org/opensearch/sql/analytics/AnalyticsEngineProfileIT.class'
@@ -1608,6 +1649,9 @@ task integTestRemote(type: RestIntegTestTask) {
     // Exclude the same tests that are excluded for integTest
     exclude 'org/opensearch/sql/doctest/**/*IT.class'
     exclude 'org/opensearch/sql/correctness/**'
+    // These need the async query test plugin installed in a dedicated cluster.
+    exclude 'org/opensearch/sql/ppl/AsyncPPLCancellationIT.class'
+    exclude 'org/opensearch/sql/security/AsyncPPLSecurityIT.class'
     exclude 'org/opensearch/sql/legacy/ExplainIT.class'
     exclude 'org/opensearch/sql/legacy/PrettyFormatterIT.class'
     exclude 'org/opensearch/sql/legacy/TermQueryExplainIT.class'

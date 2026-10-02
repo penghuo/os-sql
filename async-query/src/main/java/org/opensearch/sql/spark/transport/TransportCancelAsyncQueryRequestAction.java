@@ -16,7 +16,6 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.job.QueryJobId;
-import org.opensearch.sql.job.QueryJobStatus;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
 import org.opensearch.sql.spark.asyncquery.model.NullAsyncQueryRequestContext;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionRequest;
@@ -66,18 +65,13 @@ public class TransportCancelAsyncQueryRequestAction
             listener);
         return;
       }
-      Optional<QueryJobStatus> deleted = asyncQueryExecutorService.deleteQueryJob(queryId);
-      if (deleted.isPresent()) {
-        listener.onResponse(
-            new CancelAsyncQueryActionResponse(
-                new JSONObject().put("status", deleted.get().state().name()).toString()));
-        return;
-      }
-      String cancelledId =
+      String result =
           asyncQueryExecutorService.cancelQuery(queryId, new NullAsyncQueryRequestContext());
       listener.onResponse(
           new CancelAsyncQueryActionResponse(
-              String.format("Deleted async query with id: %s", cancelledId)));
+              parsed.isPresent()
+                  ? new JSONObject().put("status", result).toString()
+                  : String.format("Deleted async query with id: %s", result)));
     } catch (Exception e) {
       listener.onFailure(AsyncQueryOwnerRouting.toTransportException(e));
     }

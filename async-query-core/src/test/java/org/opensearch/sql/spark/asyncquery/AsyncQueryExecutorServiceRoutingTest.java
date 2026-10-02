@@ -9,7 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -253,79 +252,84 @@ class AsyncQueryExecutorServiceRoutingTest {
   }
 
   @Test
-  void deleteRoutesToJobServiceWithCurrentPrincipal() {
+  void cancelDeletesPplJobWithCurrentPrincipalAndReturnsFinalState() {
     when(securityAdapter.current()).thenReturn(ALICE);
-    QueryJobStatus cancelled =
-        snapshot(QueryJobState.CANCELLED, Optional.empty(), Optional.empty());
-    when(jobService.delete(JOB_ID, ALICE)).thenReturn(cancelled);
+    when(jobService.delete(JOB_ID, ALICE))
+        .thenReturn(snapshot(QueryJobState.CANCELLED, Optional.empty(), Optional.empty()));
 
-    assertSame(cancelled, service.deleteQueryJob(JOB_ID.encode()).orElseThrow());
+    assertEquals("CANCELLED", cancel());
 
     verify(jobService).delete(JOB_ID, ALICE);
     verifyNoSparkCalls();
   }
 
   @Test
-  void deleteOfMissingPplJobPropagatesWithoutSparkFallback() {
+  void cancelOfTerminalPplJobReturnsPriorState() {
+    when(securityAdapter.current()).thenReturn(ALICE);
+    when(jobService.delete(JOB_ID, ALICE))
+        .thenReturn(snapshot(QueryJobState.FAILED, Optional.empty(), Optional.empty()));
+
+    assertEquals("FAILED", cancel());
+    verifyNoSparkCalls();
+  }
+
+  @Test
+  void cancelOfMissingPplJobPropagatesWithoutSparkFallback() {
     when(securityAdapter.current()).thenReturn(ALICE);
     QueryJobNotFoundException missing = new QueryJobNotFoundException(JOB_ID);
     when(jobService.delete(JOB_ID, ALICE)).thenThrow(missing);
 
-    assertSame(
-        missing,
-        assertThrows(
-            QueryJobNotFoundException.class, () -> service.deleteQueryJob(JOB_ID.encode())));
+    assertSame(missing, assertThrows(QueryJobNotFoundException.class, this::cancel));
     verifyNoSparkCalls();
   }
 
   @Test
-  void deleteOwnershipDenialPropagatesWithoutSparkFallback() {
+  void cancelOwnershipDenialPropagatesWithoutSparkFallback() {
     when(securityAdapter.current()).thenReturn(ALICE);
     QueryJobForbiddenException forbidden = new QueryJobForbiddenException();
     when(jobService.delete(JOB_ID, ALICE)).thenThrow(forbidden);
 
-    assertSame(
-        forbidden,
-        assertThrows(
-            QueryJobForbiddenException.class, () -> service.deleteQueryJob(JOB_ID.encode())));
+    assertSame(forbidden, assertThrows(QueryJobForbiddenException.class, this::cancel));
     verifyNoSparkCalls();
   }
 
   @Test
-  void deleteWithoutSecurityAdapterUsesUnsecuredPrincipal() {
+  void cancelWithoutSecurityAdapterUsesUnsecuredPrincipal() {
     service =
         new AsyncQueryExecutorServiceImpl(
             metadataStorage, sparkDispatcher, sparkConfig, jobService, null);
     when(jobService.delete(JOB_ID, Principal.UNSECURED))
         .thenReturn(snapshot(QueryJobState.CANCELLED, Optional.empty(), Optional.empty()));
 
-    assertEquals(
-        QueryJobState.CANCELLED, service.deleteQueryJob(JOB_ID.encode()).orElseThrow().state());
+    assertEquals("CANCELLED", cancel());
 
     verifyNoInteractions(securityAdapter);
     verifyNoSparkCalls();
   }
 
   @Test
-  void deleteIsEmptyForSparkIdsAndSparkOnlyService() {
-    assertTrue(service.deleteQueryJob("spark-query-id").isEmpty());
-    assertTrue(service.deleteQueryJob(null).isEmpty());
+  void sparkOnlyServiceKeepsJobIdsOnSparkCancelPath() {
     service = new AsyncQueryExecutorServiceImpl(metadataStorage, sparkDispatcher, sparkConfig);
-    assertTrue(service.deleteQueryJob(JOB_ID.encode()).isEmpty());
+    when(metadataStorage.getJobMetadata(JOB_ID.encode())).thenReturn(Optional.empty());
 
-    verifyNoInteractions(
-        jobService, securityAdapter, metadataStorage, sparkDispatcher, sparkConfig);
+    assertThrows(AsyncQueryNotFoundException.class, this::cancel);
+
+    verifyNoInteractions(jobService, securityAdapter, sparkDispatcher, sparkConfig);
   }
 
   @Test
-  void cancelQueryKeepsJobIdsOnSparkPath() {
-    when(metadataStorage.getJobMetadata(JOB_ID.encode())).thenReturn(Optional.empty());
+  void malformedJobIdKeepsSparkCancelPath() {
+    when(metadataStorage.getJobMetadata("spark-query-id")).thenReturn(Optional.empty());
 
     assertThrows(
         AsyncQueryNotFoundException.class,
-        () -> service.cancelQuery(JOB_ID.encode(), requestContext));
+        () -> service.cancelQuery("spark-query-id", requestContext));
 
     verifyNoInteractions(jobService, securityAdapter, sparkDispatcher, sparkConfig);
+  }
+
+  private String cancel() {
+    return service.cancelQuery(JOB_ID.encode(), requestContext);
   }
 
   private AsyncQueryExecutionResponse fetch() {

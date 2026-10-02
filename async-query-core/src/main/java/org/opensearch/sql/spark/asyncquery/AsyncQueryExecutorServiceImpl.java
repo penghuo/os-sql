@@ -176,8 +176,17 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
     throw new AsyncQueryNotFoundException(String.format("QueryId: %s not found", queryId));
   }
 
+  /**
+   * Deletes a {@link QueryJobId} through {@link QueryJobService#delete} and returns the job's final
+   * state name ({@code CANCELLED}, {@code SUCCEEDED}, or {@code FAILED}); cancels any other id on
+   * the Spark path and returns the cancelled query id.
+   */
   @Override
   public String cancelQuery(String queryId, AsyncQueryRequestContext asyncQueryRequestContext) {
+    Optional<QueryJobId> jobId = asJobId(queryId);
+    if (jobId.isPresent() && queryJobService != null) {
+      return queryJobService.delete(jobId.get(), currentPrincipal()).state().name();
+    }
     Optional<AsyncQueryJobMetadata> asyncQueryJobMetadata =
         asyncQueryJobMetadataStorageService.getJobMetadata(queryId);
     if (asyncQueryJobMetadata.isPresent()) {
@@ -188,19 +197,6 @@ public class AsyncQueryExecutorServiceImpl implements AsyncQueryExecutorService 
       return result;
     }
     throw new AsyncQueryNotFoundException(String.format("QueryId: %s not found", queryId));
-  }
-
-  /**
-   * Deletes the job through {@link QueryJobService#delete} and returns its final snapshot. Returns
-   * empty when {@code queryId} is not a {@link QueryJobId} or no job service is wired; the caller
-   * then cancels through the Spark path with {@link #cancelQuery}.
-   */
-  public Optional<QueryJobStatus> deleteQueryJob(String queryId) {
-    Optional<QueryJobId> jobId = asJobId(queryId);
-    if (jobId.isEmpty() || queryJobService == null) {
-      return Optional.empty();
-    }
-    return Optional.of(queryJobService.delete(jobId.get(), currentPrincipal()));
   }
 
   /**

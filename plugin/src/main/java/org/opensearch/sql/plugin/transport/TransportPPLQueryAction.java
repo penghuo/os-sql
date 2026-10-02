@@ -306,8 +306,6 @@ public class TransportPPLQueryAction
       PPLQueryRequest transformedRequest,
       ActionListener<TransportPPLQueryResponse> listener,
       Consumer<String> anonymizedQuerySink) {
-    // Calcite index scans keep polling this task even after the RUNNING response unregisters it,
-    // so cancelling it stops the async query's execution.
     Runnable cancelExecution =
         task instanceof PPLQueryTask pplQueryTask
             ? () -> pplQueryTask.cancel("async PPL query cancelled")

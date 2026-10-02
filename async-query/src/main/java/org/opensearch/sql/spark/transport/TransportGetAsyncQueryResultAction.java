@@ -16,6 +16,7 @@ import org.opensearch.sql.executor.pagination.Cursor;
 import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.protocol.response.format.ExplainResponseJsonFormatter;
 import org.opensearch.sql.protocol.response.format.JsonResponseFormatter;
+import org.opensearch.sql.protocol.response.format.ProgressEnvelope;
 import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorService;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
@@ -74,13 +75,19 @@ public class TransportGetAsyncQueryResultAction
       }
       AsyncQueryExecutionResponse asyncQueryExecutionResponse =
           asyncQueryExecutorService.getAsyncQueryResults(jobId, new NullAsyncQueryRequestContext());
-      // Statement-level explain results use the sync explain formatter so the response shape
-      // matches the sync explain path byte-for-byte.
+      // Statement-level explain results use the sync explain formatter so the plan fields match the sync
+      // explain path, with progress added: a client polling an async job must get the same completion signal
+      // whatever shape the result takes, and without it an explain job would be the one response where
+      // `progress` is absent.
       if (asyncQueryExecutionResponse.getExplain() != null) {
-        listener.onResponse(
-            new GetAsyncQueryResultActionResponse(
-                new ExplainResponseJsonFormatter(JsonResponseFormatter.Style.PRETTY)
-                    .format(asyncQueryExecutionResponse.getExplain())));
+        String explainBody =
+            new ExplainResponseJsonFormatter(JsonResponseFormatter.Style.PRETTY)
+                .format(asyncQueryExecutionResponse.getExplain());
+        if (asyncQueryExecutionResponse.getProgress() != null) {
+          explainBody =
+              ProgressEnvelope.merge(explainBody, asyncQueryExecutionResponse.getProgress());
+        }
+        listener.onResponse(new GetAsyncQueryResultActionResponse(explainBody));
         return;
       }
       ResponseFormatter<AsyncQueryResult> formatter =
@@ -92,7 +99,8 @@ public class TransportGetAsyncQueryResultAction
                   asyncQueryExecutionResponse.getSchema(),
                   asyncQueryExecutionResponse.getResults(),
                   Cursor.None,
-                  asyncQueryExecutionResponse.getError()));
+                  asyncQueryExecutionResponse.getError(),
+                  asyncQueryExecutionResponse.getProgress()));
       listener.onResponse(new GetAsyncQueryResultActionResponse(responseContent));
     } catch (org.opensearch.sql.job.exceptions.QueryJobNotFoundException e) {
       // Translate to a transport-serializable OpenSearchException so cross-node forwarding

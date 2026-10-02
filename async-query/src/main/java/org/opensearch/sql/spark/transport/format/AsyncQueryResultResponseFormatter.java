@@ -6,6 +6,7 @@
 package org.opensearch.sql.spark.transport.format;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.google.gson.annotations.SerializedName;
 import java.util.List;
 import java.util.stream.Collectors;
 import lombok.Builder;
@@ -60,6 +61,9 @@ public class AsyncQueryResultResponseFormatter extends JsonResponseFormatter<Asy
     if (!Strings.isEmpty(response.getError())) {
       json.error(response.getError());
     }
+    if (response.getProgress() != null) {
+      json.progress(new Progress(response.getProgress().fractionDone()));
+    }
 
     return json.build();
   }
@@ -88,6 +92,9 @@ public class AsyncQueryResultResponseFormatter extends JsonResponseFormatter<Asy
     private Integer total;
     private Integer size;
     private final String error;
+
+    /** Omitted entirely when null, which keeps the Spark async-query response shape unchanged. */
+    private final Progress progress;
   }
 
   @RequiredArgsConstructor
@@ -95,5 +102,18 @@ public class AsyncQueryResultResponseFormatter extends JsonResponseFormatter<Asy
   public static class Column {
     private final String name;
     private final String type;
+  }
+
+  /**
+   * Nested so later progress signals — rows scanned, bytes read, a per-source breakdown — can be added
+   * without claiming another top-level response field.
+   */
+  @RequiredArgsConstructor
+  @Getter
+  public static class Progress {
+    // Gson serializes fields, not getters, so the wire name is pinned explicitly rather than by naming the
+    // field in snake_case.
+    @SerializedName("fraction_done")
+    private final double fractionDone;
   }
 }

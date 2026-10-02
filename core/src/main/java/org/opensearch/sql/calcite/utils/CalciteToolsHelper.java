@@ -101,6 +101,7 @@ import org.apache.calcite.util.Holder;
 import org.apache.calcite.util.Util;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.CalcitePlanContext;
+import org.opensearch.sql.calcite.plan.PhysicalPlanHook;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRules;
 import org.opensearch.sql.calcite.plan.rule.PPLSimplifyDedupRule;
@@ -324,6 +325,15 @@ public class CalciteToolsHelper {
 
     @Override
     protected PreparedResult implement(RelRoot root) {
+      // The chosen physical plan exists here and nowhere earlier: the plan the engine handed to the
+      // runner was still
+      // logical, and the planner that just ran is the thing that turned a `head` into an
+      // EnumerableLimit. Anything
+      // that must see or replace the operators that will actually execute has to act at this point
+      // — and before
+      // super.implement(), so that PLAN_BEFORE_IMPLEMENTATION and code generation both see the same
+      // tree.
+      root = root.withRel(PhysicalPlanHook.apply(root.rel));
       ProfileContext profileContext = QueryProfiling.current();
       if (profileContext.isEnabled()) {
         PlanProfileBuilder.ProfilePlan plan = PlanProfileBuilder.profile(root.rel);

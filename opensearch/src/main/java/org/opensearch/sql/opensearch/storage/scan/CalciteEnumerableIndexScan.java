@@ -29,6 +29,7 @@ import org.apache.logging.log4j.Logger;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.plan.Scannable;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRules;
+import org.opensearch.sql.opensearch.executor.progress.ProgressiveQueryContext;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.OpenSearchIndex;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownContext;
@@ -105,7 +106,33 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
             pref.preferArray());
 
     Expression scanOperator = implementor.stash(this, CalciteEnumerableIndexScan.class);
-    return implementor.result(physType, Blocks.toBlock(Expressions.call(scanOperator, "scan")));
+    // Claim this position's progress source now, while the position is being code-generated, and
+    // bake its id
+    // into this call site. Resolving it at scan() time instead would merge the two positions of a
+    // self-join:
+    // Calcite canonicalizes equal plan nodes, so both of them are this same object, and only the
+    // code generator
+    // ever sees them as distinct.
+    long progressSourceId = ProgressiveQueryContext.claimPosition(this);
+    // An unobserved query generates exactly the code it generated before progress existed, down to
+    // the method
+    // signature. Extended explain publishes this generated source, so emitting the overload
+    // unconditionally would
+    // change synchronous explain output for a feature synchronous queries do not even have.
+    Expression scanCall =
+        progressSourceId == NO_PROGRESS_SOURCE
+            ? Expressions.call(scanOperator, "scan")
+            : Expressions.call(
+                scanOperator, "scan", Expressions.constant(progressSourceId, long.class));
+    return implementor.result(physType, Blocks.toBlock(scanCall));
+  }
+
+  /**
+   * Scans without progress reporting; used by the direct-scan path that bypasses code generation.
+   */
+  @Override
+  public Enumerable<@Nullable Object> scan() {
+    return scan(NO_PROGRESS_SOURCE);
   }
 
   /**
@@ -114,7 +141,14 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
    * or SearchAfter recorded during previous search.
    */
   @Override
-  public Enumerable<@Nullable Object> scan() {
+  public Enumerable<@Nullable Object> scan(long progressSourceId) {
+    // One binding per physical position, resolved once here and captured by the returned
+    // enumerable, so every
+    // enumerator this position creates — a nested-loop join re-drives its inner side per outer row
+    // — reports into
+    // the same source.
+    ProgressiveQueryContext.Binding progressBinding =
+        ProgressiveQueryContext.bindingFor(progressSourceId);
     return new AbstractEnumerable<>() {
       @Override
       public Enumerator<Object> enumerator() {
@@ -126,7 +160,8 @@ public class CalciteEnumerableIndexScan extends AbstractCalciteIndexScan
             requestBuilder.getMaxResultWindow(),
             osIndex.getQueryBucketSize(),
             osIndex.buildRequest(requestBuilder),
-            osIndex.createOpenSearchResourceMonitor());
+            osIndex.createOpenSearchResourceMonitor(),
+            progressBinding);
       }
     };
   }

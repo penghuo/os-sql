@@ -13,6 +13,7 @@ import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.Warning;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.executor.progress.QueryProgress;
 
 /**
  * Wire-protocol response for a query submission.
@@ -53,11 +54,19 @@ public sealed interface QueryResult
     }
   }
 
-  /** Wait budget expired; the client polls {@link #id()} to observe the terminal outcome. */
-  record Running(QueryJobId id) implements QueryResult {
+  /**
+   * Wait budget expired; the client polls {@link #id()} to observe the terminal outcome.
+   *
+   * @param id opaque id to poll with
+   * @param progress completion estimate at the moment the wait expired; strictly below {@code 1.0},
+   *     because a job that finished inside the budget returns {@link Rows} or {@link Explain}
+   *     instead
+   */
+  record Running(QueryJobId id, QueryProgress progress) implements QueryResult {
 
     public Running {
       Objects.requireNonNull(id, "id must not be null");
+      Objects.requireNonNull(progress, "progress must not be null");
     }
 
     @Override

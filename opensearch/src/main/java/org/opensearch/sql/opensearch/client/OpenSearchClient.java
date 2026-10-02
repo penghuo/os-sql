@@ -64,6 +64,28 @@ public interface OpenSearchClient {
   OpenSearchResponse search(OpenSearchRequest request);
 
   /**
+   * Best-effort source size estimate for progress reporting.
+   *
+   * <p>Returns the sum of live primary-shard document counts, plus the per-shard counts used to
+   * weight shard-level progress within one search. This is an index-size estimate only — it says
+   * nothing about filter selectivity and does not enable exact total-hit tracking.
+   *
+   * <p>Returns empty whenever the answer would be incomplete or slow: the stats call is
+   * unauthorized, times out, or fails; any participating primary shard failed; or a primary shard
+   * reported no usable document count. Partial stats are discarded rather than blended, because a
+   * denominator missing a shard's documents would make progress overshoot. Implementations must not
+   * throw — failing to estimate must never fail or delay the query.
+   *
+   * @param indices concrete index names or patterns the source reads
+   * @param timeoutMillis bound on how long the lookup may take
+   * @return the estimate, or empty when unavailable
+   */
+  default Optional<org.opensearch.sql.opensearch.executor.progress.SourceEstimate>
+      documentCountEstimate(String[] indices, long timeoutMillis) {
+    return Optional.empty();
+  }
+
+  /**
    * Get the combination of the indices and the alias.
    *
    * @return the combination of the indices and the alias

@@ -9,6 +9,7 @@ import java.util.List;
 import lombok.Data;
 import org.opensearch.sql.data.model.ExprValue;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.executor.progress.QueryProgress;
 
 /** AsyncQueryExecutionResponse to store the response form spark job execution. */
 @Data
@@ -26,4 +27,13 @@ public class AsyncQueryExecutionResponse {
    * renderer and format this with the sync explain formatter.
    */
   private final ExecutionEngine.ExplainResponse explain;
+
+  /**
+   * Bounded, monotonic completion estimate, or {@code null} for responses that carry none.
+   *
+   * <p>Null on the Spark async-query path, which has no equivalent signal; the transport layer then
+   * omits the {@code progress} object entirely rather than publishing a fabricated zero, so
+   * existing Spark clients see an unchanged response shape.
+   */
+  private final QueryProgress progress;
 }

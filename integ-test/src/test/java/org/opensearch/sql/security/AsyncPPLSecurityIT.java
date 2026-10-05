@@ -28,9 +28,9 @@ import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.ppl.AsyncPPLTestHelpers;
 
 /**
- * Async PPL ownership checks on the two-node secured {@code asyncSecurityMultiNodeIT} cluster. Both
- * users hold every async permission, so a 403 can only come from job ownership. Requests are sent
- * to the non-owner node to exercise owner forwarding.
+ * Async PPL ownership checks on the shared two-node secured {@code integTestWithSecurity} cluster.
+ * Both users hold every async permission, so a 403 can only come from job ownership. Requests are
+ * sent to the non-owner node to exercise owner forwarding.
  */
 public class AsyncPPLSecurityIT extends SecurityTestBase {
 

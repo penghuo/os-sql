@@ -530,6 +530,9 @@ testClusters {
     }
     integTestWithSecurity {
         testDistribution = 'archive'
+        // Two nodes so AsyncPPLSecurityIT can exercise owner forwarding on the shared secured
+        // cluster. Pre-existing security suites keep running against the same cluster.
+        numberOfNodes = 2
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
         // Only /_cluster/health is registered; pin the allow-list to it for RestCommandSecurityIT.
@@ -537,13 +540,6 @@ testClusters {
     }
     remoteIntegTestWithSecurity {
         testDistribution = 'archive'
-        plugin(getJobSchedulerPlugin())
-        plugin ":opensearch-sql-plugin"
-    }
-    // Dedicated two-node secured cluster for async PPL ownership checks across owner forwarding.
-    asyncSecurityMultiNodeIT {
-        testDistribution = 'archive'
-        numberOfNodes = 2
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
     }
@@ -802,30 +798,6 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
 // (needs a 2-node cluster) and would never actually run.
 check.dependsOn asyncMultiNodeIT
 
-configureSecurityPlugin(testClusters.asyncSecurityMultiNodeIT)
-
-task asyncSecurityMultiNodeIT(type: RestIntegTestTask) {
-    useCluster testClusters.asyncSecurityMultiNodeIT
-
-    dependsOn ':opensearch-sql-plugin:bundlePlugin'
-
-    // Fail instead of skipping when the security plugin is missing.
-    systemProperty 'tests.required.plugins', 'opensearch-security'
-    systemProperty 'tests.security.manager', 'false'
-    systemProperty 'project.root', project.projectDir.absolutePath
-    systemProperty 'defaultQuerySizeLimit', '10000'
-    doFirst {
-        systemProperty 'cluster.debug', getDebug()
-        systemProperty "https", "false"
-        systemProperty "user", "admin"
-        systemProperty "password", "admin"
-    }
-
-    filter {
-        includeTestsMatching 'org.opensearch.sql.security.AsyncPPLSecurityIT'
-    }
-}
-
 task integTestWithSecurity(type: RestIntegTestTask) {
     useCluster testClusters.integTestWithSecurity
     useCluster testClusters.remoteIntegTestWithSecurity
@@ -836,9 +808,6 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     // on integTestRemote.
     systemProperty 'tests.required.plugins', 'opensearch-security'
     systemProperty 'tests.required.remote.cluster', 'true'
-
-    // The secured async ownership IT needs a dedicated two-node secured cluster.
-    dependsOn asyncSecurityMultiNodeIT
 
     systemProperty "cluster.names",
         getClusters().stream().map(cluster -> cluster.getName()).collect(Collectors.joining(","))
@@ -858,7 +827,6 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     // Exclude tests that require the analytics engine plugin stack (run separately via analyticsEngineSecurityIT)
     filter {
         excludeTestsMatching 'org.opensearch.sql.security.AnalyticsEngineSecurityIT'
-        excludeTestsMatching 'org.opensearch.sql.security.AsyncPPLSecurityIT'
     }
 
     systemProperty 'tests.security.manager', 'false'
@@ -1643,7 +1611,8 @@ task integTestRemote(type: RestIntegTestTask) {
     // Exclude the same tests that are excluded for integTest
     exclude 'org/opensearch/sql/doctest/**/*IT.class'
     exclude 'org/opensearch/sql/correctness/**'
-    // AsyncPPLSecurityIT needs a two-node secured cluster.
+    // AsyncPPLSecurityIT needs two local nodes for owner forwarding; integTestRemote runs
+    // against an externally supplied cluster that is not guaranteed to have two.
     exclude 'org/opensearch/sql/security/AsyncPPLSecurityIT.class'
     exclude 'org/opensearch/sql/legacy/ExplainIT.class'
     exclude 'org/opensearch/sql/legacy/PrettyFormatterIT.class'

@@ -6,11 +6,11 @@
 package org.opensearch.sql.security;
 
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.INDEX;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.STREAMSTATS_QUERY;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.assertStopped;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.awaitPoolsIdle;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.indexSearchCount;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.INDEX;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertStopped;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.indexSearchCount;
 
 import java.io.IOException;
 import org.apache.hc.core5.http.HttpHost;
@@ -26,7 +26,7 @@ import org.opensearch.client.RestClient;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.legacy.SQLIntegTestCase;
-import org.opensearch.sql.ppl.AsyncQueryFixture;
+import org.opensearch.sql.ppl.AsyncPPLTestHelpers;
 
 /**
  * Async PPL ownership checks on the two-node secured {@code asyncSecurityMultiNodeIT} cluster. Both
@@ -53,13 +53,13 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     updateClusterSettings(
         new SQLIntegTestCase.ClusterSetting(
             "persistent", "plugins.sql.complex_worker_pool.enabled", "false"));
-    AsyncQueryFixture.createIndex(client());
+    AsyncPPLTestHelpers.createIndex(client());
     createAsyncUser(ALICE);
     createAsyncUser(BOB);
-    RestClient[] nodes = AsyncQueryFixture.twoNodeClients(getClusterHosts(), this::nodeClient);
+    RestClient[] nodes = AsyncPPLTestHelpers.twoNodeClients(getClusterHosts(), this::nodeClient);
     owner = nodes[0];
     peer = nodes[1];
-    ownerNodeId = AsyncQueryFixture.localNodeId(owner);
+    ownerNodeId = AsyncPPLTestHelpers.localNodeId(owner);
   }
 
   @After
@@ -93,8 +93,8 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     submit.put("wait_for_completion_timeout", "0");
     String queryId =
         new JSONObject(asUser(owner, "POST", "/_plugins/_ppl", ALICE, submit)).getString("id");
-    AsyncQueryFixture.RunningSnapshot running =
-        AsyncQueryFixture.awaitRunning(owner, ownerNodeId, searchesBefore);
+    AsyncPPLTestHelpers.RunningSnapshot running =
+        AsyncPPLTestHelpers.awaitRunning(owner, ownerNodeId, searchesBefore);
 
     assertForbidden(() -> asUser(peer, "DELETE", ASYNC_PATH + queryId, BOB, null));
     assertForbidden(() -> asUser(peer, "GET", ASYNC_PATH + queryId, BOB, null));

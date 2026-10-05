@@ -6,21 +6,21 @@
 package org.opensearch.sql.ppl;
 
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.DOCS;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.EVENTSTATS_QUERY;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.OVERFLOW_QUERY;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertStopped;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitRunning;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.indexSearchCount;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.localNodeId;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.BASELINE_MIN_SEARCHES;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.DOCS;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.EVENTSTATS_QUERY;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.OVERFLOW_QUERY;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.STREAMSTATS_QUERY;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.assertStopped;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.awaitPoolsIdle;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.awaitRunning;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.indexSearchCount;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.localNodeId;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -68,11 +68,11 @@ public class AsyncPPLCancellationIT extends PPLIntegTestCase {
     enableCalcite();
     setClusterSetting(FALLBACK_ALLOWED, "true");
     setClusterSetting(COMPLEX_POOL_ENABLED, "false");
-    RestClient[] nodes = AsyncQueryFixture.twoNodeClients(getClusterHosts(), this::nodeClient);
+    RestClient[] nodes = AsyncPPLTestHelpers.twoNodeClients(getClusterHosts(), this::nodeClient);
     owner = nodes[0];
     peer = nodes[1];
     ownerNodeId = localNodeId(owner);
-    AsyncQueryFixture.createIndex(client());
+    AsyncPPLTestHelpers.createIndex(client());
   }
 
   @After
@@ -112,7 +112,7 @@ public class AsyncPPLCancellationIT extends PPLIntegTestCase {
   public void concurrentDeletesCancelOnceAndRemoveOnce() throws Exception {
     long searchesBefore = indexSearchCount(owner);
     String queryId = submitAsync(STREAMSTATS_QUERY);
-    AsyncQueryFixture.RunningSnapshot running = awaitRunning(owner, ownerNodeId, searchesBefore);
+    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(owner, ownerNodeId, searchesBefore);
     long searchesAtDelete = indexSearchCount(owner);
 
     CountDownLatch start = new CountDownLatch(1);
@@ -198,7 +198,7 @@ public class AsyncPPLCancellationIT extends PPLIntegTestCase {
   private void assertDeleteCancelsAndStops(String query, RestClient deleteNode) throws Exception {
     long searchesBefore = indexSearchCount(owner);
     String queryId = submitAsync(query);
-    AsyncQueryFixture.RunningSnapshot running = awaitRunning(owner, ownerNodeId, searchesBefore);
+    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(owner, ownerNodeId, searchesBefore);
     Assert.assertEquals(
         "RUNNING", new JSONObject(getAsyncQuery(owner, queryId)).getString("status"));
     long searchesAtDelete = indexSearchCount(owner);

@@ -34,12 +34,9 @@ import org.opensearch.client.RestClient;
  * endpoints: {@code /_nodes/<id>/stats/thread_pool}, {@code /&lt;index&gt;/_stats}, and {@code
  * /_search/point_in_time/_all}.
  *
- * <p>Both {@code streamstats} and {@code eventstats} compile to Calcite {@code Window} / {@code
- * RexOver}, which {@code ScriptDetector.hasScripts} matches, so by default the plan would dispatch
- * to the complex-worker pool. That pool's cancellation poller still reads the task cancel flag the
- * hook sets, so a broken hook would show up there too; the IT pins the plan to {@code sql-worker}
- * because that is the normal path most async PPL queries take. Callers set {@code
- * plugins.sql.complex_worker_pool.enabled} to {@code false} in setup and restore it in teardown.
+ * <p>{@code streamstats} and {@code eventstats} compile to Calcite {@code Window} / {@code
+ * RexOver}, so by default they dispatch to {@code sql-complex-worker}; the helpers can assert on
+ * either pool via the {@link #awaitRunning(RestClient, String, long, String)} overload.
  *
  * <p>Only the surface that the cross-package security IT needs is {@code public}; everything else
  * stays package-private or private.
@@ -200,19 +197,26 @@ public final class AsyncPPLTestHelpers {
     return stats.getJSONObject("search").getLong("query_total");
   }
 
-  /**
-   * Running proof: the query must be on {@code sql-worker}, have an open PIT, and have made at
-   * least {@link #RUNNING_MIN_PROGRESS} but no more than {@link #RUNNING_MAX_PROGRESS} searches
-   * since submission, so the scan is demonstrably running with over half its work remaining.
-   */
+  /** Waits for a query running on {@code sql-worker} with the complex pool idle. */
   public static RunningSnapshot awaitRunning(
       RestClient owner, String ownerNodeId, long searchesBeforeSubmit) throws Exception {
+    return awaitRunning(owner, ownerNodeId, searchesBeforeSubmit, "sql-worker");
+  }
+
+  /**
+   * Running proof: the query must be active on {@code expectedPool}, have an open PIT, and have
+   * made at least {@link #RUNNING_MIN_PROGRESS} but no more than {@link #RUNNING_MAX_PROGRESS}
+   * searches since submission, so the scan is demonstrably running with over half its work left.
+   */
+  static RunningSnapshot awaitRunning(
+      RestClient owner, String ownerNodeId, long searchesBeforeSubmit, String expectedPool)
+      throws Exception {
     long deadline = System.currentTimeMillis() + START_DEADLINE_MILLIS;
     while (System.currentTimeMillis() <= deadline) {
       Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
       long searches = indexSearchCount(owner);
       long progress = searches - searchesBeforeSubmit;
-      if (pools.get("sql-worker").get("active") > 0
+      if (pools.get(expectedPool).get("active") > 0
           && progress >= RUNNING_MIN_PROGRESS
           && progress <= RUNNING_MAX_PROGRESS) {
         // Only probe the native PIT listing once worker activity and search progress show the
@@ -220,17 +224,21 @@ public final class AsyncPPLTestHelpers {
         // and get a transient 500 from the native endpoint for an in-flight context id.
         List<String> pits = openPits(owner);
         if (!pits.isEmpty()) {
-          Assert.assertEquals(
-              "complex worker pool must be disabled so streamstats stays on sql-worker: " + pools,
-              0,
-              pools.get("sql-complex-worker").get("active").intValue());
+          if ("sql-worker".equals(expectedPool)) {
+            Assert.assertEquals(
+                "sql-worker caller must disable the complex worker pool: " + pools,
+                0,
+                pools.get("sql-complex-worker").get("active").intValue());
+          }
           return new RunningSnapshot(pools, searches, pits);
         }
       }
       Thread.sleep(10);
     }
     Assert.fail(
-        "query never reached a running state on sql-worker: pools="
+        "query never reached a running state on "
+            + expectedPool
+            + ": pools="
             + poolStats(owner, ownerNodeId)
             + " searchesBeforeSubmit="
             + searchesBeforeSubmit
@@ -263,10 +271,9 @@ public final class AsyncPPLTestHelpers {
   }
 
   /**
-   * Asserts the query stopped after DELETE: pools went idle within the deadline, the search delta
-   * measured against {@code searchesAtDelete} stayed small, and the complex-worker pool was never
-   * used. The caller must capture {@code searchesAtDelete} immediately before the DELETE so the
-   * delta tracks only post-cancel activity.
+   * Waits for every SQL pool to drain, asserts the search delta since {@code searchesAtDelete}
+   * stayed within {@link #MAX_SEARCHES_AFTER_CANCEL}, and confirms the tracked PITs were released.
+   * {@code searchesAtDelete} must be captured immediately before the DELETE.
    */
   public static void assertStopped(
       RestClient owner, String ownerNodeId, long searchesAtDelete, List<String> pitsSeenRunning)
@@ -282,10 +289,6 @@ public final class AsyncPPLTestHelpers {
             + " idle="
             + idle,
         delta <= MAX_SEARCHES_AFTER_CANCEL);
-    Assert.assertEquals(
-        "streamstats must have stayed on sql-worker: " + idle,
-        0,
-        idle.get("sql-complex-worker").get("active").intValue());
     assertPitsClosed(owner, pitsSeenRunning);
   }
 

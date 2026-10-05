@@ -189,33 +189,26 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
         "explain body must carry a plan tree", explain.has("calcite") || explain.has("root"));
   }
 
-  // Running-query cancellation across forwarding — each case installs the large cancellation
-  // fixture on demand, flips fallback/complex_pool for its own run, and resets both in finally.
   @Test
   public void deleteOnPeerForwardsCancellationOfEventstatsAndStopsExecution() throws Exception {
+    // Uses default settings and executes on sql-complex-worker.
     AsyncPPLTestHelpers.createIndex(nodeA);
-    setClusterSetting(FALLBACK_ALLOWED, "true");
-    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
-    try {
-      long searchesBefore = indexSearchCount(nodeA);
-      String queryId = submitAsync(nodeA, EVENTSTATS_QUERY);
-      AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
-      Assert.assertEquals(
-          "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
-      long searchesAtDelete = indexSearchCount(nodeA);
+    long searchesBefore = indexSearchCount(nodeA);
+    String queryId = submitAsync(nodeA, EVENTSTATS_QUERY);
+    AsyncPPLTestHelpers.RunningSnapshot running =
+        awaitRunning(nodeA, nodeAId, searchesBefore, "sql-complex-worker");
+    Assert.assertEquals(
+        "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
+    long searchesAtDelete = indexSearchCount(nodeA);
 
-      Response deleted = deleteAsyncQuery(nodeB, queryId);
-      Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
-      Assert.assertEquals(
-          "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
-      assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
-      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
-      assertNotFound(() -> getAsyncQuery(nodeB, queryId));
-      assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
-    } finally {
-      setClusterSetting(FALLBACK_ALLOWED, null);
-      setClusterSetting(COMPLEX_POOL_ENABLED, null);
-    }
+    Response deleted = deleteAsyncQuery(nodeB, queryId);
+    Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+    Assert.assertEquals(
+        "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
+    assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+    assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+    assertNotFound(() -> getAsyncQuery(nodeB, queryId));
+    assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
   }
 
   @Test

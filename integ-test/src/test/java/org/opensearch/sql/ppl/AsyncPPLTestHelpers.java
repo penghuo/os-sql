@@ -26,7 +26,7 @@ import org.opensearch.client.RestClient;
 
 /**
  * Shared helpers for the async PPL integration tests ({@link AsyncPPLQueryLifecycleIT}, {@link
- * AsyncPPLMultiNodeRoutingIT}, {@link AsyncPPLCancellationIT}, and {@code AsyncPPLSecurityIT}).
+ * AsyncPPLMultiNodeRoutingIT}, and {@code AsyncPPLSecurityIT}).
  *
  * <p>Covers both lifecycle plumbing (POST / GET / DELETE / poll-until-terminal) and the
  * cancellation fixture: a dedicated bulk-loaded index, natural {@code streamstats} / {@code
@@ -212,16 +212,20 @@ public final class AsyncPPLTestHelpers {
       Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
       long searches = indexSearchCount(owner);
       long progress = searches - searchesBeforeSubmit;
-      List<String> pits = openPits(owner);
       if (pools.get("sql-worker").get("active") > 0
-          && !pits.isEmpty()
           && progress >= RUNNING_MIN_PROGRESS
           && progress <= RUNNING_MAX_PROGRESS) {
-        Assert.assertEquals(
-            "complex worker pool must be disabled so streamstats stays on sql-worker: " + pools,
-            0,
-            pools.get("sql-complex-worker").get("active").intValue());
-        return new RunningSnapshot(pools, searches, pits);
+        // Only probe the native PIT listing once worker activity and search progress show the
+        // query is actually running, so this check can't race the engine finishing PIT setup
+        // and get a transient 500 from the native endpoint for an in-flight context id.
+        List<String> pits = openPits(owner);
+        if (!pits.isEmpty()) {
+          Assert.assertEquals(
+              "complex worker pool must be disabled so streamstats stays on sql-worker: " + pools,
+              0,
+              pools.get("sql-complex-worker").get("active").intValue());
+          return new RunningSnapshot(pools, searches, pits);
+        }
       }
       Thread.sleep(10);
     }
@@ -305,21 +309,42 @@ public final class AsyncPPLTestHelpers {
   }
 
   private static List<String> openPits(RestClient admin) throws IOException {
-    JSONObject body =
-        new JSONObject(
-            getResponseBody(
-                admin.performRequest(new Request("GET", "/_search/point_in_time/_all")), true));
-    List<String> ids = new ArrayList<>();
-    if (body.has("pits")) {
-      JSONArray arr = body.getJSONArray("pits");
-      for (int i = 0; i < arr.length(); i++) {
-        String id = arr.getJSONObject(i).optString("pit_id", null);
-        if (id != null) {
-          ids.add(id);
+    // The native /_search/point_in_time/_all endpoint occasionally throws 500 when a PIT handle
+    // is being released at the same time as the list is built; retry briefly so the oracle still
+    // sees the real list rather than treating a transient 500 as "no open PITs" or failing on
+    // first contact. Any other status is propagated unchanged, so 403/404 keep their meaning.
+    ResponseException last = null;
+    for (int attempt = 0; attempt < 10; attempt++) {
+      try {
+        JSONObject body =
+            new JSONObject(
+                getResponseBody(
+                    admin.performRequest(new Request("GET", "/_search/point_in_time/_all")), true));
+        List<String> ids = new ArrayList<>();
+        if (body.has("pits")) {
+          JSONArray arr = body.getJSONArray("pits");
+          for (int i = 0; i < arr.length(); i++) {
+            String id = arr.getJSONObject(i).optString("pit_id", null);
+            if (id != null) {
+              ids.add(id);
+            }
+          }
+        }
+        return ids;
+      } catch (ResponseException e) {
+        if (e.getResponse().getStatusLine().getStatusCode() != 500) {
+          throw e;
+        }
+        last = e;
+        try {
+          Thread.sleep(50);
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          throw new IOException(ie);
         }
       }
     }
-    return ids;
+    throw last;
   }
 
   private static void assertPitsClosed(RestClient admin, List<String> pitsSeenRunning)

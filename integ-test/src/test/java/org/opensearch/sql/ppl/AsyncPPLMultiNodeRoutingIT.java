@@ -5,10 +5,20 @@
 
 package org.opensearch.sql.ppl;
 
+import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.EVENTSTATS_QUERY;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.OVERFLOW_QUERY;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertStopped;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitRunning;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.indexSearchCount;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.localNodeId;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
 import static org.opensearch.sql.util.MatcherUtils.rows;
@@ -18,17 +28,29 @@ import static org.opensearch.sql.util.MatcherUtils.verifyNumOfRows;
 import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.apache.hc.core5.http.HttpHost;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.sql.job.QueryJobId;
+import org.opensearch.sql.legacy.SQLIntegTestCase;
 
 /**
- * Multi-node IT for owner-node routing (issue #5765).
- *
- * <p>Runs against the {@code asyncMultiNodeIT} test cluster (two nodes). Verifies:
+ * Multi-node IT for owner-node routing (issue #5765). Runs against the {@code asyncMultiNodeIT}
+ * two-node test cluster.
  *
  * <ul>
  *   <li>submit lands on node A; the returned queryId encodes node A as owner;
@@ -36,55 +58,54 @@ import org.opensearch.client.RestClient;
  *   <li>statement-level explain submitted on node A and fetched on node B returns the explain body
  *       produced by the owner's sync explain path;
  *   <li>DELETE on node B forwards to node A, returns the job's final status, and removes it from
- *       node A; an unknown id returns 404 across forwarding.
+ *       node A; an unknown id returns 404 across forwarding;
+ *   <li>a long-running Calcite query cancelled through the non-owner node stops execution;
+ *   <li>concurrent DELETEs on both nodes resolve to one 200 + one 404, and the single cancel drains
+ *       the owner;
+ *   <li>a job that fails naturally after the full scan reports FAILED on DELETE via the peer.
  * </ul>
- *
- * <p>Each request is pinned to a specific node by constructing a dedicated {@link RestClient} for
- * that node's HTTP address. The base {@link PPLIntegTestCase#client()} would round-robin across the
- * cluster hosts, which defeats the purpose of the test.
  */
 public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
 
+  private static final String FALLBACK_ALLOWED = "plugins.calcite.fallback.allowed";
+  private static final String COMPLEX_POOL_ENABLED = "plugins.sql.complex_worker_pool.enabled";
+
   private RestClient nodeA;
   private RestClient nodeB;
+  private String nodeAId;
 
   @Override
   protected void init() throws Exception {
     super.init();
     enableCalcite();
     loadIndex(Index.ACCOUNT);
-
-    // getClusterHosts() returns one HttpHost per bound address — in test clusters each node binds
-    // both [::1] AND 127.0.0.1, so a two-node cluster yields four hosts of which hosts[0] and
-    // hosts[1] are typically the *same* node. Resolve node ids per host and pick two with distinct
-    // ids, otherwise owner-node forwarding never triggers and the test gives a false pass.
-    java.util.List<org.apache.hc.core5.http.HttpHost> hosts = getClusterHosts();
-    HttpHost first = hosts.get(0);
-    String firstNodeId = probeNodeId(first);
-    HttpHost second = null;
-    for (int i = 1; i < hosts.size(); i++) {
-      HttpHost candidate = hosts.get(i);
-      if (!probeNodeId(candidate).equals(firstNodeId)) {
-        second = candidate;
-        break;
-      }
-    }
-    if (second == null) {
-      Assert.fail(
-          "AsyncPPLMultiNodeRoutingIT needs two distinct nodes; all cluster hosts resolve to "
-              + firstNodeId);
-    }
-    nodeA = RestClient.builder(first).build();
-    nodeB = RestClient.builder(second).build();
+    // getClusterHosts() returns one HttpHost per bound address — a two-node cluster typically
+    // yields four hosts of which hosts[0] and hosts[1] are the same node. Shared helper resolves
+    // node ids per host and picks two with distinct ids; without this, owner-node forwarding never
+    // triggers and the tests give a false pass.
+    RestClient[] nodes = AsyncPPLTestHelpers.twoNodeClients(getClusterHosts(), this::nodeClient);
+    nodeA = nodes[0];
+    nodeB = nodes[1];
+    nodeAId = localNodeId(nodeA);
   }
 
   @After
-  public void closeNodeClients() throws IOException {
-    if (nodeA != null) {
-      nodeA.close();
-    }
-    if (nodeB != null) {
-      nodeB.close();
+  public void closeNodeClients() throws Exception {
+    try {
+      // A running-cancel test that fails before its DELETE lands leaves a Calcite scan drawing
+      // batches from the fixture index; wait for nodeA to drain so the next test can't take its
+      // baseline against that orphan scan. If the drain still fails, raise it: a busy owner is
+      // itself a defect worth surfacing, not something to swallow.
+      if (nodeA != null && nodeAId != null) {
+        awaitPoolsIdle(nodeA, nodeAId);
+      }
+    } finally {
+      if (nodeA != null) {
+        nodeA.close();
+      }
+      if (nodeB != null) {
+        nodeB.close();
+      }
     }
   }
 
@@ -100,7 +121,6 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
 
     JSONObject fetched = pollUntilTerminal(nodeB, queryId, 30_000);
     Assert.assertEquals("SUCCEEDED", fetched.getString("status"));
-    // Async GET formatter emits raw engine type ("long"), not the JDBC family ("bigint").
     verifySchema(fetched, schema("c", "long"));
     verifyDataRows(fetched, rows(1000));
     verifyNumOfRows(fetched, 1);
@@ -108,17 +128,11 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
 
   @Test
   public void getUnknownPplIdFromNonOwner_returns404() throws Exception {
-    // A QueryJobId whose node id matches nodeA (owner-encoded) but the context id doesn't exist.
-    String fakeId = org.opensearch.sql.job.QueryJobId.create(nodeIdOf(nodeA)).encode();
-    org.opensearch.client.Request request =
-        new org.opensearch.client.Request("GET", AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT + fakeId);
-    org.opensearch.client.ResponseException ex =
-        Assert.assertThrows(
-            org.opensearch.client.ResponseException.class, () -> nodeB.performRequest(request));
-    int code = ex.getResponse().getStatusLine().getStatusCode();
-    // Owner's QueryJobNotFoundException must translate to a transport-serializable 404 so
-    // forwarding doesn't drop it to 500.
-    Assert.assertEquals("expected 404 across owner-node forwarding, got " + code, 404, code);
+    String fakeId = QueryJobId.create(nodeAId).encode();
+    Request request = new Request("GET", ASYNC_QUERY_ENDPOINT + fakeId);
+    ResponseException ex =
+        Assert.assertThrows(ResponseException.class, () -> nodeB.performRequest(request));
+    Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
   }
 
   @Test
@@ -129,42 +143,22 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     String queryId = new JSONObject(postPpl(nodeA, body)).getString("id");
     Assert.assertEquals("SUCCEEDED", pollUntilTerminal(nodeA, queryId, 30_000).getString("status"));
 
-    org.opensearch.client.Response deleted = deleteAsyncQuery(nodeB, queryId);
+    Response deleted = deleteAsyncQuery(nodeB, queryId);
 
     Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
     Assert.assertEquals(
-        "SUCCEEDED",
-        new JSONObject(org.opensearch.sql.legacy.TestUtils.getResponseBody(deleted, true))
-            .getString("status"));
+        "SUCCEEDED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
     assertNotFound(() -> getAsyncQuery(nodeA, queryId));
     assertNotFound(() -> getAsyncQuery(nodeB, queryId));
   }
 
   @Test
   public void deleteUnknownPplIdFromNonOwner_returns404() throws Exception {
-    String fakeId = org.opensearch.sql.job.QueryJobId.create(nodeIdOf(nodeA)).encode();
-    org.opensearch.client.Request request =
-        new org.opensearch.client.Request(
-            "DELETE", AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT + fakeId);
-    org.opensearch.client.ResponseException ex =
-        Assert.assertThrows(
-            org.opensearch.client.ResponseException.class, () -> nodeB.performRequest(request));
+    String fakeId = QueryJobId.create(nodeAId).encode();
+    Request request = new Request("DELETE", ASYNC_QUERY_ENDPOINT + fakeId);
+    ResponseException ex =
+        Assert.assertThrows(ResponseException.class, () -> nodeB.performRequest(request));
     Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
-  }
-
-  private static String nodeIdOf(org.opensearch.client.RestClient client) throws IOException {
-    org.opensearch.client.Response response =
-        client.performRequest(new org.opensearch.client.Request("GET", "/_nodes/_local"));
-    JSONObject body =
-        new JSONObject(org.opensearch.sql.legacy.TestUtils.getResponseBody(response, true));
-    JSONObject nodes = body.getJSONObject("nodes");
-    return nodes.keys().next();
-  }
-
-  private static String probeNodeId(HttpHost host) throws IOException {
-    try (RestClient client = RestClient.builder(host).build()) {
-      return nodeIdOf(client);
-    }
   }
 
   @Test
@@ -193,5 +187,132 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     Assert.assertNotNull("cross-node explain body never arrived", explain);
     Assert.assertTrue(
         "explain body must carry a plan tree", explain.has("calcite") || explain.has("root"));
+  }
+
+  // Running-query cancellation across forwarding — each case installs the large cancellation
+  // fixture on demand, flips fallback/complex_pool for its own run, and resets both in finally.
+  @Test
+  public void deleteOnPeerForwardsCancellationOfEventstatsAndStopsExecution() throws Exception {
+    AsyncPPLTestHelpers.createIndex(nodeA);
+    setClusterSetting(FALLBACK_ALLOWED, "true");
+    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+    try {
+      long searchesBefore = indexSearchCount(nodeA);
+      String queryId = submitAsync(nodeA, EVENTSTATS_QUERY);
+      AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
+      Assert.assertEquals(
+          "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
+      long searchesAtDelete = indexSearchCount(nodeA);
+
+      Response deleted = deleteAsyncQuery(nodeB, queryId);
+      Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+      Assert.assertEquals(
+          "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
+      assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+      assertNotFound(() -> getAsyncQuery(nodeB, queryId));
+      assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
+    } finally {
+      setClusterSetting(FALLBACK_ALLOWED, null);
+      setClusterSetting(COMPLEX_POOL_ENABLED, null);
+    }
+  }
+
+  @Test
+  public void concurrentDeletesCancelOnceAndRemoveOnce() throws Exception {
+    AsyncPPLTestHelpers.createIndex(nodeA);
+    setClusterSetting(FALLBACK_ALLOWED, "true");
+    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+    try {
+      long searchesBefore = indexSearchCount(nodeA);
+      String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
+      AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
+      long searchesAtDelete = indexSearchCount(nodeA);
+
+      CountDownLatch start = new CountDownLatch(1);
+      ExecutorService executor = Executors.newFixedThreadPool(2);
+      List<Response> responses = new ArrayList<>();
+      try {
+        Future<Response> onOwner = executor.submit(() -> deleteWhenStarted(start, nodeA, queryId));
+        Future<Response> onPeer = executor.submit(() -> deleteWhenStarted(start, nodeB, queryId));
+        start.countDown();
+        responses.add(onOwner.get(10, TimeUnit.SECONDS));
+        responses.add(onPeer.get(10, TimeUnit.SECONDS));
+      } finally {
+        executor.shutdownNow();
+      }
+
+      List<Integer> codes = new ArrayList<>();
+      for (Response response : responses) {
+        int code = response.getStatusLine().getStatusCode();
+        codes.add(code);
+        if (code == 200) {
+          Assert.assertEquals(
+              "CANCELLED", new JSONObject(getResponseBody(response, true)).getString("status"));
+        }
+      }
+      codes.sort(null);
+      Assert.assertEquals(List.of(200, 404), codes);
+      assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+    } finally {
+      setClusterSetting(FALLBACK_ALLOWED, null);
+      setClusterSetting(COMPLEX_POOL_ENABLED, null);
+    }
+  }
+
+  @Test
+  public void deleteOfFailedJobReturnsFailedAndRemovesIt() throws Exception {
+    AsyncPPLTestHelpers.createIndex(nodeA);
+    // FAILED case runs with fallback disabled so the overflow failure isn't swallowed into a
+    // legacy restart.
+    setClusterSetting(FALLBACK_ALLOWED, "false");
+    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+    try {
+      String queryId = submitAsync(nodeA, OVERFLOW_QUERY);
+      JSONObject terminal = pollUntilTerminal(nodeA, queryId, 30_000);
+      Assert.assertEquals("FAILED", terminal.getString("status"));
+      Assert.assertTrue("FAILED body must carry an error: " + terminal, terminal.has("error"));
+
+      Response deleted = deleteAsyncQuery(nodeB, queryId);
+      Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+      Assert.assertEquals(
+          "FAILED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
+      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+      assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
+      awaitPoolsIdle(nodeA, nodeAId);
+    } finally {
+      setClusterSetting(FALLBACK_ALLOWED, null);
+      setClusterSetting(COMPLEX_POOL_ENABLED, null);
+    }
+  }
+
+  private String submitAsync(RestClient client, String query) throws IOException {
+    JSONObject body = new JSONObject();
+    body.put("query", query);
+    body.put("wait_for_completion_timeout", "0");
+    return new JSONObject(postPpl(client, body)).getString("id");
+  }
+
+  private static Response deleteWhenStarted(CountDownLatch start, RestClient node, String queryId)
+      throws Exception {
+    start.await();
+    try {
+      return deleteAsyncQuery(node, queryId);
+    } catch (ResponseException e) {
+      return e.getResponse();
+    }
+  }
+
+  private RestClient nodeClient(HttpHost host) {
+    try {
+      return buildClient(Settings.EMPTY, new HttpHost[] {host});
+    } catch (IOException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  private void setClusterSetting(String name, String value) throws IOException {
+    updateClusterSettings(new SQLIntegTestCase.ClusterSetting("persistent", name, value));
   }
 }

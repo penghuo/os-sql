@@ -794,7 +794,6 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
 
     filter {
         includeTestsMatching 'org.opensearch.sql.ppl.AsyncPPLMultiNodeRoutingIT'
-        includeTestsMatching 'org.opensearch.sql.ppl.AsyncPPLCancellationIT'
     }
 }
 
@@ -838,7 +837,7 @@ task integTestWithSecurity(type: RestIntegTestTask) {
     systemProperty 'tests.required.plugins', 'opensearch-security'
     systemProperty 'tests.required.remote.cluster', 'true'
 
-    // The secured async ownership IT needs two nodes and the async query test plugin.
+    // The secured async ownership IT needs a dedicated two-node secured cluster.
     dependsOn asyncSecurityMultiNodeIT
 
     systemProperty "cluster.names",
@@ -984,7 +983,6 @@ integTest {
 
     // Run on dedicated two-node cluster via :integ-test:asyncMultiNodeIT.
     exclude 'org/opensearch/sql/ppl/AsyncPPLMultiNodeRoutingIT.class'
-    exclude 'org/opensearch/sql/ppl/AsyncPPLCancellationIT.class'
 
     // Exclude tests that require the analytics engine plugin stack (run separately via dedicated tasks)
     exclude 'org/opensearch/sql/analytics/AnalyticsEngineProfileIT.class'
@@ -1645,8 +1643,7 @@ task integTestRemote(type: RestIntegTestTask) {
     // Exclude the same tests that are excluded for integTest
     exclude 'org/opensearch/sql/doctest/**/*IT.class'
     exclude 'org/opensearch/sql/correctness/**'
-    // These need the async query test plugin installed in a dedicated cluster.
-    exclude 'org/opensearch/sql/ppl/AsyncPPLCancellationIT.class'
+    // AsyncPPLSecurityIT needs a two-node secured cluster.
     exclude 'org/opensearch/sql/security/AsyncPPLSecurityIT.class'
     exclude 'org/opensearch/sql/legacy/ExplainIT.class'
     exclude 'org/opensearch/sql/legacy/PrettyFormatterIT.class'

@@ -8,10 +8,18 @@ package org.opensearch.sql.ppl;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.DOCS;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.EVENTSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.PPL_ENDPOINT;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertStopped;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitRunning;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.indexSearchCount;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.localNodeId;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
@@ -22,13 +30,18 @@ import static org.opensearch.sql.util.MatcherUtils.verifyNumOfRows;
 import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 
 import java.io.IOException;
+import org.apache.hc.core5.http.HttpHost;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Assert;
 import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.client.RestClient;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.sql.job.QueryJobId;
+import org.opensearch.sql.legacy.SQLIntegTestCase;
 
 /**
  * End-to-end IT for the async PPL lifecycle (issue #5765). Verifies:
@@ -52,8 +65,10 @@ import org.opensearch.sql.job.QueryJobId;
  *       return 404.
  * </ul>
  *
- * <p>Runs on the Calcite engine. Cancellation of running queries is covered by {@link
- * AsyncPPLCancellationIT}.
+ * <p>Runs on the Calcite engine. Also covers running-query cancellation on a single node (local
+ * owner DELETE and streamstats/eventstats baselines) via the fixture in {@link
+ * AsyncPPLTestHelpers}; forwarded cancellation, concurrent deletes, and the FAILED path live in
+ * {@link AsyncPPLMultiNodeRoutingIT}.
  */
 public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
 
@@ -333,6 +348,122 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
     body.put("wait_for_completion_timeout", "0");
     body.put("keep_alive", "0"); // not strictly positive
     assertRejectedWith400(PPL_ENDPOINT, body);
+  }
+
+  // ---------- Running-query cancellation on a single node ----------
+  //
+  // Only the three tests below touch the large cancellation fixture and the cluster toggles
+  // (fallback=true, complex_pool=false). Each one is responsible for installing the index on
+  // demand, pinning a node client, and resetting both settings before it returns.
+
+  private static final String FALLBACK_ALLOWED = "plugins.calcite.fallback.allowed";
+  private static final String COMPLEX_POOL_ENABLED = "plugins.sql.complex_worker_pool.enabled";
+
+  @Test
+  public void async_baselineStreamstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
+    assertBaselineAggregate(STREAMSTATS_QUERY);
+  }
+
+  @Test
+  public void async_baselineEventstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
+    assertBaselineAggregate(EVENTSTATS_QUERY);
+  }
+
+  @Test
+  public void async_deleteOnOwnerCancelsStreamstatsAndStopsExecution() throws Exception {
+    AsyncPPLTestHelpers.createIndex(client());
+    try (RestClient owner = pinnedOwnerClient()) {
+      String ownerNodeId = localNodeId(owner);
+      setClusterSetting(FALLBACK_ALLOWED, "true");
+      setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+      try {
+        long searchesBefore = indexSearchCount(owner);
+        JSONObject body = new JSONObject();
+        body.put("query", STREAMSTATS_QUERY);
+        body.put("wait_for_completion_timeout", "0");
+        String queryId = new JSONObject(postPpl(owner, body)).getString("id");
+        AsyncPPLTestHelpers.RunningSnapshot running =
+            awaitRunning(owner, ownerNodeId, searchesBefore);
+        Assert.assertEquals(
+            "RUNNING", new JSONObject(getAsyncQuery(owner, queryId)).getString("status"));
+
+        long searchesAtDelete = indexSearchCount(owner);
+        Response deleted = deleteAsyncQuery(owner, queryId);
+        Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+        Assert.assertEquals(
+            "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
+        assertStopped(owner, ownerNodeId, searchesAtDelete, running.pits);
+        assertNotFound(() -> getAsyncQuery(owner, queryId));
+        assertNotFound(() -> deleteAsyncQuery(owner, queryId));
+      } finally {
+        // Drain pools even on a mid-test failure so a surviving scan can't contaminate the next
+        // case; if the drain itself fails, raise it rather than swallowing a busy owner.
+        try {
+          awaitPoolsIdle(owner, ownerNodeId);
+        } finally {
+          setClusterSetting(FALLBACK_ALLOWED, null);
+          setClusterSetting(COMPLEX_POOL_ENABLED, null);
+        }
+      }
+    }
+  }
+
+  private void assertBaselineAggregate(String query) throws Exception {
+    AsyncPPLTestHelpers.createIndex(client());
+    try (RestClient owner = pinnedOwnerClient()) {
+      String ownerNodeId = localNodeId(owner);
+      setClusterSetting(FALLBACK_ALLOWED, "true");
+      setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+      try {
+        long before = indexSearchCount(owner);
+        JSONObject body = new JSONObject();
+        body.put("query", query);
+        // The async submit still returns ID + RUNNING if the scan can't finish inside the wait,
+        // so handle both shapes.
+        body.put("wait_for_completion_timeout", "60s");
+        JSONObject response = new JSONObject(postPpl(owner, body));
+        JSONObject terminal;
+        if (response.has("id")) {
+          terminal = pollUntilTerminal(owner, response.getString("id"), 60_000);
+          Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
+        } else {
+          terminal = response;
+        }
+        JSONArray row = terminal.getJSONArray("datarows").getJSONArray(0);
+        Assert.assertEquals(
+            query + " must aggregate across the full scan to " + DOCS, DOCS, row.getInt(0));
+        long after = indexSearchCount(owner);
+        Assert.assertTrue(
+            "baseline scan must read at least "
+                + BASELINE_MIN_SEARCHES
+                + " batches: before="
+                + before
+                + " after="
+                + after,
+            after - before >= BASELINE_MIN_SEARCHES);
+      } finally {
+        try {
+          awaitPoolsIdle(owner, ownerNodeId);
+        } finally {
+          setClusterSetting(FALLBACK_ALLOWED, null);
+          setClusterSetting(COMPLEX_POOL_ENABLED, null);
+        }
+      }
+    }
+  }
+
+  /**
+   * Pins a {@link RestClient} to the first cluster host so {@link #client()} round-robin cannot
+   * split pre/post observations between nodes. Uses {@code buildClient(Settings.EMPTY, ...)} so the
+   * remote-client options the base test case already honors are inherited.
+   */
+  private RestClient pinnedOwnerClient() throws IOException {
+    HttpHost host = getClusterHosts().get(0);
+    return buildClient(Settings.EMPTY, new HttpHost[] {host});
+  }
+
+  private void setClusterSetting(String name, String value) throws IOException {
+    updateClusterSettings(new SQLIntegTestCase.ClusterSetting("persistent", name, value));
   }
 
   private static JSONObject withAsyncWait(String query) {

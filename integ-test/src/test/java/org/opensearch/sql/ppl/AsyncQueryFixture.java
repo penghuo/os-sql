@@ -9,9 +9,11 @@ import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import org.apache.hc.core5.http.HttpHost;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -20,124 +22,266 @@ import org.opensearch.client.Request;
 import org.opensearch.client.RestClient;
 
 /**
- * Client for the async query test plugin installed in the dedicated async test clusters. The plugin
- * holds the first search of one PPL query on {@link #INDEX} and reports, per node, whether the
- * query's task was cancelled, how many searches it issued, which point-in-time contexts it opened,
- * and how busy the SQL thread pools are.
+ * Fixture for async PPL cancellation integration tests. Uses only existing REST endpoints: a
+ * natural streamstats query over a bulk-loaded index keeps execution busy long enough to delete,
+ * and node thread-pool stats plus the index's search counter observe whether execution actually
+ * stopped.
+ *
+ * <p>Both {@code streamstats} and {@code eventstats} compile to Calcite {@code Window} / {@code
+ * RexOver}, which {@code ScriptDetector.hasScripts} matches, so by default the plan would dispatch
+ * to the complex-worker pool. The complex-worker dispatcher's poller still reads the task cancel
+ * flag the hook sets, so a broken hook would show up there too; the IT pins the plan to {@code
+ * sql-worker} because that is the normal path most async PPL queries take. Callers set {@code
+ * plugins.sql.complex_worker_pool.enabled} to {@code false} in setup and restore it in teardown.
  */
 public final class AsyncQueryFixture {
 
-  /** Six documents read one per search: an uncancelled scan issues at least {@link #DOCS}. */
-  public static final String INDEX = "async_query_fixture";
+  /** 10-doc batches: an uncancelled scan issues at least {@value #DOCS}/10 PIT batches. */
+  public static final String INDEX = "async_cancel_fixture";
 
-  public static final int DOCS = 6;
+  public static final int DOCS = 10_000;
 
-  public static final String QUERY = "source=" + INDEX + " | fields n";
+  public static final int MAX_RESULT_WINDOW = 10;
 
-  /** The held batch plus the batch prefetched while it is processed. */
-  public static final int MAX_SEARCHES_AFTER_CANCEL = 2;
+  /** streamstats keeps the scan serial; the aggregate forces the planner to keep the window. */
+  public static final String STREAMSTATS_QUERY =
+      "source="
+          + INDEX
+          + " | streamstats count() as running_count | stats max(running_count) as total";
 
-  private static final String BASE = "/_plugins/_async_query_fixture/";
-  private static final long WAIT_MILLIS = 10_000;
+  /** eventstats variant: an unpartitioned count that must drain the full scan to project. */
+  public static final String EVENTSTATS_QUERY =
+      "source=" + INDEX + " | eventstats count() as total | head 1 | fields total";
+
+  /** Natural runtime failure after a full window scan: scalar overflow in a post-window eval. */
+  public static final String OVERFLOW_QUERY =
+      "source="
+          + INDEX
+          + " | eventstats count() as total"
+          + " | eval bad = 9223372036854775807 + total | head 1 | fields bad";
+
+  /** Minimum searches a correct scan issues: one batch per {@link #MAX_RESULT_WINDOW}. */
+  public static final long BASELINE_MIN_SEARCHES = DOCS / MAX_RESULT_WINDOW;
+
+  /** Deadline for the owner's sql pools to go idle after DELETE. */
+  public static final long STOP_DEADLINE_MILLIS = 5_000;
+
+  /** Deadline waiting for the first batch of searches to appear while running. */
+  public static final long START_DEADLINE_MILLIS = 10_000;
+
+  /** Minimum searches a snapshot must have logged before DELETE, to prove warm-up is past. */
+  public static final long RUNNING_MIN_PROGRESS = 10;
+
+  /**
+   * Maximum search progress at snapshot time; proves the scan still has over half its work left
+   * when cancel arrives.
+   */
+  public static final long RUNNING_MAX_PROGRESS = BASELINE_MIN_SEARCHES / 2;
+
+  /** Expected search progress between DELETE and pools idle. */
+  public static final int MAX_SEARCHES_AFTER_CANCEL = 20;
+
+  private static final List<String> SQL_POOLS =
+      List.of("sql-worker", "sql-complex-worker", "sql_background_io");
 
   private AsyncQueryFixture() {}
 
-  /** Creates {@link #INDEX} with {@code index.max_result_window=1} unless it already exists. */
+  /** Bulk-loads {@link #INDEX} with {@value #DOCS} docs if it isn't already present. */
   public static void createIndex(RestClient admin) throws IOException {
-    // The low-level client reports a missing index on HEAD as a 404 response, not an exception.
     if (admin.performRequest(new Request("HEAD", "/" + INDEX)).getStatusLine().getStatusCode()
         == 200) {
       return;
     }
     Request create = new Request("PUT", "/" + INDEX);
     create.setJsonEntity(
-        "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0,"
-            + "\"max_result_window\":1},"
-            + "\"mappings\":{\"properties\":{\"n\":{\"type\":\"integer\"}}}}");
+        String.format(
+            Locale.ROOT,
+            "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0,"
+                + "\"max_result_window\":%d},"
+                + "\"mappings\":{\"properties\":"
+                + "{\"g\":{\"type\":\"keyword\"},\"n\":{\"type\":\"integer\"}}}}",
+            MAX_RESULT_WINDOW));
     admin.performRequest(create);
-    StringBuilder bulk = new StringBuilder();
-    for (int n = 1; n <= DOCS; n++) {
-      bulk.append("{\"index\":{}}\n{\"n\":").append(n).append("}\n");
+    int chunk = 1_000;
+    for (int offset = 0; offset < DOCS; offset += chunk) {
+      StringBuilder bulk = new StringBuilder(chunk * 50);
+      for (int i = 0; i < chunk && offset + i < DOCS; i++) {
+        int n = offset + i;
+        bulk.append("{\"index\":{}}\n{\"g\":\"g")
+            .append(n % 20)
+            .append("\",\"n\":")
+            .append(n)
+            .append("}\n");
+      }
+      Request bulkRequest =
+          new Request(
+              "POST", "/" + INDEX + "/_bulk" + (offset + chunk >= DOCS ? "?refresh=true" : ""));
+      bulkRequest.setJsonEntity(bulk.toString());
+      admin.performRequest(bulkRequest);
     }
-    Request load = new Request("POST", "/" + INDEX + "/_bulk?refresh=true");
-    load.setJsonEntity(bulk.toString());
-    admin.performRequest(load);
   }
 
-  /** Observes the next PPL query on {@link #INDEX} at {@code node} and holds its first search. */
-  public static void arm(RestClient node) throws IOException {
-    call(node, "POST", "arm?index=" + INDEX);
+  /** Snapshot of {@code active} and {@code queue} per SQL pool on the owner. */
+  public static Map<String, Map<String, Integer>> poolStats(RestClient node, String nodeId)
+      throws IOException {
+    JSONObject raw =
+        new JSONObject(
+            getResponseBody(
+                node.performRequest(new Request("GET", "/_nodes/" + nodeId + "/stats/thread_pool")),
+                true));
+    JSONObject pools =
+        raw.getJSONObject("nodes").getJSONObject(nodeId).getJSONObject("thread_pool");
+    Map<String, Map<String, Integer>> snapshot = new LinkedHashMap<>();
+    for (String pool : SQL_POOLS) {
+      JSONObject p = pools.optJSONObject(pool);
+      Map<String, Integer> counts = new LinkedHashMap<>();
+      counts.put("active", p == null ? 0 : p.getInt("active"));
+      counts.put("queue", p == null ? 0 : p.getInt("queue"));
+      snapshot.put(pool, counts);
+    }
+    return snapshot;
   }
 
-  public static void release(RestClient node, boolean fail) throws IOException {
-    call(node, "POST", "release?fail=" + fail);
+  /** Returns the total number of searches the owner has executed against {@link #INDEX}. */
+  public static long indexSearchCount(RestClient admin) throws IOException {
+    JSONObject body =
+        new JSONObject(
+            getResponseBody(
+                admin.performRequest(new Request("GET", "/" + INDEX + "/_stats")), true));
+    JSONObject stats = body.getJSONObject("indices").getJSONObject(INDEX).getJSONObject("total");
+    return stats.getJSONObject("search").getLong("query_total");
   }
 
-  public static void disarm(RestClient node) throws IOException {
-    call(node, "POST", "disarm");
+  /** Returns the ids of every PIT currently open across the cluster. */
+  public static List<String> openPits(RestClient admin) throws IOException {
+    JSONObject body =
+        new JSONObject(
+            getResponseBody(
+                admin.performRequest(new Request("GET", "/_search/point_in_time/_all")), true));
+    List<String> ids = new ArrayList<>();
+    if (body.has("pits")) {
+      JSONArray arr = body.getJSONArray("pits");
+      for (int i = 0; i < arr.length(); i++) {
+        String id = arr.getJSONObject(i).optString("pit_id", null);
+        if (id != null) {
+          ids.add(id);
+        }
+      }
+    }
+    return ids;
   }
 
-  public static JSONObject status(RestClient node) throws IOException {
-    return call(node, "GET", "status");
-  }
-
-  /** Waits until the first search is held while the query occupies a SQL worker. */
-  public static JSONObject awaitHeld(RestClient node) throws Exception {
-    return await(
-        node,
-        status -> status.getBoolean("held") && active(status, "sql-worker") > 0,
-        "first search held on a busy sql-worker");
-  }
-
-  /** Waits until nothing is held and every SQL pool on {@code node} is idle. */
-  public static JSONObject awaitIdle(RestClient node) throws Exception {
-    return await(
-        node,
-        status -> {
-          if (status.getBoolean("held")) {
-            return false;
-          }
-          JSONObject active = status.getJSONObject("active");
-          for (String pool : active.keySet()) {
-            if (active.getInt(pool) > 0) {
-              return false;
-            }
-          }
-          return true;
-        },
-        "idle SQL pools");
+  /** Resolves the id of the node that serves {@code client}'s requests. */
+  public static String localNodeId(RestClient client) throws IOException {
+    JSONObject body =
+        new JSONObject(
+            getResponseBody(client.performRequest(new Request("GET", "/_nodes/_local")), true));
+    return body.getJSONObject("nodes").keys().next();
   }
 
   /**
-   * Asserts that the cancelled query on {@code owner} stopped: its task was cancelled, the SQL
-   * pools went idle without further searches, and every PIT it opened was closed.
+   * Running proof: the query must be on {@code sql-worker}, have an open PIT, and have made at
+   * least {@link #RUNNING_MIN_PROGRESS} but no more than {@link #RUNNING_MAX_PROGRESS} searches
+   * since submission, so the scan is demonstrably running with over half its work remaining.
    */
-  public static void assertStopped(RestClient owner) throws Exception {
-    JSONObject idle = awaitIdle(owner);
-    Assert.assertTrue(
-        "cancelled query must not keep reading batches: " + idle,
-        idle.getInt("searches") <= MAX_SEARCHES_AFTER_CANCEL);
-    Assert.assertTrue("query task must be cancelled: " + idle, idle.getBoolean("task_cancelled"));
-    assertPitsClosed(owner, idle);
+  public static RunningSnapshot awaitRunning(
+      RestClient owner, String ownerNodeId, long searchesBeforeSubmit) throws Exception {
+    long deadline = System.currentTimeMillis() + START_DEADLINE_MILLIS;
+    while (System.currentTimeMillis() <= deadline) {
+      Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
+      long searches = indexSearchCount(owner);
+      long progress = searches - searchesBeforeSubmit;
+      List<String> pits = openPits(owner);
+      if (pools.get("sql-worker").get("active") > 0
+          && !pits.isEmpty()
+          && progress >= RUNNING_MIN_PROGRESS
+          && progress <= RUNNING_MAX_PROGRESS) {
+        Assert.assertEquals(
+            "complex worker pool must be disabled so streamstats stays on sql-worker: " + pools,
+            0,
+            pools.get("sql-complex-worker").get("active").intValue());
+        return new RunningSnapshot(pools, searches, pits);
+      }
+      Thread.sleep(10);
+    }
+    Assert.fail(
+        "query never reached a running state on sql-worker: pools="
+            + poolStats(owner, ownerNodeId)
+            + " searchesBeforeSubmit="
+            + searchesBeforeSubmit
+            + " now="
+            + indexSearchCount(owner)
+            + " pits="
+            + openPits(owner));
+    return null; // unreachable
   }
 
-  /** Asserts that none of the PITs recorded in {@code status} is still open in the cluster. */
-  public static void assertPitsClosed(RestClient admin, JSONObject status) throws IOException {
-    JSONArray tracked = status.getJSONArray("pits");
-    Assert.assertTrue("query must have opened a PIT: " + status, tracked.length() > 0);
-    List<String> open = new ArrayList<>();
-    JSONArray pits =
-        new JSONObject(
-                getResponseBody(
-                    admin.performRequest(new Request("GET", "/_search/point_in_time/_all")), true))
-            .getJSONArray("pits");
-    for (int i = 0; i < pits.length(); i++) {
-      open.add(pits.getJSONObject(i).getString("pit_id"));
+  /** Waits until every SQL pool's active + queue reaches zero. Returns the final snapshot. */
+  public static Map<String, Map<String, Integer>> awaitPoolsIdle(
+      RestClient owner, String ownerNodeId) throws Exception {
+    long deadline = System.currentTimeMillis() + STOP_DEADLINE_MILLIS;
+    Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
+    while (!poolsIdle(pools)) {
+      if (System.currentTimeMillis() > deadline) {
+        Assert.fail(
+            "sql pools never went idle on "
+                + ownerNodeId
+                + " within "
+                + STOP_DEADLINE_MILLIS
+                + "ms: "
+                + pools);
+      }
+      Thread.sleep(50);
+      pools = poolStats(owner, ownerNodeId);
     }
-    for (int i = 0; i < tracked.length(); i++) {
-      Assert.assertFalse(
-          "PIT left open by the query: " + tracked.getString(i),
-          open.contains(tracked.getString(i)));
+    return pools;
+  }
+
+  /**
+   * Asserts the query stopped after DELETE: pools went idle within the deadline, the search delta
+   * measured against {@code searchesAtDelete} stayed small, and the complex-worker pool was never
+   * used. The caller must capture {@code searchesAtDelete} immediately before the DELETE so the
+   * delta tracks only post-cancel activity.
+   */
+  public static void assertStopped(
+      RestClient owner, String ownerNodeId, long searchesAtDelete, List<String> pitsSeenRunning)
+      throws Exception {
+    Map<String, Map<String, Integer>> idle = awaitPoolsIdle(owner, ownerNodeId);
+    long after = indexSearchCount(owner);
+    long delta = after - searchesAtDelete;
+    Assert.assertTrue(
+        "cancelled query must not keep scanning past "
+            + MAX_SEARCHES_AFTER_CANCEL
+            + " searches: delta="
+            + delta
+            + " idle="
+            + idle,
+        delta <= MAX_SEARCHES_AFTER_CANCEL);
+    Assert.assertEquals(
+        "streamstats must have stayed on sql-worker: " + idle,
+        0,
+        idle.get("sql-complex-worker").get("active").intValue());
+    assertPitsClosed(owner, pitsSeenRunning);
+  }
+
+  /** Asserts none of the PITs seen while the query was running is still open. */
+  public static void assertPitsClosed(RestClient admin, List<String> pitsSeenRunning)
+      throws Exception {
+    long deadline = System.currentTimeMillis() + STOP_DEADLINE_MILLIS;
+    while (true) {
+      List<String> stillOpen = openPits(admin);
+      boolean anyLeaked = stillOpen.stream().anyMatch(pitsSeenRunning::contains);
+      if (!anyLeaked) {
+        return;
+      }
+      if (System.currentTimeMillis() > deadline) {
+        Assert.fail(
+            "PITs opened by the cancelled query were not released: seen="
+                + pitsSeenRunning
+                + " stillOpen="
+                + stillOpen);
+      }
+      Thread.sleep(50);
     }
   }
 
@@ -160,35 +304,30 @@ public final class AsyncQueryFixture {
     throw new AssertionError("async fixture tests need two distinct nodes: " + hosts);
   }
 
-  public static String localNodeId(RestClient client) throws IOException {
-    JSONObject body =
-        new JSONObject(
-            getResponseBody(client.performRequest(new Request("GET", "/_nodes/_local")), true));
-    return body.getJSONObject("nodes").keys().next();
-  }
-
-  private static int active(JSONObject status, String pool) {
-    JSONObject active = status.getJSONObject("active");
-    return active.has(pool) ? active.getInt(pool) : 0;
-  }
-
-  private static JSONObject await(
-      RestClient node, Predicate<JSONObject> condition, String description) throws Exception {
-    long deadline = System.currentTimeMillis() + WAIT_MILLIS;
-    JSONObject last = status(node);
-    while (!condition.test(last)) {
-      if (System.currentTimeMillis() > deadline) {
-        Assert.fail("timed out waiting for " + description + "; last status " + last);
+  private static boolean poolsIdle(Map<String, Map<String, Integer>> pools) {
+    for (Map<String, Integer> counts : pools.values()) {
+      if (counts.get("active") > 0 || counts.get("queue") > 0) {
+        return false;
       }
-      Thread.sleep(50);
-      last = status(node);
     }
-    return last;
+    return true;
   }
 
-  private static JSONObject call(RestClient node, String method, String endpoint)
-      throws IOException {
-    return new JSONObject(
-        getResponseBody(node.performRequest(new Request(method, BASE + endpoint)), true));
+  /** Snapshot captured once the query is proven running. */
+  public static final class RunningSnapshot {
+    public final Map<String, Map<String, Integer>> pools;
+    public final long searches;
+    public final List<String> pits;
+
+    RunningSnapshot(Map<String, Map<String, Integer>> pools, long searches, List<String> pits) {
+      this.pools = pools;
+      this.searches = searches;
+      this.pits = pits;
+    }
+
+    @Override
+    public String toString() {
+      return "RunningSnapshot{pools=" + pools + ", searches=" + searches + ", pits=" + pits + '}';
+    }
   }
 }

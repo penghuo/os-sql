@@ -497,7 +497,6 @@ testClusters {
         numberOfNodes = 2
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
-        plugin ":integ-test:async-query-test-plugin"
         setting "plugins.query.datasources.encryption.masterkey", "1234567812345678"
     }
     tracingIntegTest {
@@ -547,7 +546,6 @@ testClusters {
         numberOfNodes = 2
         plugin(getJobSchedulerPlugin())
         plugin ":opensearch-sql-plugin"
-        plugin ":integ-test:async-query-test-plugin"
     }
     // Smoke test: verify sql loads cleanly alongside analytics-engine.
     analyticsEngineCompat {
@@ -782,7 +780,6 @@ task asyncMultiNodeIT(type: RestIntegTestTask) {
     useCluster testClusters.asyncMultiNodeIT
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
-    dependsOn ':integ-test:async-query-test-plugin:bundlePlugin'
 
     systemProperty 'tests.security.manager', 'false'
     // Resolve dataset files (accounts.json, bank.json, ...) relative to the project.
@@ -812,7 +809,6 @@ task asyncSecurityMultiNodeIT(type: RestIntegTestTask) {
     useCluster testClusters.asyncSecurityMultiNodeIT
 
     dependsOn ':opensearch-sql-plugin:bundlePlugin'
-    dependsOn ':integ-test:async-query-test-plugin:bundlePlugin'
 
     // Fail instead of skipping when the security plugin is missing.
     systemProperty 'tests.required.plugins', 'opensearch-security'

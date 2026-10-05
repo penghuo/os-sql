@@ -7,10 +7,10 @@ package org.opensearch.sql.security;
 
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.ppl.AsyncQueryFixture.INDEX;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.QUERY;
+import static org.opensearch.sql.ppl.AsyncQueryFixture.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncQueryFixture.assertStopped;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.awaitHeld;
-import static org.opensearch.sql.ppl.AsyncQueryFixture.status;
+import static org.opensearch.sql.ppl.AsyncQueryFixture.awaitPoolsIdle;
+import static org.opensearch.sql.ppl.AsyncQueryFixture.indexSearchCount;
 
 import java.io.IOException;
 import org.apache.hc.core5.http.HttpHost;
@@ -30,8 +30,8 @@ import org.opensearch.sql.ppl.AsyncQueryFixture;
 
 /**
  * Async PPL ownership checks on the two-node secured {@code asyncSecurityMultiNodeIT} cluster. Both
- * users hold every async permission, so a 403 can only come from job ownership, and the requests
- * are sent to the non-owner node to exercise owner forwarding.
+ * users hold every async permission, so a 403 can only come from job ownership. Requests are sent
+ * to the non-owner node to exercise owner forwarding.
  */
 public class AsyncPPLSecurityIT extends SecurityTestBase {
 
@@ -41,6 +41,7 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
 
   private RestClient owner;
   private RestClient peer;
+  private String ownerNodeId;
 
   @Override
   protected void init() throws Exception {
@@ -49,19 +50,22 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     updateClusterSettings(
         new SQLIntegTestCase.ClusterSetting(
             "persistent", "plugins.calcite.fallback.allowed", "true"));
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", "plugins.sql.complex_worker_pool.enabled", "false"));
     AsyncQueryFixture.createIndex(client());
     createAsyncUser(ALICE);
     createAsyncUser(BOB);
     RestClient[] nodes = AsyncQueryFixture.twoNodeClients(getClusterHosts(), this::nodeClient);
     owner = nodes[0];
     peer = nodes[1];
+    ownerNodeId = AsyncQueryFixture.localNodeId(owner);
   }
 
   @After
   public void tearDownFixture() throws Exception {
     if (owner != null) {
-      AsyncQueryFixture.disarm(owner);
-      AsyncQueryFixture.awaitIdle(owner);
+      awaitPoolsIdle(owner, ownerNodeId);
       owner.close();
     }
     if (peer != null) {
@@ -70,39 +74,40 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     updateClusterSettings(
         new SQLIntegTestCase.ClusterSetting(
             "persistent", "plugins.calcite.fallback.allowed", null));
+    updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", "plugins.sql.complex_worker_pool.enabled", null));
   }
 
   @Test
   public void otherUserCannotDeleteThroughForwardingAndOwnerStillCan() throws Exception {
-    // Bob's forwarded GET and DELETE reach the owner's job service: a missing job is a 404, so a
-    // later 403 can only come from ownership.
-    String unknownId = QueryJobId.create(AsyncQueryFixture.localNodeId(owner)).encode();
+    // Positive permission control: Bob's forwarded DELETE and GET of an unknown owner-node id
+    // return 404, so a later 403 provably comes from job ownership, not a missing grant.
+    String unknownId = QueryJobId.create(ownerNodeId).encode();
     assertNotFound(() -> asUser(peer, "DELETE", ASYNC_PATH + unknownId, BOB, null));
     assertNotFound(() -> asUser(peer, "GET", ASYNC_PATH + unknownId, BOB, null));
 
-    AsyncQueryFixture.arm(owner);
-    JSONObject body = new JSONObject();
-    body.put("query", QUERY);
-    body.put("wait_for_completion_timeout", "0");
+    long searchesBefore = indexSearchCount(owner);
+    JSONObject submit = new JSONObject();
+    submit.put("query", STREAMSTATS_QUERY);
+    submit.put("wait_for_completion_timeout", "0");
     String queryId =
-        new JSONObject(asUser(owner, "POST", "/_plugins/_ppl", ALICE, body)).getString("id");
-    awaitHeld(owner);
+        new JSONObject(asUser(owner, "POST", "/_plugins/_ppl", ALICE, submit)).getString("id");
+    AsyncQueryFixture.RunningSnapshot running =
+        AsyncQueryFixture.awaitRunning(owner, ownerNodeId, searchesBefore);
 
     assertForbidden(() -> asUser(peer, "DELETE", ASYNC_PATH + queryId, BOB, null));
     assertForbidden(() -> asUser(peer, "GET", ASYNC_PATH + queryId, BOB, null));
-    JSONObject afterForbidden = status(owner);
-    Assert.assertFalse(
-        "another user's DELETE must not cancel: " + afterForbidden,
-        afterForbidden.getBoolean("task_cancelled"));
-    Assert.assertTrue(afterForbidden.getBoolean("held"));
     Assert.assertEquals(
         "RUNNING",
         new JSONObject(asUser(peer, "GET", ASYNC_PATH + queryId, ALICE, null)).getString("status"));
 
+    // Capture the search counter right before Alice's DELETE so the post-cancel delta excludes
+    // legitimate work performed while Bob was denied and Alice polled.
+    long searchesAtDelete = indexSearchCount(owner);
     JSONObject deleted = new JSONObject(asUser(peer, "DELETE", ASYNC_PATH + queryId, ALICE, null));
     Assert.assertEquals("CANCELLED", deleted.getString("status"));
-    AsyncQueryFixture.release(owner, false);
-    assertStopped(owner);
+    assertStopped(owner, ownerNodeId, searchesAtDelete, running.pits);
     assertNotFound(() -> asUser(owner, "GET", ASYNC_PATH + queryId, ALICE, null));
   }
 

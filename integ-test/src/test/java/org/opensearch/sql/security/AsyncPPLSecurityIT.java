@@ -25,7 +25,6 @@ import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.sql.job.QueryJobId;
-import org.opensearch.sql.legacy.SQLIntegTestCase;
 import org.opensearch.sql.ppl.AsyncPPLTestHelpers;
 
 /**
@@ -47,12 +46,6 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
   protected void init() throws Exception {
     super.init();
     enableCalcite();
-    updateClusterSettings(
-        new SQLIntegTestCase.ClusterSetting(
-            "persistent", "plugins.calcite.fallback.allowed", "true"));
-    updateClusterSettings(
-        new SQLIntegTestCase.ClusterSetting(
-            "persistent", "plugins.sql.complex_worker_pool.enabled", "false"));
     AsyncPPLTestHelpers.createIndex(client());
     createAsyncUser(ALICE);
     createAsyncUser(BOB);
@@ -64,19 +57,18 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
 
   @After
   public void tearDownFixture() throws Exception {
-    if (owner != null) {
-      awaitPoolsIdle(owner, ownerNodeId);
-      owner.close();
+    try {
+      if (owner != null) {
+        awaitPoolsIdle(owner, ownerNodeId);
+      }
+    } finally {
+      if (owner != null) {
+        owner.close();
+      }
+      if (peer != null) {
+        peer.close();
+      }
     }
-    if (peer != null) {
-      peer.close();
-    }
-    updateClusterSettings(
-        new SQLIntegTestCase.ClusterSetting(
-            "persistent", "plugins.calcite.fallback.allowed", null));
-    updateClusterSettings(
-        new SQLIntegTestCase.ClusterSetting(
-            "persistent", "plugins.sql.complex_worker_pool.enabled", null));
   }
 
   @Test

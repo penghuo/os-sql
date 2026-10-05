@@ -41,7 +41,6 @@ import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.sql.job.QueryJobId;
-import org.opensearch.sql.legacy.SQLIntegTestCase;
 
 /**
  * End-to-end IT for the async PPL lifecycle (issue #5765). Verifies:
@@ -352,12 +351,8 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
 
   // ---------- Running-query cancellation on a single node ----------
   //
-  // Only the three tests below touch the large cancellation fixture and the cluster toggles
-  // (fallback=true, complex_pool=false). Each one is responsible for installing the index on
-  // demand, pinning a node client, and resetting both settings before it returns.
-
-  private static final String FALLBACK_ALLOWED = "plugins.calcite.fallback.allowed";
-  private static final String COMPLEX_POOL_ENABLED = "plugins.sql.complex_worker_pool.enabled";
+  // The three cases below install the cancellation fixture on demand, pin a node client, and
+  // drain the owner's SQL pools in a finally so a mid-test failure can't leak work.
 
   @Test
   public void async_baselineStreamstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
@@ -374,8 +369,6 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
     AsyncPPLTestHelpers.createIndex(client());
     try (RestClient owner = pinnedOwnerClient()) {
       String ownerNodeId = localNodeId(owner);
-      setClusterSetting(FALLBACK_ALLOWED, "true");
-      setClusterSetting(COMPLEX_POOL_ENABLED, "false");
       try {
         long searchesBefore = indexSearchCount(owner);
         JSONObject body = new JSONObject();
@@ -396,14 +389,7 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
         assertNotFound(() -> getAsyncQuery(owner, queryId));
         assertNotFound(() -> deleteAsyncQuery(owner, queryId));
       } finally {
-        // Drain pools even on a mid-test failure so a surviving scan can't contaminate the next
-        // case; if the drain itself fails, raise it rather than swallowing a busy owner.
-        try {
-          awaitPoolsIdle(owner, ownerNodeId);
-        } finally {
-          setClusterSetting(FALLBACK_ALLOWED, null);
-          setClusterSetting(COMPLEX_POOL_ENABLED, null);
-        }
+        awaitPoolsIdle(owner, ownerNodeId);
       }
     }
   }
@@ -412,8 +398,6 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
     AsyncPPLTestHelpers.createIndex(client());
     try (RestClient owner = pinnedOwnerClient()) {
       String ownerNodeId = localNodeId(owner);
-      setClusterSetting(FALLBACK_ALLOWED, "true");
-      setClusterSetting(COMPLEX_POOL_ENABLED, "false");
       try {
         long before = indexSearchCount(owner);
         JSONObject body = new JSONObject();
@@ -442,12 +426,7 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
                 + after,
             after - before >= BASELINE_MIN_SEARCHES);
       } finally {
-        try {
-          awaitPoolsIdle(owner, ownerNodeId);
-        } finally {
-          setClusterSetting(FALLBACK_ALLOWED, null);
-          setClusterSetting(COMPLEX_POOL_ENABLED, null);
-        }
+        awaitPoolsIdle(owner, ownerNodeId);
       }
     }
   }
@@ -460,10 +439,6 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
   private RestClient pinnedOwnerClient() throws IOException {
     HttpHost host = getClusterHosts().get(0);
     return buildClient(Settings.EMPTY, new HttpHost[] {host});
-  }
-
-  private void setClusterSetting(String name, String value) throws IOException {
-    updateClusterSettings(new SQLIntegTestCase.ClusterSetting("persistent", name, value));
   }
 
   private static JSONObject withAsyncWait(String query) {

@@ -46,7 +46,6 @@ import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.sql.job.QueryJobId;
-import org.opensearch.sql.legacy.SQLIntegTestCase;
 
 /**
  * Multi-node IT for owner-node routing (issue #5765). Runs against the {@code asyncMultiNodeIT}
@@ -66,9 +65,6 @@ import org.opensearch.sql.legacy.SQLIntegTestCase;
  * </ul>
  */
 public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
-
-  private static final String FALLBACK_ALLOWED = "plugins.calcite.fallback.allowed";
-  private static final String COMPLEX_POOL_ENABLED = "plugins.sql.complex_worker_pool.enabled";
 
   private RestClient nodeA;
   private RestClient nodeB;
@@ -195,8 +191,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     AsyncPPLTestHelpers.createIndex(nodeA);
     long searchesBefore = indexSearchCount(nodeA);
     String queryId = submitAsync(nodeA, EVENTSTATS_QUERY);
-    AsyncPPLTestHelpers.RunningSnapshot running =
-        awaitRunning(nodeA, nodeAId, searchesBefore, "sql-complex-worker");
+    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
     Assert.assertEquals(
         "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
     long searchesAtDelete = indexSearchCount(nodeA);
@@ -214,70 +209,54 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
   @Test
   public void concurrentDeletesCancelOnceAndRemoveOnce() throws Exception {
     AsyncPPLTestHelpers.createIndex(nodeA);
-    setClusterSetting(FALLBACK_ALLOWED, "true");
-    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
+    long searchesBefore = indexSearchCount(nodeA);
+    String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
+    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
+    long searchesAtDelete = indexSearchCount(nodeA);
+
+    CountDownLatch start = new CountDownLatch(1);
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    List<Response> responses = new ArrayList<>();
     try {
-      long searchesBefore = indexSearchCount(nodeA);
-      String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
-      AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
-      long searchesAtDelete = indexSearchCount(nodeA);
-
-      CountDownLatch start = new CountDownLatch(1);
-      ExecutorService executor = Executors.newFixedThreadPool(2);
-      List<Response> responses = new ArrayList<>();
-      try {
-        Future<Response> onOwner = executor.submit(() -> deleteWhenStarted(start, nodeA, queryId));
-        Future<Response> onPeer = executor.submit(() -> deleteWhenStarted(start, nodeB, queryId));
-        start.countDown();
-        responses.add(onOwner.get(10, TimeUnit.SECONDS));
-        responses.add(onPeer.get(10, TimeUnit.SECONDS));
-      } finally {
-        executor.shutdownNow();
-      }
-
-      List<Integer> codes = new ArrayList<>();
-      for (Response response : responses) {
-        int code = response.getStatusLine().getStatusCode();
-        codes.add(code);
-        if (code == 200) {
-          Assert.assertEquals(
-              "CANCELLED", new JSONObject(getResponseBody(response, true)).getString("status"));
-        }
-      }
-      codes.sort(null);
-      Assert.assertEquals(List.of(200, 404), codes);
-      assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
-      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+      Future<Response> onOwner = executor.submit(() -> deleteWhenStarted(start, nodeA, queryId));
+      Future<Response> onPeer = executor.submit(() -> deleteWhenStarted(start, nodeB, queryId));
+      start.countDown();
+      responses.add(onOwner.get(10, TimeUnit.SECONDS));
+      responses.add(onPeer.get(10, TimeUnit.SECONDS));
     } finally {
-      setClusterSetting(FALLBACK_ALLOWED, null);
-      setClusterSetting(COMPLEX_POOL_ENABLED, null);
+      executor.shutdownNow();
     }
+
+    List<Integer> codes = new ArrayList<>();
+    for (Response response : responses) {
+      int code = response.getStatusLine().getStatusCode();
+      codes.add(code);
+      if (code == 200) {
+        Assert.assertEquals(
+            "CANCELLED", new JSONObject(getResponseBody(response, true)).getString("status"));
+      }
+    }
+    codes.sort(null);
+    Assert.assertEquals(List.of(200, 404), codes);
+    assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+    assertNotFound(() -> getAsyncQuery(nodeA, queryId));
   }
 
   @Test
   public void deleteOfFailedJobReturnsFailedAndRemovesIt() throws Exception {
     AsyncPPLTestHelpers.createIndex(nodeA);
-    // FAILED case runs with fallback disabled so the overflow failure isn't swallowed into a
-    // legacy restart.
-    setClusterSetting(FALLBACK_ALLOWED, "false");
-    setClusterSetting(COMPLEX_POOL_ENABLED, "false");
-    try {
-      String queryId = submitAsync(nodeA, OVERFLOW_QUERY);
-      JSONObject terminal = pollUntilTerminal(nodeA, queryId, 30_000);
-      Assert.assertEquals("FAILED", terminal.getString("status"));
-      Assert.assertTrue("FAILED body must carry an error: " + terminal, terminal.has("error"));
+    String queryId = submitAsync(nodeA, OVERFLOW_QUERY);
+    JSONObject terminal = pollUntilTerminal(nodeA, queryId, 30_000);
+    Assert.assertEquals("FAILED", terminal.getString("status"));
+    Assert.assertTrue("FAILED body must carry an error: " + terminal, terminal.has("error"));
 
-      Response deleted = deleteAsyncQuery(nodeB, queryId);
-      Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
-      Assert.assertEquals(
-          "FAILED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
-      assertNotFound(() -> getAsyncQuery(nodeA, queryId));
-      assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
-      awaitPoolsIdle(nodeA, nodeAId);
-    } finally {
-      setClusterSetting(FALLBACK_ALLOWED, null);
-      setClusterSetting(COMPLEX_POOL_ENABLED, null);
-    }
+    Response deleted = deleteAsyncQuery(nodeB, queryId);
+    Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
+    Assert.assertEquals(
+        "FAILED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
+    assertNotFound(() -> getAsyncQuery(nodeA, queryId));
+    assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
+    awaitPoolsIdle(nodeA, nodeAId);
   }
 
   private String submitAsync(RestClient client, String query) throws IOException {
@@ -303,9 +282,5 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     } catch (IOException e) {
       throw new IllegalStateException(e);
     }
-  }
-
-  private void setClusterSetting(String name, String value) throws IOException {
-    updateClusterSettings(new SQLIntegTestCase.ClusterSetting("persistent", name, value));
   }
 }

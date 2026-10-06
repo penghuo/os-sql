@@ -10,7 +10,6 @@ import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.DOCS;
-import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.EVENTSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.PPL_ENDPOINT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
@@ -65,9 +64,8 @@ import org.opensearch.sql.job.QueryJobId;
  * </ul>
  *
  * <p>Runs on the Calcite engine. Also covers running-query cancellation on a single node (local
- * owner DELETE and streamstats/eventstats baselines) via the fixture in {@link
- * AsyncPPLTestHelpers}; forwarded cancellation, concurrent deletes, and the FAILED path live in
- * {@link AsyncPPLMultiNodeRoutingIT}.
+ * owner DELETE and streamstats baseline) via the fixture in {@link AsyncPPLTestHelpers}; forwarded
+ * cancellation, concurrent deletes, and the FAILED path live in {@link AsyncPPLMultiNodeRoutingIT}.
  */
 public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
 
@@ -351,17 +349,47 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
 
   // ---------- Running-query cancellation on a single node ----------
   //
-  // The three cases below install the cancellation fixture on demand, pin a node client, and
+  // The two cases below install the cancellation fixture on demand, pin a node client, and
   // drain the owner's SQL pools in a finally so a mid-test failure can't leak work.
 
   @Test
   public void async_baselineStreamstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
-    assertBaselineAggregate(STREAMSTATS_QUERY);
-  }
-
-  @Test
-  public void async_baselineEventstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
-    assertBaselineAggregate(EVENTSTATS_QUERY);
+    AsyncPPLTestHelpers.createIndex(client());
+    try (RestClient owner = pinnedOwnerClient()) {
+      String ownerNodeId = localNodeId(owner);
+      try {
+        long before = indexSearchCount(owner);
+        JSONObject body = new JSONObject();
+        body.put("query", STREAMSTATS_QUERY);
+        // The async submit still returns ID + RUNNING if the scan can't finish inside the wait,
+        // so handle both shapes.
+        body.put("wait_for_completion_timeout", "60s");
+        JSONObject response = new JSONObject(postPpl(owner, body));
+        JSONObject terminal;
+        if (response.has("id")) {
+          terminal = pollUntilTerminal(owner, response.getString("id"), 60_000);
+          Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
+        } else {
+          terminal = response;
+        }
+        JSONArray row = terminal.getJSONArray("datarows").getJSONArray(0);
+        Assert.assertEquals(
+            "streamstats baseline must aggregate across the full scan to " + DOCS,
+            DOCS,
+            row.getInt(0));
+        long after = indexSearchCount(owner);
+        Assert.assertTrue(
+            "baseline scan must read at least "
+                + BASELINE_MIN_SEARCHES
+                + " batches: before="
+                + before
+                + " after="
+                + after,
+            after - before >= BASELINE_MIN_SEARCHES);
+      } finally {
+        awaitPoolsIdle(owner, ownerNodeId);
+      }
+    }
   }
 
   @Test
@@ -388,43 +416,6 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
         assertStopped(owner, ownerNodeId, searchesAtDelete, running.pits);
         assertNotFound(() -> getAsyncQuery(owner, queryId));
         assertNotFound(() -> deleteAsyncQuery(owner, queryId));
-      } finally {
-        awaitPoolsIdle(owner, ownerNodeId);
-      }
-    }
-  }
-
-  private void assertBaselineAggregate(String query) throws Exception {
-    AsyncPPLTestHelpers.createIndex(client());
-    try (RestClient owner = pinnedOwnerClient()) {
-      String ownerNodeId = localNodeId(owner);
-      try {
-        long before = indexSearchCount(owner);
-        JSONObject body = new JSONObject();
-        body.put("query", query);
-        // The async submit still returns ID + RUNNING if the scan can't finish inside the wait,
-        // so handle both shapes.
-        body.put("wait_for_completion_timeout", "60s");
-        JSONObject response = new JSONObject(postPpl(owner, body));
-        JSONObject terminal;
-        if (response.has("id")) {
-          terminal = pollUntilTerminal(owner, response.getString("id"), 60_000);
-          Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
-        } else {
-          terminal = response;
-        }
-        JSONArray row = terminal.getJSONArray("datarows").getJSONArray(0);
-        Assert.assertEquals(
-            query + " must aggregate across the full scan to " + DOCS, DOCS, row.getInt(0));
-        long after = indexSearchCount(owner);
-        Assert.assertTrue(
-            "baseline scan must read at least "
-                + BASELINE_MIN_SEARCHES
-                + " batches: before="
-                + before
-                + " after="
-                + after,
-            after - before >= BASELINE_MIN_SEARCHES);
       } finally {
         awaitPoolsIdle(owner, ownerNodeId);
       }

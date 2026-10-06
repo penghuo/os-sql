@@ -29,14 +29,15 @@ import org.opensearch.client.RestClient;
  * AsyncPPLMultiNodeRoutingIT}, and {@code AsyncPPLSecurityIT}).
  *
  * <p>Covers both lifecycle plumbing (POST / GET / DELETE / poll-until-terminal) and the
- * cancellation fixture: a dedicated bulk-loaded index, natural {@code streamstats} / {@code
- * eventstats} workloads, running proof, and the stop oracle. Observability uses only existing REST
- * endpoints: {@code /_nodes/<id>/stats/thread_pool}, {@code /&lt;index&gt;/_stats}, and {@code
+ * cancellation fixture: a dedicated bulk-loaded index, a natural {@code streamstats} workload,
+ * running proof, and the stop oracle. Observability uses only existing REST endpoints: {@code
+ * /_nodes/<id>/stats/thread_pool}, {@code /&lt;index&gt;/_stats}, and {@code
  * /_search/point_in_time/_all}.
  *
- * <p>{@code streamstats} and {@code eventstats} compile to Calcite {@code Window} / {@code
- * RexOver}, so by default they dispatch to {@code sql-complex-worker}. The async ITs run with
- * default cluster settings, so {@link #awaitRunning} verifies the query is active there.
+ * <p>{@code streamstats} compiles to a Calcite {@code Window} that {@code
+ * ScriptDetector.hasScripts} matches, so by default the plan dispatches to {@code
+ * sql-complex-worker}. The async ITs run with default cluster settings, so {@link #awaitRunning}
+ * verifies the query is active there.
  *
  * <p>Only the surface that the cross-package security IT needs is {@code public}; everything else
  * stays package-private or private.
@@ -59,16 +60,9 @@ public final class AsyncPPLTestHelpers {
 
   static final int MAX_RESULT_WINDOW = 10;
 
-  /** eventstats variant: an unpartitioned count that must drain the full scan to project. */
-  static final String EVENTSTATS_QUERY =
-      "source=" + INDEX + " | eventstats count() as total | head 1 | fields total";
-
-  /** Natural runtime failure after a full window scan: scalar overflow in a post-window eval. */
+  /** Runs the full streamstats scan, then overflows a bigint add at projection time. */
   static final String OVERFLOW_QUERY =
-      "source="
-          + INDEX
-          + " | eventstats count() as total"
-          + " | eval bad = 9223372036854775807 + total | head 1 | fields bad";
+      STREAMSTATS_QUERY + " | eval bad = 9223372036854775807 + total | fields bad";
 
   /** Minimum searches a correct scan issues: one batch per {@link #MAX_RESULT_WINDOW}. */
   static final long BASELINE_MIN_SEARCHES = DOCS / MAX_RESULT_WINDOW;

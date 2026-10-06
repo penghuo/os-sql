@@ -8,7 +8,6 @@ package org.opensearch.sql.ppl;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
-import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.EVENTSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.OVERFLOW_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
@@ -186,11 +185,11 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void deleteOnPeerForwardsCancellationOfEventstatsAndStopsExecution() throws Exception {
+  public void deleteOnPeerForwardsCancellationOfStreamstatsAndStopsExecution() throws Exception {
     // Uses default settings and executes on sql-complex-worker.
     AsyncPPLTestHelpers.createIndex(nodeA);
     long searchesBefore = indexSearchCount(nodeA);
-    String queryId = submitAsync(nodeA, EVENTSTATS_QUERY);
+    String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
     AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
     Assert.assertEquals(
         "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
@@ -245,10 +244,21 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
   @Test
   public void deleteOfFailedJobReturnsFailedAndRemovesIt() throws Exception {
     AsyncPPLTestHelpers.createIndex(nodeA);
+    long searchesBefore = indexSearchCount(nodeA);
     String queryId = submitAsync(nodeA, OVERFLOW_QUERY);
     JSONObject terminal = pollUntilTerminal(nodeA, queryId, 30_000);
     Assert.assertEquals("FAILED", terminal.getString("status"));
-    Assert.assertTrue("FAILED body must carry an error: " + terminal, terminal.has("error"));
+    String error = terminal.optString("error", "");
+    Assert.assertTrue(
+        "FAILED body must identify the overflow: " + terminal,
+        error.toLowerCase(java.util.Locale.ROOT).contains("overflow"));
+    long searchesAtFailure = indexSearchCount(nodeA);
+    Assert.assertTrue(
+        "overflow must fire after the full streamstats scan: delta="
+            + (searchesAtFailure - searchesBefore)
+            + " baseline="
+            + AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES,
+        searchesAtFailure - searchesBefore >= AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES);
 
     Response deleted = deleteAsyncQuery(nodeB, queryId);
     Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());

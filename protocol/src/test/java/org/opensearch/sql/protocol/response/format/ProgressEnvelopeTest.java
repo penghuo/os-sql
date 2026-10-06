@@ -43,54 +43,36 @@ class ProgressEnvelopeTest {
   }
 
   @Test
-  @DisplayName("produces exactly the body documented for an inline async success")
-  void matchesDocumentedInlineBody() {
-    // The synchronous row formatter's output, verbatim.
+  @DisplayName("preserves the pretty rendering of a retained explain GET body")
+  void matchesRenderedExplainGetBody() {
+    // The sync explain formatter's PRETTY output, verbatim. This is the only production caller of
+    // merge: a retained explain job fetched through GET /_plugins/_async_query/{id}.
     String rendered =
         """
         {
-          "schema": [
-            {
-              "name": "c",
-              "type": "bigint"
-            }
-          ],
-          "datarows": [
-            [
-              4
-            ]
-          ],
-          "total": 1,
-          "size": 1
+          "calcite": {
+            "logical": "LogicalProject",
+            "physical": "EnumerableCalc"
+          }
         }\
         """;
 
-    // What docs/user/ppl/interfaces/endpoint.md promises, and what doctest compares against. Pinned
-    // here so a
-    // formatting change in the merge is caught by a unit test rather than by a documentation test.
-    String documented =
+    // Pinned so a change to the merge's serializer configuration is caught here rather than by an
+    // integration test comparing whole response bodies.
+    String expected =
         """
         {
-          "schema": [
-            {
-              "name": "c",
-              "type": "bigint"
-            }
-          ],
-          "datarows": [
-            [
-              4
-            ]
-          ],
-          "total": 1,
-          "size": 1,
+          "calcite": {
+            "logical": "LogicalProject",
+            "physical": "EnumerableCalc"
+          },
           "progress": {
             "fraction_done": 1.0
           }
         }\
         """;
 
-    assertEquals(documented, ProgressEnvelope.merge(rendered, QueryProgress.COMPLETE));
+    assertEquals(expected, ProgressEnvelope.merge(rendered, QueryProgress.COMPLETE));
   }
 
   @Test

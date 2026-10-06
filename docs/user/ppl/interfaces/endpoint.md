@@ -682,7 +682,7 @@ Parameters:
 
 ### Example
 
-Submit a query with a wait budget large enough for completion. The response carries the same schema and rows as a synchronous PPL response — no `id`, no polling needed — plus `progress`, which reports `1.0` because the query finished:
+Submit a query with a wait budget large enough for completion. The response is byte for byte the synchronous PPL response — no `id`, no polling needed, and no `progress`, because the response is the result:
 
 ```bash ppl
 curl -sS -H 'Content-Type: application/json' \
@@ -706,10 +706,7 @@ Expected output:
     ]
   ],
   "total": 1,
-  "size": 1,
-  "progress": {
-    "fraction_done": 1.0
-  }
+  "size": 1
 }
 ```
 
@@ -765,7 +762,9 @@ The GET HTTP status is `200` whenever the poll itself succeeds. `404` from GET m
 
 ### Description
 
-Every asynchronous response carries a `progress` object reporting how far the query has got. It is present on the submit response, on every poll, and on the terminal response, so a client never has to treat a missing field as a particular value.
+A job that is retained for polling carries a `progress` object reporting how far the query has got. It is present on the `RUNNING` submit response, on every poll, and on the terminal response, so a client that is polling never has to treat a missing field as a particular value.
+
+A submission that finishes inside its `wait_for_completion_timeout` carries no `progress` object: it returns the final result instead of an id, so there is nothing left to report. Treat a body without `id` as complete.
 
 ```json
 "progress": {
@@ -779,6 +778,7 @@ Guarantees a client can rely on:
 
 | Property | Behavior |
 |---|---|
+| Presence | Present whenever the response carries a job `id` or is a poll result. Absent when a submit completed inside its wait. |
 | Range | Always finite and within `[0.0, 1.0]`. |
 | Monotonic | Never decreases across responses for one job. |
 | Running ceiling | A `RUNNING` response never exceeds `0.8`. The top 20% is reserved so that finishing every source cannot report a result that is not ready — the coordinator may still be sorting, joining, or reducing. |
@@ -796,4 +796,4 @@ A plan whose sources all run concurrently is combined by document count: for a j
 - A query the engine answers without an OpenSearch scan — one that falls back to the V2 engine, or is routed to the analytics engine — reports `0.0` while running and `1.0` on success. There is no instrumented source to observe.
 - The index-size lookup is bounded and all-or-nothing. If it is unavailable — the caller lacks permission to read `_stats`, the call times out, or a primary shard failed — progress falls back to weighting every source and every shard equally. The query is unaffected.
 - A single-request source has only one round trip to observe, so its progress comes entirely from shard completion and it has no sub-shard resolution.
-- Statement-level `explain` reports `1.0` alongside its plan output; there is no meaningful intermediate value for a plan that is never executed.
+- A retained statement-level `explain` job reports `1.0` alongside its plan output on GET; there is no meaningful intermediate value for a plan that is never executed. An explain returned inline carries no `progress`, like any other inline result.

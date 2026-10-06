@@ -24,10 +24,13 @@ import org.opensearch.client.ResponseException;
 /**
  * End-to-end progress contract for asynchronous Calcite PPL queries (issue #5797).
  *
- * <p>Asserts what the REST contract promises, across the source shapes the design enumerates:
- * {@code fraction_done} is always present and finite, running values stay within {@code [0.0,
- * 0.8]}, the sequence never decreases, {@code SUCCEEDED} is exactly {@code 1.0}, and a failed job
- * keeps its last running value instead of being rounded up.
+ * <p>Asserts what the REST contract promises, across the source shapes the design enumerates: a
+ * retained job reports a finite {@code fraction_done} on its RUNNING submit and on every poll,
+ * running values stay within {@code [0.0, 0.8]}, the sequence never decreases, {@code SUCCEEDED} is
+ * exactly {@code 1.0}, and a failed job keeps its last running value instead of being rounded up.
+ *
+ * <p>A submission that finishes inside its wait budget is the exception: it returns the ordinary
+ * final body with no {@code progress} field at all, because the response is the result.
  *
  * <p>Two things this class is deliberate about:
  *
@@ -88,7 +91,7 @@ public class AsyncPPLProgressIT extends PPLIntegTestCase {
       // callback before it
       // completes the zero-budget running snapshot, so a fast query may settle first. That is a
       // valid outcome, not
-      // a missing id, and it must still report completion.
+      // a missing id, and it must then look exactly like a synchronous result.
       assertInlineSuccess(response);
       return;
     }
@@ -97,7 +100,7 @@ public class AsyncPPLProgressIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void inlineSuccessCarriesCompleteProgress() throws IOException {
+  public void inlineSuccessOmitsProgress() throws IOException {
     JSONObject response =
         submitAsyncWithWait("source=" + TEST_INDEX_ACCOUNT + " | stats count() as c", "60s");
 
@@ -106,7 +109,7 @@ public class AsyncPPLProgressIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void inlineExplainCarriesCompleteProgress() throws IOException {
+  public void inlineExplainOmitsProgress() throws IOException {
     JSONObject response =
         submitAsyncWithWait(
             "explain source=" + TEST_INDEX_ACCOUNT + " | stats count() as c", "60s");
@@ -444,14 +447,20 @@ public class AsyncPPLProgressIT extends PPLIntegTestCase {
     assertMonotonic(observed, query);
   }
 
-  /** The inline outcome: no polling id, the ordinary result body, and completion. */
+  /**
+   * The inline outcome: no polling id, the ordinary result body, and no {@code progress}.
+   *
+   * <p>The absence is the contract, not an omission. A submission that finished inside its wait
+   * budget returns the result itself, so the body is the synchronous one unchanged and a fraction
+   * there would only restate that the query is over.
+   */
   private static void assertInlineSuccess(JSONObject response) {
     Assert.assertFalse("an inline result must not carry a polling id", response.has("id"));
     Assert.assertTrue(
         "an inline result must carry rows or a plan: " + response,
         response.has("datarows") || response.has("calcite") || response.has("root"));
-    Assert.assertEquals(
-        "an inline result must report completion", 1.0, fractionDone(response), EPSILON);
+    Assert.assertFalse(
+        "an inline result must not carry progress: " + response, response.has("progress"));
   }
 
   private JSONObject submitAsync(String query) throws IOException {

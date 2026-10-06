@@ -312,15 +312,12 @@ public class TransportPPLQueryAction
     ThreadContext threadContext = clientRef.threadPool().getThreadContext();
     ActionListener<TransportPPLQueryResponse> ctxListener =
         ContextPreservingActionListener.wrapPreservingContext(listener, threadContext);
-    // An async submission that finishes inside the wait budget returns the ordinary result body —
-    // but it is
-    // still an async response, so it must carry progress. Without this a client would have to treat
-    // a missing
-    // field as "complete" on one path and as "nothing observed" on another.
-    ActionListener<TransportPPLQueryResponse> inlineListener =
-        withProgress(ctxListener, QueryProgress.COMPLETE);
+    // A submission that finishes inside the wait budget returns the ordinary final body, byte for
+    // byte identical to the synchronous one. There is no progress field: the response is the
+    // result,
+    // so a fraction would only restate that the query is over.
     ResponseListener<ExecutionEngine.QueryResponse> responseListener =
-        createListener(transformedRequest, inlineListener);
+        createListener(transformedRequest, ctxListener);
     CompletionStage<org.opensearch.sql.job.QueryResult> submission;
     try {
       submission =
@@ -352,7 +349,7 @@ public class TransportPPLQueryAction
               responseListener.onResponse(response);
             }
             case org.opensearch.sql.job.QueryResult.Explain explain -> {
-              createExplainResponseListener(transformedRequest, inlineListener)
+              createExplainResponseListener(transformedRequest, ctxListener)
                   .onResponse(explain.response());
             }
             case org.opensearch.sql.job.QueryResult.Running running ->
@@ -380,36 +377,13 @@ public class TransportPPLQueryAction
    * Renders {@code progress.fraction_done}.
    *
    * <p>Nested under an object rather than emitted as a flat field so later signals — rows scanned,
-   * bytes read, a per-source breakdown — can be added without another top-level name. The value is
-   * always present on an asynchronous response, including the first one, so a client never has to
-   * special-case a missing field as "zero".
+   * bytes read, a per-source breakdown — can be added without another top-level name.
+   *
+   * <p>Emitted only on a RUNNING body. A submission that finished inside its wait budget returns
+   * the final result instead, and a fraction there would only restate that the query is over.
    */
   private static JSONObject progressObject(QueryProgress progress) {
     return new JSONObject().put(ProgressEnvelope.FRACTION_DONE, progress.fractionDone());
-  }
-
-  /**
-   * Adds {@code progress} to whatever body the delegate would have returned.
-   *
-   * <p>Applied only on the asynchronous submit path. Failures pass straight through so a fast
-   * failure keeps the exception type the synchronous path raises, and with it its HTTP status and
-   * error payload.
-   */
-  private static ActionListener<TransportPPLQueryResponse> withProgress(
-      ActionListener<TransportPPLQueryResponse> delegate, QueryProgress progress) {
-    return new ActionListener<>() {
-      @Override
-      public void onResponse(TransportPPLQueryResponse response) {
-        delegate.onResponse(
-            new TransportPPLQueryResponse(
-                ProgressEnvelope.merge(response.getResult(), progress), response.getContentType()));
-      }
-
-      @Override
-      public void onFailure(Exception e) {
-        delegate.onFailure(e);
-      }
-    };
   }
 
   private ResponseListener<AnalyzeResponse> createAnalyzeResponseListener(

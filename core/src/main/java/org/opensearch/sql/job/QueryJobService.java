@@ -54,11 +54,11 @@ public interface QueryJobService {
   QueryJobStatus cancel(QueryJobId id, Principal caller);
 
   /**
-   * Removes the job, cancelling it first if it has not finished, and returns its final snapshot:
-   * {@link QueryJobState#CANCELLED} for a job that was still running, otherwise the existing
-   * terminal state. The job is removed before it is cancelled, so exactly one concurrent delete
-   * succeeds; afterwards {@link #get} and {@code delete} for the ID throw {@link
-   * QueryJobNotFoundException}.
+   * Removes the job from the store, then cancels it if it has not finished, and returns its final
+   * snapshot: {@link QueryJobState#CANCELLED} for a job that was still running, otherwise the
+   * existing terminal state. The removal races against concurrent deletes and retention eviction,
+   * so exactly one caller succeeds; afterwards {@link #get} and {@code delete} for the ID throw
+   * {@link QueryJobNotFoundException}.
    *
    * @throws QueryJobNotFoundException when the ID does not resolve on this node, including when a
    *     concurrent delete or retention eviction removed the job first

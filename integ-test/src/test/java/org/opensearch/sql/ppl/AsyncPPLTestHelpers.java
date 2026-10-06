@@ -26,21 +26,9 @@ import org.opensearch.client.RestClient;
 
 /**
  * Shared helpers for the async PPL integration tests ({@link AsyncPPLQueryLifecycleIT}, {@link
- * AsyncPPLMultiNodeRoutingIT}, and {@code AsyncPPLSecurityIT}).
- *
- * <p>Covers both lifecycle plumbing (POST / GET / DELETE / poll-until-terminal) and the
- * cancellation fixture: a dedicated bulk-loaded index, a natural {@code streamstats} workload,
- * running proof, and the stop oracle. Observability uses only existing REST endpoints: {@code
- * /_nodes/<id>/stats/thread_pool}, {@code /&lt;index&gt;/_stats}, and {@code
- * /_search/point_in_time/_all}.
- *
- * <p>{@code streamstats} compiles to a Calcite {@code Window} that {@code
- * ScriptDetector.hasScripts} matches, so by default the plan dispatches to {@code
- * sql-complex-worker}. The async ITs run with default cluster settings, so {@link #awaitRunning}
- * verifies the query is active there.
- *
- * <p>Only the surface that the cross-package security IT needs is {@code public}; everything else
- * stays package-private or private.
+ * AsyncPPLMultiNodeRoutingIT}, and {@code AsyncPPLSecurityIT}). Covers lifecycle plumbing and the
+ * cancellation fixture: a dedicated bulk-loaded index, a streamstats workload, running proof, and
+ * the stop oracle.
  */
 public final class AsyncPPLTestHelpers {
 
@@ -56,32 +44,17 @@ public final class AsyncPPLTestHelpers {
           + INDEX
           + " | streamstats count() as running_count | stats max(running_count) as total";
 
-  static final int DOCS = 10_000;
-
-  static final int MAX_RESULT_WINDOW = 10;
-
   /** Runs the full streamstats scan, then overflows a bigint add at projection time. */
   static final String OVERFLOW_QUERY =
       STREAMSTATS_QUERY + " | eval bad = 9223372036854775807 + total | fields bad";
 
-  /** Minimum searches a correct scan issues: one batch per {@link #MAX_RESULT_WINDOW}. */
-  static final long BASELINE_MIN_SEARCHES = DOCS / MAX_RESULT_WINDOW;
-
-  /** Deadline for the owner's sql pools to go idle after DELETE. */
+  private static final int DOCS = 10_000;
+  private static final int MAX_RESULT_WINDOW = 10;
   private static final long STOP_DEADLINE_MILLIS = 5_000;
-
-  /** Deadline waiting for the first batch of searches to appear while running. */
   private static final long START_DEADLINE_MILLIS = 10_000;
-
-  /** Minimum searches a snapshot must have logged before DELETE, to prove warm-up is past. */
   private static final long RUNNING_MIN_PROGRESS = 10;
-
-  /** Maximum progress at snapshot: proves the scan still has over half its work left. */
-  private static final long RUNNING_MAX_PROGRESS = BASELINE_MIN_SEARCHES / 2;
-
-  /** Expected search progress between DELETE and pools idle. */
+  private static final long RUNNING_MAX_PROGRESS = DOCS / MAX_RESULT_WINDOW / 2;
   private static final int MAX_SEARCHES_AFTER_CANCEL = 20;
-
   private static final List<String> SQL_POOLS =
       List.of("sql-worker", "sql-complex-worker", "sql_background_io");
 
@@ -158,20 +131,14 @@ public final class AsyncPPLTestHelpers {
             Locale.ROOT,
             "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0,"
                 + "\"max_result_window\":%d},"
-                + "\"mappings\":{\"properties\":"
-                + "{\"g\":{\"type\":\"keyword\"},\"n\":{\"type\":\"integer\"}}}}",
+                + "\"mappings\":{\"properties\":{\"n\":{\"type\":\"integer\"}}}}",
             MAX_RESULT_WINDOW));
     admin.performRequest(create);
     int chunk = 1_000;
     for (int offset = 0; offset < DOCS; offset += chunk) {
-      StringBuilder bulk = new StringBuilder(chunk * 50);
+      StringBuilder bulk = new StringBuilder(chunk * 30);
       for (int i = 0; i < chunk && offset + i < DOCS; i++) {
-        int n = offset + i;
-        bulk.append("{\"index\":{}}\n{\"g\":\"g")
-            .append(n % 20)
-            .append("\",\"n\":")
-            .append(n)
-            .append("}\n");
+        bulk.append("{\"index\":{}}\n{\"n\":").append(offset + i).append("}\n");
       }
       Request bulkRequest =
           new Request(
@@ -193,16 +160,14 @@ public final class AsyncPPLTestHelpers {
 
   /**
    * Running proof: the query must be active on {@code sql-complex-worker}, have an open PIT, and
-   * have made at least {@link #RUNNING_MIN_PROGRESS} but no more than {@link #RUNNING_MAX_PROGRESS}
-   * searches since submission, so the scan is demonstrably running with over half its work left.
+   * have made search progress inside the running window. Returns the PIT ids seen while running.
    */
-  public static RunningSnapshot awaitRunning(
+  public static List<String> awaitRunning(
       RestClient owner, String ownerNodeId, long searchesBeforeSubmit) throws Exception {
     long deadline = System.currentTimeMillis() + START_DEADLINE_MILLIS;
     while (System.currentTimeMillis() <= deadline) {
       Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
-      long searches = indexSearchCount(owner);
-      long progress = searches - searchesBeforeSubmit;
+      long progress = indexSearchCount(owner) - searchesBeforeSubmit;
       if (pools.get("sql-complex-worker").get("active") > 0
           && progress >= RUNNING_MIN_PROGRESS
           && progress <= RUNNING_MAX_PROGRESS) {
@@ -211,7 +176,7 @@ public final class AsyncPPLTestHelpers {
         // and get a transient 500 from the native endpoint for an in-flight context id.
         List<String> pits = openPits(owner);
         if (!pits.isEmpty()) {
-          return new RunningSnapshot(pools, searches, pits);
+          return pits;
         }
       }
       Thread.sleep(10);
@@ -228,9 +193,8 @@ public final class AsyncPPLTestHelpers {
     return null; // unreachable
   }
 
-  /** Waits until every SQL pool's active + queue reaches zero. Returns the final snapshot. */
-  public static Map<String, Map<String, Integer>> awaitPoolsIdle(
-      RestClient owner, String ownerNodeId) throws Exception {
+  /** Waits until every SQL pool's active + queue reaches zero. */
+  public static void awaitPoolsIdle(RestClient owner, String ownerNodeId) throws Exception {
     long deadline = System.currentTimeMillis() + STOP_DEADLINE_MILLIS;
     Map<String, Map<String, Integer>> pools = poolStats(owner, ownerNodeId);
     while (!poolsIdle(pools)) {
@@ -246,7 +210,6 @@ public final class AsyncPPLTestHelpers {
       Thread.sleep(50);
       pools = poolStats(owner, ownerNodeId);
     }
-    return pools;
   }
 
   /**
@@ -257,16 +220,13 @@ public final class AsyncPPLTestHelpers {
   public static void assertStopped(
       RestClient owner, String ownerNodeId, long searchesAtDelete, List<String> pitsSeenRunning)
       throws Exception {
-    Map<String, Map<String, Integer>> idle = awaitPoolsIdle(owner, ownerNodeId);
-    long after = indexSearchCount(owner);
-    long delta = after - searchesAtDelete;
+    awaitPoolsIdle(owner, ownerNodeId);
+    long delta = indexSearchCount(owner) - searchesAtDelete;
     Assert.assertTrue(
         "cancelled query must not keep scanning past "
             + MAX_SEARCHES_AFTER_CANCEL
             + " searches: delta="
-            + delta
-            + " idle="
-            + idle,
+            + delta,
         delta <= MAX_SEARCHES_AFTER_CANCEL);
     assertPitsClosed(owner, pitsSeenRunning);
   }
@@ -376,26 +336,5 @@ public final class AsyncPPLTestHelpers {
       }
     }
     return true;
-  }
-
-  /**
-   * Snapshot captured once the query is proven running. Only {@link #pits} is read by callers so
-   * they can pass it to {@link #assertStopped}; the other fields exist for diagnostic logging.
-   */
-  public static final class RunningSnapshot {
-    public final List<String> pits;
-    private final Map<String, Map<String, Integer>> pools;
-    private final long searches;
-
-    RunningSnapshot(Map<String, Map<String, Integer>> pools, long searches, List<String> pits) {
-      this.pools = pools;
-      this.searches = searches;
-      this.pits = pits;
-    }
-
-    @Override
-    public String toString() {
-      return "RunningSnapshot{pools=" + pools + ", searches=" + searches + ", pits=" + pits + '}';
-    }
   }
 }

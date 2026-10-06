@@ -53,7 +53,7 @@ public final class RetentionPolicy {
 
   private void scheduleEviction(QueryJob job, Duration ttl) {
     QueryJobId id = job.id();
-    // The store holds the only strong reference, so a job deleted before its TTL is collectible.
+    // The eviction timer must not retain a deleted job until TTL.
     WeakReference<QueryJob> retained = new WeakReference<>(job);
     try {
       threadPool.schedule(

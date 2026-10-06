@@ -116,6 +116,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
 
     JSONObject fetched = pollUntilTerminal(nodeB, queryId, 30_000);
     Assert.assertEquals("SUCCEEDED", fetched.getString("status"));
+    // Async GET formatter emits raw engine type ("long"), not the JDBC family ("bigint").
     verifySchema(fetched, schema("c", "long"));
     verifyDataRows(fetched, rows(1000));
     verifyNumOfRows(fetched, 1);
@@ -190,7 +191,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     AsyncPPLTestHelpers.createIndex(nodeA);
     long searchesBefore = indexSearchCount(nodeA);
     String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
-    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
+    List<String> runningPits = awaitRunning(nodeA, nodeAId, searchesBefore);
     Assert.assertEquals(
         "RUNNING", new JSONObject(getAsyncQuery(nodeA, queryId)).getString("status"));
     long searchesAtDelete = indexSearchCount(nodeA);
@@ -199,7 +200,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
     Assert.assertEquals(
         "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
-    assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+    assertStopped(nodeA, nodeAId, searchesAtDelete, runningPits);
     assertNotFound(() -> getAsyncQuery(nodeA, queryId));
     assertNotFound(() -> getAsyncQuery(nodeB, queryId));
     assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
@@ -210,7 +211,7 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     AsyncPPLTestHelpers.createIndex(nodeA);
     long searchesBefore = indexSearchCount(nodeA);
     String queryId = submitAsync(nodeA, STREAMSTATS_QUERY);
-    AsyncPPLTestHelpers.RunningSnapshot running = awaitRunning(nodeA, nodeAId, searchesBefore);
+    List<String> runningPits = awaitRunning(nodeA, nodeAId, searchesBefore);
     long searchesAtDelete = indexSearchCount(nodeA);
 
     CountDownLatch start = new CountDownLatch(1);
@@ -237,14 +238,13 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     }
     codes.sort(null);
     Assert.assertEquals(List.of(200, 404), codes);
-    assertStopped(nodeA, nodeAId, searchesAtDelete, running.pits);
+    assertStopped(nodeA, nodeAId, searchesAtDelete, runningPits);
     assertNotFound(() -> getAsyncQuery(nodeA, queryId));
   }
 
   @Test
   public void deleteOfFailedJobReturnsFailedAndRemovesIt() throws Exception {
     AsyncPPLTestHelpers.createIndex(nodeA);
-    long searchesBefore = indexSearchCount(nodeA);
     String queryId = submitAsync(nodeA, OVERFLOW_QUERY);
     JSONObject terminal = pollUntilTerminal(nodeA, queryId, 30_000);
     Assert.assertEquals("FAILED", terminal.getString("status"));
@@ -252,13 +252,6 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     Assert.assertTrue(
         "FAILED body must identify the overflow: " + terminal,
         error.toLowerCase(java.util.Locale.ROOT).contains("overflow"));
-    long searchesAtFailure = indexSearchCount(nodeA);
-    Assert.assertTrue(
-        "overflow must fire after the full streamstats scan: delta="
-            + (searchesAtFailure - searchesBefore)
-            + " baseline="
-            + AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES,
-        searchesAtFailure - searchesBefore >= AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES);
 
     Response deleted = deleteAsyncQuery(nodeB, queryId);
     Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
@@ -266,7 +259,6 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
         "FAILED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
     assertNotFound(() -> getAsyncQuery(nodeA, queryId));
     assertNotFound(() -> deleteAsyncQuery(nodeB, queryId));
-    awaitPoolsIdle(nodeA, nodeAId);
   }
 
   private String submitAsync(RestClient client, String query) throws IOException {

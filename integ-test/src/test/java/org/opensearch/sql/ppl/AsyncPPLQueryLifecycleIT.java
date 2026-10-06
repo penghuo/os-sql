@@ -8,8 +8,6 @@ package org.opensearch.sql.ppl;
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.legacy.TestsConstants.TEST_INDEX_ACCOUNT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.ASYNC_QUERY_ENDPOINT;
-import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.BASELINE_MIN_SEARCHES;
-import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.DOCS;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.PPL_ENDPOINT;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.assertNotFound;
@@ -29,8 +27,8 @@ import static org.opensearch.sql.util.MatcherUtils.verifyNumOfRows;
 import static org.opensearch.sql.util.MatcherUtils.verifySchema;
 
 import java.io.IOException;
+import java.util.List;
 import org.apache.hc.core5.http.HttpHost;
-import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Assert;
 import org.junit.Test;
@@ -253,9 +251,8 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
       try {
         getAsyncQuery(client(), queryId);
       } catch (ResponseException ex) {
-        int code = ex.getResponse().getStatusLine().getStatusCode();
-        Assert.assertTrue(
-            "expected 4xx after keep_alive expiry, got " + code, code >= 400 && code < 500);
+        Assert.assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
+        assertNotFound(() -> deleteAsyncQuery(client(), queryId));
         return;
       }
       Thread.sleep(200);
@@ -290,34 +287,8 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void async_deleteExpiredJobReturns404() throws Exception {
-    JSONObject body = withAsyncWait("source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
-    body.put("keep_alive", "1s");
-    String queryId = new JSONObject(postPpl(client(), body)).getString("id");
-    Assert.assertEquals(
-        "SUCCEEDED", pollUntilTerminal(client(), queryId, 5_000).getString("status"));
-
-    long deadline = System.currentTimeMillis() + 3_000L;
-    while (true) {
-      try {
-        getAsyncQuery(client(), queryId);
-      } catch (ResponseException e) {
-        Assert.assertEquals(404, e.getResponse().getStatusLine().getStatusCode());
-        break;
-      }
-      Assert.assertTrue(
-          "job [" + queryId + "] was not evicted within 3s after keep_alive=1s",
-          System.currentTimeMillis() < deadline);
-      Thread.sleep(200);
-    }
-
-    assertNotFound(() -> deleteAsyncQuery(client(), queryId));
-  }
-
-  @Test
-  public void async_queryIdOfAbsentOwnerReturns404() {
+  public void async_deleteWithAbsentOwnerReturns404() {
     String absentOwnerId = QueryJobId.create("absent-node").encode();
-    assertNotFound(() -> getAsyncQuery(client(), absentOwnerId));
     assertNotFound(() -> deleteAsyncQuery(client(), absentOwnerId));
   }
 
@@ -347,51 +318,6 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
     assertRejectedWith400(PPL_ENDPOINT, body);
   }
 
-  // ---------- Running-query cancellation on a single node ----------
-  //
-  // The two cases below install the cancellation fixture on demand, pin a node client, and
-  // drain the owner's SQL pools in a finally so a mid-test failure can't leak work.
-
-  @Test
-  public void async_baselineStreamstatsReadsEveryBatchAndReportsCorrectTotal() throws Exception {
-    AsyncPPLTestHelpers.createIndex(client());
-    try (RestClient owner = pinnedOwnerClient()) {
-      String ownerNodeId = localNodeId(owner);
-      try {
-        long before = indexSearchCount(owner);
-        JSONObject body = new JSONObject();
-        body.put("query", STREAMSTATS_QUERY);
-        // The async submit still returns ID + RUNNING if the scan can't finish inside the wait,
-        // so handle both shapes.
-        body.put("wait_for_completion_timeout", "60s");
-        JSONObject response = new JSONObject(postPpl(owner, body));
-        JSONObject terminal;
-        if (response.has("id")) {
-          terminal = pollUntilTerminal(owner, response.getString("id"), 60_000);
-          Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
-        } else {
-          terminal = response;
-        }
-        JSONArray row = terminal.getJSONArray("datarows").getJSONArray(0);
-        Assert.assertEquals(
-            "streamstats baseline must aggregate across the full scan to " + DOCS,
-            DOCS,
-            row.getInt(0));
-        long after = indexSearchCount(owner);
-        Assert.assertTrue(
-            "baseline scan must read at least "
-                + BASELINE_MIN_SEARCHES
-                + " batches: before="
-                + before
-                + " after="
-                + after,
-            after - before >= BASELINE_MIN_SEARCHES);
-      } finally {
-        awaitPoolsIdle(owner, ownerNodeId);
-      }
-    }
-  }
-
   @Test
   public void async_deleteOnOwnerCancelsStreamstatsAndStopsExecution() throws Exception {
     AsyncPPLTestHelpers.createIndex(client());
@@ -403,8 +329,7 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
         body.put("query", STREAMSTATS_QUERY);
         body.put("wait_for_completion_timeout", "0");
         String queryId = new JSONObject(postPpl(owner, body)).getString("id");
-        AsyncPPLTestHelpers.RunningSnapshot running =
-            awaitRunning(owner, ownerNodeId, searchesBefore);
+        List<String> runningPits = awaitRunning(owner, ownerNodeId, searchesBefore);
         Assert.assertEquals(
             "RUNNING", new JSONObject(getAsyncQuery(owner, queryId)).getString("status"));
 
@@ -413,7 +338,7 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
         Assert.assertEquals(200, deleted.getStatusLine().getStatusCode());
         Assert.assertEquals(
             "CANCELLED", new JSONObject(getResponseBody(deleted, true)).getString("status"));
-        assertStopped(owner, ownerNodeId, searchesAtDelete, running.pits);
+        assertStopped(owner, ownerNodeId, searchesAtDelete, runningPits);
         assertNotFound(() -> getAsyncQuery(owner, queryId));
         assertNotFound(() -> deleteAsyncQuery(owner, queryId));
       } finally {

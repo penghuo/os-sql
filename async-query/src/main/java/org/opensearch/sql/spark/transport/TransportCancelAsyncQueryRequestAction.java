@@ -9,14 +9,20 @@ package org.opensearch.sql.spark.transport;
 
 import java.util.Optional;
 import org.json.JSONObject;
+import org.opensearch.OpenSearchStatusException;
+import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.ActionType;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.job.QueryJobId;
+import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
+import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
+import org.opensearch.sql.spark.asyncquery.exceptions.AsyncQueryNotFoundException;
 import org.opensearch.sql.spark.asyncquery.model.NullAsyncQueryRequestContext;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionRequest;
 import org.opensearch.sql.spark.transport.model.CancelAsyncQueryActionResponse;
@@ -62,7 +68,13 @@ public class TransportCancelAsyncQueryRequestAction
             NAME,
             request,
             CancelAsyncQueryActionResponse::new,
-            listener);
+            ActionListener.wrap(
+                listener::onResponse,
+                failure ->
+                    listener.onFailure(
+                        failure instanceof AsyncQueryNotFoundException
+                            ? new ResourceNotFoundException(failure.getMessage())
+                            : failure)));
         return;
       }
       String result =
@@ -72,8 +84,12 @@ public class TransportCancelAsyncQueryRequestAction
               parsed.isPresent()
                   ? new JSONObject().put("status", result).toString()
                   : String.format("Deleted async query with id: %s", result)));
+    } catch (QueryJobNotFoundException e) {
+      listener.onFailure(new ResourceNotFoundException(e.getMessage()));
+    } catch (QueryJobForbiddenException e) {
+      listener.onFailure(new OpenSearchStatusException(e.getMessage(), RestStatus.FORBIDDEN));
     } catch (Exception e) {
-      listener.onFailure(AsyncQueryOwnerRouting.toTransportException(e));
+      listener.onFailure(e);
     }
   }
 }

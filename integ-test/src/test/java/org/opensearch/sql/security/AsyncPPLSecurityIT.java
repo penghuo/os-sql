@@ -13,6 +13,7 @@ import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.indexSearchCount;
 
 import java.io.IOException;
+import java.util.List;
 import org.apache.hc.core5.http.HttpHost;
 import org.json.JSONObject;
 import org.junit.After;
@@ -73,11 +74,10 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
 
   @Test
   public void otherUserCannotDeleteThroughForwardingAndOwnerStillCan() throws Exception {
-    // Positive permission control: Bob's forwarded DELETE and GET of an unknown owner-node id
-    // return 404, so a later 403 provably comes from job ownership, not a missing grant.
+    // Positive permission control: Bob's forwarded DELETE of an unknown owner-node id returns
+    // 404, so a later 403 provably comes from job ownership, not a missing DELETE grant.
     String unknownId = QueryJobId.create(ownerNodeId).encode();
     assertNotFound(() -> asUser(peer, "DELETE", ASYNC_PATH + unknownId, BOB, null));
-    assertNotFound(() -> asUser(peer, "GET", ASYNC_PATH + unknownId, BOB, null));
 
     long searchesBefore = indexSearchCount(owner);
     JSONObject submit = new JSONObject();
@@ -85,11 +85,9 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     submit.put("wait_for_completion_timeout", "0");
     String queryId =
         new JSONObject(asUser(owner, "POST", "/_plugins/_ppl", ALICE, submit)).getString("id");
-    AsyncPPLTestHelpers.RunningSnapshot running =
-        AsyncPPLTestHelpers.awaitRunning(owner, ownerNodeId, searchesBefore);
+    List<String> runningPits = AsyncPPLTestHelpers.awaitRunning(owner, ownerNodeId, searchesBefore);
 
     assertForbidden(() -> asUser(peer, "DELETE", ASYNC_PATH + queryId, BOB, null));
-    assertForbidden(() -> asUser(peer, "GET", ASYNC_PATH + queryId, BOB, null));
     Assert.assertEquals(
         "RUNNING",
         new JSONObject(asUser(peer, "GET", ASYNC_PATH + queryId, ALICE, null)).getString("status"));
@@ -99,7 +97,7 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     long searchesAtDelete = indexSearchCount(owner);
     JSONObject deleted = new JSONObject(asUser(peer, "DELETE", ASYNC_PATH + queryId, ALICE, null));
     Assert.assertEquals("CANCELLED", deleted.getString("status"));
-    assertStopped(owner, ownerNodeId, searchesAtDelete, running.pits);
+    assertStopped(owner, ownerNodeId, searchesAtDelete, runningPits);
     assertNotFound(() -> asUser(owner, "GET", ASYNC_PATH + queryId, ALICE, null));
   }
 

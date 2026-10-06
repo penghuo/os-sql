@@ -5,8 +5,6 @@
 
 package org.opensearch.sql.spark.transport;
 
-import org.opensearch.OpenSearchStatusException;
-import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -14,10 +12,8 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.Writeable;
-import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.job.QueryJobId;
-import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
-import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
+import org.opensearch.sql.spark.asyncquery.exceptions.AsyncQueryNotFoundException;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportService;
@@ -61,7 +57,7 @@ final class AsyncQueryOwnerRouting {
     DiscoveryNode ownerNode = clusterService.state().nodes().get(jobId.ownerNodeId());
     if (ownerNode == null) {
       listener.onFailure(
-          new ResourceNotFoundException("QueryId: " + jobId.encode() + " not found"));
+          new AsyncQueryNotFoundException("QueryId: " + jobId.encode() + " not found"));
       return;
     }
     transportService.sendRequest(
@@ -70,21 +66,5 @@ final class AsyncQueryOwnerRouting {
         request,
         TransportRequestOptions.EMPTY,
         new ActionListenerResponseHandler<>(listener, responseReader, ThreadPool.Names.SAME));
-  }
-
-  /**
-   * Translates neutral job-service exceptions to transport-serializable {@code OpenSearchException}
-   * subclasses so the 404 / 403 status survives owner-node forwarding; otherwise the entry node
-   * receives a {@code NotSerializableExceptionWrapper} that maps to 500. Other exceptions pass
-   * through unchanged.
-   */
-  static Exception toTransportException(Exception e) {
-    if (e instanceof QueryJobNotFoundException) {
-      return new ResourceNotFoundException(e.getMessage());
-    }
-    if (e instanceof QueryJobForbiddenException) {
-      return new OpenSearchStatusException(e.getMessage(), RestStatus.FORBIDDEN);
-    }
-    return e;
   }
 }

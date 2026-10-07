@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,6 +26,7 @@ import static org.mockito.Mockito.when;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -34,8 +37,14 @@ import org.mockito.ArgumentCaptor;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.executor.progress.CompletionReason;
+import org.opensearch.sql.executor.progress.ProgressObserver;
+import org.opensearch.sql.executor.progress.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.progress.QueryProgress;
+import org.opensearch.sql.executor.progress.SourceProgressEvent;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 import org.opensearch.threadpool.ThreadPool;
@@ -150,7 +159,7 @@ class OpenSearchQueryJobServiceTest {
   void submit_synchronousRunnerFailureIsRemovedAndPreservesCause() {
     QueryRunner runner = mock(QueryRunner.class);
     IllegalArgumentException cause = new IllegalArgumentException("preparation failed");
-    when(runner.run()).thenThrow(cause);
+    when(runner.run(any())).thenThrow(cause);
 
     CompletableFuture<QueryResult> response =
         service.submit(runner, ALICE, WAIT, KEEP_ALIVE).toCompletableFuture();
@@ -266,6 +275,88 @@ class OpenSearchQueryJobServiceTest {
     verifyNoInteractions(threadPool);
   }
 
+  // ------------------------------------------------------- per-job tracker ownership (#5797)
+
+  /**
+   * The listener the runner would hand to its engine must resolve to the tracker the service
+   * samples behind {@code get()}. This is the wiring the boundary depends on and the one thing a
+   * refactor can break with no compile error: a job that handed out a different observer than it
+   * reads would report 0.0 forever while the engine happily published into nothing.
+   */
+  @Test
+  void submit_engineSideListenerResolvesToTheTrackerGetSamples() {
+    RecordingRunner runner = new RecordingRunner();
+    QueryResult.Running running = submitRunning(runner);
+
+    ProgressObserver observer = observerBehindListener(runner);
+    assertEquals(
+        0.0,
+        service.get(running.id(), ALICE).progress().fractionDone(),
+        "a sealed-but-idle source must publish nothing yet");
+
+    completeOneSource(observer, 0L);
+
+    assertEquals(
+        QueryProgress.PUBLIC_CEILING.fractionDone(),
+        service.get(running.id(), ALICE).progress().fractionDone(),
+        "events emitted through the engine-side listener must move this job's published fraction");
+  }
+
+  /**
+   * Two jobs published by the service, each registering source id {@code 0}. Source ids are
+   * per-query positions, so the same id appearing in both is the realistic case; it must not let
+   * one job's events advance the other.
+   */
+  @Test
+  void submit_sourceEventsDoNotLeakBetweenJobs() {
+    RecordingRunner runnerA = new RecordingRunner();
+    RecordingRunner runnerB = new RecordingRunner();
+    QueryResult.Running a = submitRunning(runnerA);
+    QueryResult.Running b = submitRunning(runnerB);
+    assertNotEquals(a.id(), b.id());
+
+    ProgressObserver observerA = observerBehindListener(runnerA);
+    ProgressObserver observerB = observerBehindListener(runnerB);
+    assertNotSame(observerA, observerB, "each job must own a distinct tracker");
+
+    // Both jobs genuinely have a source 0; only A's finishes.
+    observerB.register(0L, OptionalLong.of(100L));
+    observerB.seal();
+    completeOneSource(observerA, 0L);
+
+    assertEquals(
+        QueryProgress.PUBLIC_CEILING.fractionDone(),
+        service.get(a.id(), ALICE).progress().fractionDone());
+    assertEquals(
+        0.0,
+        service.get(b.id(), ALICE).progress().fractionDone(),
+        "job B shares the source id but not the accounting");
+  }
+
+  /**
+   * Resolves the observer an engine would reach, by going through the factory the job supplied
+   * rather than by reaching into the job.
+   */
+  private static ProgressObserver observerBehindListener(RecordingRunner runner) {
+    QueryRunner.ResultListeners listeners = runner.listeners();
+    assertNotNull(listeners, "the job must supply a listener factory");
+    ResponseListener<ExecutionEngine.QueryResponse> listener =
+        listeners.listenerFor(response -> {}, e -> {});
+    ProgressObserver observer = ProgressiveQueryResponseListener.observerOf(listener);
+    assertNotSame(
+        ProgressObserver.NOOP, observer, "the supplied listener must carry a real observer");
+    return observer;
+  }
+
+  /**
+   * Registers one estimated source, seals, and drains it — the shortest path to a non-zero poll.
+   */
+  private static void completeOneSource(ProgressObserver observer, long sourceId) {
+    observer.register(sourceId, OptionalLong.of(100L));
+    observer.seal();
+    observer.accept(new SourceProgressEvent.SourceCompleted(sourceId, CompletionReason.EXHAUSTED));
+  }
+
   private QueryResult.Running submitRunning(RecordingRunner runner) {
     return assertInstanceOf(
         QueryResult.Running.class,
@@ -320,11 +411,18 @@ class OpenSearchQueryJobServiceTest {
     private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
     private boolean ran;
     private boolean cancelled;
+    private ResultListeners listeners;
 
     @Override
-    public CompletionStage<QueryResult> run() {
+    public CompletionStage<QueryResult> run(ResultListeners listeners) {
       ran = true;
+      this.listeners = listeners;
       return future;
+    }
+
+    /** The factory the publishing job handed over; stands in for what the engine would receive. */
+    ResultListeners listeners() {
+      return listeners;
     }
 
     @Override

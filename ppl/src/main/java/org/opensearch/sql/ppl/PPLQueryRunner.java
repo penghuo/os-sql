@@ -11,13 +11,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
-import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
-import org.opensearch.sql.executor.progress.ProgressObserver;
-import org.opensearch.sql.executor.progress.ProgressiveQueryResponseListener;
-import org.opensearch.sql.executor.progress.ProgressiveSourceProgress;
-import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.QueryResult;
 import org.opensearch.sql.job.QueryRunner;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
@@ -33,11 +28,9 @@ import org.opensearch.sql.ppl.domain.PPLQueryRequest;
  * synchronous execution, so {@link #cancel()} marks the future as cancelled and lets a late
  * response drop on the floor.
  *
- * <p>The row listener handed to {@link PPLService} is a {@link ProgressiveQueryResponseListener},
- * which is how the storage layer discovers that this query is observed: the listener is the only
- * object that already travels from here into the execution engine. Progress itself is produced
- * entirely by the OpenSearch scan path; a plan with no instrumented scan — the V2 fallback, the
- * analytics-engine route — registers no sources and reports {@code 0.0} until the job succeeds.
+ * <p>This class observes nothing about the query's progress. It supplies result-conversion
+ * callbacks to the {@link ResultListeners} the job layer passes in, and hands the listeners it gets
+ * back to {@link PPLService} unchanged — whatever instrumentation they carry belongs to the job.
  */
 public final class PPLQueryRunner implements QueryRunner {
 
@@ -47,7 +40,6 @@ public final class PPLQueryRunner implements QueryRunner {
   private final Clock clock;
   private final AtomicBoolean started = new AtomicBoolean();
   private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
-  private final ProgressiveSourceProgress sourceProgress = new ProgressiveSourceProgress();
 
   /**
    * @param pplService live PPL service; not owned by the runner
@@ -70,40 +62,22 @@ public final class PPLQueryRunner implements QueryRunner {
   }
 
   @Override
-  public CompletionStage<QueryResult> run() {
+  public CompletionStage<QueryResult> run(ResultListeners listeners) {
     if (!started.compareAndSet(false, true)) {
       throw new IllegalStateException("PPLQueryRunner is single-use");
     }
+    Objects.requireNonNull(listeners, "listeners must not be null");
     long startMillis = clock.millis();
     pplService.execute(
         request,
-        new ProgressiveQueryResponseListener<QueryResponse>() {
-          @Override
-          public void onResponse(QueryResponse response) {
-            future.complete(QueryResult.of(response, clock.millis() - startMillis));
-          }
-
-          @Override
-          public void onFailure(Exception e) {
-            future.completeExceptionally(e);
-          }
-
-          @Override
-          public ProgressObserver progressObserver() {
-            return sourceProgress;
-          }
-        },
-        new ResponseListener<ExplainResponse>() {
-          @Override
-          public void onResponse(ExplainResponse response) {
-            future.complete(QueryResult.of(response, clock.millis() - startMillis));
-          }
-
-          @Override
-          public void onFailure(Exception e) {
-            future.completeExceptionally(e);
-          }
-        },
+        listeners.listenerFor(
+            (QueryResponse response) ->
+                future.complete(QueryResult.of(response, clock.millis() - startMillis)),
+            future::completeExceptionally),
+        listeners.listenerFor(
+            (ExplainResponse response) ->
+                future.complete(QueryResult.of(response, clock.millis() - startMillis)),
+            future::completeExceptionally),
         anonymizedQuerySink);
     return future;
   }
@@ -111,10 +85,5 @@ public final class PPLQueryRunner implements QueryRunner {
   @Override
   public void cancel() {
     future.cancel(false);
-  }
-
-  @Override
-  public QueryProgress progress() {
-    return sourceProgress.current();
   }
 }

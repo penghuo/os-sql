@@ -15,7 +15,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import org.opensearch.sql.common.response.ResponseListener;
+import org.opensearch.sql.executor.progress.ProgressObserver;
+import org.opensearch.sql.executor.progress.ProgressiveQueryResponseListener;
+import org.opensearch.sql.executor.progress.ProgressiveSourceProgress;
 import org.opensearch.sql.executor.progress.QueryProgress;
 
 /**
@@ -50,6 +55,24 @@ public final class QueryJob {
   private final Function<Throwable, Map<String, Object>> failureRenderer;
   private final long submittedAtMillis;
   private final CompletableFuture<QueryResult> completion = new CompletableFuture<>();
+
+  /**
+   * This job's progress sink, and the only one it will ever read or hand out. Distinct per job: no
+   * two jobs share accounting.
+   *
+   * <p>Its lock is a leaf. This job may acquire it while holding {@code this}; an observer's event
+   * handlers must never reach back into the job, so the order is always job monitor then observer
+   * monitor.
+   */
+  private final ProgressObserver progressObserver;
+
+  /**
+   * Per-job factory for the listeners the runner hands to its engine. Closes over {@link
+   * #progressObserver}, so the observer the engine reports to and the observer {@link
+   * #observedProgress()} samples are the same field by construction — there is no second reference
+   * for the two halves to diverge on.
+   */
+  private final QueryRunner.ResultListeners listeners;
 
   private QueryJobState state = QueryJobState.PENDING;
   private OptionalLong startedAtMillis = OptionalLong.empty();
@@ -102,12 +125,58 @@ public final class QueryJob {
       QueryRunner runner,
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(id, owner, runner, clock, failureRenderer, new ProgressiveSourceProgress());
+  }
+
+  /**
+   * Creates a job in {@link QueryJobState#PENDING} over a caller-supplied progress sink.
+   * Package-private: only {@link QueryJobService} implementations may construct a job.
+   *
+   * @param progressObserver this job's sink, distinct from every other job's. The service creates
+   *     one per job; tests supply a double to drive the lifecycle's sampling directly.
+   * @throws NullPointerException if any of {@code id}, {@code owner}, {@code runner}, {@code
+   *     clock}, or {@code progressObserver} is {@code null}
+   */
+  QueryJob(
+      QueryJobId id,
+      Principal owner,
+      QueryRunner runner,
+      Clock clock,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ProgressObserver progressObserver) {
     this.id = Objects.requireNonNull(id, "id must not be null");
     this.owner = Objects.requireNonNull(owner, "owner must not be null");
     this.runner = Objects.requireNonNull(runner, "runner must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.failureRenderer = failureRenderer;
+    this.progressObserver =
+        Objects.requireNonNull(progressObserver, "progressObserver must not be null");
     this.submittedAtMillis = clock.millis();
+    // Built here rather than lazily so the binding is established before the runner can be started,
+    // and so there is exactly one factory instance per job. Not a lambda: listenerFor is generic.
+    this.listeners =
+        new QueryRunner.ResultListeners() {
+          @Override
+          public <T> ResponseListener<T> listenerFor(
+              Consumer<T> onResponse, Consumer<Exception> onFailure) {
+            return new ProgressiveQueryResponseListener<T>() {
+              @Override
+              public void onResponse(T response) {
+                onResponse.accept(response);
+              }
+
+              @Override
+              public void onFailure(Exception e) {
+                onFailure.accept(e);
+              }
+
+              @Override
+              public ProgressObserver progressObserver() {
+                return QueryJob.this.progressObserver;
+              }
+            };
+          }
+        };
   }
 
   /** Returns the opaque, node-routable job identifier. */
@@ -145,7 +214,7 @@ public final class QueryJob {
     return switch (state) {
       case SUCCEEDED -> QueryProgress.COMPLETE;
       case PENDING -> QueryProgress.ZERO;
-      case RUNNING -> raisePublished(runnerProgress());
+      case RUNNING -> raisePublished(observedProgress());
       case FAILED, CANCELLED -> publishedProgress;
     };
   }
@@ -162,18 +231,19 @@ public final class QueryJob {
   }
 
   /**
-   * Reads the runner's observer defensively. Caller must hold {@code this}, so that sampling cannot
-   * interleave with a state transition.
+   * Reads this job's own observer defensively. Caller must hold {@code this}, so that sampling
+   * cannot interleave with a state transition.
    *
-   * <p>{@link QueryRunner#progress()} is engine-supplied, so a runner that returns {@code null} or
-   * throws degrades to "nothing observed" rather than failing the poll a client is using to
-   * discover the job's state. It is contractually cheap and non-blocking, which is what makes it
-   * safe to call from inside this monitor; the observer's own lock is a leaf — producers never
-   * reach back into the job.
+   * <p>An observer that returns {@code null} or throws degrades to "nothing observed" rather than
+   * failing the poll a client is using to discover the job's state. {@link
+   * ProgressObserver#current()} is contractually cheap and non-blocking, which is what makes it
+   * safe to call from inside this monitor.
+   *
+   * <p>This is the only path that holds both locks, and it takes them job-first.
    */
-  private QueryProgress runnerProgress() {
+  private QueryProgress observedProgress() {
     try {
-      QueryProgress snapshot = runner.progress();
+      QueryProgress snapshot = progressObserver.current();
       if (snapshot == null) {
         return QueryProgress.ZERO;
       }
@@ -275,7 +345,7 @@ public final class QueryJob {
       // Sample and freeze inside the monitor, before the state flips. Sampling outside would let a
       // concurrent poll publish a higher running value in the gap, which this transition would then
       // overwrite with the older one.
-      raisePublished(runnerProgress());
+      raisePublished(observedProgress());
       state = QueryJobState.CANCELLED;
       completedAtMillis = OptionalLong.of(clock.millis());
       shouldCancelRunner = true;
@@ -288,15 +358,16 @@ public final class QueryJob {
 
   /**
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
-   * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
+   * {@link QueryRunner#run(QueryRunner.ResultListeners)}, and wires the returned stage into this
+   * job's state machine.
    *
    * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
    * to the {@link QueryJobStore}. Any of the following short-circuit the call:
    *
    * <ul>
    *   <li>the job has already been cancelled while pending — the runner is not started;
-   *   <li>{@code runner.run()} throws — the job moves to {@link QueryJobState#FAILED};
-   *   <li>{@code runner.run()} returns {@code null} — treated as a runner failure.
+   *   <li>{@code runner.run(listeners)} throws — the job moves to {@link QueryJobState#FAILED};
+   *   <li>{@code runner.run(listeners)} returns {@code null} — treated as a runner failure.
    * </ul>
    */
   void startRunner() {
@@ -309,7 +380,7 @@ public final class QueryJob {
     }
     CompletionStage<QueryResult> stage;
     try {
-      stage = Objects.requireNonNull(runner.run(), "runner must not return null");
+      stage = Objects.requireNonNull(runner.run(listeners), "runner must not return null");
     } catch (RuntimeException e) {
       onRunnerFailure(e);
       return;
@@ -348,7 +419,7 @@ public final class QueryJob {
   /**
    * Terminal transition to {@link QueryJobState#FAILED}. Accepts the transition from either {@code
    * RUNNING} (normal failure path) or {@code PENDING} (synchronous throw from {@link
-   * QueryRunner#run()}). Ignored once the job is already terminal.
+   * QueryRunner#run(QueryRunner.ResultListeners)}). Ignored once the job is already terminal.
    *
    * @param throwable exception raised by the runner; may be a raw cause or a {@link
    *     CompletionException} wrapper (already unwrapped in {@link #startRunner()})
@@ -361,7 +432,7 @@ public final class QueryJob {
       // Same ordering as cancel(): freeze under the monitor so the frozen value cannot be lower
       // than a
       // concurrently published running one.
-      raisePublished(runnerProgress());
+      raisePublished(observedProgress());
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable, failureRenderer));

@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
@@ -28,7 +29,9 @@ import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.executor.progress.ProgressObserver;
 import org.opensearch.sql.executor.progress.QueryProgress;
+import org.opensearch.sql.executor.progress.SourceProgressEvent;
 
 /**
  * Lifecycle half of the progress contract: which fraction each job state publishes, and that
@@ -47,7 +50,7 @@ class QueryJobProgressTest {
   private static final double CEILING = QueryProgress.PUBLIC_CEILING.fractionDone();
 
   @Test
-  @DisplayName("PENDING reports zero regardless of what the runner would say")
+  @DisplayName("PENDING reports zero regardless of what the observer would say")
   void pendingReportsZero() {
     ProgressRunner runner = new ProgressRunner();
     runner.set(0.5);
@@ -106,7 +109,7 @@ class QueryJobProgressTest {
   }
 
   @Test
-  @DisplayName("a runner claiming completion while running is clamped, never published as 1.0")
+  @DisplayName("an observer claiming completion while running is clamped, never published as 1.0")
   void runningNeverPublishesOne() {
     ProgressRunner runner = new ProgressRunner();
     QueryJob job = newJob(runner);
@@ -116,8 +119,8 @@ class QueryJobProgressTest {
   }
 
   @Test
-  @DisplayName("a throwing or null runner degrades to zero instead of failing the poll")
-  void misbehavingRunnerDegradesToZero() {
+  @DisplayName("a throwing or null observer degrades to zero instead of failing the poll")
+  void misbehavingObserverDegradesToZero() {
     ProgressRunner thrower = new ProgressRunner();
     thrower.setThrowing(true);
     QueryJob throwingJob = newJob(thrower);
@@ -345,9 +348,15 @@ class QueryJobProgressTest {
 
   // ------------------------------------------------------------------ helpers
 
-  private static QueryJob newJob(QueryRunner runner) {
+  /** Builds a job over the runner's own observer, so the job samples what the test sets. */
+  private static QueryJob newJob(ProgressRunner runner) {
     return new QueryJob(
-        ID, OWNER, runner, Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC));
+        ID,
+        OWNER,
+        runner,
+        Clock.fixed(Instant.ofEpochMilli(1_000), ZoneOffset.UTC),
+        null,
+        runner.observer());
   }
 
   private static QueryResult.Running assertRunning(QueryResult result) {
@@ -364,14 +373,15 @@ class QueryJobProgressTest {
     }
   }
 
-  /** Runner whose reported fraction is driven by the test. */
+  /**
+   * Drives one job's lifecycle. Completion and cancellation come from here; the fraction does not —
+   * the job samples the {@link FakeObserver} it was constructed with. The observer is held here
+   * only so each test needs a single handle.
+   */
   private static final class ProgressRunner implements QueryRunner {
 
     private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
-    private final AtomicReference<QueryProgress> progress =
-        new AtomicReference<>(QueryProgress.ZERO);
-    private final AtomicBoolean throwing = new AtomicBoolean();
-    private final AtomicBoolean returningNull = new AtomicBoolean();
+    private final FakeObserver observer = new FakeObserver();
 
     /** Gates {@link #cancel()} so a test can hold the job inside its cancellation path. */
     private volatile CountDownLatch cancelGate;
@@ -379,8 +389,12 @@ class QueryJobProgressTest {
     private final CountDownLatch insideCancel = new CountDownLatch(1);
 
     @Override
-    public CompletionStage<QueryResult> run() {
+    public CompletionStage<QueryResult> run(ResultListeners listeners) {
       return future;
+    }
+
+    ProgressObserver observer() {
+      return observer;
     }
 
     @Override
@@ -408,8 +422,49 @@ class QueryJobProgressTest {
       }
     }
 
+    void set(double fraction) {
+      observer.set(fraction);
+    }
+
+    void setThrowing(boolean value) {
+      observer.setThrowing(value);
+    }
+
+    void setReturningNull(boolean value) {
+      observer.setReturningNull(value);
+    }
+
+    void complete(QueryResult result) {
+      future.complete(result);
+    }
+
+    void fail(Throwable throwable) {
+      future.completeExceptionally(throwable);
+    }
+  }
+
+  /**
+   * Observer whose reported fraction a test sets directly, including the two ways a real
+   * engine-side implementation could misbehave: returning {@code null} and throwing.
+   */
+  private static final class FakeObserver implements ProgressObserver {
+
+    private final AtomicReference<QueryProgress> progress =
+        new AtomicReference<>(QueryProgress.ZERO);
+    private final AtomicBoolean throwing = new AtomicBoolean();
+    private final AtomicBoolean returningNull = new AtomicBoolean();
+
     @Override
-    public QueryProgress progress() {
+    public void register(long sourceId, OptionalLong estimatedDocs) {}
+
+    @Override
+    public void seal() {}
+
+    @Override
+    public void accept(SourceProgressEvent event) {}
+
+    @Override
+    public QueryProgress current() {
       if (throwing.get()) {
         throw new IllegalStateException("observer blew up");
       }
@@ -426,14 +481,6 @@ class QueryJobProgressTest {
 
     void setReturningNull(boolean value) {
       returningNull.set(value);
-    }
-
-    void complete(QueryResult result) {
-      future.complete(result);
-    }
-
-    void fail(Throwable throwable) {
-      future.completeExceptionally(throwable);
     }
   }
 }

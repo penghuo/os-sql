@@ -41,6 +41,7 @@ import org.opensearch.sql.datasources.service.DataSourceServiceImpl;
 import org.opensearch.sql.executor.AnalyzeResponse;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.QueryType;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.OpenSearchQueryJobService;
 import org.opensearch.sql.job.OpenSearchSecurityAdapter;
 import org.opensearch.sql.job.QueryJob;
@@ -67,6 +68,7 @@ import org.opensearch.sql.protocol.response.format.CsvResponseFormatter;
 import org.opensearch.sql.protocol.response.format.ExplainResponseJsonFormatter;
 import org.opensearch.sql.protocol.response.format.Format;
 import org.opensearch.sql.protocol.response.format.JsonResponseFormatter;
+import org.opensearch.sql.protocol.response.format.ProgressEnvelope;
 import org.opensearch.sql.protocol.response.format.RawResponseFormatter;
 import org.opensearch.sql.protocol.response.format.ResponseFormatter;
 import org.opensearch.sql.protocol.response.format.SimpleJsonResponseFormatter;
@@ -310,6 +312,10 @@ public class TransportPPLQueryAction
     ThreadContext threadContext = clientRef.threadPool().getThreadContext();
     ActionListener<TransportPPLQueryResponse> ctxListener =
         ContextPreservingActionListener.wrapPreservingContext(listener, threadContext);
+    // A submission that finishes inside the wait budget returns the ordinary final body, byte for
+    // byte identical to the synchronous one. There is no progress field: the response is the
+    // result,
+    // so a fraction would only restate that the query is over.
     ResponseListener<ExecutionEngine.QueryResponse> responseListener =
         createListener(transformedRequest, ctxListener);
     CompletionStage<org.opensearch.sql.job.QueryResult> submission;
@@ -363,7 +369,21 @@ public class TransportPPLQueryAction
         .put("schema", new JSONArray())
         .put("datarows", new JSONArray())
         .put("total", 0)
+        .put("progress", progressObject(running.progress()))
         .toString();
+  }
+
+  /**
+   * Renders {@code progress.fraction_done}.
+   *
+   * <p>Nested under an object rather than emitted as a flat field so later signals — rows scanned,
+   * bytes read, a per-source breakdown — can be added without another top-level name.
+   *
+   * <p>Emitted only on a RUNNING body. A submission that finished inside its wait budget returns
+   * the final result instead, and a fraction there would only restate that the query is over.
+   */
+  private static JSONObject progressObject(QueryProgress progress) {
+    return new JSONObject().put(ProgressEnvelope.FRACTION_DONE, progress.fractionDone());
   }
 
   private ResponseListener<AnalyzeResponse> createAnalyzeResponseListener(

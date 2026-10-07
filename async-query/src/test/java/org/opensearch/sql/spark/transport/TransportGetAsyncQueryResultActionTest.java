@@ -39,6 +39,7 @@ import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.spark.asyncquery.AsyncQueryExecutorServiceImpl;
 import org.opensearch.sql.spark.asyncquery.exceptions.AsyncQueryNotFoundException;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.spark.asyncquery.model.AsyncQueryExecutionResponse;
 import org.opensearch.sql.spark.asyncquery.model.NullAsyncQueryRequestContext;
 import org.opensearch.sql.spark.transport.model.GetAsyncQueryResultActionRequest;
@@ -77,7 +78,7 @@ public class TransportGetAsyncQueryResultActionTest {
   public void testDoExecute() {
     GetAsyncQueryResultActionRequest request = new GetAsyncQueryResultActionRequest("jobId");
     AsyncQueryExecutionResponse asyncQueryExecutionResponse =
-        new AsyncQueryExecutionResponse("IN_PROGRESS", null, null, null, null, null);
+        new AsyncQueryExecutionResponse("IN_PROGRESS", null, null, null, null, null, null);
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
         .thenReturn(asyncQueryExecutionResponse);
 
@@ -108,7 +109,7 @@ public class TransportGetAsyncQueryResultActionTest {
                 tupleValue(ImmutableMap.of("name", "Smith", "age", 30))),
             null,
             null,
-            null);
+            null, null);
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
         .thenReturn(asyncQueryExecutionResponse);
 
@@ -222,7 +223,7 @@ public class TransportGetAsyncQueryResultActionTest {
                 ImmutableList.of(tupleValue(ImmutableMap.of("count", 3))),
                 null,
                 null,
-                null));
+                null, null));
 
     action.doExecute(task, new GetAsyncQueryResultActionRequest(id.encode()), actionListener);
 
@@ -244,7 +245,7 @@ public class TransportGetAsyncQueryResultActionTest {
     details.put("code", "FIELD_NOT_FOUND");
     AsyncQueryExecutionResponse response =
         new AsyncQueryExecutionResponse(
-            "FAILED", null, null, "Field [x] not found.", null, null, details);
+            "FAILED", null, null, "Field [x] not found.", null, null, details, new QueryProgress(0.6));
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any())).thenReturn(response);
 
     action.doExecute(task, new GetAsyncQueryResultActionRequest("jobId"), actionListener);
@@ -257,6 +258,7 @@ public class TransportGetAsyncQueryResultActionTest {
     Assertions.assertEquals("FIELD_NOT_FOUND", error.getString("code"));
     Assertions.assertEquals("IllegalArgumentException", error.getString("type"));
     Assertions.assertEquals("Field [x] not found.", error.getString("reason"));
+    Assertions.assertEquals(0.6, body.getJSONObject("progress").getDouble("fraction_done"));
   }
 
   @Test
@@ -275,7 +277,7 @@ public class TransportGetAsyncQueryResultActionTest {
   }
 
   @Test
-  public void explainResponseIsRenderedWithExplainFormatter() {
+  public void explainResponseIsRenderedWithExplainFormatterWithoutProgress() {
     ExecutionEngine.ExplainResponseNodeV2 plan =
         new ExecutionEngine.ExplainResponseNodeV2("logical", "physical", null);
     plan.setLogicalTree(ImmutableMap.of("operator", "LogicalProject"));
@@ -283,18 +285,57 @@ public class TransportGetAsyncQueryResultActionTest {
     when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
         .thenReturn(
             new AsyncQueryExecutionResponse(
-                "SUCCEEDED", null, null, null, null, new ExecutionEngine.ExplainResponse(plan)));
+                "SUCCEEDED",
+                null,
+                null,
+                null,
+                null,
+                new ExecutionEngine.ExplainResponse(plan),
+                null));
 
     action.doExecute(task, new GetAsyncQueryResultActionRequest("jobId"), actionListener);
 
     verify(actionListener).onResponse(createJobActionResponseArgumentCaptor.capture());
-    org.json.JSONObject calcite =
-        new org.json.JSONObject(createJobActionResponseArgumentCaptor.getValue().getResult())
-            .getJSONObject("calcite");
+    org.json.JSONObject body =
+        new org.json.JSONObject(createJobActionResponseArgumentCaptor.getValue().getResult());
+    org.json.JSONObject calcite = body.getJSONObject("calcite");
     Assertions.assertEquals(
         "LogicalProject", calcite.getJSONObject("logical").getString("operator"));
     Assertions.assertEquals(
         "EnumerableCalc", calcite.getJSONObject("physical").getString("operator"));
+    // No progress reported (the Spark path) leaves the explain body exactly as the formatter rendered it.
+    Assertions.assertFalse(body.has("progress"));
+  }
+
+  @Test
+  public void explainResponseCarriesProgressAlongsideThePlan() {
+    ExecutionEngine.ExplainResponseNodeV2 plan =
+        new ExecutionEngine.ExplainResponseNodeV2("logical", "physical", null);
+    plan.setLogicalTree(ImmutableMap.of("operator", "LogicalProject"));
+    plan.setPhysicalTree(ImmutableMap.of("operator", "EnumerableCalc"));
+    when(jobExecutorService.getAsyncQueryResults(eq("jobId"), any()))
+        .thenReturn(
+            new AsyncQueryExecutionResponse(
+                "SUCCEEDED",
+                null,
+                null,
+                null,
+                null,
+                new ExecutionEngine.ExplainResponse(plan),
+                null,
+                QueryProgress.COMPLETE));
+
+    action.doExecute(task, new GetAsyncQueryResultActionRequest("jobId"), actionListener);
+
+    verify(actionListener).onResponse(createJobActionResponseArgumentCaptor.capture());
+    org.json.JSONObject response =
+        new org.json.JSONObject(createJobActionResponseArgumentCaptor.getValue().getResult());
+    // An explain job must report completion like every other async job; the plan fields stay put.
+    Assertions.assertEquals(
+        1.0, response.getJSONObject("progress").getDouble("fraction_done"), 1e-9);
+    Assertions.assertEquals(
+        "LogicalProject",
+        response.getJSONObject("calcite").getJSONObject("logical").getString("operator"));
   }
 
   @Test

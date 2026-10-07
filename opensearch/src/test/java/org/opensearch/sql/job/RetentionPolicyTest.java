@@ -133,7 +133,7 @@ class RetentionPolicyTest {
     private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
 
     @Override
-    public CompletionStage<QueryResult> run() {
+    public CompletionStage<QueryResult> run(ResultListeners listeners) {
       return future;
     }
 

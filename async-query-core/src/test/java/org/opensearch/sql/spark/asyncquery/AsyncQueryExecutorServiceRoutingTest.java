@@ -27,6 +27,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponseNodeV2;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
+import org.opensearch.sql.executor.progress.QueryProgress;
 import org.opensearch.sql.job.Principal;
 import org.opensearch.sql.job.QueryFailure;
 import org.opensearch.sql.job.QueryJobId;
@@ -121,16 +122,32 @@ class AsyncQueryExecutorServiceRoutingTest {
   void failedJobCarriesStructuredErrorDetails() {
     Map<String, Object> details =
         Map.of("code", "FIELD_NOT_FOUND", "reason", "Field [x] not found.");
-    stubSnapshot(
-        QueryJobState.FAILED,
-        Optional.empty(),
-        Optional.of(new QueryFailure("IllegalArgumentException", "Field [x] not found.", details)));
+    when(securityAdapter.current()).thenReturn(ALICE);
+    QueryJobStatus failed =
+        snapshot(
+            QueryJobState.FAILED,
+            Optional.empty(),
+            Optional.of(
+                new QueryFailure("IllegalArgumentException", "Field [x] not found.", details)));
+    QueryProgress frozen = new QueryProgress(0.6);
+    when(jobService.get(JOB_ID, ALICE))
+        .thenReturn(
+            new QueryJobStatus(
+                failed.id(),
+                failed.state(),
+                failed.submittedAtMillis(),
+                failed.startedAtMillis(),
+                failed.completedAtMillis(),
+                failed.failure(),
+                failed.result(),
+                frozen));
 
     AsyncQueryExecutionResponse response = fetch();
 
     assertEquals("FAILED", response.getStatus());
     assertEquals("Field [x] not found.", response.getError());
     assertEquals(details, response.getErrorDetails());
+    assertEquals(frozen, response.getProgress());
     verifyNoSparkCalls();
   }
 
@@ -181,7 +198,9 @@ class AsyncQueryExecutorServiceRoutingTest {
   @Test
   void runningMarkerIsNotRenderedAsFinalRows() {
     stubSnapshot(
-        QueryJobState.SUCCEEDED, Optional.of(new QueryResult.Running(JOB_ID)), Optional.empty());
+        QueryJobState.SUCCEEDED,
+        Optional.of(new QueryResult.Running(JOB_ID, QueryProgress.ZERO)),
+        Optional.empty());
 
     AsyncQueryExecutionResponse response = fetch();
 
@@ -285,7 +304,8 @@ class AsyncQueryExecutorServiceRoutingTest {
         state == QueryJobState.PENDING ? OptionalLong.empty() : OptionalLong.of(1),
         state.isTerminal() ? OptionalLong.of(2) : OptionalLong.empty(),
         failure,
-        result);
+        result,
+        state == QueryJobState.SUCCEEDED ? QueryProgress.COMPLETE : QueryProgress.ZERO);
   }
 
   private void assertEmptyResults(AsyncQueryExecutionResponse response) {

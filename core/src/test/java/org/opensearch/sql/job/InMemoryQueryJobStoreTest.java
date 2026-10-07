@@ -85,7 +85,7 @@ class InMemoryQueryJobStoreTest {
 
   private static final class NoopRunner implements QueryRunner {
     @Override
-    public CompletionStage<QueryResult> run() {
+    public CompletionStage<QueryResult> run(ResultListeners listeners) {
       return new CompletableFuture<>();
     }
 

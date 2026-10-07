@@ -12,6 +12,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Function;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.sql.executor.progress.ProgressiveSourceProgress;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 
@@ -128,7 +129,11 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private QueryJob publish(QueryRunner runner, Principal owner) {
     while (true) {
       QueryJobId id = QueryJobId.create(clusterService.localNode().getId());
-      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer);
+      // One progress sink per job, created here so no two jobs can share accounting and so the
+      // runner never has to own one. The job binds it to both the listeners it hands the runner and
+      // the sampling behind status().
+      QueryJob job =
+          new QueryJob(id, owner, runner, clock, failureRenderer, new ProgressiveSourceProgress());
       if (store.register(job) == null) {
         return job;
       }

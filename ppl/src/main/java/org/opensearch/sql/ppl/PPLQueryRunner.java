@@ -11,7 +11,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
-import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.job.QueryResult;
@@ -28,6 +27,10 @@ import org.opensearch.sql.ppl.domain.PPLQueryRequest;
  * <p>Cancellation is best-effort: {@link PPLService} does not surface an interrupt hook for
  * synchronous execution, so {@link #cancel()} marks the future as cancelled and lets a late
  * response drop on the floor.
+ *
+ * <p>This class observes nothing about the query's progress. It supplies result-conversion
+ * callbacks to the {@link ResultListeners} the job layer passes in, and hands the listeners it gets
+ * back to {@link PPLService} unchanged — whatever instrumentation they carry belongs to the job.
  */
 public final class PPLQueryRunner implements QueryRunner {
 
@@ -59,35 +62,22 @@ public final class PPLQueryRunner implements QueryRunner {
   }
 
   @Override
-  public CompletionStage<QueryResult> run() {
+  public CompletionStage<QueryResult> run(ResultListeners listeners) {
     if (!started.compareAndSet(false, true)) {
       throw new IllegalStateException("PPLQueryRunner is single-use");
     }
+    Objects.requireNonNull(listeners, "listeners must not be null");
     long startMillis = clock.millis();
     pplService.execute(
         request,
-        new ResponseListener<QueryResponse>() {
-          @Override
-          public void onResponse(QueryResponse response) {
-            future.complete(QueryResult.of(response, clock.millis() - startMillis));
-          }
-
-          @Override
-          public void onFailure(Exception e) {
-            future.completeExceptionally(e);
-          }
-        },
-        new ResponseListener<ExplainResponse>() {
-          @Override
-          public void onResponse(ExplainResponse response) {
-            future.complete(QueryResult.of(response, clock.millis() - startMillis));
-          }
-
-          @Override
-          public void onFailure(Exception e) {
-            future.completeExceptionally(e);
-          }
-        },
+        listeners.listenerFor(
+            (QueryResponse response) ->
+                future.complete(QueryResult.of(response, clock.millis() - startMillis)),
+            future::completeExceptionally),
+        listeners.listenerFor(
+            (ExplainResponse response) ->
+                future.complete(QueryResult.of(response, clock.millis() - startMillis)),
+            future::completeExceptionally),
         anonymizedQuerySink);
     return future;
   }

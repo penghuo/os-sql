@@ -267,7 +267,7 @@ class QueryJobTest {
     private boolean cancelled;
 
     @Override
-    public CompletionStage<QueryResult> run() {
+    public CompletionStage<QueryResult> run(ResultListeners listeners) {
       runInvocations++;
       return future;
     }

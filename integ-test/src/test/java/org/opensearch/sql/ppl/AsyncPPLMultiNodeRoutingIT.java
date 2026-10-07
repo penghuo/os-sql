@@ -163,6 +163,11 @@ public class AsyncPPLMultiNodeRoutingIT extends PPLIntegTestCase {
     // Poll via nodeB (non-owner); request forwards to nodeA, which renders the full error body.
     JSONObject terminal = pollUntilTerminal(nodeB, queryId, 30_000);
     Assert.assertEquals("FAILED", terminal.getString("status"));
+    Assert.assertEquals(
+        "a planning failure must retain zero progress through forwarding",
+        0.0,
+        terminal.getJSONObject("progress").getDouble("fraction_done"),
+        1e-9);
     Object errorField = terminal.get("error");
     Assert.assertTrue(
         "cross-node GET error must be a structured object", errorField instanceof JSONObject);

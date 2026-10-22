@@ -24,9 +24,11 @@ import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
+import org.opensearch.sql.job.AccountingQueryJobStore;
 import org.opensearch.sql.job.InMemoryQueryJobStore;
 import org.opensearch.sql.job.OpenSearchQueryJobService;
 import org.opensearch.sql.job.OpenSearchSecurityAdapter;
+import org.opensearch.sql.job.QueryJobQuota;
 import org.opensearch.sql.job.QueryJobService;
 import org.opensearch.sql.job.QueryJobStore;
 import org.opensearch.sql.job.RetentionPolicy;
@@ -135,8 +137,14 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   @Singleton
-  public QueryJobStore queryJobStore() {
-    return new InMemoryQueryJobStore();
+  public QueryJobQuota queryJobQuota(Settings settings) {
+    return new QueryJobQuota(settings);
+  }
+
+  @Provides
+  @Singleton
+  public QueryJobStore queryJobStore(QueryJobQuota quota) {
+    return new AccountingQueryJobStore(new InMemoryQueryJobStore(), quota);
   }
 
   @Provides
@@ -154,7 +162,10 @@ public class OpenSearchPluginModule extends AbstractModule {
   @Provides
   @Singleton
   public QueryJobService queryJobService(
-      QueryJobStore store, ClusterService clusterService, RetentionPolicy retentionPolicy) {
+      QueryJobStore store,
+      ClusterService clusterService,
+      RetentionPolicy retentionPolicy,
+      QueryJobQuota quota) {
     return new OpenSearchQueryJobService(
         store,
         clusterService,
@@ -162,7 +173,8 @@ public class OpenSearchPluginModule extends AbstractModule {
         retentionPolicy,
         // Reuse the sync REST renderer so an async GET on a FAILED job returns the same
         // structured error body a synchronous POST would have returned for the same exception.
-        org.opensearch.sql.plugin.rest.SyncErrorReportRenderer::renderErrorMap);
+        org.opensearch.sql.plugin.rest.SyncErrorReportRenderer::renderErrorMap,
+        quota);
   }
 
   /** {@link QueryPlanFactory}. */

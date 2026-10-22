@@ -8,12 +8,15 @@ package org.opensearch.sql.plugin.rest;
 import static org.opensearch.core.rest.RestStatus.OK;
 
 import com.google.common.collect.ImmutableList;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.BaseRestHandler;
@@ -21,6 +24,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestCancellableNodeClient;
+import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.opensearch.response.error.ErrorMessageFactory;
@@ -36,9 +40,17 @@ public class RestPPLQueryAction extends BaseRestHandler {
 
   private static final Logger LOG = LogManager.getLogger();
 
-  /** Constructor of RestPPLQueryAction. */
-  public RestPPLQueryAction() {
+  /** Plugin settings the async request limits are read from. */
+  private final Settings settings;
+
+  /**
+   * Constructor of RestPPLQueryAction.
+   *
+   * @param settings plugin settings the async request limits are read from on every request
+   */
+  public RestPPLQueryAction(Settings settings) {
     super();
+    this.settings = Objects.requireNonNull(settings, "settings must not be null");
   }
 
   private static RestStatus loggedErrorCode(Exception ex) {
@@ -81,7 +93,11 @@ public class RestPPLQueryAction extends BaseRestHandler {
   @Override
   protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient nodeClient) {
     TransportPPLQueryRequest transportPPLQueryRequest =
-        new TransportPPLQueryRequest(PPLQueryRequestFactory.getPPLRequest(request));
+        new TransportPPLQueryRequest(
+            PPLQueryRequestFactory.getPPLRequest(
+                request,
+                settingDuration(Settings.Key.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT),
+                settingDuration(Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE)));
 
     // RestCancellableNodeClient cancels the PPLQueryTask on client disconnect, which cascades to
     // the analytics query + fragments.
@@ -109,6 +125,11 @@ public class RestPPLQueryAction extends BaseRestHandler {
             }
           });
     };
+  }
+
+  private Duration settingDuration(Settings.Key key) {
+    TimeValue value = settings.getSettingValue(key);
+    return Duration.ofMillis(value.millis());
   }
 
   private void sendResponse(

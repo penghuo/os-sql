@@ -33,6 +33,17 @@ import java.util.function.Function;
  *   PENDING --cancel()------&gt; CANCELLED
  * </pre>
  *
+ * <h2>Result retention</h2>
+ *
+ * A job whose id was returned to the client is {@linkplain #retain() retained} for polling. A
+ * retained {@code SUCCEEDED} result is charged against the job's {@link ResultBudget}; when the
+ * budget refuses the charge the job ends {@code FAILED} with the refusal as its cause and the rows
+ * are dropped. The store {@linkplain #detach() detaches} the job when it removes it, which returns
+ * the charge. Results that are returned inline are never retained and never charged.
+ *
+ * <p>The job releases its runner on every terminal transition, so a retained job does not keep the
+ * engine's request, task, or its own copy of the result reachable.
+ *
  * <h2>Thread safety</h2>
  *
  * All mutable state is guarded by {@code this}. Side effects that may block or reenter — invoking
@@ -44,17 +55,23 @@ public final class QueryJob {
 
   private final QueryJobId id;
   private final Principal owner;
-  private final QueryRunner runner;
+  private QueryRunner runner;
   private final Clock clock;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
+  private final ResultBudget resultBudget;
   private final long submittedAtMillis;
-  private final CompletableFuture<QueryResult> completion = new CompletableFuture<>();
+  // Signals the terminal transition without holding the result: a retained job's rows must be
+  // reachable only through result, so dropping them there frees them.
+  private final CompletableFuture<Void> completion = new CompletableFuture<>();
 
   private QueryJobState state = QueryJobState.PENDING;
   private OptionalLong startedAtMillis = OptionalLong.empty();
   private OptionalLong completedAtMillis = OptionalLong.empty();
   private Optional<QueryFailure> failure = Optional.empty();
   private Optional<QueryResult> result = Optional.empty();
+  private boolean retained;
+  private boolean detached;
+  private long chargedBytes;
 
   /**
    * Creates a job in {@link QueryJobState#PENDING}. Package-private: only {@link QueryJobService}
@@ -88,11 +105,30 @@ public final class QueryJob {
       QueryRunner runner,
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(id, owner, runner, clock, failureRenderer, ResultBudget.UNLIMITED);
+  }
+
+  /**
+   * Creates a job in {@link QueryJobState#PENDING} whose retained result is charged against {@code
+   * resultBudget}. Package-private: only {@link QueryJobService} implementations may construct a
+   * job.
+   *
+   * @param resultBudget budget a retained {@code SUCCEEDED} result is charged against
+   * @throws NullPointerException if {@code resultBudget} is {@code null}
+   */
+  QueryJob(
+      QueryJobId id,
+      Principal owner,
+      QueryRunner runner,
+      Clock clock,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ResultBudget resultBudget) {
     this.id = Objects.requireNonNull(id, "id must not be null");
     this.owner = Objects.requireNonNull(owner, "owner must not be null");
     this.runner = Objects.requireNonNull(runner, "runner must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.failureRenderer = failureRenderer;
+    this.resultBudget = Objects.requireNonNull(resultBudget, "resultBudget must not be null");
     this.submittedAtMillis = clock.millis();
   }
 
@@ -126,9 +162,15 @@ public final class QueryJob {
   public CompletionStage<QueryResult> await(Duration budget) {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
-        (value, throwable) -> {
+        (ignored, throwable) -> {
           if (throwable == null) {
-            out.complete(value);
+            QueryResult value = currentResult();
+            if (value != null) {
+              out.complete(value);
+            } else {
+              out.completeExceptionally(
+                  new IllegalStateException("query result is no longer available"));
+            }
             return;
           }
           Throwable cause = unwrap(throwable);
@@ -159,19 +201,55 @@ public final class QueryJob {
    * completes the internal future exceptionally.
    */
   public void cancel() {
-    boolean shouldCancelRunner;
+    QueryRunner toCancel;
     synchronized (this) {
       if (state.isTerminal()) {
         return;
       }
       state = QueryJobState.CANCELLED;
       completedAtMillis = OptionalLong.of(clock.millis());
-      shouldCancelRunner = true;
+      toCancel = runner;
+      runner = null;
     }
-    if (shouldCancelRunner) {
-      safeCancelRunner();
-    }
+    safeCancelRunner(toCancel);
     completion.cancel(false);
+  }
+
+  /**
+   * Marks the job as retained for polling. Package-private: the service calls this once the submit
+   * wait has expired and before the job id is returned, so no client has observed the job yet.
+   *
+   * <p>A result that already arrived is charged now. If the budget refuses it, the job moves from
+   * {@code SUCCEEDED} to {@code FAILED}; this is the only transition out of a terminal state, and
+   * it is unobservable because the id has not been returned. A result that arrives later is charged
+   * when it arrives. Idempotent, and a no-op once the job is {@linkplain #detach() detached}.
+   */
+  void retain() {
+    synchronized (this) {
+      if (retained || detached) {
+        return;
+      }
+      retained = true;
+      if (state == QueryJobState.SUCCEEDED) {
+        chargeOrFail(result.orElseThrow());
+      }
+    }
+  }
+
+  /**
+   * Detaches the job from the store and returns its result charge to the budget. Package-private:
+   * the store calls this exactly once, after removing the job. Later results are never charged.
+   */
+  void detach() {
+    long released;
+    synchronized (this) {
+      detached = true;
+      released = chargedBytes;
+      chargedBytes = 0;
+    }
+    if (released > 0) {
+      resultBudget.release(released);
+    }
   }
 
   /**
@@ -188,16 +266,18 @@ public final class QueryJob {
    * </ul>
    */
   void startRunner() {
+    QueryRunner toRun;
     synchronized (this) {
       if (state != QueryJobState.PENDING) {
         return;
       }
       state = QueryJobState.RUNNING;
       startedAtMillis = OptionalLong.of(clock.millis());
+      toRun = runner;
     }
     CompletionStage<QueryResult> stage;
     try {
-      stage = Objects.requireNonNull(runner.run(), "runner must not return null");
+      stage = Objects.requireNonNull(toRun.run(), "runner must not return null");
     } catch (RuntimeException e) {
       onRunnerFailure(e);
       return;
@@ -217,11 +297,13 @@ public final class QueryJob {
   /**
    * Terminal transition from {@link QueryJobState#RUNNING} to {@link QueryJobState#SUCCEEDED}.
    * Ignored if the job has already left {@code RUNNING} (e.g. a concurrent {@link #cancel()} beat
-   * the runner). Records the result inside the monitor; completes the future outside it.
+   * the runner). Records the result inside the monitor; completes the future outside it. A retained
+   * job charges the result first and ends {@code FAILED} if the budget refuses it.
    *
    * @param value final result produced by the runner; never {@code null}
    */
   private void onRunnerSuccess(QueryResult value) {
+    RuntimeException refused;
     synchronized (this) {
       if (state != QueryJobState.RUNNING) {
         return;
@@ -229,8 +311,35 @@ public final class QueryJob {
       state = QueryJobState.SUCCEEDED;
       completedAtMillis = OptionalLong.of(clock.millis());
       result = Optional.of(value);
+      runner = null;
+      refused = retained && !detached ? chargeOrFail(value) : null;
     }
-    completion.complete(value);
+    if (refused == null) {
+      completion.complete(null);
+    } else {
+      completion.completeExceptionally(refused);
+    }
+  }
+
+  /**
+   * Charges a {@code SUCCEEDED} result against the budget. On refusal, moves the job to {@code
+   * FAILED} with the refusal as its cause and drops the result. Must hold the monitor.
+   *
+   * @param value result to charge
+   * @return the refusal, or {@code null} when the charge was accepted
+   */
+  private RuntimeException chargeOrFail(QueryResult value) {
+    long bytes = QueryResultSizeEstimator.estimate(value);
+    try {
+      resultBudget.reserve(bytes);
+      chargedBytes = bytes;
+      return null;
+    } catch (RuntimeException e) {
+      state = QueryJobState.FAILED;
+      result = Optional.empty();
+      failure = Optional.of(QueryFailure.of(e, failureRenderer));
+      return e;
+    }
   }
 
   /**
@@ -249,6 +358,7 @@ public final class QueryJob {
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
+      runner = null;
     }
     completion.completeExceptionally(throwable);
   }
@@ -258,12 +368,24 @@ public final class QueryJob {
    * not block the state machine, and the job has already been marked {@code CANCELLED} before this
    * is called.
    */
-  private void safeCancelRunner() {
+  private static void safeCancelRunner(QueryRunner toCancel) {
+    if (toCancel == null) {
+      return;
+    }
     try {
-      runner.cancel();
+      toCancel.cancel();
     } catch (RuntimeException ignored) {
       // Cancellation is best-effort; a misbehaving runner must not block the state machine.
     }
+  }
+
+  private synchronized QueryResult currentResult() {
+    return result.orElse(null);
+  }
+
+  /** Whether the job still references its runner. Exposed for tests of the release on terminal. */
+  synchronized boolean holdsRunner() {
+    return runner != null;
   }
 
   /**

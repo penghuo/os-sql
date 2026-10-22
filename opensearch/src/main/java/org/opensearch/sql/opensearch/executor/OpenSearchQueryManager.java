@@ -5,13 +5,17 @@
 
 package org.opensearch.sql.opensearch.executor;
 
+import java.util.Locale;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.ThreadContext;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.QueryId;
 import org.opensearch.sql.executor.QueryManager;
@@ -102,7 +106,33 @@ public class OpenSearchQueryManager implements QueryManager {
               }
             });
 
-    threadPool.schedule(wrappedTask, new TimeValue(0), SQL_WORKER_THREAD_POOL_NAME);
+    try {
+      execute(threadPool, SQL_WORKER_THREAD_POOL_NAME, wrappedTask);
+    } catch (OpenSearchRejectedExecutionException e) {
+      throw poolSaturated(SQL_WORKER_THREAD_POOL_NAME);
+    }
+  }
+
+  /**
+   * Runs {@code task} on the named pool. Unlike {@code ThreadPool.schedule} with a zero delay,
+   * which hands the task to the scheduler thread and drops a rejection there, this rejects on the
+   * calling thread, so the query can still be failed through its listener. The OpenSearch thread
+   * context is preserved the same way.
+   *
+   * @throws OpenSearchRejectedExecutionException when the pool's queue is full or it is shut down
+   */
+  static void execute(ThreadPool threadPool, String poolName, Runnable task) {
+    threadPool.executor(poolName).execute(task);
+  }
+
+  /**
+   * Builds the failure reported for a query whose worker pool rejected it. Status {@code 429} tells
+   * the client to retry; the message names only the pool, never the node or the rejected task.
+   */
+  static OpenSearchStatusException poolSaturated(String poolName) {
+    return new OpenSearchStatusException(
+        String.format(Locale.ROOT, "[%s] thread pool is saturated; retry later", poolName),
+        RestStatus.TOO_MANY_REQUESTS);
   }
 
   private Runnable withCurrentContext(final Runnable task) {

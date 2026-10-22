@@ -116,6 +116,28 @@ public class PPLQueryRequest {
     return keepAlive != null ? keepAlive : DEFAULT_KEEP_ALIVE;
   }
 
+  /**
+   * Caller-supplied {@code wait_for_completion_timeout}, or the default capped at {@code max} so a
+   * lowered limit does not reject requests that rely on the default. Never null.
+   */
+  public Duration effectiveWaitForCompletion(Duration max) {
+    return waitForCompletionTimeout != null
+        ? waitForCompletionTimeout
+        : min(DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT, max);
+  }
+
+  /**
+   * Caller-supplied {@code keep_alive}, or the default capped at {@code max} so a lowered limit
+   * does not reject requests that rely on the default. Never null.
+   */
+  public Duration effectiveKeepAlive(Duration max) {
+    return keepAlive != null ? keepAlive : min(DEFAULT_KEEP_ALIVE, max);
+  }
+
+  private static Duration min(Duration a, Duration b) {
+    return a.compareTo(b) <= 0 ? a : b;
+  }
+
   public PPLQueryRequest(String pplQuery, JSONObject jsonContent, String path) {
     this(pplQuery, jsonContent, path, "");
   }

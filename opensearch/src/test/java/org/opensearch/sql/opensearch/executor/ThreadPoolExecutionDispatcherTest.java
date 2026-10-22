@@ -6,10 +6,12 @@
 package org.opensearch.sql.opensearch.executor;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -19,6 +21,8 @@ import static org.mockito.Mockito.when;
 import static org.opensearch.sql.opensearch.executor.OpenSearchQueryManager.SQL_COMPLEX_WORKER_THREAD_POOL_NAME;
 
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelVisitor;
@@ -29,11 +33,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -54,12 +62,14 @@ class ThreadPoolExecutionDispatcherTest {
   @Mock private CalcitePlanContext context;
   @Mock private ResponseListener<ExecutionEngine.QueryResponse> listener;
   @Mock private ExecutionEngine engine;
+  @Mock private ExecutorService complexPool;
 
   private ThreadPoolExecutionDispatcher dispatcher;
 
   @BeforeEach
   void setUp() {
     dispatcher = new ThreadPoolExecutionDispatcher(threadPool, settings);
+    when(threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME)).thenReturn(complexPool);
     // Mock schedule calls to return non-null cancellables (for both outer dispatch and inner
     // timeout)
     when(threadPool.schedule(any(Runnable.class), any(TimeValue.class), any()))
@@ -85,7 +95,7 @@ class ThreadPoolExecutionDispatcherTest {
     dispatcher.dispatch(plan, context, listener, engine);
 
     verify(engine).execute(plan, context, listener);
-    verify(threadPool, never()).schedule(any(), any(TimeValue.class), any());
+    verify(threadPool, never()).executor(any());
   }
 
   @Test
@@ -96,9 +106,7 @@ class ThreadPoolExecutionDispatcherTest {
 
     dispatcher.dispatch(scan, context, listener, engine);
 
-    verify(threadPool)
-        .schedule(
-            any(Runnable.class), eq(new TimeValue(0)), eq(SQL_COMPLEX_WORKER_THREAD_POOL_NAME));
+    verify(complexPool).execute(any(Runnable.class));
     verify(engine, never()).execute(any(RelNode.class), any(), any(ResponseListener.class));
   }
 
@@ -111,7 +119,7 @@ class ThreadPoolExecutionDispatcherTest {
     dispatcher.dispatch(scan, context, listener, engine);
 
     verify(engine).execute(scan, context, listener);
-    verify(threadPool, never()).schedule(any(), any(TimeValue.class), any());
+    verify(threadPool, never()).executor(any());
   }
 
   @Test
@@ -124,10 +132,10 @@ class ThreadPoolExecutionDispatcherTest {
             invocation -> {
               Runnable task = invocation.getArgument(0);
               task.run();
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
@@ -152,10 +160,10 @@ class ThreadPoolExecutionDispatcherTest {
               OpenSearchQueryManager.clearCancellableTask();
               task.run();
               taskOnSlowPool.set(OpenSearchQueryManager.getCancellableTask());
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
@@ -188,10 +196,10 @@ class ThreadPoolExecutionDispatcherTest {
               task.run();
               requestIdOnSlowPool.set(ThreadContext.get("request.id"));
               userOnSlowPool.set(ThreadContext.get("user"));
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
@@ -216,10 +224,10 @@ class ThreadPoolExecutionDispatcherTest {
               RelMetadataQueryBase.THREAD_PROVIDERS.remove();
               task.run();
               providerOnSlowPool.set(RelMetadataQueryBase.THREAD_PROVIDERS.get());
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
@@ -250,10 +258,10 @@ class ThreadPoolExecutionDispatcherTest {
               CalcitePlanContext.clearTimewrapSignals();
               CalcitePlanContext.stripNullColumns.set(false);
               task.run();
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     // Capture the values during engine.execute
     doAnswer(
@@ -287,15 +295,55 @@ class ThreadPoolExecutionDispatcherTest {
             invocation -> {
               Runnable task = invocation.getArgument(0);
               task.run();
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
 
     verify(listener).onFailure(error);
+  }
+
+  @Test
+  void reportsSaturatedSlowPoolToListenerWithoutRunningTheQuery() {
+    when(settings.<Boolean>getSettingValue(Settings.Key.SQL_COMPLEX_WORKER_POOL_ENABLED))
+        .thenReturn(true);
+    doThrow(new OpenSearchRejectedExecutionException("rejected execution on node-1"))
+        .when(complexPool)
+        .execute(any(Runnable.class));
+
+    AbstractCalciteIndexScan scan = createMockScanWithScripts();
+    dispatcher.dispatch(scan, context, listener, engine);
+
+    ArgumentCaptor<Exception> failure = ArgumentCaptor.forClass(Exception.class);
+    verify(listener).onFailure(failure.capture());
+    OpenSearchStatusException saturated =
+        assertInstanceOf(OpenSearchStatusException.class, failure.getValue());
+    assertEquals(RestStatus.TOO_MANY_REQUESTS, saturated.status());
+    assertEquals(
+        "[sql-complex-worker] thread pool is saturated; retry later", saturated.getMessage());
+    verify(engine, never()).execute(any(RelNode.class), any(), any(ResponseListener.class));
+  }
+
+  @Test
+  void throwsSaturatedSlowPoolFromDispatchTask() {
+    when(settings.<Boolean>getSettingValue(Settings.Key.SQL_COMPLEX_WORKER_POOL_ENABLED))
+        .thenReturn(true);
+    doThrow(new OpenSearchRejectedExecutionException("rejected execution on node-1"))
+        .when(complexPool)
+        .execute(any(Runnable.class));
+    AtomicBoolean ran = new AtomicBoolean();
+
+    AbstractCalciteIndexScan scan = createMockScanWithScripts();
+    OpenSearchStatusException saturated =
+        assertThrows(
+            OpenSearchStatusException.class,
+            () -> dispatcher.dispatchTask(scan, context, () -> ran.set(true)));
+
+    assertEquals(RestStatus.TOO_MANY_REQUESTS, saturated.status());
+    assertFalse(ran.get());
   }
 
   @Test
@@ -317,10 +365,10 @@ class ThreadPoolExecutionDispatcherTest {
             invocation -> {
               Runnable task = invocation.getArgument(0);
               task.run();
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
     dispatcher.dispatch(scan, context, listener, engine);
@@ -347,10 +395,10 @@ class ThreadPoolExecutionDispatcherTest {
               // Simulate running on a different thread
               OpenSearchQueryManager.clearCancellableTask();
               task.run();
-              return mock(ScheduledCancellable.class);
+              return null;
             })
-        .when(threadPool)
-        .schedule(any(Runnable.class), any(TimeValue.class), any());
+        .when(complexPool)
+        .execute(any(Runnable.class));
 
     doAnswer(
             invocation -> {

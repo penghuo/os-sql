@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.data.model.ExprValueUtils;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.pagination.Cursor;
 
@@ -35,6 +36,13 @@ class QueryJobTest {
   private static final Schema SCHEMA = new Schema(List.of());
   private static final QueryResult RESULT =
       new QueryResult.Rows(SCHEMA, List.of(), Cursor.None, List.of(), 0);
+  private static final QueryResult ROWS =
+      new QueryResult.Rows(
+          SCHEMA,
+          List.of(ExprValueUtils.tupleValue(java.util.Map.of("host", "host-1"))),
+          Cursor.None,
+          List.of(),
+          0);
 
   @Test
   void status_startsInPending() {
@@ -254,6 +262,178 @@ class QueryJobTest {
     RecordingRunner runner = new RecordingRunner();
     QueryJob job = newJob(runner, 160L);
     assertThrows(NullPointerException.class, () -> job.onTerminal(null));
+  }
+
+  @Test
+  void retain_chargesResultThatArrivesLater() {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, budget);
+    job.startRunner();
+    job.retain();
+    runner.complete(ROWS);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+    assertEquals(QueryResultSizeEstimator.estimate(ROWS), budget.charged);
+  }
+
+  @Test
+  void retain_chargesResultThatArrivedBeforeRetention() {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, budget);
+    job.startRunner();
+    runner.complete(ROWS);
+    assertEquals(0L, budget.charged);
+    job.retain();
+    job.retain();
+    assertEquals(QueryResultSizeEstimator.estimate(ROWS), budget.charged);
+  }
+
+  @Test
+  void success_withoutRetentionIsNeverCharged() {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(0L);
+    QueryJob job = newJob(runner, budget);
+    job.startRunner();
+    runner.complete(ROWS);
+    job.detach();
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+    assertEquals(0L, budget.charged);
+  }
+
+  @Test
+  void refusedCharge_failsJobAndDropsRows() throws Exception {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(1L);
+    QueryJob job = newJob(runner, budget);
+    AtomicInteger fired = new AtomicInteger();
+    job.onTerminal(fired::incrementAndGet);
+    job.startRunner();
+    CompletionStage<QueryResult> stage = job.await(Duration.ofSeconds(5));
+    job.retain();
+    runner.complete(ROWS);
+    QueryJobStatus status = job.status();
+    assertEquals(QueryJobState.FAILED, status.state());
+    assertTrue(status.result().isEmpty());
+    assertEquals("IllegalStateException", status.failure().orElseThrow().type());
+    assertEquals(1, fired.get());
+    assertEquals(0L, budget.charged);
+    ExecutionException ex =
+        assertThrows(
+            ExecutionException.class, () -> stage.toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertSame(budget.refusal, ex.getCause());
+  }
+
+  @Test
+  void refusedCharge_onRetentionReplacesUnobservedSuccess() {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(1L);
+    QueryJob job = newJob(runner, budget);
+    job.startRunner();
+    runner.complete(ROWS);
+    job.retain();
+    QueryJobStatus status = job.status();
+    assertEquals(QueryJobState.FAILED, status.state());
+    assertTrue(status.result().isEmpty());
+    assertTrue(status.failure().isPresent());
+  }
+
+  @Test
+  void detach_releasesChargeOnceAndStopsLaterCharges() {
+    RecordingRunner runner = new RecordingRunner();
+    CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, budget);
+    job.startRunner();
+    job.retain();
+    runner.complete(ROWS);
+    job.detach();
+    job.detach();
+    assertEquals(0L, budget.charged);
+    assertEquals(1, budget.releases);
+
+    RecordingRunner lateRunner = new RecordingRunner();
+    QueryJob detachedFirst = newJob(lateRunner, budget);
+    detachedFirst.startRunner();
+    detachedFirst.retain();
+    detachedFirst.detach();
+    lateRunner.complete(ROWS);
+    assertEquals(QueryJobState.SUCCEEDED, detachedFirst.status().state());
+    assertEquals(0L, budget.charged);
+  }
+
+  @Test
+  void charge_racingDetachAlwaysBalances() throws Exception {
+    CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
+    for (int i = 0; i < 200; i++) {
+      RecordingRunner runner = new RecordingRunner();
+      QueryJob job = newJob(runner, budget);
+      job.startRunner();
+      job.retain();
+      Thread completer = new Thread(() -> runner.complete(ROWS));
+      completer.start();
+      job.detach();
+      completer.join();
+    }
+    assertEquals(0L, budget.charged);
+  }
+
+  @Test
+  void terminalTransitionsReleaseTheRunner() {
+    RecordingRunner succeeded = new RecordingRunner();
+    QueryJob success = newJob(succeeded, 170L);
+    success.startRunner();
+    assertTrue(success.holdsRunner());
+    succeeded.complete(RESULT);
+    assertFalse(success.holdsRunner());
+
+    RecordingRunner failed = new RecordingRunner();
+    QueryJob failure = newJob(failed, 171L);
+    failure.startRunner();
+    failed.fail(new IllegalStateException("boom"));
+    assertFalse(failure.holdsRunner());
+
+    RecordingRunner cancelled = new RecordingRunner();
+    QueryJob cancel = newJob(cancelled, 172L);
+    cancel.startRunner();
+    cancel.cancel();
+    assertTrue(cancelled.cancelled);
+    assertFalse(cancel.holdsRunner());
+
+    QueryJob refused = newJob(new RecordingRunner(), new CountingBudget(1L));
+    refused.startRunner();
+    refused.retain();
+    assertTrue(refused.holdsRunner());
+  }
+
+  private static QueryJob newJob(QueryRunner runner, ResultBudget budget) {
+    return new QueryJob(
+        ID, OWNER, runner, Clock.fixed(Instant.ofEpochMilli(0L), ZoneOffset.UTC), null, budget);
+  }
+
+  /** Budget with a fixed capacity that records the outstanding charge. */
+  private static final class CountingBudget implements ResultBudget {
+    private final long capacity;
+    private final IllegalStateException refusal = new IllegalStateException("budget exhausted");
+    private long charged;
+    private int releases;
+
+    private CountingBudget(long capacity) {
+      this.capacity = capacity;
+    }
+
+    @Override
+    public synchronized void reserve(long bytes) {
+      if (bytes > capacity - charged) {
+        throw refusal;
+      }
+      charged += bytes;
+    }
+
+    @Override
+    public synchronized void release(long bytes) {
+      charged -= bytes;
+      releases++;
+    }
   }
 
   private static QueryJob newJob(QueryRunner runner, long submittedMillis) {

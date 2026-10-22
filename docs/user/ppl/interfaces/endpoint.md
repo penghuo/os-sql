@@ -670,13 +670,40 @@ Parameters:
 
 | Field | Type | Default | Limit | Description |
 |---|---|---|---|---|
-| `wait_for_completion_timeout` | time value string (e.g. `"5s"`, `"0"`) | `30s` when either async field is present | `0s` – `60s` (inclusive); values outside the range are rejected with `400`. | Maximum time the submit response will wait for the query to finish. For complex queries, the submit response may take slightly longer than this value. |
-| `keep_alive` | time value string (e.g. `"5m"`) | `5m` | `> 0`, `≤ 24h`; values outside the range are rejected with `400`. | How long a terminal result is retained after completion. A subsequent GET on the id succeeds within this window and returns `404` afterwards, or as soon as the job is deleted. |
+| `wait_for_completion_timeout` | time value string (e.g. `"5s"`, `"0"`) | `30s` when either async field is present | `0s` – `plugins.ppl.async.max_wait_for_completion_timeout` (default `60s`, inclusive); values outside the range are rejected with `400`. | Maximum time the submit response will wait for the query to finish. For complex queries, the submit response may take slightly longer than this value. |
+| `keep_alive` | time value string (e.g. `"5m"`) | `5m` | `> 0`, `≤ plugins.ppl.async.max_keep_alive` (default `24h`); values outside the range are rejected with `400`. | How long a terminal result is retained after completion. A subsequent GET on the id succeeds within this window and returns `404` afterwards, or as soon as the job is deleted. |
+
+A default that exceeds its configured limit is capped at the limit rather than rejected.
+
+### Capacity limits
+
+Each node bounds the async queries it accepts. When a limit is reached, the submit is rejected with `429` before the query runs, and the error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
+
+| Setting | Default | Bounds |
+|---|---|---|
+| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running on the node. |
+| `plugins.ppl.async.max_retained_jobs` | `100` | Async queries the node holds, running or retained for polling. |
+| `plugins.ppl.async.max_retained_result_size` | `10%` of heap | Estimated size of the results retained for polling. A query whose result does not fit ends `FAILED` without its rows. |
+
+Example `429` response:
+
+```json
+{
+  "error": {
+    "reason": "Error occurred in OpenSearch engine: Async query capacity on this node is exhausted [plugins.ppl.async.node_concurrent_running_queries]; retry later",
+    "details": "OpenSearchStatusException[Async query capacity on this node is exhausted [plugins.ppl.async.node_concurrent_running_queries]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
+    "type": "OpenSearchStatusException"
+  },
+  "status": 429
+}
+```
+
+A query is also failed with `429`, synchronous or async, when the SQL worker thread pools on the node are saturated. A synchronous request receives the error directly; an async query that was already accepted ends `FAILED` with the same error.
 
 ### Limitations
 
 - Async submit is only available for standard PPL queries. The following request shapes always run synchronously and ignore `wait_for_completion_timeout` / `keep_alive`: the `/_plugins/_ppl/_explain` endpoint, requests with `"profile": true`, and non-JSON response formats (`format=csv`, `format=raw`, `format=viz`).
-- Results are retained in memory on the owner node for the duration of `keep_alive`, unless the job is deleted first. Set it as low as practical for your polling cadence; the default is `5m`.
+- Results are retained in memory on the owner node for the duration of `keep_alive`, unless the job is deleted first, and count against `plugins.ppl.async.max_retained_result_size`. Set `keep_alive` as low as practical for your polling cadence; the default is `5m`.
 - Submitting an async query requires `cluster:admin/opensearch/ppl`; fetching requires `cluster:admin/opensearch/ql/async_query/result`; deleting requires `cluster:admin/opensearch/ql/async_query/delete`. Users on custom roles must be granted each action they use — a submit without the fetch grant produces an id that returns `403` on GET.
 - When the security plugin is enabled, only the user who submitted a query can fetch or delete it; other users receive `403`.
 

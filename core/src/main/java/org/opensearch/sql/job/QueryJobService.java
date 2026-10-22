@@ -32,6 +32,8 @@ public interface QueryJobService {
    *     and positive
    * @return the submission outcome, exceptionally completed with the runner's cause on inline
    *     failure or cancellation
+   * @throws RuntimeException when the {@link QueryJobStore} rejects the job for lack of capacity;
+   *     the runner is not started
    */
   CompletionStage<QueryResult> submit(
       QueryRunner runner, Principal submitter, Duration waitForCompletion, Duration keepAlive);

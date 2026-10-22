@@ -23,6 +23,7 @@ public interface QueryJobStore extends Closeable {
    * discard the incoming duplicate.
    *
    * @throws IllegalStateException when the store has been closed
+   * @throws RuntimeException when the store has no capacity for another job
    */
   QueryJob register(QueryJob job);
 

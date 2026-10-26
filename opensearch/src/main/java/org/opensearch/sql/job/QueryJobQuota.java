@@ -13,30 +13,29 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 
 /**
- * Node-local capacity for holding async query jobs.
+ * Node-local capacity for the results of finished async query jobs.
  *
  * <p>Tracks two quantities against dynamic settings:
  *
  * <ul>
- *   <li>jobs held in the store, whether queued, running, or retained for polling, against {@code
- *       plugins.ppl.async.max_retained_jobs};
+ *   <li>finished jobs retained for polling, against {@code plugins.ppl.async.max_retained_jobs};
  *   <li>estimated bytes of retained results, against {@code
  *       plugins.ppl.async.max_retained_result_size}.
  * </ul>
  *
- * <p>How many jobs run at once is the {@link OpenSearchQueryJobScheduler}'s concern; a job over
- * that limit waits instead of being rejected. Admission checks and increments under one lock, so
- * concurrent submits cannot overshoot a limit. Settings are read on every check, so a lowered limit
- * applies to the next submit; jobs already admitted are not evicted. Rejections are {@link
- * OpenSearchStatusException}s with status {@code 429} and a message that names the exhausted
- * setting and nothing else.
+ * <p>A submit is rejected while either is full. Jobs that run or wait are bounded by the {@link
+ * OpenSearchQueryJobScheduler} instead. Jobs admitted while the limit had room may still finish, so
+ * the retained count can exceed its limit by at most the running and queued jobs. Settings are read
+ * on every check, so a lowered limit applies to the next submit; retained jobs are not evicted.
+ * Rejections are {@link OpenSearchStatusException}s with status {@code 429} and a message that
+ * names the exhausted setting and nothing else.
  */
 public final class QueryJobQuota implements ResultBudget {
 
   private final Settings settings;
   private final Object lock = new Object();
 
-  private int jobs;
+  private int finished;
   private long resultBytes;
 
   /**
@@ -48,21 +47,20 @@ public final class QueryJobQuota implements ResultBudget {
   }
 
   /**
-   * Admits one new job into the store.
+   * Checks that a new job can be admitted.
    *
    * @throws OpenSearchStatusException with status {@code 429} when either limit is exhausted
    */
   void admit() {
-    int maxJobs = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS);
+    int maxFinished = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS);
     long maxBytes = maxResultBytes();
     Settings.Key exhausted;
     synchronized (lock) {
-      if (jobs >= maxJobs) {
+      if (finished >= maxFinished) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS;
       } else if (resultBytes >= maxBytes) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE;
       } else {
-        jobs++;
         return;
       }
     }
@@ -74,10 +72,17 @@ public final class QueryJobQuota implements ResultBudget {
         RestStatus.TOO_MANY_REQUESTS);
   }
 
-  /** Releases the slot of a job removed from the store, or of an admission that was not used. */
-  void releaseJob() {
+  /** Counts a finished job retained for polling. */
+  void addFinished() {
     synchronized (lock) {
-      jobs--;
+      finished++;
+    }
+  }
+
+  /** Releases a finished job removed from the store. */
+  void releaseFinished() {
+    synchronized (lock) {
+      finished--;
     }
   }
 
@@ -112,10 +117,10 @@ public final class QueryJobQuota implements ResultBudget {
     }
   }
 
-  /** Jobs admitted and not yet removed from the store. */
-  public int jobs() {
+  /** Finished jobs retained for polling. */
+  public int finished() {
     synchronized (lock) {
-      return jobs;
+      return finished;
     }
   }
 

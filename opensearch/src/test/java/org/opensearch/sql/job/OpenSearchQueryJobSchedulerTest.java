@@ -7,6 +7,7 @@ package org.opensearch.sql.job;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -22,7 +23,9 @@ import java.util.concurrent.CompletionStage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
@@ -246,6 +249,45 @@ class OpenSearchQueryJobSchedulerTest {
     public QueryRunner newAttempt() {
       return this;
     }
+  }
+
+  @Test
+  void fullQueueRejectsTheSubmit() {
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 1);
+    submit(new Runner());
+    submit(new Runner());
+    Runner rejected = new Runner();
+
+    OpenSearchStatusException e =
+        assertThrows(OpenSearchStatusException.class, () -> submit(rejected));
+
+    assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
+    assertFalse(rejected.ran);
+    assertEquals(1, scheduler.queued());
+  }
+
+  @Test
+  void zeroQueueRejectsWhenEverySlotIsBusy() {
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 0);
+    submit(new Runner());
+
+    assertThrows(OpenSearchStatusException.class, () -> submit(new Runner()));
+    assertEquals(0, scheduler.queued());
+  }
+
+  @Test
+  void requeuedJobIsKeptEvenWhenTheQueueIsFull() {
+    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 2);
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 1);
+    Runner refused = new Runner(new Runner());
+    QueryJob job = submit(refused);
+    submit(new Runner());
+    submit(new Runner());
+
+    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
+
+    assertEquals(QueryJobState.PENDING, job.status().state());
+    assertEquals(2, scheduler.queued());
   }
 
   @Test

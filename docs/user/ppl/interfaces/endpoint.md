@@ -679,13 +679,14 @@ A default that exceeds its configured limit is capped at the limit rather than r
 
 Each node runs a limited number of async queries at the same time. A query submitted beyond that limit waits in a queue: the submit response and GET report `"status": "PENDING"` until the query starts, then `RUNNING`. Queued queries start in the order they were submitted. A query that waits longer than `plugins.ppl.async.max_queued_time` ends `FAILED`.
 
-A submit is rejected with `429` before the query runs only when the node already holds too many async queries or too much retained result data. The error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
+A submit is rejected with `429` before the query runs when the queue is full, or when the node already keeps too many finished queries or too much result data for polling. The error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
 
 | Setting | Default | What it limits |
 |---|---|---|
 | `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running at the same time. Queries beyond it wait as `PENDING`. |
+| `plugins.ppl.async.max_queued_queries` | `100` | Queries waiting as `PENDING`. Submits beyond it get `429`. |
 | `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` before it ends `FAILED`. |
-| `plugins.ppl.async.max_retained_jobs` | `100` | Async queries the node holds: waiting, running, or finished and kept for polling. Submits beyond it get `429`. |
+| `plugins.ppl.async.max_retained_jobs` | `100` | Finished queries kept for polling. Submits get `429` while it is full. |
 | `plugins.ppl.async.max_retained_result_size` | `10%` of heap | Estimated size of the results kept for polling. A query whose result does not fit ends `FAILED` without its rows. Submits get `429` while it is full. |
 
 Example `429` response:
@@ -693,8 +694,8 @@ Example `429` response:
 ```json
 {
   "error": {
-    "reason": "Error occurred in OpenSearch engine: Async query capacity on this node is exhausted [plugins.ppl.async.max_retained_jobs]; retry later",
-    "details": "OpenSearchStatusException[Async query capacity on this node is exhausted [plugins.ppl.async.max_retained_jobs]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
+    "reason": "Error occurred in OpenSearch engine: Async query queue on this node is full [plugins.ppl.async.max_queued_queries]; retry later",
+    "details": "OpenSearchStatusException[Async query queue on this node is full [plugins.ppl.async.max_queued_queries]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
     "type": "OpenSearchStatusException"
   },
   "status": 429

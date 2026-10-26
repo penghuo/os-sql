@@ -30,8 +30,8 @@ import org.opensearch.client.ResponseException;
 
 /**
  * Capacity limits of async PPL (#5801): worker-pool saturation, queueing past the running limit,
- * the queue timeout, the retained job limit, the retained result budget, and the dynamic wait /
- * keep-alive limits.
+ * the queue limit and timeout, the retained job limit, the retained result budget, and the dynamic
+ * wait / keep-alive limits.
  *
  * <p>Runs on the dedicated single-node {@code asyncCapacityIT} cluster, whose {@code sql-worker}
  * and {@code sql-complex-worker} pools each have one thread and a one-slot queue, so saturation is
@@ -119,6 +119,23 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     deleteAsyncQuery(client(), running);
     Assert.assertEquals(
         "SUCCEEDED", pollUntilTerminal(client(), queuedId, 30_000).getString("status"));
+  }
+
+  @Test
+  public void fullQueueRejectsSubmitWith429() throws Exception {
+    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
+    setClusterSetting("plugins.ppl.async.max_queued_queries", "1");
+    // Running and queued jobs do not count toward the retained (finished) job limit.
+    setClusterSetting("plugins.ppl.async.max_retained_jobs", "1");
+    String nodeId = localNodeId(client());
+    submitRunning(SLOW_QUERY);
+    awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
+    Assert.assertEquals("PENDING", submitAsync(QUICK_QUERY).getString("status"));
+
+    ResponseException rejected =
+        Assert.assertThrows(ResponseException.class, () -> submit(QUICK_QUERY));
+    Assert.assertEquals(429, rejected.getResponse().getStatusLine().getStatusCode());
+    Assert.assertTrue(errorBody(rejected).contains("[plugins.ppl.async.max_queued_queries]"));
   }
 
   @Test

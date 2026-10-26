@@ -26,7 +26,9 @@ import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Runs at most {@code plugins.ppl.async.node_concurrent_running_queries} async jobs at once on this
- * node and queues the rest in submission order.
+ * node and queues up to {@code plugins.ppl.async.max_queued_queries} more in submission order; a
+ * submit beyond both is rejected with {@code 429}, like a thread pool executor with a bounded work
+ * queue.
  *
  * <p>A queued job stays {@code PENDING} until a running job finishes. It fails if it waits longer
  * than {@code plugins.ppl.async.max_queued_time}. A running job whose worker pool is saturated goes
@@ -68,23 +70,38 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @throws OpenSearchStatusException with status {@code 429} when no running slot is free and the
+   *     queue already holds {@code plugins.ppl.async.max_queued_queries} jobs
+   */
   @Override
   public void submit(QueryJob job) {
     Objects.requireNonNull(job, "job must not be null");
-    job.onTerminal(() -> onTerminal(job));
     int maxRunning =
         settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
+    int maxQueued = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES);
     boolean startNow;
     synchronized (lock) {
-      startNow = !paused && queue.isEmpty() && running.size() < maxRunning && job.isPending();
+      startNow = !paused && queue.isEmpty() && running.size() < maxRunning;
       if (startNow) {
         running.add(job);
+      } else if (queue.size() >= maxQueued) {
+        throw new OpenSearchStatusException(
+            String.format(
+                Locale.ROOT,
+                "Async query queue on this node is full [%s]; retry later",
+                Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES.getKeyValue()),
+            RestStatus.TOO_MANY_REQUESTS);
+      } else {
+        addToQueue(job, false);
       }
     }
+    job.onTerminal(() -> onTerminal(job));
     if (startNow) {
       job.startRunner();
     } else {
-      enqueue(job, false);
       // A slot may have freed between the check above and the enqueue.
       drain();
     }
@@ -135,19 +152,25 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     }
   }
 
+  /** Puts a requeued job back at the head of the queue; the queue limit does not apply. */
   private void enqueue(QueryJob job, boolean atHead) {
     synchronized (lock) {
       if (!job.isPending()) {
         // Cancelled before it could be queued; its terminal hook has already run.
         return;
       }
-      if (atHead) {
-        queue.addFirst(job);
-      } else {
-        queue.addLast(job);
-      }
-      queueTimeouts.put(job, scheduleQueueTimeout(job));
+      addToQueue(job, atHead);
     }
+  }
+
+  /** Must hold {@code lock}. */
+  private void addToQueue(QueryJob job, boolean atHead) {
+    if (atHead) {
+      queue.addFirst(job);
+    } else {
+      queue.addLast(job);
+    }
+    queueTimeouts.put(job, scheduleQueueTimeout(job));
   }
 
   /**

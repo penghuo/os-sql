@@ -107,26 +107,45 @@ class AccountingQueryJobStoreTest {
   }
 
   @Test
-  void queuedJobsCountTowardTheRetainedJobLimit() {
+  void fullQueueRejectsTheSubmitAndDropsTheJob() {
+    settings.put(org.opensearch.sql.common.setting.Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 1);
     submitRunning(new Runner());
     submitRunning(new Runner());
     submitRunning(new Runner());
+    Runner rejected = new Runner();
 
     OpenSearchStatusException e =
         assertThrows(
             OpenSearchStatusException.class,
-            () -> service.submit(new Runner(), ALICE, Duration.ZERO, KEEP_ALIVE));
+            () -> service.submit(rejected, ALICE, Duration.ZERO, KEEP_ALIVE));
 
     assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
+    assertEquals(
+        "Async query queue on this node is full [plugins.ppl.async.max_queued_queries]; retry"
+            + " later",
+        e.getMessage());
+    assertFalse(rejected.ran);
     assertEquals(1, scheduler.queued());
-    assertEquals(3, quota.jobs());
+    assertEquals(3, delegate.jobs().size());
   }
 
   @Test
-  void retainedJobsHoldTheirSlotUntilDeleted() {
+  void runningAndQueuedJobsDoNotCountAsRetained() {
+    for (int i = 0; i < 5; i++) {
+      submitRunning(new Runner());
+    }
+
+    assertEquals(2, scheduler.running());
+    assertEquals(3, scheduler.queued());
+    assertEquals(0, quota.finished());
+  }
+
+  @Test
+  void retainedFinishedJobsHoldTheirSlotUntilDeleted() {
     QueryResult.Running first = completeRetained();
     completeRetained();
     completeRetained();
+    assertEquals(3, quota.finished());
     assertThrows(
         OpenSearchStatusException.class,
         () -> service.submit(new Runner(), ALICE, Duration.ZERO, KEEP_ALIVE));
@@ -134,7 +153,16 @@ class AccountingQueryJobStoreTest {
     service.delete(first.id(), ALICE);
 
     submitRunning(new Runner());
-    assertEquals(3, quota.jobs());
+    assertEquals(2, quota.finished());
+  }
+
+  @Test
+  void jobDeletedBeforeItFinishesIsNotCounted() {
+    QueryResult.Running running = submitRunning(new Runner());
+
+    service.delete(running.id(), ALICE);
+
+    assertEquals(0, quota.finished());
   }
 
   @Test
@@ -150,7 +178,7 @@ class AccountingQueryJobStoreTest {
 
     assertInstanceOf(QueryResult.Rows.class, result);
     assertEquals(0, scheduler.running());
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
     assertEquals(0L, quota.resultBytes());
   }
 
@@ -163,7 +191,7 @@ class AccountingQueryJobStoreTest {
     service.delete(running.id(), ALICE);
 
     assertEquals(0L, quota.resultBytes());
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
   }
 
   @Test
@@ -175,7 +203,7 @@ class AccountingQueryJobStoreTest {
     eviction.getValue().run();
 
     assertEquals(0L, quota.resultBytes());
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
     assertTrue(delegate.jobs().isEmpty());
   }
 
@@ -220,13 +248,13 @@ class AccountingQueryJobStoreTest {
     assertTrue(store.remove(running.id(), job));
     assertFalse(store.remove(running.id(), job));
 
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
     assertEquals(0L, quota.resultBytes());
     assertThrows(QueryJobNotFoundException.class, () -> service.get(running.id(), ALICE));
   }
 
   @Test
-  void duplicateIdRollsBackTheAdmission() {
+  void duplicateIdReturnsTheRegisteredJob() {
     QueryJob job =
         new QueryJob(new QueryJobId("node-a", "ctx"), ALICE, new Runner(), Clock.systemUTC());
     QueryJob duplicate =
@@ -234,12 +262,10 @@ class AccountingQueryJobStoreTest {
     assertNull(store.register(job));
 
     assertEquals(job, store.register(duplicate));
-
-    assertEquals(1, quota.jobs());
   }
 
   @Test
-  void closedDelegateRollsBackTheAdmission() {
+  void closedDelegateRejectsRegistration() {
     store.close();
     QueryJob job =
         new QueryJob(new QueryJobId("node-a", "ctx"), ALICE, new Runner(), Clock.systemUTC());
@@ -247,7 +273,7 @@ class AccountingQueryJobStoreTest {
     assertThrows(IllegalStateException.class, () -> store.register(job));
 
     assertEquals(0, scheduler.running());
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
   }
 
   @Test
@@ -260,7 +286,7 @@ class AccountingQueryJobStoreTest {
 
     assertEquals(1, runner.cancels);
     assertEquals(0, scheduler.running());
-    assertEquals(0, quota.jobs());
+    assertEquals(0, quota.finished());
     assertEquals(0L, quota.resultBytes());
   }
 

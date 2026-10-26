@@ -125,7 +125,13 @@ public final class OpenSearchQueryJobService implements QueryJobService {
     }
     QueryJob job = publish(runner, submitter);
     if (scheduler != null) {
-      scheduler.submit(job);
+      try {
+        scheduler.submit(job);
+      } catch (RuntimeException e) {
+        // Queue full: the job never started and its id was never returned.
+        store.remove(job.id(), job);
+        throw e;
+      }
     } else {
       job.startRunner();
     }
@@ -135,6 +141,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
               if (error == null && result instanceof QueryResult.Running) {
                 // Runs before the id is returned to the client.
                 job.retain();
+                store.retain(job);
                 if (retentionPolicy != null) {
                   retentionPolicy.arm(job, keepAlive);
                 }

@@ -19,6 +19,7 @@ public interface QueryJobScheduler {
    * {@link QueryJobStore}.
    *
    * @param job the newly published job
+   * @throws RuntimeException when the queue is full; the job is neither started nor queued
    */
   void submit(QueryJob job);
 

@@ -6,21 +6,28 @@
 package org.opensearch.sql.job;
 
 import java.util.Collection;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * {@link QueryJobStore} that enforces {@link QueryJobQuota} around a delegate store.
  *
- * <p>{@link #register(QueryJob)} is the admission point: a job that does not fit is rejected before
- * it is published or started. {@link #remove(QueryJobId, QueryJob)} is the single release point for
- * the stored slot and the retained result charge, whichever path removes the job: inline
- * completion, DELETE, retention eviction, or {@link #close()}.
+ * <p>{@link #register(QueryJob)} is the admission point: a job is rejected before it is published
+ * or started while the retained jobs or the result budget are full. A job {@linkplain
+ * #retain(QueryJob) retained} for polling counts against the retained job limit once it finishes.
+ * {@link #remove(QueryJobId, QueryJob)} is the single release point for that count and the retained
+ * result charge, whichever path removes the job: inline completion, DELETE, retention eviction, or
+ * {@link #close()}.
  */
 public final class AccountingQueryJobStore implements QueryJobStore {
 
   private final QueryJobStore delegate;
   private final QueryJobQuota quota;
+  // Finished retained jobs that are counted against the quota; guarded by this.
+  private final Set<QueryJob> finished = Collections.newSetFromMap(new IdentityHashMap<>());
 
   /**
    * @param delegate store that holds the jobs
@@ -35,24 +42,26 @@ public final class AccountingQueryJobStore implements QueryJobStore {
   /**
    * {@inheritDoc}
    *
-   * @throws org.opensearch.OpenSearchStatusException with status {@code 429} when the node has no
-   *     capacity for another job
+   * @throws org.opensearch.OpenSearchStatusException with status {@code 429} when the retained jobs
+   *     or the result budget are full
    */
   @Override
   public QueryJob register(QueryJob job) {
     Objects.requireNonNull(job, "job must not be null");
     quota.admit();
-    QueryJob existing;
-    try {
-      existing = delegate.register(job);
-    } catch (RuntimeException e) {
-      quota.releaseJob();
-      throw e;
+    return delegate.register(job);
+  }
+
+  @Override
+  public void retain(QueryJob job) {
+    job.onTerminal(() -> countFinished(job));
+  }
+
+  private synchronized void countFinished(QueryJob job) {
+    // A job deleted before it finished is no longer in the store and is not counted.
+    if (delegate.find(job.id()).orElse(null) == job && finished.add(job)) {
+      quota.addFinished();
     }
-    if (existing != null) {
-      quota.releaseJob();
-    }
-    return existing;
   }
 
   @Override
@@ -62,11 +71,15 @@ public final class AccountingQueryJobStore implements QueryJobStore {
 
   @Override
   public boolean remove(QueryJobId id, QueryJob job) {
-    if (!delegate.remove(id, job)) {
-      return false;
+    synchronized (this) {
+      if (!delegate.remove(id, job)) {
+        return false;
+      }
+      if (finished.remove(job)) {
+        quota.releaseFinished();
+      }
     }
     job.detach();
-    quota.releaseJob();
     return true;
   }
 

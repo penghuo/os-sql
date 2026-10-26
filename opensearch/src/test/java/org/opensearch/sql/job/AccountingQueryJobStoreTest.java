@@ -55,6 +55,7 @@ class AccountingQueryJobStoreTest {
   private InMemoryQueryJobStore delegate;
   private AccountingQueryJobStore store;
   private ThreadPool threadPool;
+  private OpenSearchQueryJobScheduler scheduler;
   private OpenSearchQueryJobService service;
 
   @BeforeEach
@@ -68,6 +69,7 @@ class AccountingQueryJobStoreTest {
     DiscoveryNode localNode = mock(DiscoveryNode.class);
     when(localNode.getId()).thenReturn("node-a");
     when(clusterService.localNode()).thenReturn(localNode);
+    scheduler = new OpenSearchQueryJobScheduler(settings, threadPool);
     service =
         new OpenSearchQueryJobService(
             store,
@@ -75,35 +77,48 @@ class AccountingQueryJobStoreTest {
             Clock.systemUTC(),
             new RetentionPolicy(store, threadPool),
             null,
-            quota);
+            quota,
+            scheduler);
   }
 
   @Test
-  void submitOverRunningLimitIsRejectedBeforeTheRunnerStarts() {
+  void submitOverRunningLimitWaitsAsPendingUntilASlotFrees() {
+    Runner first = new Runner();
+    submitRunning(first);
+    submitRunning(new Runner());
+    Runner queued = new Runner();
+
+    QueryResult.Running pending =
+        assertInstanceOf(
+            QueryResult.Running.class,
+            service.submit(queued, ALICE, Duration.ZERO, KEEP_ALIVE).toCompletableFuture().join());
+
+    assertEquals(QueryJobState.PENDING, pending.state());
+    assertEquals(QueryJobState.PENDING, service.get(pending.id(), ALICE).state());
+    assertFalse(queued.ran);
+    assertEquals(1, scheduler.queued());
+
+    first.future.complete(ROWS);
+
+    assertTrue(queued.ran);
+    assertEquals(QueryJobState.RUNNING, service.get(pending.id(), ALICE).state());
+    assertEquals(2, scheduler.running());
+    assertEquals(0, scheduler.queued());
+  }
+
+  @Test
+  void queuedJobsCountTowardTheRetainedJobLimit() {
     submitRunning(new Runner());
     submitRunning(new Runner());
-    Runner rejected = new Runner();
+    submitRunning(new Runner());
 
     OpenSearchStatusException e =
         assertThrows(
             OpenSearchStatusException.class,
-            () -> service.submit(rejected, ALICE, Duration.ZERO, KEEP_ALIVE));
+            () -> service.submit(new Runner(), ALICE, Duration.ZERO, KEEP_ALIVE));
 
     assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
-    assertFalse(rejected.ran);
-    assertEquals(2, delegate.jobs().size());
-  }
-
-  @Test
-  void terminalJobFreesItsRunningSlot() {
-    Runner first = new Runner();
-    submitRunning(first);
-    submitRunning(new Runner());
-    first.future.complete(ROWS);
-
-    submitRunning(new Runner());
-
-    assertEquals(2, quota.running());
+    assertEquals(1, scheduler.queued());
     assertEquals(3, quota.jobs());
   }
 
@@ -134,7 +149,7 @@ class AccountingQueryJobStoreTest {
             .join();
 
     assertInstanceOf(QueryResult.Rows.class, result);
-    assertEquals(0, quota.running());
+    assertEquals(0, scheduler.running());
     assertEquals(0, quota.jobs());
     assertEquals(0L, quota.resultBytes());
   }
@@ -178,7 +193,7 @@ class AccountingQueryJobStoreTest {
     assertTrue(status.result().isEmpty());
     assertEquals("OpenSearchStatusException", status.failure().orElseThrow().type());
     assertEquals(0L, quota.resultBytes());
-    assertEquals(0, quota.running());
+    assertEquals(0, scheduler.running());
   }
 
   @Test
@@ -220,7 +235,6 @@ class AccountingQueryJobStoreTest {
 
     assertEquals(job, store.register(duplicate));
 
-    assertEquals(1, quota.running());
     assertEquals(1, quota.jobs());
   }
 
@@ -232,7 +246,7 @@ class AccountingQueryJobStoreTest {
 
     assertThrows(IllegalStateException.class, () -> store.register(job));
 
-    assertEquals(0, quota.running());
+    assertEquals(0, scheduler.running());
     assertEquals(0, quota.jobs());
   }
 
@@ -245,7 +259,7 @@ class AccountingQueryJobStoreTest {
     store.close();
 
     assertEquals(1, runner.cancels);
-    assertEquals(0, quota.running());
+    assertEquals(0, scheduler.running());
     assertEquals(0, quota.jobs());
     assertEquals(0L, quota.resultBytes());
   }

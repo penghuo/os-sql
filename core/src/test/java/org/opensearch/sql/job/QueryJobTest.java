@@ -405,6 +405,132 @@ class QueryJobTest {
     assertTrue(refused.holdsRunner());
   }
 
+  @Test
+  void capacityRejectionRequeuesWithAFreshAttempt() {
+    RecordingRunner retry = new RecordingRunner();
+    RetryingRunner refused = new RetryingRunner(retry);
+    RecordingScheduler scheduler = new RecordingScheduler(true);
+    QueryJob job = newJob(refused, scheduler);
+    job.startRunner();
+
+    refused.fail(new IllegalStateException("pool full"));
+
+    assertEquals(QueryJobState.PENDING, job.status().state());
+    assertTrue(job.status().startedAtMillis().isEmpty());
+    assertEquals(List.of(job), scheduler.requeued);
+    job.startRunner();
+    retry.complete(RESULT);
+    assertEquals(1, retry.runInvocations);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+  }
+
+  @Test
+  void failureThatIsNotACapacityRejectionFailsTheJob() {
+    RetryingRunner runner = new RetryingRunner(new RecordingRunner());
+    RecordingScheduler scheduler = new RecordingScheduler(false);
+    QueryJob job = newJob(runner, scheduler);
+    job.startRunner();
+
+    runner.fail(new IllegalStateException("boom"));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertTrue(scheduler.requeued.isEmpty());
+  }
+
+  @Test
+  void failQueued_failsOnlyAPendingJob() {
+    QueryJob pending = newJob(new RecordingRunner(), 180L);
+    assertTrue(pending.failQueued(new IllegalStateException("waited too long")));
+    assertEquals(QueryJobState.FAILED, pending.status().state());
+    assertEquals("waited too long", pending.status().failure().orElseThrow().reason());
+
+    RecordingRunner started = new RecordingRunner();
+    QueryJob running = newJob(started, 181L);
+    running.startRunner();
+    assertFalse(running.failQueued(new IllegalStateException("late")));
+    assertEquals(QueryJobState.RUNNING, running.status().state());
+  }
+
+  @Test
+  void await_reportsPendingForAQueuedJob() throws Exception {
+    QueryJob job = newJob(new RecordingRunner(), 182L);
+    QueryResult.Running pending =
+        assertInstanceOf(
+            QueryResult.Running.class,
+            job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertEquals(QueryJobState.PENDING, pending.state());
+
+    job.startRunner();
+    QueryResult.Running running =
+        assertInstanceOf(
+            QueryResult.Running.class,
+            job.await(Duration.ofMillis(20)).toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertEquals(QueryJobState.RUNNING, running.state());
+  }
+
+  private static QueryJob newJob(QueryRunner runner, QueryJobScheduler scheduler) {
+    return new QueryJob(
+        ID,
+        OWNER,
+        runner,
+        Clock.fixed(Instant.ofEpochMilli(0L), ZoneOffset.UTC),
+        null,
+        ResultBudget.UNLIMITED,
+        scheduler);
+  }
+
+  /** Scheduler that only records requeues and answers capacity checks with a fixed verdict. */
+  private static final class RecordingScheduler implements QueryJobScheduler {
+    private final boolean capacityRejection;
+    private final List<QueryJob> requeued = new java.util.ArrayList<>();
+
+    private RecordingScheduler(boolean capacityRejection) {
+      this.capacityRejection = capacityRejection;
+    }
+
+    @Override
+    public void submit(QueryJob job) {}
+
+    @Override
+    public boolean isCapacityRejection(Throwable failure) {
+      return capacityRejection;
+    }
+
+    @Override
+    public void requeue(QueryJob job) {
+      requeued.add(job);
+    }
+  }
+
+  /** Runner that can be failed by the test and supplies one fresh attempt. */
+  private static final class RetryingRunner implements QueryRunner {
+    private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
+    private QueryRunner nextAttempt;
+
+    private RetryingRunner(QueryRunner nextAttempt) {
+      this.nextAttempt = nextAttempt;
+    }
+
+    void fail(Throwable cause) {
+      future.completeExceptionally(cause);
+    }
+
+    @Override
+    public CompletionStage<QueryResult> run() {
+      return future;
+    }
+
+    @Override
+    public void cancel() {}
+
+    @Override
+    public QueryRunner newAttempt() {
+      QueryRunner next = nextAttempt;
+      nextAttempt = null;
+      return next;
+    }
+  }
+
   private static QueryJob newJob(QueryRunner runner, ResultBudget budget) {
     return new QueryJob(
         ID, OWNER, runner, Clock.fixed(Instant.ofEpochMilli(0L), ZoneOffset.UTC), null, budget);

@@ -19,6 +19,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.opensearch.OpenSearchStatusException;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
@@ -26,26 +27,9 @@ import org.opensearch.sql.common.setting.Settings;
 class QueryJobQuotaTest {
 
   @Test
-  void admitRejectsOnceRunningLimitIsReached() {
-    QueryJobQuota quota = new QueryJobQuota(settings(1, 10, 1_000));
-    quota.admit();
-    OpenSearchStatusException e = assertThrows(OpenSearchStatusException.class, quota::admit);
-    assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
-    assertEquals(
-        "Async query capacity on this node is exhausted"
-            + " [plugins.ppl.async.node_concurrent_running_queries]; retry later",
-        e.getMessage());
-    quota.releaseRunning();
-    quota.admit();
-    assertEquals(1, quota.running());
-    assertEquals(2, quota.jobs());
-  }
-
-  @Test
   void admitRejectsOnceRetainedJobLimitIsReached() {
     QueryJobQuota quota = new QueryJobQuota(settings(10, 1, 1_000));
     quota.admit();
-    quota.releaseRunning();
     OpenSearchStatusException e = assertThrows(OpenSearchStatusException.class, quota::admit);
     assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
     assertEquals(
@@ -54,6 +38,15 @@ class QueryJobQuotaTest {
         e.getMessage());
     quota.releaseJob();
     quota.admit();
+    assertEquals(1, quota.jobs());
+  }
+
+  @Test
+  void runningLimitDoesNotAffectAdmission() {
+    QueryJobQuota quota = new QueryJobQuota(settings(1, 10, 1_000));
+    quota.admit();
+    quota.admit();
+    assertEquals(2, quota.jobs());
   }
 
   @Test
@@ -87,30 +80,20 @@ class QueryJobQuotaTest {
   }
 
   @Test
-  void rollbackRevertsAdmission() {
-    QueryJobQuota quota = new QueryJobQuota(settings(1, 1, 100));
-    quota.admit();
-    quota.rollback();
-    assertEquals(0, quota.running());
-    assertEquals(0, quota.jobs());
-    quota.admit();
-  }
-
-  @Test
   void loweredLimitAppliesToNextAdmission() {
     MutableSettings settings = settings(5, 10, 1_000);
     QueryJobQuota quota = new QueryJobQuota(settings);
     quota.admit();
     quota.admit();
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 2);
+    settings.put(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS, 2);
     assertThrows(OpenSearchStatusException.class, quota::admit);
-    assertEquals(2, quota.running());
+    assertEquals(2, quota.jobs());
   }
 
   @Test
   void concurrentAdmissionNeverExceedsTheLimit() throws Exception {
     int limit = 7;
-    QueryJobQuota quota = new QueryJobQuota(settings(limit, 1_000, 1_000));
+    QueryJobQuota quota = new QueryJobQuota(settings(1, limit, 1_000));
     int threads = 32;
     ExecutorService pool = Executors.newFixedThreadPool(threads);
     CountDownLatch start = new CountDownLatch(1);
@@ -135,7 +118,7 @@ class QueryJobQuotaTest {
         admitted += result.get(5, TimeUnit.SECONDS) ? 1 : 0;
       }
       assertEquals(limit, admitted);
-      assertEquals(limit, quota.running());
+      assertEquals(limit, quota.jobs());
     } finally {
       pool.shutdownNow();
     }
@@ -145,6 +128,7 @@ class QueryJobQuotaTest {
     MutableSettings settings = new MutableSettings();
     settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, maxRunning);
     settings.put(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS, maxJobs);
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueMinutes(5));
     settings.put(
         Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE,
         ByteSizeValue.parseBytesSizeValue(maxResultBytes + "b", "test"));

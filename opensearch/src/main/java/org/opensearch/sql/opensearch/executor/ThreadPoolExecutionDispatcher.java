@@ -20,7 +20,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.ThreadContext;
 import org.checkerframework.checker.nullness.qual.Nullable;
-import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.sql.calcite.CalcitePlanContext;
@@ -131,8 +130,9 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
         OpenSearchQueryManager.execute(
             threadPool, SQL_COMPLEX_WORKER_THREAD_POOL_NAME, complexTask);
       } catch (OpenSearchRejectedExecutionException e) {
-        OpenSearchStatusException saturated =
-            OpenSearchQueryManager.poolSaturated(SQL_COMPLEX_WORKER_THREAD_POOL_NAME);
+        WorkerPoolSaturatedException saturated =
+            new WorkerPoolSaturatedException(
+                SQL_COMPLEX_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
         if (failureListener == null) {
           throw saturated;
         }

@@ -103,6 +103,13 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  public static final Setting<TimeValue> PPL_ASYNC_MAX_QUEUED_TIME_SETTING =
+      Setting.positiveTimeSetting(
+          Key.PPL_ASYNC_MAX_QUEUED_TIME.getKeyValue(),
+          TimeValue.timeValueMinutes(5),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   public static final Setting<ByteSizeValue> PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING =
       Setting.memorySizeSetting(
           Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE.getKeyValue(),
@@ -491,6 +498,12 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
+        Key.PPL_ASYNC_MAX_QUEUED_TIME,
+        PPL_ASYNC_MAX_QUEUED_TIME_SETTING,
+        new Updater(Key.PPL_ASYNC_MAX_QUEUED_TIME));
+    register(
+        settingBuilder,
+        clusterSettings,
         Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE,
         PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING,
         new Updater(Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE));
@@ -825,6 +838,7 @@ public class OpenSearchSettings extends Settings {
         .add(PPL_QUERY_TIMEOUT_SETTING)
         .add(PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING)
         .add(PPL_ASYNC_MAX_RETAINED_JOBS_SETTING)
+        .add(PPL_ASYNC_MAX_QUEUED_TIME_SETTING)
         .add(PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING)
         .add(PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT_SETTING)
         .add(PPL_ASYNC_MAX_KEEP_ALIVE_SETTING)

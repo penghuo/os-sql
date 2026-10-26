@@ -7,12 +7,16 @@ package org.opensearch.sql.ppl;
 
 import static org.opensearch.sql.legacy.TestUtils.getResponseBody;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.INDEX;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.STREAMSTATS_QUERY;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolBusy;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.awaitPoolsIdle;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.deleteAsyncQuery;
+import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.getAsyncQuery;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.localNodeId;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.pollUntilTerminal;
 import static org.opensearch.sql.ppl.AsyncPPLTestHelpers.postPpl;
+import static org.opensearch.sql.util.MatcherUtils.rows;
+import static org.opensearch.sql.util.MatcherUtils.verifyDataRows;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -25,8 +29,9 @@ import org.opensearch.client.Request;
 import org.opensearch.client.ResponseException;
 
 /**
- * Capacity limits of async PPL (#5801): worker-pool saturation, admission control, the retained
- * result budget, and the dynamic wait / keep-alive limits.
+ * Capacity limits of async PPL (#5801): worker-pool saturation, queueing past the running limit,
+ * the queue timeout, the retained job limit, the retained result budget, and the dynamic wait /
+ * keep-alive limits.
  *
  * <p>Runs on the dedicated single-node {@code asyncCapacityIT} cluster, whose {@code sql-worker}
  * and {@code sql-complex-worker} pools each have one thread and a one-slot queue, so saturation is
@@ -73,11 +78,11 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void saturatedWorkerPoolFailsQueriesWith429InsteadOfDroppingThem() throws Exception {
+  public void saturatedWorkerPoolFailsSyncQueriesAndQueuesAsyncOnes() throws Exception {
     String nodeId = localNodeId(client());
-    submitRunning(SLOW_QUERY);
+    String first = submitRunning(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
-    submitRunning(SLOW_QUERY);
+    String second = submitRunning(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 1);
 
     // Before the fix the rejected sync request never received a response.
@@ -89,36 +94,48 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     Assert.assertTrue(
         errorBody(sync).contains("[sql-complex-worker] thread pool is saturated; retry later"));
 
-    // Before the fix the rejected async job stayed RUNNING forever.
-    String rejected = submitRunning(SLOW_QUERY);
-    JSONObject terminal = pollUntilTerminal(client(), rejected, 30_000);
-    Assert.assertEquals("FAILED", terminal.getString("status"));
-    Assert.assertTrue(
-        terminal
-            .getJSONObject("error")
-            .toString()
-            .contains("[sql-complex-worker] thread pool is saturated; retry later"));
-    Assert.assertFalse(terminal.has("datarows"));
+    // Before the fix the rejected async job stayed RUNNING forever; now it waits for capacity.
+    String waiting = submitAsync(STREAMSTATS_QUERY).getString("id");
+    awaitStatus(waiting, "PENDING");
+    deleteAsyncQuery(client(), first);
+    deleteAsyncQuery(client(), second);
+    JSONObject terminal = pollUntilTerminal(client(), waiting, 30_000);
+    Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
+    verifyDataRows(terminal, rows(10_000));
   }
 
   @Test
-  public void concurrentRunningLimitRejectsSubmitWith429() throws Exception {
+  public void submitOverTheRunningLimitWaitsAsPendingUntilASlotFrees() throws Exception {
     setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     String nodeId = localNodeId(client());
     String running = submitRunning(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
 
-    ResponseException rejected =
-        Assert.assertThrows(ResponseException.class, () -> submit(QUICK_QUERY));
-    Assert.assertEquals(429, rejected.getResponse().getStatusLine().getStatusCode());
-    Assert.assertTrue(
-        errorBody(rejected).contains("[plugins.ppl.async.node_concurrent_running_queries]"));
+    JSONObject queued = submitAsync(QUICK_QUERY);
+    Assert.assertEquals("PENDING", queued.getString("status"));
+    String queuedId = queued.getString("id");
+    awaitStatus(queuedId, "PENDING");
 
     deleteAsyncQuery(client(), running);
-    awaitPoolsIdle(client(), nodeId);
     Assert.assertEquals(
-        "SUCCEEDED",
-        pollUntilTerminal(client(), submitRunning(QUICK_QUERY), 30_000).getString("status"));
+        "SUCCEEDED", pollUntilTerminal(client(), queuedId, 30_000).getString("status"));
+  }
+
+  @Test
+  public void queuedJobFailsAfterTheQueueTimeout() throws Exception {
+    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
+    setClusterSetting("plugins.ppl.async.max_queued_time", "1s");
+    String nodeId = localNodeId(client());
+    submitRunning(SLOW_QUERY);
+    awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
+
+    JSONObject queued = submitAsync(QUICK_QUERY);
+    Assert.assertEquals("PENDING", queued.getString("status"));
+
+    JSONObject terminal = pollUntilTerminal(client(), queued.getString("id"), 30_000);
+    Assert.assertEquals("FAILED", terminal.getString("status"));
+    Assert.assertTrue(
+        terminal.getJSONObject("error").toString().contains("[plugins.ppl.async.max_queued_time]"));
   }
 
   @Test
@@ -192,13 +209,32 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     submitRunning(QUICK_QUERY);
   }
 
-  /** Submits with {@code wait_for_completion_timeout=0}, tracks the id, and returns it. */
+  /** Submits with {@code wait_for_completion_timeout=0}, expects it to start, returns its id. */
   private String submitRunning(String query) throws IOException {
-    JSONObject response = new JSONObject(submit(query));
+    JSONObject response = submitAsync(query);
     Assert.assertEquals("RUNNING", response.getString("status"));
-    String id = response.getString("id");
-    jobIds.add(id);
-    return id;
+    return response.getString("id");
+  }
+
+  /** Submits with {@code wait_for_completion_timeout=0}, tracks the id, returns the response. */
+  private JSONObject submitAsync(String query) throws IOException {
+    JSONObject response = new JSONObject(submit(query));
+    jobIds.add(response.getString("id"));
+    return response;
+  }
+
+  /** Polls GET until the job reports {@code status}. */
+  private void awaitStatus(String id, String status) throws Exception {
+    long deadline = System.currentTimeMillis() + 10_000;
+    String last = null;
+    while (System.currentTimeMillis() < deadline) {
+      last = new JSONObject(getAsyncQuery(client(), id)).getString("status");
+      if (status.equals(last)) {
+        return;
+      }
+      Thread.sleep(50);
+    }
+    Assert.fail("job never reported " + status + "; last=" + last);
   }
 
   private String submit(String query) throws IOException {

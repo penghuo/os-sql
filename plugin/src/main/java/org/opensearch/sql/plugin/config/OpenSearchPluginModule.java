@@ -26,9 +26,11 @@ import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
 import org.opensearch.sql.job.AccountingQueryJobStore;
 import org.opensearch.sql.job.InMemoryQueryJobStore;
+import org.opensearch.sql.job.OpenSearchQueryJobScheduler;
 import org.opensearch.sql.job.OpenSearchQueryJobService;
 import org.opensearch.sql.job.OpenSearchSecurityAdapter;
 import org.opensearch.sql.job.QueryJobQuota;
+import org.opensearch.sql.job.QueryJobScheduler;
 import org.opensearch.sql.job.QueryJobService;
 import org.opensearch.sql.job.QueryJobStore;
 import org.opensearch.sql.job.RetentionPolicy;
@@ -143,6 +145,12 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   @Singleton
+  public QueryJobScheduler queryJobScheduler(Settings settings, NodeClient nodeClient) {
+    return new OpenSearchQueryJobScheduler(settings, nodeClient.threadPool());
+  }
+
+  @Provides
+  @Singleton
   public QueryJobStore queryJobStore(QueryJobQuota quota) {
     return new AccountingQueryJobStore(new InMemoryQueryJobStore(), quota);
   }
@@ -165,7 +173,8 @@ public class OpenSearchPluginModule extends AbstractModule {
       QueryJobStore store,
       ClusterService clusterService,
       RetentionPolicy retentionPolicy,
-      QueryJobQuota quota) {
+      QueryJobQuota quota,
+      QueryJobScheduler scheduler) {
     return new OpenSearchQueryJobService(
         store,
         clusterService,
@@ -174,7 +183,8 @@ public class OpenSearchPluginModule extends AbstractModule {
         // Reuse the sync REST renderer so an async GET on a FAILED job returns the same
         // structured error body a synchronous POST would have returned for the same exception.
         org.opensearch.sql.plugin.rest.SyncErrorReportRenderer::renderErrorMap,
-        quota);
+        quota,
+        scheduler);
   }
 
   /** {@link QueryPlanFactory}. */

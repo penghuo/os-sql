@@ -23,6 +23,7 @@ import org.opensearch.sql.executor.ExecutionEngine.QueryResponse;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.pagination.Cursor;
 import org.opensearch.sql.job.QueryResult;
+import org.opensearch.sql.job.QueryRunner;
 import org.opensearch.sql.ppl.domain.PPLQueryRequest;
 
 public class PPLQueryRunnerTest {
@@ -135,5 +136,38 @@ public class PPLQueryRunnerTest {
 
     assertEquals(0, stops.get());
     assertTrue(result instanceof QueryResult.Rows);
+  }
+
+  @Test
+  public void newAttempt_runsTheSameRequestAgainAndSharesTheCancellationHook()
+      throws ExecutionException, InterruptedException {
+    PPLService service = mock(PPLService.class);
+    AtomicInteger executions = new AtomicInteger();
+    doAnswer(
+            invocation -> {
+              executions.incrementAndGet();
+              ResponseListener<QueryResponse> listener = invocation.getArgument(1);
+              listener.onResponse(new QueryResponse(new Schema(List.of()), List.of(), Cursor.None));
+              return null;
+            })
+        .when(service)
+        .execute(any(PPLQueryRequest.class), any(), any(), any());
+    AtomicInteger cancels = new AtomicInteger();
+    PPLQueryRunner runner =
+        new PPLQueryRunner(
+            service,
+            new PPLQueryRequest("source=logs", null, "/_plugins/_ppl", "jdbc"),
+            s -> {},
+            Clock.systemUTC(),
+            cancels::incrementAndGet);
+    runner.run().toCompletableFuture().get();
+
+    QueryRunner attempt = runner.newAttempt();
+    assertTrue(attempt.run().toCompletableFuture().get() instanceof QueryResult.Rows);
+    assertEquals(2, executions.get());
+
+    QueryRunner pending = runner.newAttempt();
+    pending.cancel();
+    assertEquals(1, cancels.get());
   }
 }

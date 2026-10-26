@@ -481,7 +481,7 @@ Expected output:
 
 ### Description
 
-The maximum number of async PPL queries that can run at the same time on one node. A query counts from submission until it reaches a terminal state, including queries that return inline. An async submit beyond the limit is rejected with `429` before it runs; synchronous queries are not counted.
+The maximum number of async PPL queries that run at the same time on one node. A query beyond the limit waits as `PENDING` and starts, in submission order, when a running query finishes. Queries that return inline also count while they run; synchronous queries are not counted.
 1. The default value is `20`; the minimum is `1`.
 2. This setting is node scope.
 3. This setting can be updated dynamically.
@@ -494,8 +494,21 @@ The maximum number of async PPL queries that can run at the same time on one nod
 
 ### Description
 
-The maximum number of async PPL queries a node holds, running or retained for polling. A query is released when it is deleted or its `keep_alive` expires. An async submit beyond the limit is rejected with `429`.
+The maximum number of async PPL queries a node holds: waiting, running, or finished and retained for polling. A query is released when it is deleted or its `keep_alive` expires. An async submit beyond the limit is rejected with `429`.
 1. The default value is `100`; the minimum is `1`.
+2. This setting is node scope.
+3. This setting can be updated dynamically.
+
+## plugins.ppl.async.max_queued_time
+
+### Version
+
+3.10
+
+### Description
+
+How long an async PPL query may wait as `PENDING` for a free slot before it ends `FAILED`. The wait starts each time the query is queued.
+1. The default value is `5m`.
 2. This setting is node scope.
 3. This setting can be updated dynamically.
 

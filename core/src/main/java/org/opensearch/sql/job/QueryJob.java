@@ -31,7 +31,16 @@ import java.util.function.Function;
  *                                     \--runner failure--&gt; FAILED
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
+ *   PENDING --failQueued()--&gt; FAILED
+ *   RUNNING --capacity rejection--&gt; PENDING   (requeued with a fresh runner)
  * </pre>
+ *
+ * <h2>Scheduling</h2>
+ *
+ * A {@link QueryJobScheduler} decides when a {@code PENDING} job starts. When the runner fails
+ * because it was refused for lack of capacity, and it can supply a {@linkplain
+ * QueryRunner#newAttempt() fresh attempt}, the job returns to {@code PENDING} and the scheduler
+ * queues it again instead of the job failing.
  *
  * <h2>Result retention</h2>
  *
@@ -59,6 +68,7 @@ public final class QueryJob {
   private final Clock clock;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
   private final ResultBudget resultBudget;
+  private final QueryJobScheduler scheduler;
   private final long submittedAtMillis;
   // Signals the terminal transition without holding the result: a retained job's rows must be
   // reachable only through result, so dropping them there frees them.
@@ -123,12 +133,31 @@ public final class QueryJob {
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer,
       ResultBudget resultBudget) {
+    this(id, owner, runner, clock, failureRenderer, resultBudget, null);
+  }
+
+  /**
+   * Creates a job in {@link QueryJobState#PENDING} that {@code scheduler} starts and requeues.
+   * Package-private: only {@link QueryJobService} implementations may construct a job.
+   *
+   * @param scheduler requeues the job when its runner is refused for capacity; {@code null} fails
+   *     the job instead
+   */
+  QueryJob(
+      QueryJobId id,
+      Principal owner,
+      QueryRunner runner,
+      Clock clock,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ResultBudget resultBudget,
+      QueryJobScheduler scheduler) {
     this.id = Objects.requireNonNull(id, "id must not be null");
     this.owner = Objects.requireNonNull(owner, "owner must not be null");
     this.runner = Objects.requireNonNull(runner, "runner must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.failureRenderer = failureRenderer;
     this.resultBudget = Objects.requireNonNull(resultBudget, "resultBudget must not be null");
+    this.scheduler = scheduler;
     this.submittedAtMillis = clock.millis();
   }
 
@@ -180,11 +209,11 @@ public final class QueryJob {
           out.completeExceptionally(cause);
         });
     long millis = budget == null ? 0L : budget.toMillis();
-    QueryResult.Running running = new QueryResult.Running(id);
     if (millis <= 0L) {
-      out.complete(running);
+      out.complete(runningSnapshot());
     } else {
-      out.completeOnTimeout(running, millis, TimeUnit.MILLISECONDS);
+      CompletableFuture.delayedExecutor(millis, TimeUnit.MILLISECONDS)
+          .execute(() -> out.complete(runningSnapshot()));
     }
     return out.minimalCompletionStage();
   }
@@ -213,6 +242,32 @@ public final class QueryJob {
     }
     safeCancelRunner(toCancel);
     completion.cancel(false);
+  }
+
+  /**
+   * Fails a job that waited in the queue too long. Package-private: called by the {@link
+   * QueryJobScheduler} that queued it.
+   *
+   * @param cause reported as the job's failure
+   * @return {@code true} if the job was {@code PENDING} and is now {@code FAILED}
+   */
+  boolean failQueued(Throwable cause) {
+    synchronized (this) {
+      if (state != QueryJobState.PENDING) {
+        return false;
+      }
+      state = QueryJobState.FAILED;
+      completedAtMillis = OptionalLong.of(clock.millis());
+      failure = Optional.of(QueryFailure.of(cause, failureRenderer));
+      runner = null;
+    }
+    completion.completeExceptionally(cause);
+    return true;
+  }
+
+  /** Whether the job is waiting to start. */
+  synchronized boolean isPending() {
+    return state == QueryJobState.PENDING;
   }
 
   /**
@@ -345,22 +400,51 @@ public final class QueryJob {
   /**
    * Terminal transition to {@link QueryJobState#FAILED}. Accepts the transition from either {@code
    * RUNNING} (normal failure path) or {@code PENDING} (synchronous throw from {@link
-   * QueryRunner#run()}). Ignored once the job is already terminal.
+   * QueryRunner#run()}). Ignored once the job is already terminal. A {@code RUNNING} job refused
+   * for lack of capacity is requeued instead, when its runner can supply a fresh attempt.
    *
    * @param throwable exception raised by the runner; may be a raw cause or a {@link
    *     CompletionException} wrapper (already unwrapped in {@link #startRunner()})
    */
   private void onRunnerFailure(Throwable throwable) {
+    boolean requeued;
     synchronized (this) {
       if (state != QueryJobState.RUNNING && state != QueryJobState.PENDING) {
         return;
       }
-      state = QueryJobState.FAILED;
-      completedAtMillis = OptionalLong.of(clock.millis());
-      failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
-      runner = null;
+      requeued = state == QueryJobState.RUNNING && prepareNextAttempt(throwable);
+      if (!requeued) {
+        state = QueryJobState.FAILED;
+        completedAtMillis = OptionalLong.of(clock.millis());
+        failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
+        runner = null;
+      }
     }
-    completion.completeExceptionally(throwable);
+    if (requeued) {
+      scheduler.requeue(this);
+    } else {
+      completion.completeExceptionally(throwable);
+    }
+  }
+
+  /**
+   * Moves a {@code RUNNING} job back to {@code PENDING} with a fresh runner when {@code throwable}
+   * is a capacity rejection the scheduler can retry. Must hold the monitor.
+   *
+   * @return {@code true} if the job is {@code PENDING} again
+   */
+  private boolean prepareNextAttempt(Throwable throwable) {
+    if (scheduler == null || runner == null || !scheduler.isCapacityRejection(throwable)) {
+      return false;
+    }
+    QueryRunner nextAttempt = runner.newAttempt();
+    if (nextAttempt == null) {
+      return false;
+    }
+    state = QueryJobState.PENDING;
+    startedAtMillis = OptionalLong.empty();
+    runner = nextAttempt;
+    return true;
   }
 
   /**
@@ -377,6 +461,11 @@ public final class QueryJob {
     } catch (RuntimeException ignored) {
       // Cancellation is best-effort; a misbehaving runner must not block the state machine.
     }
+  }
+
+  private synchronized QueryResult.Running runningSnapshot() {
+    return new QueryResult.Running(
+        id, state == QueryJobState.PENDING ? QueryJobState.PENDING : QueryJobState.RUNNING);
   }
 
   private synchronized QueryResult currentResult() {

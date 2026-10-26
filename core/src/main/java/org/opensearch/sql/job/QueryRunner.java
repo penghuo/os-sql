@@ -25,4 +25,13 @@ public interface QueryRunner {
 
   /** Requests cooperative cancellation. Safe to call from any state. */
   void cancel();
+
+  /**
+   * Returns an unstarted runner for the same query, so the query can run again after this runner
+   * was refused for lack of capacity before doing any work. Returns {@code null} when the query
+   * cannot run again; the refusal then fails the job.
+   */
+  default QueryRunner newAttempt() {
+    return null;
+  }
 }

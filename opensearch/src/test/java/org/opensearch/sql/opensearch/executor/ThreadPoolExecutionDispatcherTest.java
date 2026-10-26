@@ -38,10 +38,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
-import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
-import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -319,9 +317,8 @@ class ThreadPoolExecutionDispatcherTest {
 
     ArgumentCaptor<Exception> failure = ArgumentCaptor.forClass(Exception.class);
     verify(listener).onFailure(failure.capture());
-    OpenSearchStatusException saturated =
-        assertInstanceOf(OpenSearchStatusException.class, failure.getValue());
-    assertEquals(RestStatus.TOO_MANY_REQUESTS, saturated.status());
+    WorkerPoolSaturatedException saturated =
+        assertInstanceOf(WorkerPoolSaturatedException.class, failure.getValue());
     assertEquals(
         "[sql-complex-worker] thread pool is saturated; retry later", saturated.getMessage());
     verify(engine, never()).execute(any(RelNode.class), any(), any(ResponseListener.class));
@@ -337,12 +334,10 @@ class ThreadPoolExecutionDispatcherTest {
     AtomicBoolean ran = new AtomicBoolean();
 
     AbstractCalciteIndexScan scan = createMockScanWithScripts();
-    OpenSearchStatusException saturated =
-        assertThrows(
-            OpenSearchStatusException.class,
-            () -> dispatcher.dispatchTask(scan, context, () -> ran.set(true)));
+    assertThrows(
+        WorkerPoolSaturatedException.class,
+        () -> dispatcher.dispatchTask(scan, context, () -> ran.set(true)));
 
-    assertEquals(RestStatus.TOO_MANY_REQUESTS, saturated.status());
     assertFalse(ran.get());
   }
 

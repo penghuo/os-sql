@@ -21,10 +21,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
-import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -90,7 +88,7 @@ class OpenSearchQueryManagerTest {
   }
 
   @Test
-  public void submitQueryRejectedBySaturatedPoolFailsWith429() {
+  public void submitQueryRejectedBySaturatedPoolThrowsWorkerPoolSaturated() {
     NodeClient nodeClient = mock(NodeClient.class);
     ThreadPool threadPool = mock(ThreadPool.class);
     Settings settings = mock(Settings.class);
@@ -116,12 +114,12 @@ class OpenSearchQueryManagerTest {
           }
         };
 
-    OpenSearchStatusException e =
+    WorkerPoolSaturatedException e =
         assertThrows(
-            OpenSearchStatusException.class,
+            WorkerPoolSaturatedException.class,
             () -> new OpenSearchQueryManager(nodeClient, settings).submit(queryPlan));
-    assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
     assertEquals("[sql-worker] thread pool is saturated; retry later", e.getMessage());
+    assertFalse(e.isExecutorShutdown());
     assertFalse(isRun.get());
   }
 }

@@ -677,28 +677,31 @@ A default that exceeds its configured limit is capped at the limit rather than r
 
 ### Capacity limits
 
-Each node bounds the async queries it accepts. When a limit is reached, the submit is rejected with `429` before the query runs, and the error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
+Each node runs a limited number of async queries at the same time. A query submitted beyond that limit waits in a queue: the submit response and GET report `"status": "PENDING"` until the query starts, then `RUNNING`. Queued queries start in the order they were submitted. A query that waits longer than `plugins.ppl.async.max_queued_time` ends `FAILED`.
 
-| Setting | Default | Bounds |
+A submit is rejected with `429` before the query runs only when the node already holds too many async queries or too much retained result data. The error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
+
+| Setting | Default | What it limits |
 |---|---|---|
-| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running on the node. |
-| `plugins.ppl.async.max_retained_jobs` | `100` | Async queries the node holds, running or retained for polling. |
-| `plugins.ppl.async.max_retained_result_size` | `10%` of heap | Estimated size of the results retained for polling. A query whose result does not fit ends `FAILED` without its rows. |
+| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running at the same time. Queries beyond it wait as `PENDING`. |
+| `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` before it ends `FAILED`. |
+| `plugins.ppl.async.max_retained_jobs` | `100` | Async queries the node holds: waiting, running, or finished and kept for polling. Submits beyond it get `429`. |
+| `plugins.ppl.async.max_retained_result_size` | `10%` of heap | Estimated size of the results kept for polling. A query whose result does not fit ends `FAILED` without its rows. Submits get `429` while it is full. |
 
 Example `429` response:
 
 ```json
 {
   "error": {
-    "reason": "Error occurred in OpenSearch engine: Async query capacity on this node is exhausted [plugins.ppl.async.node_concurrent_running_queries]; retry later",
-    "details": "OpenSearchStatusException[Async query capacity on this node is exhausted [plugins.ppl.async.node_concurrent_running_queries]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
+    "reason": "Error occurred in OpenSearch engine: Async query capacity on this node is exhausted [plugins.ppl.async.max_retained_jobs]; retry later",
+    "details": "OpenSearchStatusException[Async query capacity on this node is exhausted [plugins.ppl.async.max_retained_jobs]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
     "type": "OpenSearchStatusException"
   },
   "status": 429
 }
 ```
 
-A query is also failed with `429`, synchronous or async, when the SQL worker thread pools on the node are saturated. A synchronous request receives the error directly; an async query that was already accepted ends `FAILED` with the same error.
+When the SQL worker thread pools on the node are full, a synchronous query fails with `429` and the message `thread pool is saturated; retry later`. An async query is not failed: it goes back to the queue as `PENDING` and starts again when the pools have room.
 
 ### Limitations
 
@@ -737,7 +740,7 @@ Expected output:
 }
 ```
 
-If the query is still running when the wait expires, the response is:
+If the query is still running when the wait expires, the response is below. `status` is `PENDING` instead when the query is waiting for capacity (see [Capacity limits](#capacity-limits)).
 
 ```json
 {
@@ -749,7 +752,7 @@ If the query is still running when the wait expires, the response is:
 }
 ```
 
-The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED` or `FAILED`):
+The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED` or `FAILED`). While the query waits or runs, GET returns `PENDING` or `RUNNING`:
 
 ```
 GET    /_plugins/_async_query/<id>

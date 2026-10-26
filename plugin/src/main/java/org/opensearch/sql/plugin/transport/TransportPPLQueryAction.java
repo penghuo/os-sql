@@ -317,14 +317,18 @@ public class TransportPPLQueryAction
       throw new IllegalArgumentException("Async PPL queries require a cancellable PPLQueryTask");
     }
     Runnable cancelExecution = () -> pplQueryTask.cancel("async PPL query cancelled");
-    QueryRunner runner =
-        new PPLQueryRunner(
-            pplService,
-            transformedRequest,
-            anonymizedQuerySink,
-            Clock.systemUTC(),
-            cancelExecution);
     ThreadContext threadContext = clientRef.threadPool().getThreadContext();
+    // A queued job starts later on another thread; the wrapper restores this request's context.
+    QueryRunner runner =
+        new ContextPreservingQueryRunner(
+            new PPLQueryRunner(
+                pplService,
+                transformedRequest,
+                anonymizedQuerySink,
+                Clock.systemUTC(),
+                cancelExecution),
+            threadContext,
+            pplQueryTask);
     ActionListener<TransportPPLQueryResponse> ctxListener =
         ContextPreservingActionListener.wrapPreservingContext(listener, threadContext);
     ResponseListener<ExecutionEngine.QueryResponse> responseListener =
@@ -383,7 +387,7 @@ public class TransportPPLQueryAction
   private static String formatRunning(org.opensearch.sql.job.QueryResult.Running running) {
     return new JSONObject()
         .put("id", running.id().encode())
-        .put("status", "RUNNING")
+        .put("status", running.state().name())
         .put("schema", new JSONArray())
         .put("datarows", new JSONArray())
         .put("total", 0)

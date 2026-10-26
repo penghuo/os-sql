@@ -13,29 +13,29 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 
 /**
- * Node-local capacity for async query jobs.
+ * Node-local capacity for holding async query jobs.
  *
- * <p>Tracks three quantities against dynamic settings:
+ * <p>Tracks two quantities against dynamic settings:
  *
  * <ul>
- *   <li>jobs that are not yet terminal, against {@code
- *       plugins.ppl.async.node_concurrent_running_queries};
- *   <li>jobs held in the store, against {@code plugins.ppl.async.max_retained_jobs};
+ *   <li>jobs held in the store, whether queued, running, or retained for polling, against {@code
+ *       plugins.ppl.async.max_retained_jobs};
  *   <li>estimated bytes of retained results, against {@code
  *       plugins.ppl.async.max_retained_result_size}.
  * </ul>
  *
- * <p>Admission checks and increments under one lock, so concurrent submits cannot overshoot a
- * limit. Settings are read on every check, so a lowered limit applies to the next submit; jobs
- * already admitted are not evicted. Rejections are {@link OpenSearchStatusException}s with status
- * {@code 429} and a message that names the exhausted setting and nothing else.
+ * <p>How many jobs run at once is the {@link OpenSearchQueryJobScheduler}'s concern; a job over
+ * that limit waits instead of being rejected. Admission checks and increments under one lock, so
+ * concurrent submits cannot overshoot a limit. Settings are read on every check, so a lowered limit
+ * applies to the next submit; jobs already admitted are not evicted. Rejections are {@link
+ * OpenSearchStatusException}s with status {@code 429} and a message that names the exhausted
+ * setting and nothing else.
  */
 public final class QueryJobQuota implements ResultBudget {
 
   private final Settings settings;
   private final Object lock = new Object();
 
-  private int running;
   private int jobs;
   private long resultBytes;
 
@@ -48,25 +48,20 @@ public final class QueryJobQuota implements ResultBudget {
   }
 
   /**
-   * Admits one new job, counting it as running and stored.
+   * Admits one new job into the store.
    *
-   * @throws OpenSearchStatusException with status {@code 429} when any limit is exhausted
+   * @throws OpenSearchStatusException with status {@code 429} when either limit is exhausted
    */
   void admit() {
-    int maxRunning =
-        settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
     int maxJobs = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS);
     long maxBytes = maxResultBytes();
     Settings.Key exhausted;
     synchronized (lock) {
-      if (running >= maxRunning) {
-        exhausted = Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES;
-      } else if (jobs >= maxJobs) {
+      if (jobs >= maxJobs) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS;
       } else if (resultBytes >= maxBytes) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE;
       } else {
-        running++;
         jobs++;
         return;
       }
@@ -79,22 +74,7 @@ public final class QueryJobQuota implements ResultBudget {
         RestStatus.TOO_MANY_REQUESTS);
   }
 
-  /** Reverts an {@link #admit()} whose job was never published. */
-  void rollback() {
-    synchronized (lock) {
-      running--;
-      jobs--;
-    }
-  }
-
-  /** Releases the running slot of a job that reached a terminal state. Called once per job. */
-  void releaseRunning() {
-    synchronized (lock) {
-      running--;
-    }
-  }
-
-  /** Releases the stored slot of a job removed from the store. Called once per job. */
+  /** Releases the slot of a job removed from the store, or of an admission that was not used. */
   void releaseJob() {
     synchronized (lock) {
       jobs--;
@@ -129,13 +109,6 @@ public final class QueryJobQuota implements ResultBudget {
   public void release(long bytes) {
     synchronized (lock) {
       resultBytes -= bytes;
-    }
-  }
-
-  /** Jobs admitted and not yet terminal. */
-  public int running() {
-    synchronized (lock) {
-      return running;
     }
   }
 

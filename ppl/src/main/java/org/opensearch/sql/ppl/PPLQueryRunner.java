@@ -99,6 +99,12 @@ public final class PPLQueryRunner implements QueryRunner {
     return future;
   }
 
+  /** Returns an unstarted runner for the same request, reusing the same cancellation hook. */
+  @Override
+  public QueryRunner newAttempt() {
+    return new PPLQueryRunner(pplService, request, anonymizedQuerySink, clock, cancelExecution);
+  }
+
   @Override
   public void cancel() {
     // Unlike cancel(false), this returns true only for the call that performs the transition.

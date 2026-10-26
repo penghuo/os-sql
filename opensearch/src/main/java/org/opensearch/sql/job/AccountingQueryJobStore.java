@@ -15,8 +15,7 @@ import java.util.Optional;
  * <p>{@link #register(QueryJob)} is the admission point: a job that does not fit is rejected before
  * it is published or started. {@link #remove(QueryJobId, QueryJob)} is the single release point for
  * the stored slot and the retained result charge, whichever path removes the job: inline
- * completion, DELETE, retention eviction, or {@link #close()}. The running slot is released when
- * the job reaches a terminal state.
+ * completion, DELETE, retention eviction, or {@link #close()}.
  */
 public final class AccountingQueryJobStore implements QueryJobStore {
 
@@ -47,15 +46,13 @@ public final class AccountingQueryJobStore implements QueryJobStore {
     try {
       existing = delegate.register(job);
     } catch (RuntimeException e) {
-      quota.rollback();
+      quota.releaseJob();
       throw e;
     }
     if (existing != null) {
-      quota.rollback();
-      return existing;
+      quota.releaseJob();
     }
-    job.onTerminal(quota::releaseRunning);
-    return null;
+    return existing;
   }
 
   @Override

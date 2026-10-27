@@ -44,8 +44,6 @@ public abstract class Settings {
     PPL_ASYNC_MAX_QUEUED_QUERIES("plugins.ppl.async.max_queued_queries"),
     PPL_ASYNC_MAX_QUEUED_TIME("plugins.ppl.async.max_queued_time"),
     PPL_ASYNC_MAX_RETAINED_RESULT_SIZE("plugins.ppl.async.max_retained_result_size"),
-    PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT("plugins.ppl.async.max_wait_for_completion_timeout"),
-    PPL_ASYNC_MAX_KEEP_ALIVE("plugins.ppl.async.max_keep_alive"),
 
     /** Enable Calcite as execution engine */
     CALCITE_ENGINE_ENABLED("plugins.calcite.enabled"),

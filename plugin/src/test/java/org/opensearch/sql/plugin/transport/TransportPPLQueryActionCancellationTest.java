@@ -19,7 +19,6 @@ import static org.mockito.Mockito.when;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
@@ -28,7 +27,6 @@ import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.tasks.TaskId;
@@ -53,8 +51,6 @@ public class TransportPPLQueryActionCancellationTest {
   private final PPLService pplService = mock(PPLService.class);
   private final NodeClient client = mock(NodeClient.class);
   private final SecurityAdapter security = mock(SecurityAdapter.class);
-  private final org.opensearch.sql.common.setting.Settings settings =
-      mock(org.opensearch.sql.common.setting.Settings.class);
   private final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
 
   @SuppressWarnings("unchecked")
@@ -69,14 +65,6 @@ public class TransportPPLQueryActionCancellationTest {
     setField("clientRef", client);
     setField("queryJobService", jobs);
     setField("securityAdapter", security);
-    setField("pluginSettingsRef", settings);
-    when(settings.getSettingValue(
-            org.opensearch.sql.common.setting.Settings.Key
-                .PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT))
-        .thenReturn(TimeValue.timeValueSeconds(60));
-    when(settings.getSettingValue(
-            org.opensearch.sql.common.setting.Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE))
-        .thenReturn(TimeValue.timeValueHours(24));
     ThreadPool pool = mock(ThreadPool.class);
     when(client.threadPool()).thenReturn(pool);
     when(pool.getThreadContext()).thenReturn(threadContext);
@@ -122,31 +110,6 @@ public class TransportPPLQueryActionCancellationTest {
     assertTrue(task.isCancelled());
     assertEquals("async PPL query cancelled", task.getReasonCancelled());
     verifyNoInteractions(pplService);
-  }
-
-  @Test
-  public void defaultWaitAndKeepAliveAreCappedByTheConfiguredMaximums() throws Exception {
-    when(settings.getSettingValue(
-            org.opensearch.sql.common.setting.Settings.Key
-                .PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT))
-        .thenReturn(TimeValue.timeValueSeconds(5));
-    when(settings.getSettingValue(
-            org.opensearch.sql.common.setting.Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE))
-        .thenReturn(TimeValue.timeValueMinutes(1));
-    PPLQueryTask task =
-        new TransportPPLQueryRequest("source=test", null, "/_plugins/_ppl")
-            .createTask(1, "transport", PPLQueryAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
-    when(security.current()).thenReturn(Principal.UNSECURED);
-    when(jobs.submit(any(), any(), any(), any()))
-        .thenReturn(
-            CompletableFuture.completedFuture(
-                new QueryResult.Running(new QueryJobId("owner-node", "query-context"))));
-
-    submit(task);
-
-    verify(jobs)
-        .submit(
-            any(), eq(Principal.UNSECURED), eq(Duration.ofSeconds(5)), eq(Duration.ofMinutes(1)));
   }
 
   private void submit(Task task) throws Exception {

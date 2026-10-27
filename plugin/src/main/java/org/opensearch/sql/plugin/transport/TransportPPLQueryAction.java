@@ -11,7 +11,6 @@ import static org.opensearch.sql.lang.PPLLangSpec.PPL_SPEC;
 import static org.opensearch.sql.protocol.response.format.JsonResponseFormatter.Style.PRETTY;
 
 import java.time.Clock;
-import java.time.Duration;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
@@ -32,7 +31,6 @@ import org.opensearch.common.inject.Guice;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.ModulesBuilder;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.common.response.ResponseListener;
@@ -339,10 +337,8 @@ public class TransportPPLQueryAction
           queryJobService.submit(
               runner,
               securityAdapter.current(),
-              transformedRequest.effectiveWaitForCompletion(
-                  settingDuration(Settings.Key.PPL_ASYNC_MAX_WAIT_FOR_COMPLETION_TIMEOUT)),
-              transformedRequest.effectiveKeepAlive(
-                  settingDuration(Settings.Key.PPL_ASYNC_MAX_KEEP_ALIVE)));
+              transformedRequest.effectiveWaitForCompletion(),
+              transformedRequest.effectiveKeepAlive());
     } catch (RuntimeException e) {
       responseListener.onFailure(e);
       return;
@@ -373,11 +369,6 @@ public class TransportPPLQueryAction
                 ctxListener.onResponse(new TransportPPLQueryResponse(formatRunning(running)));
           }
         });
-  }
-
-  private Duration settingDuration(Settings.Key key) {
-    TimeValue value = pluginSettingsRef.getSettingValue(key);
-    return Duration.ofMillis(value.millis());
   }
 
   /**

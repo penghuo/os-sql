@@ -538,38 +538,12 @@ The memory budget for results that async PPL queries retain for polling on one n
 2. This setting is node scope.
 3. This setting can be updated dynamically.
 
-## plugins.ppl.async.max_wait_for_completion_timeout
-
-### Version
-
-3.10
-
-### Description
-
-The largest `wait_for_completion_timeout` an async submit accepts; larger values are rejected with `400`. When a request omits the field, its `30s` default is capped at this value.
-1. The default value is `60s`; the minimum is `0s`.
-2. This setting is node scope.
-3. This setting can be updated dynamically.
-
-## plugins.ppl.async.max_keep_alive
-
-### Version
-
-3.10
-
-### Description
-
-The largest `keep_alive` an async submit accepts; larger values are rejected with `400`. When a request omits the field, its `5m` default is capped at this value. Lowering it applies to new submits only.
-1. The default value is `24h`.
-2. This setting is node scope.
-3. This setting can be updated dynamically.
-
 ### Example
 
-Allow at most 10 running async queries per node and retain their results for at most one hour:
+Allow at most 10 running async queries and 50 queued ones per node:
 
 ```bash ignore
 curl -sS -H 'Content-Type: application/json' \
 -X PUT localhost:9200/_plugins/_query/settings \
--d '{"transient" : {"plugins.ppl.async.node_concurrent_running_queries" : 10, "plugins.ppl.async.max_keep_alive" : "1h"}}'
+-d '{"transient" : {"plugins.ppl.async.node_concurrent_running_queries" : 10, "plugins.ppl.async.max_queued_queries" : 50}}'
 ```

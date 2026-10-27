@@ -670,10 +670,8 @@ Parameters:
 
 | Field | Type | Default | Limit | Description |
 |---|---|---|---|---|
-| `wait_for_completion_timeout` | time value string (e.g. `"5s"`, `"0"`) | `30s` when either async field is present | `0s` – `plugins.ppl.async.max_wait_for_completion_timeout` (default `60s`, inclusive); values outside the range are rejected with `400`. | Maximum time the submit response will wait for the query to finish. For complex queries, the submit response may take slightly longer than this value. |
-| `keep_alive` | time value string (e.g. `"5m"`) | `5m` | `> 0`, `≤ plugins.ppl.async.max_keep_alive` (default `24h`); values outside the range are rejected with `400`. | How long a terminal result is retained after completion. A subsequent GET on the id succeeds within this window and returns `404` afterwards, or as soon as the job is deleted. |
-
-A default that exceeds its configured limit is capped at the limit rather than rejected.
+| `wait_for_completion_timeout` | time value string (e.g. `"5s"`, `"0"`) | `30s` when either async field is present | `0s` – `60s` (inclusive); values outside the range are rejected with `400`. | Maximum time the submit response will wait for the query to finish. For complex queries, the submit response may take slightly longer than this value. |
+| `keep_alive` | time value string (e.g. `"5m"`) | `5m` | `> 0`, `≤ 24h`; values outside the range are rejected with `400`. | How long a terminal result is retained after completion. A subsequent GET on the id succeeds within this window and returns `404` afterwards, or as soon as the job is deleted. |
 
 ### Capacity limits
 

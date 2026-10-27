@@ -11,7 +11,6 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-import java.time.Duration;
 import java.util.List;
 import org.json.JSONObject;
 import org.junit.Rule;
@@ -328,23 +327,5 @@ public class PPLQueryRequestTest {
 
   private static PPLQueryRequest pplRequest(String body) {
     return new PPLQueryRequest("source=t", new JSONObject(body), "/_plugins/_ppl");
-  }
-
-  @Test
-  public void effectiveAsyncDurationsCapOnlyTheDefaults() {
-    PPLQueryRequest request = new PPLQueryRequest("source=t", null, null, "jdbc");
-    assertEquals(
-        Duration.ofSeconds(10), request.effectiveWaitForCompletion(Duration.ofSeconds(10)));
-    assertEquals(
-        PPLQueryRequest.DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT,
-        request.effectiveWaitForCompletion(Duration.ofSeconds(60)));
-    assertEquals(Duration.ofMinutes(1), request.effectiveKeepAlive(Duration.ofMinutes(1)));
-    assertEquals(
-        PPLQueryRequest.DEFAULT_KEEP_ALIVE, request.effectiveKeepAlive(Duration.ofHours(24)));
-
-    request.waitForCompletionTimeout(Duration.ofSeconds(45)).keepAlive(Duration.ofHours(2));
-    assertEquals(
-        Duration.ofSeconds(45), request.effectiveWaitForCompletion(Duration.ofSeconds(10)));
-    assertEquals(Duration.ofHours(2), request.effectiveKeepAlive(Duration.ofMinutes(1)));
   }
 }

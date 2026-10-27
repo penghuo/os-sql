@@ -41,22 +41,17 @@ public class PPLQueryRequestFactory {
   private static final String QUERY_PARAMS_KEEP_ALIVE = "keep_alive";
 
   /**
-   * Build {@link PPLQueryRequest} from {@link RestRequest}, bounding the async fields.
+   * Build {@link PPLQueryRequest} from {@link RestRequest}.
    *
-   * @param request REST request to parse
-   * @param maxWaitForCompletion largest accepted {@code wait_for_completion_timeout}
-   * @param maxKeepAlive largest accepted {@code keep_alive}
-   * @return the parsed request
-   * @throws IllegalArgumentException when the request is malformed or an async field is out of
-   *     range
+   * @param request {@link PPLQueryRequest}
+   * @return {@link RestRequest}
    */
-  public static PPLQueryRequest getPPLRequest(
-      RestRequest request, Duration maxWaitForCompletion, Duration maxKeepAlive) {
+  public static PPLQueryRequest getPPLRequest(RestRequest request) {
     switch (request.method()) {
       case GET:
         return parsePPLRequestFromUrl(request);
       case POST:
-        return parsePPLRequestFromPayload(request, maxWaitForCompletion, maxKeepAlive);
+        return parsePPLRequestFromPayload(request);
       default:
         throw new IllegalArgumentException(
             "OpenSearch PPL doesn't supported HTTP " + request.method().name());
@@ -73,8 +68,7 @@ public class PPLQueryRequestFactory {
     return new PPLQueryRequest(ppl, null, restRequest.path());
   }
 
-  private static PPLQueryRequest parsePPLRequestFromPayload(
-      RestRequest restRequest, Duration maxWaitForCompletion, Duration maxKeepAlive) {
+  private static PPLQueryRequest parsePPLRequestFromPayload(RestRequest restRequest) {
     String content = restRequest.content().utf8ToString();
     JSONObject jsonContent;
     Format format = getFormat(restRequest.params(), restRequest.rawPath());
@@ -149,7 +143,7 @@ public class PPLQueryRequestFactory {
                 jsonContent.getString(QUERY_PARAMS_WAIT_FOR_COMPLETION_TIMEOUT),
                 QUERY_PARAMS_WAIT_FOR_COMPLETION_TIMEOUT,
                 Duration.ZERO,
-                maxWaitForCompletion));
+                Duration.ofSeconds(60)));
       }
       if (jsonContent.has(QUERY_PARAMS_KEEP_ALIVE)) {
         pplRequest.keepAlive(
@@ -157,7 +151,7 @@ public class PPLQueryRequestFactory {
                 jsonContent.getString(QUERY_PARAMS_KEEP_ALIVE),
                 QUERY_PARAMS_KEEP_ALIVE,
                 Duration.ofMillis(1),
-                maxKeepAlive));
+                Duration.ofHours(24)));
       }
       return pplRequest;
     } catch (JSONException e) {

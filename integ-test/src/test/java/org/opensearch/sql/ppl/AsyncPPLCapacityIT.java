@@ -226,27 +226,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     submitAccepted(QUICK_QUERY);
   }
 
-  @Test
-  public void waitAndKeepAliveLimitsFollowDynamicSettings() throws Exception {
-    setClusterSetting("plugins.ppl.async.max_wait_for_completion_timeout", "5s");
-    setClusterSetting("plugins.ppl.async.max_keep_alive", "1m");
-
-    assertBadRequest(
-        new JSONObject().put("query", QUICK_QUERY).put("wait_for_completion_timeout", "10s"));
-    assertBadRequest(new JSONObject().put("query", QUICK_QUERY).put("keep_alive", "2m"));
-    JSONObject withinLimits =
-        new JSONObject(
-            postPpl(
-                client(),
-                new JSONObject()
-                    .put("query", QUICK_QUERY)
-                    .put("wait_for_completion_timeout", "5s")
-                    .put("keep_alive", "1m")));
-    Assert.assertTrue(withinLimits.has("datarows"));
-    // The 5m keep_alive default exceeds the 1m limit; it is capped instead of rejected.
-    submitAccepted(QUICK_QUERY);
-  }
-
   /** Submits with {@code wait_for_completion_timeout=0}, expects it accepted, returns its id. */
   private String submitAccepted(String query) throws IOException {
     JSONObject response = submitAsync(query);
@@ -282,12 +261,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   private String submit(String query) throws IOException {
     return postPpl(
         client(), new JSONObject().put("query", query).put("wait_for_completion_timeout", "0"));
-  }
-
-  private void assertBadRequest(JSONObject body) {
-    ResponseException e =
-        Assert.assertThrows(ResponseException.class, () -> postPpl(client(), body));
-    Assert.assertEquals(400, e.getResponse().getStatusLine().getStatusCode());
   }
 
   private static String errorBody(ResponseException e) throws IOException {

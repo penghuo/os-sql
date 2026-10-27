@@ -125,8 +125,6 @@ The scheduler works like a thread pool executor with a bounded work queue. A job
 | `plugins.ppl.async.max_queued_time` | `5m` | Scheduler |
 | `plugins.ppl.async.max_retained_jobs` | `100` | `AccountingQueryJobStore` and `QueryJobQuota` |
 | `plugins.ppl.async.max_retained_result_size` | `10%` of heap | `QueryJobQuota` |
-| `plugins.ppl.async.max_wait_for_completion_timeout` | `60s` | `PPLQueryRequestFactory` |
-| `plugins.ppl.async.max_keep_alive` | `24h` | `PPLQueryRequestFactory` |
 
 All settings are dynamic and read on every decision. A lowered limit applies to the next submit; jobs already admitted are not evicted.
 

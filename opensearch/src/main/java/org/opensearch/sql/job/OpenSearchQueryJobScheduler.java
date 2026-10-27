@@ -30,39 +30,60 @@ import org.opensearch.threadpool.ThreadPool;
  * submit beyond both is rejected with {@code 429}, like a thread pool executor with a bounded work
  * queue.
  *
- * <p>A queued job stays {@code PENDING} until a running job finishes. It fails if it waits longer
- * than {@code plugins.ppl.async.max_queued_time}. A running job whose worker pool is saturated goes
- * back to the head of the queue. No queued job starts until {@link #RETRY_DELAY} has passed, so a
- * saturated pool is not hit with a retry for every job that finishes. Jobs start one at a time, and
- * starting stops at the first refusal.
+ * <p>A job whose worker pool is saturated gives up its running slot and backs off on its own:
+ * {@link #INITIAL_BACKOFF}, doubling up to {@link #MAX_BACKOFF}. It then returns to the head of the
+ * queue. Other jobs keep starting meanwhile, as in OpenSearch's retries of rejected executions.
+ *
+ * <p>A job may wait, queued or backing off, for at most {@code plugins.ppl.async.max_queued_time}
+ * in total, counted from when it first had to wait. After that it ends {@code FAILED}.
  *
  * <h2>Thread safety</h2>
  *
- * Queue and running set are guarded by {@code lock}. Jobs are started and failed after the lock is
- * released; a job never calls back into the scheduler while holding its own monitor, so the lock
- * order is always scheduler, then job.
+ * All state is guarded by {@code lock}. Jobs are started and failed after the lock is released; a
+ * job never calls back into the scheduler while holding its own monitor, so the lock order is
+ * always scheduler, then job.
  */
 public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
 
-  /** Delay before a job refused by a saturated worker pool is tried again. */
-  static final TimeValue RETRY_DELAY = TimeValue.timeValueSeconds(1);
+  /** First wait after a worker pool refuses a job. */
+  static final TimeValue INITIAL_BACKOFF = TimeValue.timeValueMillis(500);
+
+  /** Longest wait between two attempts of a refused job. */
+  static final TimeValue MAX_BACKOFF = TimeValue.timeValueSeconds(8);
 
   private static final Logger LOG = LogManager.getLogger(OpenSearchQueryJobScheduler.class);
+
+  /** Marks a wait deadline that has fired. */
+  private static final Cancellable EXPIRED =
+      new Cancellable() {
+        @Override
+        public boolean cancel() {
+          return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+          return false;
+        }
+      };
 
   private final Settings settings;
   private final ThreadPool threadPool;
   private final Object lock = new Object();
   private final Set<QueryJob> running = Collections.newSetFromMap(new IdentityHashMap<>());
   private final Deque<QueryJob> queue = new ArrayDeque<>();
-  private final Map<QueryJob, Cancellable> queueTimeouts = new IdentityHashMap<>();
-  // A worker pool refused a job; nothing starts until the retry timer fires.
-  private boolean paused;
+  // Refused jobs waiting out their backoff, with the timer that puts them back in the queue.
+  private final Map<QueryJob, Cancellable> backingOff = new IdentityHashMap<>();
+  // Refusals so far, per job; sets the next backoff.
+  private final Map<QueryJob, Integer> refusals = new IdentityHashMap<>();
+  // Fails a job still waiting when its total wait runs out; armed when the job first waits.
+  private final Map<QueryJob, Cancellable> waitDeadlines = new IdentityHashMap<>();
   // Marks a thread that is draining, so a drain triggered while starting a job does not nest.
   private final ThreadLocal<Boolean> draining = ThreadLocal.withInitial(() -> false);
 
   /**
    * @param settings plugin settings the limits are read from on every decision
-   * @param threadPool runs the queue timeout and retry timers on the generic pool
+   * @param threadPool runs the backoff and wait deadline timers on the generic pool
    * @throws NullPointerException if either argument is {@code null}
    */
   public OpenSearchQueryJobScheduler(Settings settings, ThreadPool threadPool) {
@@ -84,7 +105,7 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     int maxQueued = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES);
     boolean startNow;
     synchronized (lock) {
-      startNow = !paused && queue.isEmpty() && running.size() < maxRunning;
+      startNow = queue.isEmpty() && running.size() < maxRunning;
       if (startNow) {
         running.add(job);
       } else if (queue.size() >= maxQueued) {
@@ -95,7 +116,8 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
                 Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES.getKeyValue()),
             RestStatus.TOO_MANY_REQUESTS);
       } else {
-        addToQueue(job, false);
+        queue.addLast(job);
+        armWaitDeadline(job);
       }
     }
     job.onTerminal(() -> onTerminal(job));
@@ -112,29 +134,31 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     return ExceptionsHelper.unwrap(failure, WorkerPoolSaturatedException.class) != null;
   }
 
+  /** Frees the refused job's slot and puts it back in the queue after its backoff. */
   @Override
   public void requeue(QueryJob job) {
-    boolean scheduleRetry;
+    boolean waitExpired = false;
     synchronized (lock) {
       running.remove(job);
-      scheduleRetry = !paused;
-      paused = true;
-    }
-    enqueue(job, true);
-    if (scheduleRetry) {
-      try {
-        threadPool.schedule(this::resume, RETRY_DELAY, ThreadPool.Names.GENERIC);
-      } catch (RuntimeException e) {
-        LOG.warn("Failed to schedule a retry of a queued async query", e);
-        resume();
+      // Not pending when cancelled while being refused; its terminal hook cleans up.
+      if (job.isPending()) {
+        waitExpired = !armWaitDeadline(job);
+        if (!waitExpired) {
+          int attempt = refusals.merge(job, 1, Integer::sum);
+          // The timer takes the lock, so it cannot run before the job is recorded below.
+          Cancellable timer = scheduleBackoff(job, backoff(attempt));
+          if (timer == null) {
+            queue.addFirst(job);
+          } else {
+            backingOff.put(job, timer);
+          }
+        }
       }
     }
-  }
-
-  private void resume() {
-    synchronized (lock) {
-      paused = false;
+    if (waitExpired) {
+      failWaitedTooLong(job);
     }
+    // The freed slot can start another job while this one backs off.
     drain();
   }
 
@@ -145,37 +169,42 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     }
   }
 
-  /** Jobs waiting to start. */
+  /** Jobs waiting to start, queued or backing off. */
   public int queued() {
     synchronized (lock) {
-      return queue.size();
+      return queue.size() + backingOff.size();
     }
-  }
-
-  /** Puts a requeued job back at the head of the queue; the queue limit does not apply. */
-  private void enqueue(QueryJob job, boolean atHead) {
-    synchronized (lock) {
-      if (!job.isPending()) {
-        // Cancelled before it could be queued; its terminal hook has already run.
-        return;
-      }
-      addToQueue(job, atHead);
-    }
-  }
-
-  /** Must hold {@code lock}. */
-  private void addToQueue(QueryJob job, boolean atHead) {
-    if (atHead) {
-      queue.addFirst(job);
-    } else {
-      queue.addLast(job);
-    }
-    queueTimeouts.put(job, scheduleQueueTimeout(job));
   }
 
   /**
-   * Starts queued jobs one at a time while running slots are free and no pool refusal is pending.
+   * The wait after a job's {@code refusals}-th refusal: {@link #INITIAL_BACKOFF} doubled, capped.
    */
+  static TimeValue backoff(int refusals) {
+    long millis = INITIAL_BACKOFF.millis() << Math.min(refusals - 1, 16);
+    return TimeValue.timeValueMillis(Math.min(millis, MAX_BACKOFF.millis()));
+  }
+
+  private Cancellable scheduleBackoff(QueryJob job, TimeValue delay) {
+    try {
+      return threadPool.schedule(() -> onBackoffElapsed(job), delay, ThreadPool.Names.GENERIC);
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to schedule the retry of a refused async query", e);
+      return null;
+    }
+  }
+
+  private void onBackoffElapsed(QueryJob job) {
+    synchronized (lock) {
+      if (!backingOff.containsKey(job)) {
+        return;
+      }
+      backingOff.remove(job);
+      queue.addFirst(job);
+    }
+    drain();
+  }
+
+  /** Starts queued jobs one at a time while running slots are free. */
   private void drain() {
     if (draining.get()) {
       // Called back while this thread starts a job; the loop below picks up the free slot.
@@ -187,24 +216,18 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
         int maxRunning =
             settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
         QueryJob next;
-        Cancellable timeout;
-        boolean start;
         synchronized (lock) {
-          if (paused || running.size() >= maxRunning || queue.isEmpty()) {
+          if (running.size() >= maxRunning || queue.isEmpty()) {
             return;
           }
           next = queue.pollFirst();
-          timeout = queueTimeouts.remove(next);
-          start = next.isPending();
-          if (start) {
-            running.add(next);
+          if (!next.isPending()) {
+            continue;
           }
+          running.add(next);
         }
-        cancel(timeout);
-        if (start) {
-          // May requeue the job, and pause starting, when the worker pool refuses it.
-          next.startRunner();
-        }
+        // May requeue the job when the worker pool refuses it.
+        next.startRunner();
       }
     } finally {
       draining.set(false);
@@ -213,37 +236,64 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
 
   private void onTerminal(QueryJob job) {
     boolean freedSlot;
-    Cancellable timeout = null;
+    Cancellable backoff;
+    Cancellable deadline;
     synchronized (lock) {
       freedSlot = running.remove(job);
-      if (!freedSlot && queue.remove(job)) {
-        timeout = queueTimeouts.remove(job);
-      }
+      queue.remove(job);
+      backoff = backingOff.remove(job);
+      deadline = waitDeadlines.remove(job);
+      refusals.remove(job);
     }
-    cancel(timeout);
+    cancel(backoff);
+    cancel(deadline);
     if (freedSlot) {
       drain();
     }
   }
 
-  private Cancellable scheduleQueueTimeout(QueryJob job) {
-    TimeValue maxQueuedTime = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME);
-    try {
-      return threadPool.schedule(
-          () -> onQueueTimeout(job, maxQueuedTime), maxQueuedTime, ThreadPool.Names.GENERIC);
-    } catch (RuntimeException e) {
-      LOG.warn("Failed to schedule the queue timeout of an async query", e);
-      return null;
+  /**
+   * Arms the job's wait deadline the first time it has to wait. Must hold {@code lock}.
+   *
+   * @return {@code false} if the deadline has already fired, so the job may not wait again
+   */
+  private boolean armWaitDeadline(QueryJob job) {
+    if (waitDeadlines.containsKey(job)) {
+      return waitDeadlines.get(job) != EXPIRED;
     }
+    TimeValue maxQueuedTime = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME);
+    Cancellable deadline;
+    try {
+      deadline =
+          threadPool.schedule(() -> onWaitDeadline(job), maxQueuedTime, ThreadPool.Names.GENERIC);
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to schedule the wait deadline of an async query", e);
+      deadline = null;
+    }
+    waitDeadlines.put(job, deadline);
+    return true;
   }
 
-  private void onQueueTimeout(QueryJob job, TimeValue maxQueuedTime) {
+  private void onWaitDeadline(QueryJob job) {
+    Cancellable backoff;
     synchronized (lock) {
-      if (!queue.remove(job)) {
+      if (!waitDeadlines.containsKey(job)) {
         return;
       }
-      queueTimeouts.remove(job);
+      waitDeadlines.put(job, EXPIRED);
+      boolean wasBackingOff = backingOff.containsKey(job);
+      backoff = backingOff.remove(job);
+      if (!queue.remove(job) && !wasBackingOff) {
+        // Running now; if it is refused again, requeue fails it instead of waiting.
+        return;
+      }
     }
+    cancel(backoff);
+    failWaitedTooLong(job);
+  }
+
+  private void failWaitedTooLong(QueryJob job) {
+    TimeValue maxQueuedTime = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME);
     job.failQueued(
         new OpenSearchStatusException(
             String.format(
@@ -255,7 +305,7 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
   }
 
   private static void cancel(Cancellable timer) {
-    if (timer != null) {
+    if (timer != null && timer != EXPIRED) {
       timer.cancel();
     }
   }

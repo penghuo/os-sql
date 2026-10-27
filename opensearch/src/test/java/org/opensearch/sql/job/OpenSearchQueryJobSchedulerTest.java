@@ -11,7 +11,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -82,12 +85,16 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void startedJobCancelsItsQueueTimeout() {
+  void finishedJobCancelsItsWaitDeadline() {
     Runner first = new Runner();
     submit(first);
-    submit(new Runner());
-
+    Runner queued = new Runner();
+    submit(queued);
     first.future.complete(ROWS);
+    assertTrue(queued.ran);
+    verify(timer, never()).cancel();
+
+    queued.future.complete(ROWS);
 
     verify(timer).cancel();
   }
@@ -147,7 +154,7 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void saturatedWorkerPoolRequeuesTheJobAndRetriesIt() {
+  void refusedJobBacksOffAndThenRunsAgain() {
     Runner retry = new Runner();
     Runner refused = new Runner(retry);
     QueryJob job = submit(refused);
@@ -158,14 +165,8 @@ class OpenSearchQueryJobSchedulerTest {
     assertTrue(job.status().startedAtMillis().isEmpty());
     assertEquals(0, scheduler.running());
     assertEquals(1, scheduler.queued());
-    ArgumentCaptor<Runnable> retryTimer = ArgumentCaptor.forClass(Runnable.class);
-    verify(threadPool)
-        .schedule(
-            retryTimer.capture(),
-            eq(OpenSearchQueryJobScheduler.RETRY_DELAY),
-            eq(ThreadPool.Names.GENERIC));
-
-    retryTimer.getValue().run();
+    Runnable backoff = captureSchedule(OpenSearchQueryJobScheduler.INITIAL_BACKOFF);
+    backoff.run();
     retry.future.complete(ROWS);
 
     assertTrue(retry.ran);
@@ -174,7 +175,7 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void requeuedJobGoesAheadOfJobsAlreadyWaiting() {
+  void otherJobsUseTheSlotWhileARefusedJobBacksOff() {
     Runner retry = new Runner();
     Runner refused = new Runner(retry);
     submit(refused);
@@ -182,54 +183,97 @@ class OpenSearchQueryJobSchedulerTest {
     submit(waiting);
 
     refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
-    ArgumentCaptor<Runnable> timers = ArgumentCaptor.forClass(Runnable.class);
-    verify(threadPool, org.mockito.Mockito.atLeastOnce())
-        .schedule(timers.capture(), eq(OpenSearchQueryJobScheduler.RETRY_DELAY), any());
-    timers.getValue().run();
 
+    assertTrue(waiting.ran);
+    Runner later = new Runner();
+    submit(later);
+    captureSchedule(OpenSearchQueryJobScheduler.INITIAL_BACKOFF).run();
+    waiting.future.complete(ROWS);
     assertTrue(retry.ran);
-    assertFalse(waiting.ran);
+    assertFalse(later.ran);
   }
 
   @Test
-  void refusalPausesStartsUntilTheRetryTimerFires() {
+  void newSubmitsStartWhileARefusedJobBacksOff() {
     settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 2);
-    Runner other = new Runner();
-    submit(other);
     Runner refused = new Runner(new Runner());
     submit(refused);
     refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
-    Runner submittedWhilePaused = new Runner();
-    submit(submittedWhilePaused);
 
-    other.future.complete(ROWS);
+    Runner fresh = new Runner();
+    submit(fresh);
 
-    assertFalse(submittedWhilePaused.ran);
-    assertEquals(2, scheduler.queued());
-    ArgumentCaptor<Runnable> retryTimer = ArgumentCaptor.forClass(Runnable.class);
-    verify(threadPool)
-        .schedule(retryTimer.capture(), eq(OpenSearchQueryJobScheduler.RETRY_DELAY), any());
-    retryTimer.getValue().run();
-    assertTrue(submittedWhilePaused.ran);
+    assertTrue(fresh.ran);
+  }
+
+  @Test
+  void backoffDoublesFromTheInitialDelayUpToTheCap() {
+    assertEquals(TimeValue.timeValueMillis(500), OpenSearchQueryJobScheduler.backoff(1));
+    assertEquals(TimeValue.timeValueSeconds(1), OpenSearchQueryJobScheduler.backoff(2));
+    assertEquals(TimeValue.timeValueSeconds(2), OpenSearchQueryJobScheduler.backoff(3));
+    assertEquals(TimeValue.timeValueSeconds(4), OpenSearchQueryJobScheduler.backoff(4));
+    assertEquals(TimeValue.timeValueSeconds(8), OpenSearchQueryJobScheduler.backoff(5));
+    assertEquals(TimeValue.timeValueSeconds(8), OpenSearchQueryJobScheduler.backoff(6));
+    assertEquals(TimeValue.timeValueSeconds(8), OpenSearchQueryJobScheduler.backoff(100));
+  }
+
+  @Test
+  void eachRefusalOfTheSameJobBacksOffLonger() {
+    RefusingRunner refusing = new RefusingRunner();
+    submit(refusing);
+    captureSchedule(OpenSearchQueryJobScheduler.backoff(1)).run();
+
+    captureSchedule(OpenSearchQueryJobScheduler.backoff(2)).run();
+
+    captureSchedule(OpenSearchQueryJobScheduler.backoff(3));
+    assertEquals(3, refusing.attempts);
+  }
+
+  @Test
+  void waitDeadlineFailsAJobThatIsBackingOff() {
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueSeconds(30));
+    RefusingRunner refusing = new RefusingRunner();
+    QueryJob job = submit(refusing);
+    Runnable deadline = captureSchedule(TimeValue.timeValueSeconds(30));
+
+    deadline.run();
+
+    QueryJobStatus status = job.status();
+    assertEquals(QueryJobState.FAILED, status.state());
+    assertEquals(
+        "Async query waited longer than [30s] for capacity"
+            + " [plugins.ppl.async.max_queued_time]; retry later",
+        status.failure().orElseThrow().reason());
     assertEquals(0, scheduler.queued());
   }
 
   @Test
-  void startingStopsAtTheFirstRefusal() {
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 1);
-    Runner first = new Runner();
-    submit(first);
+  void waitDeadlineCountsFromTheFirstWaitAcrossRefusals() {
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueSeconds(30));
     RefusingRunner refusing = new RefusingRunner();
     submit(refusing);
-    Runner behind = new Runner();
-    submit(behind);
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 3);
+    captureSchedule(OpenSearchQueryJobScheduler.backoff(1)).run();
 
+    verify(threadPool, times(1))
+        .schedule(any(Runnable.class), eq(TimeValue.timeValueSeconds(30)), any());
+  }
+
+  @Test
+  void refusalAfterTheWaitDeadlineFailsTheJob() {
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueSeconds(30));
+    Runner first = new Runner();
+    submit(first);
+    Runner refused = new Runner(new Runner());
+    QueryJob job = submit(refused);
+    Runnable deadline = captureSchedule(TimeValue.timeValueSeconds(30));
     first.future.complete(ROWS);
+    deadline.run();
+    assertEquals(QueryJobState.RUNNING, job.status().state());
 
-    assertEquals(1, refusing.attempts);
-    assertFalse(behind.ran);
-    assertEquals(2, scheduler.queued());
+    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertEquals(0, scheduler.queued());
   }
 
   /** Runner refused by a saturated pool on every attempt, synchronously like sql-worker. */
@@ -249,6 +293,14 @@ class OpenSearchQueryJobSchedulerTest {
     public QueryRunner newAttempt() {
       return this;
     }
+  }
+
+  /** Returns the last task scheduled on the generic pool with {@code delay}. */
+  private Runnable captureSchedule(TimeValue delay) {
+    ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+    verify(threadPool, atLeastOnce())
+        .schedule(task.capture(), eq(delay), eq(ThreadPool.Names.GENERIC));
+    return task.getValue();
   }
 
   @Test
@@ -276,15 +328,18 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void requeuedJobIsKeptEvenWhenTheQueueIsFull() {
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 2);
+  void refusedJobReentersTheQueueEvenWhenItIsFull() {
     settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 1);
     Runner refused = new Runner(new Runner());
     QueryJob job = submit(refused);
-    submit(new Runner());
-    submit(new Runner());
-
+    Runner second = new Runner();
+    submit(second);
     refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
+    assertTrue(second.ran);
+    submit(new Runner());
+    assertThrows(OpenSearchStatusException.class, () -> submit(new Runner()));
+
+    captureSchedule(OpenSearchQueryJobScheduler.INITIAL_BACKOFF).run();
 
     assertEquals(QueryJobState.PENDING, job.status().state());
     assertEquals(2, scheduler.queued());

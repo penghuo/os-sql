@@ -520,7 +520,7 @@ The maximum number of async PPL queries that wait as `PENDING` on one node becau
 
 ### Description
 
-How long an async PPL query may wait as `PENDING` for a free slot before it ends `FAILED`. The wait starts each time the query is queued.
+How long an async PPL query may wait as `PENDING` in total before it ends `FAILED`. The wait starts the first time the query has to wait, and includes the time spent retrying when the SQL worker pools were full.
 1. The default value is `5m`.
 2. This setting is node scope.
 3. This setting can be updated dynamically.

@@ -685,7 +685,7 @@ A submit is rejected with `429` before the query runs when the queue is full, or
 |---|---|---|
 | `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running at the same time. Queries beyond it wait as `PENDING`. |
 | `plugins.ppl.async.max_queued_queries` | `100` | Queries waiting as `PENDING`. Submits beyond it get `429`. |
-| `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` before it ends `FAILED`. |
+| `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` in total, including retries, before it ends `FAILED`. |
 | `plugins.ppl.async.max_retained_jobs` | `100` | Finished queries kept for polling. Submits get `429` while it is full. |
 | `plugins.ppl.async.max_retained_result_size` | `10%` of heap | Estimated size of the results kept for polling. A query whose result does not fit ends `FAILED` without its rows. Submits get `429` while it is full. |
 
@@ -702,7 +702,7 @@ Example `429` response:
 }
 ```
 
-When the SQL worker thread pools on the node are full, a synchronous query fails with `429` and the message `thread pool is saturated; retry later`. An async query is not failed: it goes back to the queue as `PENDING` and starts again when the pools have room.
+When the SQL worker thread pools on the node are full, a synchronous query fails with `429` and the message `thread pool is saturated; retry later`. An async query is not failed: it waits as `PENDING` and tries again, first after 500 ms and then after twice as long each time, up to 8 seconds between tries. Other queries keep starting meanwhile. It ends `FAILED` if its total wait passes `plugins.ppl.async.max_queued_time`.
 
 ### Limitations
 

@@ -23,6 +23,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -32,6 +33,7 @@ import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.executor.execution.AbstractPlan;
 import org.opensearch.sql.executor.execution.QueryPlan;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
@@ -121,5 +123,45 @@ class OpenSearchQueryManagerTest {
     assertEquals("[sql-worker] thread pool is saturated; retry later", e.getMessage());
     assertFalse(e.isExecutorShutdown());
     assertFalse(isRun.get());
+  }
+
+  @Test
+  public void notifyExecutionStartedReachesAListeningTask() {
+    ListeningTask task = new ListeningTask();
+    OpenSearchQueryManager.setCancellableTask(task);
+    try {
+      OpenSearchQueryManager.notifyExecutionStarted();
+    } finally {
+      OpenSearchQueryManager.clearCancellableTask();
+    }
+    assertEquals(1, task.started);
+
+    // Without a task, or with one that does not listen, there is nothing to notify.
+    OpenSearchQueryManager.notifyExecutionStarted();
+    OpenSearchQueryManager.setCancellableTask(mock(CancellableTask.class));
+    try {
+      OpenSearchQueryManager.notifyExecutionStarted();
+    } finally {
+      OpenSearchQueryManager.clearCancellableTask();
+    }
+  }
+
+  private static final class ListeningTask extends CancellableTask
+      implements ExecutionStartListener {
+    private int started;
+
+    ListeningTask() {
+      super(1, "transport", "action", "", TaskId.EMPTY_TASK_ID, java.util.Map.of());
+    }
+
+    @Override
+    public boolean shouldCancelChildrenOnCancellation() {
+      return false;
+    }
+
+    @Override
+    public void onExecutionStarted() {
+      started++;
+    }
   }
 }

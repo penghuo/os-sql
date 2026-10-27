@@ -139,8 +139,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
         .whenComplete(
             (result, error) -> {
               if (error == null && result instanceof QueryResult.Running) {
-                // Runs before the id is returned to the client.
-                job.retain();
+                // The job was retained when its wait expired; runs before the id is returned.
                 store.retain(job);
                 if (retentionPolicy != null) {
                   retentionPolicy.arm(job, keepAlive);

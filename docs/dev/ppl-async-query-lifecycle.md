@@ -18,17 +18,22 @@ This page explains the states of an async PPL query and how it moves between the
 
 ## Job states
 
-A job has one of five states (`QueryJobState`). `SUCCEEDED`, `FAILED`, and `CANCELLED` are terminal.
+A job has one of five states (`QueryJobState`). `PENDING` means accepted but not yet executing: waiting in the queue, backing off after a worker pool refused it, or being prepared (parsed and planned) on a worker. `RUNNING` means executing. `SUCCEEDED`, `FAILED`, and `CANCELLED` are terminal.
+
+Two rules hold for every job:
+
+- It never returns to an earlier state. In particular, a refused job stays `PENDING`; it never goes from `RUNNING` back to `PENDING`.
+- A terminal state never changes.
 
 ```mermaid
 stateDiagram-v2
   [*] --> PENDING : submit admitted
-  PENDING --> RUNNING : running slot free
-  RUNNING --> PENDING : worker pool full (retry after backoff)
-  RUNNING --> SUCCEEDED : result ready
-  RUNNING --> FAILED : query error, or result over the budget
-  PENDING --> FAILED : waited longer than max_queued_time
+  PENDING --> PENDING : worker pool full, retry after backoff
+  PENDING --> RUNNING : execution starts
+  PENDING --> FAILED : waited too long, node shutting down, or error before execution
   PENDING --> CANCELLED : DELETE
+  RUNNING --> SUCCEEDED : result ready
+  RUNNING --> FAILED : execution error, timeout, or result over the budget
   RUNNING --> CANCELLED : DELETE
   SUCCEEDED --> [*]
   FAILED --> [*]
@@ -37,17 +42,17 @@ stateDiagram-v2
 
 | From | To | Trigger | Code |
 |---|---|---|---|
-| — | `PENDING` | Submit passes the admission check and is published to the store | `OpenSearchQueryJobService.submit` |
-| `PENDING` | `RUNNING` | A running slot is free: at submit, or when another job frees one | `OpenSearchQueryJobScheduler.submit` / `drain`, `QueryJob.startRunner` |
-| `RUNNING` | `PENDING` | `sql-worker` or `sql-complex-worker` refused the task (`WorkerPoolSaturatedException`); the job gets a fresh runner and backs off | `QueryJob.onRunnerFailure`, `OpenSearchQueryJobScheduler.requeue` |
-| `RUNNING` | `SUCCEEDED` | The runner returned a result | `QueryJob.onRunnerSuccess` |
-| `RUNNING` | `FAILED` | The runner failed, or a retained result does not fit the result budget | `QueryJob.onRunnerFailure`, `QueryJob.chargeOrFail` |
-| `PENDING` | `FAILED` | The total wait passed `max_queued_time`, or the node cannot schedule the retry | `OpenSearchQueryJobScheduler.onWaitDeadline`, `QueryJob.failQueued` |
+| — | `PENDING` | Submit passes the admission checks and is published to the store | `OpenSearchQueryJobService.submit` |
+| `PENDING` | `PENDING` | `sql-worker` or `sql-complex-worker` refused the query (`WorkerPoolSaturatedException`) before it executed; the job gets a fresh runner and backs off | `QueryJob.onRunnerFailure`, `OpenSearchQueryJobScheduler.requeue` |
+| `PENDING` | `RUNNING` | The engine begins executing the query, on the worker that runs it | `OpenSearchExecutionEngine` → `PPLQueryTask.onExecutionStarted` → `QueryJob.onExecutionStarted` |
+| `PENDING` | `FAILED` | The total wait passed `max_queued_time`; the pool refused because the node is shutting down; the retry could not be scheduled; or the query failed while being prepared (parse, plan) | `OpenSearchQueryJobScheduler`, `QueryJob.failQueued`, `QueryJob.onRunnerFailure` |
 | `PENDING` / `RUNNING` | `CANCELLED` | DELETE | `OpenSearchQueryJobService.delete`, `QueryJob.cancel` |
+| `RUNNING` | `SUCCEEDED` | The runner returned a result, and it fits the budget if retained | `QueryJob.onRunnerSuccess` |
+| `RUNNING` | `FAILED` | Execution failed or timed out, or a retained result does not fit the budget | `QueryJob.onRunnerFailure`, `QueryJob.chargeOrFail` |
 
-One more transition is not visible to clients. When a result arrives just as the submit wait expires, `QueryJob.retain` charges it before the id is returned. If the budget refuses it, the job goes from `SUCCEEDED` to `FAILED`. No client has the id yet, so no one sees the `SUCCEEDED` state.
+A job is handed to its runner while still `PENDING`. It becomes `RUNNING` only when the engine reports that execution began; a runner that cannot report this counts as starting at once. A result that arrives without a start report counts as starting and finishing together.
 
-A refusal while the node shuts down is not retried: the job ends `FAILED`.
+When the submit wait expires, the job is checked and, if unfinished, marked retained in one step. A job that just finished is reported inline instead, so a finished result is never retained after the fact.
 
 ## Submit
 
@@ -57,7 +62,7 @@ flowchart TD
   B -- yes --> R1[429, nothing published]
   B -- no --> C[publish job as PENDING]
   C --> D{running slot free and queue empty?}
-  D -- yes --> E[start: RUNNING]
+  D -- yes --> E[hand to runner: PENDING until execution starts]
   D -- no --> F{queue full?}
   F -- yes --> R2[429, job removed]
   F -- no --> G[queue: PENDING]
@@ -87,10 +92,10 @@ A retained job counts toward `max_retained_jobs` from when it finishes, and only
 
 The scheduler works like a thread pool executor with a bounded work queue. A job does not hold a thread while it runs; the work runs on the SQL worker pools.
 
-- **Running slots.** At most `node_concurrent_running_queries` jobs are `RUNNING`.
+- **Running slots.** At most `node_concurrent_running_queries` jobs hold a slot: handed to their runner, whether still being prepared (`PENDING`) or executing (`RUNNING`).
 - **Queue.** Up to `max_queued_queries` jobs wait as `PENDING`, in submission order. A submit beyond that gets `429`.
 - **Refused job.** A job refused by a full worker pool gives up its slot and backs off on its own: 500 ms, doubling up to 8 s. Then it goes back to the head of the queue. It is not subject to `max_queued_queries`, because it was already accepted. Other jobs keep starting meanwhile.
-- **Wait deadline.** A job may wait, queued or backing off, for `max_queued_time` in total. The clock starts the first time the job waits and is not reset by later refusals. When it runs out, a waiting job ends `FAILED`. A job that is running at that moment fails on its next refusal instead.
+- **Wait deadline.** A job may wait, queued or backing off, for `max_queued_time` in total. The clock starts the first time the job waits and is not reset by later refusals. When it runs out, a waiting job ends `FAILED`. A job that holds a slot at that moment fails on its next refusal instead.
 
 ## Timers
 
@@ -105,7 +110,7 @@ The scheduler works like a thread pool executor with a bounded work queue. A job
 
 | State | GET | DELETE |
 |---|---|---|
-| `PENDING` | `200`, `status: PENDING`, no rows | `200`, `status: CANCELLED`; the job is removed |
+| `PENDING` | `200`, `status: PENDING`, no rows | `200`, `status: CANCELLED`; the job is removed (and preparation stopped) |
 | `RUNNING` | `200`, `status: RUNNING`, no rows | `200`, `status: CANCELLED`; execution is cancelled and the job removed |
 | `SUCCEEDED` | `200`, the rows | `200`, `status: SUCCEEDED`; the job is removed |
 | `FAILED` | `200`, the error | `200`, `status: FAILED`; the job is removed |

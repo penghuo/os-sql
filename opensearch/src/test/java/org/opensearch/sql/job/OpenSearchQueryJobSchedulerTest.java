@@ -143,10 +143,12 @@ class OpenSearchQueryJobSchedulerTest {
   void queueTimeoutAfterTheJobStartedIsIgnored() {
     Runner first = new Runner();
     submit(first);
-    QueryJob job = submit(new Runner());
+    Runner second = new Runner();
+    QueryJob job = submit(second);
     ArgumentCaptor<Runnable> timeout = ArgumentCaptor.forClass(Runnable.class);
     verify(threadPool).schedule(timeout.capture(), any(TimeValue.class), any());
     first.future.complete(ROWS);
+    second.start();
 
     timeout.getValue().run();
 
@@ -268,7 +270,8 @@ class OpenSearchQueryJobSchedulerTest {
     Runnable deadline = captureSchedule(TimeValue.timeValueSeconds(30));
     first.future.complete(ROWS);
     deadline.run();
-    assertEquals(QueryJobState.RUNNING, job.status().state());
+    // Handed to its runner, so no longer waiting; the deadline does not fail it yet.
+    assertEquals(QueryJobState.PENDING, job.status().state());
 
     refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
 
@@ -284,6 +287,11 @@ class OpenSearchQueryJobSchedulerTest {
     public CompletionStage<QueryResult> run() {
       attempts++;
       return CompletableFuture.failedFuture(new WorkerPoolSaturatedException("sql-worker", false));
+    }
+
+    @Override
+    public CompletionStage<QueryResult> run(Runnable onStarted) {
+      return run();
     }
 
     @Override
@@ -435,11 +443,15 @@ class OpenSearchQueryJobSchedulerTest {
     return job;
   }
 
-  /** Runner whose completion the test drives; optionally supplies one fresh attempt. */
+  /**
+   * Runner whose start and completion the test drives; optionally supplies one fresh attempt. It
+   * reports execution start only through {@link #start()}, as a refusal comes before that.
+   */
   private static final class Runner implements QueryRunner {
     private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
     private final List<Runner> attempts = new ArrayList<>();
     private boolean ran;
+    private Runnable onStarted;
 
     Runner() {}
 
@@ -451,6 +463,17 @@ class OpenSearchQueryJobSchedulerTest {
     public CompletionStage<QueryResult> run() {
       ran = true;
       return future;
+    }
+
+    @Override
+    public CompletionStage<QueryResult> run(Runnable onStarted) {
+      this.onStarted = onStarted;
+      return run();
+    }
+
+    /** Reports that execution began. */
+    void start() {
+      onStarted.run();
     }
 
     @Override

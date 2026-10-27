@@ -265,28 +265,31 @@ class QueryJobTest {
   }
 
   @Test
-  void retain_chargesResultThatArrivesLater() {
+  void expiredWait_retainsTheJobAndChargesTheLaterResult() throws Exception {
     RecordingRunner runner = new RecordingRunner();
     CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
     QueryJob job = newJob(runner, budget);
     job.startRunner();
-    job.retain();
+    QueryResult expired = job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS);
+    assertInstanceOf(QueryResult.Running.class, expired);
     runner.complete(ROWS);
     assertEquals(QueryJobState.SUCCEEDED, job.status().state());
     assertEquals(QueryResultSizeEstimator.estimate(ROWS), budget.charged);
   }
 
   @Test
-  void retain_chargesResultThatArrivedBeforeRetention() {
+  void expiredWait_reportsAJobThatAlreadyFinishedInline() throws Exception {
     RecordingRunner runner = new RecordingRunner();
-    CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
+    CountingBudget budget = new CountingBudget(1L);
     QueryJob job = newJob(runner, budget);
     job.startRunner();
     runner.complete(ROWS);
+
+    QueryResult result = job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS);
+
+    assertSame(ROWS, result);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
     assertEquals(0L, budget.charged);
-    job.retain();
-    job.retain();
-    assertEquals(QueryResultSizeEstimator.estimate(ROWS), budget.charged);
   }
 
   @Test
@@ -309,8 +312,7 @@ class QueryJobTest {
     AtomicInteger fired = new AtomicInteger();
     job.onTerminal(fired::incrementAndGet);
     job.startRunner();
-    CompletionStage<QueryResult> stage = job.await(Duration.ofSeconds(5));
-    job.retain();
+    job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS);
     runner.complete(ROWS);
     QueryJobStatus status = job.status();
     assertEquals(QueryJobState.FAILED, status.state());
@@ -318,24 +320,6 @@ class QueryJobTest {
     assertEquals("IllegalStateException", status.failure().orElseThrow().type());
     assertEquals(1, fired.get());
     assertEquals(0L, budget.charged);
-    ExecutionException ex =
-        assertThrows(
-            ExecutionException.class, () -> stage.toCompletableFuture().get(1, TimeUnit.SECONDS));
-    assertSame(budget.refusal, ex.getCause());
-  }
-
-  @Test
-  void refusedCharge_onRetentionReplacesUnobservedSuccess() {
-    RecordingRunner runner = new RecordingRunner();
-    CountingBudget budget = new CountingBudget(1L);
-    QueryJob job = newJob(runner, budget);
-    job.startRunner();
-    runner.complete(ROWS);
-    job.retain();
-    QueryJobStatus status = job.status();
-    assertEquals(QueryJobState.FAILED, status.state());
-    assertTrue(status.result().isEmpty());
-    assertTrue(status.failure().isPresent());
   }
 
   @Test
@@ -344,7 +328,7 @@ class QueryJobTest {
     CountingBudget budget = new CountingBudget(Long.MAX_VALUE);
     QueryJob job = newJob(runner, budget);
     job.startRunner();
-    job.retain();
+    job.await(Duration.ZERO);
     runner.complete(ROWS);
     job.detach();
     job.detach();
@@ -354,7 +338,7 @@ class QueryJobTest {
     RecordingRunner lateRunner = new RecordingRunner();
     QueryJob detachedFirst = newJob(lateRunner, budget);
     detachedFirst.startRunner();
-    detachedFirst.retain();
+    detachedFirst.await(Duration.ZERO);
     detachedFirst.detach();
     lateRunner.complete(ROWS);
     assertEquals(QueryJobState.SUCCEEDED, detachedFirst.status().state());
@@ -368,7 +352,7 @@ class QueryJobTest {
       RecordingRunner runner = new RecordingRunner();
       QueryJob job = newJob(runner, budget);
       job.startRunner();
-      job.retain();
+      job.await(Duration.ZERO);
       Thread completer = new Thread(() -> runner.complete(ROWS));
       completer.start();
       job.detach();
@@ -401,8 +385,85 @@ class QueryJobTest {
 
     QueryJob refused = newJob(new RecordingRunner(), new CountingBudget(1L));
     refused.startRunner();
-    refused.retain();
+    refused.await(Duration.ZERO);
     assertTrue(refused.holdsRunner());
+  }
+
+  @Test
+  void startRunner_keepsTheJobPendingUntilExecutionStarts() {
+    StartReportingRunner runner = new StartReportingRunner();
+    QueryJob job = newJob(runner, 190L);
+
+    job.startRunner();
+
+    assertEquals(QueryJobState.PENDING, job.status().state());
+    assertTrue(job.status().startedAtMillis().isEmpty());
+    runner.onStarted.run();
+    assertEquals(QueryJobState.RUNNING, job.status().state());
+    assertTrue(job.status().startedAtMillis().isPresent());
+    runner.future.complete(RESULT);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+  }
+
+  @Test
+  void resultWithoutAStartReportStillSucceeds() {
+    StartReportingRunner runner = new StartReportingRunner();
+    QueryJob job = newJob(runner, 191L);
+    job.startRunner();
+
+    runner.future.complete(RESULT);
+
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+    assertTrue(job.status().startedAtMillis().isPresent());
+  }
+
+  @Test
+  void errorBeforeExecutionStartsFailsAPendingJob() {
+    StartReportingRunner runner = new StartReportingRunner();
+    QueryJob job = newJob(runner, 192L);
+    job.startRunner();
+
+    runner.future.completeExceptionally(new IllegalArgumentException("bad query"));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertTrue(job.status().startedAtMillis().isEmpty());
+  }
+
+  @Test
+  void capacityRejectionAfterExecutionStartedFailsTheJob() {
+    StartReportingRunner runner = new StartReportingRunner();
+    QueryJob job = newJob(runner, new RecordingScheduler(true));
+    job.startRunner();
+    runner.onStarted.run();
+
+    runner.future.completeExceptionally(new IllegalStateException("pool full"));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+  }
+
+  /** Runner that reports its start only when the test says so. */
+  private static final class StartReportingRunner implements QueryRunner {
+    private final CompletableFuture<QueryResult> future = new CompletableFuture<>();
+    private Runnable onStarted;
+
+    @Override
+    public CompletionStage<QueryResult> run() {
+      return future;
+    }
+
+    @Override
+    public CompletionStage<QueryResult> run(Runnable onStarted) {
+      this.onStarted = onStarted;
+      return future;
+    }
+
+    @Override
+    public void cancel() {}
+
+    @Override
+    public QueryRunner newAttempt() {
+      return new StartReportingRunner();
+    }
   }
 
   @Test
@@ -413,6 +474,7 @@ class QueryJobTest {
     QueryJob job = newJob(refused, scheduler);
     job.startRunner();
 
+    assertEquals(QueryJobState.PENDING, job.status().state());
     refused.fail(new IllegalStateException("pool full"));
 
     assertEquals(QueryJobState.PENDING, job.status().state());
@@ -518,6 +580,12 @@ class QueryJobTest {
     @Override
     public CompletionStage<QueryResult> run() {
       return future;
+    }
+
+    /** Never reports a start: the refusal comes before execution begins. */
+    @Override
+    public CompletionStage<QueryResult> run(Runnable onStarted) {
+      return run();
     }
 
     @Override

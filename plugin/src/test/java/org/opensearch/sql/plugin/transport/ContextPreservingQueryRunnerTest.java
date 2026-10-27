@@ -26,9 +26,10 @@ import org.opensearch.tasks.CancellableTask;
 public class ContextPreservingQueryRunnerTest {
 
   private final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
-  private final CancellableTask task =
-      new TransportPPLQueryRequest("source=test", null, "/_plugins/_ppl")
-          .createTask(1, "transport", PPLQueryAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
+  private final PPLQueryTask task =
+      (PPLQueryTask)
+          new TransportPPLQueryRequest("source=test", null, "/_plugins/_ppl")
+              .createTask(1, "transport", PPLQueryAction.NAME, TaskId.EMPTY_TASK_ID, Map.of());
 
   @After
   public void tearDown() {
@@ -80,6 +81,19 @@ public class ContextPreservingQueryRunnerTest {
 
     assertEquals("alice", retry.header.get());
     assertSame(task, retry.task.get());
+  }
+
+  @Test
+  public void runReportsExecutionStartThroughThePplTask() {
+    QueryRunner runner =
+        new ContextPreservingQueryRunner(new CapturingRunner(threadContext), threadContext, task);
+    java.util.concurrent.atomic.AtomicInteger started =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    runner.run(started::incrementAndGet);
+    task.onExecutionStarted();
+
+    assertEquals(1, started.get());
   }
 
   @Test

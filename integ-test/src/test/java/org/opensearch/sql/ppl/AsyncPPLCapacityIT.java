@@ -80,9 +80,9 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   @Test
   public void saturatedWorkerPoolFailsSyncQueriesAndQueuesAsyncOnes() throws Exception {
     String nodeId = localNodeId(client());
-    String first = submitRunning(SLOW_QUERY);
+    String first = submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
-    String second = submitRunning(SLOW_QUERY);
+    String second = submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 1);
 
     // Before the fix the rejected sync request never received a response.
@@ -97,18 +97,39 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     // Before the fix the rejected async job stayed RUNNING forever; now it waits for capacity.
     String waiting = submitAsync(STREAMSTATS_QUERY).getString("id");
     awaitStatus(waiting, "PENDING");
+    // Refused and retried while the pools stay full, it is never reported as RUNNING.
+    for (int i = 0; i < 20; i++) {
+      Assert.assertEquals("PENDING", status(waiting));
+      Thread.sleep(100);
+    }
     deleteAsyncQuery(client(), first);
     deleteAsyncQuery(client(), second);
-    JSONObject terminal = pollUntilTerminal(client(), waiting, 30_000);
-    Assert.assertEquals("SUCCEEDED", terminal.getString("status"));
-    verifyDataRows(terminal, rows(10_000));
+    // Once it starts, its status only moves forward: PENDING, RUNNING, SUCCEEDED.
+    List<String> seen = new ArrayList<>();
+    long deadline = System.currentTimeMillis() + 30_000;
+    while (System.currentTimeMillis() < deadline
+        && (seen.isEmpty() || !"SUCCEEDED".equals(seen.get(seen.size() - 1)))) {
+      String status = status(waiting);
+      if (seen.isEmpty() || !seen.get(seen.size() - 1).equals(status)) {
+        seen.add(status);
+      }
+      Thread.sleep(20);
+    }
+    List<String> order = List.of("PENDING", "RUNNING", "SUCCEEDED");
+    for (int i = 1; i < seen.size(); i++) {
+      Assert.assertTrue(
+          "status went backwards: " + seen,
+          order.indexOf(seen.get(i - 1)) < order.indexOf(seen.get(i)));
+    }
+    Assert.assertEquals("SUCCEEDED", seen.get(seen.size() - 1));
+    verifyDataRows(new JSONObject(getAsyncQuery(client(), waiting)), rows(10_000));
   }
 
   @Test
   public void submitOverTheRunningLimitWaitsAsPendingUntilASlotFrees() throws Exception {
     setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     String nodeId = localNodeId(client());
-    String running = submitRunning(SLOW_QUERY);
+    String running = submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
 
     JSONObject queued = submitAsync(QUICK_QUERY);
@@ -128,7 +149,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     // Running and queued jobs do not count toward the retained (finished) job limit.
     setClusterSetting("plugins.ppl.async.max_retained_jobs", "1");
     String nodeId = localNodeId(client());
-    submitRunning(SLOW_QUERY);
+    submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
     Assert.assertEquals("PENDING", submitAsync(QUICK_QUERY).getString("status"));
 
@@ -143,7 +164,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     setClusterSetting("plugins.ppl.async.max_queued_time", "1s");
     String nodeId = localNodeId(client());
-    submitRunning(SLOW_QUERY);
+    submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
 
     JSONObject queued = submitAsync(QUICK_QUERY);
@@ -158,9 +179,9 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   @Test
   public void retainedJobLimitRejectsSubmitUntilAJobIsDeleted() throws Exception {
     setClusterSetting("plugins.ppl.async.max_retained_jobs", "2");
-    String first = submitRunning(QUICK_QUERY);
+    String first = submitAccepted(QUICK_QUERY);
     pollUntilTerminal(client(), first, 30_000);
-    pollUntilTerminal(client(), submitRunning(QUICK_QUERY), 30_000);
+    pollUntilTerminal(client(), submitAccepted(QUICK_QUERY), 30_000);
 
     ResponseException rejected =
         Assert.assertThrows(ResponseException.class, () -> submit(QUICK_QUERY));
@@ -170,7 +191,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     deleteAsyncQuery(client(), first);
     Assert.assertEquals(
         "SUCCEEDED",
-        pollUntilTerminal(client(), submitRunning(QUICK_QUERY), 30_000).getString("status"));
+        pollUntilTerminal(client(), submitAccepted(QUICK_QUERY), 30_000).getString("status"));
   }
 
   @Test
@@ -178,7 +199,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     setClusterSetting("plugins.ppl.async.max_retained_result_size", "1kb");
 
     JSONObject terminal =
-        pollUntilTerminal(client(), submitRunning("source=" + INDEX + " | head 100"), 30_000);
+        pollUntilTerminal(client(), submitAccepted("source=" + INDEX + " | head 100"), 30_000);
 
     Assert.assertEquals("FAILED", terminal.getString("status"));
     Assert.assertTrue(
@@ -191,7 +212,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
 
   @Test
   public void exhaustedResultBudgetRejectsSubmitUntilAResultIsDeleted() throws Exception {
-    String retained = submitRunning(QUICK_QUERY);
+    String retained = submitAccepted(QUICK_QUERY);
     Assert.assertEquals(
         "SUCCEEDED", pollUntilTerminal(client(), retained, 30_000).getString("status"));
     setClusterSetting("plugins.ppl.async.max_retained_result_size", "1b");
@@ -202,7 +223,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     Assert.assertTrue(errorBody(rejected).contains("[plugins.ppl.async.max_retained_result_size]"));
 
     deleteAsyncQuery(client(), retained);
-    submitRunning(QUICK_QUERY);
+    submitAccepted(QUICK_QUERY);
   }
 
   @Test
@@ -223,13 +244,13 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
                     .put("keep_alive", "1m")));
     Assert.assertTrue(withinLimits.has("datarows"));
     // The 5m keep_alive default exceeds the 1m limit; it is capped instead of rejected.
-    submitRunning(QUICK_QUERY);
+    submitAccepted(QUICK_QUERY);
   }
 
-  /** Submits with {@code wait_for_completion_timeout=0}, expects it to start, returns its id. */
-  private String submitRunning(String query) throws IOException {
+  /** Submits with {@code wait_for_completion_timeout=0}, expects it accepted, returns its id. */
+  private String submitAccepted(String query) throws IOException {
     JSONObject response = submitAsync(query);
-    Assert.assertEquals("RUNNING", response.getString("status"));
+    Assert.assertTrue(List.of("PENDING", "RUNNING").contains(response.getString("status")));
     return response.getString("id");
   }
 
@@ -238,6 +259,10 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     JSONObject response = new JSONObject(submit(query));
     jobIds.add(response.getString("id"));
     return response;
+  }
+
+  private String status(String id) throws IOException {
+    return new JSONObject(getAsyncQuery(client(), id)).getString("status");
   }
 
   /** Polls GET until the job reports {@code status}. */

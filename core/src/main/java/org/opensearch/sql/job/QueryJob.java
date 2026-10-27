@@ -24,16 +24,19 @@ import java.util.function.Function;
  * is deliberately small — five accessors and one mutator — so that engines cannot observe or drive
  * lifecycle transitions except through the runner they were given.
  *
- * <p>State transitions:
+ * <p>State transitions. {@code PENDING} means accepted but not yet executing: queued, backing off
+ * after a refusal, or being prepared. A job never returns to an earlier state, and a terminal state
+ * never changes.
  *
  * <pre>
- *   PENDING --startRunner()--&gt; RUNNING --runner success--&gt; SUCCEEDED
- *                                     \--runner success, budget refuses--&gt; FAILED
- *                                     \--runner failure--&gt; FAILED
- *                                     \--capacity rejection--&gt; PENDING   (fresh runner)
- *                                     \--cancel()------&gt; CANCELLED
- *   PENDING --cancel()------&gt; CANCELLED
- *   PENDING --failQueued()--&gt; FAILED
+ *   PENDING --execution starts--------------&gt; RUNNING
+ *   PENDING --refused for capacity----------&gt; PENDING   (fresh runner, requeued)
+ *   PENDING --error before execution--------&gt; FAILED
+ *   PENDING --failQueued()------------------&gt; FAILED    (waited too long)
+ *   PENDING --cancel()----------------------&gt; CANCELLED
+ *   RUNNING --result------------------------&gt; SUCCEEDED
+ *   RUNNING --error, or result over budget--&gt; FAILED
+ *   RUNNING --cancel()----------------------&gt; CANCELLED
  * </pre>
  *
  * See {@code docs/dev/ppl-async-query-lifecycle.md} for the full lifecycle, including the store and
@@ -41,18 +44,19 @@ import java.util.function.Function;
  *
  * <h2>Scheduling</h2>
  *
- * A {@link QueryJobScheduler} decides when a {@code PENDING} job starts. When the runner fails
- * because it was refused for lack of capacity, and it can supply a {@linkplain
- * QueryRunner#newAttempt() fresh attempt}, the job returns to {@code PENDING} and the scheduler
- * queues it again instead of the job failing.
+ * A {@link QueryJobScheduler} decides when a {@code PENDING} job is handed to its runner. The job
+ * stays {@code PENDING} until the runner reports that execution began. When the runner is refused
+ * for lack of capacity before that, and it can supply a {@linkplain QueryRunner#newAttempt() fresh
+ * attempt}, the job stays {@code PENDING} and the scheduler queues it again.
  *
  * <h2>Result retention</h2>
  *
- * A job whose id was returned to the client is {@linkplain #retain() retained} for polling. A
- * retained {@code SUCCEEDED} result is charged against the job's {@link ResultBudget}; when the
- * budget refuses the charge the job ends {@code FAILED} with the refusal as its cause and the rows
- * are dropped. The store {@linkplain #detach() detaches} the job when it removes it, which returns
- * the charge. Results that are returned inline are never retained and never charged.
+ * A job still unfinished when the submit wait expires is retained for polling: its id is returned
+ * instead of a result. A retained job's result is charged against its {@link ResultBudget} when it
+ * arrives; when the budget refuses the charge the job ends {@code FAILED} with the refusal as its
+ * cause and the rows are dropped. The store {@linkplain #detach() detaches} the job when it removes
+ * it, which returns the charge. Results that are returned inline are never retained and never
+ * charged.
  *
  * <p>The job releases its runner on every terminal transition, so a retained job does not keep the
  * engine's request, task, or its own copy of the result reachable.
@@ -83,6 +87,7 @@ public final class QueryJob {
   private OptionalLong completedAtMillis = OptionalLong.empty();
   private Optional<QueryFailure> failure = Optional.empty();
   private Optional<QueryResult> result = Optional.empty();
+  private boolean dispatched;
   private boolean retained;
   private boolean detached;
   private long chargedBytes;
@@ -167,16 +172,31 @@ public final class QueryJob {
 
   /**
    * Bounded, non-blocking wait. The returned stage fires exactly once — with the runner's {@link
-   * QueryResult} on success, {@link QueryResult.Running} when the budget expires, or exceptionally
-   * with the unwrapped runner cause on failure or cancellation. The callback fires on the
-   * runner-completing thread (success/failure) or the JDK {@code Delayer} daemon (timeout); callers
-   * needing {@code ThreadContext} preserved must wrap their listener with {@code
-   * ContextPreservingActionListener} before registering.
+   * QueryResult} on success, exceptionally with the unwrapped runner cause on failure or
+   * cancellation, or with {@link QueryResult.Running} when the budget expires first. Expiry marks
+   * the job retained for polling in the same step that checks it has not finished, so a job is
+   * either reported inline or retained, never both. The callback fires on the runner-completing
+   * thread (success/failure) or the JDK {@code Delayer} daemon (timeout); callers needing {@code
+   * ThreadContext} preserved must wrap their listener with {@code ContextPreservingActionListener}
+   * before registering.
    *
    * <p>Non-{@link Exception} throwables re-throw so JVM-level errors (e.g. {@link
    * OutOfMemoryError}) are not silently downgraded to an application-level failure.
    */
   public CompletionStage<QueryResult> await(Duration budget) {
+    CompletableFuture<QueryResult> out = outcome();
+    long millis = budget == null ? 0L : budget.toMillis();
+    if (millis <= 0L) {
+      out.complete(null);
+    } else {
+      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
+    }
+    // null marks an expired wait.
+    return out.thenCompose(value -> value != null ? out : onWaitExpired()).minimalCompletionStage();
+  }
+
+  /** The job's outcome: its result on success, its unwrapped cause on failure or cancellation. */
+  private CompletableFuture<QueryResult> outcome() {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
         (ignored, throwable) -> {
@@ -196,15 +216,18 @@ public final class QueryJob {
           }
           out.completeExceptionally(cause);
         });
-    long millis = budget == null ? 0L : budget.toMillis();
-    if (millis <= 0L) {
-      out.complete(null);
-    } else {
-      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
+    return out;
+  }
+
+  /** Retains an unfinished job for polling; reports a job that just finished inline instead. */
+  private CompletionStage<QueryResult> onWaitExpired() {
+    synchronized (this) {
+      if (!state.isTerminal()) {
+        retained = true;
+        return CompletableFuture.completedFuture(new QueryResult.Running(id, state));
+      }
     }
-    // null marks an expired wait; the snapshot reports whether the job is queued or running then.
-    return out.thenApply(value -> value != null ? value : runningSnapshot())
-        .minimalCompletionStage();
+    return outcome();
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -242,7 +265,7 @@ public final class QueryJob {
    */
   boolean failQueued(Throwable cause) {
     synchronized (this) {
-      if (state != QueryJobState.PENDING) {
+      if (state != QueryJobState.PENDING || dispatched) {
         return false;
       }
       state = QueryJobState.FAILED;
@@ -254,30 +277,9 @@ public final class QueryJob {
     return true;
   }
 
-  /** Whether the job is waiting to start. */
+  /** Whether the job is waiting to be handed to its runner. */
   synchronized boolean isPending() {
-    return state == QueryJobState.PENDING;
-  }
-
-  /**
-   * Marks the job as retained for polling. Package-private: the service calls this once the submit
-   * wait has expired and before the job id is returned, so no client has observed the job yet.
-   *
-   * <p>A result that already arrived is charged now. If the budget refuses it, the job moves from
-   * {@code SUCCEEDED} to {@code FAILED}; this is the only transition out of a terminal state, and
-   * it is unobservable because the id has not been returned. A result that arrives later is charged
-   * when it arrives. Idempotent, and a no-op once the job is {@linkplain #detach() detached}.
-   */
-  void retain() {
-    synchronized (this) {
-      if (retained || detached) {
-        return;
-      }
-      retained = true;
-      if (state == QueryJobState.SUCCEEDED) {
-        chargeOrFail(result.orElseThrow());
-      }
-    }
+    return state == QueryJobState.PENDING && !dispatched;
   }
 
   /**
@@ -297,15 +299,16 @@ public final class QueryJob {
   }
 
   /**
-   * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
-   * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
+   * Hands a {@link QueryJobState#PENDING} job to its runner and wires the returned stage into this
+   * job's state machine. The job becomes {@link QueryJobState#RUNNING} when the runner reports that
+   * execution began.
    *
    * <p>Package-private. The {@link QueryJobScheduler}, or the service when there is none, invokes
    * this when the job may start; again after each capacity rejection. Any of the following
    * short-circuit the call:
    *
    * <ul>
-   *   <li>the job has already been cancelled while pending — the runner is not started;
+   *   <li>the job is not pending or already handed to its runner — the call is ignored;
    *   <li>{@code runner.run()} throws — the job moves to {@link QueryJobState#FAILED};
    *   <li>{@code runner.run()} returns {@code null} — treated as a runner failure.
    * </ul>
@@ -313,16 +316,17 @@ public final class QueryJob {
   void startRunner() {
     QueryRunner toRun;
     synchronized (this) {
-      if (state != QueryJobState.PENDING) {
+      if (state != QueryJobState.PENDING || dispatched) {
         return;
       }
-      state = QueryJobState.RUNNING;
-      startedAtMillis = OptionalLong.of(clock.millis());
+      dispatched = true;
       toRun = runner;
     }
     CompletionStage<QueryResult> stage;
     try {
-      stage = Objects.requireNonNull(toRun.run(), "runner must not return null");
+      stage =
+          Objects.requireNonNull(
+              toRun.run(this::onExecutionStarted), "runner must not return null");
     } catch (RuntimeException e) {
       onRunnerFailure(e);
       return;
@@ -339,17 +343,29 @@ public final class QueryJob {
         });
   }
 
+  /** Transition from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}. */
+  private synchronized void onExecutionStarted() {
+    if (state == QueryJobState.PENDING && dispatched) {
+      state = QueryJobState.RUNNING;
+      startedAtMillis = OptionalLong.of(clock.millis());
+    }
+  }
+
   /**
-   * Terminal transition from {@link QueryJobState#RUNNING} to {@link QueryJobState#SUCCEEDED}.
-   * Ignored if the job has already left {@code RUNNING} (e.g. a concurrent {@link #cancel()} beat
-   * the runner). Records the result inside the monitor; completes the future outside it. A retained
-   * job charges the result first and ends {@code FAILED} if the budget refuses it.
+   * Terminal transition from {@link QueryJobState#RUNNING} to {@link QueryJobState#SUCCEEDED}. A
+   * result from a runner that never reported its start counts as starting and finishing at once.
+   * Ignored once the job is terminal (e.g. a concurrent {@link #cancel()} beat the runner). Records
+   * the result inside the monitor; completes the future outside it. A retained job charges the
+   * result first and ends {@code FAILED} if the budget refuses it.
    *
    * @param value final result produced by the runner; never {@code null}
    */
   private void onRunnerSuccess(QueryResult value) {
     RuntimeException refused;
     synchronized (this) {
+      if (state == QueryJobState.PENDING && dispatched) {
+        onExecutionStarted();
+      }
       if (state != QueryJobState.RUNNING) {
         return;
       }
@@ -388,10 +404,10 @@ public final class QueryJob {
   }
 
   /**
-   * Terminal transition to {@link QueryJobState#FAILED}. Accepts the transition from either {@code
-   * RUNNING} (normal failure path) or {@code PENDING} (synchronous throw from {@link
-   * QueryRunner#run()}). Ignored once the job is already terminal. A {@code RUNNING} job refused
-   * for lack of capacity is requeued instead, when its runner can supply a fresh attempt.
+   * Terminal transition to {@link QueryJobState#FAILED}, from {@code RUNNING} or from {@code
+   * PENDING} (an error before execution began). Ignored once the job is already terminal. A job
+   * refused for lack of capacity before execution began stays {@code PENDING} and is requeued
+   * instead, when its runner can supply a fresh attempt.
    *
    * @param throwable exception raised by the runner; may be a raw cause or a {@link
    *     CompletionException} wrapper (already unwrapped in {@link #startRunner()})
@@ -402,7 +418,7 @@ public final class QueryJob {
       if (state != QueryJobState.RUNNING && state != QueryJobState.PENDING) {
         return;
       }
-      requeued = state == QueryJobState.RUNNING && prepareNextAttempt(throwable);
+      requeued = state == QueryJobState.PENDING && dispatched && prepareNextAttempt(throwable);
       if (!requeued) {
         state = QueryJobState.FAILED;
         completedAtMillis = OptionalLong.of(clock.millis());
@@ -418,10 +434,10 @@ public final class QueryJob {
   }
 
   /**
-   * Moves a {@code RUNNING} job back to {@code PENDING} with a fresh runner when {@code throwable}
-   * is a capacity rejection the scheduler can retry. Must hold the monitor.
+   * Gives a refused job a fresh runner, to be handed out again, when {@code throwable} is a
+   * capacity rejection the scheduler can retry. Must hold the monitor.
    *
-   * @return {@code true} if the job is {@code PENDING} again
+   * @return {@code true} if the job will be requeued
    */
   private boolean prepareNextAttempt(Throwable throwable) {
     if (scheduler == null || runner == null || !scheduler.isCapacityRejection(throwable)) {
@@ -431,8 +447,7 @@ public final class QueryJob {
     if (nextAttempt == null) {
       return false;
     }
-    state = QueryJobState.PENDING;
-    startedAtMillis = OptionalLong.empty();
+    dispatched = false;
     runner = nextAttempt;
     return true;
   }
@@ -451,11 +466,6 @@ public final class QueryJob {
     } catch (RuntimeException ignored) {
       // Cancellation is best-effort; a misbehaving runner must not block the state machine.
     }
-  }
-
-  private synchronized QueryResult.Running runningSnapshot() {
-    return new QueryResult.Running(
-        id, state == QueryJobState.PENDING ? QueryJobState.PENDING : QueryJobState.RUNNING);
   }
 
   private synchronized QueryResult currentResult() {

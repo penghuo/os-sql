@@ -50,6 +50,13 @@ public class OpenSearchQueryManager implements QueryManager {
     cancellableTask.remove();
   }
 
+  /** Tells this thread's query task, if it listens, that its query begins executing. */
+  public static void notifyExecutionStarted() {
+    if (cancellableTask.get() instanceof ExecutionStartListener listener) {
+      listener.onExecutionStarted();
+    }
+  }
+
   @Override
   public QueryId submit(AbstractPlan queryPlan) {
     TimeValue timeout = settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT);

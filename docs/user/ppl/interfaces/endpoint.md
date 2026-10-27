@@ -741,7 +741,7 @@ Expected output:
 }
 ```
 
-If the query is still running when the wait expires, the response is below. `status` is `PENDING` instead when the query is waiting for capacity (see [Capacity limits](#capacity-limits)).
+If the query has not finished when the wait expires, the response carries an id and a status. `status` is `PENDING` while the query waits for capacity or is being prepared, and `RUNNING` once it executes (see [Capacity limits](#capacity-limits)). A query's status only moves forward: `PENDING`, then `RUNNING`, then a terminal status.
 
 ```json
 {

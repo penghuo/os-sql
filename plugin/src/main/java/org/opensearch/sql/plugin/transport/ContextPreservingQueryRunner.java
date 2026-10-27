@@ -28,17 +28,17 @@ final class ContextPreservingQueryRunner implements QueryRunner {
   private final QueryRunner delegate;
   private final Supplier<ThreadContext.StoredContext> submitterContext;
   private final Map<String, String> submitterLogContext;
-  private final CancellableTask task;
+  private final PPLQueryTask task;
 
   /**
    * Captures the current thread's context; call on the submitting thread.
    *
    * @param delegate runner to execute
    * @param threadContext the node's thread context
-   * @param task the PPL task cancellation reaches
+   * @param task the PPL task cancellation reaches and the engine reports execution start to
    */
   ContextPreservingQueryRunner(
-      QueryRunner delegate, ThreadContext threadContext, CancellableTask task) {
+      QueryRunner delegate, ThreadContext threadContext, PPLQueryTask task) {
     this(
         delegate,
         threadContext.newRestorableContext(false),
@@ -50,11 +50,18 @@ final class ContextPreservingQueryRunner implements QueryRunner {
       QueryRunner delegate,
       Supplier<ThreadContext.StoredContext> submitterContext,
       Map<String, String> submitterLogContext,
-      CancellableTask task) {
+      PPLQueryTask task) {
     this.delegate = Objects.requireNonNull(delegate, "delegate must not be null");
     this.submitterContext = submitterContext;
     this.submitterLogContext = submitterLogContext;
     this.task = Objects.requireNonNull(task, "task must not be null");
+  }
+
+  /** Runs the query and reports when the engine begins executing it, through the PPL task. */
+  @Override
+  public CompletionStage<QueryResult> run(Runnable onStarted) {
+    task.setExecutionStartListener(onStarted);
+    return run();
   }
 
   @Override

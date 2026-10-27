@@ -31,7 +31,11 @@ import java.util.function.Function;
  *                                     \--runner failure--&gt; FAILED
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
+ *   PENDING --failQueued()--&gt; FAILED    (waited too long to start)
  * </pre>
+ *
+ * See {@code docs/dev/ppl-async-query-lifecycle.md} for the full lifecycle, including the store and
+ * the scheduler.
  *
  * <h2>Thread safety</h2>
  *
@@ -114,16 +118,30 @@ public final class QueryJob {
 
   /**
    * Bounded, non-blocking wait. The returned stage fires exactly once — with the runner's {@link
-   * QueryResult} on success, {@link QueryResult.Running} when the budget expires, or exceptionally
-   * with the unwrapped runner cause on failure or cancellation. The callback fires on the
-   * runner-completing thread (success/failure) or the JDK {@code Delayer} daemon (timeout); callers
-   * needing {@code ThreadContext} preserved must wrap their listener with {@code
+   * QueryResult} on success, exceptionally with the unwrapped runner cause on failure or
+   * cancellation, or with {@link QueryResult.Running} carrying the job's state when the budget
+   * expires first. A job that finishes just as the budget expires is reported inline. The callback
+   * fires on the runner-completing thread (success/failure) or the JDK {@code Delayer} daemon
+   * (timeout); callers needing {@code ThreadContext} preserved must wrap their listener with {@code
    * ContextPreservingActionListener} before registering.
    *
    * <p>Non-{@link Exception} throwables re-throw so JVM-level errors (e.g. {@link
    * OutOfMemoryError}) are not silently downgraded to an application-level failure.
    */
   public CompletionStage<QueryResult> await(Duration budget) {
+    CompletableFuture<QueryResult> out = outcome();
+    long millis = budget == null ? 0L : budget.toMillis();
+    if (millis <= 0L) {
+      out.complete(null);
+    } else {
+      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
+    }
+    // null marks an expired wait.
+    return out.thenCompose(value -> value != null ? out : onWaitExpired()).minimalCompletionStage();
+  }
+
+  /** The job's outcome: its result on success, its unwrapped cause on failure or cancellation. */
+  private CompletableFuture<QueryResult> outcome() {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
         (value, throwable) -> {
@@ -137,14 +155,17 @@ public final class QueryJob {
           }
           out.completeExceptionally(cause);
         });
-    long millis = budget == null ? 0L : budget.toMillis();
-    QueryResult.Running running = new QueryResult.Running(id);
-    if (millis <= 0L) {
-      out.complete(running);
-    } else {
-      out.completeOnTimeout(running, millis, TimeUnit.MILLISECONDS);
+    return out;
+  }
+
+  /** Reports an unfinished job by its state; reports a job that just finished inline instead. */
+  private CompletionStage<QueryResult> onWaitExpired() {
+    synchronized (this) {
+      if (!state.isTerminal()) {
+        return CompletableFuture.completedFuture(new QueryResult.Running(id, state));
+      }
     }
-    return out.minimalCompletionStage();
+    return outcome();
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -175,14 +196,34 @@ public final class QueryJob {
   }
 
   /**
+   * Fails a job that waited too long to start. Package-private: called by the scheduler that queued
+   * it.
+   *
+   * @param cause reported as the job's failure
+   * @return {@code true} if the job was {@code PENDING} and is now {@code FAILED}
+   */
+  boolean failQueued(Throwable cause) {
+    synchronized (this) {
+      if (state != QueryJobState.PENDING) {
+        return false;
+      }
+      state = QueryJobState.FAILED;
+      completedAtMillis = OptionalLong.of(clock.millis());
+      failure = Optional.of(QueryFailure.of(cause, failureRenderer));
+    }
+    completion.completeExceptionally(cause);
+    return true;
+  }
+
+  /**
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
    * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
    *
-   * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
-   * to the {@link QueryJobStore}. Any of the following short-circuit the call:
+   * <p>Package-private. The service, or the scheduler that queued the job, invokes this exactly
+   * once when the job may start. Any of the following short-circuit the call:
    *
    * <ul>
-   *   <li>the job has already been cancelled while pending — the runner is not started;
+   *   <li>the job has already been cancelled or failed while pending — the runner is not started;
    *   <li>{@code runner.run()} throws — the job moves to {@link QueryJobState#FAILED};
    *   <li>{@code runner.run()} returns {@code null} — treated as a runner failure.
    * </ul>

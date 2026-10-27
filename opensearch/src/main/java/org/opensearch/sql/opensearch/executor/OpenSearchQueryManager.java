@@ -103,23 +103,14 @@ public class OpenSearchQueryManager implements QueryManager {
               }
             });
 
+    // Submit to the executor directly: ThreadPool.schedule with a zero delay hands the task to the
+    // scheduler thread, which drops a rejection and leaves the query without a response. The
+    // executor rejects on this thread and preserves the thread context the same way.
     try {
-      execute(threadPool, SQL_WORKER_THREAD_POOL_NAME, wrappedTask);
+      threadPool.executor(SQL_WORKER_THREAD_POOL_NAME).execute(wrappedTask);
     } catch (OpenSearchRejectedExecutionException e) {
       throw new WorkerPoolSaturatedException(SQL_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
     }
-  }
-
-  /**
-   * Runs {@code task} on the named pool. Unlike {@code ThreadPool.schedule} with a zero delay,
-   * which hands the task to the scheduler thread and drops a rejection there, this rejects on the
-   * calling thread, so the query can still be failed through its listener. The OpenSearch thread
-   * context is preserved the same way.
-   *
-   * @throws OpenSearchRejectedExecutionException when the pool's queue is full or it is shut down
-   */
-  static void execute(ThreadPool threadPool, String poolName, Runnable task) {
-    threadPool.executor(poolName).execute(task);
   }
 
   private Runnable withCurrentContext(final Runnable task) {

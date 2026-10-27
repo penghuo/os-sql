@@ -28,12 +28,16 @@ import java.util.function.Function;
  *
  * <pre>
  *   PENDING --startRunner()--&gt; RUNNING --runner success--&gt; SUCCEEDED
+ *                                     \--runner success, budget refuses--&gt; FAILED
  *                                     \--runner failure--&gt; FAILED
+ *                                     \--capacity rejection--&gt; PENDING   (fresh runner)
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
  *   PENDING --failQueued()--&gt; FAILED
- *   RUNNING --capacity rejection--&gt; PENDING   (requeued with a fresh runner)
  * </pre>
+ *
+ * See {@code docs/dev/ppl-async-query-lifecycle.md} for the full lifecycle, including the store and
+ * the scheduler.
  *
  * <h2>Scheduling</h2>
  *
@@ -115,33 +119,17 @@ public final class QueryJob {
       QueryRunner runner,
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer) {
-    this(id, owner, runner, clock, failureRenderer, ResultBudget.UNLIMITED);
-  }
-
-  /**
-   * Creates a job in {@link QueryJobState#PENDING} whose retained result is charged against {@code
-   * resultBudget}. Package-private: only {@link QueryJobService} implementations may construct a
-   * job.
-   *
-   * @param resultBudget budget a retained {@code SUCCEEDED} result is charged against
-   * @throws NullPointerException if {@code resultBudget} is {@code null}
-   */
-  QueryJob(
-      QueryJobId id,
-      Principal owner,
-      QueryRunner runner,
-      Clock clock,
-      Function<Throwable, Map<String, Object>> failureRenderer,
-      ResultBudget resultBudget) {
-    this(id, owner, runner, clock, failureRenderer, resultBudget, null);
+    this(id, owner, runner, clock, failureRenderer, ResultBudget.UNLIMITED, null);
   }
 
   /**
    * Creates a job in {@link QueryJobState#PENDING} that {@code scheduler} starts and requeues.
    * Package-private: only {@link QueryJobService} implementations may construct a job.
    *
+   * @param resultBudget budget a retained {@code SUCCEEDED} result is charged against
    * @param scheduler requeues the job when its runner is refused for capacity; {@code null} fails
    *     the job instead
+   * @throws NullPointerException if {@code resultBudget} is {@code null}
    */
   QueryJob(
       QueryJobId id,
@@ -210,12 +198,13 @@ public final class QueryJob {
         });
     long millis = budget == null ? 0L : budget.toMillis();
     if (millis <= 0L) {
-      out.complete(runningSnapshot());
+      out.complete(null);
     } else {
-      CompletableFuture.delayedExecutor(millis, TimeUnit.MILLISECONDS)
-          .execute(() -> out.complete(runningSnapshot()));
+      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
     }
-    return out.minimalCompletionStage();
+    // null marks an expired wait; the snapshot reports whether the job is queued or running then.
+    return out.thenApply(value -> value != null ? value : runningSnapshot())
+        .minimalCompletionStage();
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -311,8 +300,9 @@ public final class QueryJob {
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
    * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
    *
-   * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
-   * to the {@link QueryJobStore}. Any of the following short-circuit the call:
+   * <p>Package-private. The {@link QueryJobScheduler}, or the service when there is none, invokes
+   * this when the job may start; again after each capacity rejection. Any of the following
+   * short-circuit the call:
    *
    * <ul>
    *   <li>the job has already been cancelled while pending — the runner is not started;

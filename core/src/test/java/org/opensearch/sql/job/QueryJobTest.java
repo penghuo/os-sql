@@ -533,7 +533,13 @@ class QueryJobTest {
 
   private static QueryJob newJob(QueryRunner runner, ResultBudget budget) {
     return new QueryJob(
-        ID, OWNER, runner, Clock.fixed(Instant.ofEpochMilli(0L), ZoneOffset.UTC), null, budget);
+        ID,
+        OWNER,
+        runner,
+        Clock.fixed(Instant.ofEpochMilli(0L), ZoneOffset.UTC),
+        null,
+        budget,
+        null);
   }
 
   /** Budget with a fixed capacity that records the outstanding charge. */

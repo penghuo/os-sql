@@ -23,31 +23,28 @@ class QueryJobQuotaTest {
   @Test
   void admitRejectsOnceRetainedFinishedJobLimitIsReached() {
     QueryJobQuota quota = new QueryJobQuota(settings(10, 1, 1_000));
-    quota.admit();
-    quota.admit();
-    quota.addFinished();
-    OpenSearchStatusException e = assertThrows(OpenSearchStatusException.class, quota::admit);
+    quota.checkAdmission(0);
+    OpenSearchStatusException e =
+        assertThrows(OpenSearchStatusException.class, () -> quota.checkAdmission(1));
     assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
     assertEquals(
         "Async query capacity on this node is exhausted"
             + " [plugins.ppl.async.max_retained_jobs]; retry later",
         e.getMessage());
-    quota.releaseFinished();
-    quota.admit();
-    assertEquals(0, quota.finished());
   }
 
   @Test
   void admitRejectsOnceResultBudgetIsExhausted() {
     QueryJobQuota quota = new QueryJobQuota(settings(10, 10, 100));
     quota.reserve(100);
-    OpenSearchStatusException e = assertThrows(OpenSearchStatusException.class, quota::admit);
+    OpenSearchStatusException e =
+        assertThrows(OpenSearchStatusException.class, () -> quota.checkAdmission(0));
     assertEquals(
         "Async query capacity on this node is exhausted"
             + " [plugins.ppl.async.max_retained_result_size]; retry later",
         e.getMessage());
     quota.release(1);
-    quota.admit();
+    quota.checkAdmission(0);
   }
 
   @Test
@@ -71,12 +68,9 @@ class QueryJobQuotaTest {
   void loweredLimitAppliesToNextAdmission() {
     MutableSettings settings = settings(5, 10, 1_000);
     QueryJobQuota quota = new QueryJobQuota(settings);
-    quota.addFinished();
-    quota.addFinished();
-    quota.admit();
+    quota.checkAdmission(2);
     settings.put(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS, 2);
-    assertThrows(OpenSearchStatusException.class, quota::admit);
-    assertEquals(2, quota.finished());
+    assertThrows(OpenSearchStatusException.class, () -> quota.checkAdmission(2));
   }
 
   static MutableSettings settings(int maxRunning, int maxJobs, long maxResultBytes) {

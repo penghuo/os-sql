@@ -104,18 +104,6 @@ public class PPLQueryRequest {
     return Format.of(format).orElse(null) == Format.JDBC;
   }
 
-  /** Caller-supplied {@code wait_for_completion_timeout} or the default. Never null. */
-  public Duration effectiveWaitForCompletion() {
-    return waitForCompletionTimeout != null
-        ? waitForCompletionTimeout
-        : DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT;
-  }
-
-  /** Caller-supplied {@code keep_alive} or the default. Never null. */
-  public Duration effectiveKeepAlive() {
-    return keepAlive != null ? keepAlive : DEFAULT_KEEP_ALIVE;
-  }
-
   /**
    * Caller-supplied {@code wait_for_completion_timeout}, or the default capped at {@code max} so a
    * lowered limit does not reject requests that rely on the default. Never null.

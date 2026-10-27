@@ -26,7 +26,7 @@ public final class AccountingQueryJobStore implements QueryJobStore {
 
   private final QueryJobStore delegate;
   private final QueryJobQuota quota;
-  // Finished retained jobs that are counted against the quota; guarded by this.
+  // Finished retained jobs, counted against plugins.ppl.async.max_retained_jobs; guarded by this.
   private final Set<QueryJob> finished = Collections.newSetFromMap(new IdentityHashMap<>());
 
   /**
@@ -48,8 +48,13 @@ public final class AccountingQueryJobStore implements QueryJobStore {
   @Override
   public QueryJob register(QueryJob job) {
     Objects.requireNonNull(job, "job must not be null");
-    quota.admit();
+    quota.checkAdmission(finished());
     return delegate.register(job);
+  }
+
+  /** Finished jobs retained for polling. */
+  public synchronized int finished() {
+    return finished.size();
   }
 
   @Override
@@ -59,8 +64,8 @@ public final class AccountingQueryJobStore implements QueryJobStore {
 
   private synchronized void countFinished(QueryJob job) {
     // A job deleted before it finished is no longer in the store and is not counted.
-    if (delegate.find(job.id()).orElse(null) == job && finished.add(job)) {
-      quota.addFinished();
+    if (delegate.find(job.id()).orElse(null) == job) {
+      finished.add(job);
     }
   }
 
@@ -75,9 +80,7 @@ public final class AccountingQueryJobStore implements QueryJobStore {
       if (!delegate.remove(id, job)) {
         return false;
       }
-      if (finished.remove(job)) {
-        quota.releaseFinished();
-      }
+      finished.remove(job);
     }
     job.detach();
     return true;

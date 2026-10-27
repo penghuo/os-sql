@@ -41,6 +41,7 @@
   + [PPL Command Checklist](ppl-commands.md): A checklist of developing a new PPL command
   + [PPL Functions](ppl-functions.md): Guidance on developing a PPL function
   + [PPL Linter Grammar Compatibility CI](ppl-lint-grammar-compatibility-ci.md): Guidance on validating SQL grammar changes against OpenSearch Dashboards PPL linter rules
+  + [PPL Async Query Lifecycle](ppl-async-query-lifecycle.md): States of an async PPL query and how it moves between them
 
 ### Query Processing
 

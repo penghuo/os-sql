@@ -129,15 +129,18 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     }
   }
 
+  /** A full pool is retried; a pool that refuses because the node is shutting down is not. */
   @Override
   public boolean isCapacityRejection(Throwable failure) {
-    return ExceptionsHelper.unwrap(failure, WorkerPoolSaturatedException.class) != null;
+    Throwable saturated = ExceptionsHelper.unwrap(failure, WorkerPoolSaturatedException.class);
+    return saturated != null && !((WorkerPoolSaturatedException) saturated).isExecutorShutdown();
   }
 
   /** Frees the refused job's slot and puts it back in the queue after its backoff. */
   @Override
   public void requeue(QueryJob job) {
     boolean waitExpired = false;
+    boolean retryUnscheduled = false;
     synchronized (lock) {
       running.remove(job);
       // Not pending when cancelled while being refused; its terminal hook cleans up.
@@ -147,9 +150,8 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
           int attempt = refusals.merge(job, 1, Integer::sum);
           // The timer takes the lock, so it cannot run before the job is recorded below.
           Cancellable timer = scheduleBackoff(job, backoff(attempt));
-          if (timer == null) {
-            queue.addFirst(job);
-          } else {
+          retryUnscheduled = timer == null;
+          if (!retryUnscheduled) {
             backingOff.put(job, timer);
           }
         }
@@ -157,6 +159,12 @@ public final class OpenSearchQueryJobScheduler implements QueryJobScheduler {
     }
     if (waitExpired) {
       failWaitedTooLong(job);
+    } else if (retryUnscheduled) {
+      // The generic pool refused the timer, as it does while the node shuts down.
+      job.failQueued(
+          new OpenSearchStatusException(
+              "Async query could not be retried on this node; retry later",
+              RestStatus.TOO_MANY_REQUESTS));
     }
     // The freed slot can start another job while this one backs off.
     drain();

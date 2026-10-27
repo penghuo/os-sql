@@ -346,6 +346,34 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
+  void poolShutdownFailsTheJobInsteadOfRetrying() {
+    Runner refused = new Runner(new Runner());
+    QueryJob job = submit(refused);
+
+    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", true));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertEquals(0, scheduler.queued());
+  }
+
+  @Test
+  void refusedJobFailsWhenItsRetryCannotBeScheduled() {
+    when(threadPool.schedule(
+            any(Runnable.class), eq(OpenSearchQueryJobScheduler.INITIAL_BACKOFF), any()))
+        .thenThrow(new IllegalStateException("generic pool shut down"));
+    Runner refused = new Runner(new Runner());
+    QueryJob job = submit(refused);
+
+    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
+
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertEquals(
+        "Async query could not be retried on this node; retry later",
+        job.status().failure().orElseThrow().reason());
+    assertEquals(0, scheduler.queued());
+  }
+
+  @Test
   void rejectionWithoutAFreshAttemptFailsTheJob() {
     Runner refused = new Runner();
     QueryJob job = submit(refused);
@@ -389,6 +417,8 @@ class OpenSearchQueryJobSchedulerTest {
         scheduler.isCapacityRejection(
             new RuntimeException(new WorkerPoolSaturatedException("sql-complex-worker", false))));
     assertFalse(scheduler.isCapacityRejection(new IllegalStateException("boom")));
+    assertFalse(
+        scheduler.isCapacityRejection(new WorkerPoolSaturatedException("sql-worker", true)));
   }
 
   private QueryJob submit(QueryRunner runner) {

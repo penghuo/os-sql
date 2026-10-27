@@ -15,11 +15,12 @@ import org.opensearch.sql.common.setting.Settings;
 /**
  * Node-local capacity for the results of finished async query jobs.
  *
- * <p>Tracks two quantities against dynamic settings:
+ * <p>Checks two limits against dynamic settings:
  *
  * <ul>
- *   <li>finished jobs retained for polling, against {@code plugins.ppl.async.max_retained_jobs};
- *   <li>estimated bytes of retained results, against {@code
+ *   <li>finished jobs retained for polling, counted by the {@link AccountingQueryJobStore}, against
+ *       {@code plugins.ppl.async.max_retained_jobs};
+ *   <li>estimated bytes of retained results, tracked here, against {@code
  *       plugins.ppl.async.max_retained_result_size}.
  * </ul>
  *
@@ -35,7 +36,6 @@ public final class QueryJobQuota implements ResultBudget {
   private final Settings settings;
   private final Object lock = new Object();
 
-  private int finished;
   private long resultBytes;
 
   /**
@@ -49,20 +49,19 @@ public final class QueryJobQuota implements ResultBudget {
   /**
    * Checks that a new job can be admitted.
    *
+   * @param finishedJobs finished jobs currently retained for polling
    * @throws OpenSearchStatusException with status {@code 429} when either limit is exhausted
    */
-  void admit() {
+  void checkAdmission(int finishedJobs) {
     int maxFinished = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS);
     long maxBytes = maxResultBytes();
     Settings.Key exhausted;
-    synchronized (lock) {
-      if (finished >= maxFinished) {
-        exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS;
-      } else if (resultBytes >= maxBytes) {
-        exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE;
-      } else {
-        return;
-      }
+    if (finishedJobs >= maxFinished) {
+      exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS;
+    } else if (resultBytes() >= maxBytes) {
+      exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE;
+    } else {
+      return;
     }
     throw new OpenSearchStatusException(
         String.format(
@@ -70,20 +69,6 @@ public final class QueryJobQuota implements ResultBudget {
             "Async query capacity on this node is exhausted [%s]; retry later",
             exhausted.getKeyValue()),
         RestStatus.TOO_MANY_REQUESTS);
-  }
-
-  /** Counts a finished job retained for polling. */
-  void addFinished() {
-    synchronized (lock) {
-      finished++;
-    }
-  }
-
-  /** Releases a finished job removed from the store. */
-  void releaseFinished() {
-    synchronized (lock) {
-      finished--;
-    }
   }
 
   /**
@@ -114,13 +99,6 @@ public final class QueryJobQuota implements ResultBudget {
   public void release(long bytes) {
     synchronized (lock) {
       resultBytes -= bytes;
-    }
-  }
-
-  /** Finished jobs retained for polling. */
-  public int finished() {
-    synchronized (lock) {
-      return finished;
     }
   }
 

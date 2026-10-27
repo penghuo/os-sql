@@ -12,6 +12,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.ThreadContext;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.QueryId;
 import org.opensearch.sql.executor.QueryManager;
@@ -47,6 +48,13 @@ public class OpenSearchQueryManager implements QueryManager {
 
   public static void clearCancellableTask() {
     cancellableTask.remove();
+  }
+
+  /** Tells this thread's query task, if it listens, that its query begins executing. */
+  public static void notifyExecutionStarted() {
+    if (cancellableTask.get() instanceof ExecutionStartListener listener) {
+      listener.onExecutionStarted();
+    }
   }
 
   @Override
@@ -102,7 +110,14 @@ public class OpenSearchQueryManager implements QueryManager {
               }
             });
 
-    threadPool.schedule(wrappedTask, new TimeValue(0), SQL_WORKER_THREAD_POOL_NAME);
+    // Submit to the executor directly: ThreadPool.schedule with a zero delay hands the task to the
+    // scheduler thread, which drops a rejection and leaves the query without a response. The
+    // executor rejects on this thread and preserves the thread context the same way.
+    try {
+      threadPool.executor(SQL_WORKER_THREAD_POOL_NAME).execute(wrappedTask);
+    } catch (OpenSearchRejectedExecutionException e) {
+      throw new WorkerPoolSaturatedException(SQL_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
+    }
   }
 
   private Runnable withCurrentContext(final Runnable task) {

@@ -157,7 +157,7 @@ class OpenSearchQueryJobServiceTest {
   void submit_synchronousRunnerFailureIsRemovedAndPreservesCause() {
     QueryRunner runner = mock(QueryRunner.class);
     IllegalArgumentException cause = new IllegalArgumentException("preparation failed");
-    when(runner.run()).thenThrow(cause);
+    when(runner.run(any(Runnable.class))).thenThrow(cause);
 
     CompletableFuture<QueryResult> response =
         service.submit(runner, ALICE, WAIT, KEEP_ALIVE).toCompletableFuture();

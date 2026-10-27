@@ -107,6 +107,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       ExecutionContext context,
       ResponseListener<QueryResponse> listener) {
     PhysicalPlan plan = executionProtector.protect(physicalPlan);
+    OpenSearchQueryManager.notifyExecutionStarted();
     client.schedule(
         () -> {
           try {
@@ -134,6 +135,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
 
   @Override
   public void explain(PhysicalPlan plan, ResponseListener<ExplainResponse> listener) {
+    OpenSearchQueryManager.notifyExecutionStarted();
     client.schedule(
         () -> {
           try {
@@ -233,6 +235,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       Format format,
       CalcitePlanContext context,
       ResponseListener<ExplainResponse> listener) {
+    OpenSearchQueryManager.notifyExecutionStarted();
     client.schedule(
         () -> {
           try {
@@ -328,6 +331,7 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
   @Override
   public void execute(
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
+    OpenSearchQueryManager.notifyExecutionStarted();
     client.schedule(
         () -> {
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {

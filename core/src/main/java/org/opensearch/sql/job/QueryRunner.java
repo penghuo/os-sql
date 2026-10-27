@@ -23,6 +23,27 @@ public interface QueryRunner {
   /** Starts execution and returns the future that carries the final result. */
   CompletionStage<QueryResult> run();
 
+  /**
+   * Starts execution like {@link #run()} and calls {@code onStarted} when the query begins
+   * executing, after it has waited for and been accepted by a worker. A runner that cannot tell
+   * calls it at once.
+   *
+   * @param onStarted called when execution begins; may be called more than once
+   */
+  default CompletionStage<QueryResult> run(Runnable onStarted) {
+    onStarted.run();
+    return run();
+  }
+
   /** Requests cooperative cancellation. Safe to call from any state. */
   void cancel();
+
+  /**
+   * Returns an unstarted runner for the same query, so the query can run again after this runner
+   * was refused for lack of capacity before doing any work. Returns {@code null} when the query
+   * cannot run again; the refusal then fails the job.
+   */
+  default QueryRunner newAttempt() {
+    return null;
+  }
 }

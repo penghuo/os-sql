@@ -156,7 +156,7 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
   }
 
   @Test
-  public void async_submitWithZeroWaitReturnsRunningSnapshot() throws IOException {
+  public void async_submitWithZeroWaitReturnsUnfinishedSnapshot() throws IOException {
     JSONObject body = new JSONObject();
     body.put("query", "source=" + TEST_INDEX_ACCOUNT + " | stats count() as c");
     body.put("wait_for_completion_timeout", "0");
@@ -164,7 +164,8 @@ public class AsyncPPLQueryLifecycleIT extends PPLIntegTestCase {
     JSONObject response = new JSONObject(postPpl(client(), body));
 
     Assert.assertTrue("async response must carry queryId", response.has("id"));
-    Assert.assertEquals("RUNNING", response.getString("status"));
+    // PENDING until execution begins on a worker, RUNNING after.
+    Assert.assertTrue(List.of("PENDING", "RUNNING").contains(response.getString("status")));
     Assert.assertEquals(0, response.getJSONArray("schema").length());
     Assert.assertEquals(0, response.getJSONArray("datarows").length());
     Assert.assertEquals(0, response.getInt("total"));

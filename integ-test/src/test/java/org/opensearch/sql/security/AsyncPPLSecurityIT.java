@@ -42,6 +42,9 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
   private static final String NO_DELETE_USER = "async_no_delete";
   private static final String ASYNC_PATH = "/_plugins/_async_query/";
 
+  /** Readable by Alice and not by Bob. */
+  private static final String ALICE_ONLY_INDEX = "async_alice_only_fixture";
+
   private RestClient owner;
   private RestClient peer;
   private String ownerNodeId;
@@ -51,9 +54,10 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     super.init();
     enableCalcite();
     AsyncPPLTestHelpers.createIndex(client());
-    createAsyncUser(ALICE, true);
-    createAsyncUser(BOB, true);
-    createAsyncUser(NO_DELETE_USER, false);
+    AsyncPPLTestHelpers.createIndex(client(), ALICE_ONLY_INDEX, 10);
+    createAsyncUser(ALICE, true, "async_*");
+    createAsyncUser(BOB, true, INDEX);
+    createAsyncUser(NO_DELETE_USER, false, INDEX);
     RestClient[] nodes = AsyncPPLTestHelpers.twoNodeClients(getClusterHosts(), this::nodeClient);
     owner = nodes[0];
     peer = nodes[1];
@@ -128,7 +132,7 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
               .getString("status"));
     }
 
-    createAsyncUser(NO_DELETE_USER, true);
+    createAsyncUser(NO_DELETE_USER, true, INDEX);
     Assert.assertEquals(
         "SUCCEEDED",
         new JSONObject(asUser(peer, "DELETE", ASYNC_PATH + queryId, NO_DELETE_USER, null))
@@ -136,7 +140,74 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     assertNotFound(() -> asUser(owner, "GET", ASYNC_PATH + queryId, NO_DELETE_USER, null));
   }
 
-  private void createAsyncUser(String user, boolean canDelete) throws IOException {
+  @Test
+  public void queuedJobStartsWithItsOwnSubmittersPermissions() throws Exception {
+    // Positive control: Alice can read the index Bob's query targets.
+    JSONObject aliceOnly =
+        new JSONObject().put("query", "source=" + ALICE_ONLY_INDEX + " | head 1");
+    asUser(owner, "POST", "/_plugins/_ppl", ALICE, aliceOnly);
+    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
+    try {
+      String aliceJob =
+          new JSONObject(
+                  asUser(
+                      owner,
+                      "POST",
+                      "/_plugins/_ppl",
+                      ALICE,
+                      new JSONObject()
+                          .put("query", STREAMSTATS_QUERY)
+                          .put("wait_for_completion_timeout", "0")))
+              .getString("id");
+      JSONObject bobSubmit =
+          new JSONObject(
+              asUser(
+                  owner,
+                  "POST",
+                  "/_plugins/_ppl",
+                  BOB,
+                  new JSONObject(aliceOnly.toString()).put("wait_for_completion_timeout", "0")));
+      Assert.assertEquals("PENDING", bobSubmit.getString("status"));
+      String bobJob = bobSubmit.getString("id");
+
+      // Deleting Alice's job frees the slot on a thread that holds Alice's context; Bob's queued
+      // job starts there and must still run as Bob.
+      asUser(owner, "DELETE", ASYNC_PATH + aliceJob, ALICE, null);
+
+      JSONObject terminal = awaitTerminalAs(bobJob, BOB);
+      Assert.assertEquals("FAILED", terminal.getString("status"));
+      Assert.assertTrue(terminal.getJSONObject("error").toString().contains("no permissions"));
+      asUser(owner, "DELETE", ASYNC_PATH + bobJob, BOB, null);
+    } finally {
+      setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", null);
+    }
+  }
+
+  private JSONObject awaitTerminalAs(String id, String user) throws Exception {
+    long deadline = System.currentTimeMillis() + 30_000;
+    JSONObject last = null;
+    while (System.currentTimeMillis() < deadline) {
+      last = new JSONObject(asUser(owner, "GET", ASYNC_PATH + id, user, null));
+      String status = last.getString("status");
+      if (!"RUNNING".equals(status) && !"PENDING".equals(status)) {
+        return last;
+      }
+      Thread.sleep(100);
+    }
+    throw new AssertionError("job never reached a terminal state: " + last);
+  }
+
+  private void setClusterSetting(String key, String value) throws IOException {
+    Request request = new Request("PUT", "/_cluster/settings");
+    request.setJsonEntity(
+        value == null
+            ? "{\"transient\":{\"" + key + "\": null}}"
+            : "{\"transient\":{\"" + key + "\": \"" + value + "\"}}");
+    client().performRequest(request);
+  }
+
+  private void createAsyncUser(String user, boolean canDelete, String indexPattern)
+      throws IOException {
     String role = user + "_role";
     List<String> clusterPermissions =
         new ArrayList<>(
@@ -147,7 +218,7 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     }
     createRoleWithPermissions(
         role,
-        INDEX,
+        indexPattern,
         clusterPermissions.toArray(new String[0]),
         new String[] {
           "indices:data/read/search*",

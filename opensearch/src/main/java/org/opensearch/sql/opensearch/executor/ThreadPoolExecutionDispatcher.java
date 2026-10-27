@@ -21,6 +21,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.ThreadContext;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.common.setting.Settings;
@@ -76,7 +77,7 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
       long currentTime = Hook.CURRENT_TIME.get(-1L);
       TimeValue timeout = settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT);
 
-      threadPool.schedule(
+      Runnable complexTask =
           () -> {
             final Thread executionThread = Thread.currentThread();
             Cancellable timeoutHandle =
@@ -124,9 +125,21 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
               CalcitePlanContext.clearTimewrapSignals();
               QueryProfiling.clear();
             }
-          },
-          new TimeValue(0),
-          SQL_COMPLEX_WORKER_THREAD_POOL_NAME);
+          };
+      // Submitted to the executor directly, as in OpenSearchQueryManager, so a rejection surfaces.
+      try {
+        threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME).execute(complexTask);
+      } catch (OpenSearchRejectedExecutionException e) {
+        WorkerPoolSaturatedException saturated =
+            new WorkerPoolSaturatedException(
+                SQL_COMPLEX_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
+        if (failureListener == null) {
+          throw saturated;
+        }
+        // Report directly: thrown through QueryService, the rejection would be eligible for the
+        // V2 fallback, which would retry the query on the saturated node.
+        failureListener.onFailure(saturated);
+      }
     } else {
       CalcitePlanContext.executionPool.set(SQL_WORKER_THREAD_POOL_NAME);
       task.run();

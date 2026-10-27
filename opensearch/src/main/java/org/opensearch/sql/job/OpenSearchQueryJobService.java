@@ -23,6 +23,11 @@ import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
  * Kept in the {@code org.opensearch.sql.job} package so it can construct {@link QueryJob} and
  * invoke its package-private {@code startRunner()} without widening the visibility of either.
  *
+ * <p>A job whose submit wait expires is retained for polling: its result is charged against the
+ * {@link ResultBudget}, and {@link RetentionPolicy} evicts it after {@code keepAlive}. Capacity is
+ * enforced by the {@link QueryJobStore}, which may reject a submit before the job is published, and
+ * the {@link QueryJobScheduler}, which may queue a published job until a running slot frees.
+ *
  * <p>Job-id collisions are handled by retrying with a fresh {@link QueryJobId}. Because {@link
  * QueryJobId#create(String)} draws from {@link java.util.UUID#randomUUID}, collisions are not
  * observed in practice.
@@ -34,6 +39,8 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private final Clock clock;
   private final RetentionPolicy retentionPolicy;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
+  private final ResultBudget resultBudget;
+  private final QueryJobScheduler scheduler;
 
   /**
    * Legacy constructor without a failure renderer; existing tests and the no-wiring case keep
@@ -66,11 +73,41 @@ public final class OpenSearchQueryJobService implements QueryJobService {
       Clock clock,
       RetentionPolicy retentionPolicy,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(
+        store,
+        clusterService,
+        clock,
+        retentionPolicy,
+        failureRenderer,
+        ResultBudget.UNLIMITED,
+        null);
+  }
+
+  /**
+   * Full constructor.
+   *
+   * @param resultBudget budget every retained result is charged against
+   * @param scheduler decides when a published job starts; {@code null} starts it at once
+   * @throws NullPointerException if {@code store}, {@code clusterService}, {@code clock}, or {@code
+   *     resultBudget} is {@code null}
+   * @see #OpenSearchQueryJobService(QueryJobStore, ClusterService, Clock, RetentionPolicy,
+   *     Function)
+   */
+  public OpenSearchQueryJobService(
+      QueryJobStore store,
+      ClusterService clusterService,
+      Clock clock,
+      RetentionPolicy retentionPolicy,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ResultBudget resultBudget,
+      QueryJobScheduler scheduler) {
     this.store = Objects.requireNonNull(store, "store must not be null");
     this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.retentionPolicy = retentionPolicy;
     this.failureRenderer = failureRenderer;
+    this.resultBudget = Objects.requireNonNull(resultBudget, "resultBudget must not be null");
+    this.scheduler = scheduler;
   }
 
   @Override
@@ -87,11 +124,23 @@ public final class OpenSearchQueryJobService implements QueryJobService {
       throw new IllegalArgumentException("keepAlive must be positive");
     }
     QueryJob job = publish(runner, submitter);
-    job.startRunner();
+    if (scheduler != null) {
+      try {
+        scheduler.submit(job);
+      } catch (RuntimeException e) {
+        // Queue full: the job never started and its id was never returned.
+        store.remove(job.id(), job);
+        throw e;
+      }
+    } else {
+      job.startRunner();
+    }
     return job.await(waitForCompletion)
         .whenComplete(
             (result, error) -> {
               if (error == null && result instanceof QueryResult.Running) {
+                // The job was retained when its wait expired; runs before the id is returned.
+                store.retain(job);
                 if (retentionPolicy != null) {
                   retentionPolicy.arm(job, keepAlive);
                 }
@@ -139,7 +188,8 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private QueryJob publish(QueryRunner runner, Principal owner) {
     while (true) {
       QueryJobId id = QueryJobId.create(clusterService.localNode().getId());
-      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer);
+      QueryJob job =
+          new QueryJob(id, owner, runner, clock, failureRenderer, resultBudget, scheduler);
       if (store.register(job) == null) {
         return job;
       }

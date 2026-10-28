@@ -20,16 +20,21 @@ import java.time.Clock;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.executor.WorkerPoolSaturatedException;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.threadpool.Scheduler.ScheduledCancellable;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -41,6 +46,8 @@ class OpenSearchQueryJobSchedulerTest {
           new ExecutionEngine.Schema(List.of()), List.of(), Cursor.None, List.of(), 0);
 
   private AccountingQueryJobStoreTest.MutableSettings settings;
+  private final ThreadContext threadContext =
+      new ThreadContext(org.opensearch.common.settings.Settings.EMPTY);
   private ThreadPool threadPool;
   private ScheduledCancellable timer;
   private OpenSearchQueryJobScheduler scheduler;
@@ -52,7 +59,14 @@ class OpenSearchQueryJobSchedulerTest {
     threadPool = mock(ThreadPool.class);
     timer = mock(ScheduledCancellable.class);
     when(threadPool.schedule(any(Runnable.class), any(TimeValue.class), any())).thenReturn(timer);
+    when(threadPool.getThreadContext()).thenReturn(threadContext);
     scheduler = new OpenSearchQueryJobScheduler(settings, threadPool);
+  }
+
+  @AfterEach
+  void tearDown() {
+    OpenSearchQueryManager.clearCancellableTask();
+    org.apache.logging.log4j.ThreadContext.clearMap();
   }
 
   @Test
@@ -216,6 +230,48 @@ class OpenSearchQueryJobSchedulerTest {
     assertEquals(2, scheduler.running());
   }
 
+  @Test
+  void queuedJobStartsInItsSubmittersContextAndPutsBackTheStartingThreads() throws Exception {
+    Runner first = new Runner();
+    submit(first);
+    CancellableTask submitterTask = mock(CancellableTask.class);
+    ContextCapturingRunner queued = new ContextCapturingRunner(threadContext);
+    try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+      threadContext.putHeader("submitter", "alice");
+      org.apache.logging.log4j.ThreadContext.put("request_id", "req-1");
+      OpenSearchQueryManager.setCancellableTask(submitterTask);
+      submit(queued);
+    }
+    OpenSearchQueryManager.clearCancellableTask();
+    org.apache.logging.log4j.ThreadContext.clearMap();
+
+    CancellableTask starterTask = mock(CancellableTask.class);
+    AtomicReference<String> headerAfter = new AtomicReference<>();
+    AtomicReference<String> requestIdAfter = new AtomicReference<>();
+    AtomicReference<CancellableTask> taskAfter = new AtomicReference<>();
+    // The thread that finishes the running job starts the queued one.
+    Thread starter =
+        new Thread(
+            () -> {
+              threadContext.putHeader("submitter", "bob");
+              org.apache.logging.log4j.ThreadContext.put("request_id", "req-2");
+              OpenSearchQueryManager.setCancellableTask(starterTask);
+              first.future.complete(ROWS);
+              headerAfter.set(threadContext.getHeader("submitter"));
+              requestIdAfter.set(org.apache.logging.log4j.ThreadContext.get("request_id"));
+              taskAfter.set(OpenSearchQueryManager.getCancellableTask());
+            });
+    starter.start();
+    starter.join();
+
+    assertEquals("alice", queued.header.get());
+    assertEquals("req-1", queued.requestId.get());
+    assertEquals(submitterTask, queued.task.get());
+    assertEquals("bob", headerAfter.get());
+    assertEquals("req-2", requestIdAfter.get());
+    assertEquals(starterTask, taskAfter.get());
+  }
+
   /** Returns the wait deadline scheduled on the generic pool with {@code delay}. */
   private Runnable captureDeadline(TimeValue delay) {
     ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
@@ -245,6 +301,29 @@ class OpenSearchQueryJobSchedulerTest {
     public void cancel() {
       future.cancel(false);
     }
+  }
+
+  /** Runner that records the context it starts in. */
+  private static final class ContextCapturingRunner implements QueryRunner {
+    private final ThreadContext threadContext;
+    private final AtomicReference<String> header = new AtomicReference<>();
+    private final AtomicReference<String> requestId = new AtomicReference<>();
+    private final AtomicReference<CancellableTask> task = new AtomicReference<>();
+
+    ContextCapturingRunner(ThreadContext threadContext) {
+      this.threadContext = threadContext;
+    }
+
+    @Override
+    public CompletionStage<QueryResult> run() {
+      header.set(threadContext.getHeader("submitter"));
+      requestId.set(org.apache.logging.log4j.ThreadContext.get("request_id"));
+      task.set(OpenSearchQueryManager.getCancellableTask());
+      return new CompletableFuture<>();
+    }
+
+    @Override
+    public void cancel() {}
   }
 
   /** Runner refused by a saturated pool as it starts, synchronously like sql-worker. */

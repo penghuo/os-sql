@@ -7,11 +7,10 @@ This page explains the states of an async PPL query and how it moves between the
 | Class | Module | Role |
 |---|---|---|
 | `TransportPPLQueryAction` | plugin | Builds the runner and calls the job service for a submit that carries `wait_for_completion_timeout` or `keep_alive` |
-| `ContextPreservingQueryRunner` | plugin | Restores the submitter's thread context, logging context, and PPL task when a queued query starts on another thread |
 | `PPLQueryRunner` | ppl | Runs one PPL query |
 | `OpenSearchQueryJobService` | opensearch | Submit, GET, and DELETE |
 | `AccountingQueryJobStore` | opensearch | Holds jobs; counts finished retained jobs and rejects a submit when they reach the limit |
-| `OpenSearchQueryJobScheduler` | opensearch | Running slots, the queue, and the wait deadline |
+| `OpenSearchQueryJobScheduler` | opensearch | Running slots, the queue, and the wait deadline; starts a queued job in its submitter's context |
 | `RetentionPolicy` | opensearch | Removes a finished job `keep_alive` after it finishes |
 | `QueryJob` | core | The state machine of one query |
 
@@ -89,6 +88,7 @@ The scheduler works like a thread pool executor with a bounded work queue. A job
 
 - **Running slots.** At most `node_concurrent_running_queries` jobs are `RUNNING`.
 - **Queue.** Up to `max_queued_queries` jobs wait as `PENDING`, in submission order. A submit beyond that gets `429`.
+- **Submitter context.** A queued job starts on whichever thread frees a slot. The scheduler captures the submitting thread's context when it queues the job and restores it when the job starts: the OpenSearch thread context (security user, headers, trace span), the logging context, and the query task that cancellation reaches.
 - **Wait deadline.** A queued job may wait for `max_queued_time`. When it runs out, the job ends `FAILED`. The deadline is cancelled when the job starts.
 - **Worker pools.** A running slot only bounds async jobs. It does not reserve room in the SQL worker pools, which sync queries and other features share. A job that a full pool refuses ends `FAILED`; it is not retried. Admitting every query through one scheduler is tracked in [#5912](https://github.com/opensearch-project/sql/issues/5912).
 

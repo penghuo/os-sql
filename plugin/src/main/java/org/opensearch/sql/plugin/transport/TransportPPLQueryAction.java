@@ -315,18 +315,14 @@ public class TransportPPLQueryAction
       throw new IllegalArgumentException("Async PPL queries require a cancellable PPLQueryTask");
     }
     Runnable cancelExecution = () -> pplQueryTask.cancel("async PPL query cancelled");
-    ThreadContext threadContext = clientRef.threadPool().getThreadContext();
-    // A queued job starts later on another thread; the wrapper restores this request's context.
     QueryRunner runner =
-        new ContextPreservingQueryRunner(
-            new PPLQueryRunner(
-                pplService,
-                transformedRequest,
-                anonymizedQuerySink,
-                Clock.systemUTC(),
-                cancelExecution),
-            threadContext,
-            pplQueryTask);
+        new PPLQueryRunner(
+            pplService,
+            transformedRequest,
+            anonymizedQuerySink,
+            Clock.systemUTC(),
+            cancelExecution);
+    ThreadContext threadContext = clientRef.threadPool().getThreadContext();
     ActionListener<TransportPPLQueryResponse> ctxListener =
         ContextPreservingActionListener.wrapPreservingContext(listener, threadContext);
     ResponseListener<ExecutionEngine.QueryResponse> responseListener =

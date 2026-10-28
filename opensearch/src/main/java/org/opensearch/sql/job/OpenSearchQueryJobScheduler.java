@@ -13,12 +13,16 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.sql.common.setting.Settings;
+import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.threadpool.Scheduler.Cancellable;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -30,6 +34,11 @@ import org.opensearch.threadpool.ThreadPool;
  *
  * <p>A queued job may wait for at most {@code plugins.ppl.async.max_queued_time}. After that it
  * ends {@code FAILED}.
+ *
+ * <p>A queued job starts later on whichever thread frees a slot. It starts in the context of the
+ * thread that submitted it: the OpenSearch thread context (security user, headers, trace span), the
+ * logging context, and the query task that cancellation reaches. The starting thread's own context
+ * is put back afterwards.
  *
  * <p>A running slot only bounds async jobs; it does not reserve room in the SQL worker pools, which
  * other queries share. A job whose worker pool refuses it fails.
@@ -47,7 +56,7 @@ public final class OpenSearchQueryJobScheduler {
   private final ThreadPool threadPool;
   private final Object lock = new Object();
   private final Set<QueryJob> running = Collections.newSetFromMap(new IdentityHashMap<>());
-  private final Deque<QueryJob> queue = new ArrayDeque<>();
+  private final Deque<Queued> queue = new ArrayDeque<>();
   // Fails a queued job that waited too long; armed when the job is queued.
   private final Map<QueryJob, Cancellable> waitDeadlines = new IdentityHashMap<>();
   // Marks a thread that is draining, so a drain triggered while starting a job does not nest.
@@ -90,7 +99,7 @@ public final class OpenSearchQueryJobScheduler {
                 Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES.getKeyValue()),
             RestStatus.TOO_MANY_REQUESTS);
       } else {
-        queue.addLast(job);
+        queue.addLast(Queued.capture(job, threadPool.getThreadContext()));
         armWaitDeadline(job);
       }
     }
@@ -128,18 +137,18 @@ public final class OpenSearchQueryJobScheduler {
       while (true) {
         int maxRunning =
             settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
-        QueryJob next;
+        Queued next;
         Cancellable deadline;
         synchronized (lock) {
           if (running.size() >= maxRunning || queue.isEmpty()) {
             return;
           }
           next = queue.pollFirst();
-          deadline = waitDeadlines.remove(next);
-          running.add(next);
+          deadline = waitDeadlines.remove(next.job());
+          running.add(next.job());
         }
         cancel(deadline);
-        next.startRunner();
+        next.startAsSubmitter();
       }
     } finally {
       draining.set(false);
@@ -151,7 +160,7 @@ public final class OpenSearchQueryJobScheduler {
     Cancellable deadline;
     synchronized (lock) {
       freedSlot = running.remove(job);
-      queue.remove(job);
+      queue.removeIf(queued -> queued.job() == job);
       deadline = waitDeadlines.remove(job);
     }
     cancel(deadline);
@@ -175,7 +184,7 @@ public final class OpenSearchQueryJobScheduler {
   private void onWaitDeadline(QueryJob job) {
     synchronized (lock) {
       waitDeadlines.remove(job);
-      if (!queue.remove(job)) {
+      if (!queue.removeIf(queued -> queued.job() == job)) {
         // Started meanwhile.
         return;
       }
@@ -194,6 +203,46 @@ public final class OpenSearchQueryJobScheduler {
   private static void cancel(Cancellable timer) {
     if (timer != null) {
       timer.cancel();
+    }
+  }
+
+  /** A queued job and the context of the thread that submitted it. */
+  private record Queued(
+      QueryJob job,
+      Supplier<ThreadContext.StoredContext> threadContext,
+      Map<String, String> logContext,
+      CancellableTask task) {
+
+    /** Captures the current thread's context; call on the submitting thread. */
+    static Queued capture(QueryJob job, ThreadContext threadContext) {
+      return new Queued(
+          job,
+          threadContext.newRestorableContext(false),
+          org.apache.logging.log4j.ThreadContext.getImmutableContext(),
+          OpenSearchQueryManager.getCancellableTask());
+    }
+
+    /** Starts the job in the submitter's context, then puts back the current thread's. */
+    void startAsSubmitter() {
+      Map<String, String> callerLogContext =
+          org.apache.logging.log4j.ThreadContext.getImmutableContext();
+      CancellableTask callerTask = OpenSearchQueryManager.getCancellableTask();
+      try (ThreadContext.StoredContext ignored = threadContext.get()) {
+        restore(logContext, task);
+        job.startRunner();
+      } finally {
+        restore(callerLogContext, callerTask);
+      }
+    }
+
+    private static void restore(Map<String, String> logContext, CancellableTask task) {
+      org.apache.logging.log4j.ThreadContext.clearMap();
+      org.apache.logging.log4j.ThreadContext.putAll(logContext);
+      if (task == null) {
+        OpenSearchQueryManager.clearCancellableTask();
+      } else {
+        OpenSearchQueryManager.setCancellableTask(task);
+      }
     }
   }
 }

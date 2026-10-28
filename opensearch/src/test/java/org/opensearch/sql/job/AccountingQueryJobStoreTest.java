@@ -65,6 +65,10 @@ class AccountingQueryJobStoreTest {
     delegate = new InMemoryQueryJobStore();
     store = new AccountingQueryJobStore(delegate, settings);
     threadPool = mock(ThreadPool.class);
+    when(threadPool.getThreadContext())
+        .thenReturn(
+            new org.opensearch.common.util.concurrent.ThreadContext(
+                org.opensearch.common.settings.Settings.EMPTY));
     ClusterService clusterService = mock(ClusterService.class);
     DiscoveryNode localNode = mock(DiscoveryNode.class);
     when(localNode.getId()).thenReturn("node-a");

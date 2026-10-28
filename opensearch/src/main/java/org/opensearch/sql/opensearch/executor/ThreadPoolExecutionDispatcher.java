@@ -127,9 +127,8 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
             }
           };
       try {
-        threadPool
-            .executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME)
-            .execute(threadPool.getThreadContext().preserveContext(complexTask));
+        // The executor runs the task in this thread's ThreadContext.
+        threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME).execute(complexTask);
       } catch (OpenSearchRejectedExecutionException e) {
         WorkerPoolSaturatedException saturated =
             new WorkerPoolSaturatedException(SQL_COMPLEX_WORKER_THREAD_POOL_NAME);

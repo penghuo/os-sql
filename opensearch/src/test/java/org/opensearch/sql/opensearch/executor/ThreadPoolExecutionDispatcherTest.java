@@ -62,17 +62,12 @@ class ThreadPoolExecutionDispatcherTest {
   @Mock private ExecutionEngine engine;
   @Mock private ExecutorService complexPool;
 
-  private final org.opensearch.common.util.concurrent.ThreadContext threadContext =
-      new org.opensearch.common.util.concurrent.ThreadContext(
-          org.opensearch.common.settings.Settings.EMPTY);
-
   private ThreadPoolExecutionDispatcher dispatcher;
 
   @BeforeEach
   void setUp() {
     dispatcher = new ThreadPoolExecutionDispatcher(threadPool, settings);
     when(threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME)).thenReturn(complexPool);
-    when(threadPool.getThreadContext()).thenReturn(threadContext);
     // Mock schedule calls to return non-null cancellables (for both outer dispatch and inner
     // timeout)
     when(threadPool.schedule(any(Runnable.class), any(TimeValue.class), any()))
@@ -209,42 +204,6 @@ class ThreadPoolExecutionDispatcherTest {
 
     assertEquals("test-123", requestIdOnSlowPool.get());
     assertEquals("admin", userOnSlowPool.get());
-  }
-
-  @Test
-  void runsOnSlowPoolWithTheDispatchingThreadContext() throws Exception {
-    when(settings.<Boolean>getSettingValue(Settings.Key.SQL_COMPLEX_WORKER_POOL_ENABLED))
-        .thenReturn(true);
-    when(settings.<TimeValue>getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT))
-        .thenReturn(new TimeValue(60000));
-    AtomicReference<Runnable> submitted = new AtomicReference<>();
-    doAnswer(
-            invocation -> {
-              submitted.set(invocation.getArgument(0));
-              return null;
-            })
-        .when(complexPool)
-        .execute(any(Runnable.class));
-    AtomicReference<String> headerOnSlowPool = new AtomicReference<>();
-    doAnswer(
-            invocation -> {
-              headerOnSlowPool.set(threadContext.getHeader("submitter"));
-              return null;
-            })
-        .when(engine)
-        .execute(any(RelNode.class), any(), any(ResponseListener.class));
-
-    AbstractCalciteIndexScan scan = createMockScanWithScripts();
-    try (org.opensearch.common.util.concurrent.ThreadContext.StoredContext ignored =
-        threadContext.stashContext()) {
-      threadContext.putHeader("submitter", "alice");
-      dispatcher.dispatch(scan, context, listener, engine);
-    }
-    Thread slowPool = new Thread(submitted.get());
-    slowPool.start();
-    slowPool.join();
-
-    assertEquals("alice", headerOnSlowPool.get());
   }
 
   @Test

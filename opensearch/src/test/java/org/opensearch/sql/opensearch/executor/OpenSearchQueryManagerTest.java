@@ -17,6 +17,7 @@ import static org.mockito.Mockito.when;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -57,6 +58,7 @@ class OpenSearchQueryManagerTest {
     Scheduler.ScheduledCancellable mockScheduledTask = mock(Scheduler.ScheduledCancellable.class);
 
     when(nodeClient.threadPool()).thenReturn(threadPool);
+    when(threadPool.getThreadContext()).thenReturn(newThreadContext());
     when(settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT))
         .thenReturn(TimeValue.timeValueSeconds(60));
 
@@ -88,11 +90,61 @@ class OpenSearchQueryManagerTest {
   }
 
   @Test
+  public void submitQueryRunsOnTheWorkerWithTheSubmittersThreadContext() throws Exception {
+    NodeClient nodeClient = mock(NodeClient.class);
+    ThreadPool threadPool = mock(ThreadPool.class);
+    Settings settings = mock(Settings.class);
+    org.opensearch.common.util.concurrent.ThreadContext threadContext = newThreadContext();
+    when(nodeClient.threadPool()).thenReturn(threadPool);
+    when(threadPool.getThreadContext()).thenReturn(threadContext);
+    when(settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT))
+        .thenReturn(TimeValue.timeValueSeconds(60));
+    when(threadPool.schedule(any(), any(), any()))
+        .thenReturn(mock(Scheduler.ScheduledCancellable.class));
+    ExecutorService worker = mock(ExecutorService.class);
+    when(threadPool.executor(OpenSearchQueryManager.SQL_WORKER_THREAD_POOL_NAME))
+        .thenReturn(worker);
+    AtomicReference<Runnable> submitted = new AtomicReference<>();
+    doAnswer(
+            invocation -> {
+              submitted.set(invocation.getArgument(0));
+              return null;
+            })
+        .when(worker)
+        .execute(any());
+    AtomicReference<String> headerOnWorker = new AtomicReference<>();
+    AbstractPlan queryPlan =
+        new QueryPlan(queryId, queryType, plan, queryService, listener) {
+          @Override
+          public void execute() {
+            headerOnWorker.set(threadContext.getHeader("submitter"));
+          }
+        };
+
+    try (org.opensearch.common.util.concurrent.ThreadContext.StoredContext ignored =
+        threadContext.stashContext()) {
+      threadContext.putHeader("submitter", "alice");
+      new OpenSearchQueryManager(nodeClient, settings).submit(queryPlan);
+    }
+    Thread workerThread = new Thread(submitted.get());
+    workerThread.start();
+    workerThread.join();
+
+    assertEquals("alice", headerOnWorker.get());
+  }
+
+  private static org.opensearch.common.util.concurrent.ThreadContext newThreadContext() {
+    return new org.opensearch.common.util.concurrent.ThreadContext(
+        org.opensearch.common.settings.Settings.EMPTY);
+  }
+
+  @Test
   public void submitQueryRejectedBySaturatedPoolThrowsWorkerPoolSaturated() {
     NodeClient nodeClient = mock(NodeClient.class);
     ThreadPool threadPool = mock(ThreadPool.class);
     Settings settings = mock(Settings.class);
     when(nodeClient.threadPool()).thenReturn(threadPool);
+    when(threadPool.getThreadContext()).thenReturn(newThreadContext());
     when(settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT))
         .thenReturn(TimeValue.timeValueSeconds(60));
     ExecutorService worker = mock(ExecutorService.class);

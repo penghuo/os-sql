@@ -90,7 +90,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
       awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 1);
       String saturated = "[sql-complex-worker] thread pool is saturated; retry later";
 
-      // Before the fix the rejected sync request never received a response.
       ResponseException sync =
           Assert.assertThrows(
               ResponseException.class,
@@ -98,8 +97,8 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
       Assert.assertEquals(429, sync.getResponse().getStatusLine().getStatusCode());
       Assert.assertTrue(errorBody(sync).contains(saturated));
 
-      // Before the fix the rejected async job stayed RUNNING forever. The pool refuses it after
-      // planning, so it fails inline with 429 or, once its id was returned, ends FAILED.
+      // The pool refuses it after planning, so it fails inline with 429 or, once its id was
+      // returned, ends FAILED.
       JSONObject async;
       try {
         async = submitAsync(STREAMSTATS_QUERY);
@@ -112,7 +111,7 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
       Assert.assertEquals("FAILED", terminal.getString("status"));
       Assert.assertTrue(terminal.getJSONObject("error").toString().contains(saturated));
     } finally {
-      // Cancel the sync queries' tasks as DELETE does for an async query, then drop the requests.
+      // Cancel the sync queries' tasks, then drop the requests.
       client()
           .performRequest(new Request("POST", "/_tasks/_cancel?actions=" + PPLQueryAction.NAME));
       busy.forEach(Cancellable::cancel);

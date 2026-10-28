@@ -134,8 +134,6 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
         if (failureListener == null) {
           throw saturated;
         }
-        // Report directly: thrown through QueryService, the rejection would be eligible for the
-        // V2 fallback, which would retry the query on the saturated node.
         failureListener.onFailure(saturated);
       }
     } else {

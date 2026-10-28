@@ -20,11 +20,10 @@ import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 public interface QueryJobService {
 
   /**
-   * Starts the runner, or queues it until a running slot frees, and races its completion against
-   * {@code waitForCompletion}. Returns the terminal result inline when the runner wins, or {@link
-   * QueryResult.Running} when the wait expires. Inline success and failure remove the job before
-   * the returned stage completes. Retention is attached only when a {@code Running} result exposes
-   * an id for polling.
+   * Starts the runner and races its completion against {@code waitForCompletion}. Returns the
+   * terminal result inline when the runner wins, or {@link QueryResult.Running} when the wait
+   * expires. Inline success and failure remove the job before the returned stage completes.
+   * Retention is attached only when a {@code Running} result exposes an id for polling.
    *
    * @param runner engine adapter that will produce the result
    * @param submitter caller identity retained for authorization
@@ -33,8 +32,6 @@ public interface QueryJobService {
    *     and positive
    * @return the submission outcome, exceptionally completed with the runner's cause on inline
    *     failure or cancellation
-   * @throws RuntimeException when the job is rejected for lack of capacity; the runner is not
-   *     started
    */
   CompletionStage<QueryResult> submit(
       QueryRunner runner, Principal submitter, Duration waitForCompletion, Duration keepAlive);

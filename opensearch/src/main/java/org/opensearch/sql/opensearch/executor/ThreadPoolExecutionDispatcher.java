@@ -126,7 +126,6 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
               QueryProfiling.clear();
             }
           };
-      // Submitted to the executor directly, as in OpenSearchQueryManager, so a rejection surfaces.
       try {
         threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME).execute(complexTask);
       } catch (OpenSearchRejectedExecutionException e) {

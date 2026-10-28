@@ -103,9 +103,7 @@ public class OpenSearchQueryManager implements QueryManager {
               }
             });
 
-    // Submit to the executor directly: ThreadPool.schedule with a zero delay hands the task to the
-    // scheduler thread, which drops a rejection and leaves the query without a response. The
-    // executor rejects on this thread and preserves the thread context the same way.
+    // ThreadPool.schedule drops a rejection on its scheduler thread; the executor throws it here.
     try {
       threadPool.executor(SQL_WORKER_THREAD_POOL_NAME).execute(wrappedTask);
     } catch (OpenSearchRejectedExecutionException e) {

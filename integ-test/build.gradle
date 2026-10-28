@@ -834,7 +834,6 @@ task asyncCapacityIT(type: RestIntegTestTask) {
     }
 }
 
-// AsyncPPLCapacityIT is excluded from `integTest` (needs one-thread SQL pools); run it with check.
 check.dependsOn asyncCapacityIT
 
 task integTestWithSecurity(type: RestIntegTestTask) {
@@ -999,7 +998,7 @@ integTest {
 
     // Run on dedicated two-node cluster via :integ-test:asyncMultiNodeIT.
     exclude 'org/opensearch/sql/ppl/AsyncPPLMultiNodeRoutingIT.class'
-    // Run on dedicated one-thread-pool cluster via :integ-test:asyncCapacityIT.
+    // Runs on the dedicated asyncCapacityIT cluster.
     exclude 'org/opensearch/sql/ppl/AsyncPPLCapacityIT.class'
 
     // Exclude tests that require the analytics engine plugin stack (run separately via dedicated tasks)
@@ -1664,7 +1663,7 @@ task integTestRemote(type: RestIntegTestTask) {
     // AsyncPPLSecurityIT needs two local nodes for owner forwarding; integTestRemote runs
     // against an externally supplied cluster that is not guaranteed to have two.
     exclude 'org/opensearch/sql/security/AsyncPPLSecurityIT.class'
-    // AsyncPPLCapacityIT needs one-thread SQL pools and a store no other test shares.
+    // Runs on the dedicated asyncCapacityIT cluster.
     exclude 'org/opensearch/sql/ppl/AsyncPPLCapacityIT.class'
     exclude 'org/opensearch/sql/legacy/ExplainIT.class'
     exclude 'org/opensearch/sql/legacy/PrettyFormatterIT.class'

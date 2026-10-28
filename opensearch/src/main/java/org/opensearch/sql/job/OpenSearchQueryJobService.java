@@ -23,9 +23,6 @@ import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
  * Kept in the {@code org.opensearch.sql.job} package so it can construct {@link QueryJob} and
  * invoke its package-private {@code startRunner()} without widening the visibility of either.
  *
- * <p>Capacity is enforced by the {@link OpenSearchQueryJobScheduler}, which may queue a published
- * job until a running slot frees, or reject it when the queue is full.
- *
  * <p>Job-id collisions are handled by retrying with a fresh {@link QueryJobId}. Because {@link
  * QueryJobId#create(String)} draws from {@link java.util.UUID#randomUUID}, collisions are not
  * observed in practice.
@@ -74,13 +71,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   }
 
   /**
-   * Full constructor.
-   *
    * @param scheduler decides when a published job starts; {@code null} starts it at once
-   * @throws NullPointerException if {@code store}, {@code clusterService}, or {@code clock} is
-   *     {@code null}
-   * @see #OpenSearchQueryJobService(QueryJobStore, ClusterService, Clock, RetentionPolicy,
-   *     Function)
    */
   public OpenSearchQueryJobService(
       QueryJobStore store,

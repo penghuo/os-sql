@@ -737,7 +737,7 @@ Expected output:
 }
 ```
 
-If the query has not finished when the wait expires, the response carries an id and a status. `status` is `PENDING` while the query waits in the queue, and `RUNNING` once it starts (see [Capacity limits](#capacity-limits)). A query's status only moves forward: `PENDING`, then `RUNNING`, then a terminal status.
+If the query is still running when the wait expires, the response is:
 
 ```json
 {
@@ -749,7 +749,7 @@ If the query has not finished when the wait expires, the response carries an id 
 }
 ```
 
-The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED` or `FAILED`). While the query waits or runs, GET returns `PENDING` or `RUNNING`:
+The client then polls `GET /_plugins/_async_query/{id}` until it returns a terminal status (`SUCCEEDED` or `FAILED`):
 
 ```
 GET    /_plugins/_async_query/<id>

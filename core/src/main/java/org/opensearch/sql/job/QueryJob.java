@@ -34,9 +34,6 @@ import java.util.function.Function;
  *   PENDING --failQueued()--&gt; FAILED    (waited too long to start)
  * </pre>
  *
- * See {@code docs/dev/ppl-async-query-lifecycle.md} for the full lifecycle, including the store and
- * the scheduler.
- *
  * <h2>Thread safety</h2>
  *
  * All mutable state is guarded by {@code this}. Side effects that may block or reenter — invoking
@@ -118,11 +115,10 @@ public final class QueryJob {
 
   /**
    * Bounded, non-blocking wait. The returned stage fires exactly once — with the runner's {@link
-   * QueryResult} on success, exceptionally with the unwrapped runner cause on failure or
-   * cancellation, or with {@link QueryResult.Running} carrying the job's state when the budget
-   * expires first. A job that finishes just as the budget expires is reported inline. The callback
-   * fires on the runner-completing thread (success/failure) or the JDK {@code Delayer} daemon
-   * (timeout); callers needing {@code ThreadContext} preserved must wrap their listener with {@code
+   * QueryResult} on success, {@link QueryResult.Running} when the budget expires, or exceptionally
+   * with the unwrapped runner cause on failure or cancellation. The callback fires on the
+   * runner-completing thread (success/failure) or the JDK {@code Delayer} daemon (timeout); callers
+   * needing {@code ThreadContext} preserved must wrap their listener with {@code
    * ContextPreservingActionListener} before registering.
    *
    * <p>Non-{@link Exception} throwables re-throw so JVM-level errors (e.g. {@link
@@ -219,11 +215,11 @@ public final class QueryJob {
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
    * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
    *
-   * <p>Package-private. The service, or the scheduler that queued the job, invokes this exactly
-   * once when the job may start. Any of the following short-circuit the call:
+   * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
+   * to the {@link QueryJobStore}. Any of the following short-circuit the call:
    *
    * <ul>
-   *   <li>the job has already been cancelled or failed while pending — the runner is not started;
+   *   <li>the job has already been cancelled while pending — the runner is not started;
    *   <li>{@code runner.run()} throws — the job moves to {@link QueryJobState#FAILED};
    *   <li>{@code runner.run()} returns {@code null} — treated as a runner failure.
    * </ul>

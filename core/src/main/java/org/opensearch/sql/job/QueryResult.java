@@ -53,11 +53,7 @@ public sealed interface QueryResult
     }
   }
 
-  /**
-   * Wait budget expired; the client polls {@link #id()} to observe the terminal outcome. {@link
-   * #state()} is the job's state when the wait expired: {@code PENDING} while it waits for
-   * capacity, otherwise {@code RUNNING}.
-   */
+  /** Wait budget expired; the client polls {@link #id()} to observe the terminal outcome. */
   record Running(QueryJobId id, QueryJobState state) implements QueryResult {
 
     public Running {
@@ -65,7 +61,6 @@ public sealed interface QueryResult
       Objects.requireNonNull(state, "state must not be null");
     }
 
-    /** A snapshot of a job that is running. */
     public Running(QueryJobId id) {
       this(id, QueryJobState.RUNNING);
     }

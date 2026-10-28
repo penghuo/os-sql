@@ -1,0 +1,121 @@
+# PPL Async Query Lifecycle
+
+This page explains the states of an async PPL query and how it moves between them. It is for developers changing the async code; the user-facing API is documented in [endpoint.md](../user/ppl/interfaces/endpoint.md).
+
+## Components
+
+| Class | Module | Role |
+|---|---|---|
+| `TransportPPLQueryAction` | plugin | Builds the runner and calls the job service for a submit that carries `wait_for_completion_timeout` or `keep_alive` |
+| `PPLQueryRunner` | ppl | Runs one PPL query |
+| `OpenSearchQueryJobService` | opensearch | Submit, GET, and DELETE |
+| `OpenSearchQueryJobScheduler` | opensearch | Running slots, the queue, and the wait deadline; starts a queued job in its submitter's context |
+| `RetentionPolicy` | opensearch | Removes a finished job `keep_alive` after it finishes |
+| `QueryJob` | core | The state machine of one query |
+
+## Job states
+
+A job has one of five states (`QueryJobState`). `PENDING` means accepted and waiting in the queue for a running slot. `RUNNING` means handed to its runner: being parsed, planned, or executed. `SUCCEEDED`, `FAILED`, and `CANCELLED` are terminal.
+
+Two rules hold for every job:
+
+- It never returns to an earlier state.
+- A terminal state never changes.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING : submit
+  PENDING --> RUNNING : running slot free
+  PENDING --> FAILED : waited longer than max_queued_time
+  PENDING --> CANCELLED : DELETE
+  RUNNING --> SUCCEEDED : result ready
+  RUNNING --> FAILED : error, timeout, or worker pool full
+  RUNNING --> CANCELLED : DELETE
+  SUCCEEDED --> [*]
+  FAILED --> [*]
+  CANCELLED --> [*]
+```
+
+| From | To | Trigger | Code |
+|---|---|---|---|
+| — | `PENDING` | Submit is published to the store | `OpenSearchQueryJobService.submit` |
+| `PENDING` | `RUNNING` | A running slot is free: at submit, or when a running job finishes | `OpenSearchQueryJobScheduler`, `QueryJob.startRunner` |
+| `PENDING` | `FAILED` | The job waited in the queue longer than `max_queued_time` | `OpenSearchQueryJobScheduler`, `QueryJob.failQueued` |
+| `PENDING` / `RUNNING` | `CANCELLED` | DELETE | `OpenSearchQueryJobService.delete`, `QueryJob.cancel` |
+| `RUNNING` | `SUCCEEDED` | The runner returned a result | `QueryJob.onRunnerSuccess` |
+| `RUNNING` | `FAILED` | Parsing, planning, or execution failed or timed out, or `sql-worker` or `sql-complex-worker` refused the query (`WorkerPoolSaturatedException`) | `QueryJob.onRunnerFailure` |
+
+When the submit wait expires, the job is reported `PENDING` if it still waits in the queue, otherwise `RUNNING`. A job that finishes at that moment is reported `RUNNING`; the next GET returns its outcome.
+
+## Submit
+
+```mermaid
+flowchart TD
+  A[POST /_plugins/_ppl with async fields] --> C[publish job as PENDING]
+  C --> D{running slot free and queue empty?}
+  D -- yes --> E[hand to runner: RUNNING]
+  D -- no --> F{queue full?}
+  F -- yes --> R2[429, job removed]
+  F -- no --> G[queue: PENDING]
+  E --> H{finished within wait_for_completion_timeout?}
+  G --> H
+  H -- yes --> I[return the result or error inline, job removed]
+  H -- no --> J[return id with status PENDING or RUNNING, job retained]
+```
+
+A job that finishes inside the submit wait is never retained. This includes a query that a full worker pool refused; the client gets `429`. A job whose id is returned is retained for polling until it is deleted or its `keep_alive` expires.
+
+## Store lifecycle
+
+A job is in the store from publish until removal.
+
+| Event | Removed by |
+|---|---|
+| Finished inside the submit wait | `OpenSearchQueryJobService.submit` |
+| Queue full at submit | `OpenSearchQueryJobService.submit` |
+| DELETE | `OpenSearchQueryJobService.delete` (then the job is cancelled) |
+| `keep_alive` after it finished | `RetentionPolicy` |
+| Store closed | `InMemoryQueryJobStore.close` |
+
+## Scheduler
+
+The scheduler works like a thread pool executor with a bounded work queue. A job does not hold a thread while it runs; the work runs on the SQL worker pools.
+
+- **Running slots.** At most as many jobs are `RUNNING` as `sql-worker` has threads (`thread_pool.sql-worker.size`, the number of processors by default). Jobs beyond that wait here as `PENDING`, not in the worker pool's queue.
+- **Queue.** Up to `max_queued_queries` jobs wait as `PENDING`, in submission order. A submit beyond that gets `429`.
+- **Submitter context.** A queued job starts on whichever thread frees a slot. The scheduler captures the submitting thread's context when it queues the job and restores it when the job starts: the OpenSearch thread context (security user, headers, trace span), the logging context, and the query task that cancellation reaches.
+- **Wait deadline.** A queued job may wait for `max_queued_time`. When it runs out, the job ends `FAILED`. The deadline is cancelled when the job starts.
+- **Worker pools.** A running slot does not reserve a thread. Sync queries and other features share the SQL worker pools, so a `RUNNING` job may still wait in a pool's queue. A job that a full pool refuses ends `FAILED`; it is not retried. Admitting every query through one scheduler is tracked in [#5912](https://github.com/opensearch-project/sql/issues/5912).
+
+## Timers
+
+| Timer | Pool | Armed | Effect |
+|---|---|---|---|
+| Wait deadline | `generic` | When the job is queued | Fails the job if it is still queued |
+| Retention | `generic` | When a retained job finishes | Removes the job after `keep_alive` |
+| Query timeout | `generic` | When the query runs on a worker | Interrupts the worker after `plugins.ppl.query.timeout` |
+
+## GET and DELETE by state
+
+| State | GET | DELETE |
+|---|---|---|
+| `PENDING` | `200`, `status: PENDING`, no rows | `200`, `status: CANCELLED`; the job is removed |
+| `RUNNING` | `200`, `status: RUNNING`, no rows | `200`, `status: CANCELLED`; execution is cancelled and the job removed |
+| `SUCCEEDED` | `200`, the rows | `200`, `status: SUCCEEDED`; the job is removed |
+| `FAILED` | `200`, the error | `200`, `status: FAILED`; the job is removed |
+| Removed or unknown | `404` | `404` |
+
+## Settings
+
+| Setting | Default | Enforced by |
+|---|---|---|
+| `plugins.ppl.async.max_queued_queries` | `100` | Scheduler |
+| `plugins.ppl.async.max_queued_time` | `5m` | Scheduler |
+
+All settings are dynamic and read on every decision. A lowered limit applies to the next submit; jobs already admitted are not evicted.
+
+## Thread safety
+
+- `QueryJob` guards its state with its own monitor and never takes the scheduler's lock while holding it.
+- The scheduler has one lock. Locks are always taken in the order scheduler, then job.
+- Jobs are started, failed, and cancelled after the scheduler lock is released. A job refused synchronously on start fails and frees its slot, which calls back into the scheduler; `drain` does not nest on the same thread.

@@ -673,6 +673,32 @@ Parameters:
 | `wait_for_completion_timeout` | time value string (e.g. `"5s"`, `"0"`) | `30s` when either async field is present | `0s` – `60s` (inclusive); values outside the range are rejected with `400`. | Maximum time the submit response will wait for the query to finish. For complex queries, the submit response may take slightly longer than this value. |
 | `keep_alive` | time value string (e.g. `"5m"`) | `5m` | `> 0`, `≤ 24h`; values outside the range are rejected with `400`. | How long a terminal result is retained after completion. A subsequent GET on the id succeeds within this window and returns `404` afterwards, or as soon as the job is deleted. |
 
+### Capacity limits
+
+Each node runs as many async queries at the same time as its `sql-worker` thread pool has threads (`thread_pool.sql-worker.size`, the number of processors by default). A query submitted beyond that waits in a queue: the submit response and GET report `"status": "PENDING"` until the query starts, then `RUNNING`. Queued queries start in the order they were submitted. A query that waits longer than `plugins.ppl.async.max_queued_time` ends `FAILED`.
+
+A submit is rejected with `429` before the query runs when the queue is full. The error names the exhausted setting. Retry later. See [settings](../admin/settings.md) for each setting.
+
+| Setting | Default | What it limits |
+|---|---|---|
+| `plugins.ppl.async.max_queued_queries` | `100` | Queries waiting as `PENDING`. Submits beyond it get `429`. |
+| `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` before it ends `FAILED`. |
+
+Example `429` response:
+
+```json
+{
+  "error": {
+    "reason": "Error occurred in OpenSearch engine: Async query queue on this node is full [plugins.ppl.async.max_queued_queries]; retry later",
+    "details": "OpenSearchStatusException[Async query queue on this node is full [plugins.ppl.async.max_queued_queries]; retry later]\nFor more details, please send request for Json format to see the raw response from OpenSearch engine.",
+    "type": "OpenSearchStatusException"
+  },
+  "status": 429
+}
+```
+
+When the SQL worker thread pools on the node are full, a query fails with `429` and the message `thread pool is saturated; retry later`. The pools are shared with synchronous queries, so this can happen to an async query that already started. If its id was already returned, GET reports it `FAILED` with that error. Retry the query later.
+
 ### Limitations
 
 - Async submit is only available for standard PPL queries. The following request shapes always run synchronously and ignore `wait_for_completion_timeout` / `keep_alive`: the `/_plugins/_ppl/_explain` endpoint, requests with `"profile": true`, and non-JSON response formats (`format=csv`, `format=raw`, `format=viz`).

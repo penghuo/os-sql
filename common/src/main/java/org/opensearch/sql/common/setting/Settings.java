@@ -38,6 +38,10 @@ public abstract class Settings {
     PPL_JOIN_SUBSEARCH_MAXOUT("plugins.ppl.join.subsearch_maxout"),
     PPL_REST_ALLOWED_ENDPOINTS("plugins.ppl.rest.allowed_endpoints"),
 
+    /** Async PPL Settings. */
+    PPL_ASYNC_MAX_QUEUED_QUERIES("plugins.ppl.async.max_queued_queries"),
+    PPL_ASYNC_MAX_QUEUED_TIME("plugins.ppl.async.max_queued_time"),
+
     /** Enable Calcite as execution engine */
     CALCITE_ENGINE_ENABLED("plugins.calcite.enabled"),
     CALCITE_FALLBACK_ALLOWED("plugins.calcite.fallback.allowed"),

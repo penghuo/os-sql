@@ -20,8 +20,8 @@ import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
  *
  * <p>Symmetric with the existing {@code OpenSearchQueryManager}: the neutral interface lives in
  * {@code core}, this class supplies the OpenSearch-side wiring (node-id, clock, in-memory store).
- * Kept in the {@code org.opensearch.sql.job} package so it can construct {@link QueryJob} and
- * invoke its package-private {@code startRunner()} without widening the visibility of either.
+ * Kept in the {@code org.opensearch.sql.job} package so it can construct {@link QueryJob} without
+ * widening its visibility.
  *
  * <p>Job-id collisions are handled by retrying with a fresh {@link QueryJobId}. Because {@link
  * QueryJobId#create(String)} draws from {@link java.util.UUID#randomUUID}, collisions are not
@@ -34,18 +34,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private final Clock clock;
   private final RetentionPolicy retentionPolicy;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
-
-  /**
-   * Legacy constructor without a failure renderer; existing tests and the no-wiring case keep
-   * working. Equivalent to passing {@code null} for {@code failureRenderer}.
-   */
-  public OpenSearchQueryJobService(
-      QueryJobStore store,
-      ClusterService clusterService,
-      Clock clock,
-      RetentionPolicy retentionPolicy) {
-    this(store, clusterService, clock, retentionPolicy, null);
-  }
+  private final OpenSearchQueryJobScheduler scheduler;
 
   /**
    * @param store registry that will hold submitted jobs
@@ -57,20 +46,23 @@ public final class OpenSearchQueryJobService implements QueryJobService {
    * @param failureRenderer supplies the structured {@code details} payload captured on {@link
    *     QueryFailure} when a job transitions to {@code FAILED}; may be {@code null} (empty
    *     details). Forwarded to every submitted {@link QueryJob} and invoked at most once per job.
-   * @throws NullPointerException if {@code store}, {@code clusterService}, or {@code clock} is
-   *     {@code null}
+   * @param scheduler decides when a published job starts
+   * @throws NullPointerException if {@code store}, {@code clusterService}, {@code clock}, or {@code
+   *     scheduler} is {@code null}
    */
   public OpenSearchQueryJobService(
       QueryJobStore store,
       ClusterService clusterService,
       Clock clock,
       RetentionPolicy retentionPolicy,
-      Function<Throwable, Map<String, Object>> failureRenderer) {
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      OpenSearchQueryJobScheduler scheduler) {
     this.store = Objects.requireNonNull(store, "store must not be null");
     this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.retentionPolicy = retentionPolicy;
     this.failureRenderer = failureRenderer;
+    this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
   }
 
   @Override
@@ -87,7 +79,13 @@ public final class OpenSearchQueryJobService implements QueryJobService {
       throw new IllegalArgumentException("keepAlive must be positive");
     }
     QueryJob job = publish(runner, submitter);
-    job.startRunner();
+    try {
+      scheduler.submit(job);
+    } catch (RuntimeException e) {
+      // Queue full: the job never started and its id was never returned.
+      store.remove(job.id(), job);
+      throw e;
+    }
     return job.await(waitForCompletion)
         .whenComplete(
             (result, error) -> {

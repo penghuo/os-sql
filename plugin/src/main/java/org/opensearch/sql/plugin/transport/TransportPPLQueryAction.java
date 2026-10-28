@@ -374,7 +374,7 @@ public class TransportPPLQueryAction
   private static String formatRunning(org.opensearch.sql.job.QueryResult.Running running) {
     return new JSONObject()
         .put("id", running.id().encode())
-        .put("status", "RUNNING")
+        .put("status", running.state().name())
         .put("schema", new JSONArray())
         .put("datarows", new JSONArray())
         .put("total", 0)

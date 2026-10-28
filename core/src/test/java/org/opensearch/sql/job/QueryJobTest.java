@@ -256,6 +256,59 @@ class QueryJobTest {
     assertThrows(NullPointerException.class, () -> job.onTerminal(null));
   }
 
+  @Test
+  void failQueued_failsOnlyAPendingJob() {
+    QueryJob pending = newJob(new RecordingRunner(), 180L);
+    pending.failQueued(new IllegalStateException("waited too long"));
+    assertEquals(QueryJobState.FAILED, pending.status().state());
+    assertEquals("waited too long", pending.status().failure().orElseThrow().reason());
+
+    RecordingRunner started = new RecordingRunner();
+    QueryJob running = newJob(started, 181L);
+    running.startRunner();
+    running.failQueued(new IllegalStateException("late"));
+    assertEquals(QueryJobState.RUNNING, running.status().state());
+  }
+
+  @Test
+  void failQueued_neverStartsTheRunner() {
+    RecordingRunner runner = new RecordingRunner();
+    QueryJob job = newJob(runner, 183L);
+    job.failQueued(new IllegalStateException("waited too long"));
+    job.startRunner();
+    assertEquals(0, runner.runInvocations());
+    assertEquals(QueryJobState.FAILED, job.status().state());
+  }
+
+  @Test
+  void await_reportsTheStateOfAnUnfinishedJob() throws Exception {
+    QueryJob job = newJob(new RecordingRunner(), 182L);
+    QueryResult.Running pending =
+        assertInstanceOf(
+            QueryResult.Running.class,
+            job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertEquals(QueryJobState.PENDING, pending.state());
+
+    job.startRunner();
+    QueryResult.Running running =
+        assertInstanceOf(
+            QueryResult.Running.class,
+            job.await(Duration.ofMillis(20)).toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertEquals(QueryJobState.RUNNING, running.state());
+  }
+
+  @Test
+  void await_reportsAJobThatAlreadyFinishedInline() throws Exception {
+    RecordingRunner runner = new RecordingRunner();
+    QueryJob job = newJob(runner, 184L);
+    job.startRunner();
+    runner.complete(RESULT);
+
+    QueryResult result = job.await(Duration.ZERO).toCompletableFuture().get(1, TimeUnit.SECONDS);
+
+    assertSame(RESULT, result);
+  }
+
   private static QueryJob newJob(QueryRunner runner, long submittedMillis) {
     return new QueryJob(
         ID, OWNER, runner, Clock.fixed(Instant.ofEpochMilli(submittedMillis), ZoneOffset.UTC));

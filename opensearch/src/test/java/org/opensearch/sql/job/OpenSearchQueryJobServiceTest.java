@@ -38,9 +38,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
@@ -328,7 +332,12 @@ class OpenSearchQueryJobServiceTest {
     InMemoryQueryJobStore racingStore = spy(store);
     OpenSearchQueryJobService racingService =
         new OpenSearchQueryJobService(
-            racingStore, clusterService("node-a"), Clock.systemUTC(), retentionPolicy);
+            racingStore,
+            clusterService("node-a"),
+            Clock.systemUTC(),
+            retentionPolicy,
+            null,
+            scheduler());
     RecordingRunner runner = new RecordingRunner();
     QueryJobId id =
         assertInstanceOf(
@@ -413,6 +422,62 @@ class OpenSearchQueryJobServiceTest {
     verifyNoInteractions(threadPool);
   }
 
+  @Test
+  void submit_overTheRunningLimitIsPendingUntilASlotFrees() {
+    OpenSearchQueryJobService queued = newQueuedService(1, 100);
+    RecordingRunner first = new RecordingRunner();
+    submitRunning(queued, first);
+    RecordingRunner waiting = new RecordingRunner();
+
+    QueryResult.Running pending = submitRunning(queued, waiting);
+
+    assertEquals(QueryJobState.PENDING, pending.state());
+    assertEquals(QueryJobState.PENDING, queued.get(pending.id(), ALICE).state());
+    assertFalse(waiting.wasRun());
+    first.future.complete(RESULT);
+    assertTrue(waiting.wasRun());
+    assertEquals(QueryJobState.RUNNING, queued.get(pending.id(), ALICE).state());
+  }
+
+  @Test
+  void submit_rejectedByAFullQueueIsRemovedFromTheStore() {
+    OpenSearchQueryJobService queued = newQueuedService(1, 0);
+    submitRunning(queued, new RecordingRunner());
+    RecordingRunner rejected = new RecordingRunner();
+
+    OpenSearchStatusException e =
+        assertThrows(
+            OpenSearchStatusException.class,
+            () -> queued.submit(rejected, ALICE, Duration.ZERO, KEEP_ALIVE));
+
+    assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
+    assertFalse(rejected.wasRun());
+    assertEquals(1, store.jobs().size());
+  }
+
+  private OpenSearchQueryJobService newQueuedService(int maxRunning, int maxQueued) {
+    OpenSearchQueryJobSchedulerTest.MutableSettings settings =
+        OpenSearchQueryJobSchedulerTest.settings();
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, maxQueued);
+    ThreadPool pool =
+        OpenSearchQueryJobSchedulerTest.threadPool(
+            maxRunning, new ThreadContext(org.opensearch.common.settings.Settings.EMPTY));
+    return new OpenSearchQueryJobService(
+        store,
+        clusterService("node-a"),
+        Clock.systemUTC(),
+        null,
+        null,
+        new OpenSearchQueryJobScheduler(settings, pool));
+  }
+
+  private static QueryResult.Running submitRunning(
+      OpenSearchQueryJobService service, RecordingRunner runner) {
+    return assertInstanceOf(
+        QueryResult.Running.class,
+        service.submit(runner, ALICE, Duration.ZERO, KEEP_ALIVE).toCompletableFuture().join());
+  }
+
   private QueryResult.Running submitRunning(RecordingRunner runner) {
     return assertInstanceOf(
         QueryResult.Running.class,
@@ -437,7 +502,15 @@ class OpenSearchQueryJobServiceTest {
       RetentionPolicy policy,
       java.util.function.Function<Throwable, java.util.Map<String, Object>> renderer) {
     return new OpenSearchQueryJobService(
-        store, clusterService("node-a"), Clock.systemUTC(), policy, renderer);
+        store, clusterService("node-a"), Clock.systemUTC(), policy, renderer, scheduler());
+  }
+
+  /** A scheduler with more running slots than any test submits, so every job starts at once. */
+  private static OpenSearchQueryJobScheduler scheduler() {
+    return new OpenSearchQueryJobScheduler(
+        OpenSearchQueryJobSchedulerTest.settings(),
+        OpenSearchQueryJobSchedulerTest.threadPool(
+            100, new ThreadContext(org.opensearch.common.settings.Settings.EMPTY)));
   }
 
   private static ClusterService clusterService(String localNodeId) {

@@ -473,3 +473,38 @@ Expected output:
 }
 ```
   
+## plugins.ppl.async.max_queued_queries
+
+### Version
+
+3.10
+
+### Description
+
+The maximum number of async PPL queries that wait as `PENDING` on one node. A node runs as many async queries at the same time as its `sql-worker` thread pool has threads (`thread_pool.sql-worker.size`, the number of processors by default); further queries wait in this queue. A submit beyond the limit is rejected with `429`. A value of `0` means a query is rejected instead of queued when every thread is busy.
+1. The default value is `100`; the minimum is `0`.
+2. This setting is node scope.
+3. This setting can be updated dynamically.
+
+## plugins.ppl.async.max_queued_time
+
+### Version
+
+3.10
+
+### Description
+
+How long an async PPL query may wait as `PENDING` in the queue before it ends `FAILED`.
+1. The default value is `5m`.
+2. This setting is node scope.
+3. This setting can be updated dynamically.
+
+### Example
+
+Allow at most 50 queued async queries per node:
+
+```bash ignore
+curl -sS -H 'Content-Type: application/json' \
+-X PUT localhost:9200/_plugins/_query/settings \
+-d '{"transient" : {"plugins.ppl.async.max_queued_queries" : 50}}'
+```

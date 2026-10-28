@@ -31,6 +31,7 @@ import java.util.function.Function;
  *                                     \--runner failure--&gt; FAILED
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
+ *   PENDING --failQueued()--&gt; FAILED    (waited too long to start)
  * </pre>
  *
  * <h2>Thread safety</h2>
@@ -138,13 +139,19 @@ public final class QueryJob {
           out.completeExceptionally(cause);
         });
     long millis = budget == null ? 0L : budget.toMillis();
-    QueryResult.Running running = new QueryResult.Running(id);
     if (millis <= 0L) {
-      out.complete(running);
+      out.complete(null);
     } else {
-      out.completeOnTimeout(running, millis, TimeUnit.MILLISECONDS);
+      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
     }
-    return out.minimalCompletionStage();
+    // null marks an expired wait; the job's state is read when it expires.
+    return out.thenApply(value -> value != null ? value : new QueryResult.Running(id, waitState()))
+        .minimalCompletionStage();
+  }
+
+  /** {@code PENDING} while the job waits to start, otherwise {@code RUNNING}. */
+  private synchronized QueryJobState waitState() {
+    return state == QueryJobState.PENDING ? QueryJobState.PENDING : QueryJobState.RUNNING;
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -175,11 +182,29 @@ public final class QueryJob {
   }
 
   /**
+   * Fails a job that waited too long to start. Package-private: called by the scheduler that queued
+   * it.
+   *
+   * @param cause reported as the job's failure; ignored unless the job is {@code PENDING}
+   */
+  void failQueued(Throwable cause) {
+    synchronized (this) {
+      if (state != QueryJobState.PENDING) {
+        return;
+      }
+      state = QueryJobState.FAILED;
+      completedAtMillis = OptionalLong.of(clock.millis());
+      failure = Optional.of(QueryFailure.of(cause, failureRenderer));
+    }
+    completion.completeExceptionally(cause);
+  }
+
+  /**
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
    * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
    *
-   * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
-   * to the {@link QueryJobStore}. Any of the following short-circuit the call:
+   * <p>Package-private. The scheduler invokes this exactly once, when the job may start. Any of the
+   * following short-circuit the call:
    *
    * <ul>
    *   <li>the job has already been cancelled while pending — the runner is not started;

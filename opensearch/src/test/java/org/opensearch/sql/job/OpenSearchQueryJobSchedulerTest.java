@@ -17,7 +17,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.time.Clock;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
@@ -45,7 +47,7 @@ class OpenSearchQueryJobSchedulerTest {
       new QueryResult.Rows(
           new ExecutionEngine.Schema(List.of()), List.of(), Cursor.None, List.of(), 0);
 
-  private AccountingQueryJobStoreTest.MutableSettings settings;
+  private MutableSettings settings;
   private final ThreadContext threadContext =
       new ThreadContext(org.opensearch.common.settings.Settings.EMPTY);
   private ThreadPool threadPool;
@@ -55,7 +57,7 @@ class OpenSearchQueryJobSchedulerTest {
 
   @BeforeEach
   void setUp() {
-    settings = AccountingQueryJobStoreTest.settings(1, 100);
+    settings = settings(1);
     threadPool = mock(ThreadPool.class);
     timer = mock(ScheduledCancellable.class);
     when(threadPool.schedule(any(Runnable.class), any(TimeValue.class), any())).thenReturn(timer);
@@ -284,6 +286,34 @@ class OpenSearchQueryJobSchedulerTest {
         new QueryJob(new QueryJobId("node-a", "ctx-" + nextId++), ALICE, runner, Clock.systemUTC());
     scheduler.submit(job);
     return job;
+  }
+
+  static MutableSettings settings(int maxRunning) {
+    MutableSettings settings = new MutableSettings();
+    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, maxRunning);
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 100);
+    settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueMinutes(5));
+    return settings;
+  }
+
+  /** {@link Settings} backed by a map the test can change between calls. */
+  static final class MutableSettings extends Settings {
+    private final Map<Key, Object> values = new HashMap<>();
+
+    void put(Key key, Object value) {
+      values.put(key, value);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getSettingValue(Key key) {
+      return (T) values.get(key);
+    }
+
+    @Override
+    public List<?> getSettings() {
+      return List.of();
+    }
   }
 
   /** Runner whose completion the test drives. */

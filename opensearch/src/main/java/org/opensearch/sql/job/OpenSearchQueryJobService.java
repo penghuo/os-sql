@@ -23,10 +23,8 @@ import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
  * Kept in the {@code org.opensearch.sql.job} package so it can construct {@link QueryJob} and
  * invoke its package-private {@code startRunner()} without widening the visibility of either.
  *
- * <p>A job whose submit wait expires is retained for polling, and {@link RetentionPolicy} evicts it
- * after {@code keepAlive}. Capacity is enforced by the {@link QueryJobStore}, which may reject a
- * submit before the job is published, and the {@link OpenSearchQueryJobScheduler}, which may queue
- * a published job until a running slot frees.
+ * <p>Capacity is enforced by the {@link OpenSearchQueryJobScheduler}, which may queue a published
+ * job until a running slot frees, or reject it when the queue is full.
  *
  * <p>Job-id collisions are handled by retrying with a fresh {@link QueryJobId}. Because {@link
  * QueryJobId#create(String)} draws from {@link java.util.UUID#randomUUID}, collisions are not
@@ -128,8 +126,6 @@ public final class OpenSearchQueryJobService implements QueryJobService {
         .whenComplete(
             (result, error) -> {
               if (error == null && result instanceof QueryResult.Running) {
-                // Runs before the id is returned.
-                store.retain(job);
                 if (retentionPolicy != null) {
                   retentionPolicy.arm(job, keepAlive);
                 }

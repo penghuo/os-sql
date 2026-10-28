@@ -677,14 +677,13 @@ Parameters:
 
 Each node runs a limited number of async queries at the same time. A query submitted beyond that limit waits in a queue: the submit response and GET report `"status": "PENDING"` until the query starts, then `RUNNING`. Queued queries start in the order they were submitted. A query that waits longer than `plugins.ppl.async.max_queued_time` ends `FAILED`.
 
-A submit is rejected with `429` before the query runs when the queue is full, or when the node already keeps too many finished queries for polling. The error names the exhausted setting. Retry later, or delete finished queries to free capacity. See [settings](../admin/settings.md) for each setting.
+A submit is rejected with `429` before the query runs when the queue is full. The error names the exhausted setting. Retry later. See [settings](../admin/settings.md) for each setting.
 
 | Setting | Default | What it limits |
 |---|---|---|
 | `plugins.ppl.async.node_concurrent_running_queries` | `20` | Async queries running at the same time. Queries beyond it wait as `PENDING`. |
 | `plugins.ppl.async.max_queued_queries` | `100` | Queries waiting as `PENDING`. Submits beyond it get `429`. |
 | `plugins.ppl.async.max_queued_time` | `5m` | How long a query may wait as `PENDING` before it ends `FAILED`. |
-| `plugins.ppl.async.max_retained_jobs` | `100` | Finished queries kept for polling. Submits get `429` while it is full. |
 
 Example `429` response:
 

@@ -24,7 +24,6 @@ import org.opensearch.sql.executor.QueryService;
 import org.opensearch.sql.executor.execution.QueryPlanFactory;
 import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionRepository;
-import org.opensearch.sql.job.AccountingQueryJobStore;
 import org.opensearch.sql.job.InMemoryQueryJobStore;
 import org.opensearch.sql.job.OpenSearchQueryJobScheduler;
 import org.opensearch.sql.job.OpenSearchQueryJobService;
@@ -143,8 +142,8 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   @Singleton
-  public QueryJobStore queryJobStore(Settings settings) {
-    return new AccountingQueryJobStore(new InMemoryQueryJobStore(), settings);
+  public QueryJobStore queryJobStore() {
+    return new InMemoryQueryJobStore();
   }
 
   @Provides

@@ -23,15 +23,8 @@ public interface QueryJobStore extends Closeable {
    * discard the incoming duplicate.
    *
    * @throws IllegalStateException when the store has been closed
-   * @throws RuntimeException when the store has no capacity for another job
    */
   QueryJob register(QueryJob job);
-
-  /**
-   * Notes that {@code job}'s id was returned to the client for polling, so once finished it is
-   * retained until removed. Stores that limit retained jobs count it from then on.
-   */
-  default void retain(QueryJob job) {}
 
   /** Looks up a job by ID. */
   Optional<QueryJob> find(QueryJobId id);

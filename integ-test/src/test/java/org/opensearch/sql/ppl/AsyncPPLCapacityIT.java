@@ -28,12 +28,11 @@ import org.opensearch.client.ResponseException;
 
 /**
  * Capacity limits of async PPL (#5801): worker-pool saturation, queueing past the running limit,
- * the queue limit and timeout, and the retained job limit.
+ * and the queue limit and timeout.
  *
  * <p>Runs on the dedicated single-node {@code asyncCapacityIT} cluster, whose {@code sql-worker}
  * and {@code sql-complex-worker} pools each have one thread and a one-slot queue, so saturation is
- * deterministic and no other IT's retained jobs count against the limits. Every test deletes the
- * jobs it creates and restores the settings it changes.
+ * deterministic. Every test deletes the jobs it creates and restores the settings it changes.
  */
 public class AsyncPPLCapacityIT extends PPLIntegTestCase {
 
@@ -127,8 +126,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   public void fullQueueRejectsSubmitWith429() throws Exception {
     setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     setClusterSetting("plugins.ppl.async.max_queued_queries", "1");
-    // Running and queued jobs do not count toward the retained (finished) job limit.
-    setClusterSetting("plugins.ppl.async.max_retained_jobs", "1");
     String nodeId = localNodeId(client());
     submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
@@ -155,24 +152,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
     Assert.assertEquals("FAILED", terminal.getString("status"));
     Assert.assertTrue(
         terminal.getJSONObject("error").toString().contains("[plugins.ppl.async.max_queued_time]"));
-  }
-
-  @Test
-  public void retainedJobLimitRejectsSubmitUntilAJobIsDeleted() throws Exception {
-    setClusterSetting("plugins.ppl.async.max_retained_jobs", "2");
-    String first = submitAccepted(QUICK_QUERY);
-    pollUntilTerminal(client(), first, 30_000);
-    pollUntilTerminal(client(), submitAccepted(QUICK_QUERY), 30_000);
-
-    ResponseException rejected =
-        Assert.assertThrows(ResponseException.class, () -> submit(QUICK_QUERY));
-    Assert.assertEquals(429, rejected.getResponse().getStatusLine().getStatusCode());
-    Assert.assertTrue(errorBody(rejected).contains("[plugins.ppl.async.max_retained_jobs]"));
-
-    deleteAsyncQuery(client(), first);
-    Assert.assertEquals(
-        "SUCCEEDED",
-        pollUntilTerminal(client(), submitAccepted(QUICK_QUERY), 30_000).getString("status"));
   }
 
   /** Submits with {@code wait_for_completion_timeout=0}, expects it accepted, returns its id. */

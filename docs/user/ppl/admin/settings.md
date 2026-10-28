@@ -486,19 +486,6 @@ The maximum number of async PPL queries that run at the same time on one node. A
 2. This setting is node scope.
 3. This setting can be updated dynamically.
 
-## plugins.ppl.async.max_retained_jobs
-
-### Version
-
-3.10
-
-### Description
-
-The maximum number of finished async PPL queries a node keeps for polling. A query counts from when it finishes until it is deleted or its `keep_alive` expires; waiting and running queries do not count. While the limit is reached, async submits are rejected with `429`. Queries already running when it is reached may still finish and be kept.
-1. The default value is `100`; the minimum is `1`.
-2. This setting is node scope.
-3. This setting can be updated dynamically.
-
 ## plugins.ppl.async.max_queued_queries
 
 ### Version

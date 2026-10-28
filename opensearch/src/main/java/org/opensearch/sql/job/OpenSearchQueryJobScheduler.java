@@ -16,8 +16,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -52,8 +50,6 @@ import org.opensearch.threadpool.ThreadPool;
  */
 public final class OpenSearchQueryJobScheduler {
 
-  private static final Logger LOG = LogManager.getLogger(OpenSearchQueryJobScheduler.class);
-
   private final Settings settings;
   private final ThreadPool threadPool;
   private final int maxRunning;
@@ -74,7 +70,7 @@ public final class OpenSearchQueryJobScheduler {
   public OpenSearchQueryJobScheduler(Settings settings, ThreadPool threadPool) {
     this.settings = Objects.requireNonNull(settings, "settings must not be null");
     this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
-    this.maxRunning = Math.max(1, threadPool.info(SQL_WORKER_THREAD_POOL_NAME).getMax());
+    this.maxRunning = threadPool.info(SQL_WORKER_THREAD_POOL_NAME).getMax();
   }
 
   /**
@@ -102,8 +98,8 @@ public final class OpenSearchQueryJobScheduler {
                 Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES.getKeyValue()),
             RestStatus.TOO_MANY_REQUESTS);
       } else {
-        queue.addLast(Queued.capture(job, threadPool.getThreadContext()));
         armWaitDeadline(job);
+        queue.addLast(Queued.capture(job, threadPool.getThreadContext()));
       }
     }
     job.onTerminal(() -> onTerminal(job));
@@ -173,13 +169,9 @@ public final class OpenSearchQueryJobScheduler {
   /** Arms the deadline of a job that was just queued. Must hold {@code lock}. */
   private void armWaitDeadline(QueryJob job) {
     TimeValue maxQueuedTime = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME);
-    try {
-      waitDeadlines.put(
-          job,
-          threadPool.schedule(() -> onWaitDeadline(job), maxQueuedTime, ThreadPool.Names.GENERIC));
-    } catch (RuntimeException e) {
-      LOG.warn("Failed to schedule the wait deadline of an async query", e);
-    }
+    waitDeadlines.put(
+        job,
+        threadPool.schedule(() -> onWaitDeadline(job), maxQueuedTime, ThreadPool.Names.GENERIC));
   }
 
   private void onWaitDeadline(QueryJob job) {

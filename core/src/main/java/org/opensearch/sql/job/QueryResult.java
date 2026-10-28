@@ -61,10 +61,6 @@ public sealed interface QueryResult
       Objects.requireNonNull(state, "state must not be null");
     }
 
-    public Running(QueryJobId id) {
-      this(id, QueryJobState.RUNNING);
-    }
-
     @Override
     public long tookMillis() {
       return 0L;

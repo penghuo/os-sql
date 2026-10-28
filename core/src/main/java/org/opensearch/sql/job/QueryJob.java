@@ -203,8 +203,8 @@ public final class QueryJob {
    * Transitions the job from {@link QueryJobState#PENDING} to {@link QueryJobState#RUNNING}, calls
    * {@link QueryRunner#run()}, and wires the returned stage into this job's state machine.
    *
-   * <p>Package-private. The service invokes this exactly once, immediately after publishing the job
-   * to the {@link QueryJobStore}. Any of the following short-circuit the call:
+   * <p>Package-private. The scheduler invokes this exactly once, when the job may start. Any of the
+   * following short-circuit the call:
    *
    * <ul>
    *   <li>the job has already been cancelled while pending — the runner is not started;

@@ -33,6 +33,7 @@ import org.opensearch.core.tasks.TaskId;
 import org.opensearch.sql.job.Principal;
 import org.opensearch.sql.job.QueryJobId;
 import org.opensearch.sql.job.QueryJobService;
+import org.opensearch.sql.job.QueryJobState;
 import org.opensearch.sql.job.QueryResult;
 import org.opensearch.sql.job.QueryRunner;
 import org.opensearch.sql.job.SecurityAdapter;
@@ -99,7 +100,8 @@ public class TransportPPLQueryActionCancellationTest {
     when(jobs.submit(any(), eq(Principal.UNSECURED), any(), any()))
         .thenReturn(
             CompletableFuture.completedFuture(
-                new QueryResult.Running(new QueryJobId("owner-node", "query-context"))));
+                new QueryResult.Running(
+                    new QueryJobId("owner-node", "query-context"), QueryJobState.RUNNING)));
 
     submit(task);
 

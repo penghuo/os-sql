@@ -332,7 +332,12 @@ class OpenSearchQueryJobServiceTest {
     InMemoryQueryJobStore racingStore = spy(store);
     OpenSearchQueryJobService racingService =
         new OpenSearchQueryJobService(
-            racingStore, clusterService("node-a"), Clock.systemUTC(), retentionPolicy);
+            racingStore,
+            clusterService("node-a"),
+            Clock.systemUTC(),
+            retentionPolicy,
+            null,
+            scheduler());
     RecordingRunner runner = new RecordingRunner();
     QueryJobId id =
         assertInstanceOf(
@@ -497,7 +502,15 @@ class OpenSearchQueryJobServiceTest {
       RetentionPolicy policy,
       java.util.function.Function<Throwable, java.util.Map<String, Object>> renderer) {
     return new OpenSearchQueryJobService(
-        store, clusterService("node-a"), Clock.systemUTC(), policy, renderer);
+        store, clusterService("node-a"), Clock.systemUTC(), policy, renderer, scheduler());
+  }
+
+  /** A scheduler with more running slots than any test submits, so every job starts at once. */
+  private static OpenSearchQueryJobScheduler scheduler() {
+    return new OpenSearchQueryJobScheduler(
+        OpenSearchQueryJobSchedulerTest.settings(),
+        OpenSearchQueryJobSchedulerTest.threadPool(
+            100, new ThreadContext(org.opensearch.common.settings.Settings.EMPTY)));
   }
 
   private static ClusterService clusterService(String localNodeId) {

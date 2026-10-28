@@ -119,7 +119,6 @@ class OpenSearchQueryManagerTest {
             WorkerPoolSaturatedException.class,
             () -> new OpenSearchQueryManager(nodeClient, settings).submit(queryPlan));
     assertEquals("[sql-worker] thread pool is saturated; retry later", e.getMessage());
-    assertFalse(e.isExecutorShutdown());
     assertFalse(isRun.get());
   }
 }

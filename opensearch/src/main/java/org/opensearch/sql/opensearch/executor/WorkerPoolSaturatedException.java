@@ -16,11 +16,8 @@ public class WorkerPoolSaturatedException extends OpenSearchRejectedExecutionExc
 
   /**
    * @param poolName the pool that refused the query
-   * @param executorShutdown whether the pool refused because it is shutting down
    */
-  public WorkerPoolSaturatedException(String poolName, boolean executorShutdown) {
-    super(
-        String.format(Locale.ROOT, "[%s] thread pool is saturated; retry later", poolName),
-        executorShutdown);
+  public WorkerPoolSaturatedException(String poolName) {
+    super(String.format(Locale.ROOT, "[%s] thread pool is saturated; retry later", poolName));
   }
 }

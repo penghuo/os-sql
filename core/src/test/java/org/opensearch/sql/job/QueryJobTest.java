@@ -259,14 +259,14 @@ class QueryJobTest {
   @Test
   void failQueued_failsOnlyAPendingJob() {
     QueryJob pending = newJob(new RecordingRunner(), 180L);
-    assertTrue(pending.failQueued(new IllegalStateException("waited too long")));
+    pending.failQueued(new IllegalStateException("waited too long"));
     assertEquals(QueryJobState.FAILED, pending.status().state());
     assertEquals("waited too long", pending.status().failure().orElseThrow().reason());
 
     RecordingRunner started = new RecordingRunner();
     QueryJob running = newJob(started, 181L);
     running.startRunner();
-    assertFalse(running.failQueued(new IllegalStateException("late")));
+    running.failQueued(new IllegalStateException("late"));
     assertEquals(QueryJobState.RUNNING, running.status().state());
   }
 

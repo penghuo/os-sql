@@ -125,19 +125,6 @@ public final class QueryJob {
    * OutOfMemoryError}) are not silently downgraded to an application-level failure.
    */
   public CompletionStage<QueryResult> await(Duration budget) {
-    CompletableFuture<QueryResult> out = outcome();
-    long millis = budget == null ? 0L : budget.toMillis();
-    if (millis <= 0L) {
-      out.complete(null);
-    } else {
-      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
-    }
-    // null marks an expired wait.
-    return out.thenCompose(value -> value != null ? out : onWaitExpired()).minimalCompletionStage();
-  }
-
-  /** The job's outcome: its result on success, its unwrapped cause on failure or cancellation. */
-  private CompletableFuture<QueryResult> outcome() {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
         (value, throwable) -> {
@@ -151,17 +138,20 @@ public final class QueryJob {
           }
           out.completeExceptionally(cause);
         });
-    return out;
+    long millis = budget == null ? 0L : budget.toMillis();
+    if (millis <= 0L) {
+      out.complete(null);
+    } else {
+      out.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
+    }
+    // null marks an expired wait; the job's state is read when it expires.
+    return out.thenApply(value -> value != null ? value : new QueryResult.Running(id, waitState()))
+        .minimalCompletionStage();
   }
 
-  /** Reports an unfinished job by its state; reports a job that just finished inline instead. */
-  private CompletionStage<QueryResult> onWaitExpired() {
-    synchronized (this) {
-      if (!state.isTerminal()) {
-        return CompletableFuture.completedFuture(new QueryResult.Running(id, state));
-      }
-    }
-    return outcome();
+  /** {@code PENDING} while the job waits to start, otherwise {@code RUNNING}. */
+  private synchronized QueryJobState waitState() {
+    return state == QueryJobState.PENDING ? QueryJobState.PENDING : QueryJobState.RUNNING;
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -195,20 +185,18 @@ public final class QueryJob {
    * Fails a job that waited too long to start. Package-private: called by the scheduler that queued
    * it.
    *
-   * @param cause reported as the job's failure
-   * @return {@code true} if the job was {@code PENDING} and is now {@code FAILED}
+   * @param cause reported as the job's failure; ignored unless the job is {@code PENDING}
    */
-  boolean failQueued(Throwable cause) {
+  void failQueued(Throwable cause) {
     synchronized (this) {
       if (state != QueryJobState.PENDING) {
-        return false;
+        return;
       }
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(cause, failureRenderer));
     }
     completion.completeExceptionally(cause);
-    return true;
   }
 
   /**

@@ -192,7 +192,7 @@ class OpenSearchQueryJobSchedulerTest {
     Runner queued = new Runner();
     submit(queued);
 
-    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker", false));
+    refused.future.completeExceptionally(new WorkerPoolSaturatedException("sql-worker"));
 
     QueryJobStatus status = job.status();
     assertEquals(QueryJobState.FAILED, status.state());
@@ -360,7 +360,7 @@ class OpenSearchQueryJobSchedulerTest {
   private static final class RefusingRunner implements QueryRunner {
     @Override
     public CompletionStage<QueryResult> run() {
-      throw new WorkerPoolSaturatedException("sql-worker", false);
+      throw new WorkerPoolSaturatedException("sql-worker");
     }
 
     @Override

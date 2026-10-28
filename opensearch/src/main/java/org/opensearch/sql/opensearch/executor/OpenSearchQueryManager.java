@@ -107,7 +107,7 @@ public class OpenSearchQueryManager implements QueryManager {
     try {
       threadPool.executor(SQL_WORKER_THREAD_POOL_NAME).execute(wrappedTask);
     } catch (OpenSearchRejectedExecutionException e) {
-      throw new WorkerPoolSaturatedException(SQL_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
+      throw new WorkerPoolSaturatedException(SQL_WORKER_THREAD_POOL_NAME);
     }
   }
 

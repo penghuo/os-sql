@@ -113,14 +113,14 @@ public final class OpenSearchQueryJobScheduler {
   }
 
   /** Jobs started and not yet terminal. */
-  public int running() {
+  int running() {
     synchronized (lock) {
       return running.size();
     }
   }
 
   /** Jobs waiting to start. */
-  public int queued() {
+  int queued() {
     synchronized (lock) {
       return queue.size();
     }

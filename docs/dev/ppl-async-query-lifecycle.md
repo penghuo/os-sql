@@ -45,7 +45,7 @@ stateDiagram-v2
 | `RUNNING` | `SUCCEEDED` | The runner returned a result | `QueryJob.onRunnerSuccess` |
 | `RUNNING` | `FAILED` | Parsing, planning, or execution failed or timed out, or `sql-worker` or `sql-complex-worker` refused the query (`WorkerPoolSaturatedException`) | `QueryJob.onRunnerFailure` |
 
-When the submit wait expires, the job is reported by its state at that moment, `PENDING` or `RUNNING`. A job that finished at that moment is reported inline instead.
+When the submit wait expires, the job is reported `PENDING` if it still waits in the queue, otherwise `RUNNING`. A job that finishes at that moment is reported `RUNNING`; the next GET returns its outcome.
 
 ## Submit
 

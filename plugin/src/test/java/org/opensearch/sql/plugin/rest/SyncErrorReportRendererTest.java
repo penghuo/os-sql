@@ -36,7 +36,7 @@ public class SyncErrorReportRendererTest {
 
   @Test
   public void saturatedWorkerPoolReturns429() {
-    WorkerPoolSaturatedException saturated = new WorkerPoolSaturatedException("sql-worker", false);
+    WorkerPoolSaturatedException saturated = new WorkerPoolSaturatedException("sql-worker");
     assertEquals(429, SyncErrorReportRenderer.statusCodeFor(saturated));
     assertEquals(429, SyncErrorReportRenderer.statusCodeFor(new RuntimeException(saturated)));
     assertEquals(

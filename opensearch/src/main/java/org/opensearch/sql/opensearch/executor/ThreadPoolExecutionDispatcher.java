@@ -130,8 +130,7 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
         threadPool.executor(SQL_COMPLEX_WORKER_THREAD_POOL_NAME).execute(complexTask);
       } catch (OpenSearchRejectedExecutionException e) {
         WorkerPoolSaturatedException saturated =
-            new WorkerPoolSaturatedException(
-                SQL_COMPLEX_WORKER_THREAD_POOL_NAME, e.isExecutorShutdown());
+            new WorkerPoolSaturatedException(SQL_COMPLEX_WORKER_THREAD_POOL_NAME);
         if (failureListener == null) {
           throw saturated;
         }

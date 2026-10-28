@@ -86,14 +86,6 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
-  public static final Setting<Integer> PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING =
-      Setting.intSetting(
-          Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES.getKeyValue(),
-          20,
-          1,
-          Setting.Property.NodeScope,
-          Setting.Property.Dynamic);
-
   public static final Setting<Integer> PPL_ASYNC_MAX_QUEUED_QUERIES_SETTING =
       Setting.intSetting(
           Key.PPL_ASYNC_MAX_QUEUED_QUERIES.getKeyValue(),
@@ -463,12 +455,6 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
-        Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES,
-        PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING,
-        new Updater(Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES));
-    register(
-        settingBuilder,
-        clusterSettings,
         Key.PPL_ASYNC_MAX_QUEUED_QUERIES,
         PPL_ASYNC_MAX_QUEUED_QUERIES_SETTING,
         new Updater(Key.PPL_ASYNC_MAX_QUEUED_QUERIES));
@@ -795,7 +781,6 @@ public class OpenSearchSettings extends Settings {
         .add(DESERIALIZATION_MAX_BYTES_SETTING)
         .add(PPL_ENABLED_SETTING)
         .add(PPL_QUERY_TIMEOUT_SETTING)
-        .add(PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES_SETTING)
         .add(PPL_ASYNC_MAX_QUEUED_QUERIES_SETTING)
         .add(PPL_ASYNC_MAX_QUEUED_TIME_SETTING)
         .add(PPL_SYNTAX_LEGACY_PREFERRED_SETTING)

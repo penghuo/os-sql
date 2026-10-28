@@ -146,19 +146,24 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
     JSONObject aliceOnly =
         new JSONObject().put("query", "source=" + ALICE_ONLY_INDEX + " | head 1");
     asUser(owner, "POST", "/_plugins/_ppl", ALICE, aliceOnly);
-    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
+    // Alice's jobs take every running slot, so Bob's job has to wait in the queue.
+    List<String> aliceJobs = new ArrayList<>();
+    String bobJob = null;
     try {
-      String aliceJob =
-          new JSONObject(
-                  asUser(
-                      owner,
-                      "POST",
-                      "/_plugins/_ppl",
-                      ALICE,
-                      new JSONObject()
-                          .put("query", STREAMSTATS_QUERY)
-                          .put("wait_for_completion_timeout", "0")))
-              .getString("id");
+      int slots = AsyncPPLTestHelpers.sqlWorkerThreads(owner, ownerNodeId);
+      for (int i = 0; i < slots; i++) {
+        aliceJobs.add(
+            new JSONObject(
+                    asUser(
+                        owner,
+                        "POST",
+                        "/_plugins/_ppl",
+                        ALICE,
+                        new JSONObject()
+                            .put("query", STREAMSTATS_QUERY)
+                            .put("wait_for_completion_timeout", "0")))
+                .getString("id"));
+      }
       JSONObject bobSubmit =
           new JSONObject(
               asUser(
@@ -168,18 +173,22 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
                   BOB,
                   new JSONObject(aliceOnly.toString()).put("wait_for_completion_timeout", "0")));
       Assert.assertEquals("PENDING", bobSubmit.getString("status"));
-      String bobJob = bobSubmit.getString("id");
+      bobJob = bobSubmit.getString("id");
 
       // Deleting Alice's job frees the slot on a thread that holds Alice's context; Bob's queued
       // job starts there and must still run as Bob.
-      asUser(owner, "DELETE", ASYNC_PATH + aliceJob, ALICE, null);
+      asUser(owner, "DELETE", ASYNC_PATH + aliceJobs.remove(0), ALICE, null);
 
       JSONObject terminal = awaitTerminalAs(bobJob, BOB);
       Assert.assertEquals("FAILED", terminal.getString("status"));
       Assert.assertTrue(terminal.getJSONObject("error").toString().contains("no permissions"));
-      asUser(owner, "DELETE", ASYNC_PATH + bobJob, BOB, null);
     } finally {
-      setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", null);
+      for (String id : aliceJobs) {
+        asUser(owner, "DELETE", ASYNC_PATH + id, ALICE, null);
+      }
+      if (bobJob != null) {
+        asUser(owner, "DELETE", ASYNC_PATH + bobJob, BOB, null);
+      }
     }
   }
 
@@ -195,15 +204,6 @@ public class AsyncPPLSecurityIT extends SecurityTestBase {
       Thread.sleep(100);
     }
     throw new AssertionError("job never reached a terminal state: " + last);
-  }
-
-  private void setClusterSetting(String key, String value) throws IOException {
-    Request request = new Request("PUT", "/_cluster/settings");
-    request.setJsonEntity(
-        value == null
-            ? "{\"transient\":{\"" + key + "\": null}}"
-            : "{\"transient\":{\"" + key + "\": \"" + value + "\"}}");
-    client().performRequest(request);
   }
 
   private void createAsyncUser(String user, boolean canDelete, String indexPattern)

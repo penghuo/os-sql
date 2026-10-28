@@ -23,16 +23,21 @@ import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
+import org.opensearch.client.Cancellable;
 import org.opensearch.client.Request;
+import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.client.ResponseListener;
+import org.opensearch.sql.plugin.transport.PPLQueryAction;
 
 /**
- * Capacity limits of async PPL (#5801): worker-pool saturation, queueing past the running limit,
+ * Capacity limits of async PPL (#5801): worker-pool saturation, queueing past the running slots,
  * and the queue limit and timeout.
  *
  * <p>Runs on the dedicated single-node {@code asyncCapacityIT} cluster, whose {@code sql-worker}
  * and {@code sql-complex-worker} pools each have one thread and a one-slot queue, so saturation is
- * deterministic. Every test deletes the jobs it creates and restores the settings it changes.
+ * deterministic and one async query fills the running slots. Every test deletes the jobs it creates
+ * and restores the settings it changes.
  */
 public class AsyncPPLCapacityIT extends PPLIntegTestCase {
 
@@ -76,38 +81,46 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
   @Test
   public void saturatedWorkerPoolFailsSyncAndAsyncQueriesWith429() throws Exception {
     String nodeId = localNodeId(client());
-    submitAccepted(SLOW_QUERY);
-    awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
-    submitAccepted(SLOW_QUERY);
-    awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 1);
-    String saturated = "[sql-complex-worker] thread pool is saturated; retry later";
-
-    // Before the fix the rejected sync request never received a response.
-    ResponseException sync =
-        Assert.assertThrows(
-            ResponseException.class,
-            () -> postPpl(client(), new JSONObject().put("query", SLOW_QUERY)));
-    Assert.assertEquals(429, sync.getResponse().getStatusLine().getStatusCode());
-    Assert.assertTrue(errorBody(sync).contains(saturated));
-
-    // Before the fix the rejected async job stayed RUNNING forever. The pool refuses it after
-    // planning, so it fails inline with 429 or, once its id was returned, ends FAILED.
-    JSONObject async;
+    // Sync queries fill the pool, so the async query below still gets a running slot.
+    List<Cancellable> busy = new ArrayList<>();
     try {
-      async = submitAsync(STREAMSTATS_QUERY);
-    } catch (ResponseException e) {
-      Assert.assertEquals(429, e.getResponse().getStatusLine().getStatusCode());
-      Assert.assertTrue(errorBody(e).contains(saturated));
-      return;
+      busy.add(startSync(SLOW_QUERY));
+      awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
+      busy.add(startSync(SLOW_QUERY));
+      awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 1);
+      String saturated = "[sql-complex-worker] thread pool is saturated; retry later";
+
+      // Before the fix the rejected sync request never received a response.
+      ResponseException sync =
+          Assert.assertThrows(
+              ResponseException.class,
+              () -> postPpl(client(), new JSONObject().put("query", SLOW_QUERY)));
+      Assert.assertEquals(429, sync.getResponse().getStatusLine().getStatusCode());
+      Assert.assertTrue(errorBody(sync).contains(saturated));
+
+      // Before the fix the rejected async job stayed RUNNING forever. The pool refuses it after
+      // planning, so it fails inline with 429 or, once its id was returned, ends FAILED.
+      JSONObject async;
+      try {
+        async = submitAsync(STREAMSTATS_QUERY);
+      } catch (ResponseException e) {
+        Assert.assertEquals(429, e.getResponse().getStatusLine().getStatusCode());
+        Assert.assertTrue(errorBody(e).contains(saturated));
+        return;
+      }
+      JSONObject terminal = pollUntilTerminal(client(), async.getString("id"), 30_000);
+      Assert.assertEquals("FAILED", terminal.getString("status"));
+      Assert.assertTrue(terminal.getJSONObject("error").toString().contains(saturated));
+    } finally {
+      // Cancel the sync queries' tasks as DELETE does for an async query, then drop the requests.
+      client()
+          .performRequest(new Request("POST", "/_tasks/_cancel?actions=" + PPLQueryAction.NAME));
+      busy.forEach(Cancellable::cancel);
     }
-    JSONObject terminal = pollUntilTerminal(client(), async.getString("id"), 30_000);
-    Assert.assertEquals("FAILED", terminal.getString("status"));
-    Assert.assertTrue(terminal.getJSONObject("error").toString().contains(saturated));
   }
 
   @Test
   public void submitOverTheRunningLimitWaitsAsPendingUntilASlotFrees() throws Exception {
-    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     String nodeId = localNodeId(client());
     String running = submitAccepted(SLOW_QUERY);
     awaitPoolBusy(client(), nodeId, COMPLEX_POOL, 1, 0);
@@ -124,7 +137,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
 
   @Test
   public void fullQueueRejectsSubmitWith429() throws Exception {
-    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     setClusterSetting("plugins.ppl.async.max_queued_queries", "1");
     String nodeId = localNodeId(client());
     submitAccepted(SLOW_QUERY);
@@ -139,7 +151,6 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
 
   @Test
   public void queuedJobFailsAfterTheQueueTimeout() throws Exception {
-    setClusterSetting("plugins.ppl.async.node_concurrent_running_queries", "1");
     setClusterSetting("plugins.ppl.async.max_queued_time", "1s");
     String nodeId = localNodeId(client());
     submitAccepted(SLOW_QUERY);
@@ -180,6 +191,22 @@ public class AsyncPPLCapacityIT extends PPLIntegTestCase {
       Thread.sleep(50);
     }
     Assert.fail("job never reported " + status + "; last=" + last);
+  }
+
+  /** Starts a sync query without waiting for it; cancel the returned handle to stop it. */
+  private Cancellable startSync(String query) {
+    Request request = new Request("POST", "/_plugins/_ppl");
+    request.setJsonEntity(new JSONObject().put("query", query).toString());
+    return client()
+        .performRequestAsync(
+            request,
+            new ResponseListener() {
+              @Override
+              public void onSuccess(Response response) {}
+
+              @Override
+              public void onFailure(Exception exception) {}
+            });
   }
 
   private String submit(String query) throws IOException {

@@ -81,11 +81,11 @@ A job is in the store from publish until removal.
 
 The scheduler works like a thread pool executor with a bounded work queue. A job does not hold a thread while it runs; the work runs on the SQL worker pools.
 
-- **Running slots.** At most `node_concurrent_running_queries` jobs are `RUNNING`.
+- **Running slots.** At most as many jobs are `RUNNING` as `sql-worker` has threads (`thread_pool.sql-worker.size`, the number of processors by default). Jobs beyond that wait here as `PENDING`, not in the worker pool's queue.
 - **Queue.** Up to `max_queued_queries` jobs wait as `PENDING`, in submission order. A submit beyond that gets `429`.
 - **Submitter context.** A queued job starts on whichever thread frees a slot. The scheduler captures the submitting thread's context when it queues the job and restores it when the job starts: the OpenSearch thread context (security user, headers, trace span), the logging context, and the query task that cancellation reaches.
 - **Wait deadline.** A queued job may wait for `max_queued_time`. When it runs out, the job ends `FAILED`. The deadline is cancelled when the job starts.
-- **Worker pools.** A running slot only bounds async jobs. It does not reserve room in the SQL worker pools, which sync queries and other features share. A job that a full pool refuses ends `FAILED`; it is not retried. Admitting every query through one scheduler is tracked in [#5912](https://github.com/opensearch-project/sql/issues/5912).
+- **Worker pools.** A running slot does not reserve a thread. Sync queries and other features share the SQL worker pools, so a `RUNNING` job may still wait in a pool's queue. A job that a full pool refuses ends `FAILED`; it is not retried. Admitting every query through one scheduler is tracked in [#5912](https://github.com/opensearch-project/sql/issues/5912).
 
 ## Timers
 
@@ -109,7 +109,6 @@ The scheduler works like a thread pool executor with a bounded work queue. A job
 
 | Setting | Default | Enforced by |
 |---|---|---|
-| `plugins.ppl.async.node_concurrent_running_queries` | `20` | Scheduler |
 | `plugins.ppl.async.max_queued_queries` | `100` | Scheduler |
 | `plugins.ppl.async.max_queued_time` | `5m` | Scheduler |
 

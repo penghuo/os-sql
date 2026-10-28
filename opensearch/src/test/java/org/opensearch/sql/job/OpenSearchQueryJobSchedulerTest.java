@@ -57,11 +57,10 @@ class OpenSearchQueryJobSchedulerTest {
 
   @BeforeEach
   void setUp() {
-    settings = settings(1);
-    threadPool = mock(ThreadPool.class);
+    settings = settings();
+    threadPool = threadPool(1, threadContext);
     timer = mock(ScheduledCancellable.class);
     when(threadPool.schedule(any(Runnable.class), any(TimeValue.class), any())).thenReturn(timer);
-    when(threadPool.getThreadContext()).thenReturn(threadContext);
     scheduler = new OpenSearchQueryJobScheduler(settings, threadPool);
   }
 
@@ -72,8 +71,10 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void startsUpToTheLimitAndQueuesTheRestInOrder() {
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 2);
+  void startsAsManyJobsAsSqlWorkerHasThreadsAndQueuesTheRestInOrder() {
+    when(threadPool.info(OpenSearchQueryManager.SQL_WORKER_THREAD_POOL_NAME))
+        .thenReturn(new ThreadPool.Info("sql-worker", ThreadPool.ThreadPoolType.FIXED, 2));
+    scheduler = new OpenSearchQueryJobScheduler(settings, threadPool);
     Runner a = new Runner();
     Runner b = new Runner();
     Runner c = new Runner();
@@ -217,22 +218,6 @@ class OpenSearchQueryJobSchedulerTest {
   }
 
   @Test
-  void raisedLimitStartsMoreJobsOnTheNextRelease() {
-    Runner first = new Runner();
-    submit(first);
-    Runner second = new Runner();
-    Runner third = new Runner();
-    submit(second);
-    submit(third);
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, 3);
-
-    first.future.complete(ROWS);
-
-    assertTrue(second.ran && third.ran);
-    assertEquals(2, scheduler.running());
-  }
-
-  @Test
   void queuedJobStartsInItsSubmittersContextAndPutsBackTheStartingThreads() throws Exception {
     Runner first = new Runner();
     submit(first);
@@ -288,12 +273,20 @@ class OpenSearchQueryJobSchedulerTest {
     return job;
   }
 
-  static MutableSettings settings(int maxRunning) {
+  static MutableSettings settings() {
     MutableSettings settings = new MutableSettings();
-    settings.put(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES, maxRunning);
     settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, 100);
     settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_TIME, TimeValue.timeValueMinutes(5));
     return settings;
+  }
+
+  /** A thread pool mock whose {@code sql-worker} has {@code workers} threads. */
+  static ThreadPool threadPool(int workers, ThreadContext threadContext) {
+    ThreadPool threadPool = mock(ThreadPool.class);
+    when(threadPool.info(OpenSearchQueryManager.SQL_WORKER_THREAD_POOL_NAME))
+        .thenReturn(new ThreadPool.Info("sql-worker", ThreadPool.ThreadPoolType.FIXED, workers));
+    when(threadPool.getThreadContext()).thenReturn(threadContext);
+    return threadPool;
   }
 
   /** {@link Settings} backed by a map the test can change between calls. */

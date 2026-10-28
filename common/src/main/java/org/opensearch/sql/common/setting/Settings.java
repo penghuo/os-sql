@@ -39,7 +39,6 @@ public abstract class Settings {
     PPL_REST_ALLOWED_ENDPOINTS("plugins.ppl.rest.allowed_endpoints"),
 
     /** Async PPL Settings. */
-    PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES("plugins.ppl.async.node_concurrent_running_queries"),
     PPL_ASYNC_MAX_QUEUED_QUERIES("plugins.ppl.async.max_queued_queries"),
     PPL_ASYNC_MAX_QUEUED_TIME("plugins.ppl.async.max_queued_time"),
 

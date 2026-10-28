@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.job;
 
+import static org.opensearch.sql.opensearch.executor.OpenSearchQueryManager.SQL_WORKER_THREAD_POOL_NAME;
+
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Deque;
@@ -27,10 +29,10 @@ import org.opensearch.threadpool.Scheduler.Cancellable;
 import org.opensearch.threadpool.ThreadPool;
 
 /**
- * Runs at most {@code plugins.ppl.async.node_concurrent_running_queries} async jobs at once on this
- * node and queues up to {@code plugins.ppl.async.max_queued_queries} more in submission order; a
- * submit beyond both is rejected with {@code 429}, like a thread pool executor with a bounded work
- * queue.
+ * Runs at most as many async jobs at once on this node as {@code sql-worker} has threads, and
+ * queues up to {@code plugins.ppl.async.max_queued_queries} more in submission order; a submit
+ * beyond both is rejected with {@code 429}, like a thread pool executor with a bounded work queue.
+ * Queued jobs wait here as {@code PENDING} rather than in the worker pool's queue.
  *
  * <p>A queued job may wait for at most {@code plugins.ppl.async.max_queued_time}. After that it
  * ends {@code FAILED}.
@@ -40,8 +42,8 @@ import org.opensearch.threadpool.ThreadPool;
  * logging context, and the query task that cancellation reaches. The starting thread's own context
  * is put back afterwards.
  *
- * <p>A running slot only bounds async jobs; it does not reserve room in the SQL worker pools, which
- * other queries share. A job whose worker pool refuses it fails.
+ * <p>A running slot does not reserve a thread: synchronous queries share the SQL worker pools, so a
+ * running job may still wait in a pool's queue, and a job whose worker pool refuses it fails.
  *
  * <h2>Thread safety</h2>
  *
@@ -54,6 +56,7 @@ public final class OpenSearchQueryJobScheduler {
 
   private final Settings settings;
   private final ThreadPool threadPool;
+  private final int maxRunning;
   private final Object lock = new Object();
   private final Set<QueryJob> running = Collections.newSetFromMap(new IdentityHashMap<>());
   private final Deque<Queued> queue = new ArrayDeque<>();
@@ -64,12 +67,14 @@ public final class OpenSearchQueryJobScheduler {
 
   /**
    * @param settings plugin settings the limits are read from on every decision
-   * @param threadPool runs the wait deadline timers on the generic pool
+   * @param threadPool sizes the running slots after {@code sql-worker} and runs the wait deadline
+   *     timers on the generic pool
    * @throws NullPointerException if either argument is {@code null}
    */
   public OpenSearchQueryJobScheduler(Settings settings, ThreadPool threadPool) {
     this.settings = Objects.requireNonNull(settings, "settings must not be null");
     this.threadPool = Objects.requireNonNull(threadPool, "threadPool must not be null");
+    this.maxRunning = Math.max(1, threadPool.info(SQL_WORKER_THREAD_POOL_NAME).getMax());
   }
 
   /**
@@ -83,8 +88,6 @@ public final class OpenSearchQueryJobScheduler {
    */
   public void submit(QueryJob job) {
     Objects.requireNonNull(job, "job must not be null");
-    int maxRunning =
-        settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
     int maxQueued = settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES);
     boolean startNow;
     synchronized (lock) {
@@ -135,8 +138,6 @@ public final class OpenSearchQueryJobScheduler {
     draining.set(true);
     try {
       while (true) {
-        int maxRunning =
-            settings.getSettingValue(Settings.Key.PPL_ASYNC_NODE_CONCURRENT_RUNNING_QUERIES);
         Queued next;
         Cancellable deadline;
         synchronized (lock) {

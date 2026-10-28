@@ -200,6 +200,20 @@ public final class AsyncPPLTestHelpers {
     return null; // unreachable
   }
 
+  /** Threads of {@code sql-worker} on {@code nodeId}, which is also its async running slots. */
+  public static int sqlWorkerThreads(RestClient node, String nodeId) throws IOException {
+    JSONObject raw =
+        new JSONObject(
+            getResponseBody(
+                node.performRequest(new Request("GET", "/_nodes/" + nodeId + "/thread_pool")),
+                true));
+    return raw.getJSONObject("nodes")
+        .getJSONObject(nodeId)
+        .getJSONObject("thread_pool")
+        .getJSONObject("sql-worker")
+        .getInt("size");
+  }
+
   /** Waits until {@code pool} on {@code nodeId} reports at least the given active and queued. */
   public static void awaitPoolBusy(
       RestClient owner, String nodeId, String pool, int minActive, int minQueued) throws Exception {

@@ -452,11 +452,11 @@ class OpenSearchQueryJobServiceTest {
 
   private OpenSearchQueryJobService newQueuedService(int maxRunning, int maxQueued) {
     OpenSearchQueryJobSchedulerTest.MutableSettings settings =
-        OpenSearchQueryJobSchedulerTest.settings(maxRunning);
+        OpenSearchQueryJobSchedulerTest.settings();
     settings.put(Settings.Key.PPL_ASYNC_MAX_QUEUED_QUERIES, maxQueued);
-    ThreadPool pool = mock(ThreadPool.class);
-    when(pool.getThreadContext())
-        .thenReturn(new ThreadContext(org.opensearch.common.settings.Settings.EMPTY));
+    ThreadPool pool =
+        OpenSearchQueryJobSchedulerTest.threadPool(
+            maxRunning, new ThreadContext(org.opensearch.common.settings.Settings.EMPTY));
     return new OpenSearchQueryJobService(
         store,
         clusterService("node-a"),

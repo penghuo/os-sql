@@ -473,19 +473,6 @@ Expected output:
 }
 ```
   
-## plugins.ppl.async.node_concurrent_running_queries
-
-### Version
-
-3.10
-
-### Description
-
-The maximum number of async PPL queries that run at the same time on one node. A query beyond the limit waits as `PENDING` and starts, in submission order, when a running query finishes. Queries that return inline also count while they run; synchronous queries are not counted.
-1. The default value is `20`; the minimum is `1`.
-2. This setting is node scope.
-3. This setting can be updated dynamically.
-
 ## plugins.ppl.async.max_queued_queries
 
 ### Version
@@ -494,7 +481,7 @@ The maximum number of async PPL queries that run at the same time on one node. A
 
 ### Description
 
-The maximum number of async PPL queries that wait as `PENDING` on one node because every running slot is busy. A submit beyond the limit is rejected with `429`. A value of `0` means a query is rejected instead of queued when every slot is busy.
+The maximum number of async PPL queries that wait as `PENDING` on one node. A node runs as many async queries at the same time as its `sql-worker` thread pool has threads (`thread_pool.sql-worker.size`, the number of processors by default); further queries wait in this queue. A submit beyond the limit is rejected with `429`. A value of `0` means a query is rejected instead of queued when every thread is busy.
 1. The default value is `100`; the minimum is `0`.
 2. This setting is node scope.
 3. This setting can be updated dynamically.
@@ -514,10 +501,10 @@ How long an async PPL query may wait as `PENDING` in the queue before it ends `F
 
 ### Example
 
-Allow at most 10 running async queries and 50 queued ones per node:
+Allow at most 50 queued async queries per node:
 
 ```bash ignore
 curl -sS -H 'Content-Type: application/json' \
 -X PUT localhost:9200/_plugins/_query/settings \
--d '{"transient" : {"plugins.ppl.async.node_concurrent_running_queries" : 10, "plugins.ppl.async.max_queued_queries" : 50}}'
+-d '{"transient" : {"plugins.ppl.async.max_queued_queries" : 50}}'
 ```

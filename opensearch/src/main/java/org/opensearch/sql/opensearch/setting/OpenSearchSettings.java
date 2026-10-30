@@ -27,6 +27,7 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.search.aggregations.MultiBucketConsumerService;
 import org.opensearch.sql.common.antlr.AstBuildGuard;
@@ -83,6 +84,21 @@ public class OpenSearchSettings extends Settings {
       Setting.positiveTimeSetting(
           Key.PPL_QUERY_TIMEOUT.getKeyValue(),
           TimeValue.timeValueSeconds(300),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  public static final Setting<Integer> PPL_ASYNC_MAX_RETAINED_JOBS_SETTING =
+      Setting.intSetting(
+          Key.PPL_ASYNC_MAX_RETAINED_JOBS.getKeyValue(),
+          1000,
+          1,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  public static final Setting<ByteSizeValue> PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING =
+      Setting.memorySizeSetting(
+          Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE.getKeyValue(),
+          "10%",
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
@@ -440,6 +456,18 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
+        Key.PPL_ASYNC_MAX_RETAINED_JOBS,
+        PPL_ASYNC_MAX_RETAINED_JOBS_SETTING,
+        new Updater(Key.PPL_ASYNC_MAX_RETAINED_JOBS));
+    register(
+        settingBuilder,
+        clusterSettings,
+        Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE,
+        PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING,
+        new Updater(Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE));
+    register(
+        settingBuilder,
+        clusterSettings,
         Key.PPL_SYNTAX_LEGACY_PREFERRED,
         PPL_SYNTAX_LEGACY_PREFERRED_SETTING,
         new Updater(Key.PPL_SYNTAX_LEGACY_PREFERRED));
@@ -754,6 +782,8 @@ public class OpenSearchSettings extends Settings {
         .add(DESERIALIZATION_MAX_BYTES_SETTING)
         .add(PPL_ENABLED_SETTING)
         .add(PPL_QUERY_TIMEOUT_SETTING)
+        .add(PPL_ASYNC_MAX_RETAINED_JOBS_SETTING)
+        .add(PPL_ASYNC_MAX_RETAINED_RESULT_SIZE_SETTING)
         .add(PPL_SYNTAX_LEGACY_PREFERRED_SETTING)
         .add(CALCITE_ENGINE_ENABLED_SETTING)
         .add(CALCITE_FALLBACK_ALLOWED_SETTING)

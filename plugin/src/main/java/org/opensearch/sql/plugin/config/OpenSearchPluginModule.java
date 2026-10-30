@@ -12,6 +12,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.AbstractModule;
 import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.analysis.ExpressionAnalyzer;
 import org.opensearch.sql.common.setting.Settings;
@@ -135,8 +136,18 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   @Singleton
-  public QueryJobStore queryJobStore() {
-    return new InMemoryQueryJobStore();
+  public InMemoryQueryJobStore inMemoryQueryJobStore(Settings settings) {
+    return new InMemoryQueryJobStore(
+        () -> settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS),
+        () ->
+            settings
+                .<ByteSizeValue>getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE)
+                .getBytes());
+  }
+
+  @Provides
+  public QueryJobStore queryJobStore(InMemoryQueryJobStore store) {
+    return store;
   }
 
   @Provides
@@ -154,7 +165,7 @@ public class OpenSearchPluginModule extends AbstractModule {
   @Provides
   @Singleton
   public QueryJobService queryJobService(
-      QueryJobStore store, ClusterService clusterService, RetentionPolicy retentionPolicy) {
+      InMemoryQueryJobStore store, ClusterService clusterService, RetentionPolicy retentionPolicy) {
     return new OpenSearchQueryJobService(
         store,
         clusterService,
@@ -162,7 +173,8 @@ public class OpenSearchPluginModule extends AbstractModule {
         retentionPolicy,
         // Reuse the sync REST renderer so an async GET on a FAILED job returns the same
         // structured error body a synchronous POST would have returned for the same exception.
-        org.opensearch.sql.plugin.rest.SyncErrorReportRenderer::renderErrorMap);
+        org.opensearch.sql.plugin.rest.SyncErrorReportRenderer::renderErrorMap,
+        store);
   }
 
   /** {@link QueryPlanFactory}. */

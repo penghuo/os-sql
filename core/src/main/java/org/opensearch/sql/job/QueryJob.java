@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.job;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Map;
@@ -29,9 +30,19 @@ import java.util.function.Function;
  * <pre>
  *   PENDING --startRunner()--&gt; RUNNING --runner success--&gt; SUCCEEDED
  *                                     \--runner failure--&gt; FAILED
+ *                                     \--result over budget--&gt; FAILED
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
  * </pre>
+ *
+ * <h2>Result retention</h2>
+ *
+ * A job still unfinished when the submit wait expires is retained for polling. A retained job
+ * charges its result against its {@link ResultBudget} when the runner succeeds; when the budget
+ * refuses the charge, the job ends {@code FAILED} with the refusal as its cause and the rows are
+ * dropped. Results returned inline are never charged. The store {@linkplain #detach() detaches} a
+ * job when it removes it, which returns the charge. The job releases its runner on every terminal
+ * transition, so a retained job does not keep the runner or its copy of the result reachable.
  *
  * <h2>Thread safety</h2>
  *
@@ -44,9 +55,10 @@ public final class QueryJob {
 
   private final QueryJobId id;
   private final Principal owner;
-  private final QueryRunner runner;
+  private QueryRunner runner;
   private final Clock clock;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
+  private final ResultBudget resultBudget;
   private final long submittedAtMillis;
   private final CompletableFuture<QueryResult> completion = new CompletableFuture<>();
 
@@ -55,6 +67,9 @@ public final class QueryJob {
   private OptionalLong completedAtMillis = OptionalLong.empty();
   private Optional<QueryFailure> failure = Optional.empty();
   private Optional<QueryResult> result = Optional.empty();
+  private boolean retained;
+  private boolean detached;
+  private long chargedBytes;
 
   /**
    * Creates a job in {@link QueryJobState#PENDING}. Package-private: only {@link QueryJobService}
@@ -88,11 +103,30 @@ public final class QueryJob {
       QueryRunner runner,
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(id, owner, runner, clock, failureRenderer, ResultBudget.UNLIMITED);
+  }
+
+  /**
+   * Creates a job in {@link QueryJobState#PENDING} whose retained result is charged against {@code
+   * resultBudget}. Package-private: only {@link QueryJobService} implementations may construct a
+   * job.
+   *
+   * @param resultBudget budget a result is charged against when the job succeeds while retained
+   * @throws NullPointerException if {@code resultBudget} is {@code null}
+   */
+  QueryJob(
+      QueryJobId id,
+      Principal owner,
+      QueryRunner runner,
+      Clock clock,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ResultBudget resultBudget) {
     this.id = Objects.requireNonNull(id, "id must not be null");
     this.owner = Objects.requireNonNull(owner, "owner must not be null");
     this.runner = Objects.requireNonNull(runner, "runner must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.failureRenderer = failureRenderer;
+    this.resultBudget = Objects.requireNonNull(resultBudget, "resultBudget must not be null");
     this.submittedAtMillis = clock.millis();
   }
 
@@ -115,36 +149,59 @@ public final class QueryJob {
   /**
    * Bounded, non-blocking wait. The returned stage fires exactly once — with the runner's {@link
    * QueryResult} on success, {@link QueryResult.Running} when the budget expires, or exceptionally
-   * with the unwrapped runner cause on failure or cancellation. The callback fires on the
-   * runner-completing thread (success/failure) or the JDK {@code Delayer} daemon (timeout); callers
-   * needing {@code ThreadContext} preserved must wrap their listener with {@code
-   * ContextPreservingActionListener} before registering.
+   * with the unwrapped runner cause on failure or cancellation. Expiry retains the job for polling
+   * in the same step that checks it has not succeeded, so a result is either returned inline or
+   * retained and charged, never both. The callback fires on the runner-completing thread
+   * (success/failure) or the JDK {@code Delayer} daemon (timeout); callers needing {@code
+   * ThreadContext} preserved must wrap their listener with {@code ContextPreservingActionListener}
+   * before registering.
    *
    * <p>Non-{@link Exception} throwables re-throw so JVM-level errors (e.g. {@link
    * OutOfMemoryError}) are not silently downgraded to an application-level failure.
    */
   public CompletionStage<QueryResult> await(Duration budget) {
-    CompletableFuture<QueryResult> out = new CompletableFuture<>();
+    CompletableFuture<QueryResult> waited = new CompletableFuture<>();
     completion.whenComplete(
         (value, throwable) -> {
           if (throwable == null) {
-            out.complete(value);
+            waited.complete(value);
             return;
           }
           Throwable cause = unwrap(throwable);
           if (cause instanceof Error error) {
             throw error;
           }
-          out.completeExceptionally(cause);
+          waited.completeExceptionally(cause);
         });
     long millis = budget == null ? 0L : budget.toMillis();
-    QueryResult.Running running = new QueryResult.Running(id);
+    // null marks an expired wait.
     if (millis <= 0L) {
-      out.complete(running);
+      waited.complete(null);
     } else {
-      out.completeOnTimeout(running, millis, TimeUnit.MILLISECONDS);
+      waited.completeOnTimeout(null, millis, TimeUnit.MILLISECONDS);
     }
+    CompletableFuture<QueryResult> out = new CompletableFuture<>();
+    waited.whenComplete(
+        (value, throwable) -> {
+          if (throwable != null) {
+            out.completeExceptionally(throwable);
+          } else {
+            out.complete(value != null ? value : retainUnlessSucceeded());
+          }
+        });
     return out.minimalCompletionStage();
+  }
+
+  /**
+   * Returns the result of a job that already succeeded. Otherwise retains the job for polling and
+   * returns {@link QueryResult.Running}, so a result is never retained without being charged.
+   */
+  private synchronized QueryResult retainUnlessSucceeded() {
+    if (state == QueryJobState.SUCCEEDED) {
+      return result.orElseThrow();
+    }
+    retained = true;
+    return new QueryResult.Running(id);
   }
 
   /** One-shot hook that fires exactly once when the job reaches any terminal state. */
@@ -159,19 +216,34 @@ public final class QueryJob {
    * completes the internal future exceptionally.
    */
   public void cancel() {
-    boolean shouldCancelRunner;
+    QueryRunner toCancel;
     synchronized (this) {
       if (state.isTerminal()) {
         return;
       }
       state = QueryJobState.CANCELLED;
       completedAtMillis = OptionalLong.of(clock.millis());
-      shouldCancelRunner = true;
+      toCancel = runner;
+      runner = null;
     }
-    if (shouldCancelRunner) {
-      safeCancelRunner();
-    }
+    safeCancelRunner(toCancel);
     completion.cancel(false);
+  }
+
+  /**
+   * Detaches the job from the store and returns its result charge to the budget. Package-private:
+   * the store calls this once, after removing the job. A result that arrives later is not charged.
+   */
+  void detach() {
+    long released;
+    synchronized (this) {
+      detached = true;
+      released = chargedBytes;
+      chargedBytes = 0;
+    }
+    if (released > 0) {
+      resultBudget.release(released);
+    }
   }
 
   /**
@@ -188,16 +260,18 @@ public final class QueryJob {
    * </ul>
    */
   void startRunner() {
+    QueryRunner toRun;
     synchronized (this) {
       if (state != QueryJobState.PENDING) {
         return;
       }
       state = QueryJobState.RUNNING;
       startedAtMillis = OptionalLong.of(clock.millis());
+      toRun = runner;
     }
     CompletionStage<QueryResult> stage;
     try {
-      stage = Objects.requireNonNull(runner.run(), "runner must not return null");
+      stage = Objects.requireNonNull(toRun.run(), "runner must not return null");
     } catch (RuntimeException e) {
       onRunnerFailure(e);
       return;
@@ -217,20 +291,41 @@ public final class QueryJob {
   /**
    * Terminal transition from {@link QueryJobState#RUNNING} to {@link QueryJobState#SUCCEEDED}.
    * Ignored if the job has already left {@code RUNNING} (e.g. a concurrent {@link #cancel()} beat
-   * the runner). Records the result inside the monitor; completes the future outside it.
+   * the runner). Records the result inside the monitor; completes the future outside it. A retained
+   * job charges the result first and ends {@code FAILED} if the budget refuses it.
    *
    * @param value final result produced by the runner; never {@code null}
    */
   private void onRunnerSuccess(QueryResult value) {
+    RuntimeException refused = null;
     synchronized (this) {
       if (state != QueryJobState.RUNNING) {
         return;
       }
-      state = QueryJobState.SUCCEEDED;
       completedAtMillis = OptionalLong.of(clock.millis());
-      result = Optional.of(value);
+      runner = null;
+      if (retained && !detached) {
+        long bytes = QueryResultSizeEstimator.estimate(value);
+        try {
+          resultBudget.reserve(bytes);
+          chargedBytes = bytes;
+        } catch (RuntimeException e) {
+          refused = e;
+        }
+      }
+      if (refused == null) {
+        state = QueryJobState.SUCCEEDED;
+        result = Optional.of(value);
+      } else {
+        state = QueryJobState.FAILED;
+        failure = Optional.of(QueryFailure.of(refused, failureRenderer));
+      }
     }
-    completion.complete(value);
+    if (refused == null) {
+      completion.complete(value);
+    } else {
+      completion.completeExceptionally(refused);
+    }
   }
 
   /**
@@ -249,6 +344,7 @@ public final class QueryJob {
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
+      runner = null;
     }
     completion.completeExceptionally(throwable);
   }
@@ -258,12 +354,21 @@ public final class QueryJob {
    * not block the state machine, and the job has already been marked {@code CANCELLED} before this
    * is called.
    */
-  private void safeCancelRunner() {
+  private static void safeCancelRunner(QueryRunner toCancel) {
+    if (toCancel == null) {
+      return;
+    }
     try {
-      runner.cancel();
+      toCancel.cancel();
     } catch (RuntimeException ignored) {
       // Cancellation is best-effort; a misbehaving runner must not block the state machine.
     }
+  }
+
+  /** Whether the job still references its runner. */
+  @VisibleForTesting
+  synchronized boolean holdsRunner() {
+    return runner != null;
   }
 
   /**

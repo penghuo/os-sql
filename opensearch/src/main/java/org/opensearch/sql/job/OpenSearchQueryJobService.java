@@ -34,6 +34,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private final Clock clock;
   private final RetentionPolicy retentionPolicy;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
+  private final ResultBudget resultBudget;
 
   /**
    * Legacy constructor without a failure renderer; existing tests and the no-wiring case keep
@@ -66,11 +67,28 @@ public final class OpenSearchQueryJobService implements QueryJobService {
       Clock clock,
       RetentionPolicy retentionPolicy,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(store, clusterService, clock, retentionPolicy, failureRenderer, ResultBudget.UNLIMITED);
+  }
+
+  /**
+   * @param resultBudget budget a retained job charges its result against; usually the {@code store}
+   *     itself, which returns the charge when it removes the job
+   * @throws NullPointerException if {@code store}, {@code clusterService}, {@code clock}, or {@code
+   *     resultBudget} is {@code null}
+   */
+  public OpenSearchQueryJobService(
+      QueryJobStore store,
+      ClusterService clusterService,
+      Clock clock,
+      RetentionPolicy retentionPolicy,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      ResultBudget resultBudget) {
     this.store = Objects.requireNonNull(store, "store must not be null");
     this.clusterService = Objects.requireNonNull(clusterService, "clusterService must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.retentionPolicy = retentionPolicy;
     this.failureRenderer = failureRenderer;
+    this.resultBudget = Objects.requireNonNull(resultBudget, "resultBudget must not be null");
   }
 
   @Override
@@ -139,7 +157,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private QueryJob publish(QueryRunner runner, Principal owner) {
     while (true) {
       QueryJobId id = QueryJobId.create(clusterService.localNode().getId());
-      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer);
+      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer, resultBudget);
       if (store.register(job) == null) {
         return job;
       }

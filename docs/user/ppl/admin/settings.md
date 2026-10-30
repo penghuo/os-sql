@@ -110,6 +110,48 @@ Expected output:
 }
 ```
   
+## plugins.ppl.async.max_retained_jobs
+
+### Version
+
+3.10
+
+### Description
+
+This setting limits how many asynchronous PPL jobs a node holds, running or finished. A job is held from submit until it is deleted or its `keep_alive` expires; a job whose result is returned inline is held only while it runs. While the limit is reached, an asynchronous submit fails with `429`.
+1. The default value is 1000. The minimum is 1.
+2. This setting is node scope.
+3. This setting can be updated dynamically. A lowered limit applies to the next submit; jobs already held are not removed.
+
+### Example
+
+```bash ignore
+curl -sS -H 'Content-Type: application/json' \
+-X PUT localhost:9200/_plugins/_query/settings \
+-d '{"transient" : {"plugins.ppl.async.max_retained_jobs" : 100}}'
+```
+
+## plugins.ppl.async.max_retained_result_size
+
+### Version
+
+3.10
+
+### Description
+
+This setting limits the heap that a node uses to retain the results of asynchronous PPL jobs for polling. The size of a result is estimated from its rows when the job finishes. A result that does not fit in the remaining budget is dropped and the job ends `FAILED` with a `429` error. While retained results fill the budget, an asynchronous submit fails with `429`. Results returned inline are not counted. The budget is released when a job is deleted or its `keep_alive` expires.
+1. The default value is 10% of the heap. The value is a percentage of the heap or a byte size such as `512mb`.
+2. This setting is node scope.
+3. This setting can be updated dynamically. A lowered limit applies to the next submit or result; results already retained are kept.
+
+### Example
+
+```bash ignore
+curl -sS -H 'Content-Type: application/json' \
+-X PUT localhost:9200/_plugins/_query/settings \
+-d '{"transient" : {"plugins.ppl.async.max_retained_result_size" : "5%"}}'
+```
+
 ## plugins.query.memory_limit
 
 ### Version

@@ -16,6 +16,10 @@ The meaning of fields in the response is as follows:
 | `ppl_request_count` | Total count of PPL request within the interval |
 | `ppl_failed_request_count_syserr` | Count of failed PPL request due to system error within the interval |
 | `ppl_failed_request_count_cuserr` | Count of failed PPL request due to bad request within the interval |  
+| `ppl_async_retained_jobs` | Asynchronous PPL jobs the node holds, running or finished |
+| `ppl_async_retained_result_bytes` | Estimated bytes of asynchronous PPL results the node retains for polling |
+| `ppl_async_rejected_submit_count` | Total count of asynchronous PPL submits rejected with `429` because the node retains too many jobs or results |
+| `ppl_async_rejected_result_count` | Total count of asynchronous PPL results dropped because they did not fit in the retained result budget |
 
 ### Example  
 

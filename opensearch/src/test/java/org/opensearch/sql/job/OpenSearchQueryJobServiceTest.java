@@ -25,6 +25,7 @@ import static org.mockito.Mockito.when;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -41,8 +42,11 @@ import org.mockito.ArgumentCaptor;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.sql.data.model.ExprStringValue;
+import org.opensearch.sql.data.model.ExprTupleValue;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.job.exceptions.QueryJobCapacityException;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 import org.opensearch.threadpool.ThreadPool;
@@ -56,6 +60,15 @@ class OpenSearchQueryJobServiceTest {
   private static final QueryResult.Rows RESULT =
       new QueryResult.Rows(
           new ExecutionEngine.Schema(List.of()), List.of(), Cursor.None, List.of(), 0);
+
+  private static final QueryResult.Rows WIDE_RESULT =
+      new QueryResult.Rows(
+          new ExecutionEngine.Schema(List.of()),
+          List.of(
+              ExprTupleValue.fromExprValueMap(Map.of("f", new ExprStringValue("x".repeat(64))))),
+          Cursor.None,
+          List.of(),
+          0);
 
   private InMemoryQueryJobStore store;
   private ThreadPool threadPool;
@@ -411,6 +424,80 @@ class OpenSearchQueryJobServiceTest {
     assertFalse(runner.wasRun());
     assertTrue(store.jobs().isEmpty());
     verifyNoInteractions(threadPool);
+  }
+
+  @Test
+  void submit_refusedWhileTheStoreIsFullNeverStartsTheRunner() {
+    useLimitedStore(1, Long.MAX_VALUE);
+    submitRunning(new RecordingRunner());
+    RecordingRunner refused = new RecordingRunner();
+
+    assertThrows(
+        QueryJobCapacityException.class, () -> service.submit(refused, ALICE, WAIT, KEEP_ALIVE));
+
+    assertFalse(refused.wasRun());
+    assertEquals(1, store.size());
+  }
+
+  @Test
+  void submit_retainedResultIsChargedUntilDeleted() {
+    useLimitedStore(10, Long.MAX_VALUE);
+    RecordingRunner runner = new RecordingRunner();
+    QueryResult.Running running = submitRunning(runner);
+
+    runner.complete(WIDE_RESULT);
+    assertEquals(QueryResultSizeEstimator.estimate(WIDE_RESULT), store.resultBytes());
+
+    service.delete(running.id(), ALICE);
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void submit_retainedResultIsChargedUntilEvicted() {
+    useLimitedStore(10, Long.MAX_VALUE);
+    RecordingRunner runner = new RecordingRunner();
+    submitRunning(runner);
+    runner.complete(WIDE_RESULT);
+
+    expireRetainedJob();
+
+    assertEquals(0L, store.resultBytes());
+    assertEquals(0, store.size());
+  }
+
+  @Test
+  void submit_inlineResultIsNeverCharged() {
+    useLimitedStore(10, 1L);
+    RecordingRunner runner = new RecordingRunner();
+    runner.complete(WIDE_RESULT);
+
+    assertSame(
+        WIDE_RESULT, service.submit(runner, ALICE, WAIT, KEEP_ALIVE).toCompletableFuture().join());
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void submit_retainedResultOverBudgetFailsTheJobWithoutRows() {
+    useLimitedStore(10, 1L);
+    RecordingRunner runner = new RecordingRunner();
+    QueryResult.Running running = submitRunning(runner);
+
+    runner.complete(WIDE_RESULT);
+
+    QueryJobStatus status = service.get(running.id(), ALICE);
+    assertEquals(QueryJobState.FAILED, status.state());
+    assertEquals(
+        QueryJobCapacityException.class.getSimpleName(), status.failure().orElseThrow().type());
+    assertTrue(status.result().isEmpty());
+    assertEquals(0L, store.resultBytes());
+  }
+
+  private void useLimitedStore(int maxJobs, long maxResultBytes) {
+    store = new InMemoryQueryJobStore(() -> maxJobs, () -> maxResultBytes);
+    retentionPolicy = new RetentionPolicy(store, threadPool);
+    service =
+        new OpenSearchQueryJobService(
+            store, clusterService("node-a"), Clock.systemUTC(), retentionPolicy, null, store);
   }
 
   private QueryResult.Running submitRunning(RecordingRunner runner) {

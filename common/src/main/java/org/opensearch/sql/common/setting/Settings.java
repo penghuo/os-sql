@@ -26,6 +26,8 @@ public abstract class Settings {
     /** PPL Settings. */
     PPL_ENABLED("plugins.ppl.enabled"),
     PPL_QUERY_TIMEOUT("plugins.ppl.query.timeout"),
+    PPL_ASYNC_MAX_RETAINED_JOBS("plugins.ppl.async.max_retained_jobs"),
+    PPL_ASYNC_MAX_RETAINED_RESULT_SIZE("plugins.ppl.async.max_retained_result_size"),
     PATTERN_METHOD("plugins.ppl.pattern.method"),
     PATTERN_MODE("plugins.ppl.pattern.mode"),
     PATTERN_MAX_SAMPLE_COUNT("plugins.ppl.pattern.max.sample.count"),

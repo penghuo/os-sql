@@ -100,6 +100,7 @@ import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.ExecutionEngine.ExplainResponse;
 import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.esdomain.LocalClusterState;
+import org.opensearch.sql.legacy.metrics.GaugeMetric;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.legacy.plugin.RestSqlAction;
 import org.opensearch.sql.legacy.plugin.RestSqlStatsAction;
@@ -240,6 +241,18 @@ public class SQLPlugin extends Plugin
     providers.add(new CoreEndpointsProvider());
     providers.addAll(this.restEndpointProviders);
     RestEndpointRegistryHolder.set(new RestEndpointRegistry(providers));
+  }
+
+  private static void registerQueryJobStoreMetrics(
+      org.opensearch.sql.job.InMemoryQueryJobStore store) {
+    Metrics metrics = Metrics.getInstance();
+    metrics.registerMetric(new GaugeMetric<>("ppl_async_retained_jobs", store::size));
+    metrics.registerMetric(
+        new GaugeMetric<>("ppl_async_retained_result_bytes", store::resultBytes));
+    metrics.registerMetric(
+        new GaugeMetric<>("ppl_async_rejected_submit_count", store::rejectedSubmits));
+    metrics.registerMetric(
+        new GaugeMetric<>("ppl_async_rejected_result_count", store::rejectedResults));
   }
 
   @Override
@@ -482,6 +495,8 @@ public class SQLPlugin extends Plugin
         injector.getInstance(org.opensearch.sql.job.QueryJobService.class);
     org.opensearch.sql.job.SecurityAdapter securityAdapter =
         injector.getInstance(org.opensearch.sql.job.SecurityAdapter.class);
+    registerQueryJobStoreMetrics(
+        injector.getInstance(org.opensearch.sql.job.InMemoryQueryJobStore.class));
 
     ScheduledAsyncQueryJobRunner.getJobRunnerInstance()
         .loadJobResource(client, clusterService, threadPool, asyncQueryExecutorService);

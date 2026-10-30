@@ -7,6 +7,7 @@ package org.opensearch.sql.job;
 
 import java.time.Duration;
 import java.util.concurrent.CompletionStage;
+import org.opensearch.sql.job.exceptions.QueryJobCapacityException;
 import org.opensearch.sql.job.exceptions.QueryJobForbiddenException;
 import org.opensearch.sql.job.exceptions.QueryJobNotFoundException;
 
@@ -32,6 +33,7 @@ public interface QueryJobService {
    *     and positive
    * @return the submission outcome, exceptionally completed with the runner's cause on inline
    *     failure or cancellation
+   * @throws QueryJobCapacityException when the node cannot retain another job
    */
   CompletionStage<QueryResult> submit(
       QueryRunner runner, Principal submitter, Duration waitForCompletion, Duration keepAlive);

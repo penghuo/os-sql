@@ -24,6 +24,7 @@ import org.opensearch.index.query.QueryShardException;
 import org.opensearch.sql.common.error.ErrorReport;
 import org.opensearch.sql.common.error.QueryProcessingStage;
 import org.opensearch.sql.exception.NonFallbackCalciteException;
+import org.opensearch.sql.job.exceptions.QueryJobCapacityException;
 import org.opensearch.sql.opensearch.executor.WorkerPoolSaturatedException;
 
 /**
@@ -41,6 +42,15 @@ public class SyncErrorReportRendererTest {
     assertEquals(429, SyncErrorReportRenderer.statusCodeFor(new RuntimeException(saturated)));
     assertEquals(
         "Too Many Requests", SyncErrorReportRenderer.renderErrorMap(saturated).get("reason"));
+  }
+
+  @Test
+  public void exhaustedQueryJobCapacityReturns429() {
+    QueryJobCapacityException exhausted = new QueryJobCapacityException("capacity exhausted");
+    assertEquals(429, SyncErrorReportRenderer.statusCodeFor(exhausted));
+    assertEquals(429, SyncErrorReportRenderer.statusCodeFor(new RuntimeException(exhausted)));
+    assertEquals(
+        "Too Many Requests", SyncErrorReportRenderer.renderErrorMap(exhausted).get("reason"));
   }
 
   @Test

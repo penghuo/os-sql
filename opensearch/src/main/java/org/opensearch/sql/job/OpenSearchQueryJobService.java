@@ -139,7 +139,7 @@ public final class OpenSearchQueryJobService implements QueryJobService {
   private QueryJob publish(QueryRunner runner, Principal owner) {
     while (true) {
       QueryJobId id = QueryJobId.create(clusterService.localNode().getId());
-      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer);
+      QueryJob job = new QueryJob(id, owner, runner, clock, failureRenderer, store);
       if (store.register(job) == null) {
         return job;
       }

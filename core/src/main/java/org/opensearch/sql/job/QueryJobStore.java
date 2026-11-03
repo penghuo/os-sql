@@ -39,6 +39,24 @@ public interface QueryJobStore extends Closeable {
   Collection<QueryJob> jobs();
 
   /**
+   * Charges the estimated size of a retained result. A {@link QueryJob} calls this while it holds
+   * its own monitor, so implementations must not call back into a job. Accepts every charge by
+   * default.
+   *
+   * @param bytes estimated size of the result; never negative
+   * @throws org.opensearch.sql.job.exceptions.QueryJobCapacityException when {@code bytes} does not
+   *     fit; it becomes the job's failure cause
+   */
+  default void reserve(long bytes) {}
+
+  /**
+   * Returns a charge made by {@link #reserve(long)}.
+   *
+   * @param bytes charge to return; never negative
+   */
+  default void release(long bytes) {}
+
+  /**
    * Stops accepting new jobs and cancels every remaining job. Idempotent; safe to invoke from
    * shutdown hooks.
    */

@@ -12,6 +12,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.AbstractModule;
 import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.sql.analysis.Analyzer;
 import org.opensearch.sql.analysis.ExpressionAnalyzer;
 import org.opensearch.sql.common.setting.Settings;
@@ -135,8 +136,13 @@ public class OpenSearchPluginModule extends AbstractModule {
 
   @Provides
   @Singleton
-  public QueryJobStore queryJobStore() {
-    return new InMemoryQueryJobStore();
+  public QueryJobStore queryJobStore(Settings settings) {
+    return new InMemoryQueryJobStore(
+        () -> settings.getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS),
+        () ->
+            settings
+                .<ByteSizeValue>getSettingValue(Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE)
+                .getBytes());
   }
 
   @Provides

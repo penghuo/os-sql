@@ -18,15 +18,20 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
+import org.opensearch.sql.data.model.ExprStringValue;
+import org.opensearch.sql.data.model.ExprTupleValue;
 import org.opensearch.sql.executor.ExecutionEngine.Schema;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.job.exceptions.QueryJobCapacityException;
 
 class QueryJobTest {
 
@@ -35,6 +40,15 @@ class QueryJobTest {
   private static final Schema SCHEMA = new Schema(List.of());
   private static final QueryResult RESULT =
       new QueryResult.Rows(SCHEMA, List.of(), Cursor.None, List.of(), 0);
+  private static final QueryResult WIDE_RESULT =
+      new QueryResult.Rows(
+          SCHEMA,
+          List.of(
+              ExprTupleValue.fromExprValueMap(Map.of("f", new ExprStringValue("x".repeat(64))))),
+          Cursor.None,
+          List.of(),
+          0);
+  private static final long WIDE_RESULT_BYTES = QueryResultSizeEstimator.estimate(WIDE_RESULT);
 
   @Test
   void status_startsInPending() {
@@ -250,6 +264,112 @@ class QueryJobTest {
   }
 
   @Test
+  void retainedResult_isChargedWhenItArrives() {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    assertInstanceOf(
+        QueryResult.Running.class, job.await(Duration.ZERO).toCompletableFuture().getNow(null));
+    runner.complete(WIDE_RESULT);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+    assertEquals(QueryResultSizeEstimator.estimate(WIDE_RESULT), store.resultBytes());
+  }
+
+  @Test
+  void inlineResult_isNotCharged() throws Exception {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    CompletionStage<QueryResult> stage = job.await(Duration.ofSeconds(30));
+    runner.complete(WIDE_RESULT);
+    assertSame(WIDE_RESULT, stage.toCompletableFuture().get(1, TimeUnit.SECONDS));
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void retainedResultOverBudget_failsJobAndDropsRows() {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(0L);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    job.await(Duration.ZERO);
+    runner.complete(WIDE_RESULT);
+    QueryJobStatus status = job.status();
+    assertEquals(QueryJobState.FAILED, status.state());
+    assertEquals(
+        QueryJobCapacityException.class.getSimpleName(), status.failure().orElseThrow().type());
+    assertTrue(status.result().isEmpty());
+    assertFalse(job.holdsRunner());
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void detach_returnsTheChargeOnce() {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    job.await(Duration.ZERO);
+    runner.complete(WIDE_RESULT);
+    job.detach();
+    job.detach();
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void resultArrivingAfterDetach_isNotCharged() {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    job.await(Duration.ZERO);
+    job.detach();
+    runner.complete(WIDE_RESULT);
+    assertEquals(QueryJobState.SUCCEEDED, job.status().state());
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void runnerIsReleasedOnEveryTerminalTransition() {
+    RecordingRunner succeeding = new RecordingRunner();
+    QueryJob succeeded = newJob(succeeding, 170L);
+    succeeded.startRunner();
+    assertTrue(succeeded.holdsRunner());
+    succeeding.complete(RESULT);
+    assertFalse(succeeded.holdsRunner());
+
+    RecordingRunner failing = new RecordingRunner();
+    QueryJob failed = newJob(failing, 180L);
+    failed.startRunner();
+    failing.fail(new IllegalStateException("boom"));
+    assertFalse(failed.holdsRunner());
+
+    RecordingRunner cancelling = new RecordingRunner();
+    QueryJob cancelled = newJob(cancelling, 190L);
+    cancelled.startRunner();
+    cancelled.cancel();
+    assertFalse(cancelled.holdsRunner());
+    assertTrue(cancelling.wasCancelled());
+  }
+
+  @RepeatedTest(200)
+  void resultRacingTheWait_isReturnedInlineOrChargedNeverBoth() throws Exception {
+    RecordingRunner runner = new RecordingRunner();
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    Thread completer = new Thread(() -> runner.complete(WIDE_RESULT));
+    CompletionStage<QueryResult> stage = job.await(Duration.ofMillis(1));
+    completer.start();
+    QueryResult result = stage.toCompletableFuture().get(1, TimeUnit.SECONDS);
+    completer.join();
+    long expected = result instanceof QueryResult.Running ? WIDE_RESULT_BYTES : 0L;
+    assertEquals(expected, store.resultBytes());
+  }
+
+  @Test
   void onTerminal_rejectsNull() {
     RecordingRunner runner = new RecordingRunner();
     QueryJob job = newJob(runner, 160L);
@@ -387,6 +507,14 @@ class QueryJobTest {
                 java.util.Optional.empty(),
                 java.util.Optional.empty(),
                 QueryProgress.DONE));
+  }
+
+  private static InMemoryQueryJobStore newStore(long maxResultBytes) {
+    return new InMemoryQueryJobStore(() -> 10, () -> maxResultBytes);
+  }
+
+  private static QueryJob newJob(QueryRunner runner, QueryJobStore store) {
+    return new QueryJob(ID, OWNER, runner, Clock.systemUTC(), null, store);
   }
 
   private static QueryJob newJob(QueryRunner runner, long submittedMillis) {

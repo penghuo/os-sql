@@ -6,22 +6,23 @@
 package org.opensearch.sql.ast.tree;
 
 import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.ToString;
 import org.opensearch.sql.ast.AbstractNodeVisitor;
 import org.opensearch.sql.ast.expression.QualifiedName;
 import org.opensearch.sql.ast.expression.UnresolvedExpression;
+import org.opensearch.sql.executor.TimeBounds;
 
 /** Logical plan node of Relation, the interface for building the searching sources. */
 @ToString
 @Getter
 @EqualsAndHashCode(callSuper = false)
-@RequiredArgsConstructor
 public class Relation extends UnresolvedPlan {
   private static final String COMMA = ",";
 
@@ -33,8 +34,25 @@ public class Relation extends UnresolvedPlan {
    */
   private final List<UnresolvedExpression> tableNames;
 
+  /**
+   * Request-level time range the searched expression is narrowed to, or null when the request
+   * declared none. Held here rather than written into {@link #tableNames}: the bounds apply to the
+   * expression as a whole, and the name that carries them is only assembled in {@link
+   * #getTableQualifiedName}.
+   */
+  @Nullable private final TimeBounds timeBounds;
+
+  public Relation(List<UnresolvedExpression> tableNames) {
+    this(tableNames, null);
+  }
+
+  public Relation(List<UnresolvedExpression> tableNames, @Nullable TimeBounds timeBounds) {
+    this.tableNames = tableNames;
+    this.timeBounds = timeBounds;
+  }
+
   public Relation(UnresolvedExpression tableName) {
-    this.tableNames = Collections.singletonList(tableName);
+    this(Collections.singletonList(tableName));
   }
 
   public List<QualifiedName> getQualifiedNames() {
@@ -46,17 +64,36 @@ public class Relation extends UnresolvedPlan {
    * determine DataSource,Schema and Table Name during Analyzer stage. So Passing QualifiedName
    * directly to Analyzer Stage.
    *
+   * <p>Carries {@link #timeBounds} when the request declared any, appended to the joined name so
+   * the storage engine decodes it back whole.
+   *
    * @return TableQualifiedName.
    */
   public QualifiedName getTableQualifiedName() {
+    QualifiedName joined;
     if (tableNames.size() == 1) {
-      return (QualifiedName) tableNames.get(0);
+      joined = (QualifiedName) tableNames.get(0);
     } else {
-      return new QualifiedName(
-          tableNames.stream()
-              .map(UnresolvedExpression::toString)
-              .collect(Collectors.joining(COMMA)));
+      joined =
+          new QualifiedName(
+              tableNames.stream()
+                  .map(UnresolvedExpression::toString)
+                  .collect(Collectors.joining(COMMA)));
     }
+    return timeBounds == null ? joined : withTimeBounds(joined);
+  }
+
+  /**
+   * {@code name} with the bounds appended once, at the end. Encoding each source separately cannot
+   * work: the sources are joined with {@link #COMMA}, which is also the separator inside an encoded
+   * block, so only the trailing block would decode and every earlier one would be left behind in
+   * the index expression.
+   */
+  private QualifiedName withTimeBounds(QualifiedName name) {
+    List<String> parts = new ArrayList<>(name.getParts());
+    int last = parts.size() - 1;
+    parts.set(last, timeBounds.encodeInto(parts.get(last)));
+    return new QualifiedName(parts);
   }
 
   @Override

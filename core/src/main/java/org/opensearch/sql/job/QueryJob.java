@@ -5,6 +5,7 @@
 
 package org.opensearch.sql.job;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Map;
@@ -29,9 +30,20 @@ import java.util.function.Function;
  * <pre>
  *   PENDING --startRunner()--&gt; RUNNING --runner success--&gt; SUCCEEDED
  *                                     \--runner failure--&gt; FAILED
+ *                                     \--result over budget--&gt; FAILED
  *                                     \--cancel()------&gt; CANCELLED
  *   PENDING --cancel()------&gt; CANCELLED
  * </pre>
+ *
+ * <h2>Result retention</h2>
+ *
+ * A job still unfinished when the submit wait expires is retained for polling. When a retained job
+ * reaches a terminal state it takes a slot in its {@link QueryJobStore}, and a successful job also
+ * charges its result; when the store refuses the charge, the job ends {@code FAILED} with the
+ * refusal as its cause and the rows are dropped. Jobs reported inline take no slot and no charge.
+ * The store {@linkplain #detach() detaches} a job when it removes it, which returns both. The job
+ * releases its runner on every terminal transition, so a retained job does not keep the runner or
+ * its copy of the result reachable.
  *
  * <h2>Thread safety</h2>
  *
@@ -46,9 +58,10 @@ public final class QueryJob {
 
   private final QueryJobId id;
   private final Principal owner;
-  private final QueryRunner runner;
+  private QueryRunner runner;
   private final Clock clock;
   private final Function<Throwable, Map<String, Object>> failureRenderer;
+  private final QueryJobStore store;
   private final long submittedAtMillis;
   private final CompletableFuture<QueryResult> completion = new CompletableFuture<>();
 
@@ -58,6 +71,10 @@ public final class QueryJob {
   private Optional<QueryFailure> failure = Optional.empty();
   private Optional<QueryResult> result = Optional.empty();
   private double runningFraction;
+  private boolean retained;
+  private boolean detached;
+  private boolean slotTaken;
+  private long chargedBytes;
 
   /**
    * Creates a job in {@link QueryJobState#PENDING}. Package-private: only {@link QueryJobService}
@@ -91,11 +108,29 @@ public final class QueryJob {
       QueryRunner runner,
       Clock clock,
       Function<Throwable, Map<String, Object>> failureRenderer) {
+    this(id, owner, runner, clock, failureRenderer, null);
+  }
+
+  /**
+   * Creates a job in {@link QueryJobState#PENDING} whose retained result is charged against {@code
+   * store}. Package-private: only {@link QueryJobService} implementations may construct a job.
+   *
+   * @param store store the job is registered in; charged when the job succeeds while retained.
+   *     Nullable (no charge).
+   */
+  QueryJob(
+      QueryJobId id,
+      Principal owner,
+      QueryRunner runner,
+      Clock clock,
+      Function<Throwable, Map<String, Object>> failureRenderer,
+      QueryJobStore store) {
     this.id = Objects.requireNonNull(id, "id must not be null");
     this.owner = Objects.requireNonNull(owner, "owner must not be null");
     this.runner = Objects.requireNonNull(runner, "runner must not be null");
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
     this.failureRenderer = failureRenderer;
+    this.store = store;
     this.submittedAtMillis = clock.millis();
   }
 
@@ -133,6 +168,9 @@ public final class QueryJob {
    * callers needing {@code ThreadContext} preserved must wrap their listener with {@code
    * ContextPreservingActionListener} before registering.
    *
+   * <p>Expiry retains the job for polling in the same step that checks it has not succeeded, so a
+   * result is either returned inline or retained and charged, never both.
+   *
    * <p>Non-{@link Exception} throwables re-throw so JVM-level errors (e.g. {@link
    * OutOfMemoryError}) are not silently downgraded to an application-level failure.
    */
@@ -140,6 +178,10 @@ public final class QueryJob {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
         (value, throwable) -> {
+          if (isRetained()) {
+            // The expired wait reports Running; the outcome is left for polling.
+            return;
+          }
           if (throwable == null) {
             out.complete(value);
             return;
@@ -152,7 +194,9 @@ public final class QueryJob {
         });
     long millis = budget == null ? 0L : budget.toMillis();
     if (millis <= 0L) {
-      out.complete(running());
+      if (!out.isDone()) {
+        out.complete(retainUnlessSucceeded());
+      }
     } else {
       // Cancellable, so an early outcome does not keep the job reachable until the timeout.
       CompletableFuture<Void> timer = new CompletableFuture<>();
@@ -161,12 +205,33 @@ public final class QueryJob {
           .thenRun(
               () -> {
                 if (!out.isDone()) {
-                  out.complete(running());
+                  out.complete(retainUnlessSucceeded());
                 }
               });
       out.whenComplete((value, throwable) -> timer.cancel(false));
     }
     return out.minimalCompletionStage();
+  }
+
+  /**
+   * Returns the result of a job that already succeeded. Otherwise retains the job for polling and
+   * returns {@link QueryResult.Running}, so a result is never retained without being charged.
+   */
+  private QueryResult retainUnlessSucceeded() {
+    synchronized (this) {
+      if (state == QueryJobState.SUCCEEDED) {
+        return result.orElseThrow();
+      }
+      retained = true;
+      if (state.isTerminal()) {
+        takeSlot(null);
+      }
+    }
+    return running();
+  }
+
+  private synchronized boolean isRetained() {
+    return retained;
   }
 
   private QueryResult.Running running() {
@@ -189,7 +254,7 @@ public final class QueryJob {
    * completes the internal future exceptionally.
    */
   public void cancel() {
-    boolean shouldCancelRunner;
+    QueryRunner toCancel;
     double sample = sampleRunnerProgress();
     synchronized (this) {
       if (state.isTerminal()) {
@@ -198,12 +263,32 @@ public final class QueryJob {
       progress(sample);
       state = QueryJobState.CANCELLED;
       completedAtMillis = OptionalLong.of(clock.millis());
-      shouldCancelRunner = true;
+      toCancel = runner;
+      runner = null;
+      takeSlot(null);
     }
-    if (shouldCancelRunner) {
-      safeCancelRunner();
-    }
+    safeCancelRunner(toCancel);
     completion.cancel(false);
+  }
+
+  /**
+   * Detaches the job from the store and returns its slot and result charge to the store.
+   * Package-private: the store calls this once, after removing the job. A job that finishes later
+   * takes no slot.
+   */
+  void detach() {
+    boolean release;
+    long released;
+    synchronized (this) {
+      detached = true;
+      release = slotTaken;
+      released = chargedBytes;
+      slotTaken = false;
+      chargedBytes = 0;
+    }
+    if (release) {
+      store.release(released);
+    }
   }
 
   /**
@@ -220,16 +305,18 @@ public final class QueryJob {
    * </ul>
    */
   void startRunner() {
+    QueryRunner toRun;
     synchronized (this) {
       if (state != QueryJobState.PENDING) {
         return;
       }
       state = QueryJobState.RUNNING;
       startedAtMillis = OptionalLong.of(clock.millis());
+      toRun = runner;
     }
     CompletionStage<QueryResult> stage;
     try {
-      stage = Objects.requireNonNull(runner.run(), "runner must not return null");
+      stage = Objects.requireNonNull(toRun.run(), "runner must not return null");
     } catch (RuntimeException e) {
       onRunnerFailure(e);
       return;
@@ -249,20 +336,33 @@ public final class QueryJob {
   /**
    * Terminal transition from {@link QueryJobState#RUNNING} to {@link QueryJobState#SUCCEEDED}.
    * Ignored if the job has already left {@code RUNNING} (e.g. a concurrent {@link #cancel()} beat
-   * the runner). Records the result inside the monitor; completes the future outside it.
+   * the runner). Records the result inside the monitor; completes the future outside it. A retained
+   * job charges the result first and ends {@code FAILED} if the store refuses it.
    *
    * @param value final result produced by the runner; never {@code null}
    */
   private void onRunnerSuccess(QueryResult value) {
+    RuntimeException refused = null;
     synchronized (this) {
       if (state != QueryJobState.RUNNING) {
         return;
       }
-      state = QueryJobState.SUCCEEDED;
       completedAtMillis = OptionalLong.of(clock.millis());
-      result = Optional.of(value);
+      runner = null;
+      refused = takeSlot(value);
+      if (refused == null) {
+        state = QueryJobState.SUCCEEDED;
+        result = Optional.of(value);
+      } else {
+        state = QueryJobState.FAILED;
+        failure = Optional.of(QueryFailure.of(refused, failureRenderer));
+      }
     }
-    completion.complete(value);
+    if (refused == null) {
+      completion.complete(value);
+    } else {
+      completion.completeExceptionally(refused);
+    }
   }
 
   /**
@@ -282,8 +382,36 @@ public final class QueryJob {
       state = QueryJobState.FAILED;
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
+      runner = null;
+      takeSlot(null);
     }
     completion.completeExceptionally(throwable);
+  }
+
+  /**
+   * Takes the store slot of a retained job that has just reached a terminal state, and charges a
+   * successful result. Does nothing for a job that is not retained, already detached, or already
+   * holds its slot. Caller holds the monitor.
+   *
+   * @param value result of a successful job; {@code null} when the job failed or was cancelled
+   * @return the store's refusal of the result, or {@code null} when the result was charged
+   */
+  private RuntimeException takeSlot(QueryResult value) {
+    if (!retained || detached || slotTaken || store == null) {
+      return null;
+    }
+    long bytes = value == null ? 0L : QueryResultSizeEstimator.estimate(value);
+    RuntimeException refused = null;
+    try {
+      store.retain(bytes);
+      chargedBytes = bytes;
+    } catch (RuntimeException e) {
+      // The job ends FAILED and stays retained, so it still takes a slot, without its rows.
+      store.retain(0L);
+      refused = e;
+    }
+    slotTaken = true;
+    return refused;
   }
 
   /** Never decreases, and stays below 1.0 until SUCCEEDED. Caller holds the monitor. */
@@ -299,13 +427,15 @@ public final class QueryJob {
 
   /** Called outside the monitor; the runner is foreign code. */
   private double sampleRunnerProgress() {
+    QueryRunner sampled;
     synchronized (this) {
       if (state != QueryJobState.RUNNING) {
         return 0D;
       }
+      sampled = runner;
     }
     try {
-      QueryProgress progress = runner.progress();
+      QueryProgress progress = sampled.progress();
       return progress == null ? 0D : progress.fractionDone();
     } catch (RuntimeException e) {
       return 0D;
@@ -317,12 +447,21 @@ public final class QueryJob {
    * not block the state machine, and the job has already been marked {@code CANCELLED} before this
    * is called.
    */
-  private void safeCancelRunner() {
+  private static void safeCancelRunner(QueryRunner toCancel) {
+    if (toCancel == null) {
+      return;
+    }
     try {
-      runner.cancel();
+      toCancel.cancel();
     } catch (RuntimeException ignored) {
       // Cancellation is best-effort; a misbehaving runner must not block the state machine.
     }
+  }
+
+  /** Whether the job still references its runner. */
+  @VisibleForTesting
+  synchronized boolean holdsRunner() {
+    return runner != null;
   }
 
   /**

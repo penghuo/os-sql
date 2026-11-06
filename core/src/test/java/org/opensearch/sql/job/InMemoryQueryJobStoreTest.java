@@ -105,20 +105,27 @@ class InMemoryQueryJobStoreTest {
   @Test
   void register_refusesWhileTheJobLimitIsReached() {
     InMemoryQueryJobStore store = new InMemoryQueryJobStore(() -> 1, () -> Long.MAX_VALUE);
-    QueryJob first = newJob("ctx-first");
-    store.register(first);
+    QueryJob finished = finishedRetainedJob(store, "ctx-finished");
     QueryJobCapacityException e =
         assertThrows(QueryJobCapacityException.class, () -> store.register(newJob("ctx-second")));
     assertTrue(e.getMessage().contains("plugins.ppl.async.max_retained_jobs"), e.getMessage());
-    store.remove(first.id(), first);
+    store.remove(finished.id(), finished);
     assertEquals(null, store.register(newJob("ctx-second")));
+  }
+
+  @Test
+  void register_doesNotCountRunningJobs() {
+    InMemoryQueryJobStore store = new InMemoryQueryJobStore(() -> 1, () -> Long.MAX_VALUE);
+    retainedJob(store, "ctx-running", new CompletableFuture<>());
+    assertEquals(null, store.register(newJob("ctx-second")));
+    assertEquals(0, store.retainedJobs());
   }
 
   @Test
   void register_readsTheJobLimitOnEveryCall() {
     AtomicInteger limit = new AtomicInteger(2);
     InMemoryQueryJobStore store = new InMemoryQueryJobStore(limit::get, () -> Long.MAX_VALUE);
-    store.register(newJob("ctx-1"));
+    finishedRetainedJob(store, "ctx-1");
     limit.set(1);
     assertThrows(QueryJobCapacityException.class, () -> store.register(newJob("ctx-2")));
     assertEquals(1, store.size());
@@ -127,7 +134,7 @@ class InMemoryQueryJobStoreTest {
   @Test
   void register_refusesWhileRetainedResultsFillTheBudget() {
     InMemoryQueryJobStore store = new InMemoryQueryJobStore(() -> 10, () -> 100L);
-    store.reserve(100L);
+    store.retain(100L);
     QueryJobCapacityException e =
         assertThrows(QueryJobCapacityException.class, () -> store.register(newJob("ctx-full")));
     assertTrue(
@@ -137,13 +144,16 @@ class InMemoryQueryJobStoreTest {
   }
 
   @Test
-  void reserve_refusesBytesBeyondTheBudget() {
+  void retain_refusesBytesBeyondTheBudgetWithoutTakingASlot() {
     InMemoryQueryJobStore store = new InMemoryQueryJobStore(() -> 10, () -> 100L);
-    store.reserve(60L);
-    assertThrows(QueryJobCapacityException.class, () -> store.reserve(41L));
+    store.retain(60L);
+    assertThrows(QueryJobCapacityException.class, () -> store.retain(41L));
     assertEquals(60L, store.resultBytes());
-    store.reserve(40L);
+    assertEquals(1, store.retainedJobs());
+    store.retain(40L);
+    store.retain(0L);
     assertEquals(100L, store.resultBytes());
+    assertEquals(3, store.retainedJobs());
   }
 
   @Test
@@ -153,13 +163,15 @@ class InMemoryQueryJobStoreTest {
     QueryJob job = retainedJob(store, "ctx-charged", result);
     result.complete(WIDE_RESULT);
     assertEquals(QueryResultSizeEstimator.estimate(WIDE_RESULT), store.resultBytes());
+    assertEquals(1, store.retainedJobs());
     assertTrue(store.remove(job.id(), job));
     assertFalse(store.remove(job.id(), job));
     assertEquals(0L, store.resultBytes());
+    assertEquals(0, store.retainedJobs());
   }
 
   @Test
-  void concurrentJobs_neverExceedTheLimitsAndReturnEveryCharge() throws Exception {
+  void concurrentJobs_neverExceedTheBudgetAndReturnEveryCharge() throws Exception {
     int maxJobs = 4;
     long resultBytes = QueryResultSizeEstimator.estimate(WIDE_RESULT);
     InMemoryQueryJobStore store = new InMemoryQueryJobStore(() -> maxJobs, () -> 3 * resultBytes);
@@ -181,8 +193,8 @@ class InMemoryQueryJobStoreTest {
                     } catch (QueryJobCapacityException e) {
                       continue;
                     }
-                    peakJobs.accumulateAndGet(store.size(), Math::max);
                     result.complete(WIDE_RESULT);
+                    peakJobs.accumulateAndGet(store.retainedJobs(), Math::max);
                     peakBytes.accumulateAndGet(store.resultBytes(), Math::max);
                     store.remove(job.id(), job);
                   }
@@ -195,8 +207,10 @@ class InMemoryQueryJobStoreTest {
       pool.shutdownNow();
     }
     assertEquals(0, store.size());
+    assertEquals(0, store.retainedJobs());
     assertEquals(0L, store.resultBytes());
-    assertTrue(peakJobs.get() <= maxJobs, "peak jobs " + peakJobs.get());
+    // A job admitted while there was room still takes its slot when it finishes.
+    assertTrue(peakJobs.get() <= maxJobs + 8, "peak jobs " + peakJobs.get());
     assertTrue(peakBytes.get() <= 3 * resultBytes, "peak bytes " + peakBytes.get());
   }
 
@@ -214,6 +228,13 @@ class InMemoryQueryJobStoreTest {
     assertEquals(null, store.register(job));
     job.startRunner();
     job.await(Duration.ZERO);
+    return job;
+  }
+
+  private static QueryJob finishedRetainedJob(InMemoryQueryJobStore store, String contextId) {
+    CompletableFuture<QueryResult> result = new CompletableFuture<>();
+    QueryJob job = retainedJob(store, contextId, result);
+    result.complete(WIDE_RESULT);
     return job;
   }
 

@@ -277,7 +277,7 @@ class QueryJobTest {
   }
 
   @Test
-  void inlineResult_isNotCharged() throws Exception {
+  void inlineResult_takesNoSlotAndNoCharge() throws Exception {
     RecordingRunner runner = new RecordingRunner();
     InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
     QueryJob job = newJob(runner, store);
@@ -286,6 +286,7 @@ class QueryJobTest {
     runner.complete(WIDE_RESULT);
     assertSame(WIDE_RESULT, stage.toCompletableFuture().get(1, TimeUnit.SECONDS));
     assertEquals(0L, store.resultBytes());
+    assertEquals(0, store.retainedJobs());
   }
 
   @Test
@@ -329,6 +330,58 @@ class QueryJobTest {
     runner.complete(WIDE_RESULT);
     assertEquals(QueryJobState.SUCCEEDED, job.status().state());
     assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void retainedJob_takesAStoreSlotOnEveryTerminalTransition() {
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+
+    RecordingRunner failing = new RecordingRunner();
+    QueryJob failed = newJob(failing, store);
+    failed.startRunner();
+    failed.await(Duration.ZERO);
+    assertEquals(0, store.retainedJobs());
+    failing.fail(new IllegalStateException("boom"));
+    assertEquals(1, store.retainedJobs());
+
+    QueryJob cancelled = newJob(new RecordingRunner(), store);
+    cancelled.startRunner();
+    cancelled.await(Duration.ZERO);
+    cancelled.cancel();
+    assertEquals(2, store.retainedJobs());
+
+    failed.detach();
+    cancelled.detach();
+    assertEquals(0, store.retainedJobs());
+    assertEquals(0L, store.resultBytes());
+  }
+
+  @Test
+  void jobFailedBeforeTheWait_isReportedInlineAndTakesNoSlot() {
+    InMemoryQueryJobStore store = newStore(Long.MAX_VALUE);
+    RecordingRunner runner = new RecordingRunner();
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    runner.fail(new IllegalStateException("boom"));
+
+    CompletableFuture<QueryResult> outcome = job.await(Duration.ZERO).toCompletableFuture();
+
+    assertTrue(outcome.isCompletedExceptionally());
+    assertEquals(0, store.retainedJobs());
+  }
+
+  @Test
+  void retainedResultOverBudget_stillTakesASlot() {
+    InMemoryQueryJobStore store = newStore(0L);
+    RecordingRunner runner = new RecordingRunner();
+    QueryJob job = newJob(runner, store);
+    job.startRunner();
+    job.await(Duration.ZERO);
+    runner.complete(WIDE_RESULT);
+    assertEquals(QueryJobState.FAILED, job.status().state());
+    assertEquals(1, store.retainedJobs());
+    job.detach();
+    assertEquals(0, store.retainedJobs());
   }
 
   @Test

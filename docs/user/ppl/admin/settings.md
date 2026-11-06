@@ -118,10 +118,10 @@ Expected output:
 
 ### Description
 
-This setting limits how many asynchronous PPL jobs a node holds, running or finished. A job is held from submit until it is deleted or its `keep_alive` expires; a job whose result is returned inline is held only while it runs. While the limit is reached, an asynchronous submit fails with `429`.
+This setting limits how many finished asynchronous PPL jobs a node retains for polling. A job counts once it finishes, if its submit returned an `id`, until it is deleted or its `keep_alive` expires. Running jobs and jobs whose result is returned inline are not counted, so jobs that were running when the limit was reached still count once they finish. While the limit is reached, an asynchronous submit fails with `429`. Synchronous queries are not affected.
 1. The default value is 1000. The minimum is 1.
 2. This setting is node scope.
-3. This setting can be updated dynamically. A lowered limit applies to the next submit; jobs already held are not removed.
+3. This setting can be updated dynamically. A lowered limit applies to the next submit; retained jobs are not removed.
 
 ### Example
 

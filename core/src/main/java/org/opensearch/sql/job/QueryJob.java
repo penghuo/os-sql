@@ -37,12 +37,13 @@ import java.util.function.Function;
  *
  * <h2>Result retention</h2>
  *
- * A job still unfinished when the submit wait expires is retained for polling. A retained job
- * charges its result against its {@link QueryJobStore} when the runner succeeds; when the store
- * refuses the charge, the job ends {@code FAILED} with the refusal as its cause and the rows are
- * dropped. Results returned inline are never charged. The store {@linkplain #detach() detaches} a
- * job when it removes it, which returns the charge. The job releases its runner on every terminal
- * transition, so a retained job does not keep the runner or its copy of the result reachable.
+ * A job still unfinished when the submit wait expires is retained for polling. When a retained job
+ * reaches a terminal state it takes a slot in its {@link QueryJobStore}, and a successful job also
+ * charges its result; when the store refuses the charge, the job ends {@code FAILED} with the
+ * refusal as its cause and the rows are dropped. Jobs reported inline take no slot and no charge.
+ * The store {@linkplain #detach() detaches} a job when it removes it, which returns both. The job
+ * releases its runner on every terminal transition, so a retained job does not keep the runner or
+ * its copy of the result reachable.
  *
  * <h2>Thread safety</h2>
  *
@@ -72,6 +73,7 @@ public final class QueryJob {
   private double runningFraction;
   private boolean retained;
   private boolean detached;
+  private boolean slotTaken;
   private long chargedBytes;
 
   /**
@@ -176,6 +178,10 @@ public final class QueryJob {
     CompletableFuture<QueryResult> out = new CompletableFuture<>();
     completion.whenComplete(
         (value, throwable) -> {
+          if (isRetained()) {
+            // The expired wait reports Running; the outcome is left for polling.
+            return;
+          }
           if (throwable == null) {
             out.complete(value);
             return;
@@ -188,7 +194,9 @@ public final class QueryJob {
         });
     long millis = budget == null ? 0L : budget.toMillis();
     if (millis <= 0L) {
-      out.complete(retainUnlessSucceeded());
+      if (!out.isDone()) {
+        out.complete(retainUnlessSucceeded());
+      }
     } else {
       // Cancellable, so an early outcome does not keep the job reachable until the timeout.
       CompletableFuture<Void> timer = new CompletableFuture<>();
@@ -215,8 +223,15 @@ public final class QueryJob {
         return result.orElseThrow();
       }
       retained = true;
+      if (state.isTerminal()) {
+        takeSlot(null);
+      }
     }
     return running();
+  }
+
+  private synchronized boolean isRetained() {
+    return retained;
   }
 
   private QueryResult.Running running() {
@@ -250,23 +265,28 @@ public final class QueryJob {
       completedAtMillis = OptionalLong.of(clock.millis());
       toCancel = runner;
       runner = null;
+      takeSlot(null);
     }
     safeCancelRunner(toCancel);
     completion.cancel(false);
   }
 
   /**
-   * Detaches the job from the store and returns its result charge to the store. Package-private:
-   * the store calls this once, after removing the job. A result that arrives later is not charged.
+   * Detaches the job from the store and returns its slot and result charge to the store.
+   * Package-private: the store calls this once, after removing the job. A job that finishes later
+   * takes no slot.
    */
   void detach() {
+    boolean release;
     long released;
     synchronized (this) {
       detached = true;
+      release = slotTaken;
       released = chargedBytes;
+      slotTaken = false;
       chargedBytes = 0;
     }
-    if (released > 0) {
+    if (release) {
       store.release(released);
     }
   }
@@ -329,15 +349,7 @@ public final class QueryJob {
       }
       completedAtMillis = OptionalLong.of(clock.millis());
       runner = null;
-      if (retained && !detached && store != null) {
-        long bytes = QueryResultSizeEstimator.estimate(value);
-        try {
-          store.reserve(bytes);
-          chargedBytes = bytes;
-        } catch (RuntimeException e) {
-          refused = e;
-        }
-      }
+      refused = takeSlot(value);
       if (refused == null) {
         state = QueryJobState.SUCCEEDED;
         result = Optional.of(value);
@@ -371,8 +383,35 @@ public final class QueryJob {
       completedAtMillis = OptionalLong.of(clock.millis());
       failure = Optional.of(QueryFailure.of(throwable, failureRenderer));
       runner = null;
+      takeSlot(null);
     }
     completion.completeExceptionally(throwable);
+  }
+
+  /**
+   * Takes the store slot of a retained job that has just reached a terminal state, and charges a
+   * successful result. Does nothing for a job that is not retained, already detached, or already
+   * holds its slot. Caller holds the monitor.
+   *
+   * @param value result of a successful job; {@code null} when the job failed or was cancelled
+   * @return the store's refusal of the result, or {@code null} when the result was charged
+   */
+  private RuntimeException takeSlot(QueryResult value) {
+    if (!retained || detached || slotTaken || store == null) {
+      return null;
+    }
+    long bytes = value == null ? 0L : QueryResultSizeEstimator.estimate(value);
+    RuntimeException refused = null;
+    try {
+      store.retain(bytes);
+      chargedBytes = bytes;
+    } catch (RuntimeException e) {
+      // The job ends FAILED and stays retained, so it still takes a slot, without its rows.
+      store.retain(0L);
+      refused = e;
+    }
+    slotTaken = true;
+    return refused;
   }
 
   /** Never decreases, and stays below 1.0 until SUCCEEDED. Caller holds the monitor. */

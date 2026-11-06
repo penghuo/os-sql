@@ -20,12 +20,13 @@ import org.opensearch.sql.job.exceptions.QueryJobCapacityException;
 /**
  * Node-local, in-memory {@link QueryJobStore}.
  *
- * <p>The store bounds what the node retains. {@link #register(QueryJob)} refuses a job while the
- * store holds the maximum number of jobs, running or finished, or while retained results fill the
- * result budget. Its jobs charge retained results against the store, and {@link #remove(QueryJobId,
- * QueryJob)} returns a removed job's charge. Limits are read on every check, so a lowered limit
- * applies to the next submit and held jobs are not evicted. Cluster visibility is intentionally not
- * modelled.
+ * <p>The store bounds what the node retains for polling. {@link #register(QueryJob)} refuses a job
+ * while the store retains the maximum number of finished jobs, or while their results fill the
+ * result budget. A job retained for polling takes a slot and charges its result when it finishes,
+ * and {@link #remove(QueryJobId, QueryJob)} returns both. Running jobs are not counted, so jobs
+ * admitted while there was room can take the retained count past its limit when they finish. Limits
+ * are read on every check, so a lowered limit applies to the next submit and retained jobs are not
+ * evicted. Cluster visibility is intentionally not modelled.
  */
 public final class InMemoryQueryJobStore implements QueryJobStore {
 
@@ -35,6 +36,7 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
   private volatile boolean closed;
 
   // Guarded by this.
+  private int retainedJobs;
   private long resultBytes;
 
   /** Creates a store without limits. */
@@ -43,7 +45,8 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
   }
 
   /**
-   * @param maxJobs maximum number of jobs the store holds; read on every {@link #register}
+   * @param maxJobs maximum number of finished jobs the store retains; read on every {@link
+   *     #register}
    * @param maxResultBytes budget for the estimated bytes of retained results; read on every check
    * @throws NullPointerException if either argument is {@code null}
    */
@@ -55,8 +58,8 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
   /**
    * {@inheritDoc}
    *
-   * @throws QueryJobCapacityException when the store holds the maximum number of jobs or retained
-   *     results fill the result budget
+   * @throws QueryJobCapacityException when the store retains the maximum number of finished jobs or
+   *     their results fill the result budget
    */
   @Override
   public QueryJob register(QueryJob job) {
@@ -68,7 +71,7 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
     long byteLimit = maxResultBytes.getAsLong();
     Settings.Key exhausted;
     synchronized (this) {
-      if (jobs.size() >= jobLimit) {
+      if (retainedJobs >= jobLimit) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_JOBS;
       } else if (resultBytes >= byteLimit) {
         exhausted = Settings.Key.PPL_ASYNC_MAX_RETAINED_RESULT_SIZE;
@@ -124,10 +127,11 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
    * @throws QueryJobCapacityException when {@code bytes} does not fit in the remaining budget
    */
   @Override
-  public void reserve(long bytes) {
+  public void retain(long bytes) {
     long byteLimit = maxResultBytes.getAsLong();
     synchronized (this) {
-      if (bytes <= byteLimit - resultBytes) {
+      if (bytes == 0 || bytes <= byteLimit - resultBytes) {
+        retainedJobs++;
         resultBytes += bytes;
         return;
       }
@@ -142,12 +146,18 @@ public final class InMemoryQueryJobStore implements QueryJobStore {
 
   @Override
   public synchronized void release(long bytes) {
+    retainedJobs--;
     resultBytes -= bytes;
   }
 
   /** Number of jobs the store holds, running or finished. */
   public int size() {
     return jobs.size();
+  }
+
+  /** Number of finished jobs the store retains for polling. */
+  public synchronized int retainedJobs() {
+    return retainedJobs;
   }
 
   /** Estimated bytes of retained results currently charged. */

@@ -429,7 +429,9 @@ class OpenSearchQueryJobServiceTest {
   @Test
   void submit_refusedWhileTheStoreIsFullNeverStartsTheRunner() {
     useLimitedStore(1, Long.MAX_VALUE);
-    submitRunning(new RecordingRunner());
+    RecordingRunner finished = new RecordingRunner();
+    submitRunning(finished);
+    finished.complete(RESULT);
     RecordingRunner refused = new RecordingRunner();
 
     assertThrows(

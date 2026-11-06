@@ -69,9 +69,10 @@ public class AsyncPPLRetentionLimitsIT extends PPLIntegTestCase {
 
   @Test
   public void retainedJobLimitRejectsSubmitWith429UntilAJobIsDeleted() throws Exception {
-    // The node holds one job less than this limit, so one more job fills it.
+    // The node retains one finished job less than this limit, so one more finished job fills it.
     setLimit(MAX_JOBS, smallestAdmittingLimit(MAX_JOBS, jobs -> jobs));
     String id = submitRetained(ROWS_QUERY);
+    pollUntilTerminal(client(), id, POLL_TIMEOUT_MILLIS);
 
     ResponseException rejected =
         Assert.assertThrows(ResponseException.class, () -> submitRetained(ROWS_QUERY));

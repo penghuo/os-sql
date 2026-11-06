@@ -14,7 +14,7 @@ import org.opensearch.sql.data.model.ExprValue;
 /**
  * Approximates the heap retained by a {@link QueryResult}.
  *
- * <p>The estimate is what {@link QueryJobStore#reserve(long)} is charged, so it only needs to be
+ * <p>The estimate is what {@link QueryJobStore#retain(long)} is charged, so it only needs to be
  * proportional to the real footprint, not exact. Constants approximate 64-bit JVM object sizes with
  * compressed oops; a 10,000-row, eight-column result measured about 8.9 MB of live heap and
  * estimates within the same order of magnitude.

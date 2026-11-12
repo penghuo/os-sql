@@ -186,16 +186,9 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
     this.timeBounds = timeBounds;
   }
 
-  /** A relation whose names carry the request's time bounds (see {@link TimeBounds}). */
+  /** A relation narrowed to the request's time bounds (see {@link TimeBounds}). */
   private Relation relation(List<UnresolvedExpression> tableSources) {
-    if (timeBounds == null) {
-      return new Relation(tableSources);
-    }
-    // Only the last: the sources are joined with commas, and the joined name must end in one block.
-    List<UnresolvedExpression> sources = new ArrayList<>(tableSources);
-    int last = sources.size() - 1;
-    sources.set(last, withTimeBounds(sources.get(last)));
-    return new Relation(sources);
+    return new Relation(tableSources, timeBounds);
   }
 
   /**
@@ -215,16 +208,6 @@ public class AstBuilder extends OpenSearchPPLParserBaseVisitor<UnresolvedPlan> {
       }
     }
     return true;
-  }
-
-  private UnresolvedExpression withTimeBounds(UnresolvedExpression tableSource) {
-    if (!(tableSource instanceof QualifiedName name)) {
-      return tableSource;
-    }
-    List<String> parts = new ArrayList<>(name.getParts());
-    int last = parts.size() - 1;
-    parts.set(last, timeBounds.encodeInto(parts.get(last)));
-    return new QualifiedName(parts);
   }
 
   public Settings getSettings() {

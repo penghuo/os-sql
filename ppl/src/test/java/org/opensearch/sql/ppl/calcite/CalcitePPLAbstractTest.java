@@ -116,7 +116,11 @@ public class CalcitePPLAbstractTest {
    * actually emits to the production HEP optimizer.
    */
   public RelNode getRelNodeRaw(String ppl) {
-    CalcitePlanContext context = createBuilderContext();
+    return getRelNodeRaw(createBuilderContext(), ppl);
+  }
+
+  /** Same as {@link #getRelNodeRaw(String)}, analyzing into the given context. */
+  public RelNode getRelNodeRaw(CalcitePlanContext context, String ppl) {
     Query query = (Query) plan(pplParser, ppl);
     planTransformer.analyze(query.getPlan(), context);
     RelNode root = context.relBuilder.build();

@@ -102,6 +102,9 @@ import org.apache.calcite.util.Util;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.Scannable;
+import org.opensearch.sql.calcite.plan.metadata.OpenSearchRelMdCollation;
+import org.opensearch.sql.calcite.plan.rel.EmptyValuesFactory;
+import org.opensearch.sql.calcite.plan.rule.EmptyValuesRules;
 import org.opensearch.sql.calcite.plan.rule.OpenSearchRules;
 import org.opensearch.sql.calcite.plan.rule.PPLSimplifyDedupRule;
 import org.opensearch.sql.calcite.profile.PlanProfileBuilder;
@@ -205,8 +208,14 @@ public class CalciteToolsHelper {
 
   /** do nothing, just extend for a public construct for new */
   public static class OpenSearchRelBuilder extends RelBuilder {
-    public OpenSearchRelBuilder(Context context, RelOptCluster cluster, RelOptSchema relOptSchema) {
-      super(context, cluster, relOptSchema);
+    public OpenSearchRelBuilder(
+        @Nullable Context context, RelOptCluster cluster, @Nullable RelOptSchema relOptSchema) {
+      super(
+          Contexts.chain(
+              Contexts.of(EmptyValuesFactory.INSTANCE),
+              context == null ? Contexts.empty() : context),
+          cluster,
+          relOptSchema);
     }
 
     @Override
@@ -254,8 +263,16 @@ public class CalciteToolsHelper {
       return action.apply(cluster, catalogReader, prepareContext.getRootSchema().plus(), statement);
     }
 
+    @Override
+    protected RelOptCluster createCluster(RelOptPlanner planner, RexBuilder rexBuilder) {
+      final RelOptCluster cluster = super.createCluster(planner, rexBuilder);
+      OpenSearchRelMdCollation.install(cluster);
+      return cluster;
+    }
+
     private void registerCustomizedRules(RelOptPlanner planner) {
       OpenSearchRules.OPEN_SEARCH_OPT_RULES.forEach(planner::addRule);
+      EmptyValuesRules.register(planner);
     }
 
     /**
@@ -376,6 +393,7 @@ public class CalciteToolsHelper {
     protected RelRoot trimUnusedFields(RelRoot root) {
       final SqlToRelConverter.Config config =
           SqlToRelConverter.config()
+              .withRelBuilderFactory(EmptyValuesFactory.LOGICAL_BUILDER)
               .withTrimUnusedFields(shouldTrim(root.rel))
               .withExpand(THREAD_EXPAND.get())
               .withInSubQueryThreshold(requireNonNull(THREAD_INSUBQUERY_THRESHOLD.get()));
@@ -560,7 +578,12 @@ public class CalciteToolsHelper {
 
   /** Try to optimize the plan by using HepPlanner */
   private static final List<RelOptRule> hepRuleList =
-      List.of(FilterMergeRule.Config.DEFAULT.toRule(), PPLSimplifyDedupRule.DEDUP_SIMPLIFY_RULE);
+      List.of(
+          FilterMergeRule.Config.DEFAULT
+              .withRelBuilderFactory(EmptyValuesFactory.LOGICAL_BUILDER)
+              .as(FilterMergeRule.Config.class)
+              .toRule(),
+          PPLSimplifyDedupRule.DEDUP_SIMPLIFY_RULE);
 
   private static final HepProgram HEP_PROGRAM =
       new HepProgramBuilder().addRuleCollection(hepRuleList).build();
